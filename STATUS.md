@@ -37,14 +37,26 @@ CLI banner + `--demo`.
 - Config is immutable records; `ConfigService` rebuilds + persists + raises events
   per mutation, guarded by a semaphore.
 
+**Wave 3 (Providers) — complete.** Each provider separates a pure mapper
+(JSON→domain, fixture-tested) from its HTTP client.
+- **Demo** — all 3 sources over `DemoData`; backs `--demo`.
+- **GitHub** — `GitHubApiClient` (PRs/Issues/Actions), `GitHubMapper`, workflow
+  discovery, PAT Bearer auth.
+- **Azure DevOps** — `AzureDevOpsApiClient` (PRs, Work Items via WIQL+batch,
+  Build pipelines + timeline stages), numeric-vote mapping, connectionData
+  self-id for voting, Basic PAT auth.
+- **Linear** — `LinearApiClient` (GraphQL, work items + comments + state change),
+  state-type → category 1:1 mapping, raw API-key auth.
+- **58 tests pass** (33 provider + 25 core).
+
 ## Where we left off
-Wave 2 done, tests green. **Paused for approval before Wave 3.**
+Wave 3 done, tests green. **Paused for approval before Wave 4.**
 
 ## What's next
-**Wave 3 — Providers** (MAG-60), 4 parallel tasks: Demo (all 3 sources), GitHub
-(PRs/Issues/Actions + discovery), Azure DevOps (PRs/Work Items/Pipelines +
-discovery), Linear (Work Items). Each implements only its supported source
-interfaces, fixture-based tests.
+**Wave 4 — TUI shell** (MAG-61): Terminal.Gui v2 app shell (tabs, master/detail,
+footer hints, themes, help modal), DI composition (registry from all factories +
+config service + secret store), runs end-to-end against Demo. This is where the
+DI container finally gets wired.
 
 ## Gotchas
 - Session cwd is `/Users/.../Bored`; build with absolute paths to `/Users/.../forgetop`.
@@ -54,3 +66,10 @@ interfaces, fixture-based tests.
   composition happens in Wave 4 (TUI) / Cli.
 - Gemini review needs `GEMINI_API_KEY` (was unset at Wave 1).
 - Spectre.Console.Cli 0.55: `Command.Execute` override is `protected` + takes `CancellationToken`.
+- **PR filter gap:** PR `ListAsync` honours only open/all state — `Mine`/`ReviewRequested`
+  filters are NOT implemented for PRs (GitHub needs the search API, ADO needs creator/
+  reviewer params). Work-item `MineOnly` IS implemented. Address in Wave 5.
+- **GitHub run logs** return a job-status summary, not raw text (full logs are a zip).
+- Provider **write paths** (vote/merge/comment/setState/trigger) are implemented but
+  only covered by mapper/read tests — live verification happens in Wave 6 with real PATs.
+- Each connection builds its own `HttpClient` (fine for a TUI; not via IHttpClientFactory).
