@@ -228,6 +228,11 @@ public sealed class PipelinesView(PipelineController controller) : SectionView
             TreeBuilder = new DelegateTreeBuilder<PipeNode>(n => n.Children),
             AspectGetter = n => n.Label,
         };
+        // azdo-style carets so it's obvious a node expands.
+        tree.Style.ExpandableSymbol = new System.Rune('▸');
+        tree.Style.CollapseableSymbol = new System.Rune('▾');
+        tree.Style.ColorExpandSymbol = true;
+        tree.Style.ShowBranchLines = true;
         tree.AddObjects(stages);
         return tree;
     }

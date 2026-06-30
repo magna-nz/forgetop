@@ -62,6 +62,8 @@ public abstract class SectionView : View
     {
         ColorScheme = scheme;
         Table.ColorScheme = scheme;
+        // Dim the header so the data is what stands out (gh-dash / azdo style).
+        _header.ColorScheme = new ColorScheme { Normal = new Terminal.Gui.Attribute(Color.Gray, scheme.Normal.Background) };
     }
 
     /// <summary>Fetch data (network) — safe to call off the UI thread.</summary>
