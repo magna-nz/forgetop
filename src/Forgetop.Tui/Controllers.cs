@@ -118,6 +118,14 @@ public sealed class WorkItemController(SectionService sections, IConfigService c
 {
     private List<WorkItem> _items = [];
 
+    public bool MineOnly { get; private set; }
+
+    public bool ToggleMine()
+    {
+        MineOnly = !MineOnly;
+        return MineOnly;
+    }
+
     public async Task<SectionData> LoadAsync(CancellationToken ct = default)
     {
         var source = await sections.GetWorkItemSourceAsync(ct).ConfigureAwait(false);
@@ -127,8 +135,9 @@ public sealed class WorkItemController(SectionService sections, IConfigService c
             return SectionData.Unbound("Work Items");
         }
 
-        _items = (await source.ListAsync(new WorkItemQuery(), ct).ConfigureAwait(false)).ToList();
-        return new SectionData(Labels.For(config, config.Current.WorkItems?.ConnectionId), _items.Select(RowFormatter.WorkItem).ToList());
+        _items = (await source.ListAsync(new WorkItemQuery { MineOnly = MineOnly }, ct).ConfigureAwait(false)).ToList();
+        var label = $"{Labels.For(config, config.Current.WorkItems?.ConnectionId)}{(MineOnly ? " · Mine" : "")}";
+        return new SectionData(label, _items.Select(RowFormatter.WorkItem).ToList());
     }
 
     public WorkItem? At(int index) => index >= 0 && index < _items.Count ? _items[index] : null;
@@ -240,4 +249,16 @@ public sealed class PipelineController(SectionService sections, IConfigService c
 
     public Task SubscribeAsync(DiscoveredPipeline pipeline, CancellationToken ct = default) =>
         config.SubscribePipelineAsync(pipeline.ConnectionId, pipeline.Definition.Id, ct);
+
+    public async Task<bool> UnsubscribeSelectedAsync(int index, CancellationToken ct = default)
+    {
+        if (index < 0 || index >= _items.Count)
+        {
+            return false;
+        }
+
+        var (feed, run) = _items[index];
+        await config.UnsubscribePipelineAsync(feed.Connection.ConnectionId, run.DefinitionId, ct).ConfigureAwait(false);
+        return true;
+    }
 }

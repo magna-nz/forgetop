@@ -56,6 +56,10 @@ public sealed class WorkItemsView(WorkItemController controller) : SectionView("
     {
         switch (KeyChar(keyEvent))
         {
+            case 'f':
+                controller.ToggleMine();
+                RunAction(() => Task.CompletedTask);
+                return true;
             case 's':
                 var state = Dialogs.Prompt("Set state", "New state (e.g. open/closed, In Progress, Done):");
                 if (state is not null)
@@ -103,6 +107,13 @@ public sealed class PipelinesView(PipelineController controller) : SectionView("
                 return true;
             case 'd':
                 Discover();
+                return true;
+            case 'u':
+                if (Dialogs.Confirm("Unsubscribe", "Stop tracking the selected pipeline?"))
+                {
+                    RunAction(() => controller.UnsubscribeSelectedAsync(SelectedIndex));
+                }
+
                 return true;
             default:
                 return false;

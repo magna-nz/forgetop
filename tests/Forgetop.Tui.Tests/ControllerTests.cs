@@ -76,6 +76,29 @@ public class ControllerTests
     }
 
     [Fact]
+    public async Task WorkItemController_mine_toggle_changes_label()
+    {
+        var (sections, config) = await BoundDemoAsync();
+        var controller = new WorkItemController(sections, config);
+
+        await controller.LoadAsync();
+        Assert.True(controller.ToggleMine());
+        var mine = await controller.LoadAsync();
+        Assert.Contains("Mine", mine.ProviderLabel);
+    }
+
+    [Fact]
+    public async Task PipelineController_unsubscribe_selected_does_not_throw()
+    {
+        var (sections, config) = await BoundDemoAsync();
+        var controller = new PipelineController(sections, config);
+        await controller.LoadAsync();
+
+        Assert.True(await controller.UnsubscribeSelectedAsync(0));
+        Assert.False(await controller.UnsubscribeSelectedAsync(999));
+    }
+
+    [Fact]
     public async Task PipelineController_aggregates_discovers_and_subscribes()
     {
         var (sections, config) = await BoundDemoAsync();

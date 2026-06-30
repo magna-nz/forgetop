@@ -1,4 +1,5 @@
 using Forgetop.Core.Domain;
+using Forgetop.Core.Http;
 using Forgetop.Core.Providers;
 
 namespace Forgetop.Providers.Linear;
@@ -47,7 +48,7 @@ public sealed class LinearProviderFactory : IProviderFactory
 
     public IProviderConnection Create(Connection connection, string? secret)
     {
-        var http = new HttpClient
+        var http = new HttpClient(new RetryHandler(new HttpClientHandler()))
         {
             BaseAddress = new Uri(connection.BaseUrl ?? "https://api.linear.app/graphql"),
         };

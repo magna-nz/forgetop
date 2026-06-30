@@ -34,12 +34,13 @@ public static class AppHost
         else
         {
             services.AddSingleton<IConfigStore>(_ => new JsonConfigStore());
-            services.AddSingleton<ISecretStore>(_ => new FallbackSecretStore(new InMemorySecretStore(), new EnvironmentSecretStore()));
+            services.AddSingleton<ISecretStore>(_ => OsSecretStore.CreateDefault());
         }
 
         services.AddSingleton<IConfigService, ConfigService>();
         services.AddSingleton<ConnectionResolver>();
         services.AddSingleton<SectionService>();
+        services.AddSingleton<SetupService>();
         services.AddSingleton<ForgetopApp>();
 
         return services.BuildServiceProvider();

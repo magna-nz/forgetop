@@ -1,5 +1,6 @@
 using System.Net.Http.Headers;
 using Forgetop.Core.Domain;
+using Forgetop.Core.Http;
 using Forgetop.Core.Providers;
 
 namespace Forgetop.Providers.GitHub;
@@ -53,7 +54,7 @@ public sealed class GitHubProviderFactory : IProviderFactory
         var repo = connection.Repository
             ?? throw new InvalidOperationException("GitHub connection requires a Repository.");
 
-        var http = new HttpClient
+        var http = new HttpClient(new RetryHandler(new HttpClientHandler()))
         {
             BaseAddress = new Uri(connection.BaseUrl ?? "https://api.github.com/"),
         };

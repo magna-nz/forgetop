@@ -1,6 +1,7 @@
 using System.Net.Http.Headers;
 using System.Text;
 using Forgetop.Core.Domain;
+using Forgetop.Core.Http;
 using Forgetop.Core.Providers;
 
 namespace Forgetop.Providers.AzureDevOps;
@@ -84,7 +85,7 @@ public sealed class AzureDevOpsProviderFactory : IProviderFactory
         var repo = connection.Repository ?? project;
 
         var baseUrl = connection.BaseUrl ?? $"https://dev.azure.com/{org}/";
-        var http = new HttpClient { BaseAddress = new Uri(baseUrl.EndsWith('/') ? baseUrl : baseUrl + "/") };
+        var http = new HttpClient(new RetryHandler(new HttpClientHandler())) { BaseAddress = new Uri(baseUrl.EndsWith('/') ? baseUrl : baseUrl + "/") };
         if (!string.IsNullOrEmpty(secret))
         {
             var basic = Convert.ToBase64String(Encoding.ASCII.GetBytes(":" + secret));

@@ -1,5 +1,6 @@
 using Forgetop.Core.App;
 using Forgetop.Core.Configuration;
+using Forgetop.Core.Providers;
 using Terminal.Gui;
 
 namespace Forgetop.Tui;
@@ -13,6 +14,8 @@ public sealed class ForgetopApp
     private static readonly TimeSpan PipelineRefreshInterval = TimeSpan.FromSeconds(5);
 
     private readonly IConfigService _config;
+    private readonly SetupService _setup;
+    private readonly IProviderRegistry _registry;
     private readonly ThemeManager _theme;
 
     private readonly PullRequestController _prController;
@@ -24,10 +27,12 @@ public sealed class ForgetopApp
     private WorkItemsView _workItemView = null!;
     private PipelinesView _pipelineView = null!;
 
-    public ForgetopApp(SectionService sections, IConfigService config)
+    public ForgetopApp(SectionService sections, IConfigService config, SetupService setup, IProviderRegistry registry)
     {
         ArgumentNullException.ThrowIfNull(sections);
         _config = config ?? throw new ArgumentNullException(nameof(config));
+        _setup = setup ?? throw new ArgumentNullException(nameof(setup));
+        _registry = registry ?? throw new ArgumentNullException(nameof(registry));
         _theme = new ThemeManager(config.Current.Ui.Theme);
 
         _prController = new PullRequestController(sections, config);
@@ -41,6 +46,11 @@ public sealed class ForgetopApp
         try
         {
             Build();
+            if (_config.Current.Connections.Count == 0)
+            {
+                await SetupWizard.FirstRunAsync(_setup, _registry).ConfigureAwait(true);
+            }
+
             await _prView.ReloadAsync(ct).ConfigureAwait(true);
             await _workItemView.ReloadAsync(ct).ConfigureAwait(true);
             await _pipelineView.ReloadAsync(ct).ConfigureAwait(true);
@@ -79,6 +89,7 @@ public sealed class ForgetopApp
             new StatusItem(Key.CtrlMask | Key.Q, "~^Q~ Quit", () => Application.RequestStop()),
             new StatusItem(Key.F1, "~F1~ Help", ShowHelp),
             new StatusItem(Key.F2, $"~F2~ Theme ({_theme.Current})", CycleTheme),
+            new StatusItem(Key.F3, "~F3~ Config", OpenConfig),
             new StatusItem(Key.F5, "~F5~ Refresh", RefreshAll),
             new StatusItem(Key.Null, "actions: see F1", null),
         ]);
@@ -103,6 +114,19 @@ public sealed class ForgetopApp
             });
             return true;
         });
+
+    private void OpenConfig()
+    {
+        try
+        {
+            SetupWizard.ShowConfigAsync(_setup, _registry, _config).GetAwaiter().GetResult();
+            RefreshAll();
+        }
+        catch (Exception ex)
+        {
+            Dialogs.Error("forgetop", ex.Message);
+        }
+    }
 
     private void RefreshAll()
     {
@@ -135,13 +159,13 @@ public sealed class ForgetopApp
         "forgetop — keys",
         "\nGlobal\n" +
         "  Tab / ← →   switch section      ↑ ↓   move in list\n" +
-        "  F5 refresh   F2 theme   F1 help   ^Q quit\n\n" +
+        "  F5 refresh   F3 config   F2 theme   F1 help   ^Q quit\n\n" +
         "Pull Requests\n" +
         "  f  cycle filter (All/Mine/ReviewRequested)\n" +
         "  a  approve   m  merge   c  comment   d  diff/files   v  comments\n\n" +
         "Work Items\n" +
-        "  s  set state   c  comment\n\n" +
+        "  f  toggle mine   s  set state   c  comment\n\n" +
         "Pipelines\n" +
-        "  ↵  drill-in (stages + logs)   t  trigger/re-run   d  discover & subscribe\n",
+        "  ↵  drill-in (stages + logs)   t  trigger/re-run   d  discover & subscribe   u  unsubscribe\n",
         "OK");
 }

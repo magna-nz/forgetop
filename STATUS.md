@@ -88,14 +88,27 @@ CLI banner + `--demo`.
 - Pipeline **unsubscribe** and work-item **mine filter** not surfaced in the UI.
 - State change is **free-text** (no per-provider valid-state picker).
 
+**Wave 6 (Wizard, config UI, secrets, docs) — complete.**
+- **Native OS secret store**: `KeychainSecretStore` (macOS, verified on arm64),
+  `DpapiSecretStore` (Windows), `SecretToolSecretStore` (Linux), `OsSecretStore.CreateDefault`
+  with env-var fallback; wired into non-demo `AppHost`.
+- **SetupService** (Core, tested): create connection + store PAT + bind section.
+- **SetupWizard / config UI** (Tui): first-run flow (no connections) + `F3` config
+  screen (add to any section / remove connection).
+- **RetryHandler** (Core, tested): retries transient 5xx/408/429/network errors;
+  attached to all real provider HttpClients.
+- **Carryovers**: pipeline `u` unsubscribe, work-item `f` mine toggle.
+- **README.md** written.
+- **95 tests pass** (39 Core + 40 Providers + 16 Tui).
+
 ## Where we left off
-Wave 5 complete (incl. PR diff + threads), tests green, build clean.
-**Paused for approval before Wave 6.**
+**All 6 waves complete.** Build clean (0 warnings), 95 tests green. macOS Keychain
+verified on this machine. Ready to raise the PR (pending user approval).
 
 ## What's next
-**Wave 6 — Setup wizard, runtime config UI, polish, docs** (MAG-63): first-run
-wizard (per-section provider+PAT), in-app add/remove connections & subscriptions,
-native secret store, error/retry polish, README. (Possibly fold in PR diff/threads.)
+- Raise PR to `main` (user approval required) → then mark MAG-57 done.
+- v2 backlog: GitLab + Bitbucket providers; OAuth device flow; Spectre-rich rendering
+  in detail panes; per-provider valid-state picker.
 
 ## Gotchas
 - Session cwd is `/Users/.../Bored`; build with absolute paths to `/Users/.../forgetop`.
