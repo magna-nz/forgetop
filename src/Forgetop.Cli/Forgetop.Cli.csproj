@@ -11,7 +11,6 @@
 
   <ItemGroup>
     <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="10.0.9" />
-    <PackageReference Include="Spectre.Console.Cli" Version="0.55.0" />
   </ItemGroup>
 
   <PropertyGroup>
@@ -19,6 +18,23 @@
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+
+    <!-- Packaging: `dotnet pack` produces a .NET global tool -->
+    <PackAsTool>true</PackAsTool>
+    <ToolCommandName>forgetop</ToolCommandName>
+    <PackageId>forgetop</PackageId>
+    <Version>0.1.0</Version>
+    <Authors>magna-nz</Authors>
+    <Description>htop for your software forges — a multi-provider terminal UI for pull requests, work items, and CI pipelines across GitHub, Azure DevOps, and Linear.</Description>
+    <PackageTags>tui;terminal;github;azure-devops;linear;pull-requests;pipelines;ci;cli;devops</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/magna-nz/forgetop</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/magna-nz/forgetop</RepositoryUrl>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
   </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
 
 </Project>
