@@ -34,6 +34,8 @@ public interface IConfigService
     Task AddOrUpdateConnectionAsync(Connection connection, string? secret = null, CancellationToken ct = default);
     Task RemoveConnectionAsync(string connectionId, CancellationToken ct = default);
 
+    Task SetThemeAsync(string? theme, CancellationToken ct = default);
+
     Task BindPullRequestsAsync(string connectionId, CancellationToken ct = default);
     Task BindWorkItemsAsync(string connectionId, CancellationToken ct = default);
     Task UnbindSectionAsync(Section section, CancellationToken ct = default);
@@ -135,6 +137,9 @@ public sealed class ConfigService : IConfigService
                 Pipelines = pipelines,
             };
         });
+
+    public Task SetThemeAsync(string? theme, CancellationToken ct = default) =>
+        MutateAsync(null, ct, config => Task.FromResult(config with { Ui = config.Ui with { Theme = theme } }));
 
     public Task BindPullRequestsAsync(string connectionId, CancellationToken ct = default) =>
         MutateAsync(Section.PullRequests, ct, config =>

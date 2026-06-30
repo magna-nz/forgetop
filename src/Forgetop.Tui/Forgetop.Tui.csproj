@@ -6,7 +6,7 @@
 
   <ItemGroup>
     <PackageReference Include="Spectre.Console" Version="0.57.1" />
-    <PackageReference Include="Terminal.Gui" Version="2.4.16" />
+    <PackageReference Include="Terminal.Gui" Version="1.18.1" />
   </ItemGroup>
 
   <PropertyGroup>

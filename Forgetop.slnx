@@ -11,5 +11,6 @@
   <Folder Name="/tests/">
     <Project Path="tests/Forgetop.Core.Tests/Forgetop.Core.Tests.csproj" />
     <Project Path="tests/Forgetop.Providers.Tests/Forgetop.Providers.Tests.csproj" />
+    <Project Path="tests/Forgetop.Tui.Tests/Forgetop.Tui.Tests.csproj" />
   </Folder>
 </Solution>

@@ -18,9 +18,9 @@ public class ConfigServiceTests
         new FakeProviderFactory(ProviderType.Linear, new ProviderCapabilities { SupportsWorkItems = true }),
     });
 
-    private static (ConfigService service, InMemoryConfigStore store, InMemorySecretStore secrets) Build()
+    private static (ConfigService service, RecordingConfigStore store, InMemorySecretStore secrets) Build()
     {
-        var store = new InMemoryConfigStore();
+        var store = new RecordingConfigStore();
         var secrets = new InMemorySecretStore();
         return (new ConfigService(store, secrets, Registry()), store, secrets);
     }
@@ -47,7 +47,7 @@ public class ConfigServiceTests
     [Fact]
     public async Task AddConnection_with_secret_throws_on_readonly_store()
     {
-        var service = new ConfigService(new InMemoryConfigStore(), new EnvironmentSecretStore(), Registry());
+        var service = new ConfigService(new RecordingConfigStore(), new EnvironmentSecretStore(), Registry());
 
         await Assert.ThrowsAsync<InvalidOperationException>(
             () => service.AddOrUpdateConnectionAsync(Conn("gh-1", ProviderType.GitHub), secret: "pat"));
@@ -137,7 +137,7 @@ public class ConfigServiceTests
     [Fact]
     public async Task Load_reads_existing_config_into_current()
     {
-        var store = new InMemoryConfigStore();
+        var store = new RecordingConfigStore();
         await store.SaveAsync(new ForgetopConfig
         {
             Connections = [Conn("gh-1", ProviderType.GitHub)],

@@ -42,7 +42,7 @@ public sealed class FakeProviderFactory : IProviderFactory
 }
 
 /// <summary>In-memory config store for service tests; records save count.</summary>
-public sealed class InMemoryConfigStore : IConfigStore
+public sealed class RecordingConfigStore : IConfigStore
 {
     private ForgetopConfig _config = ForgetopConfig.Empty;
 

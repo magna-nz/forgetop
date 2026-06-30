@@ -29,7 +29,13 @@ CLI banner + `--demo`.
   runtime mutation + cascade, secret stores).
 
 ## Decisions made
-- .NET 10 LTS; `.slnx`; Terminal.Gui v2 API.
+- .NET 10 LTS; `.slnx`.
+- **Terminal.Gui pinned to v1.18.1** (not v2): introspection showed 2.4.16 is a
+  heavily-refactored, partially-incomplete API (no `TabView`/`Toplevel`,
+  `Application.Run(IRunnable)`). v1 is the mature, complete, documented line.
+  Only `Forgetop.Tui` is affected. (User approved.)
+- Spectre.Console NOT yet used in the TUI (plain Terminal.Gui rendering); kept as a
+  dependency for possible richer detail rendering later, else drop in Wave 6.
 - `IProvider` split into capability-scoped source interfaces; connections expose
   only supported sources (null otherwise).
 - `Connection` lives in Domain (consumed by both Providers factory and Config) to
@@ -49,14 +55,25 @@ CLI banner + `--demo`.
   state-type → category 1:1 mapping, raw API-key auth.
 - **58 tests pass** (33 provider + 25 core).
 
+**Wave 4 (TUI shell) — complete.**
+- **Core/App** — `ConnectionResolver` (config id → live connection via registry+secrets)
+  and `SectionService` (bound sources per section, pipelines multi-source). Tested.
+- **Tui** (Terminal.Gui **v1.18.1**) — `ForgetopApp` (Init/Run/Shutdown, tabbed
+  Window, StatusBar hints, F1 help, F2 theme cycle, F5 refresh, ^Q quit),
+  `SectionView` (master/detail: ListView + detail TextView, frame title = bound
+  provider), `ThemeManager` (dark/light/matrix, persists via `IConfigService.SetThemeAsync`),
+  `RowFormatter` (pure domain→row projections).
+- **Cli** — `AppHost` DI composition (all 4 factories + registry + config + secrets +
+  app), `DemoSetup` (Demo connection bound to all sections), `--demo` entry point.
+- **67 tests pass** (29 Core + 33 Providers + 5 Tui).
+
 ## Where we left off
-Wave 3 done, tests green. **Paused for approval before Wave 4.**
+Wave 4 done, tests green, full build clean. **Paused for approval before Wave 5.**
 
 ## What's next
-**Wave 4 — TUI shell** (MAG-61): Terminal.Gui v2 app shell (tabs, master/detail,
-footer hints, themes, help modal), DI composition (registry from all factories +
-config service + secret store), runs end-to-end against Demo. This is where the
-DI container finally gets wired.
+**Wave 5 — Section screens & interactions** (MAG-62): PR diff/comment/vote/merge,
+work-item state change/comment, pipelines multi-source live auto-refresh + drill-in
++ logs + trigger + runtime subscribe. Plus PR Mine/ReviewRequested filters (Wave 3 gap).
 
 ## Gotchas
 - Session cwd is `/Users/.../Bored`; build with absolute paths to `/Users/.../forgetop`.
@@ -73,3 +90,9 @@ DI container finally gets wired.
 - Provider **write paths** (vote/merge/comment/setState/trigger) are implemented but
   only covered by mapper/read tests — live verification happens in Wave 6 with real PATs.
 - Each connection builds its own `HttpClient` (fine for a TUI; not via IHttpClientFactory).
+- **Live TUI not verifiable here** (no TTY): Wave 4 validated by compile + Core data-path
+  tests + DI graph. Run `dotnet run --project src/Forgetop.Cli -- --demo` in a real
+  terminal to see it. Terminal.Gui API was introspected via a scratchpad reflection probe.
+- Wave 4 loads each section synchronously before `Application.Run` (await once); live
+  auto-refresh is Wave 5. Non-demo secret store is InMemory primary (non-persistent) +
+  Env fallback until the native store lands in Wave 6.

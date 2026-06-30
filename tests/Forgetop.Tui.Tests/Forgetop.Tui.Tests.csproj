@@ -19,8 +19,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\..\src\Forgetop.Core\Forgetop.Core.csproj" />
-    <ProjectReference Include="..\..\src\Forgetop.Providers.Demo\Forgetop.Providers.Demo.csproj" />
+    <ProjectReference Include="..\..\src\Forgetop.Tui\Forgetop.Tui.csproj" />
   </ItemGroup>
 
 </Project>
