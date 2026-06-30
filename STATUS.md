@@ -101,8 +101,23 @@ CLI banner + `--demo`.
 - **README.md** written.
 - **95 tests pass** (39 Core + 40 Providers + 16 Tui).
 
-## Where we left off
-**All 6 waves complete; PR raised.** Build clean (0 warnings), 95 tests green.
+## UI redesign (MAG-64) — branch feature/MAG-64-ui-redesign
+**Phase A (data)** ✓ — PR Checks/Mergeable/Labels/ChangedFiles/Additions/Deletions
+across domain + Demo + GitHub (enrich top 25 w/ detail+check-runs) + ADO (mergeStatus/labels).
+**Phase B (UI)** ✓ —
+- `SectionView` rebuilt on **TableView**: one-line header, full-width column table,
+  per-cell status colour via `ColumnStyle.ColorGetter`, **detail pane expands beneath**
+  (Enter) / collapses (Esc).
+- **←/→ switch tabs** (via Table.KeyPress → TabView.SwitchTabBy).
+- **Pipelines**: Status · Pipeline · Branch · Build · Timestamp · Duration; Enter → jobs+logs.
+- **PRs**: Title · CI(✓/✗/●) · ± · Created; Enter → overview (Reviewers/Labels/Summary/
+  Changes/Checks/mergeable). d=diff, v=comments.
+- **30s auto-refresh** all sections (background load → MainLoop.Invoke render).
+- Plain Unicode icons (no Nerd Font). `StatusColors`, `Fmt`, `DetailFormatter.PrOverview`.
+- **108 tests** green. **Live UI NOT verified here (no TTY)** — needs `--demo` in a real terminal.
+
+## Where we left off (v1)
+**All 6 v1 waves complete; PR #1 merged.** Build clean, tests green.
 Packaged as a .NET global tool (verified: pack → install → run). macOS Keychain
 verified on arm64.
 - **PR: https://github.com/magna-nz/forgetop/pull/1** (base `main`) — awaiting user

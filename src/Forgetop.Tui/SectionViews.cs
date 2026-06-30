@@ -1,13 +1,49 @@
+using System.Data;
 using Forgetop.Core.Domain;
 using Forgetop.Core.Providers;
 using Terminal.Gui;
 
 namespace Forgetop.Tui;
 
-/// <summary>Pull Requests screen: (f)ilter, (a)pprove, (m)erge, (c)omment.</summary>
-public sealed class PullRequestsView(PullRequestController controller) : SectionView("Pull Requests")
+/// <summary>Pull Requests: Title · CI · ± · Created. Enter → overview; f/a/m/c/d/v actions.</summary>
+public sealed class PullRequestsView(PullRequestController controller) : SectionView
 {
-    protected override Task<SectionData> LoadAsync(CancellationToken ct = default) => controller.LoadAsync(ct);
+    public override Task LoadDataAsync(CancellationToken ct = default) => controller.LoadAsync(ct);
+
+    public override void Render()
+    {
+        SetHeader($"Pull Requests   ·   {controller.Label}");
+
+        var items = controller.Items;
+        var dt = new DataTable();
+        dt.Columns.Add("Title");
+        dt.Columns.Add("CI");
+        dt.Columns.Add("±");
+        dt.Columns.Add("Created");
+        foreach (var pr in items)
+        {
+            dt.Rows.Add(
+                $"#{pr.Number?.ToString() ?? pr.Id}  {pr.Title}",
+                StatusColors.CheckIcon(pr.Checks),
+                $"+{pr.Additions} -{pr.Deletions}",
+                Fmt.Date(pr.CreatedAt));
+        }
+
+        SetTable(dt);
+        Table.Style.ColumnStyles[dt.Columns["CI"]!] = new TableView.ColumnStyle
+        {
+            Alignment = TextAlignment.Centered,
+            ColorGetter = a => StatusColors.Scheme(Table, a.RowIndex >= 0 && a.RowIndex < items.Count ? StatusColors.CheckColor(items[a.RowIndex].Checks) : Color.Gray),
+        };
+    }
+
+    protected override void OnActivated(int row)
+    {
+        if (row >= 0 && row < controller.Items.Count)
+        {
+            Expand(DetailFormatter.PrOverview(controller.Items[row]));
+        }
+    }
 
     protected override bool OnActionKey(KeyEvent keyEvent)
     {
@@ -18,12 +54,12 @@ public sealed class PullRequestsView(PullRequestController controller) : Section
                 RunAction(() => Task.CompletedTask);
                 return true;
             case 'a':
-                RunAction(() => controller.VoteAsync(SelectedIndex, ReviewVote.Approved));
+                RunAction(() => controller.VoteAsync(SelectedRow, ReviewVote.Approved));
                 return true;
             case 'm':
                 if (Dialogs.Confirm("Merge", "Merge the selected pull request?"))
                 {
-                    RunAction(() => controller.MergeAsync(SelectedIndex, new MergeOptions()));
+                    RunAction(() => controller.MergeAsync(SelectedRow, new MergeOptions()));
                 }
 
                 return true;
@@ -31,15 +67,15 @@ public sealed class PullRequestsView(PullRequestController controller) : Section
                 var body = Dialogs.Prompt("Comment", "Comment body:");
                 if (body is not null)
                 {
-                    RunAction(() => controller.CommentAsync(SelectedIndex, body));
+                    RunAction(() => controller.CommentAsync(SelectedRow, body));
                 }
 
                 return true;
             case 'd':
-                ShowDetailSafe(() => controller.GetDiffTextAsync(SelectedIndex));
+                ShowDetailSafe(() => controller.GetDiffTextAsync(SelectedRow));
                 return true;
             case 'v':
-                ShowDetailSafe(() => controller.GetThreadsTextAsync(SelectedIndex));
+                ShowDetailSafe(() => controller.GetThreadsTextAsync(SelectedRow));
                 return true;
             default:
                 return false;
@@ -47,10 +83,37 @@ public sealed class PullRequestsView(PullRequestController controller) : Section
     }
 }
 
-/// <summary>Work Items screen: (s)tate change, (c)omment.</summary>
-public sealed class WorkItemsView(WorkItemController controller) : SectionView("Work Items")
+/// <summary>Work Items: Id · Title · State · Type · Assignee. Enter → detail; f/s/c actions.</summary>
+public sealed class WorkItemsView(WorkItemController controller) : SectionView
 {
-    protected override Task<SectionData> LoadAsync(CancellationToken ct = default) => controller.LoadAsync(ct);
+    public override Task LoadDataAsync(CancellationToken ct = default) => controller.LoadAsync(ct);
+
+    public override void Render()
+    {
+        SetHeader($"Work Items   ·   {controller.Label}");
+
+        var items = controller.Items;
+        var dt = new DataTable();
+        dt.Columns.Add("Id");
+        dt.Columns.Add("Title");
+        dt.Columns.Add("State");
+        dt.Columns.Add("Type");
+        dt.Columns.Add("Assignee");
+        foreach (var w in items)
+        {
+            dt.Rows.Add(w.Identifier ?? w.Id, w.Title, w.State, w.Type ?? "-", w.Assignee?.DisplayName ?? "–");
+        }
+
+        SetTable(dt);
+    }
+
+    protected override void OnActivated(int row)
+    {
+        if (row >= 0 && row < controller.Items.Count)
+        {
+            Expand(DetailFormatter.WorkItemDetail(controller.Items[row]));
+        }
+    }
 
     protected override bool OnActionKey(KeyEvent keyEvent)
     {
@@ -64,7 +127,7 @@ public sealed class WorkItemsView(WorkItemController controller) : SectionView("
                 var state = Dialogs.Prompt("Set state", "New state (e.g. open/closed, In Progress, Done):");
                 if (state is not null)
                 {
-                    RunAction(() => controller.SetStateAsync(SelectedIndex, state));
+                    RunAction(() => controller.SetStateAsync(SelectedRow, state));
                 }
 
                 return true;
@@ -72,7 +135,7 @@ public sealed class WorkItemsView(WorkItemController controller) : SectionView("
                 var body = Dialogs.Prompt("Comment", "Comment body:");
                 if (body is not null)
                 {
-                    RunAction(() => controller.CommentAsync(SelectedIndex, body));
+                    RunAction(() => controller.CommentAsync(SelectedRow, body));
                 }
 
                 return true;
@@ -82,26 +145,57 @@ public sealed class WorkItemsView(WorkItemController controller) : SectionView("
     }
 }
 
-/// <summary>Pipelines screen: ↵ drill-in, (t)rigger, (d)iscover &amp; subscribe.</summary>
-public sealed class PipelinesView(PipelineController controller) : SectionView("Pipelines")
+/// <summary>Pipelines: Status · Pipeline · Branch · Build · Timestamp · Duration. Enter → jobs; t/d/u actions.</summary>
+public sealed class PipelinesView(PipelineController controller) : SectionView
 {
-    protected override Task<SectionData> LoadAsync(CancellationToken ct = default) => controller.LoadAsync(ct);
+    public override Task LoadDataAsync(CancellationToken ct = default) => controller.LoadAsync(ct);
+
+    public override void Render()
+    {
+        SetHeader($"Pipelines   ·   {controller.Label}");
+
+        var items = controller.Items;
+        var dt = new DataTable();
+        dt.Columns.Add("Status");
+        dt.Columns.Add("Pipeline");
+        dt.Columns.Add("Branch");
+        dt.Columns.Add("Build");
+        dt.Columns.Add("Timestamp");
+        dt.Columns.Add("Duration");
+        foreach (var (connection, run) in items)
+        {
+            dt.Rows.Add(
+                StatusColors.PipelineLabel(run.Status),
+                run.Name ?? connection,
+                run.Branch ?? "–",
+                run.Number is { } n ? $"#{n}" : run.Id,
+                Fmt.DateTime(run.StartedAt),
+                Fmt.Duration(run));
+        }
+
+        SetTable(dt);
+        Table.Style.ColumnStyles[dt.Columns["Status"]!] = new TableView.ColumnStyle
+        {
+            ColorGetter = a => StatusColors.Scheme(Table, a.RowIndex >= 0 && a.RowIndex < items.Count ? StatusColors.PipelineColor(items[a.RowIndex].Run.Status) : Color.Gray),
+        };
+    }
+
+    protected override void OnActivated(int row)
+    {
+        if (row >= 0 && row < controller.Items.Count)
+        {
+            ShowDetailSafe(() => controller.GetRunDetailAsync(row));
+        }
+    }
 
     protected override bool OnActionKey(KeyEvent keyEvent)
     {
-        if (keyEvent.Key == Key.Enter)
-        {
-            var detail = controller.GetRunDetailAsync(SelectedIndex).GetAwaiter().GetResult();
-            ShowDetail(detail);
-            return true;
-        }
-
         switch (KeyChar(keyEvent))
         {
             case 't':
                 if (Dialogs.Confirm("Trigger", "Re-run the selected pipeline?"))
                 {
-                    RunAction(() => controller.TriggerAsync(SelectedIndex));
+                    RunAction(() => controller.TriggerAsync(SelectedRow));
                 }
 
                 return true;
@@ -111,7 +205,7 @@ public sealed class PipelinesView(PipelineController controller) : SectionView("
             case 'u':
                 if (Dialogs.Confirm("Unsubscribe", "Stop tracking the selected pipeline?"))
                 {
-                    RunAction(() => controller.UnsubscribeSelectedAsync(SelectedIndex));
+                    RunAction(() => controller.UnsubscribeSelectedAsync(SelectedRow));
                 }
 
                 return true;

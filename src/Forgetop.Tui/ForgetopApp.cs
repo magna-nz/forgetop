@@ -7,11 +7,11 @@ namespace Forgetop.Tui;
 
 /// <summary>
 /// The forgetop terminal application: a tabbed shell (Pull Requests / Work Items
-/// / Pipelines) over the bound providers, modelled on azdo.
+/// / Pipelines) over the bound providers, modelled on azdo / gh-dash.
 /// </summary>
 public sealed class ForgetopApp
 {
-    private static readonly TimeSpan PipelineRefreshInterval = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan RefreshInterval = TimeSpan.FromSeconds(30);
 
     private readonly IConfigService _config;
     private readonly SetupService _setup;
@@ -23,6 +23,7 @@ public sealed class ForgetopApp
     private readonly PipelineController _pipelineController;
 
     private Window _window = null!;
+    private TabView _tabs = null!;
     private PullRequestsView _prView = null!;
     private WorkItemsView _workItemView = null!;
     private PipelinesView _pipelineView = null!;
@@ -40,6 +41,8 @@ public sealed class ForgetopApp
         _pipelineController = new PipelineController(sections, config);
     }
 
+    private SectionView[] Views => [_prView, _workItemView, _pipelineView];
+
     public async Task RunAsync(CancellationToken ct = default)
     {
         Application.Init();
@@ -51,11 +54,9 @@ public sealed class ForgetopApp
                 await SetupWizard.FirstRunAsync(_setup, _registry).ConfigureAwait(true);
             }
 
-            await _prView.ReloadAsync(ct).ConfigureAwait(true);
-            await _workItemView.ReloadAsync(ct).ConfigureAwait(true);
-            await _pipelineView.ReloadAsync(ct).ConfigureAwait(true);
+            await RefreshAllAsync(ct).ConfigureAwait(true);
             ApplyTheme();
-            StartPipelineAutoRefresh();
+            StartAutoRefresh();
             Application.Run();
         }
         finally
@@ -70,10 +71,15 @@ public sealed class ForgetopApp
         _workItemView = new WorkItemsView(_workItemController);
         _pipelineView = new PipelinesView(_pipelineController);
 
-        var tabs = new TabView { X = 0, Y = 0, Width = Dim.Fill(), Height = Dim.Fill() };
-        tabs.AddTab(new TabView.Tab("Pull Requests", _prView), andSelect: true);
-        tabs.AddTab(new TabView.Tab("Work Items", _workItemView), andSelect: false);
-        tabs.AddTab(new TabView.Tab("Pipelines", _pipelineView), andSelect: false);
+        _tabs = new TabView { X = 0, Y = 0, Width = Dim.Fill(), Height = Dim.Fill() };
+        _tabs.AddTab(new TabView.Tab("Pull Requests", _prView), andSelect: true);
+        _tabs.AddTab(new TabView.Tab("Work Items", _workItemView), andSelect: false);
+        _tabs.AddTab(new TabView.Tab("Pipelines", _pipelineView), andSelect: false);
+
+        foreach (var view in Views)
+        {
+            view.TabSwitch += delta => _tabs.SwitchTabBy(delta);
+        }
 
         _window = new Window("forgetop — htop for your software forges")
         {
@@ -82,7 +88,7 @@ public sealed class ForgetopApp
             Width = Dim.Fill(),
             Height = Dim.Fill(1),
         };
-        _window.Add(tabs);
+        _window.Add(_tabs);
 
         var statusBar = new StatusBar(
         [
@@ -91,29 +97,54 @@ public sealed class ForgetopApp
             new StatusItem(Key.F2, $"~F2~ Theme ({_theme.Current})", CycleTheme),
             new StatusItem(Key.F3, "~F3~ Config", OpenConfig),
             new StatusItem(Key.F5, "~F5~ Refresh", RefreshAll),
-            new StatusItem(Key.Null, "actions: see F1", null),
+            new StatusItem(Key.Null, "←/→ tabs · ↵ details · actions: F1", null),
         ]);
 
         Application.Top.Add(_window, statusBar);
     }
 
-    private void StartPipelineAutoRefresh() =>
-        Application.MainLoop.AddTimeout(PipelineRefreshInterval, loop =>
+    private async Task RefreshAllAsync(CancellationToken ct)
+    {
+        foreach (var view in Views)
         {
-            _ = Task.Run(async () =>
+            await view.RefreshAsync(ct).ConfigureAwait(true);
+        }
+    }
+
+    private void StartAutoRefresh() =>
+        Application.MainLoop.AddTimeout(RefreshInterval, loop =>
+        {
+            foreach (var view in Views)
             {
-                try
+                var captured = view;
+                _ = Task.Run(async () =>
                 {
-                    var data = await _pipelineController.LoadAsync().ConfigureAwait(false);
-                    Application.MainLoop.Invoke(() => _pipelineView.Apply(data));
-                }
-                catch
-                {
-                    // Ignore transient refresh failures; the next tick retries.
-                }
-            });
+                    try
+                    {
+                        await captured.LoadDataAsync().ConfigureAwait(false);
+                        Application.MainLoop.Invoke(captured.Render);
+                    }
+                    catch
+                    {
+                        // ignore transient refresh failures; the next tick retries
+                    }
+                });
+            }
+
             return true;
         });
+
+    private void RefreshAll()
+    {
+        try
+        {
+            RefreshAllAsync(CancellationToken.None).GetAwaiter().GetResult();
+        }
+        catch (Exception ex)
+        {
+            Dialogs.Error("forgetop", ex.Message);
+        }
+    }
 
     private void OpenConfig()
     {
@@ -128,23 +159,15 @@ public sealed class ForgetopApp
         }
     }
 
-    private void RefreshAll()
-    {
-        try
-        {
-            _prView.ReloadAsync().GetAwaiter().GetResult();
-            _workItemView.ReloadAsync().GetAwaiter().GetResult();
-            _pipelineView.ReloadAsync().GetAwaiter().GetResult();
-        }
-        catch (Exception ex)
-        {
-            Dialogs.Error("forgetop", ex.Message);
-        }
-    }
-
     private void ApplyTheme()
     {
-        _window.ColorScheme = _theme.Scheme();
+        var scheme = _theme.Scheme();
+        _window.ColorScheme = scheme;
+        foreach (var view in Views)
+        {
+            view.ApplyScheme(scheme);
+        }
+
         Application.Refresh();
     }
 
@@ -159,6 +182,7 @@ public sealed class ForgetopApp
         "forgetop — keys",
         "\nGlobal\n" +
         "  Tab / ← →   switch section      ↑ ↓   move in list\n" +
+        "  ↵  expand details   Esc  collapse\n" +
         "  F5 refresh   F3 config   F2 theme   F1 help   ^Q quit\n\n" +
         "Pull Requests\n" +
         "  f  cycle filter (All/Mine/ReviewRequested)\n" +
@@ -166,6 +190,6 @@ public sealed class ForgetopApp
         "Work Items\n" +
         "  f  toggle mine   s  set state   c  comment\n\n" +
         "Pipelines\n" +
-        "  ↵  drill-in (stages + logs)   t  trigger/re-run   d  discover & subscribe   u  unsubscribe\n",
+        "  ↵  jobs + logs   t  trigger/re-run   d  discover & subscribe   u  unsubscribe\n",
         "OK");
 }
