@@ -16,7 +16,6 @@ public sealed class PullRequestsView(PullRequestController controller) : Section
 
     public override void Render()
     {
-        SetHeader($"Pull Requests   ·   {controller.Label}");
 
         var items = controller.Items;
         var dt = new DataTable();
@@ -37,7 +36,7 @@ public sealed class PullRequestsView(PullRequestController controller) : Section
         Table.Style.ColumnStyles[dt.Columns["CI"]!] = new TableView.ColumnStyle
         {
             Alignment = TextAlignment.Centered,
-            ColorGetter = a => StatusColors.Scheme(Table, a.RowIndex >= 0 && a.RowIndex < items.Count ? StatusColors.CheckColor(items[a.RowIndex].Checks) : Color.Gray),
+            ColorGetter = a => StatusColors.Scheme(a.RowIndex >= 0 && a.RowIndex < items.Count ? StatusColors.CheckColor(items[a.RowIndex].Checks) : Color.Gray, a.RowScheme?.Normal.Background ?? Color.Black),
         };
     }
 
@@ -94,7 +93,6 @@ public sealed class WorkItemsView(WorkItemController controller) : SectionView
 
     public override void Render()
     {
-        SetHeader($"Work Items   ·   {controller.Label}");
 
         var items = controller.Items;
         var dt = new DataTable();
@@ -156,7 +154,6 @@ public sealed class PipelinesView(PipelineController controller) : SectionView
 
     public override void Render()
     {
-        SetHeader($"Pipelines   ·   {controller.Label}");
 
         var items = controller.Items;
         var dt = new DataTable();
@@ -182,7 +179,7 @@ public sealed class PipelinesView(PipelineController controller) : SectionView
         SetTable(dt);
         Table.Style.ColumnStyles[dt.Columns["Status"]!] = new TableView.ColumnStyle
         {
-            ColorGetter = a => StatusColors.Scheme(Table, a.RowIndex >= 0 && a.RowIndex < items.Count ? StatusColors.PipelineColor(items[a.RowIndex].Run.Status) : Color.Gray),
+            ColorGetter = a => StatusColors.Scheme(a.RowIndex >= 0 && a.RowIndex < items.Count ? StatusColors.PipelineColor(items[a.RowIndex].Run.Status) : Color.Gray, a.RowScheme?.Normal.Background ?? Color.Black),
         };
     }
 
@@ -234,6 +231,21 @@ public sealed class PipelinesView(PipelineController controller) : SectionView
         tree.Style.ColorExpandSymbol = true;
         tree.Style.ShowBranchLines = true;
         tree.AddObjects(stages);
+        tree.ExpandAll(); // show stages → jobs → steps immediately
+        tree.ObjectActivated += e =>
+        {
+            if (e.ActivatedObject is { } node)
+            {
+                if (tree.IsExpanded(node))
+                {
+                    tree.Collapse(node);
+                }
+                else
+                {
+                    tree.Expand(node);
+                }
+            }
+        };
         return tree;
     }
 

@@ -44,10 +44,7 @@ internal static class StatusColors
         _ => Color.Gray,
     };
 
-    /// <summary>A colour scheme whose foreground is <paramref name="fg"/> over the table's own background.</summary>
-    public static ColorScheme Scheme(View table, Color fg)
-    {
-        var bg = table.ColorScheme?.Normal.Background ?? Color.Black;
-        return new ColorScheme { Normal = new Terminal.Gui.Attribute(fg, bg), Focus = new Terminal.Gui.Attribute(fg, bg) };
-    }
+    /// <summary>A colour scheme whose foreground is <paramref name="fg"/> over <paramref name="bg"/>.</summary>
+    public static ColorScheme Scheme(Color fg, Color bg) =>
+        new() { Normal = new Terminal.Gui.Attribute(fg, bg), Focus = new Terminal.Gui.Attribute(fg, bg) };
 }

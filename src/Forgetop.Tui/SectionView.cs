@@ -9,7 +9,6 @@ namespace Forgetop.Tui;
 /// </summary>
 public abstract class SectionView : View
 {
-    private readonly Label _header;
     protected readonly TableView Table;
     private readonly FrameView _detailPane;
     private readonly TextView _detailText;
@@ -23,12 +22,10 @@ public abstract class SectionView : View
         Width = Dim.Fill();
         Height = Dim.Fill();
 
-        _header = new Label { X = 1, Y = 0, Width = Dim.Fill(1), Text = string.Empty };
-
         Table = new TableView
         {
             X = 0,
-            Y = 1,
+            Y = 0,
             Width = Dim.Fill(),
             Height = Dim.Fill(),
             FullRowSelect = true,
@@ -52,7 +49,7 @@ public abstract class SectionView : View
         _detailText = new TextView { X = 0, Y = 0, Width = Dim.Fill(), Height = Dim.Fill(), ReadOnly = true, WordWrap = true };
         _detailText.KeyPress += OnDetailEsc;
 
-        Add(_header, Table, _detailPane);
+        Add(Table, _detailPane);
     }
 
     protected int SelectedRow => Table.SelectedRow;
@@ -62,8 +59,6 @@ public abstract class SectionView : View
     {
         ColorScheme = scheme;
         Table.ColorScheme = scheme;
-        // Dim the header so the data is what stands out (gh-dash / azdo style).
-        _header.ColorScheme = new ColorScheme { Normal = new Terminal.Gui.Attribute(Color.Gray, scheme.Normal.Background) };
     }
 
     /// <summary>Fetch data (network) — safe to call off the UI thread.</summary>
@@ -83,8 +78,6 @@ public abstract class SectionView : View
 
     /// <summary>Handle a letter action key; return true if handled.</summary>
     protected virtual bool OnActionKey(KeyEvent keyEvent) => false;
-
-    protected void SetHeader(string text) => _header.Text = text;
 
     protected void SetTable(DataTable table) => Table.Table = table;
 

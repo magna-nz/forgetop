@@ -31,18 +31,19 @@ public sealed class ThemeManager
     /// </summary>
     public ColorScheme Scheme() => Current switch
     {
-        "light" => Build(Color.Black, Color.White, Color.Black, Color.BrightCyan),
-        "matrix" => Build(Color.BrightGreen, Color.Black, Color.Black, Color.Green),
-        "ocean" => Build(Color.White, Color.Blue, Color.Black, Color.BrightCyan),
-        _ => Build(Color.White, Color.Black, Color.Black, Color.BrightCyan), // dark — terminal-native
+        "light" => Build(Color.Black, Color.White, Color.Black, Color.Gray),
+        "matrix" => Build(Color.BrightGreen, Color.Black, Color.BrightGreen, Color.DarkGray),
+        "ocean" => Build(Color.White, Color.Blue, Color.White, Color.BrightBlue),
+        _ => Build(Color.White, Color.Black, Color.White, Color.DarkGray), // dark — terminal-native
     };
 
+    // Calm scheme: no loud hotkey colour (HotNormal == Normal), subtle selection bar.
     private static ColorScheme Build(Color fg, Color bg, Color focusFg, Color focusBg) => new()
     {
         Normal = new Terminal.Gui.Attribute(fg, bg),
+        HotNormal = new Terminal.Gui.Attribute(fg, bg),
         Focus = new Terminal.Gui.Attribute(focusFg, focusBg),
-        HotNormal = new Terminal.Gui.Attribute(Color.BrightYellow, bg),
-        HotFocus = new Terminal.Gui.Attribute(Color.BrightYellow, focusBg),
+        HotFocus = new Terminal.Gui.Attribute(focusFg, focusBg),
         Disabled = new Terminal.Gui.Attribute(Color.DarkGray, bg),
     };
 }

@@ -34,7 +34,7 @@ public sealed class ConnectionsBar : View
                 X = x,
                 Y = 0,
                 Text = text,
-                ColorScheme = StatusColors.Scheme(this, item.Healthy ? Color.BrightGreen : Color.BrightRed),
+                ColorScheme = StatusColors.Scheme(item.Healthy ? Color.BrightGreen : Color.BrightRed, ColorScheme?.Normal.Background ?? Color.Black),
             });
             x += text.Length + 3;
         }
