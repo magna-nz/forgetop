@@ -46,21 +46,86 @@ Swap the runtime id for your platform: `osx-arm64`, `osx-x64`, `linux-x64`, `win
 > forgetop is a full-screen TUI and needs an interactive terminal. Run it
 > directly in your terminal — piping it / running in CI prints a friendly message and exits.
 
-## First-run setup
+## Setup walkthrough
 
-On first launch (no config yet) forgetop walks you through binding each section:
+The first time you run `forgetop` (with no config yet) it launches a **setup
+wizard**. Everything is a small modal dialog — **↑/↓** to move in a list, **Enter**
+or **Tab → Enter** to accept, **Esc** (or *Cancel*) to skip a step.
 
-1. **Pick a provider** for the section (e.g. GitHub for Pull Requests).
-2. **Enter the scope** — owner/org, project, repo as the provider needs.
-3. **Paste a Personal Access Token** — stored in your OS keychain (never written to disk in plaintext).
+**1. Welcome.** A dialog explains there are no connections yet and that you can
+skip any section and finish later with `F3`. Press **Enter** to continue.
 
-Skip any section and configure it later with **`F3`** inside the app. Each section
-is independent, so you can mix providers (PRs on GitHub, pipelines on Azure DevOps,
-work items on Linear). The Pipelines section can track **several** providers at once.
+**2. For each section, "Configure *X* now?"** You're asked in turn about
+**Pull Requests**, **Work Items**, then **Pipelines**. Choose **Yes** to set it up
+now or **No** to skip (configure it later with `F3`). Sections are independent —
+you don't have to use the same provider for each.
 
-Suggested token scopes: **GitHub** `repo` + `workflow` · **Azure DevOps** Code (read),
-Work Items (read/write), Build (read/execute) · **Linear** a personal API key.
-No token? Set `FORGETOP_PAT_<connection-id>` env vars as a fallback.
+**3. Pick a provider.** Only providers that *can* serve that section are listed
+(e.g. Linear appears for Work Items but not Pull Requests).
+
+**4. Answer the prompts.** What you're asked depends on the provider:
+
+| Provider | Prompts |
+|----------|---------|
+| **GitHub** | Display name · Organization (owner/org) · Repository · Personal Access Token |
+| **Azure DevOps** | Display name · Organization · Project · Repository · Personal Access Token |
+| **Linear** | Display name · Personal API key |
+| **Demo** | Display name only (no token) |
+
+- **Display name** is just a label shown in the tab header (e.g. `Acme/web`).
+- The **token** is stored in your **OS keychain** (macOS Keychain / Windows DPAPI /
+  Linux libsecret) — never written to disk in plaintext. Paste it and press Enter.
+
+**5. Done.** forgetop confirms each section (e.g. *"Pull Requests is now served by
+Acme/web"*) and drops you into the app with your data loaded.
+
+### Worked example — PRs on GitHub, Pipelines on Azure DevOps, Work Items on Linear
+
+```
+Configure Pull Requests now? → Yes
+  Provider            → GitHub
+  Display name        → Acme/web
+  Organization        → acme
+  Repository          → web
+  Personal Access Token → ghp_xxx           (scopes: repo, workflow)
+
+Configure Work Items now? → Yes
+  Provider            → Linear
+  Display name        → Acme (Linear)
+  Personal API key    → lin_api_xxx
+
+Configure Pipelines now? → Yes
+  Provider            → AzureDevOps
+  Display name        → Acme CI
+  Organization        → acme
+  Project             → Platform
+  Repository          → web
+  Personal Access Token → (PAT: Code read, Build read/execute)
+```
+
+You now have GitHub PRs, Linear issues, and ADO pipelines side by side. The
+Pipelines section can hold **more than one** connection — add another (e.g. GitHub
+Actions) with `F3` and it aggregates the runs.
+
+### Changing things later (`F3`)
+
+Press **`F3`** any time to open the config screen:
+- **Add → Pull Requests / Work Items / Pipelines** — runs the same prompts as above
+  to bind (or re-bind) a section.
+- **Remove: *name*** — deletes a connection and unbinds it everywhere.
+
+Changes persist and the affected section refreshes immediately.
+
+### Tokens & scopes
+
+| Provider | Suggested scopes |
+|----------|------------------|
+| GitHub | `repo` + `workflow` |
+| Azure DevOps | Code (read), Work Items (read/write), Build (read/execute) |
+| Linear | a personal API key |
+
+No keychain / prefer env vars? forgetop also reads `FORGETOP_PAT_<connection-id>`
+as a fallback.
 
 ## Keys
 
@@ -82,14 +147,8 @@ No token? Set `FORGETOP_PAT_<connection-id>` env vars as a fallback.
 
 GitLab and Bitbucket are planned for v2. Providers declare their capabilities,
 so the UI hides/relabels what a platform doesn't support (e.g. GitHub "approve"
-vs Azure DevOps numeric votes; "Issues" vs "Work Items").
-
-### Tokens
-
-Tokens are stored in your OS keychain (macOS Keychain, Windows DPAPI, Linux
-libsecret). As a fallback, forgetop reads `FORGETOP_PAT_<KEY>` environment
-variables. Suggested PAT scopes: GitHub `repo` + `workflow`; Azure DevOps Code
-(read), Work Items (read/write), Build (read/execute); Linear a personal API key.
+vs Azure DevOps numeric votes; "Issues" vs "Work Items"). See
+[Setup walkthrough](#setup-walkthrough) for connecting them and token scopes.
 
 ## Architecture
 
