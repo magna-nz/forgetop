@@ -14,6 +14,7 @@ public sealed class GitHubApiClient
     private readonly HttpClient _http;
     private readonly string _owner;
     private readonly string _repo;
+    private string? _selfLogin;
 
     public GitHubApiClient(HttpClient http, string owner, string repo)
     {
@@ -28,7 +29,22 @@ public sealed class GitHubApiClient
     {
         var state = query.IncludeCompleted ? "all" : "open";
         using var doc = await GetAsync($"{Repo}/pulls?state={state}&per_page={query.Limit ?? 50}", ct).ConfigureAwait(false);
-        return doc.RootElement.EnumerateArray().Select(GitHubMapper.MapPullRequest).ToList();
+        var prs = doc.RootElement.EnumerateArray().Select(GitHubMapper.MapPullRequest).ToList();
+
+        var me = query.Filter == PullRequestFilter.All ? null : await GetSelfLoginAsync(ct).ConfigureAwait(false);
+        return PullRequestFilters.Apply(prs, query.Filter, me);
+    }
+
+    private async Task<string?> GetSelfLoginAsync(CancellationToken ct)
+    {
+        if (_selfLogin is not null)
+        {
+            return _selfLogin;
+        }
+
+        using var doc = await GetAsync("user", ct).ConfigureAwait(false);
+        _selfLogin = doc.RootElement.Str("login");
+        return _selfLogin;
     }
 
     public async Task<PullRequest> GetPullRequestAsync(string id, CancellationToken ct)

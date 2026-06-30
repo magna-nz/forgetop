@@ -20,6 +20,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\Forgetop.Tui\Forgetop.Tui.csproj" />
+    <ProjectReference Include="..\..\src\Forgetop.Providers.Demo\Forgetop.Providers.Demo.csproj" />
   </ItemGroup>
 
 </Project>

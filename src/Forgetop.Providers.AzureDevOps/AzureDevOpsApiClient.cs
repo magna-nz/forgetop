@@ -33,7 +33,10 @@ public sealed class AzureDevOpsApiClient
         var status = query.IncludeCompleted ? "all" : "active";
         var path = $"{_project}/_apis/git/repositories/{_repository}/pullrequests?searchCriteria.status={status}&$top={query.Limit ?? 50}&{Api}";
         using var doc = await GetAsync(path, ct).ConfigureAwait(false);
-        return doc.RootElement.Arr("value").Select(AzureDevOpsMapper.MapPullRequest).ToList();
+        var prs = doc.RootElement.Arr("value").Select(AzureDevOpsMapper.MapPullRequest).ToList();
+
+        var me = query.Filter == PullRequestFilter.All ? null : await GetSelfIdAsync(ct).ConfigureAwait(false);
+        return PullRequestFilters.Apply(prs, query.Filter, me);
     }
 
     public async Task<PullRequest> GetPullRequestAsync(string id, CancellationToken ct)

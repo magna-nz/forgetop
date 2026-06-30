@@ -1,7 +1,5 @@
 using Forgetop.Core.App;
 using Forgetop.Core.Configuration;
-using Forgetop.Core.Domain;
-using Forgetop.Core.Providers;
 using Terminal.Gui;
 
 namespace Forgetop.Tui;
@@ -12,20 +10,29 @@ namespace Forgetop.Tui;
 /// </summary>
 public sealed class ForgetopApp
 {
-    private readonly SectionService _sections;
+    private static readonly TimeSpan PipelineRefreshInterval = TimeSpan.FromSeconds(5);
+
     private readonly IConfigService _config;
     private readonly ThemeManager _theme;
 
+    private readonly PullRequestController _prController;
+    private readonly WorkItemController _workItemController;
+    private readonly PipelineController _pipelineController;
+
     private Window _window = null!;
-    private SectionView _prView = null!;
-    private SectionView _workItemView = null!;
-    private SectionView _pipelineView = null!;
+    private PullRequestsView _prView = null!;
+    private WorkItemsView _workItemView = null!;
+    private PipelinesView _pipelineView = null!;
 
     public ForgetopApp(SectionService sections, IConfigService config)
     {
-        _sections = sections ?? throw new ArgumentNullException(nameof(sections));
+        ArgumentNullException.ThrowIfNull(sections);
         _config = config ?? throw new ArgumentNullException(nameof(config));
         _theme = new ThemeManager(config.Current.Ui.Theme);
+
+        _prController = new PullRequestController(sections, config);
+        _workItemController = new WorkItemController(sections, config);
+        _pipelineController = new PipelineController(sections, config);
     }
 
     public async Task RunAsync(CancellationToken ct = default)
@@ -34,8 +41,11 @@ public sealed class ForgetopApp
         try
         {
             Build();
-            await ReloadAsync(ct).ConfigureAwait(false);
+            await _prView.ReloadAsync(ct).ConfigureAwait(true);
+            await _workItemView.ReloadAsync(ct).ConfigureAwait(true);
+            await _pipelineView.ReloadAsync(ct).ConfigureAwait(true);
             ApplyTheme();
+            StartPipelineAutoRefresh();
             Application.Run();
         }
         finally
@@ -46,9 +56,9 @@ public sealed class ForgetopApp
 
     private void Build()
     {
-        _prView = new SectionView("Pull Requests");
-        _workItemView = new SectionView("Work Items");
-        _pipelineView = new SectionView("Pipelines");
+        _prView = new PullRequestsView(_prController);
+        _workItemView = new WorkItemsView(_workItemController);
+        _pipelineView = new PipelinesView(_pipelineController);
 
         var tabs = new TabView { X = 0, Y = 0, Width = Dim.Fill(), Height = Dim.Fill() };
         tabs.AddTab(new TabView.Tab("Pull Requests", _prView), andSelect: true);
@@ -69,67 +79,43 @@ public sealed class ForgetopApp
             new StatusItem(Key.CtrlMask | Key.Q, "~^Q~ Quit", () => Application.RequestStop()),
             new StatusItem(Key.F1, "~F1~ Help", ShowHelp),
             new StatusItem(Key.F2, $"~F2~ Theme ({_theme.Current})", CycleTheme),
-            new StatusItem(Key.F5, "~F5~ Refresh", () => _ = ReloadAsync()),
-            new StatusItem(Key.Null, "Tab/←→ switch section", null),
+            new StatusItem(Key.F5, "~F5~ Refresh", RefreshAll),
+            new StatusItem(Key.Null, "actions: see F1", null),
         ]);
 
         Application.Top.Add(_window, statusBar);
     }
 
-    private async Task ReloadAsync(CancellationToken ct = default)
-    {
-        _prView.SetData(await LoadPullRequestsAsync(ct).ConfigureAwait(false));
-        _workItemView.SetData(await LoadWorkItemsAsync(ct).ConfigureAwait(false));
-        _pipelineView.SetData(await LoadPipelinesAsync(ct).ConfigureAwait(false));
-    }
-
-    private async Task<SectionData> LoadPullRequestsAsync(CancellationToken ct)
-    {
-        var source = await _sections.GetPullRequestSourceAsync(ct).ConfigureAwait(false);
-        if (source is null)
+    private void StartPipelineAutoRefresh() =>
+        Application.MainLoop.AddTimeout(PipelineRefreshInterval, loop =>
         {
-            return SectionData.Unbound("Pull Requests");
-        }
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    var data = await _pipelineController.LoadAsync().ConfigureAwait(false);
+                    Application.MainLoop.Invoke(() => _pipelineView.Apply(data));
+                }
+                catch
+                {
+                    // Ignore transient refresh failures; the next tick retries.
+                }
+            });
+            return true;
+        });
 
-        var prs = await source.ListAsync(new PullRequestQuery(), ct).ConfigureAwait(false);
-        return new SectionData(LabelFor(_config.Current.PullRequests?.ConnectionId), prs.Select(RowFormatter.PullRequest).ToList());
-    }
-
-    private async Task<SectionData> LoadWorkItemsAsync(CancellationToken ct)
+    private void RefreshAll()
     {
-        var source = await _sections.GetWorkItemSourceAsync(ct).ConfigureAwait(false);
-        if (source is null)
+        try
         {
-            return SectionData.Unbound("Work Items");
+            _prView.ReloadAsync().GetAwaiter().GetResult();
+            _workItemView.ReloadAsync().GetAwaiter().GetResult();
+            _pipelineView.ReloadAsync().GetAwaiter().GetResult();
         }
-
-        var items = await source.ListAsync(new WorkItemQuery(), ct).ConfigureAwait(false);
-        return new SectionData(LabelFor(_config.Current.WorkItems?.ConnectionId), items.Select(RowFormatter.WorkItem).ToList());
-    }
-
-    private async Task<SectionData> LoadPipelinesAsync(CancellationToken ct)
-    {
-        var feeds = await _sections.GetPipelineFeedsAsync(ct).ConfigureAwait(false);
-        if (feeds.Count == 0)
+        catch (Exception ex)
         {
-            return SectionData.Unbound("Pipelines");
+            Dialogs.Error("forgetop", ex.Message);
         }
-
-        var rows = new List<SectionRow>();
-        foreach (var feed in feeds)
-        {
-            var runs = await feed.Source.ListRunsAsync(new PipelineRunQuery { Limit = 25 }, ct).ConfigureAwait(false);
-            rows.AddRange(runs.Select(r => RowFormatter.PipelineRun(feed.Connection.DisplayName, r)));
-        }
-
-        var label = string.Join(" + ", feeds.Select(f => f.Connection.DisplayName));
-        return new SectionData(label, rows);
-    }
-
-    private string LabelFor(string? connectionId)
-    {
-        var connection = connectionId is null ? null : _config.Current.FindConnection(connectionId);
-        return connection is null ? "unbound" : $"{connection.DisplayName} ({connection.ProviderType})";
     }
 
     private void ApplyTheme()
@@ -147,6 +133,15 @@ public sealed class ForgetopApp
 
     private static void ShowHelp() => MessageBox.Query(
         "forgetop — keys",
-        "\nTab / ← →   switch section\n↑ ↓          move in list\nF5           refresh\nF2           cycle theme\nF1           this help\n^Q           quit\n",
+        "\nGlobal\n" +
+        "  Tab / ← →   switch section      ↑ ↓   move in list\n" +
+        "  F5 refresh   F2 theme   F1 help   ^Q quit\n\n" +
+        "Pull Requests\n" +
+        "  f  cycle filter (All/Mine/ReviewRequested)\n" +
+        "  a  approve     m  merge     c  comment\n\n" +
+        "Work Items\n" +
+        "  s  set state   c  comment\n\n" +
+        "Pipelines\n" +
+        "  ↵  drill-in (stages + logs)   t  trigger/re-run   d  discover & subscribe\n",
         "OK");
 }

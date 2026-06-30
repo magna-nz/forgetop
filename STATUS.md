@@ -67,13 +67,34 @@ CLI banner + `--demo`.
   app), `DemoSetup` (Demo connection bound to all sections), `--demo` entry point.
 - **67 tests pass** (29 Core + 33 Providers + 5 Tui).
 
+**Wave 5 (Screens & interactions) — implemented (one notable deferral).**
+- **PR filters** (Wave 3 gap closed): `PullRequestFilters` (Core, tested) + provider
+  integration (GitHub `/user`, ADO connectionData, Demo=alice).
+- **Tui controllers** (pure, tested against Demo): `PullRequestController`
+  (load/cycle-filter/vote/merge/comment), `WorkItemController` (load/set-state/comment),
+  `PipelineController` (aggregate/drill-in detail+logs/trigger/discover/subscribe).
+- **Tui views**: specialized `PullRequestsView` (f/a/m/c), `WorkItemsView` (s/c),
+  `PipelinesView` (↵ drill-in, t trigger, d discover+subscribe) over an abstract
+  `SectionView` with action-key handling; `Dialogs` (prompt/pick/confirm/info/error).
+- **Pipelines live auto-refresh** every 5s (background fetch → MainLoop.Invoke).
+- **75 tests pass** (33 Core + 33 Providers + 9 Tui).
+
+### Deferred from Wave 5 (decide before closing MAG-62)
+- **PR diff / changed-files view NOT built** — detail pane shows PR metadata only.
+  Fetching + rendering diffs is sizable; needs a decision (do now vs Wave 6).
+- PR/work-item **comment threads not shown inline** (post works; viewing existing
+  threads not wired into the detail pane).
+- Pipeline **unsubscribe** and work-item **mine filter** not surfaced in the UI.
+- State change is **free-text** (no per-provider valid-state picker).
+
 ## Where we left off
-Wave 4 done, tests green, full build clean. **Paused for approval before Wave 5.**
+Wave 5 implemented, tests green, build clean. **Paused for approval — and for a
+decision on the deferred PR diff/threads above.**
 
 ## What's next
-**Wave 5 — Section screens & interactions** (MAG-62): PR diff/comment/vote/merge,
-work-item state change/comment, pipelines multi-source live auto-refresh + drill-in
-+ logs + trigger + runtime subscribe. Plus PR Mine/ReviewRequested filters (Wave 3 gap).
+**Wave 6 — Setup wizard, runtime config UI, polish, docs** (MAG-63): first-run
+wizard (per-section provider+PAT), in-app add/remove connections & subscriptions,
+native secret store, error/retry polish, README. (Possibly fold in PR diff/threads.)
 
 ## Gotchas
 - Session cwd is `/Users/.../Bored`; build with absolute paths to `/Users/.../forgetop`.

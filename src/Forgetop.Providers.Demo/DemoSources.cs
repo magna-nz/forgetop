@@ -13,7 +13,9 @@ internal sealed class DemoPullRequestSource : IPullRequestSource
             prs = prs.Where(p => p.Status is PullRequestStatus.Open or PullRequestStatus.Draft);
         }
 
-        return Task.FromResult<IReadOnlyList<PullRequest>>(prs.ToList());
+        // "alice" is the demo's current user, so Mine / ReviewRequested filters do something visible.
+        var filtered = PullRequestFilters.Apply(prs.ToList(), query.Filter, DemoData.Alice.Handle);
+        return Task.FromResult(filtered);
     }
 
     public Task<PullRequest> GetAsync(string id, CancellationToken ct = default) =>

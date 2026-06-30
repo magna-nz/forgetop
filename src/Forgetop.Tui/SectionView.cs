@@ -3,17 +3,17 @@ using Terminal.Gui;
 namespace Forgetop.Tui;
 
 /// <summary>
-/// A master/detail section pane: a list of rows on the left, the selected row's
-/// detail on the right. The frame title shows the bound provider.
+/// A master/detail section pane: list of rows on the left, selected row's detail
+/// on the right. Subclasses load their data and handle action keys.
 /// </summary>
-public sealed class SectionView : FrameView
+public abstract class SectionView : FrameView
 {
     private readonly ListView _list;
     private readonly TextView _detail;
     private readonly string _sectionName;
     private IReadOnlyList<SectionRow> _rows = [];
 
-    public SectionView(string sectionName)
+    protected SectionView(string sectionName)
     {
         _sectionName = sectionName;
         Title = sectionName;
@@ -41,13 +41,44 @@ public sealed class SectionView : FrameView
         Add(_list, _detail);
     }
 
-    public void SetData(SectionData data)
+    protected int SelectedIndex => _list.SelectedItem;
+
+    /// <summary>Load this section's data (called on initial load and on refresh).</summary>
+    protected abstract Task<SectionData> LoadAsync(CancellationToken ct = default);
+
+    public async Task ReloadAsync(CancellationToken ct = default) => Apply(await LoadAsync(ct).ConfigureAwait(true));
+
+    public void Apply(SectionData data)
     {
         Title = $"{_sectionName}  ·  {data.ProviderLabel}";
         _rows = data.Rows;
         _list.SetSource(data.Rows.Select(r => r.Display).ToList());
         UpdateDetail(_rows.Count > 0 ? 0 : -1);
     }
+
+    public override bool ProcessKey(KeyEvent keyEvent) => OnActionKey(keyEvent) || base.ProcessKey(keyEvent);
+
+    /// <summary>Handle a section-specific action key; return true if handled.</summary>
+    protected virtual bool OnActionKey(KeyEvent keyEvent) => false;
+
+    /// <summary>Replace the detail pane text (e.g. pipeline drill-in).</summary>
+    protected void ShowDetail(string text) => _detail.Text = text;
+
+    /// <summary>Run an async action, refresh the list, and surface any error.</summary>
+    protected void RunAction(Func<Task> action)
+    {
+        try
+        {
+            action().GetAwaiter().GetResult();
+            ReloadAsync().GetAwaiter().GetResult();
+        }
+        catch (Exception ex)
+        {
+            Dialogs.Error("forgetop", ex.Message);
+        }
+    }
+
+    protected static char KeyChar(KeyEvent keyEvent) => char.ToLowerInvariant((char)keyEvent.KeyValue);
 
     private void OnSelectedItemChanged(ListViewItemEventArgs args) => UpdateDetail(args.Item);
 
