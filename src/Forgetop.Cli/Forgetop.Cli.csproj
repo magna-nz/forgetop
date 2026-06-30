@@ -1,0 +1,40 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="..\Forgetop.Core\Forgetop.Core.csproj" />
+    <ProjectReference Include="..\Forgetop.Tui\Forgetop.Tui.csproj" />
+    <ProjectReference Include="..\Forgetop.Providers.Demo\Forgetop.Providers.Demo.csproj" />
+    <ProjectReference Include="..\Forgetop.Providers.GitHub\Forgetop.Providers.GitHub.csproj" />
+    <ProjectReference Include="..\Forgetop.Providers.AzureDevOps\Forgetop.Providers.AzureDevOps.csproj" />
+    <ProjectReference Include="..\Forgetop.Providers.Linear\Forgetop.Providers.Linear.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="10.0.9" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+
+    <!-- Packaging: `dotnet pack` produces a .NET global tool -->
+    <PackAsTool>true</PackAsTool>
+    <ToolCommandName>forgetop</ToolCommandName>
+    <PackageId>forgetop</PackageId>
+    <Version>0.1.0</Version>
+    <Authors>magna-nz</Authors>
+    <Description>htop for your software forges — a multi-provider terminal UI for pull requests, work items, and CI pipelines across GitHub, Azure DevOps, and Linear.</Description>
+    <PackageTags>tui;terminal;github;azure-devops;linear;pull-requests;pipelines;ci;cli;devops</PackageTags>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/magna-nz/forgetop</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/magna-nz/forgetop</RepositoryUrl>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+</Project>

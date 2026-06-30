@@ -1,0 +1,16 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Forgetop.Cli/Forgetop.Cli.csproj" />
+    <Project Path="src/Forgetop.Core/Forgetop.Core.csproj" />
+    <Project Path="src/Forgetop.Providers.AzureDevOps/Forgetop.Providers.AzureDevOps.csproj" />
+    <Project Path="src/Forgetop.Providers.Demo/Forgetop.Providers.Demo.csproj" />
+    <Project Path="src/Forgetop.Providers.GitHub/Forgetop.Providers.GitHub.csproj" />
+    <Project Path="src/Forgetop.Providers.Linear/Forgetop.Providers.Linear.csproj" />
+    <Project Path="src/Forgetop.Tui/Forgetop.Tui.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Forgetop.Core.Tests/Forgetop.Core.Tests.csproj" />
+    <Project Path="tests/Forgetop.Providers.Tests/Forgetop.Providers.Tests.csproj" />
+    <Project Path="tests/Forgetop.Tui.Tests/Forgetop.Tui.Tests.csproj" />
+  </Folder>
+</Solution>
