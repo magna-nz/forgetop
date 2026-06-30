@@ -50,7 +50,7 @@ public abstract class SectionView : View
             Visible = false,
         };
         _detailText = new TextView { X = 0, Y = 0, Width = Dim.Fill(), Height = Dim.Fill(), ReadOnly = true, WordWrap = true };
-        _detailPane.Add(_detailText);
+        _detailText.KeyPress += OnDetailEsc;
 
         Add(_header, Table, _detailPane);
     }
@@ -86,13 +86,42 @@ public abstract class SectionView : View
 
     protected void SetTable(DataTable table) => Table.Table = table;
 
+    /// <summary>Show plain-text detail beneath the table.</summary>
     protected void Expand(string detail)
     {
         _detailText.Text = detail;
+        ShowDetailPane(_detailText);
+    }
+
+    /// <summary>Show an arbitrary (navigable) view beneath the table, e.g. a TreeView.</summary>
+    protected void ExpandView(View content)
+    {
+        content.X = 0;
+        content.Y = 0;
+        content.Width = Dim.Fill();
+        content.Height = Dim.Fill();
+        content.KeyPress += OnDetailEsc;
+        ShowDetailPane(content);
+    }
+
+    private void ShowDetailPane(View content)
+    {
+        _detailPane.RemoveAll();
+        _detailPane.Add(content);
         _detailPane.Visible = true;
         _expanded = true;
         Table.Height = Dim.Percent(55);
         SetNeedsDisplay();
+        content.SetFocus();
+    }
+
+    private void OnDetailEsc(KeyEventEventArgs args)
+    {
+        if (args.KeyEvent.Key == Key.Esc)
+        {
+            Collapse();
+            args.Handled = true;
+        }
     }
 
     private void Collapse()
@@ -100,6 +129,7 @@ public abstract class SectionView : View
         _detailPane.Visible = false;
         _expanded = false;
         Table.Height = Dim.Fill();
+        Table.SetFocus();
         SetNeedsDisplay();
     }
 

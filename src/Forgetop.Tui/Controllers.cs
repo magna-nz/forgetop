@@ -218,6 +218,18 @@ public sealed class PipelineController(SectionService sections, IConfigService c
         return new SectionData(Label, rows);
     }
 
+    /// <summary>The fully-detailed run (stages → jobs → steps) for the drill-in tree.</summary>
+    public async Task<PipelineRun?> GetRunAsync(int index, CancellationToken ct = default)
+    {
+        if (index < 0 || index >= _items.Count)
+        {
+            return null;
+        }
+
+        var (feed, run) = _items[index];
+        return await feed.Source.GetRunAsync(run.Id, ct).ConfigureAwait(false);
+    }
+
     public async Task<string> GetRunDetailAsync(int index, CancellationToken ct = default)
     {
         if (index < 0 || index >= _items.Count)

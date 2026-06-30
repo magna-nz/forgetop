@@ -16,6 +16,7 @@ public sealed class ForgetopApp
     private readonly IConfigService _config;
     private readonly SetupService _setup;
     private readonly IProviderRegistry _registry;
+    private readonly ConnectionHealthService _health;
     private readonly ThemeManager _theme;
 
     private readonly PullRequestController _prController;
@@ -24,16 +25,18 @@ public sealed class ForgetopApp
 
     private Window _window = null!;
     private TabView _tabs = null!;
+    private ConnectionsBar _connectionsBar = null!;
     private PullRequestsView _prView = null!;
     private WorkItemsView _workItemView = null!;
     private PipelinesView _pipelineView = null!;
 
-    public ForgetopApp(SectionService sections, IConfigService config, SetupService setup, IProviderRegistry registry)
+    public ForgetopApp(SectionService sections, IConfigService config, SetupService setup, IProviderRegistry registry, ConnectionHealthService health)
     {
         ArgumentNullException.ThrowIfNull(sections);
         _config = config ?? throw new ArgumentNullException(nameof(config));
         _setup = setup ?? throw new ArgumentNullException(nameof(setup));
         _registry = registry ?? throw new ArgumentNullException(nameof(registry));
+        _health = health ?? throw new ArgumentNullException(nameof(health));
         _theme = new ThemeManager(config.Current.Ui.Theme);
 
         _prController = new PullRequestController(sections, config);
@@ -57,6 +60,7 @@ public sealed class ForgetopApp
             await RefreshAllAsync(ct).ConfigureAwait(true);
             ApplyTheme();
             StartAutoRefresh();
+            RefreshHealth();
             Application.Run();
         }
         finally
@@ -72,9 +76,9 @@ public sealed class ForgetopApp
         _pipelineView = new PipelinesView(_pipelineController);
 
         _tabs = new TabView { X = 0, Y = 0, Width = Dim.Fill(), Height = Dim.Fill() };
-        _tabs.AddTab(new TabView.Tab("Pull Requests", _prView), andSelect: true);
-        _tabs.AddTab(new TabView.Tab("Work Items", _workItemView), andSelect: false);
-        _tabs.AddTab(new TabView.Tab("Pipelines", _pipelineView), andSelect: false);
+        _tabs.AddTab(new TabView.Tab("   Pull Requests   ", _prView), andSelect: true);
+        _tabs.AddTab(new TabView.Tab("   Work Items   ", _workItemView), andSelect: false);
+        _tabs.AddTab(new TabView.Tab("   Pipelines   ", _pipelineView), andSelect: false);
 
         foreach (var view in Views)
         {
@@ -86,9 +90,11 @@ public sealed class ForgetopApp
             X = 0,
             Y = 0,
             Width = Dim.Fill(),
-            Height = Dim.Fill(1),
+            Height = Dim.Fill(2),
         };
         _window.Add(_tabs);
+
+        _connectionsBar = new ConnectionsBar { X = 0, Y = Pos.Bottom(_window) };
 
         var statusBar = new StatusBar(
         [
@@ -100,7 +106,7 @@ public sealed class ForgetopApp
             new StatusItem(Key.Null, "←/→ tabs · ↵ details · actions: F1", null),
         ]);
 
-        Application.Top.Add(_window, statusBar);
+        Application.Top.Add(_window, _connectionsBar, statusBar);
     }
 
     private async Task RefreshAllAsync(CancellationToken ct)
@@ -131,7 +137,22 @@ public sealed class ForgetopApp
                 });
             }
 
+            RefreshHealth();
             return true;
+        });
+
+    private void RefreshHealth() =>
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                var health = await _health.CheckAllAsync().ConfigureAwait(false);
+                Application.MainLoop.Invoke(() => _connectionsBar.Update(health));
+            }
+            catch
+            {
+                // ignore; the next tick retries
+            }
         });
 
     private void RefreshAll()
@@ -163,6 +184,7 @@ public sealed class ForgetopApp
     {
         var scheme = _theme.Scheme();
         _window.ColorScheme = scheme;
+        _connectionsBar.ColorScheme = scheme;
         foreach (var view in Views)
         {
             view.ApplyScheme(scheme);

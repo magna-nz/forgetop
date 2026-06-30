@@ -213,25 +213,41 @@ public sealed class GitHubApiClient
     public Task TriggerAsync(string definitionId, string? branch, CancellationToken ct) =>
         PostAsync($"{Repo}/actions/workflows/{definitionId}/dispatches", new { @ref = branch ?? "main" }, ct);
 
-    private static PipelineJob MapJob(JsonElement el)
+    private static PipelineJob MapJob(JsonElement el) => new()
+    {
+        Id = el.Int("id")?.ToString() ?? "0",
+        Name = el.Str("name") ?? "(job)",
+        Status = StatusOf(el),
+        StartedAt = el.Date("started_at"),
+        FinishedAt = el.Date("completed_at"),
+        Steps = el.Arr("steps")
+            .Select(s => new PipelineStep { Name = s.Str("name") ?? "step", Status = StatusOf(s) })
+            .ToList(),
+    };
+
+    private static PipelineRunStatus StatusOf(JsonElement el)
     {
         var status = el.Str("status");
         var conclusion = el.Str("conclusion");
-        var runStatus = status == "completed"
+        return status == "completed"
             ? (conclusion == "success" ? PipelineRunStatus.Succeeded
-                : conclusion == "cancelled" ? PipelineRunStatus.Canceled
+                : conclusion is "cancelled" or "skipped" ? PipelineRunStatus.Canceled
                 : PipelineRunStatus.Failed)
             : status == "queued" ? PipelineRunStatus.Queued
             : PipelineRunStatus.Running;
+    }
 
-        return new PipelineJob
+    public async Task<bool> CheckAsync(CancellationToken ct)
+    {
+        try
         {
-            Id = el.Int("id")?.ToString() ?? "0",
-            Name = el.Str("name") ?? "(job)",
-            Status = runStatus,
-            StartedAt = el.Date("started_at"),
-            FinishedAt = el.Date("completed_at"),
-        };
+            using var resp = await _http.GetAsync("user", ct).ConfigureAwait(false);
+            return resp.IsSuccessStatusCode;
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     private async Task<JsonDocument> GetAsync(string path, CancellationToken ct)

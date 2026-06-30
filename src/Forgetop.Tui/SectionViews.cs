@@ -2,8 +2,12 @@ using System.Data;
 using Forgetop.Core.Domain;
 using Forgetop.Core.Providers;
 using Terminal.Gui;
+using Terminal.Gui.Trees;
 
 namespace Forgetop.Tui;
+
+/// <summary>A node in the pipeline drill-in tree (stage → job → step).</summary>
+internal sealed record PipeNode(string Label, IReadOnlyList<PipeNode> Children);
 
 /// <summary>Pull Requests: Title · CI · ± · Created. Enter → overview; f/a/m/c/d/v actions.</summary>
 public sealed class PullRequestsView(PullRequestController controller) : SectionView
@@ -157,6 +161,7 @@ public sealed class PipelinesView(PipelineController controller) : SectionView
         var items = controller.Items;
         var dt = new DataTable();
         dt.Columns.Add("Status");
+        dt.Columns.Add("Provider");
         dt.Columns.Add("Pipeline");
         dt.Columns.Add("Branch");
         dt.Columns.Add("Build");
@@ -166,7 +171,8 @@ public sealed class PipelinesView(PipelineController controller) : SectionView
         {
             dt.Rows.Add(
                 StatusColors.PipelineLabel(run.Status),
-                run.Name ?? connection,
+                connection,
+                run.Name ?? "–",
                 run.Branch ?? "–",
                 run.Number is { } n ? $"#{n}" : run.Id,
                 Fmt.DateTime(run.StartedAt),
@@ -182,10 +188,48 @@ public sealed class PipelinesView(PipelineController controller) : SectionView
 
     protected override void OnActivated(int row)
     {
-        if (row >= 0 && row < controller.Items.Count)
+        if (row < 0 || row >= controller.Items.Count)
         {
-            ShowDetailSafe(() => controller.GetRunDetailAsync(row));
+            return;
         }
+
+        try
+        {
+            var run = controller.GetRunAsync(row).GetAwaiter().GetResult();
+            if (run is null)
+            {
+                return;
+            }
+
+            if (run.Stages.Count == 0)
+            {
+                Expand(controller.GetRunDetailAsync(row).GetAwaiter().GetResult());
+                return;
+            }
+
+            ExpandView(BuildTree(run));
+        }
+        catch (Exception ex)
+        {
+            Dialogs.Error("forgetop", ex.Message);
+        }
+    }
+
+    private static TreeView<PipeNode> BuildTree(PipelineRun run)
+    {
+        var stages = run.Stages.Select(stage => new PipeNode(
+            $"{StatusColors.PipelineIcon(stage.Status)} {stage.Name}",
+            stage.Jobs.Select(job => new PipeNode(
+                $"{StatusColors.PipelineIcon(job.Status)} {job.Name}",
+                job.Steps.Select(step => new PipeNode($"{StatusColors.PipelineIcon(step.Status)} {step.Name}", [])).ToList())).ToList())).ToList();
+
+        var tree = new TreeView<PipeNode>
+        {
+            TreeBuilder = new DelegateTreeBuilder<PipeNode>(n => n.Children),
+            AspectGetter = n => n.Label,
+        };
+        tree.AddObjects(stages);
+        return tree;
     }
 
     protected override bool OnActionKey(KeyEvent keyEvent)

@@ -120,8 +120,24 @@ internal static class DemoData
                     Name = "test", Status = PipelineRunStatus.Failed,
                     Jobs =
                     [
-                        new PipelineJob { Id = "j11", Name = "unit", Status = PipelineRunStatus.Succeeded },
-                        new PipelineJob { Id = "j12", Name = "integration", Status = PipelineRunStatus.Failed },
+                        new PipelineJob
+                        {
+                            Id = "j11", Name = "unit", Status = PipelineRunStatus.Succeeded,
+                            Steps =
+                            [
+                                new PipelineStep { Name = "restore", Status = PipelineRunStatus.Succeeded },
+                                new PipelineStep { Name = "dotnet test", Status = PipelineRunStatus.Succeeded },
+                            ],
+                        },
+                        new PipelineJob
+                        {
+                            Id = "j12", Name = "integration", Status = PipelineRunStatus.Failed,
+                            Steps =
+                            [
+                                new PipelineStep { Name = "spin up containers", Status = PipelineRunStatus.Succeeded },
+                                new PipelineStep { Name = "run suite", Status = PipelineRunStatus.Failed },
+                            ],
+                        },
                     ],
                 },
             ],
