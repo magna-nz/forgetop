@@ -1,0 +1,24 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="..\Forgetop.Core\Forgetop.Core.csproj" />
+    <ProjectReference Include="..\Forgetop.Tui\Forgetop.Tui.csproj" />
+    <ProjectReference Include="..\Forgetop.Providers.Demo\Forgetop.Providers.Demo.csproj" />
+    <ProjectReference Include="..\Forgetop.Providers.GitHub\Forgetop.Providers.GitHub.csproj" />
+    <ProjectReference Include="..\Forgetop.Providers.AzureDevOps\Forgetop.Providers.AzureDevOps.csproj" />
+    <ProjectReference Include="..\Forgetop.Providers.Linear\Forgetop.Providers.Linear.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="10.0.9" />
+    <PackageReference Include="Spectre.Console.Cli" Version="0.55.0" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+</Project>
