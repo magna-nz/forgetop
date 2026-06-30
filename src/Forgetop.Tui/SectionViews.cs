@@ -35,6 +35,12 @@ public sealed class PullRequestsView(PullRequestController controller) : Section
                 }
 
                 return true;
+            case 'd':
+                ShowDetailSafe(() => controller.GetDiffTextAsync(SelectedIndex));
+                return true;
+            case 'v':
+                ShowDetailSafe(() => controller.GetThreadsTextAsync(SelectedIndex));
+                return true;
             default:
                 return false;
         }

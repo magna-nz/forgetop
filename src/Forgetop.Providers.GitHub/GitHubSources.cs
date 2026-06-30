@@ -8,6 +8,7 @@ internal sealed class GitHubPullRequestSource(GitHubApiClient client) : IPullReq
     public Task<IReadOnlyList<PullRequest>> ListAsync(PullRequestQuery query, CancellationToken ct = default) => client.ListPullRequestsAsync(query, ct);
     public Task<PullRequest> GetAsync(string id, CancellationToken ct = default) => client.GetPullRequestAsync(id, ct);
     public Task<IReadOnlyList<CommentThread>> GetThreadsAsync(string pullRequestId, CancellationToken ct = default) => client.GetPullRequestThreadsAsync(pullRequestId, ct);
+    public Task<IReadOnlyList<FileChange>> GetChangesAsync(string pullRequestId, CancellationToken ct = default) => client.GetChangesAsync(pullRequestId, ct);
     public Task AddCommentAsync(string pullRequestId, string body, CancellationToken ct = default) => client.AddPullRequestCommentAsync(pullRequestId, body, ct);
     public Task VoteAsync(string pullRequestId, ReviewVote vote, CancellationToken ct = default) => client.VoteAsync(pullRequestId, vote, ct);
     public Task MergeAsync(string pullRequestId, MergeOptions options, CancellationToken ct = default) => client.MergeAsync(pullRequestId, options, ct);

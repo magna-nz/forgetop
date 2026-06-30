@@ -64,6 +64,19 @@ public abstract class SectionView : FrameView
     /// <summary>Replace the detail pane text (e.g. pipeline drill-in).</summary>
     protected void ShowDetail(string text) => _detail.Text = text;
 
+    /// <summary>Load detail text asynchronously and show it, surfacing any error.</summary>
+    protected void ShowDetailSafe(Func<Task<string>> load)
+    {
+        try
+        {
+            ShowDetail(load().GetAwaiter().GetResult());
+        }
+        catch (Exception ex)
+        {
+            Dialogs.Error("forgetop", ex.Message);
+        }
+    }
+
     /// <summary>Run an async action, refresh the list, and surface any error.</summary>
     protected void RunAction(Func<Task> action)
     {

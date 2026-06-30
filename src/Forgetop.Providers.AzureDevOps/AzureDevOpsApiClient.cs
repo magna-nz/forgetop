@@ -64,6 +64,20 @@ public sealed class AzureDevOpsApiClient
         }).ToList();
     }
 
+    public async Task<IReadOnlyList<FileChange>> GetChangesAsync(string id, CancellationToken ct)
+    {
+        using var iterDoc = await GetAsync($"{PrBase(id)}/iterations?{Api}", ct).ConfigureAwait(false);
+        var iterations = iterDoc.RootElement.Arr("value").ToList();
+        if (iterations.Count == 0)
+        {
+            return [];
+        }
+
+        var lastIteration = iterations[^1].Int("id");
+        using var doc = await GetAsync($"{PrBase(id)}/iterations/{lastIteration}/changes?{Api}", ct).ConfigureAwait(false);
+        return doc.RootElement.Arr("changeEntries").Select(AzureDevOpsMapper.MapChangeEntry).ToList();
+    }
+
     public Task AddPullRequestCommentAsync(string id, string body, CancellationToken ct) =>
         PostAsync($"{PrBase(id)}/threads?{Api}", new { comments = new[] { new { content = body, commentType = 1 } }, status = 1 }, ct);
 

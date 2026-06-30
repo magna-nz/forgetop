@@ -73,6 +73,26 @@ public static class GitHubMapper
         };
     }
 
+    public static FileChange MapFileChange(JsonElement el)
+    {
+        var kind = el.Str("status") switch
+        {
+            "added" => FileChangeKind.Added,
+            "removed" => FileChangeKind.Deleted,
+            "renamed" => FileChangeKind.Renamed,
+            _ => FileChangeKind.Modified,
+        };
+
+        return new FileChange
+        {
+            Path = el.Str("filename") ?? "(unknown)",
+            Kind = kind,
+            Additions = el.Int("additions") ?? 0,
+            Deletions = el.Int("deletions") ?? 0,
+            Patch = el.Str("patch"),
+        };
+    }
+
     public static PipelineDefinition MapWorkflow(JsonElement el) => new()
     {
         Id = el.Int("id")?.ToString() ?? el.Str("path") ?? "0",

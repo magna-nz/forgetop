@@ -69,6 +69,23 @@ public static class AzureDevOpsMapper
         };
     }
 
+    public static FileChange MapChangeEntry(JsonElement el)
+    {
+        var kind = el.Str("changeType") switch
+        {
+            "add" => FileChangeKind.Added,
+            "delete" => FileChangeKind.Deleted,
+            "rename" or "sourceRename" => FileChangeKind.Renamed,
+            _ => FileChangeKind.Modified,
+        };
+
+        return new FileChange
+        {
+            Path = el.Obj("item")?.Str("path") ?? "(unknown)",
+            Kind = kind,
+        };
+    }
+
     /// <summary>Maps a work item whose fields live under the <c>fields</c> object.</summary>
     public static WorkItem MapWorkItem(JsonElement el)
     {

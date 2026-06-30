@@ -138,7 +138,7 @@ public sealed class ForgetopApp
         "  F5 refresh   F2 theme   F1 help   ^Q quit\n\n" +
         "Pull Requests\n" +
         "  f  cycle filter (All/Mine/ReviewRequested)\n" +
-        "  a  approve     m  merge     c  comment\n\n" +
+        "  a  approve   m  merge   c  comment   d  diff/files   v  comments\n\n" +
         "Work Items\n" +
         "  s  set state   c  comment\n\n" +
         "Pipelines\n" +

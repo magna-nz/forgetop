@@ -69,6 +69,12 @@ public sealed class GitHubApiClient
             : [new CommentThread { Id = $"pr-{id}", Comments = comments }];
     }
 
+    public async Task<IReadOnlyList<FileChange>> GetChangesAsync(string id, CancellationToken ct)
+    {
+        using var doc = await GetAsync($"{Repo}/pulls/{id}/files?per_page=100", ct).ConfigureAwait(false);
+        return doc.RootElement.EnumerateArray().Select(GitHubMapper.MapFileChange).ToList();
+    }
+
     public Task AddPullRequestCommentAsync(string id, string body, CancellationToken ct) =>
         PostAsync($"{Repo}/issues/{id}/comments", new { body }, ct);
 

@@ -1,5 +1,26 @@
 namespace Forgetop.Core.Domain;
 
+/// <summary>How a file changed in a pull request.</summary>
+public enum FileChangeKind
+{
+    Added,
+    Modified,
+    Deleted,
+    Renamed,
+}
+
+/// <summary>One changed file in a pull request, optionally with a unified-diff patch.</summary>
+public sealed record FileChange
+{
+    public required string Path { get; init; }
+    public FileChangeKind Kind { get; init; }
+    public int Additions { get; init; }
+    public int Deletions { get; init; }
+
+    /// <summary>Unified-diff patch text when the provider supplies it (GitHub does; ADO doesn't).</summary>
+    public string? Patch { get; init; }
+}
+
 /// <summary>A reviewer on a pull request and their current vote.</summary>
 public sealed record Reviewer
 {

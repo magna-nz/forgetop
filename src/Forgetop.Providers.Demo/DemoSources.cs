@@ -34,6 +34,20 @@ internal sealed class DemoPullRequestSource : IPullRequestSource
             },
         ]);
 
+    public Task<IReadOnlyList<FileChange>> GetChangesAsync(string pullRequestId, CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<FileChange>>(
+        [
+            new FileChange
+            {
+                Path = "src/Http/RetryPolicy.cs",
+                Kind = FileChangeKind.Added,
+                Additions = 24,
+                Deletions = 0,
+                Patch = "@@ -0,0 +1,3 @@\n+public sealed class RetryPolicy\n+{\n+    // jittered exponential backoff\n",
+            },
+            new FileChange { Path = "src/Http/HttpClientFactory.cs", Kind = FileChangeKind.Modified, Additions = 6, Deletions = 2 },
+        ]);
+
     public Task AddCommentAsync(string pullRequestId, string body, CancellationToken ct = default) => Task.CompletedTask;
     public Task VoteAsync(string pullRequestId, ReviewVote vote, CancellationToken ct = default) => Task.CompletedTask;
     public Task MergeAsync(string pullRequestId, MergeOptions options, CancellationToken ct = default) => Task.CompletedTask;

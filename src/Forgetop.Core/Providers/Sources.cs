@@ -8,6 +8,10 @@ public interface IPullRequestSource
     Task<IReadOnlyList<PullRequest>> ListAsync(PullRequestQuery query, CancellationToken ct = default);
     Task<PullRequest> GetAsync(string id, CancellationToken ct = default);
     Task<IReadOnlyList<CommentThread>> GetThreadsAsync(string pullRequestId, CancellationToken ct = default);
+
+    /// <summary>The files changed by the pull request (with patches where the provider supplies them).</summary>
+    Task<IReadOnlyList<FileChange>> GetChangesAsync(string pullRequestId, CancellationToken ct = default);
+
     Task AddCommentAsync(string pullRequestId, string body, CancellationToken ct = default);
     Task VoteAsync(string pullRequestId, ReviewVote vote, CancellationToken ct = default);
     Task MergeAsync(string pullRequestId, MergeOptions options, CancellationToken ct = default);

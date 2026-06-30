@@ -77,19 +77,18 @@ CLI banner + `--demo`.
   `PipelinesView` (↵ drill-in, t trigger, d discover+subscribe) over an abstract
   `SectionView` with action-key handling; `Dialogs` (prompt/pick/confirm/info/error).
 - **Pipelines live auto-refresh** every 5s (background fetch → MainLoop.Invoke).
-- **75 tests pass** (33 Core + 33 Providers + 9 Tui).
+- **PR diff + changed-files** (`d` key): `IPullRequestSource.GetChangesAsync` +
+  `FileChange` domain + GitHub (patch) / ADO (iteration changes) / Demo; rendered by
+  `DetailFormatter.Diff`. **Inline comment threads** (`v` key) via `DetailFormatter.Threads`.
+- **86 tests pass** (33 Core + 39 Providers + 14 Tui).
 
-### Deferred from Wave 5 (decide before closing MAG-62)
-- **PR diff / changed-files view NOT built** — detail pane shows PR metadata only.
-  Fetching + rendering diffs is sizable; needs a decision (do now vs Wave 6).
-- PR/work-item **comment threads not shown inline** (post works; viewing existing
-  threads not wired into the detail pane).
+### Minor gaps remaining (fold into Wave 6)
 - Pipeline **unsubscribe** and work-item **mine filter** not surfaced in the UI.
 - State change is **free-text** (no per-provider valid-state picker).
 
 ## Where we left off
-Wave 5 implemented, tests green, build clean. **Paused for approval — and for a
-decision on the deferred PR diff/threads above.**
+Wave 5 complete (incl. PR diff + threads), tests green, build clean.
+**Paused for approval before Wave 6.**
 
 ## What's next
 **Wave 6 — Setup wizard, runtime config UI, polish, docs** (MAG-63): first-run

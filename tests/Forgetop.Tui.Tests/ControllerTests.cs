@@ -51,6 +51,20 @@ public class ControllerTests
     }
 
     [Fact]
+    public async Task PullRequestController_returns_diff_and_threads_text()
+    {
+        var (sections, config) = await BoundDemoAsync();
+        var controller = new PullRequestController(sections, config);
+        await controller.LoadAsync();
+
+        var diff = await controller.GetDiffTextAsync(0);
+        Assert.Contains("Changed files", diff);
+
+        var threads = await controller.GetThreadsTextAsync(0);
+        Assert.False(string.IsNullOrEmpty(threads));
+    }
+
+    [Fact]
     public async Task WorkItemController_loads_and_sets_state()
     {
         var (sections, config) = await BoundDemoAsync();

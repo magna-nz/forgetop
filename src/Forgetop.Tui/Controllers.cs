@@ -87,6 +87,30 @@ public sealed class PullRequestController(SectionService sections, IConfigServic
         await source.AddCommentAsync(pr.Id, body, ct).ConfigureAwait(false);
         return true;
     }
+
+    public async Task<string> GetDiffTextAsync(int index, CancellationToken ct = default)
+    {
+        var pr = At(index);
+        var source = await sections.GetPullRequestSourceAsync(ct).ConfigureAwait(false);
+        if (pr is null || source is null)
+        {
+            return string.Empty;
+        }
+
+        return DetailFormatter.Diff(await source.GetChangesAsync(pr.Id, ct).ConfigureAwait(false));
+    }
+
+    public async Task<string> GetThreadsTextAsync(int index, CancellationToken ct = default)
+    {
+        var pr = At(index);
+        var source = await sections.GetPullRequestSourceAsync(ct).ConfigureAwait(false);
+        if (pr is null || source is null)
+        {
+            return string.Empty;
+        }
+
+        return DetailFormatter.Threads(await source.GetThreadsAsync(pr.Id, ct).ConfigureAwait(false));
+    }
 }
 
 /// <summary>Backs the Work Items screen: load + state change / comment on the selected item.</summary>
