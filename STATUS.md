@@ -102,11 +102,14 @@ CLI banner + `--demo`.
 - **95 tests pass** (39 Core + 40 Providers + 16 Tui).
 
 ## Where we left off
-**All 6 waves complete.** Build clean (0 warnings), 95 tests green. macOS Keychain
-verified on this machine. Ready to raise the PR (pending user approval).
+**All 6 waves complete; PR raised.** Build clean (0 warnings), 95 tests green.
+Packaged as a .NET global tool (verified: pack → install → run). macOS Keychain
+verified on arm64.
+- **PR: https://github.com/magna-nz/forgetop/pull/1** (base `main`) — awaiting user
+  merge; user will test `--demo` in their terminal after.
 
 ## What's next
-- Raise PR to `main` (user approval required) → then mark MAG-57 done.
+- User merges PR #1 → then mark MAG-57 done.
 - v2 backlog: GitLab + Bitbucket providers; OAuth device flow; Spectre-rich rendering
   in detail panes; per-provider valid-state picker.
 
