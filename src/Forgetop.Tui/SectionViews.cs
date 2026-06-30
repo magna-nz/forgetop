@@ -1,9 +1,8 @@
 using System.Data;
-using System.Text;
 using Forgetop.Core.Domain;
 using Forgetop.Core.Providers;
-using Terminal.Gui.Input;
-using Terminal.Gui.Views;
+using Terminal.Gui;
+using Terminal.Gui.Trees;
 
 namespace Forgetop.Tui;
 
@@ -17,6 +16,7 @@ public sealed class PullRequestsView(PullRequestController controller) : Section
 
     public override void Render()
     {
+
         var items = controller.Items;
         var dt = new DataTable();
         dt.Columns.Add("Title");
@@ -33,7 +33,11 @@ public sealed class PullRequestsView(PullRequestController controller) : Section
         }
 
         SetTable(dt);
-        ColorColumn(1, row => StatusColors.CheckColor(items[row].Checks));
+        Table.Style.ColumnStyles[dt.Columns["CI"]!] = new TableView.ColumnStyle
+        {
+            Alignment = TextAlignment.Centered,
+            ColorGetter = a => StatusColors.Scheme(a.RowIndex >= 0 && a.RowIndex < items.Count ? StatusColors.CheckColor(items[a.RowIndex].Checks) : Color.Gray, a.RowScheme?.Normal.Background ?? Color.Black),
+        };
     }
 
     protected override void OnActivated(int row)
@@ -44,12 +48,17 @@ public sealed class PullRequestsView(PullRequestController controller) : Section
         }
     }
 
-    protected override bool OnActionKey(Key key)
+    protected override bool OnActionKey(KeyEvent keyEvent)
     {
-        switch (KeyChar(key))
+        switch (KeyChar(keyEvent))
         {
-            case 'f': controller.CycleFilter(); RunAction(() => Task.CompletedTask); return true;
-            case 'a': RunAction(() => controller.VoteAsync(SelectedRow, ReviewVote.Approved)); return true;
+            case 'f':
+                controller.CycleFilter();
+                RunAction(() => Task.CompletedTask);
+                return true;
+            case 'a':
+                RunAction(() => controller.VoteAsync(SelectedRow, ReviewVote.Approved));
+                return true;
             case 'm':
                 if (Dialogs.Confirm("Merge", "Merge the selected pull request?"))
                 {
@@ -65,9 +74,14 @@ public sealed class PullRequestsView(PullRequestController controller) : Section
                 }
 
                 return true;
-            case 'd': ShowDetailSafe(() => controller.GetDiffTextAsync(SelectedRow)); return true;
-            case 'v': ShowDetailSafe(() => controller.GetThreadsTextAsync(SelectedRow)); return true;
-            default: return false;
+            case 'd':
+                ShowDetailSafe(() => controller.GetDiffTextAsync(SelectedRow));
+                return true;
+            case 'v':
+                ShowDetailSafe(() => controller.GetThreadsTextAsync(SelectedRow));
+                return true;
+            default:
+                return false;
         }
     }
 }
@@ -79,6 +93,7 @@ public sealed class WorkItemsView(WorkItemController controller) : SectionView
 
     public override void Render()
     {
+
         var items = controller.Items;
         var dt = new DataTable();
         dt.Columns.Add("Id");
@@ -102,11 +117,14 @@ public sealed class WorkItemsView(WorkItemController controller) : SectionView
         }
     }
 
-    protected override bool OnActionKey(Key key)
+    protected override bool OnActionKey(KeyEvent keyEvent)
     {
-        switch (KeyChar(key))
+        switch (KeyChar(keyEvent))
         {
-            case 'f': controller.ToggleMine(); RunAction(() => Task.CompletedTask); return true;
+            case 'f':
+                controller.ToggleMine();
+                RunAction(() => Task.CompletedTask);
+                return true;
             case 's':
                 var state = Dialogs.Prompt("Set state", "New state (e.g. open/closed, In Progress, Done):");
                 if (state is not null)
@@ -123,18 +141,20 @@ public sealed class WorkItemsView(WorkItemController controller) : SectionView
                 }
 
                 return true;
-            default: return false;
+            default:
+                return false;
         }
     }
 }
 
-/// <summary>Pipelines: Status · Provider · Pipeline · Branch · Build · Timestamp · Duration. Enter → jobs; t/d/u.</summary>
+/// <summary>Pipelines: Status · Pipeline · Branch · Build · Timestamp · Duration. Enter → jobs; t/d/u actions.</summary>
 public sealed class PipelinesView(PipelineController controller) : SectionView
 {
     public override Task LoadDataAsync(CancellationToken ct = default) => controller.LoadAsync(ct);
 
     public override void Render()
     {
+
         var items = controller.Items;
         var dt = new DataTable();
         dt.Columns.Add("Status");
@@ -157,7 +177,10 @@ public sealed class PipelinesView(PipelineController controller) : SectionView
         }
 
         SetTable(dt);
-        ColorColumn(0, row => StatusColors.PipelineColor(items[row].Run.Status));
+        Table.Style.ColumnStyles[dt.Columns["Status"]!] = new TableView.ColumnStyle
+        {
+            ColorGetter = a => StatusColors.Scheme(a.RowIndex >= 0 && a.RowIndex < items.Count ? StatusColors.PipelineColor(items[a.RowIndex].Run.Status) : Color.Gray, a.RowScheme?.Normal.Background ?? Color.Black),
+        };
     }
 
     protected override void OnActivated(int row)
@@ -199,20 +222,36 @@ public sealed class PipelinesView(PipelineController controller) : SectionView
 
         var tree = new TreeView<PipeNode>
         {
-            TreeBuilder = new DelegateTreeBuilder<PipeNode>(n => n.Children, n => n.Children.Count > 0),
+            TreeBuilder = new DelegateTreeBuilder<PipeNode>(n => n.Children),
             AspectGetter = n => n.Label,
         };
-        tree.Style.ExpandableSymbol = new System.Text.Rune('▸');
-        tree.Style.CollapseableSymbol = new System.Text.Rune('▾');
+        // azdo-style carets so it's obvious a node expands.
+        tree.Style.ExpandableSymbol = new System.Rune('▸');
+        tree.Style.CollapseableSymbol = new System.Rune('▾');
+        tree.Style.ColorExpandSymbol = true;
         tree.Style.ShowBranchLines = true;
         tree.AddObjects(stages);
-        tree.ExpandAll();
+        tree.ExpandAll(); // show stages → jobs → steps immediately
+        tree.ObjectActivated += e =>
+        {
+            if (e.ActivatedObject is { } node)
+            {
+                if (tree.IsExpanded(node))
+                {
+                    tree.Collapse(node);
+                }
+                else
+                {
+                    tree.Expand(node);
+                }
+            }
+        };
         return tree;
     }
 
-    protected override bool OnActionKey(Key key)
+    protected override bool OnActionKey(KeyEvent keyEvent)
     {
-        switch (KeyChar(key))
+        switch (KeyChar(keyEvent))
         {
             case 't':
                 if (Dialogs.Confirm("Trigger", "Re-run the selected pipeline?"))
@@ -221,7 +260,9 @@ public sealed class PipelinesView(PipelineController controller) : SectionView
                 }
 
                 return true;
-            case 'd': Discover(); return true;
+            case 'd':
+                Discover();
+                return true;
             case 'u':
                 if (Dialogs.Confirm("Unsubscribe", "Stop tracking the selected pipeline?"))
                 {
@@ -229,7 +270,8 @@ public sealed class PipelinesView(PipelineController controller) : SectionView
                 }
 
                 return true;
-            default: return false;
+            default:
+                return false;
         }
     }
 
@@ -246,7 +288,8 @@ public sealed class PipelinesView(PipelineController controller) : SectionView
         var picked = Dialogs.Pick("Subscribe to pipeline", labels);
         if (picked is not null)
         {
-            RunAction(() => controller.SubscribeAsync(found[labels.IndexOf(picked)]));
+            var chosen = found[labels.IndexOf(picked)];
+            RunAction(() => controller.SubscribeAsync(chosen));
         }
     }
 }

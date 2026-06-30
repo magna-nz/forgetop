@@ -1,21 +1,17 @@
 using System.Data;
-using Terminal.Gui.App;
-using Terminal.Gui.Drawing;
-using Terminal.Gui.Input;
-using Terminal.Gui.ViewBase;
-using Terminal.Gui.Views;
+using Terminal.Gui;
 
 namespace Forgetop.Tui;
 
 /// <summary>
-/// A section screen (v2): a full-width column table with a detail pane that
-/// expands beneath it on Enter and collapses on Esc.
+/// A section screen: a one-line header, a full-width column table, and a detail
+/// pane that expands *beneath* the table on Enter (collapses on Esc).
 /// </summary>
 public abstract class SectionView : View
 {
     protected readonly TableView Table;
     private readonly FrameView _detailPane;
-    private readonly Label _detailText;
+    private readonly TextView _detailText;
     private bool _expanded;
 
     /// <summary>Raised on ←/→ to move between tabs (-1 / +1).</summary>
@@ -26,43 +22,49 @@ public abstract class SectionView : View
         Width = Dim.Fill();
         Height = Dim.Fill();
 
-        Table = new TableView { X = 0, Y = 0, Width = Dim.Fill(), Height = Dim.Fill(), FullRowSelect = true };
+        Table = new TableView
+        {
+            X = 0,
+            Y = 0,
+            Width = Dim.Fill(),
+            Height = Dim.Fill(),
+            FullRowSelect = true,
+        };
         Table.Style.ShowHorizontalHeaderUnderline = true;
         Table.Style.ShowHorizontalHeaderOverline = false;
         Table.Style.ShowVerticalCellLines = false;
-        Table.Activated += (_, _) => OnActivated(SelectedRow);
-        Table.KeyDown += OnKey;
+        Table.Style.ShowVerticalHeaderLines = false;
+        Table.Style.AlwaysShowHeaders = true;
+        Table.CellActivated += _ => OnActivated(Table.SelectedRow);
+        Table.KeyPress += OnTableKey;
 
-        _detailPane = new FrameView { Title = "Details", X = 0, Y = Pos.Bottom(Table), Width = Dim.Fill(), Height = Dim.Fill(), Visible = false };
-        _detailText = new Label { X = 0, Y = 0, Width = Dim.Fill(), Height = Dim.Fill() };
-        _detailText.KeyDown += OnDetailKey;
+        _detailPane = new FrameView("Details")
+        {
+            X = 0,
+            Y = Pos.Bottom(Table),
+            Width = Dim.Fill(),
+            Height = Dim.Fill(),
+            Visible = false,
+        };
+        _detailText = new TextView { X = 0, Y = 0, Width = Dim.Fill(), Height = Dim.Fill(), ReadOnly = true, WordWrap = true };
+        _detailText.KeyPress += OnDetailEsc;
 
         Add(Table, _detailPane);
     }
 
-    private Color _background = new("#1e1e2e");
+    protected int SelectedRow => Table.SelectedRow;
 
-    protected int SelectedRow => Table.Value?.SelectedCell.Y ?? 0;
-
-    public void ApplyScheme(Scheme scheme)
+    /// <summary>Apply the active theme so the table (and its status colours) match.</summary>
+    public void ApplyScheme(ColorScheme scheme)
     {
-        _background = scheme.Normal.Background;
-        SetScheme(scheme);
+        ColorScheme = scheme;
+        Table.ColorScheme = scheme;
     }
 
-    /// <summary>Colour a column's cells per row (e.g. the status column).</summary>
-    protected void ColorColumn(int columnIndex, Func<int, Color> rowColor)
-    {
-        Table.Style.ColumnStyles[columnIndex] = new ColumnStyle
-        {
-            ColorGetter = args => StatusColors.Scheme(rowColor(args.RowIndex), _background),
-        };
-    }
-
-    protected static char KeyChar(Key key) => char.ToLowerInvariant((char)key.AsRune.Value);
-
+    /// <summary>Fetch data (network) — safe to call off the UI thread.</summary>
     public abstract Task LoadDataAsync(CancellationToken ct = default);
 
+    /// <summary>Rebuild the table from already-loaded data — must run on the UI thread.</summary>
     public abstract void Render();
 
     public async Task RefreshAsync(CancellationToken ct = default)
@@ -71,38 +73,59 @@ public abstract class SectionView : View
         Render();
     }
 
+    /// <summary>Called when the user presses Enter on a row.</summary>
     protected virtual void OnActivated(int row) { }
 
-    protected virtual bool OnActionKey(Key key) => false;
+    /// <summary>Handle a letter action key; return true if handled.</summary>
+    protected virtual bool OnActionKey(KeyEvent keyEvent) => false;
 
-    protected void SetTable(DataTable table) => Table.Table = new DataTableSource(table);
+    protected void SetTable(DataTable table) => Table.Table = table;
 
+    /// <summary>Show plain-text detail beneath the table.</summary>
     protected void Expand(string detail)
     {
         _detailText.Text = detail;
         ShowDetailPane(_detailText);
     }
 
+    /// <summary>Show an arbitrary (navigable) view beneath the table, e.g. a TreeView.</summary>
     protected void ExpandView(View content)
     {
         content.X = 0;
         content.Y = 0;
         content.Width = Dim.Fill();
         content.Height = Dim.Fill();
-        content.KeyDown += OnDetailKey;
+        content.KeyPress += OnDetailEsc;
         ShowDetailPane(content);
     }
 
-    protected void ShowDetailSafe(Func<Task<string>> load)
+    private void ShowDetailPane(View content)
     {
-        try
+        _detailPane.RemoveAll();
+        _detailPane.Add(content);
+        _detailPane.Visible = true;
+        _expanded = true;
+        Table.Height = Dim.Percent(55);
+        SetNeedsDisplay();
+        content.SetFocus();
+    }
+
+    private void OnDetailEsc(KeyEventEventArgs args)
+    {
+        if (args.KeyEvent.Key == Key.Esc)
         {
-            Expand(load().GetAwaiter().GetResult());
+            Collapse();
+            args.Handled = true;
         }
-        catch (Exception ex)
-        {
-            Dialogs.Error("forgetop", ex.Message);
-        }
+    }
+
+    private void Collapse()
+    {
+        _detailPane.Visible = false;
+        _expanded = false;
+        Table.Height = Dim.Fill();
+        Table.SetFocus();
+        SetNeedsDisplay();
     }
 
     protected void RunAction(Func<Task> action)
@@ -118,50 +141,43 @@ public abstract class SectionView : View
         }
     }
 
-    private void ShowDetailPane(View content)
+    protected void ShowDetailSafe(Func<Task<string>> load)
     {
-        _detailPane.RemoveAll();
-        _detailPane.Add(content);
-        _detailPane.Visible = true;
-        _expanded = true;
-        Table.Height = Dim.Percent(55);
-        content.SetFocus();
-        SetNeedsDraw();
-    }
-
-    private void Collapse()
-    {
-        _detailPane.Visible = false;
-        _expanded = false;
-        Table.Height = Dim.Fill();
-        Table.SetFocus();
-        SetNeedsDraw();
-    }
-
-    private void OnKey(object? sender, Key key)
-    {
-        if (key == Key.CursorLeft)
+        try
         {
-            TabSwitch?.Invoke(-1);
-            key.Handled = true;
+            Expand(load().GetAwaiter().GetResult());
         }
-        else if (key == Key.CursorRight)
+        catch (Exception ex)
         {
-            TabSwitch?.Invoke(1);
-            key.Handled = true;
-        }
-        else if (OnActionKey(key))
-        {
-            key.Handled = true;
+            Dialogs.Error("forgetop", ex.Message);
         }
     }
 
-    private void OnDetailKey(object? sender, Key key)
+    protected static char KeyChar(KeyEvent keyEvent) => char.ToLowerInvariant((char)keyEvent.KeyValue);
+
+    private void OnTableKey(KeyEventEventArgs args)
     {
-        if (key == Key.Esc && _expanded)
+        switch (args.KeyEvent.Key)
         {
-            Collapse();
-            key.Handled = true;
+            case Key.CursorLeft:
+                TabSwitch?.Invoke(-1);
+                args.Handled = true;
+                return;
+            case Key.CursorRight:
+                TabSwitch?.Invoke(1);
+                args.Handled = true;
+                return;
+            case Key.Esc when _expanded:
+                Collapse();
+                args.Handled = true;
+                return;
+            default:
+                if (OnActionKey(args.KeyEvent))
+                {
+                    args.Handled = true;
+                }
+
+                return;
         }
     }
 }
