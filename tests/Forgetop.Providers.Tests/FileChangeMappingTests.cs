@@ -46,6 +46,21 @@ public class FileChangeMappingTests
     }
 
     [Fact]
+    public void AzureDevOps_unified_diff_marks_inserts_and_deletes()
+    {
+        var (patch, additions, deletions) = Forgetop.Providers.AzureDevOps.UnifiedDiff.Build(
+            oldText: "one\ntwo\nthree",
+            newText: "one\nTWO\nthree\nfour");
+
+        Assert.Equal(2, additions);  // "TWO" and "four"
+        Assert.Equal(1, deletions);  // "two"
+        Assert.Contains("+TWO", patch);
+        Assert.Contains("-two", patch);
+        Assert.Contains("+four", patch);
+        Assert.Contains(" one", patch); // unchanged line kept with space prefix
+    }
+
+    [Fact]
     public async Task Demo_returns_canned_changes()
     {
         var conn = new DemoProviderFactory().Create(

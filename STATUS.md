@@ -77,10 +77,12 @@ CLI banner + `--demo`.
   `PipelinesView` (↵ drill-in, t trigger, d discover+subscribe) over an abstract
   `SectionView` with action-key handling; `Dialogs` (prompt/pick/confirm/info/error).
 - **Pipelines live auto-refresh** every 5s (background fetch → MainLoop.Invoke).
-- **PR diff + changed-files** (`d` key): `IPullRequestSource.GetChangesAsync` +
-  `FileChange` domain + GitHub (patch) / ADO (iteration changes) / Demo; rendered by
-  `DetailFormatter.Diff`. **Inline comment threads** (`v` key) via `DetailFormatter.Threads`.
-- **86 tests pass** (33 Core + 39 Providers + 14 Tui).
+- **PR diff + changed-files** (`d` key) with **real patches on every provider**:
+  GitHub (native patch), Azure DevOps (fetch base/head blob content + DiffPlex line
+  diff in `UnifiedDiff`), Demo (canned). `IPullRequestSource.GetChangesAsync` +
+  `FileChange` domain; rendered by `DetailFormatter.Diff`. **Inline comment threads**
+  (`v` key) via `DetailFormatter.Threads`.
+- **87 tests pass** (33 Core + 40 Providers + 14 Tui).
 
 ### Minor gaps remaining (fold into Wave 6)
 - Pipeline **unsubscribe** and work-item **mine filter** not surfaced in the UI.

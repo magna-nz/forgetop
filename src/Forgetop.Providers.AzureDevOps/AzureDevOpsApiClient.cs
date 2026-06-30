@@ -73,9 +73,68 @@ public sealed class AzureDevOpsApiClient
             return [];
         }
 
-        var lastIteration = iterations[^1].Int("id");
-        using var doc = await GetAsync($"{PrBase(id)}/iterations/{lastIteration}/changes?{Api}", ct).ConfigureAwait(false);
-        return doc.RootElement.Arr("changeEntries").Select(AzureDevOpsMapper.MapChangeEntry).ToList();
+        var last = iterations[^1];
+        var newCommit = last.Obj("sourceRefCommit")?.Str("commitId");
+        var baseCommit = last.Obj("commonRefCommit")?.Str("commitId") ?? last.Obj("targetRefCommit")?.Str("commitId");
+        var iterationId = last.Int("id");
+
+        using var doc = await GetAsync($"{PrBase(id)}/iterations/{iterationId}/changes?{Api}", ct).ConfigureAwait(false);
+
+        var result = new List<FileChange>();
+        foreach (var raw in doc.RootElement.Arr("changeEntries"))
+        {
+            if (raw.Obj("item")?.Bool("isFolder") == true)
+            {
+                continue;
+            }
+
+            var change = AzureDevOpsMapper.MapChangeEntry(raw);
+            result.Add(await WithPatchAsync(change, baseCommit, newCommit, ct).ConfigureAwait(false));
+        }
+
+        return result;
+    }
+
+    /// <summary>Fetches before/after content and computes a patch; degrades to no patch on any failure.</summary>
+    private async Task<FileChange> WithPatchAsync(FileChange change, string? baseCommit, string? newCommit, CancellationToken ct)
+    {
+        try
+        {
+            var oldText = change.Kind == FileChangeKind.Added || baseCommit is null
+                ? string.Empty
+                : await GetItemContentAsync(change.Path, baseCommit, ct).ConfigureAwait(false);
+            var newText = change.Kind == FileChangeKind.Deleted || newCommit is null
+                ? string.Empty
+                : await GetItemContentAsync(change.Path, newCommit, ct).ConfigureAwait(false);
+
+            if (oldText is null && newText is null)
+            {
+                return change; // binary or unreadable — leave as file-list entry
+            }
+
+            var (patch, additions, deletions) = UnifiedDiff.Build(oldText ?? string.Empty, newText ?? string.Empty);
+            return change with { Patch = patch, Additions = additions, Deletions = deletions };
+        }
+        catch
+        {
+            return change;
+        }
+    }
+
+    private async Task<string?> GetItemContentAsync(string path, string commitId, CancellationToken ct)
+    {
+        var url = $"{_project}/_apis/git/repositories/{_repository}/items?path={Uri.EscapeDataString(path)}" +
+                  $"&versionDescriptor.versionType=commit&versionDescriptor.version={commitId}&includeContent=true&{Api}";
+
+        using var resp = await _http.GetAsync(url, ct).ConfigureAwait(false);
+        if (!resp.IsSuccessStatusCode)
+        {
+            return null;
+        }
+
+        await using var stream = await resp.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
+        using var doc = await JsonDocument.ParseAsync(stream, default, ct).ConfigureAwait(false);
+        return doc.RootElement.Str("content");
     }
 
     public Task AddPullRequestCommentAsync(string id, string body, CancellationToken ct) =>
