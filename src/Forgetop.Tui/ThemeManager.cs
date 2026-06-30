@@ -5,7 +5,7 @@ namespace Forgetop.Tui;
 /// <summary>Named colour schemes with a cycle-through switcher; the current name persists to config.</summary>
 public sealed class ThemeManager
 {
-    private static readonly string[] AllThemes = ["dark", "light", "matrix"];
+    private static readonly string[] AllThemes = ["dark", "light", "matrix", "ocean"];
 
     public ThemeManager(string? initial)
     {
@@ -24,12 +24,17 @@ public sealed class ThemeManager
         return Current;
     }
 
-    /// <summary>Build the colour scheme for the current theme. Call after <c>Application.Init</c>.</summary>
+    /// <summary>
+    /// Build the colour scheme for the current theme. Call after <c>Application.Init</c>.
+    /// "dark" uses a Black background so it adopts the host terminal's palette (modern,
+    /// native look like azdo / gh-dash); the others are explicit.
+    /// </summary>
     public ColorScheme Scheme() => Current switch
     {
-        "light" => Build(Color.Black, Color.White, Color.White, Color.Blue),
+        "light" => Build(Color.Black, Color.White, Color.Black, Color.BrightCyan),
         "matrix" => Build(Color.BrightGreen, Color.Black, Color.Black, Color.Green),
-        _ => Build(Color.White, Color.Blue, Color.Black, Color.Cyan),
+        "ocean" => Build(Color.White, Color.Blue, Color.Black, Color.BrightCyan),
+        _ => Build(Color.White, Color.Black, Color.Black, Color.BrightCyan), // dark — terminal-native
     };
 
     private static ColorScheme Build(Color fg, Color bg, Color focusFg, Color focusBg) => new()
