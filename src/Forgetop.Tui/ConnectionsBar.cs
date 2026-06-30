@@ -1,12 +1,11 @@
 using Forgetop.Core.App;
-using Terminal.Gui;
+using Terminal.Gui.Drawing;
+using Terminal.Gui.ViewBase;
+using Terminal.Gui.Views;
 
 namespace Forgetop.Tui;
 
-/// <summary>
-/// A one-line bar listing each configured connection with a green/red dot for
-/// whether it's currently reachable. Sits at the bottom of the window.
-/// </summary>
+/// <summary>One-line bar: each connection with a green/red reachability dot.</summary>
 public sealed class ConnectionsBar : View
 {
     public ConnectionsBar()
@@ -14,6 +13,9 @@ public sealed class ConnectionsBar : View
         Width = Dim.Fill();
         Height = 1;
     }
+
+    /// <summary>Background colour to paint the dots against (set from the theme).</summary>
+    public Color Background { get; set; } = new("#1e1e2e");
 
     public void Update(IReadOnlyList<ConnectionHealth> health)
     {
@@ -29,13 +31,9 @@ public sealed class ConnectionsBar : View
         foreach (var item in health)
         {
             var text = $"● {item.Connection.DisplayName}";
-            Add(new Label
-            {
-                X = x,
-                Y = 0,
-                Text = text,
-                ColorScheme = StatusColors.Scheme(item.Healthy ? Color.BrightGreen : Color.BrightRed, ColorScheme?.Normal.Background ?? Color.Black),
-            });
+            var label = new Label { X = x, Y = 0, Text = text };
+            label.SetScheme(StatusColors.Scheme(StatusColors.HealthColor(item.Healthy), Background));
+            Add(label);
             x += text.Length + 3;
         }
     }

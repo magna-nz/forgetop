@@ -60,10 +60,10 @@ public class RowFormatterTests
 public class ThemeManagerTests
 {
     [Fact]
-    public void Defaults_to_dark_for_unknown_theme()
+    public void Defaults_to_slate_for_unknown_theme()
     {
-        Assert.Equal("dark", new ThemeManager(null).Current);
-        Assert.Equal("dark", new ThemeManager("nonsense").Current);
+        Assert.Equal("slate", new ThemeManager(null).Current);
+        Assert.Equal("slate", new ThemeManager("nonsense").Current);
         Assert.Equal("light", new ThemeManager("light").Current);
     }
 

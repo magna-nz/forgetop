@@ -1,13 +1,16 @@
 using Forgetop.Core.App;
 using Forgetop.Core.Configuration;
 using Forgetop.Core.Providers;
-using Terminal.Gui;
+using Terminal.Gui.App;
+using Terminal.Gui.Input;
+using Terminal.Gui.ViewBase;
+using Terminal.Gui.Views;
 
 namespace Forgetop.Tui;
 
 /// <summary>
-/// The forgetop terminal application: a tabbed shell (Pull Requests / Work Items
-/// / Pipelines) over the bound providers, modelled on azdo / gh-dash.
+/// The forgetop terminal application (Terminal.Gui v2): a tabbed, true-colour
+/// dashboard over the bound providers.
 /// </summary>
 public sealed class ForgetopApp
 {
@@ -24,7 +27,7 @@ public sealed class ForgetopApp
     private readonly PipelineController _pipelineController;
 
     private Window _window = null!;
-    private TabView _tabs = null!;
+    private Tabs _tabs = null!;
     private ConnectionsBar _connectionsBar = null!;
     private PullRequestsView _prView = null!;
     private WorkItemsView _workItemView = null!;
@@ -61,52 +64,61 @@ public sealed class ForgetopApp
             ApplyTheme();
             StartAutoRefresh();
             RefreshHealth();
-            Application.Run();
+            Application.Run(_window);
         }
         finally
         {
+            _window?.Dispose();
             Application.Shutdown();
         }
     }
 
     private void Build()
     {
-        _prView = new PullRequestsView(_prController);
-        _workItemView = new WorkItemsView(_workItemController);
-        _pipelineView = new PipelinesView(_pipelineController);
+        _prView = new PullRequestsView(_prController) { Title = "Pull Requests" };
+        _workItemView = new WorkItemsView(_workItemController) { Title = "Work Items" };
+        _pipelineView = new PipelinesView(_pipelineController) { Title = "Pipelines" };
 
-        _tabs = new TabView { X = 0, Y = 0, Width = Dim.Fill(), Height = Dim.Fill() };
-        _tabs.AddTab(new TabView.Tab("   Pull Requests   ", _prView), andSelect: true);
-        _tabs.AddTab(new TabView.Tab("   Work Items   ", _workItemView), andSelect: false);
-        _tabs.AddTab(new TabView.Tab("   Pipelines   ", _pipelineView), andSelect: false);
+        _tabs = new Tabs { X = 0, Y = 0, Width = Dim.Fill(), Height = Dim.Fill(2), TabSpacing = 3 };
+        _tabs.Add(_prView);
+        _tabs.Add(_workItemView);
+        _tabs.Add(_pipelineView);
 
         foreach (var view in Views)
         {
-            view.TabSwitch += delta => _tabs.SwitchTabBy(delta);
+            view.TabSwitch += SwitchTab;
         }
 
-        _window = new Window("forgetop — htop for your software forges")
+        _connectionsBar = new ConnectionsBar { X = 0, Y = Pos.Bottom(_tabs) };
+
+        var statusBar = new StatusBar(new[]
         {
-            X = 0,
-            Y = 0,
-            Width = Dim.Fill(),
-            Height = Dim.Fill(2),
-        };
-        _window.Add(_tabs);
+            new Shortcut(Key.Q.WithCtrl, "Quit", () => Application.RequestStop(_window), "^Q"),
+            new Shortcut(Key.F1, "Help", ShowHelp, "F1"),
+            new Shortcut(Key.F2, "Theme", CycleTheme, "F2"),
+            new Shortcut(Key.F3, "Config", OpenConfig, "F3"),
+            new Shortcut(Key.F5, "Refresh", RefreshAll, "F5"),
+        });
 
-        _connectionsBar = new ConnectionsBar { X = 0, Y = Pos.Bottom(_window) };
+        _window = new Window { Title = "forgetop — htop for your software forges", X = 0, Y = 0, Width = Dim.Fill(), Height = Dim.Fill() };
+        _window.Add(_tabs, _connectionsBar, statusBar);
+    }
 
-        var statusBar = new StatusBar(
-        [
-            new StatusItem(Key.CtrlMask | Key.Q, "~^Q~ Quit", () => Application.RequestStop()),
-            new StatusItem(Key.F1, "~F1~ Help", ShowHelp),
-            new StatusItem(Key.F2, $"~F2~ Theme ({_theme.Current})", CycleTheme),
-            new StatusItem(Key.F3, "~F3~ Config", OpenConfig),
-            new StatusItem(Key.F5, "~F5~ Refresh", RefreshAll),
-            new StatusItem(Key.Null, "←/→ tabs · ↵ details · actions: F1", null),
-        ]);
+    private void SwitchTab(int delta)
+    {
+        var tabs = _tabs.TabCollection.ToList();
+        if (tabs.Count == 0)
+        {
+            return;
+        }
 
-        Application.Top.Add(_window, _connectionsBar, statusBar);
+        var index = _tabs.Value is { } current ? tabs.IndexOf(current) : 0;
+        if (index < 0)
+        {
+            index = 0;
+        }
+
+        _tabs.Value = tabs[(index + delta + tabs.Count) % tabs.Count];
     }
 
     private async Task RefreshAllAsync(CancellationToken ct)
@@ -118,7 +130,7 @@ public sealed class ForgetopApp
     }
 
     private void StartAutoRefresh() =>
-        Application.MainLoop.AddTimeout(RefreshInterval, loop =>
+        Application.AddTimeout(RefreshInterval, () =>
         {
             foreach (var view in Views)
             {
@@ -128,11 +140,11 @@ public sealed class ForgetopApp
                     try
                     {
                         await captured.LoadDataAsync().ConfigureAwait(false);
-                        Application.MainLoop.Invoke(captured.Render);
+                        Application.Invoke(captured.Render);
                     }
                     catch
                     {
-                        // ignore transient refresh failures; the next tick retries
+                        // ignore transient refresh failures
                     }
                 });
             }
@@ -147,11 +159,11 @@ public sealed class ForgetopApp
             try
             {
                 var health = await _health.CheckAllAsync().ConfigureAwait(false);
-                Application.MainLoop.Invoke(() => _connectionsBar.Update(health));
+                Application.Invoke(() => _connectionsBar.Update(health));
             }
             catch
             {
-                // ignore; the next tick retries
+                // ignore; next tick retries
             }
         });
 
@@ -183,14 +195,14 @@ public sealed class ForgetopApp
     private void ApplyTheme()
     {
         var scheme = _theme.Scheme();
-        _window.ColorScheme = scheme;
-        _connectionsBar.ColorScheme = scheme;
+        _window.SetScheme(scheme);
+        _connectionsBar.Background = scheme.Normal.Background;
         foreach (var view in Views)
         {
             view.ApplyScheme(scheme);
         }
 
-        Application.Refresh();
+        Application.LayoutAndDraw(true);
     }
 
     private void CycleTheme()
@@ -201,17 +213,12 @@ public sealed class ForgetopApp
     }
 
     private static void ShowHelp() => MessageBox.Query(
+        Application.Instance,
         "forgetop — keys",
-        "\nGlobal\n" +
-        "  Tab / ← →   switch section      ↑ ↓   move in list\n" +
-        "  ↵  expand details   Esc  collapse\n" +
-        "  F5 refresh   F3 config   F2 theme   F1 help   ^Q quit\n\n" +
-        "Pull Requests\n" +
-        "  f  cycle filter (All/Mine/ReviewRequested)\n" +
-        "  a  approve   m  merge   c  comment   d  diff/files   v  comments\n\n" +
-        "Work Items\n" +
-        "  f  toggle mine   s  set state   c  comment\n\n" +
-        "Pipelines\n" +
-        "  ↵  jobs + logs   t  trigger/re-run   d  discover & subscribe   u  unsubscribe\n",
+        "\nGlobal:  Tab / ← →  switch section   ↑ ↓  move   ↵ details   Esc collapse\n" +
+        "         F5 refresh   F3 config   F2 theme   F1 help   ^Q quit\n\n" +
+        "Pull Requests:  f filter   a approve   m merge   c comment   d diff   v comments\n" +
+        "Work Items:     f mine   s set state   c comment\n" +
+        "Pipelines:      ↵ jobs/steps   t trigger   d discover   u unsubscribe\n",
         "OK");
 }

@@ -6,13 +6,16 @@
 
   <ItemGroup>
     <PackageReference Include="Spectre.Console" Version="0.57.1" />
-    <PackageReference Include="Terminal.Gui" Version="1.18.1" />
+    <PackageReference Include="Terminal.Gui" Version="2.4.16" />
   </ItemGroup>
 
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <!-- 2.4.16 is mid-migration: the static Application API is obsolete but still
+         functional. We ride it intentionally; revisit when v2 stabilises. -->
+    <NoWarn>$(NoWarn);CS0618</NoWarn>
   </PropertyGroup>
 
 </Project>
