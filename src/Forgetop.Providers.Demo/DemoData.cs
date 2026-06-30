@@ -16,7 +16,7 @@ internal static class DemoData
         new PullRequest
         {
             Id = "101", Number = 101, Title = "Add retry policy to HTTP client",
-            Description = "Wraps outbound calls in a Polly retry with jitter.",
+            Description = "Wraps outbound calls in a Polly retry with jitter.\n\nReduces 5xx-related flakiness in the banking sync job.",
             Author = Alice, Status = PullRequestStatus.Open, SourceRef = "feature/retry", TargetRef = "main",
             CreatedAt = Now.AddHours(-30), UpdatedAt = Now.AddHours(-2),
             Reviewers =
@@ -24,19 +24,34 @@ internal static class DemoData
                 new Reviewer { User = Bob, Vote = ReviewVote.Approved },
                 new Reviewer { User = Carol, Vote = ReviewVote.WaitingForAuthor, IsRequired = true },
             ],
+            Labels = ["banking", "enhancement"],
+            Checks = CheckStatus.Passed,
+            CheckSummary = new CheckSummary { Successful = 14, Neutral = 1 },
+            Mergeable = MergeableState.Mergeable,
+            ChangedFiles = 2, Additions = 24, Deletions = 2,
         },
         new PullRequest
         {
             Id = "102", Number = 102, Title = "Fix flaky pipeline cache key", Author = Bob,
+            Description = "WIP — still narrowing down the cache key collision.",
             Status = PullRequestStatus.Draft, IsDraft = true, SourceRef = "fix/cache", TargetRef = "main",
             CreatedAt = Now.AddHours(-6),
             Reviewers = [new Reviewer { User = Alice, Vote = ReviewVote.NoVote }],
+            Labels = ["wip", "ci"],
+            Checks = CheckStatus.Pending,
+            CheckSummary = new CheckSummary { Successful = 2, InProgress = 12, Neutral = 1 },
+            Mergeable = MergeableState.Blocked,
+            ChangedFiles = 3, Additions = 12, Deletions = 5,
         },
         new PullRequest
         {
             Id = "100", Number = 100, Title = "Bump dependencies", Author = Carol,
             Status = PullRequestStatus.Merged, SourceRef = "chore/bump", TargetRef = "main",
             CreatedAt = Now.AddDays(-3), UpdatedAt = Now.AddDays(-2),
+            Labels = ["chore"],
+            Checks = CheckStatus.Passed,
+            Mergeable = MergeableState.Unknown,
+            ChangedFiles = 8, Additions = 120, Deletions = 60,
         },
     ];
 
@@ -93,12 +108,41 @@ internal static class DemoData
             Id = "r500", DefinitionId = "ci", Number = 500, Name = "CI", Status = PipelineRunStatus.Failed,
             TriggeredBy = Bob, Branch = "main", CommitSha = "9f8e7d6", StartedAt = Now.AddHours(-1),
             FinishedAt = Now.AddMinutes(-52),
+            Stages =
+            [
+                new PipelineStage
+                {
+                    Name = "build", Status = PipelineRunStatus.Succeeded,
+                    Jobs = [new PipelineJob { Id = "j10", Name = "compile", Status = PipelineRunStatus.Succeeded }],
+                },
+                new PipelineStage
+                {
+                    Name = "test", Status = PipelineRunStatus.Failed,
+                    Jobs =
+                    [
+                        new PipelineJob { Id = "j11", Name = "unit", Status = PipelineRunStatus.Succeeded },
+                        new PipelineJob { Id = "j12", Name = "integration", Status = PipelineRunStatus.Failed },
+                    ],
+                },
+            ],
         },
         new PipelineRun
         {
             Id = "r207", DefinitionId = "release", Number = 207, Name = "Release", Status = PipelineRunStatus.Succeeded,
             TriggeredBy = Carol, Branch = "main", CommitSha = "1234abc", StartedAt = Now.AddDays(-2),
             FinishedAt = Now.AddDays(-2).AddMinutes(8),
+            Stages =
+            [
+                new PipelineStage
+                {
+                    Name = "publish", Status = PipelineRunStatus.Succeeded,
+                    Jobs =
+                    [
+                        new PipelineJob { Id = "j20", Name = "pack", Status = PipelineRunStatus.Succeeded },
+                        new PipelineJob { Id = "j21", Name = "deploy", Status = PipelineRunStatus.Succeeded },
+                    ],
+                },
+            ],
         },
     ];
 }

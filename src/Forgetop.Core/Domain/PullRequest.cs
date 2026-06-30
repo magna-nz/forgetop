@@ -29,6 +29,35 @@ public sealed record Reviewer
     public bool IsRequired { get; init; }
 }
 
+/// <summary>Roll-up CI/check state for a pull request.</summary>
+public enum CheckStatus
+{
+    None,
+    Pending,
+    Passed,
+    Failed,
+}
+
+/// <summary>Whether a pull request can be merged.</summary>
+public enum MergeableState
+{
+    Unknown,
+    Mergeable,
+    Blocked,
+    Conflicting,
+}
+
+/// <summary>Counts behind <see cref="CheckStatus"/> for the detail view.</summary>
+public sealed record CheckSummary
+{
+    public int Successful { get; init; }
+    public int InProgress { get; init; }
+    public int Failed { get; init; }
+    public int Neutral { get; init; }
+
+    public int Total => Successful + InProgress + Failed + Neutral;
+}
+
 /// <summary>Provider-neutral pull request / merge request.</summary>
 public sealed record PullRequest
 {
@@ -44,6 +73,15 @@ public sealed record PullRequest
     public string? TargetRef { get; init; }
 
     public IReadOnlyList<Reviewer> Reviewers { get; init; } = [];
+    public IReadOnlyList<string> Labels { get; init; } = [];
+
+    public CheckStatus Checks { get; init; }
+    public CheckSummary? CheckSummary { get; init; }
+    public MergeableState Mergeable { get; init; }
+
+    public int ChangedFiles { get; init; }
+    public int Additions { get; init; }
+    public int Deletions { get; init; }
 
     public DateTimeOffset CreatedAt { get; init; }
     public DateTimeOffset? UpdatedAt { get; init; }

@@ -32,7 +32,46 @@ public sealed class GitHubApiClient
         var prs = doc.RootElement.EnumerateArray().Select(GitHubMapper.MapPullRequest).ToList();
 
         var me = query.Filter == PullRequestFilter.All ? null : await GetSelfLoginAsync(ct).ConfigureAwait(false);
-        return PullRequestFilters.Apply(prs, query.Filter, me);
+        var filtered = PullRequestFilters.Apply(prs, query.Filter, me);
+
+        // The list endpoint omits diff stats / mergeable / checks — enrich the top rows
+        // (each needs 2 extra calls) and leave the rest as the cheap list view.
+        const int enrichCap = 25;
+        var result = new List<PullRequest>(filtered.Count);
+        for (var i = 0; i < filtered.Count; i++)
+        {
+            result.Add(i < enrichCap ? await EnrichAsync(filtered[i], ct).ConfigureAwait(false) : filtered[i]);
+        }
+
+        return result;
+    }
+
+    private async Task<PullRequest> EnrichAsync(PullRequest pr, CancellationToken ct)
+    {
+        if (pr.Number is not { } number)
+        {
+            return pr;
+        }
+
+        try
+        {
+            using var detail = await GetAsync($"{Repo}/pulls/{number}", ct).ConfigureAwait(false);
+            var enriched = GitHubMapper.MapPullRequest(detail.RootElement);
+
+            var sha = detail.RootElement.Obj("head")?.Str("sha");
+            if (sha is not null)
+            {
+                using var checks = await GetAsync($"{Repo}/commits/{sha}/check-runs", ct).ConfigureAwait(false);
+                var (status, summary) = GitHubMapper.MapChecks(checks.RootElement);
+                enriched = enriched with { Checks = status, CheckSummary = summary };
+            }
+
+            return enriched;
+        }
+        catch
+        {
+            return pr; // keep the basic row if enrichment fails
+        }
     }
 
     private async Task<string?> GetSelfLoginAsync(CancellationToken ct)

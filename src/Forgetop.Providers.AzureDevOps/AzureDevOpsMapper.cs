@@ -46,6 +46,14 @@ public static class AzureDevOpsMapper
             _ => PullRequestStatus.Open,
         };
 
+        var mergeable = el.Bool("isDraft") ? MergeableState.Blocked : el.Str("mergeStatus") switch
+        {
+            "succeeded" => MergeableState.Mergeable,
+            "conflicts" or "failure" => MergeableState.Conflicting,
+            "rejectedByPolicy" => MergeableState.Blocked,
+            _ => MergeableState.Unknown,
+        };
+
         var id = el.Int("pullRequestId");
         return new PullRequest
         {
@@ -66,6 +74,8 @@ public static class AzureDevOpsMapper
                 Vote = MapVote(r.Int("vote") ?? 0),
                 IsRequired = r.Bool("isRequired"),
             }).ToList(),
+            Labels = el.Arr("labels").Select(l => l.Str("name") ?? "").Where(n => n.Length > 0).ToList(),
+            Mergeable = mergeable,
         };
     }
 
