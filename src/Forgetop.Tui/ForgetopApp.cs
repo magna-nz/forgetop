@@ -59,6 +59,7 @@ public sealed class ForgetopApp
 
             await RefreshAllAsync(ct).ConfigureAwait(true);
             ApplyTheme();
+            _prView.FocusContent();
             StartAutoRefresh();
             RefreshHealth();
             Application.Run();

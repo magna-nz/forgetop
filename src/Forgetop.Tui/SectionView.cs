@@ -155,6 +155,9 @@ public abstract class SectionView : View
 
     protected static char KeyChar(KeyEvent keyEvent) => char.ToLowerInvariant((char)keyEvent.KeyValue);
 
+    /// <summary>Give the row table keyboard focus (so arrows move rows, not tabs).</summary>
+    public void FocusContent() => Table.SetFocus();
+
     private void OnTableKey(KeyEventEventArgs args)
     {
         switch (args.KeyEvent.Key)
@@ -165,6 +168,27 @@ public abstract class SectionView : View
                 return;
             case Key.CursorRight:
                 TabSwitch?.Invoke(1);
+                args.Handled = true;
+                return;
+            // Handle up/down ourselves and clamp, so focus never escapes up into the
+            // tab bar (which would turn arrows into tab switches).
+            case Key.CursorUp:
+                if (Table.SelectedRow > 0)
+                {
+                    Table.SelectedRow--;
+                    Table.SetNeedsDisplay();
+                }
+
+                args.Handled = true;
+                return;
+            case Key.CursorDown:
+                var rowCount = Table.Table?.Rows.Count ?? 0;
+                if (Table.SelectedRow < rowCount - 1)
+                {
+                    Table.SelectedRow++;
+                    Table.SetNeedsDisplay();
+                }
+
                 args.Handled = true;
                 return;
             case Key.Esc when _expanded:
