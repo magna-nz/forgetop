@@ -11,6 +11,7 @@ use ratatui::widgets::TableState;
 
 use crate::overlay::{Action, InputKind, Outcome, Overlay, PickerKind};
 use crate::theme::Theme;
+use crate::wizard::{Wizard, WizardOutcome};
 
 /// The three top-level tabs, in order.
 pub const TABS: [&str; 3] = ["Pull Requests", "Work Items", "Pipelines"];
@@ -49,6 +50,8 @@ pub struct App {
     pub toast: Option<String>,
     /// Open modal overlay, if any. When set, keys route here instead of the table.
     pub overlay: Option<Overlay>,
+    /// Add-connection wizard, if running. Takes priority over the overlay/screens.
+    pub wizard: Option<Wizard>,
     /// Current screen — the list, or a full-screen sub-view like the PR diff.
     pub screen: Screen,
     pub last_refresh: DateTime<Local>,
@@ -195,6 +198,7 @@ impl App {
             pr_filter: PullRequestFilter::All,
             toast: None,
             overlay: None,
+            wizard: None,
             screen: Screen::List,
             last_refresh: Local::now(),
             should_quit: false,
@@ -385,7 +389,11 @@ impl App {
         // Any keypress dismisses the previous one-shot toast.
         self.toast = None;
 
-        // An open overlay swallows all input until it resolves.
+        // The wizard, then any overlay, swallow all input until they resolve.
+        if self.wizard.is_some() {
+            self.on_wizard_key(key, deps).await;
+            return;
+        }
         if self.overlay.is_some() {
             self.on_overlay_key(key, deps).await;
             return;
@@ -445,6 +453,7 @@ impl App {
                 let _ = deps.config.set_theme(Some(next.to_string())).await;
             }
             'o' => self.open_selected(),
+            'n' => self.start_add_connection(),
             'f' if self.active == 0 => self.cycle_pr_filter(deps).await,
             // PR write actions (Pull Requests tab only; each no-ops off-tab).
             'a' => self.open_pr_vote(ReviewVote::Approved),
@@ -635,6 +644,71 @@ impl App {
             }
             None => self.toast = Some("No web URL for this item".into()),
         }
+    }
+
+    // ---- add-connection wizard ----
+
+    pub fn start_add_connection(&mut self) {
+        self.wizard = Some(Wizard::new());
+    }
+
+    async fn on_wizard_key(&mut self, key: Key, deps: &AppDeps) {
+        let outcome = match self.wizard.as_mut() {
+            Some(w) => w.handle(key),
+            None => return,
+        };
+        match outcome {
+            WizardOutcome::Keep => {}
+            WizardOutcome::Cancel => {
+                self.wizard = None;
+                self.toast = Some("Cancelled".into());
+            }
+            WizardOutcome::Commit => {
+                if let Some(w) = self.wizard.take() {
+                    self.commit_wizard(w, deps).await;
+                }
+            }
+        }
+    }
+
+    async fn commit_wizard(&mut self, wizard: Wizard, deps: &AppDeps) {
+        let draft = wizard.draft;
+        let Some(provider) = draft.provider else {
+            self.toast = Some("No provider chosen".into());
+            return;
+        };
+        let id = Connection::new_id(provider);
+        let connection = Connection {
+            id: id.clone(),
+            provider_type: provider,
+            display_name: if draft.display_name.is_empty() { provider.as_str().to_string() } else { draft.display_name },
+            base_url: None,
+            organization: draft.organization,
+            project: draft.project,
+            repository: draft.repository,
+            credential_ref: None,
+        };
+
+        if let Err(e) = deps.config.add_or_update_connection(connection, draft.pat).await {
+            self.toast = Some(format!("Add failed: {e}"));
+            return;
+        }
+
+        if let Some(section) = draft.bind_section {
+            let result = match section {
+                Section::PullRequests => deps.config.bind_pull_requests(&id).await,
+                Section::WorkItems => deps.config.bind_work_items(&id).await,
+                Section::Pipelines => deps.config.set_pipeline_auto_discover(&id, true).await,
+            };
+            if let Err(e) = result {
+                self.toast = Some(format!("Added, but binding failed: {e}"));
+                self.reload_all(deps).await;
+                return;
+            }
+        }
+
+        self.toast = Some(format!("Added {} connection", provider.as_str()));
+        self.reload_all(deps).await;
     }
 
     // ---- PR write actions ----

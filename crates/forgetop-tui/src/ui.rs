@@ -13,6 +13,7 @@ use ratatui::Frame;
 use crate::app::{App, DiffView, PipeRow, PipelineView, Screen, TABS};
 use crate::overlay::Overlay;
 use crate::theme::{check_icon, pipeline_icon, Theme};
+use crate::wizard::{Prompt, PromptKind};
 
 pub fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
@@ -36,7 +37,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     render_health(frame, rows[2], app);
     render_footer(frame, rows[3], app);
 
-    if app.overlay.is_some() {
+    if app.wizard.is_some() {
+        render_wizard(frame, area, app);
+    } else if app.overlay.is_some() {
         render_overlay(frame, area, app);
     }
 }
@@ -429,6 +432,13 @@ fn render_health(frame: &mut Frame, area: Rect, app: &App) {
 /// Context-aware key glossary for the active tab (azdo-style bar along the bottom).
 /// While an overlay is open it shows that overlay's own keys instead.
 fn footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
+    if let Some(wizard) = &app.wizard {
+        return match wizard.current() {
+            Some(Prompt { kind: PromptKind::Pick { .. }, .. }) => vec![("↑↓", "choose"), ("↵", "next"), ("Esc", "cancel")],
+            Some(_) => vec![("type", "value"), ("↵", "next"), ("Esc", "cancel")],
+            None => vec![("Esc", "cancel")],
+        };
+    }
     if let Some(overlay) = &app.overlay {
         return overlay.hint();
     }
@@ -454,7 +464,7 @@ fn footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
         2 => keys.extend([("↵", "drill-in"), ("T", "trigger"), ("o", "open")]),
         _ => {}
     }
-    keys.extend([("r", "refresh"), ("t", "theme"), ("q", "quit")]);
+    keys.extend([("n", "add-conn"), ("r", "refresh"), ("t", "theme"), ("q", "quit")]);
     keys
 }
 
@@ -738,6 +748,66 @@ fn render_overlay(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(lines).block(block).wrap(Wrap { trim: false }), rect);
 }
 
+fn render_wizard(frame: &mut Frame, area: Rect, app: &App) {
+    let theme = &app.theme;
+    let Some(wizard) = &app.wizard else { return };
+    let Some(prompt) = wizard.current() else { return };
+    let accent = theme.accent;
+
+    let mut lines: Vec<Line> = vec![
+        Line::from(Span::styled(prompt.label.clone(), Style::default().fg(theme.fg).add_modifier(Modifier::BOLD))),
+        Line::from(""),
+    ];
+    match &prompt.kind {
+        PromptKind::Text { buffer, secret } => {
+            let shown = if *secret { "•".repeat(buffer.chars().count()) } else { buffer.clone() };
+            lines.push(Line::from(vec![
+                Span::styled("> ", Style::default().fg(accent)),
+                Span::styled(shown, Style::default().fg(theme.fg)),
+                Span::styled("█", Style::default().fg(accent)),
+            ]));
+        }
+        PromptKind::Pick { items, selected } => {
+            for (i, item) in items.iter().enumerate() {
+                if i == *selected {
+                    lines.push(Line::from(vec![
+                        Span::styled(" ▐ ", Style::default().fg(accent)),
+                        Span::styled(item.clone(), Style::default().fg(accent).add_modifier(Modifier::BOLD)),
+                    ]));
+                } else {
+                    lines.push(Line::from(Span::styled(format!("   {item}"), Style::default().fg(theme.fg))));
+                }
+            }
+        }
+    }
+
+    let hint = footer_keys(app)
+        .into_iter()
+        .flat_map(|(k, l)| {
+            [
+                Span::styled(format!(" {k} "), Style::default().fg(theme.bg).bg(accent).add_modifier(Modifier::BOLD)),
+                Span::styled(format!(" {l}   "), Style::default().fg(theme.dim)),
+            ]
+        })
+        .collect::<Vec<_>>();
+    lines.push(Line::from(""));
+    lines.push(Line::from(hint));
+
+    let height = lines.len() as u16 + 2;
+    let width = 64.min(area.width.saturating_sub(6));
+    let rect = centered_rect(width, height, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(accent))
+        .style(Style::default().bg(theme.panel))
+        .title(Span::styled(format!(" Add connection · {} ", wizard.step_label()), Style::default().fg(accent).add_modifier(Modifier::BOLD)));
+
+    frame.render_widget(Clear, rect);
+    frame.render_widget(Paragraph::new(lines).block(block).wrap(Wrap { trim: false }), rect);
+}
+
 /// A rectangle of the given size, centred within `area`.
 fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     let x = area.x + (area.width.saturating_sub(width)) / 2;
@@ -963,6 +1033,18 @@ mod tests {
         app.active = 2;
         let out = render_to_string(&mut app, 120, 24);
         assert!(out.contains("drill-in") && out.contains("trigger"), "pipelines footer");
+    }
+
+    #[test]
+    fn wizard_popup_renders_provider_choices() {
+        use crate::wizard::Wizard;
+        let mut app = App::new("slate");
+        app.wizard = Some(Wizard::new());
+        let out = render_to_string(&mut app, 100, 24);
+        assert!(out.contains("Add connection"), "wizard title");
+        assert!(out.contains("Provider"), "prompt label");
+        assert!(out.contains("GitHub") && out.contains("Linear"), "provider options");
+        assert!(out.contains("choose") && out.contains("cancel"), "wizard footer hints");
     }
 
     #[test]

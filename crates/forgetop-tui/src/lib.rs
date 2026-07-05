@@ -5,6 +5,7 @@ pub mod app;
 pub mod overlay;
 pub mod theme;
 pub mod ui;
+pub mod wizard;
 
 use std::io::{self, Stdout};
 use std::time::Duration;
