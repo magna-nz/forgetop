@@ -5,10 +5,10 @@ use forgetop_core::domain::*;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Cell, Clear, Paragraph, Row, Table, Tabs, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Tabs, Wrap};
 use ratatui::Frame;
 
-use crate::app::{App, PipeRow, TABS};
+use crate::app::{App, DiffView, PipeRow, Screen, TABS};
 use crate::overlay::Overlay;
 use crate::theme::{check_icon, pipeline_icon, Theme};
 
@@ -77,6 +77,10 @@ fn render_tabs(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_content(frame: &mut Frame, area: Rect, app: &mut App) {
+    if let Screen::Diff(diff) = &app.screen {
+        render_diff(frame, area, &app.theme, diff);
+        return;
+    }
     if app.show_detail && app.selected().is_some() {
         let split = Layout::default()
             .direction(Direction::Vertical)
@@ -419,9 +423,12 @@ fn footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
     if let Some(overlay) = &app.overlay {
         return overlay.hint();
     }
+    if matches!(app.screen, Screen::Diff(_)) {
+        return vec![("↑↓", "file"), ("PgUp/Dn", "scroll"), ("Esc", "back"), ("q", "quit")];
+    }
     let mut keys = vec![("↑↓", "move"), ("←→", "tabs"), ("↵", "detail")];
     if app.active == 0 {
-        keys.extend([("f", "filter"), ("a", "approve"), ("x", "reject"), ("m", "merge"), ("c", "comment")]);
+        keys.extend([("f", "filter"), ("d", "diff"), ("a", "approve"), ("x", "reject"), ("m", "merge"), ("c", "comment")]);
     }
     keys.extend([("r", "refresh"), ("t", "theme"), ("q", "quit")]);
     keys
@@ -455,6 +462,130 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         Paragraph::new(Line::from(Span::styled(right, right_style)).right_aligned()).style(bar),
         cols[1],
     );
+}
+
+// ---- diff view ----
+
+fn kind_badge(theme: &Theme, kind: FileChangeKind) -> Span<'static> {
+    let (letter, color) = match kind {
+        FileChangeKind::Added => ("A", theme.green),
+        FileChangeKind::Modified => ("M", theme.yellow),
+        FileChangeKind::Deleted => ("D", theme.red),
+        FileChangeKind::Renamed => ("R", theme.blue),
+    };
+    Span::styled(letter, Style::default().fg(color).add_modifier(Modifier::BOLD))
+}
+
+fn render_diff(frame: &mut Frame, area: Rect, theme: &Theme, diff: &DiffView) {
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(44), Constraint::Min(20)])
+        .split(area);
+
+    let thread_h = if diff.threads.is_empty() { 3 } else { 12 };
+    let left = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(4), Constraint::Length(thread_h)])
+        .split(cols[0]);
+
+    render_diff_files(frame, left[0], theme, diff);
+    render_diff_threads(frame, left[1], theme, diff);
+    render_diff_patch(frame, cols[1], theme, diff);
+}
+
+fn render_diff_files(frame: &mut Frame, area: Rect, theme: &Theme, diff: &DiffView) {
+    let title = format!("{} · files", diff.pr_label);
+    let block = section_block(theme, &title);
+    if diff.files.is_empty() {
+        empty(frame, area, theme, "No changed files.", block);
+        return;
+    }
+
+    let rows: Vec<Row> = diff
+        .files
+        .iter()
+        .map(|f| {
+            Row::new(vec![
+                Cell::from(kind_badge(theme, f.kind)),
+                Cell::from(Span::styled(f.path.clone(), Style::default().fg(theme.fg))),
+                Cell::from(Span::styled(format!("+{} -{}", f.additions, f.deletions), Style::default().fg(theme.dim))),
+            ])
+        })
+        .collect();
+
+    let widths = [Constraint::Length(1), Constraint::Min(10), Constraint::Length(10)];
+    let table = Table::new(rows, widths)
+        .block(block)
+        .column_spacing(1)
+        .row_highlight_style(highlight(theme))
+        .highlight_symbol("▐ ");
+    let mut state = TableState::default();
+    state.select(Some(diff.selected));
+    frame.render_stateful_widget(table, area, &mut state);
+}
+
+fn render_diff_threads(frame: &mut Frame, area: Rect, theme: &Theme, diff: &DiffView) {
+    let title = format!("Comments ({})", diff.threads.len());
+    let block = section_block(theme, &title);
+    if diff.threads.is_empty() {
+        empty(frame, area, theme, "No review comments.", block);
+        return;
+    }
+    let mut lines: Vec<Line> = Vec::new();
+    for t in &diff.threads {
+        let loc = match (&t.file_path, t.line) {
+            (Some(p), Some(l)) => format!("{p}:{l}"),
+            (Some(p), None) => p.clone(),
+            _ => "general".into(),
+        };
+        let mark = if t.is_resolved { "✓ resolved" } else { "○ open" };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{loc} "), Style::default().fg(theme.accent)),
+            Span::styled(mark.to_string(), Style::default().fg(if t.is_resolved { theme.green } else { theme.dim })),
+        ]));
+        for c in &t.comments {
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {}: ", c.author.display_name), Style::default().fg(theme.blue)),
+                Span::styled(c.body.clone(), Style::default().fg(theme.fg)),
+            ]));
+        }
+    }
+    frame.render_widget(Paragraph::new(lines).block(block).wrap(Wrap { trim: true }), area);
+}
+
+fn render_diff_patch(frame: &mut Frame, area: Rect, theme: &Theme, diff: &DiffView) {
+    let Some(file) = diff.current() else {
+        frame.render_widget(section_block(theme, "Patch"), area);
+        return;
+    };
+    let title = format!("{}  (+{} -{})", file.path, file.additions, file.deletions);
+    let block = section_block(theme, &title);
+
+    let Some(patch) = &file.patch else {
+        empty(frame, area, theme, "No inline patch for this file (binary, or the provider didn't supply one).", block);
+        return;
+    };
+
+    let lines: Vec<Line> = patch.lines().map(|l| patch_line(theme, l)).collect();
+    frame.render_widget(
+        Paragraph::new(lines).block(block).scroll((diff.scroll, 0)),
+        area,
+    );
+}
+
+fn patch_line(theme: &Theme, line: &str) -> Line<'static> {
+    let color = if line.starts_with("@@") {
+        theme.accent
+    } else if line.starts_with("+++") || line.starts_with("---") {
+        theme.dim
+    } else if line.starts_with('+') {
+        theme.green
+    } else if line.starts_with('-') {
+        theme.red
+    } else {
+        theme.fg
+    };
+    Line::from(Span::styled(line.to_string(), Style::default().fg(color)))
 }
 
 // ---- overlays ----
@@ -649,9 +780,45 @@ mod tests {
         app.prs.push(sample_pr());
         app.pr_state.select(Some(0));
         let out = render_to_string(&mut app, 120, 24);
-        for label in ["approve", "reject", "merge", "comment"] {
+        for label in ["diff", "approve", "reject", "merge", "comment"] {
             assert!(out.contains(label), "PR footer should advertise '{label}'");
         }
+    }
+
+    #[test]
+    fn diff_view_renders_files_patch_and_comments() {
+        use crate::app::{DiffView, Screen};
+        let mut app = App::new("slate");
+        app.screen = Screen::Diff(DiffView {
+            pr_label: "PR #42".into(),
+            files: vec![FileChange {
+                path: "src/http/retry.rs".into(),
+                kind: FileChangeKind::Added,
+                additions: 24,
+                deletions: 0,
+                patch: Some("@@ -0,0 +1,2 @@\n+pub struct RetryPolicy;\n-old line\n".into()),
+            }],
+            threads: vec![CommentThread {
+                id: "t1".into(),
+                comments: vec![Comment {
+                    id: "c1".into(),
+                    author: User { id: "b".into(), display_name: "Bob".into(), handle: None, avatar_url: None },
+                    body: "nit here".into(),
+                    created_at: None,
+                }],
+                file_path: None,
+                line: None,
+                is_resolved: false,
+            }],
+            selected: 0,
+            scroll: 0,
+        });
+
+        let out = render_to_string(&mut app, 120, 30);
+        assert!(out.contains("src/http/retry.rs"), "file path in list");
+        assert!(out.contains("RetryPolicy"), "patch content shown");
+        assert!(out.contains("Bob") && out.contains("nit here"), "thread comment shown");
+        assert!(out.contains("scroll") && out.contains("back"), "diff footer keys");
     }
 
     #[test]

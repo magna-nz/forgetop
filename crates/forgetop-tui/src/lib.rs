@@ -101,6 +101,8 @@ fn map_key(code: KeyCode, mods: KeyModifiers) -> Key {
         KeyCode::Enter => Key::Enter,
         KeyCode::Esc => Key::Escape,
         KeyCode::Backspace => Key::Backspace,
+        KeyCode::PageUp => Key::PageUp,
+        KeyCode::PageDown => Key::PageDown,
         KeyCode::Char(c) => Key::Char(c),
         _ => Key::None,
     }

@@ -47,8 +47,44 @@ pub struct App {
     pub toast: Option<String>,
     /// Open modal overlay, if any. When set, keys route here instead of the table.
     pub overlay: Option<Overlay>,
+    /// Current screen — the list, or a full-screen sub-view like the PR diff.
+    pub screen: Screen,
     pub last_refresh: DateTime<Local>,
     pub should_quit: bool,
+}
+
+/// Full-screen views layered above the list.
+pub enum Screen {
+    List,
+    Diff(DiffView),
+}
+
+/// State for the full-screen PR diff + threads view.
+pub struct DiffView {
+    pub pr_label: String,
+    pub files: Vec<FileChange>,
+    pub threads: Vec<CommentThread>,
+    pub selected: usize,
+    pub scroll: u16,
+}
+
+impl DiffView {
+    pub fn current(&self) -> Option<&FileChange> {
+        self.files.get(self.selected)
+    }
+
+    fn select_file(&mut self, delta: isize) {
+        if self.files.is_empty() {
+            return;
+        }
+        let n = self.files.len() as isize;
+        self.selected = (((self.selected as isize + delta) % n + n) % n) as usize;
+        self.scroll = 0;
+    }
+
+    fn scroll_by(&mut self, delta: i32) {
+        self.scroll = (self.scroll as i32 + delta).max(0) as u16;
+    }
 }
 
 impl App {
@@ -69,6 +105,7 @@ impl App {
             pr_filter: PullRequestFilter::All,
             toast: None,
             overlay: None,
+            screen: Screen::List,
             last_refresh: Local::now(),
             should_quit: false,
         }
@@ -263,6 +300,12 @@ impl App {
             return;
         }
 
+        // A full-screen sub-view (e.g. the diff) handles its own keys.
+        if matches!(self.screen, Screen::Diff(_)) {
+            self.on_diff_key(key);
+            return;
+        }
+
         match key {
             Key::Escape => {
                 if self.show_detail {
@@ -282,7 +325,7 @@ impl App {
                 }
             }
             Key::Char(c) => self.on_char(c, deps).await,
-            Key::Backspace | Key::Quit | Key::None => {}
+            Key::Backspace | Key::PageUp | Key::PageDown | Key::Quit | Key::None => {}
         }
     }
 
@@ -307,8 +350,45 @@ impl App {
             'x' => self.open_pr_vote(ReviewVote::Rejected),
             'm' => self.open_pr_merge(),
             'c' => self.open_pr_comment(),
+            'd' => self.open_diff(deps).await,
             _ => {}
         }
+    }
+
+    /// Key handling while the full-screen diff view is open.
+    fn on_diff_key(&mut self, key: Key) {
+        let Screen::Diff(diff) = &mut self.screen else { return };
+        match key {
+            Key::Escape => self.screen = Screen::List,
+            Key::Char('q') => self.should_quit = true,
+            Key::Up | Key::Char('k') => diff.select_file(-1),
+            Key::Down | Key::Char('j') => diff.select_file(1),
+            Key::PageDown | Key::Char(' ') => diff.scroll_by(10),
+            Key::PageUp | Key::Char('b') => diff.scroll_by(-10),
+            _ => {}
+        }
+    }
+
+    async fn open_diff(&mut self, deps: &AppDeps) {
+        let Some(pr) = self.selected_pr() else { return };
+        let id = pr.id.clone();
+        let label = pr_label(pr);
+        let source = match deps.sections.pull_request_source().await {
+            Ok(Some(s)) => s,
+            _ => {
+                self.toast = Some("No pull-request provider is bound".into());
+                return;
+            }
+        };
+        let files = match source.changes(&id).await {
+            Ok(f) => f,
+            Err(e) => {
+                self.toast = Some(format!("Diff failed: {e}"));
+                return;
+            }
+        };
+        let threads = source.threads(&id).await.unwrap_or_default();
+        self.screen = Screen::Diff(DiffView { pr_label: label, files, threads, selected: 0, scroll: 0 });
     }
 
     async fn on_overlay_key(&mut self, key: Key, deps: &AppDeps) {
@@ -429,6 +509,8 @@ pub enum Key {
     Enter,
     Escape,
     Backspace,
+    PageUp,
+    PageDown,
     Char(char),
     /// Hard quit (Ctrl-C), honoured in every mode.
     Quit,
