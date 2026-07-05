@@ -345,12 +345,19 @@ impl App {
                 let _ = deps.config.set_theme(Some(next.to_string())).await;
             }
             'f' if self.active == 0 => self.cycle_pr_filter(deps).await,
-            // PR write actions (Pull Requests tab only).
+            // PR write actions (Pull Requests tab only; each no-ops off-tab).
             'a' => self.open_pr_vote(ReviewVote::Approved),
             'x' => self.open_pr_vote(ReviewVote::Rejected),
             'm' => self.open_pr_merge(),
-            'c' => self.open_pr_comment(),
             'd' => self.open_diff(deps).await,
+            // Work-item actions (Work Items tab only).
+            's' => self.open_wi_state(),
+            // Comment is offered on both PR and work-item tabs.
+            'c' => match self.active {
+                0 => self.open_pr_comment(),
+                1 => self.open_wi_comment(),
+                _ => {}
+            },
             _ => {}
         }
     }
@@ -438,6 +445,13 @@ impl App {
     }
 
     async fn execute_action(&mut self, action: Action, deps: &AppDeps) {
+        match action {
+            Action::PrVote(_) | Action::PrMerge(_) | Action::PrComment(_) => self.execute_pr_action(action, deps).await,
+            Action::WiSetState(_) | Action::WiComment(_) => self.execute_wi_action(action, deps).await,
+        }
+    }
+
+    async fn execute_pr_action(&mut self, action: Action, deps: &AppDeps) {
         let Some(id) = self.selected_pr().map(|p| p.id.clone()) else {
             self.toast = Some("Nothing selected".into());
             return;
@@ -463,6 +477,7 @@ impl App {
                 }
                 source.add_comment(&id, text).await.map(|_| "Comment added".to_string())
             }
+            _ => return,
         };
 
         match result {
@@ -478,6 +493,82 @@ impl App {
             Err(e) => self.toast = Some(format!("Failed: {e}")),
         }
     }
+
+    // ---- work-item write actions ----
+
+    fn selected_wi(&self) -> Option<&WorkItem> {
+        if self.active != 1 {
+            return None;
+        }
+        self.wi_state.selected().and_then(|i| self.wis.get(i))
+    }
+
+    fn open_wi_state(&mut self) {
+        let Some(wi) = self.selected_wi() else { return };
+        let current = wi.state.clone();
+        let title = format!("Set state — {}", wi_label(wi));
+        // Offer the real state names seen across the current items (provider-accurate);
+        // fall back to a generic set if we can't infer at least two.
+        let mut states: Vec<String> = self.wis.iter().map(|w| w.state.clone()).collect();
+        states.sort();
+        states.dedup();
+        if states.len() < 2 {
+            states = vec!["Todo".into(), "In Progress".into(), "Done".into()];
+        }
+        let selected = states.iter().position(|s| *s == current).unwrap_or(0);
+        self.overlay = Some(Overlay::Picker { title, items: states, selected, kind: PickerKind::WorkItemState });
+    }
+
+    fn open_wi_comment(&mut self) {
+        let Some(wi) = self.selected_wi() else { return };
+        let title = format!("Comment on {}", wi_label(wi));
+        self.overlay = Some(Overlay::Input { title, buffer: String::new(), kind: InputKind::WorkItemComment });
+    }
+
+    async fn execute_wi_action(&mut self, action: Action, deps: &AppDeps) {
+        let Some(id) = self.selected_wi().map(|w| w.id.clone()) else {
+            self.toast = Some("Nothing selected".into());
+            return;
+        };
+        let source = match deps.sections.work_item_source().await {
+            Ok(Some(s)) => s,
+            _ => {
+                self.toast = Some("No work-item provider is bound".into());
+                return;
+            }
+        };
+
+        let result = match &action {
+            Action::WiSetState(state) => source.set_state(&id, state).await.map(|_| format!("State → {state}")),
+            Action::WiComment(text) => {
+                if text.trim().is_empty() {
+                    self.toast = Some("Empty comment — nothing sent".into());
+                    return;
+                }
+                source.add_comment(&id, text).await.map(|_| "Comment added".to_string())
+            }
+            _ => return,
+        };
+
+        match result {
+            Ok(msg) => {
+                self.toast = Some(msg);
+                let mut errors = Vec::new();
+                self.reload_work_items(deps, &mut errors).await;
+                self.fix_selection();
+                if let Some(e) = errors.first() {
+                    self.toast = Some(e.clone());
+                }
+            }
+            Err(e) => self.toast = Some(format!("Failed: {e}")),
+        }
+    }
+}
+
+fn wi_label(wi: &WorkItem) -> String {
+    let id = wi.identifier.clone().map(|i| format!("{i} ")).unwrap_or_default();
+    let title: String = wi.title.chars().take(40).collect();
+    format!("{id}— {title}")
 }
 
 fn pr_label(pr: &PullRequest) -> String {

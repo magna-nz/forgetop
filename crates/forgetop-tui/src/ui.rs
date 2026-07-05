@@ -427,8 +427,10 @@ fn footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
         return vec![("↑↓", "file"), ("PgUp/Dn", "scroll"), ("Esc", "back"), ("q", "quit")];
     }
     let mut keys = vec![("↑↓", "move"), ("←→", "tabs"), ("↵", "detail")];
-    if app.active == 0 {
-        keys.extend([("f", "filter"), ("d", "diff"), ("a", "approve"), ("x", "reject"), ("m", "merge"), ("c", "comment")]);
+    match app.active {
+        0 => keys.extend([("f", "filter"), ("d", "diff"), ("a", "approve"), ("x", "reject"), ("m", "merge"), ("c", "comment")]),
+        1 => keys.extend([("s", "state"), ("c", "comment")]),
+        _ => {}
     }
     keys.extend([("r", "refresh"), ("t", "theme"), ("q", "quit")]);
     keys
@@ -819,6 +821,15 @@ mod tests {
         assert!(out.contains("RetryPolicy"), "patch content shown");
         assert!(out.contains("Bob") && out.contains("nit here"), "thread comment shown");
         assert!(out.contains("scroll") && out.contains("back"), "diff footer keys");
+    }
+
+    #[test]
+    fn work_items_footer_lists_state_and_comment_not_pr_keys() {
+        let mut app = App::new("slate");
+        app.active = 1;
+        let out = render_to_string(&mut app, 120, 24);
+        assert!(out.contains("state") && out.contains("comment"), "WI footer should list state + comment");
+        assert!(!out.contains("approve") && !out.contains("diff"), "PR-only keys hidden on WI tab");
     }
 
     #[test]

@@ -13,16 +13,20 @@ pub enum Action {
     PrVote(ReviewVote),
     PrMerge(MergeStrategy),
     PrComment(String),
+    WiSetState(String),
+    WiComment(String),
 }
 
 #[derive(Debug, Clone, Copy)]
 pub enum PickerKind {
     PrMergeStrategy,
+    WorkItemState,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub enum InputKind {
     PrComment,
+    WorkItemComment,
 }
 
 pub enum Overlay {
@@ -77,7 +81,7 @@ impl Overlay {
                     }
                     Outcome::Keep
                 }
-                Key::Enter => Outcome::Submit(resolve_picker(*kind, *selected)),
+                Key::Enter => Outcome::Submit(resolve_picker(*kind, *selected, items)),
                 Key::Escape => Outcome::Cancel,
                 _ => Outcome::Keep,
             },
@@ -98,7 +102,7 @@ impl Overlay {
     }
 }
 
-fn resolve_picker(kind: PickerKind, selected: usize) -> Action {
+fn resolve_picker(kind: PickerKind, selected: usize, items: &[String]) -> Action {
     match kind {
         PickerKind::PrMergeStrategy => {
             let strategy = match selected {
@@ -108,12 +112,14 @@ fn resolve_picker(kind: PickerKind, selected: usize) -> Action {
             };
             Action::PrMerge(strategy)
         }
+        PickerKind::WorkItemState => Action::WiSetState(items.get(selected).cloned().unwrap_or_default()),
     }
 }
 
 fn resolve_input(kind: InputKind, text: String) -> Action {
     match kind {
         InputKind::PrComment => Action::PrComment(text),
+        InputKind::WorkItemComment => Action::WiComment(text),
     }
 }
 
@@ -147,6 +153,30 @@ mod tests {
         match o.handle(Key::Enter) {
             Outcome::Submit(Action::PrMerge(MergeStrategy::Squash)) => {}
             _ => panic!("expected PrMerge(Squash)"),
+        }
+    }
+
+    #[test]
+    fn work_item_picker_resolves_to_selected_state_name() {
+        let mut o = Overlay::Picker {
+            title: "s".into(),
+            items: vec!["Todo".into(), "In Progress".into(), "Done".into()],
+            selected: 0,
+            kind: PickerKind::WorkItemState,
+        };
+        o.handle(Key::Down); // -> In Progress
+        match o.handle(Key::Enter) {
+            Outcome::Submit(Action::WiSetState(state)) => assert_eq!(state, "In Progress"),
+            _ => panic!("expected WiSetState"),
+        }
+    }
+
+    #[test]
+    fn work_item_input_resolves_to_comment() {
+        let mut o = Overlay::Input { title: "c".into(), buffer: "needs tests".into(), kind: InputKind::WorkItemComment };
+        match o.handle(Key::Enter) {
+            Outcome::Submit(Action::WiComment(text)) => assert_eq!(text, "needs tests"),
+            _ => panic!("expected WiComment"),
         }
     }
 
