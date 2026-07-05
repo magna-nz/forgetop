@@ -6,3 +6,7 @@ license.workspace = true
 
 [dependencies]
 forgetop-core.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+tokio.workspace = true
+chrono.workspace = true

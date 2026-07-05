@@ -12,3 +12,4 @@ path = "src/main.rs"
 forgetop-core.workspace = true
 forgetop-providers.workspace = true
 forgetop-tui.workspace = true
+tokio.workspace = true
