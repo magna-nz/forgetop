@@ -11,7 +11,7 @@ use ratatui::widgets::TableState;
 
 use crate::overlay::{Action, InputKind, Outcome, Overlay, PickerKind};
 use crate::theme::Theme;
-use crate::wizard::{Wizard, WizardOutcome};
+use crate::wizard::{section_label, Wizard, WizardOutcome};
 
 /// The three top-level tabs, in order.
 pub const TABS: [&str; 3] = ["Pull Requests", "Work Items", "Pipelines"];
@@ -64,6 +64,32 @@ pub enum Screen {
     List,
     Diff(Box<DiffView>),
     Pipeline(Box<PipelineView>),
+    Config(Box<ConfigView>),
+}
+
+/// A configured connection, as shown in the config screen.
+pub struct ConnRow {
+    pub id: String,
+    pub display: String,
+    pub provider: ProviderType,
+    pub healthy: bool,
+    /// Which sections this connection is currently bound to.
+    pub bindings: Vec<&'static str>,
+}
+
+/// Snapshot state for the config / connections screen. Rebuilt after each mutation.
+pub struct ConfigView {
+    pub connections: Vec<ConnRow>,
+    pub pr_binding: Option<String>,
+    pub wi_binding: Option<String>,
+    pub pipeline_subs: Vec<String>,
+    pub selected: usize,
+}
+
+impl ConfigView {
+    fn selected_conn(&self) -> Option<&ConnRow> {
+        self.connections.get(self.selected)
+    }
 }
 
 /// One row of the flattened, collapsible pipeline tree.
@@ -409,6 +435,10 @@ impl App {
                 self.on_pipeline_key(key);
                 return;
             }
+            Screen::Config(_) => {
+                self.on_config_key(key, deps).await;
+                return;
+            }
             Screen::List => {}
         }
 
@@ -454,6 +484,7 @@ impl App {
             }
             'o' => self.open_selected(),
             'n' => self.start_add_connection(),
+            'C' => self.open_config(deps).await,
             'f' if self.active == 0 => self.cycle_pr_filter(deps).await,
             // PR write actions (Pull Requests tab only; each no-ops off-tab).
             'a' => self.open_pr_vote(ReviewVote::Approved),
@@ -624,7 +655,7 @@ impl App {
         match &self.screen {
             Screen::Diff(v) => return v.url.clone(),
             Screen::Pipeline(v) => return v.run.url.clone(),
-            Screen::List => {}
+            Screen::List | Screen::Config(_) => {}
         }
         match self.active {
             0 => self.selected_pr().and_then(|p| p.url.clone()),
@@ -709,6 +740,133 @@ impl App {
 
         self.toast = Some(format!("Added {} connection", provider.as_str()));
         self.reload_all(deps).await;
+        self.rebuild_config_view(deps).await;
+    }
+
+    // ---- config / connections screen ----
+
+    async fn open_config(&mut self, deps: &AppDeps) {
+        let view = self.build_config_view(deps);
+        self.screen = Screen::Config(Box::new(view));
+    }
+
+    fn build_config_view(&self, deps: &AppDeps) -> ConfigView {
+        let cfg = deps.config.snapshot();
+        let display_of = |id: &str| cfg.find_connection(id).map(|c| c.display_name.clone()).unwrap_or_else(|| id.to_string());
+
+        let pr_binding = cfg.pull_requests.as_ref().map(|b| display_of(&b.connection_id));
+        let wi_binding = cfg.work_items.as_ref().map(|b| display_of(&b.connection_id));
+        let pipeline_subs = cfg
+            .pipelines
+            .as_ref()
+            .map(|p| p.subscriptions.iter().map(|s| display_of(&s.connection_id)).collect())
+            .unwrap_or_default();
+
+        let connections = cfg
+            .connections
+            .iter()
+            .map(|c| {
+                let mut bindings = Vec::new();
+                if cfg.pull_requests.as_ref().is_some_and(|b| b.connection_id == c.id) {
+                    bindings.push("PR");
+                }
+                if cfg.work_items.as_ref().is_some_and(|b| b.connection_id == c.id) {
+                    bindings.push("WI");
+                }
+                if cfg.pipelines.as_ref().is_some_and(|p| p.subscriptions.iter().any(|s| s.connection_id == c.id)) {
+                    bindings.push("Pipe");
+                }
+                ConnRow {
+                    id: c.id.clone(),
+                    display: c.display_name.clone(),
+                    provider: c.provider_type,
+                    healthy: self.health.iter().find(|h| h.connection.id == c.id).map(|h| h.healthy).unwrap_or(false),
+                    bindings,
+                }
+            })
+            .collect();
+
+        ConfigView { connections, pr_binding, wi_binding, pipeline_subs, selected: 0 }
+    }
+
+    async fn rebuild_config_view(&mut self, deps: &AppDeps) {
+        let sel = match &self.screen {
+            Screen::Config(v) => v.selected,
+            _ => return,
+        };
+        let mut view = self.build_config_view(deps);
+        view.selected = sel.min(view.connections.len().saturating_sub(1));
+        self.screen = Screen::Config(Box::new(view));
+    }
+
+    async fn on_config_key(&mut self, key: Key, deps: &AppDeps) {
+        match key {
+            Key::Escape => self.screen = Screen::List,
+            Key::Char('q') => self.should_quit = true,
+            Key::Char('a') => self.start_add_connection(),
+            Key::Char('p') => self.config_bind(Section::PullRequests, deps).await,
+            Key::Char('w') => self.config_bind(Section::WorkItems, deps).await,
+            Key::Char('x') | Key::Char('d') => self.config_remove_selected(),
+            Key::Up | Key::Char('k') => self.config_move(-1),
+            Key::Down | Key::Char('j') => self.config_move(1),
+            _ => {}
+        }
+    }
+
+    fn config_move(&mut self, delta: isize) {
+        if let Screen::Config(v) = &mut self.screen {
+            let len = v.connections.len();
+            if len == 0 {
+                return;
+            }
+            let n = len as isize;
+            v.selected = (((v.selected as isize + delta) % n + n) % n) as usize;
+        }
+    }
+
+    fn config_selected_id(&self) -> Option<(String, String)> {
+        if let Screen::Config(v) = &self.screen {
+            return v.selected_conn().map(|c| (c.id.clone(), c.display.clone()));
+        }
+        None
+    }
+
+    async fn config_bind(&mut self, section: Section, deps: &AppDeps) {
+        let Some((id, _)) = self.config_selected_id() else { return };
+        let result = match section {
+            Section::PullRequests => deps.config.bind_pull_requests(&id).await,
+            Section::WorkItems => deps.config.bind_work_items(&id).await,
+            Section::Pipelines => deps.config.set_pipeline_auto_discover(&id, true).await,
+        };
+        match result {
+            Ok(()) => {
+                self.toast = Some(format!("Bound to {}", section_label(section)));
+                self.reload_all(deps).await;
+                self.rebuild_config_view(deps).await;
+            }
+            Err(e) => self.toast = Some(format!("{e}")),
+        }
+    }
+
+    fn config_remove_selected(&mut self) {
+        let Some((id, label)) = self.config_selected_id() else { return };
+        self.overlay = Some(Overlay::Confirm {
+            title: "Remove connection".into(),
+            message: format!("Remove '{label}' and its bindings?"),
+            action: Action::RemoveConnection { id, label },
+        });
+    }
+
+    async fn execute_config_action(&mut self, action: Action, deps: &AppDeps) {
+        let Action::RemoveConnection { id, label } = action else { return };
+        match deps.config.remove_connection(&id).await {
+            Ok(()) => {
+                self.toast = Some(format!("Removed {label}"));
+                self.reload_all(deps).await;
+                self.rebuild_config_view(deps).await;
+            }
+            Err(e) => self.toast = Some(format!("Remove failed: {e}")),
+        }
     }
 
     // ---- PR write actions ----
@@ -753,6 +911,7 @@ impl App {
             Action::PrVote(_) | Action::PrMerge(_) | Action::PrComment(_) => self.execute_pr_action(action, deps).await,
             Action::WiSetState(_) | Action::WiComment(_) => self.execute_wi_action(action, deps).await,
             Action::PipelineTrigger { .. } => self.execute_pipeline_action(action, deps).await,
+            Action::RemoveConnection { .. } => self.execute_config_action(action, deps).await,
         }
     }
 

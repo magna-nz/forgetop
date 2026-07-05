@@ -16,6 +16,7 @@ pub enum Action {
     WiSetState(String),
     WiComment(String),
     PipelineTrigger { connection_id: String, definition_id: String, branch: Option<String>, label: String },
+    RemoveConnection { id: String, label: String },
 }
 
 #[derive(Debug, Clone, Copy)]

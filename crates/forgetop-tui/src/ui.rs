@@ -10,7 +10,7 @@ use ratatui::widgets::{
 };
 use ratatui::Frame;
 
-use crate::app::{App, DiffView, PipeRow, PipelineView, Screen, TABS};
+use crate::app::{App, ConfigView, DiffView, PipeRow, PipelineView, Screen, TABS};
 use crate::overlay::Overlay;
 use crate::theme::{check_icon, pipeline_icon, Theme};
 use crate::wizard::{Prompt, PromptKind};
@@ -89,6 +89,10 @@ fn render_content(frame: &mut Frame, area: Rect, app: &mut App) {
         }
         Screen::Pipeline(view) => {
             render_pipeline(frame, area, &app.theme, view);
+            return;
+        }
+        Screen::Config(view) => {
+            render_config(frame, area, &app.theme, view);
             return;
         }
         Screen::List => {}
@@ -448,6 +452,17 @@ fn footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
     if matches!(app.screen, Screen::Pipeline(_)) {
         return vec![("↑↓", "move"), ("↵", "expand"), ("T", "trigger"), ("o", "open"), ("Esc", "back"), ("q", "quit")];
     }
+    if matches!(app.screen, Screen::Config(_)) {
+        return vec![
+            ("↑↓", "move"),
+            ("a", "add"),
+            ("p", "bind-PR"),
+            ("w", "bind-WI"),
+            ("x", "remove"),
+            ("Esc", "back"),
+            ("q", "quit"),
+        ];
+    }
     let mut keys = vec![("↑↓", "move"), ("←→", "tabs")];
     match app.active {
         0 => keys.extend([
@@ -464,7 +479,7 @@ fn footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
         2 => keys.extend([("↵", "drill-in"), ("T", "trigger"), ("o", "open")]),
         _ => {}
     }
-    keys.extend([("n", "add-conn"), ("r", "refresh"), ("t", "theme"), ("q", "quit")]);
+    keys.extend([("C", "config"), ("r", "refresh"), ("t", "theme"), ("q", "quit")]);
     keys
 }
 
@@ -620,6 +635,66 @@ fn patch_line(theme: &Theme, line: &str) -> Line<'static> {
         theme.fg
     };
     Line::from(Span::styled(line.to_string(), Style::default().fg(color)))
+}
+
+// ---- config / connections ----
+
+fn render_config(frame: &mut Frame, area: Rect, theme: &Theme, view: &ConfigView) {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(4), Constraint::Length(6)])
+        .split(area);
+
+    // Connections table.
+    let conns_block = section_block(theme, "Connections");
+    if view.connections.is_empty() {
+        empty(frame, rows[0], theme, "No connections yet. Press a to add one.", conns_block);
+    } else {
+        let header = header_row(theme, &["", "Name", "Provider", "Bound to"]);
+        let table_rows: Vec<Row> = view
+            .connections
+            .iter()
+            .map(|c| {
+                let (dot, color) = if c.healthy { ("●", theme.green) } else { ("○", theme.red) };
+                let bound = if c.bindings.is_empty() { "—".to_string() } else { c.bindings.join(", ") };
+                Row::new(vec![
+                    Cell::from(Span::styled(dot, Style::default().fg(color))),
+                    Cell::from(Span::styled(c.display.clone(), Style::default().fg(theme.fg))),
+                    Cell::from(Span::styled(c.provider.as_str().to_string(), Style::default().fg(theme.cyan))),
+                    Cell::from(Span::styled(bound, Style::default().fg(theme.dim))),
+                ])
+            })
+            .collect();
+        let widths = [Constraint::Length(1), Constraint::Min(16), Constraint::Length(14), Constraint::Length(18)];
+        let table = Table::new(table_rows, widths)
+            .header(header)
+            .block(conns_block)
+            .column_spacing(1)
+            .row_highlight_style(highlight(theme))
+            .highlight_symbol("▐ ");
+        let mut state = TableState::default();
+        state.select(Some(view.selected.min(view.connections.len().saturating_sub(1))));
+        frame.render_stateful_widget(table, rows[0], &mut state);
+    }
+
+    // Section bindings summary.
+    let dash = || "— (unbound)".to_string();
+    let subs = if view.pipeline_subs.is_empty() { dash() } else { view.pipeline_subs.join(", ") };
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("Pull Requests  ", Style::default().fg(theme.dim)),
+            Span::styled(view.pr_binding.clone().unwrap_or_else(dash), Style::default().fg(theme.fg)),
+        ]),
+        Line::from(vec![
+            Span::styled("Work Items     ", Style::default().fg(theme.dim)),
+            Span::styled(view.wi_binding.clone().unwrap_or_else(dash), Style::default().fg(theme.fg)),
+        ]),
+        Line::from(vec![
+            Span::styled("Pipelines      ", Style::default().fg(theme.dim)),
+            Span::styled(subs, Style::default().fg(theme.fg)),
+        ]),
+    ];
+    frame.render_widget(Paragraph::new(lines).block(section_block(theme, "Section bindings")), rows[1]);
 }
 
 // ---- pipeline drill-in ----
@@ -1033,6 +1108,33 @@ mod tests {
         app.active = 2;
         let out = render_to_string(&mut app, 120, 24);
         assert!(out.contains("drill-in") && out.contains("trigger"), "pipelines footer");
+    }
+
+    #[test]
+    fn config_screen_renders_connections_and_bindings() {
+        use crate::app::{ConfigView, ConnRow, Screen};
+        let mut app = App::new("slate");
+        app.screen = Screen::Config(Box::new(ConfigView {
+            connections: vec![ConnRow {
+                id: "gh-1".into(),
+                display: "My GitHub".into(),
+                provider: ProviderType::GitHub,
+                healthy: true,
+                bindings: vec!["PR", "Pipe"],
+            }],
+            pr_binding: Some("My GitHub".into()),
+            wi_binding: None,
+            pipeline_subs: vec!["My GitHub".into()],
+            selected: 0,
+        }));
+        let out = render_to_string(&mut app, 100, 24);
+        assert!(out.contains("Connections"), "connections panel");
+        assert!(out.contains("My GitHub"), "connection name");
+        assert!(out.contains("Section bindings"), "bindings panel");
+        assert!(out.contains("unbound"), "unbound work items shown");
+        for label in ["add", "remove", "bind-PR"] {
+            assert!(out.contains(label), "config footer should list '{label}'");
+        }
     }
 
     #[test]
