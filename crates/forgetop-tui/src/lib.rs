@@ -2,6 +2,7 @@
 //! so there are no framework focus fights — every keystroke is dispatched by us.
 
 pub mod app;
+pub mod overlay;
 pub mod theme;
 pub mod ui;
 
@@ -89,18 +90,20 @@ fn map_key(code: KeyCode, mods: KeyModifiers) -> Key {
     if mods.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('c')) {
         return Key::Quit;
     }
+    // Keep keys semantic but preserve raw characters, so the app can interpret them
+    // as navigation in normal mode or as literal text while an input overlay is open.
     match code {
-        KeyCode::Up | KeyCode::Char('k') => Key::Up,
-        KeyCode::Down | KeyCode::Char('j') => Key::Down,
-        KeyCode::Left | KeyCode::Char('h') => Key::Left,
-        KeyCode::Right | KeyCode::Char('l') => Key::Right,
+        KeyCode::Up => Key::Up,
+        KeyCode::Down => Key::Down,
+        KeyCode::Left => Key::Left,
+        KeyCode::Right => Key::Right,
         KeyCode::Tab => Key::Tab,
         KeyCode::Enter => Key::Enter,
         KeyCode::Esc => Key::Escape,
-        KeyCode::Char('r') => Key::Refresh,
-        KeyCode::Char('t') => Key::Theme,
-        KeyCode::Char('q') => Key::Quit,
-        KeyCode::Char(c @ '1'..='3') => Key::Num(c as usize - '1' as usize),
+        KeyCode::Backspace => Key::Backspace,
+        KeyCode::PageUp => Key::PageUp,
+        KeyCode::PageDown => Key::PageDown,
+        KeyCode::Char(c) => Key::Char(c),
         _ => Key::None,
     }
 }

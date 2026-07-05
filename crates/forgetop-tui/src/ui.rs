@@ -5,10 +5,13 @@ use forgetop_core::domain::*;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Cell, Paragraph, Row, Table, Tabs, Wrap};
+use ratatui::widgets::{
+    Block, BorderType, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState, Tabs, Wrap,
+};
 use ratatui::Frame;
 
-use crate::app::{App, PipeRow, TABS};
+use crate::app::{App, DiffView, PipeRow, PipelineView, Screen, TABS};
+use crate::overlay::Overlay;
 use crate::theme::{check_icon, pipeline_icon, Theme};
 
 pub fn render(frame: &mut Frame, app: &mut App) {
@@ -32,6 +35,10 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     render_content(frame, rows[1], app);
     render_health(frame, rows[2], app);
     render_footer(frame, rows[3], app);
+
+    if app.overlay.is_some() {
+        render_overlay(frame, area, app);
+    }
 }
 
 fn render_tabs(frame: &mut Frame, area: Rect, app: &App) {
@@ -72,6 +79,17 @@ fn render_tabs(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_content(frame: &mut Frame, area: Rect, app: &mut App) {
+    match &app.screen {
+        Screen::Diff(diff) => {
+            render_diff(frame, area, &app.theme, diff);
+            return;
+        }
+        Screen::Pipeline(view) => {
+            render_pipeline(frame, area, &app.theme, view);
+            return;
+        }
+        Screen::List => {}
+    }
     if app.show_detail && app.selected().is_some() {
         let split = Layout::default()
             .direction(Direction::Vertical)
@@ -143,9 +161,10 @@ fn checks_span(theme: &Theme, pr: &PullRequest) -> Span<'static> {
 
 fn render_prs(frame: &mut Frame, area: Rect, app: &mut App) {
     let theme = &app.theme;
-    let block = section_block(theme, "Pull Requests");
+    let title = format!("Pull Requests · {}", app.pr_filter_label());
+    let block = section_block(theme, &title);
     if app.prs.is_empty() {
-        let msg = if app.loading { "Loading pull requests…" } else { "No pull requests. Press r to refresh." };
+        let msg = if app.loading { "Loading pull requests…" } else { "No pull requests. Press f to change filter, r to refresh." };
         empty(frame, area, theme, msg, block);
         return;
     }
@@ -407,32 +426,323 @@ fn render_health(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
+/// Context-aware key glossary for the active tab (azdo-style bar along the bottom).
+/// While an overlay is open it shows that overlay's own keys instead.
+fn footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
+    if let Some(overlay) = &app.overlay {
+        return overlay.hint();
+    }
+    if matches!(app.screen, Screen::Diff(_)) {
+        return vec![("↑↓", "file"), ("PgUp/Dn", "scroll"), ("o", "open"), ("Esc", "back"), ("q", "quit")];
+    }
+    if matches!(app.screen, Screen::Pipeline(_)) {
+        return vec![("↑↓", "move"), ("↵", "expand"), ("T", "trigger"), ("o", "open"), ("Esc", "back"), ("q", "quit")];
+    }
+    let mut keys = vec![("↑↓", "move"), ("←→", "tabs")];
+    match app.active {
+        0 => keys.extend([
+            ("↵", "detail"),
+            ("f", "filter"),
+            ("d", "diff"),
+            ("a", "approve"),
+            ("x", "reject"),
+            ("m", "merge"),
+            ("c", "comment"),
+            ("o", "open"),
+        ]),
+        1 => keys.extend([("↵", "detail"), ("s", "state"), ("c", "comment"), ("o", "open")]),
+        2 => keys.extend([("↵", "drill-in"), ("T", "trigger"), ("o", "open")]),
+        _ => {}
+    }
+    keys.extend([("r", "refresh"), ("t", "theme"), ("q", "quit")]);
+    keys
+}
+
 fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     let theme = &app.theme;
+    // A subtle bar background so the glossary reads as a distinct strip.
+    let bar = Style::default().bg(theme.panel);
+
+    let mut spans = vec![Span::styled(" ", bar)];
+    for (key, label) in footer_keys(app) {
+        spans.push(Span::styled(format!(" {key} "), bar.fg(theme.bg).bg(theme.accent).add_modifier(Modifier::BOLD)));
+        spans.push(Span::styled(format!(" {label}  "), bar.fg(theme.fg)));
+    }
+
+    // Right side: transient toast (highlighted) or the standing status line.
+    let (right, right_style) = match &app.toast {
+        Some(t) => (format!("{t} "), bar.fg(theme.yellow).add_modifier(Modifier::BOLD)),
+        None => (format!("{} ", app.status), bar.fg(theme.dim)),
+    };
+    let right_w = right.chars().count().min(70) as u16 + 1;
+
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(10), Constraint::Length(app.status.len().min(60) as u16 + 1)])
+        .constraints([Constraint::Min(10), Constraint::Length(right_w)])
         .split(area);
 
-    let keys = Line::from(vec![
-        Span::styled(" ↑↓", Style::default().fg(theme.accent)),
-        Span::styled(" move  ", Style::default().fg(theme.dim)),
-        Span::styled("←→", Style::default().fg(theme.accent)),
-        Span::styled(" tabs  ", Style::default().fg(theme.dim)),
-        Span::styled("↵", Style::default().fg(theme.accent)),
-        Span::styled(" detail  ", Style::default().fg(theme.dim)),
-        Span::styled("r", Style::default().fg(theme.accent)),
-        Span::styled(" refresh  ", Style::default().fg(theme.dim)),
-        Span::styled("t", Style::default().fg(theme.accent)),
-        Span::styled(" theme  ", Style::default().fg(theme.dim)),
-        Span::styled("q", Style::default().fg(theme.accent)),
-        Span::styled(" quit", Style::default().fg(theme.dim)),
-    ]);
-    frame.render_widget(Paragraph::new(keys), cols[0]);
+    frame.render_widget(Paragraph::new(Line::from(spans)).style(bar), cols[0]);
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(app.status.clone(), Style::default().fg(theme.dim))).right_aligned()),
+        Paragraph::new(Line::from(Span::styled(right, right_style)).right_aligned()).style(bar),
         cols[1],
     );
+}
+
+// ---- diff view ----
+
+fn kind_badge(theme: &Theme, kind: FileChangeKind) -> Span<'static> {
+    let (letter, color) = match kind {
+        FileChangeKind::Added => ("A", theme.green),
+        FileChangeKind::Modified => ("M", theme.yellow),
+        FileChangeKind::Deleted => ("D", theme.red),
+        FileChangeKind::Renamed => ("R", theme.blue),
+    };
+    Span::styled(letter, Style::default().fg(color).add_modifier(Modifier::BOLD))
+}
+
+fn render_diff(frame: &mut Frame, area: Rect, theme: &Theme, diff: &DiffView) {
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(44), Constraint::Min(20)])
+        .split(area);
+
+    let thread_h = if diff.threads.is_empty() { 3 } else { 12 };
+    let left = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(4), Constraint::Length(thread_h)])
+        .split(cols[0]);
+
+    render_diff_files(frame, left[0], theme, diff);
+    render_diff_threads(frame, left[1], theme, diff);
+    render_diff_patch(frame, cols[1], theme, diff);
+}
+
+fn render_diff_files(frame: &mut Frame, area: Rect, theme: &Theme, diff: &DiffView) {
+    let title = format!("{} · files", diff.pr_label);
+    let block = section_block(theme, &title);
+    if diff.files.is_empty() {
+        empty(frame, area, theme, "No changed files.", block);
+        return;
+    }
+
+    let rows: Vec<Row> = diff
+        .files
+        .iter()
+        .map(|f| {
+            Row::new(vec![
+                Cell::from(kind_badge(theme, f.kind)),
+                Cell::from(Span::styled(f.path.clone(), Style::default().fg(theme.fg))),
+                Cell::from(Span::styled(format!("+{} -{}", f.additions, f.deletions), Style::default().fg(theme.dim))),
+            ])
+        })
+        .collect();
+
+    let widths = [Constraint::Length(1), Constraint::Min(10), Constraint::Length(10)];
+    let table = Table::new(rows, widths)
+        .block(block)
+        .column_spacing(1)
+        .row_highlight_style(highlight(theme))
+        .highlight_symbol("▐ ");
+    let mut state = TableState::default();
+    state.select(Some(diff.selected));
+    frame.render_stateful_widget(table, area, &mut state);
+}
+
+fn render_diff_threads(frame: &mut Frame, area: Rect, theme: &Theme, diff: &DiffView) {
+    let title = format!("Comments ({})", diff.threads.len());
+    let block = section_block(theme, &title);
+    if diff.threads.is_empty() {
+        empty(frame, area, theme, "No review comments.", block);
+        return;
+    }
+    let mut lines: Vec<Line> = Vec::new();
+    for t in &diff.threads {
+        let loc = match (&t.file_path, t.line) {
+            (Some(p), Some(l)) => format!("{p}:{l}"),
+            (Some(p), None) => p.clone(),
+            _ => "general".into(),
+        };
+        let mark = if t.is_resolved { "✓ resolved" } else { "○ open" };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{loc} "), Style::default().fg(theme.accent)),
+            Span::styled(mark.to_string(), Style::default().fg(if t.is_resolved { theme.green } else { theme.dim })),
+        ]));
+        for c in &t.comments {
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {}: ", c.author.display_name), Style::default().fg(theme.blue)),
+                Span::styled(c.body.clone(), Style::default().fg(theme.fg)),
+            ]));
+        }
+    }
+    frame.render_widget(Paragraph::new(lines).block(block).wrap(Wrap { trim: true }), area);
+}
+
+fn render_diff_patch(frame: &mut Frame, area: Rect, theme: &Theme, diff: &DiffView) {
+    let Some(file) = diff.current() else {
+        frame.render_widget(section_block(theme, "Patch"), area);
+        return;
+    };
+    let title = format!("{}  (+{} -{})", file.path, file.additions, file.deletions);
+    let block = section_block(theme, &title);
+
+    let Some(patch) = &file.patch else {
+        empty(frame, area, theme, "No inline patch for this file (binary, or the provider didn't supply one).", block);
+        return;
+    };
+
+    let lines: Vec<Line> = patch.lines().map(|l| patch_line(theme, l)).collect();
+    frame.render_widget(
+        Paragraph::new(lines).block(block).scroll((diff.scroll, 0)),
+        area,
+    );
+}
+
+fn patch_line(theme: &Theme, line: &str) -> Line<'static> {
+    let color = if line.starts_with("@@") {
+        theme.accent
+    } else if line.starts_with("+++") || line.starts_with("---") {
+        theme.dim
+    } else if line.starts_with('+') {
+        theme.green
+    } else if line.starts_with('-') {
+        theme.red
+    } else {
+        theme.fg
+    };
+    Line::from(Span::styled(line.to_string(), Style::default().fg(color)))
+}
+
+// ---- pipeline drill-in ----
+
+fn render_pipeline(frame: &mut Frame, area: Rect, theme: &Theme, view: &PipelineView) {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(3)])
+        .split(area);
+
+    // Header: run identity + status + branch/trigger.
+    let branch = view.branch.clone().unwrap_or_else(|| "—".into());
+    let who = view.run.triggered_by.as_ref().map(|u| u.display_name.clone()).unwrap_or_else(|| "—".into());
+    let header = Line::from(vec![
+        Span::styled(format!("{} ", pipeline_icon(view.run.status)), Style::default().fg(theme.pipeline_color(view.run.status))),
+        Span::styled(format!("{:?}", view.run.status), Style::default().fg(theme.pipeline_color(view.run.status)).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("   branch {branch}   triggered by {who}"), Style::default().fg(theme.dim)),
+    ]);
+    let header_block = section_block(theme, &view.title);
+    frame.render_widget(Paragraph::new(header).block(header_block), rows[0]);
+
+    // Tree of stages → jobs → steps.
+    let nodes = view.flatten();
+    let tree_block = section_block(theme, "Stages · jobs · steps");
+    if nodes.is_empty() {
+        empty(frame, rows[1], theme, "No stages reported for this run.", tree_block);
+        return;
+    }
+
+    let items: Vec<ListItem> = nodes
+        .iter()
+        .map(|n| {
+            let indent = "  ".repeat(n.depth);
+            let marker = match n.key {
+                Some(_) if n.expanded => "▾ ",
+                Some(_) => "▸ ",
+                None => "· ",
+            };
+            let label_style = if n.depth == 0 {
+                Style::default().fg(theme.fg).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.fg)
+            };
+            ListItem::new(Line::from(vec![
+                Span::raw(indent),
+                Span::styled(marker, Style::default().fg(theme.dim)),
+                Span::styled(format!("{} ", pipeline_icon(n.status)), Style::default().fg(theme.pipeline_color(n.status))),
+                Span::styled(n.label.clone(), label_style),
+            ]))
+        })
+        .collect();
+
+    let list = List::new(items).block(tree_block).highlight_style(highlight(theme)).highlight_symbol("▐ ");
+    let mut state = ListState::default();
+    state.select(Some(view.selected.min(nodes.len().saturating_sub(1))));
+    frame.render_stateful_widget(list, rows[1], &mut state);
+}
+
+// ---- overlays ----
+
+fn render_overlay(frame: &mut Frame, area: Rect, app: &App) {
+    let theme = &app.theme;
+    let Some(overlay) = &app.overlay else { return };
+
+    let (body, hint_color): (Vec<Line>, _) = match overlay {
+        Overlay::Confirm { message, .. } => (
+            vec![Line::from(""), Line::from(Span::styled(message.clone(), Style::default().fg(theme.fg)))],
+            theme.yellow,
+        ),
+        Overlay::Picker { items, selected, .. } => (
+            items
+                .iter()
+                .enumerate()
+                .map(|(i, item)| {
+                    if i == *selected {
+                        Line::from(vec![
+                            Span::styled(" ▐ ", Style::default().fg(theme.accent)),
+                            Span::styled(item.clone(), Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+                        ])
+                    } else {
+                        Line::from(Span::styled(format!("   {item}"), Style::default().fg(theme.fg)))
+                    }
+                })
+                .collect(),
+            theme.accent,
+        ),
+        Overlay::Input { buffer, .. } => (
+            vec![
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("> ", Style::default().fg(theme.accent)),
+                    Span::styled(buffer.clone(), Style::default().fg(theme.fg)),
+                    Span::styled("█", Style::default().fg(theme.accent)),
+                ]),
+            ],
+            theme.green,
+        ),
+    };
+
+    let hint = footer_keys(app)
+        .into_iter()
+        .flat_map(|(k, l)| {
+            [
+                Span::styled(format!(" {k} "), Style::default().fg(theme.bg).bg(hint_color).add_modifier(Modifier::BOLD)),
+                Span::styled(format!(" {l}   "), Style::default().fg(theme.dim)),
+            ]
+        })
+        .collect::<Vec<_>>();
+
+    let mut lines = body;
+    lines.push(Line::from(""));
+    lines.push(Line::from(hint));
+
+    let height = lines.len() as u16 + 2;
+    let width = 64.min(area.width.saturating_sub(6));
+    let rect = centered_rect(width, height, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(hint_color))
+        .style(Style::default().bg(theme.panel))
+        .title(Span::styled(format!(" {} ", overlay.title()), Style::default().fg(hint_color).add_modifier(Modifier::BOLD)));
+
+    frame.render_widget(Clear, rect);
+    frame.render_widget(Paragraph::new(lines).block(block).wrap(Wrap { trim: false }), rect);
+}
+
+/// A rectangle of the given size, centred within `area`.
+fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    Rect { x, y, width: width.min(area.width), height: height.min(area.height) }
 }
 
 // ---- helpers ----
@@ -507,6 +817,169 @@ mod tests {
         let expanded = render_to_string(&mut app, 100, 24);
         assert!(expanded.contains("Detail"), "detail panel should expand on Enter");
         assert!(expanded.contains("Alice Ng"), "detail should show the author");
+    }
+
+    #[test]
+    fn pr_footer_shows_filter_key_and_active_filter() {
+        let mut app = App::new("slate");
+        app.prs.push(sample_pr());
+        app.pr_state.select(Some(0));
+
+        let out = render_to_string(&mut app, 100, 24);
+        assert!(out.contains("filter"), "PR tab footer should advertise the filter key");
+        assert!(out.contains("Pull Requests · all"), "PR title should show the active filter");
+
+        // On the Work Items tab the filter key is not offered.
+        app.active = 1;
+        let wi = render_to_string(&mut app, 100, 24);
+        assert!(!wi.contains("filter"), "filter is PR-only");
+    }
+
+    #[test]
+    fn merge_picker_overlay_renders_over_the_list() {
+        use crate::overlay::{Overlay, PickerKind};
+        let mut app = App::new("slate");
+        app.prs.push(sample_pr());
+        app.pr_state.select(Some(0));
+        app.overlay = Some(Overlay::Picker {
+            title: "Merge PR #42 via".into(),
+            items: vec!["Merge commit".into(), "Squash".into(), "Rebase".into()],
+            selected: 1,
+            kind: PickerKind::PrMergeStrategy,
+        });
+
+        let out = render_to_string(&mut app, 100, 24);
+        assert!(out.contains("Merge PR #42 via"), "overlay title should render");
+        assert!(out.contains("Squash") && out.contains("Rebase"), "strategies should render");
+        assert!(out.contains("select") && out.contains("cancel"), "overlay hints in footer");
+    }
+
+    #[test]
+    fn pr_footer_lists_write_action_keys() {
+        let mut app = App::new("slate");
+        app.prs.push(sample_pr());
+        app.pr_state.select(Some(0));
+        let out = render_to_string(&mut app, 120, 24);
+        for label in ["diff", "approve", "reject", "merge", "comment"] {
+            assert!(out.contains(label), "PR footer should advertise '{label}'");
+        }
+    }
+
+    #[test]
+    fn diff_view_renders_files_patch_and_comments() {
+        use crate::app::{DiffView, Screen};
+        let mut app = App::new("slate");
+        app.screen = Screen::Diff(Box::new(DiffView {
+            pr_label: "PR #42".into(),
+            url: Some("http://example/pr/42".into()),
+            files: vec![FileChange {
+                path: "src/http/retry.rs".into(),
+                kind: FileChangeKind::Added,
+                additions: 24,
+                deletions: 0,
+                patch: Some("@@ -0,0 +1,2 @@\n+pub struct RetryPolicy;\n-old line\n".into()),
+            }],
+            threads: vec![CommentThread {
+                id: "t1".into(),
+                comments: vec![Comment {
+                    id: "c1".into(),
+                    author: User { id: "b".into(), display_name: "Bob".into(), handle: None, avatar_url: None },
+                    body: "nit here".into(),
+                    created_at: None,
+                }],
+                file_path: None,
+                line: None,
+                is_resolved: false,
+            }],
+            selected: 0,
+            scroll: 0,
+        }));
+
+        let out = render_to_string(&mut app, 120, 30);
+        assert!(out.contains("src/http/retry.rs"), "file path in list");
+        assert!(out.contains("RetryPolicy"), "patch content shown");
+        assert!(out.contains("Bob") && out.contains("nit here"), "thread comment shown");
+        assert!(out.contains("scroll") && out.contains("back"), "diff footer keys");
+    }
+
+    fn sample_run() -> PipelineRun {
+        PipelineRun {
+            id: "r1".into(),
+            definition_id: "ci".into(),
+            number: Some(101),
+            name: Some("CI".into()),
+            status: PipelineRunStatus::Running,
+            triggered_by: Some(User { id: "u".into(), display_name: "Dana".into(), handle: None, avatar_url: None }),
+            branch: Some("main".into()),
+            commit_sha: None,
+            started_at: None,
+            finished_at: None,
+            url: None,
+            stages: vec![PipelineStage {
+                name: "Build".into(),
+                status: PipelineRunStatus::Succeeded,
+                jobs: vec![PipelineJob {
+                    id: "j1".into(),
+                    name: "compile".into(),
+                    status: PipelineRunStatus::Succeeded,
+                    started_at: None,
+                    finished_at: None,
+                    steps: vec![PipelineStep { name: "cargo build".into(), status: PipelineRunStatus::Succeeded }],
+                }],
+            }],
+        }
+    }
+
+    #[test]
+    fn pipeline_view_flattens_stage_job_step() {
+        let view = PipelineView::new("CI #101".into(), sample_run(), "demo".into(), "ci".into(), Some("main".into()));
+        let flat = view.flatten();
+        assert_eq!(flat.len(), 3, "one stage + one job + one step");
+        assert_eq!(flat[0].depth, 0);
+        assert_eq!(flat[2].depth, 2);
+    }
+
+    #[test]
+    fn pipeline_drill_in_renders_tree_and_keys() {
+        use crate::app::Screen;
+        let mut app = App::new("slate");
+        app.screen = Screen::Pipeline(Box::new(PipelineView::new(
+            "CI #101".into(),
+            sample_run(),
+            "demo".into(),
+            "ci".into(),
+            Some("main".into()),
+        )));
+        let out = render_to_string(&mut app, 120, 30);
+        assert!(out.contains("Build"), "stage name");
+        assert!(out.contains("compile"), "job name");
+        assert!(out.contains("cargo build"), "step name");
+        assert!(out.contains("expand") && out.contains("trigger"), "drill-in footer keys");
+    }
+
+    #[test]
+    fn pipelines_footer_lists_drillin_and_trigger() {
+        let mut app = App::new("slate");
+        app.active = 2;
+        let out = render_to_string(&mut app, 120, 24);
+        assert!(out.contains("drill-in") && out.contains("trigger"), "pipelines footer");
+    }
+
+    #[test]
+    fn work_items_footer_lists_state_and_comment_not_pr_keys() {
+        let mut app = App::new("slate");
+        app.active = 1;
+        let out = render_to_string(&mut app, 120, 24);
+        assert!(out.contains("state") && out.contains("comment"), "WI footer should list state + comment");
+        assert!(!out.contains("approve") && !out.contains("diff"), "PR-only keys hidden on WI tab");
+    }
+
+    #[test]
+    fn toast_renders_in_footer() {
+        let mut app = App::new("slate");
+        app.toast = Some("Filter: mine (1 PRs)".into());
+        let out = render_to_string(&mut app, 100, 24);
+        assert!(out.contains("Filter: mine"), "toast should appear in the footer");
     }
 
     #[test]

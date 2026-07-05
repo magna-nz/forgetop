@@ -10,3 +10,4 @@ ratatui.workspace = true
 crossterm.workspace = true
 tokio.workspace = true
 chrono.workspace = true
+open.workspace = true

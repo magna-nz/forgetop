@@ -1,5 +1,6 @@
 //! Application state and the (async) update logic driven by the event loop.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use chrono::{DateTime, Local};
@@ -8,6 +9,7 @@ use forgetop_core::provider::*;
 use forgetop_core::service::{ConfigService, ConnectionHealth, ConnectionHealthService, SectionService};
 use ratatui::widgets::TableState;
 
+use crate::overlay::{Action, InputKind, Outcome, Overlay, PickerKind};
 use crate::theme::Theme;
 
 /// The three top-level tabs, in order.
@@ -23,6 +25,7 @@ pub struct AppDeps {
 
 /// One pipeline run, tagged with the connection it came from (for the provider column).
 pub struct PipeRow {
+    pub connection_id: String,
     pub connection: String,
     pub provider: ProviderType,
     pub run: PipelineRun,
@@ -41,8 +44,137 @@ pub struct App {
     pub status: String,
     pub loading: bool,
     pub show_detail: bool,
+    pub pr_filter: PullRequestFilter,
+    /// Transient one-shot message shown in the footer until the next keypress.
+    pub toast: Option<String>,
+    /// Open modal overlay, if any. When set, keys route here instead of the table.
+    pub overlay: Option<Overlay>,
+    /// Current screen — the list, or a full-screen sub-view like the PR diff.
+    pub screen: Screen,
     pub last_refresh: DateTime<Local>,
     pub should_quit: bool,
+}
+
+/// Full-screen views layered above the list. The large views are boxed so the
+/// common `List` state doesn't bloat every `Screen` value.
+pub enum Screen {
+    List,
+    Diff(Box<DiffView>),
+    Pipeline(Box<PipelineView>),
+}
+
+/// One row of the flattened, collapsible pipeline tree.
+pub struct FlatNode {
+    pub depth: usize,
+    pub label: String,
+    pub status: PipelineRunStatus,
+    /// Collapse key when the node has children; `None` for leaf steps.
+    pub key: Option<String>,
+    pub expanded: bool,
+}
+
+/// State for the full-screen pipeline drill-in (stages → jobs → steps).
+pub struct PipelineView {
+    pub title: String,
+    pub run: PipelineRun,
+    pub connection_id: String,
+    pub definition_id: String,
+    pub branch: Option<String>,
+    collapsed: HashSet<String>,
+    pub selected: usize,
+}
+
+impl PipelineView {
+    pub fn new(title: String, run: PipelineRun, connection_id: String, definition_id: String, branch: Option<String>) -> Self {
+        Self { title, run, connection_id, definition_id, branch, collapsed: HashSet::new(), selected: 0 }
+    }
+
+    /// Flattens stages/jobs/steps into visible rows, honouring collapsed nodes.
+    pub fn flatten(&self) -> Vec<FlatNode> {
+        let mut out = Vec::new();
+        for (si, stage) in self.run.stages.iter().enumerate() {
+            let key = format!("s{si}");
+            let expanded = !self.collapsed.contains(&key);
+            out.push(FlatNode {
+                depth: 0,
+                label: stage.name.clone(),
+                status: stage.status,
+                key: (!stage.jobs.is_empty()).then(|| key.clone()),
+                expanded,
+            });
+            if !expanded {
+                continue;
+            }
+            for (ji, job) in stage.jobs.iter().enumerate() {
+                let jkey = format!("s{si}.j{ji}");
+                let jexpanded = !self.collapsed.contains(&jkey);
+                out.push(FlatNode {
+                    depth: 1,
+                    label: job.name.clone(),
+                    status: job.status,
+                    key: (!job.steps.is_empty()).then(|| jkey.clone()),
+                    expanded: jexpanded,
+                });
+                if jexpanded {
+                    for step in &job.steps {
+                        out.push(FlatNode { depth: 2, label: step.name.clone(), status: step.status, key: None, expanded: false });
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn move_sel(&mut self, delta: isize) {
+        let len = self.flatten().len();
+        if len == 0 {
+            return;
+        }
+        let n = len as isize;
+        self.selected = (((self.selected as isize + delta) % n + n) % n) as usize;
+    }
+
+    /// Expands/collapses the node under the cursor (no-op on leaf steps).
+    fn toggle_selected(&mut self) {
+        if let Some(Some(key)) = self.flatten().get(self.selected).map(|n| n.key.clone()) {
+            if !self.collapsed.remove(&key) {
+                self.collapsed.insert(key);
+            }
+            let len = self.flatten().len();
+            if self.selected >= len {
+                self.selected = len.saturating_sub(1);
+            }
+        }
+    }
+}
+
+/// State for the full-screen PR diff + threads view.
+pub struct DiffView {
+    pub pr_label: String,
+    pub url: Option<String>,
+    pub files: Vec<FileChange>,
+    pub threads: Vec<CommentThread>,
+    pub selected: usize,
+    pub scroll: u16,
+}
+
+impl DiffView {
+    pub fn current(&self) -> Option<&FileChange> {
+        self.files.get(self.selected)
+    }
+
+    fn select_file(&mut self, delta: isize) {
+        if self.files.is_empty() {
+            return;
+        }
+        let n = self.files.len() as isize;
+        self.selected = (((self.selected as isize + delta) % n + n) % n) as usize;
+        self.scroll = 0;
+    }
+
+    fn scroll_by(&mut self, delta: i32) {
+        self.scroll = (self.scroll as i32 + delta).max(0) as u16;
+    }
 }
 
 impl App {
@@ -60,8 +192,21 @@ impl App {
             status: "Loading…".into(),
             loading: true,
             show_detail: false,
+            pr_filter: PullRequestFilter::All,
+            toast: None,
+            overlay: None,
+            screen: Screen::List,
             last_refresh: Local::now(),
             should_quit: false,
+        }
+    }
+
+    /// Human label for the current PR filter (shown in the section title / footer).
+    pub fn pr_filter_label(&self) -> &'static str {
+        match self.pr_filter {
+            PullRequestFilter::All => "all",
+            PullRequestFilter::Mine => "mine",
+            PullRequestFilter::ReviewRequested => "review-requested",
         }
     }
 
@@ -142,54 +287,12 @@ impl App {
         self.status = "Refreshing…".into();
 
         let mut errors: Vec<String> = Vec::new();
-
-        match deps.sections.pull_request_source().await {
-            Ok(Some(src)) => match src.list(&pr_query()).await {
-                Ok(list) => self.prs = list,
-                Err(e) => errors.push(format!("PRs: {e}")),
-            },
-            Ok(None) => self.prs.clear(),
-            Err(e) => errors.push(format!("PRs: {e}")),
-        }
-
-        match deps.sections.work_item_source().await {
-            Ok(Some(src)) => match src.list(&wi_query()).await {
-                Ok(list) => self.wis = list,
-                Err(e) => errors.push(format!("Work items: {e}")),
-            },
-            Ok(None) => self.wis.clear(),
-            Err(e) => errors.push(format!("Work items: {e}")),
-        }
-
-        self.pipes.clear();
-        match deps.sections.pipeline_feeds().await {
-            Ok(feeds) => {
-                for feed in feeds {
-                    let provider = feed.connection.provider_type();
-                    let name = feed.connection.display_name().to_string();
-                    let queries = feed_queries(&feed.subscription);
-                    for q in queries {
-                        match feed.source.list_runs(&q).await {
-                            Ok(runs) => {
-                                for run in runs {
-                                    self.pipes.push(PipeRow { connection: name.clone(), provider, run });
-                                }
-                            }
-                            Err(e) => errors.push(format!("Pipelines ({name}): {e}")),
-                        }
-                    }
-                }
-            }
-            Err(e) => errors.push(format!("Pipelines: {e}")),
-        }
-
+        self.reload_pull_requests(deps, &mut errors).await;
+        self.reload_work_items(deps, &mut errors).await;
+        self.reload_pipelines(deps, &mut errors).await;
         self.health = deps.health.check_all().await;
 
-        self.clamp_selection();
-        self.wi_state.select((!self.wis.is_empty()).then_some(self.wi_state.selected().unwrap_or(0)));
-        self.pipe_state.select((!self.pipes.is_empty()).then_some(self.pipe_state.selected().unwrap_or(0)));
-        self.pr_state.select((!self.prs.is_empty()).then_some(self.pr_state.selected().unwrap_or(0)));
-
+        self.fix_selection();
         self.last_refresh = Local::now();
         self.loading = false;
         self.status = if errors.is_empty() {
@@ -199,12 +302,109 @@ impl App {
         };
     }
 
+    async fn reload_pull_requests(&mut self, deps: &AppDeps, errors: &mut Vec<String>) {
+        match deps.sections.pull_request_source().await {
+            Ok(Some(src)) => match src.list(&pr_query(self.pr_filter)).await {
+                Ok(list) => self.prs = list,
+                Err(e) => errors.push(format!("PRs: {e}")),
+            },
+            Ok(None) => self.prs.clear(),
+            Err(e) => errors.push(format!("PRs: {e}")),
+        }
+    }
+
+    async fn reload_work_items(&mut self, deps: &AppDeps, errors: &mut Vec<String>) {
+        match deps.sections.work_item_source().await {
+            Ok(Some(src)) => match src.list(&wi_query()).await {
+                Ok(list) => self.wis = list,
+                Err(e) => errors.push(format!("Work items: {e}")),
+            },
+            Ok(None) => self.wis.clear(),
+            Err(e) => errors.push(format!("Work items: {e}")),
+        }
+    }
+
+    async fn reload_pipelines(&mut self, deps: &AppDeps, errors: &mut Vec<String>) {
+        self.pipes.clear();
+        match deps.sections.pipeline_feeds().await {
+            Ok(feeds) => {
+                for feed in feeds {
+                    let provider = feed.connection.provider_type();
+                    let name = feed.connection.display_name().to_string();
+                    let conn_id = feed.connection.connection_id().to_string();
+                    for q in feed_queries(&feed.subscription) {
+                        match feed.source.list_runs(&q).await {
+                            Ok(runs) => {
+                                for run in runs {
+                                    self.pipes.push(PipeRow { connection_id: conn_id.clone(), connection: name.clone(), provider, run });
+                                }
+                            }
+                            Err(e) => errors.push(format!("Pipelines ({name}): {e}")),
+                        }
+                    }
+                }
+            }
+            Err(e) => errors.push(format!("Pipelines: {e}")),
+        }
+    }
+
+    /// Re-selects a valid row per tab after the underlying data changed.
+    fn fix_selection(&mut self) {
+        self.clamp_selection();
+        self.pr_state.select((!self.prs.is_empty()).then_some(self.pr_state.selected().unwrap_or(0)));
+        self.wi_state.select((!self.wis.is_empty()).then_some(self.wi_state.selected().unwrap_or(0)));
+        self.pipe_state.select((!self.pipes.is_empty()).then_some(self.pipe_state.selected().unwrap_or(0)));
+    }
+
+    /// Cycles the PR filter, reloads just the PR list, and toasts the new filter.
+    async fn cycle_pr_filter(&mut self, deps: &AppDeps) {
+        self.pr_filter = match self.pr_filter {
+            PullRequestFilter::All => PullRequestFilter::Mine,
+            PullRequestFilter::Mine => PullRequestFilter::ReviewRequested,
+            PullRequestFilter::ReviewRequested => PullRequestFilter::All,
+        };
+        let mut errors = Vec::new();
+        self.reload_pull_requests(deps, &mut errors).await;
+        self.pr_state.select((!self.prs.is_empty()).then_some(0));
+        self.show_detail = false;
+        self.toast = Some(match errors.first() {
+            Some(e) => e.clone(),
+            None => format!("Filter: {} ({} PRs)", self.pr_filter_label(), self.prs.len()),
+        });
+    }
+
     // ---- key handling ----
 
-    /// Returns after applying the key. `deps` is used for async refresh / theme persistence.
+    /// Applies a key. `deps` is used for async refresh / actions / theme persistence.
     pub async fn on_key(&mut self, key: Key, deps: &AppDeps) {
+        // Ctrl-C hard-quits from any mode.
+        if key == Key::Quit {
+            self.should_quit = true;
+            return;
+        }
+        // Any keypress dismisses the previous one-shot toast.
+        self.toast = None;
+
+        // An open overlay swallows all input until it resolves.
+        if self.overlay.is_some() {
+            self.on_overlay_key(key, deps).await;
+            return;
+        }
+
+        // Full-screen sub-views handle their own keys.
+        match self.screen {
+            Screen::Diff(_) => {
+                self.on_diff_key(key);
+                return;
+            }
+            Screen::Pipeline(_) => {
+                self.on_pipeline_key(key);
+                return;
+            }
+            Screen::List => {}
+        }
+
         match key {
-            Key::Quit => self.should_quit = true,
             Key::Escape => {
                 if self.show_detail {
                     self.show_detail = false;
@@ -215,26 +415,420 @@ impl App {
             Key::Left => self.switch_tab(-1),
             Key::Right => self.switch_tab(1),
             Key::Tab => self.switch_tab(1),
-            Key::Num(n) => self.set_tab(n),
             Key::Up => self.move_up(),
             Key::Down => self.move_down(),
             Key::Enter => {
-                if self.selected().is_some() {
+                if self.active == 2 {
+                    self.open_pipeline(deps).await;
+                } else if self.selected().is_some() {
                     self.show_detail = !self.show_detail;
                 }
             }
-            Key::Refresh => self.reload_all(deps).await,
-            Key::Theme => {
+            Key::Char(c) => self.on_char(c, deps).await,
+            Key::Backspace | Key::PageUp | Key::PageDown | Key::Quit | Key::None => {}
+        }
+    }
+
+    /// Normal-mode character commands.
+    async fn on_char(&mut self, c: char, deps: &AppDeps) {
+        match c {
+            'q' => self.should_quit = true,
+            'j' => self.move_down(),
+            'k' => self.move_up(),
+            'h' => self.switch_tab(-1),
+            'l' => self.switch_tab(1),
+            '1'..='3' => self.set_tab(c as usize - '1' as usize),
+            'r' => self.reload_all(deps).await,
+            't' => {
                 let next = Theme::next(self.theme.name);
                 self.theme = Theme::by_name(next);
                 let _ = deps.config.set_theme(Some(next.to_string())).await;
             }
-            Key::None => {}
+            'o' => self.open_selected(),
+            'f' if self.active == 0 => self.cycle_pr_filter(deps).await,
+            // PR write actions (Pull Requests tab only; each no-ops off-tab).
+            'a' => self.open_pr_vote(ReviewVote::Approved),
+            'x' => self.open_pr_vote(ReviewVote::Rejected),
+            'm' => self.open_pr_merge(),
+            'd' => self.open_diff(deps).await,
+            // Work-item actions (Work Items tab only).
+            's' => self.open_wi_state(),
+            // Pipeline trigger (Pipelines tab).
+            'T' if self.active == 2 => self.open_pipeline_trigger(),
+            // Comment is offered on both PR and work-item tabs.
+            'c' => match self.active {
+                0 => self.open_pr_comment(),
+                1 => self.open_wi_comment(),
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+
+    /// Key handling while the full-screen diff view is open.
+    fn on_diff_key(&mut self, key: Key) {
+        let Screen::Diff(diff) = &mut self.screen else { return };
+        match key {
+            Key::Escape => self.screen = Screen::List,
+            Key::Char('q') => self.should_quit = true,
+            Key::Char('o') => self.open_selected(),
+            Key::Up | Key::Char('k') => diff.select_file(-1),
+            Key::Down | Key::Char('j') => diff.select_file(1),
+            Key::PageDown | Key::Char(' ') => diff.scroll_by(10),
+            Key::PageUp | Key::Char('b') => diff.scroll_by(-10),
+            _ => {}
+        }
+    }
+
+    async fn open_diff(&mut self, deps: &AppDeps) {
+        let Some(pr) = self.selected_pr() else { return };
+        let id = pr.id.clone();
+        let label = pr_label(pr);
+        let url = pr.url.clone();
+        let source = match deps.sections.pull_request_source().await {
+            Ok(Some(s)) => s,
+            _ => {
+                self.toast = Some("No pull-request provider is bound".into());
+                return;
+            }
+        };
+        let files = match source.changes(&id).await {
+            Ok(f) => f,
+            Err(e) => {
+                self.toast = Some(format!("Diff failed: {e}"));
+                return;
+            }
+        };
+        let threads = source.threads(&id).await.unwrap_or_default();
+        self.screen = Screen::Diff(Box::new(DiffView { pr_label: label, url, files, threads, selected: 0, scroll: 0 }));
+    }
+
+    // ---- pipeline drill-in + trigger ----
+
+    fn selected_pipe(&self) -> Option<&PipeRow> {
+        if self.active != 2 {
+            return None;
+        }
+        self.pipe_state.selected().and_then(|i| self.pipes.get(i))
+    }
+
+    async fn open_pipeline(&mut self, deps: &AppDeps) {
+        let Some(pipe) = self.selected_pipe() else { return };
+        let conn_id = pipe.connection_id.clone();
+        let run_id = pipe.run.id.clone();
+        let definition_id = pipe.run.definition_id.clone();
+        let branch = pipe.run.branch.clone();
+        let title = pipe_label(pipe);
+        let fallback = pipe.run.clone();
+
+        // Enrich with full stages/jobs/steps via get_run (list_runs may be shallow).
+        let feeds = deps.sections.pipeline_feeds().await.unwrap_or_default();
+        let run = match feeds.iter().find(|f| f.connection.connection_id() == conn_id) {
+            Some(feed) => feed.source.get_run(&run_id).await.unwrap_or(fallback),
+            None => fallback,
+        };
+
+        self.screen = Screen::Pipeline(Box::new(PipelineView::new(title, run, conn_id, definition_id, branch)));
+    }
+
+    fn on_pipeline_key(&mut self, key: Key) {
+        match key {
+            Key::Escape => self.screen = Screen::List,
+            Key::Char('q') => self.should_quit = true,
+            Key::Char('T') => self.open_pipeline_trigger(),
+            Key::Char('o') => self.open_selected(),
+            other => {
+                if let Screen::Pipeline(view) = &mut self.screen {
+                    match other {
+                        Key::Up | Key::Char('k') => view.move_sel(-1),
+                        Key::Down | Key::Char('j') => view.move_sel(1),
+                        Key::Enter | Key::Char(' ') | Key::Right | Key::Left => view.toggle_selected(),
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    /// The pipeline to trigger — from the drill-in view if open, else the selected list row.
+    fn pipeline_target(&self) -> Option<(String, String, Option<String>, String)> {
+        if let Screen::Pipeline(v) = &self.screen {
+            return Some((v.connection_id.clone(), v.definition_id.clone(), v.branch.clone(), v.title.clone()));
+        }
+        let pipe = self.selected_pipe()?;
+        Some((pipe.connection_id.clone(), pipe.run.definition_id.clone(), pipe.run.branch.clone(), pipe_label(pipe)))
+    }
+
+    fn open_pipeline_trigger(&mut self) {
+        let Some((connection_id, definition_id, branch, label)) = self.pipeline_target() else { return };
+        let message = match &branch {
+            Some(b) => format!("Trigger {label} on {b}?"),
+            None => format!("Trigger {label}?"),
+        };
+        self.overlay = Some(Overlay::Confirm {
+            title: "Trigger".into(),
+            message,
+            action: Action::PipelineTrigger { connection_id, definition_id, branch, label },
+        });
+    }
+
+    async fn execute_pipeline_action(&mut self, action: Action, deps: &AppDeps) {
+        let Action::PipelineTrigger { connection_id, definition_id, branch, label } = action else { return };
+        let feeds = match deps.sections.pipeline_feeds().await {
+            Ok(f) => f,
+            Err(e) => {
+                self.toast = Some(format!("Trigger failed: {e}"));
+                return;
+            }
+        };
+        let Some(feed) = feeds.iter().find(|f| f.connection.connection_id() == connection_id) else {
+            self.toast = Some("Pipeline connection not found".into());
+            return;
+        };
+        match feed.source.trigger(&definition_id, branch.as_deref()).await {
+            Ok(()) => {
+                self.toast = Some(format!("Triggered {label}"));
+                let mut errors = Vec::new();
+                self.reload_pipelines(deps, &mut errors).await;
+                self.fix_selection();
+                if let Some(e) = errors.first() {
+                    self.toast = Some(e.clone());
+                }
+            }
+            Err(e) => self.toast = Some(format!("Trigger failed: {e}")),
+        }
+    }
+
+    async fn on_overlay_key(&mut self, key: Key, deps: &AppDeps) {
+        let Some(mut overlay) = self.overlay.take() else { return };
+        match overlay.handle(key) {
+            Outcome::Keep => self.overlay = Some(overlay),
+            Outcome::Cancel => self.toast = Some("Cancelled".into()),
+            Outcome::Submit(action) => self.execute_action(action, deps).await,
+        }
+    }
+
+    // ---- open in browser ----
+
+    /// The web URL of whatever is in focus — the open sub-view, else the selected row.
+    fn selected_url(&self) -> Option<String> {
+        match &self.screen {
+            Screen::Diff(v) => return v.url.clone(),
+            Screen::Pipeline(v) => return v.run.url.clone(),
+            Screen::List => {}
+        }
+        match self.active {
+            0 => self.selected_pr().and_then(|p| p.url.clone()),
+            1 => self.selected_wi().and_then(|w| w.url.clone()),
+            2 => self.selected_pipe().and_then(|p| p.run.url.clone()),
+            _ => None,
+        }
+    }
+
+    fn open_selected(&mut self) {
+        match self.selected_url() {
+            Some(url) => {
+                self.toast = Some(match open::that(&url) {
+                    Ok(()) => format!("Opened {url}"),
+                    Err(e) => format!("Couldn't open browser: {e}"),
+                });
+            }
+            None => self.toast = Some("No web URL for this item".into()),
+        }
+    }
+
+    // ---- PR write actions ----
+
+    fn selected_pr(&self) -> Option<&PullRequest> {
+        if self.active != 0 {
+            return None;
+        }
+        self.pr_state.selected().and_then(|i| self.prs.get(i))
+    }
+
+    fn open_pr_vote(&mut self, vote: ReviewVote) {
+        let Some(pr) = self.selected_pr() else { return };
+        let verb = match vote {
+            ReviewVote::Approved => "Approve",
+            ReviewVote::Rejected => "Request changes on",
+            _ => "Vote on",
+        };
+        let message = format!("{verb} {}?", pr_label(pr));
+        self.overlay = Some(Overlay::Confirm { title: "Review".into(), message, action: Action::PrVote(vote) });
+    }
+
+    fn open_pr_merge(&mut self) {
+        let Some(pr) = self.selected_pr() else { return };
+        let title = format!("Merge {} via", pr_label(pr));
+        self.overlay = Some(Overlay::Picker {
+            title,
+            items: vec!["Merge commit".into(), "Squash".into(), "Rebase".into()],
+            selected: 0,
+            kind: PickerKind::PrMergeStrategy,
+        });
+    }
+
+    fn open_pr_comment(&mut self) {
+        let Some(pr) = self.selected_pr() else { return };
+        let title = format!("Comment on {}", pr_label(pr));
+        self.overlay = Some(Overlay::Input { title, buffer: String::new(), kind: InputKind::PrComment });
+    }
+
+    async fn execute_action(&mut self, action: Action, deps: &AppDeps) {
+        match action {
+            Action::PrVote(_) | Action::PrMerge(_) | Action::PrComment(_) => self.execute_pr_action(action, deps).await,
+            Action::WiSetState(_) | Action::WiComment(_) => self.execute_wi_action(action, deps).await,
+            Action::PipelineTrigger { .. } => self.execute_pipeline_action(action, deps).await,
+        }
+    }
+
+    async fn execute_pr_action(&mut self, action: Action, deps: &AppDeps) {
+        let Some(id) = self.selected_pr().map(|p| p.id.clone()) else {
+            self.toast = Some("Nothing selected".into());
+            return;
+        };
+        let source = match deps.sections.pull_request_source().await {
+            Ok(Some(s)) => s,
+            _ => {
+                self.toast = Some("No pull-request provider is bound".into());
+                return;
+            }
+        };
+
+        let result = match &action {
+            Action::PrVote(vote) => source.vote(&id, *vote).await.map(|_| vote_message(*vote).to_string()),
+            Action::PrMerge(strategy) => source
+                .merge(&id, &MergeOptions { strategy: *strategy, delete_source_ref: false })
+                .await
+                .map(|_| format!("Merged ({strategy:?})")),
+            Action::PrComment(text) => {
+                if text.trim().is_empty() {
+                    self.toast = Some("Empty comment — nothing sent".into());
+                    return;
+                }
+                source.add_comment(&id, text).await.map(|_| "Comment added".to_string())
+            }
+            _ => return,
+        };
+
+        match result {
+            Ok(msg) => {
+                self.toast = Some(msg);
+                let mut errors = Vec::new();
+                self.reload_pull_requests(deps, &mut errors).await;
+                self.fix_selection();
+                if let Some(e) = errors.first() {
+                    self.toast = Some(e.clone());
+                }
+            }
+            Err(e) => self.toast = Some(format!("Failed: {e}")),
+        }
+    }
+
+    // ---- work-item write actions ----
+
+    fn selected_wi(&self) -> Option<&WorkItem> {
+        if self.active != 1 {
+            return None;
+        }
+        self.wi_state.selected().and_then(|i| self.wis.get(i))
+    }
+
+    fn open_wi_state(&mut self) {
+        let Some(wi) = self.selected_wi() else { return };
+        let current = wi.state.clone();
+        let title = format!("Set state — {}", wi_label(wi));
+        // Offer the real state names seen across the current items (provider-accurate);
+        // fall back to a generic set if we can't infer at least two.
+        let mut states: Vec<String> = self.wis.iter().map(|w| w.state.clone()).collect();
+        states.sort();
+        states.dedup();
+        if states.len() < 2 {
+            states = vec!["Todo".into(), "In Progress".into(), "Done".into()];
+        }
+        let selected = states.iter().position(|s| *s == current).unwrap_or(0);
+        self.overlay = Some(Overlay::Picker { title, items: states, selected, kind: PickerKind::WorkItemState });
+    }
+
+    fn open_wi_comment(&mut self) {
+        let Some(wi) = self.selected_wi() else { return };
+        let title = format!("Comment on {}", wi_label(wi));
+        self.overlay = Some(Overlay::Input { title, buffer: String::new(), kind: InputKind::WorkItemComment });
+    }
+
+    async fn execute_wi_action(&mut self, action: Action, deps: &AppDeps) {
+        let Some(id) = self.selected_wi().map(|w| w.id.clone()) else {
+            self.toast = Some("Nothing selected".into());
+            return;
+        };
+        let source = match deps.sections.work_item_source().await {
+            Ok(Some(s)) => s,
+            _ => {
+                self.toast = Some("No work-item provider is bound".into());
+                return;
+            }
+        };
+
+        let result = match &action {
+            Action::WiSetState(state) => source.set_state(&id, state).await.map(|_| format!("State → {state}")),
+            Action::WiComment(text) => {
+                if text.trim().is_empty() {
+                    self.toast = Some("Empty comment — nothing sent".into());
+                    return;
+                }
+                source.add_comment(&id, text).await.map(|_| "Comment added".to_string())
+            }
+            _ => return,
+        };
+
+        match result {
+            Ok(msg) => {
+                self.toast = Some(msg);
+                let mut errors = Vec::new();
+                self.reload_work_items(deps, &mut errors).await;
+                self.fix_selection();
+                if let Some(e) = errors.first() {
+                    self.toast = Some(e.clone());
+                }
+            }
+            Err(e) => self.toast = Some(format!("Failed: {e}")),
         }
     }
 }
 
-/// Semantic key events the loop feeds into [`App::on_key`].
+fn wi_label(wi: &WorkItem) -> String {
+    let id = wi.identifier.clone().map(|i| format!("{i} ")).unwrap_or_default();
+    let title: String = wi.title.chars().take(40).collect();
+    format!("{id}— {title}")
+}
+
+fn pipe_label(pipe: &PipeRow) -> String {
+    let name = pipe.run.name.clone().unwrap_or_else(|| pipe.run.definition_id.clone());
+    match pipe.run.number {
+        Some(n) => format!("{name} #{n}"),
+        None => name,
+    }
+}
+
+fn pr_label(pr: &PullRequest) -> String {
+    let num = pr.number.map(|n| format!("#{n} ")).unwrap_or_default();
+    let title: String = pr.title.chars().take(40).collect();
+    format!("PR {num}— {title}")
+}
+
+fn vote_message(vote: ReviewVote) -> &'static str {
+    match vote {
+        ReviewVote::Approved => "Approved",
+        ReviewVote::ApprovedWithSuggestions => "Approved with suggestions",
+        ReviewVote::Rejected => "Requested changes",
+        ReviewVote::WaitingForAuthor => "Waiting for author",
+        ReviewVote::NoVote => "Vote reset",
+    }
+}
+
+/// Semantic key events the loop feeds into [`App::on_key`]. Character keys keep
+/// their raw value so the app can treat them as navigation in normal mode or as
+/// literal text while an input overlay is open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Key {
     Up,
@@ -244,15 +838,17 @@ pub enum Key {
     Tab,
     Enter,
     Escape,
-    Refresh,
-    Theme,
+    Backspace,
+    PageUp,
+    PageDown,
+    Char(char),
+    /// Hard quit (Ctrl-C), honoured in every mode.
     Quit,
-    Num(usize),
     None,
 }
 
-fn pr_query() -> PullRequestQuery {
-    PullRequestQuery { filter: PullRequestFilter::All, include_completed: false, limit: Some(50) }
+fn pr_query(filter: PullRequestFilter) -> PullRequestQuery {
+    PullRequestQuery { filter, include_completed: false, limit: Some(50) }
 }
 
 fn wi_query() -> WorkItemQuery {
@@ -268,5 +864,84 @@ fn feed_queries(sub: &forgetop_core::config::PipelineSubscription) -> Vec<Pipeli
             .iter()
             .map(|id| PipelineRunQuery { definition_id: Some(id.clone()), branch: None, limit: Some(10) })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pr(url: Option<&str>) -> PullRequest {
+        PullRequest {
+            id: "1".into(),
+            number: Some(1),
+            title: "t".into(),
+            description: None,
+            author: User { id: "a".into(), display_name: "A".into(), handle: None, avatar_url: None },
+            status: PullRequestStatus::Open,
+            is_draft: false,
+            source_ref: None,
+            target_ref: None,
+            reviewers: vec![],
+            labels: vec![],
+            checks: CheckStatus::None,
+            check_summary: None,
+            mergeable: MergeableState::Unknown,
+            changed_files: 0,
+            additions: 0,
+            deletions: 0,
+            created_at: None,
+            updated_at: None,
+            url: url.map(Into::into),
+        }
+    }
+
+    fn wi(url: Option<&str>) -> WorkItem {
+        WorkItem {
+            id: "w".into(),
+            identifier: None,
+            title: "t".into(),
+            description: None,
+            state: "Todo".into(),
+            state_category: WorkItemStateCategory::Backlog,
+            work_item_type: None,
+            assignee: None,
+            created_at: None,
+            updated_at: None,
+            url: url.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn selected_url_reads_active_tab_and_subview() {
+        let mut app = App::new("slate");
+        app.prs.push(pr(Some("http://pr")));
+        app.pr_state.select(Some(0));
+        app.active = 0;
+        assert_eq!(app.selected_url().as_deref(), Some("http://pr"));
+
+        app.wis.push(wi(Some("http://wi")));
+        app.wi_state.select(Some(0));
+        app.active = 1;
+        assert_eq!(app.selected_url().as_deref(), Some("http://wi"));
+
+        // An open sub-view takes precedence over the active tab.
+        app.screen = Screen::Diff(Box::new(DiffView {
+            pr_label: "x".into(),
+            url: Some("http://diff".into()),
+            files: vec![],
+            threads: vec![],
+            selected: 0,
+            scroll: 0,
+        }));
+        assert_eq!(app.selected_url().as_deref(), Some("http://diff"));
+    }
+
+    #[test]
+    fn selected_url_is_none_when_item_has_no_url() {
+        let mut app = App::new("slate");
+        app.prs.push(pr(None));
+        app.pr_state.select(Some(0));
+        assert_eq!(app.selected_url(), None);
     }
 }
