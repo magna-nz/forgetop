@@ -170,6 +170,12 @@ impl ConfigService {
         cfg.ui.theme = theme;
         self.persist(cfg).await
     }
+
+    pub async fn set_hidden_sections(&self, hidden: Vec<Section>) -> Result<()> {
+        let mut cfg = self.snapshot();
+        cfg.ui.hidden_sections = hidden;
+        self.persist(cfg).await
+    }
 }
 
 /// Turns a configured connection id into a live [`ProviderConnection`].

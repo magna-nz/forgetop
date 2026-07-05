@@ -2,7 +2,7 @@
 //! When an overlay is open, the app routes every key to it via [`Overlay::handle`]
 //! instead of the table, so there's no ambiguity between typing and navigation.
 
-use forgetop_core::domain::ReviewVote;
+use forgetop_core::domain::{ReviewVote, Section};
 use forgetop_core::provider::MergeStrategy;
 
 use crate::app::Key;
@@ -17,6 +17,14 @@ pub enum Action {
     WiComment(String),
     PipelineTrigger { connection_id: String, definition_id: String, branch: Option<String>, label: String },
     RemoveConnection { id: String, label: String },
+    SetVisibleSections(Vec<Section>),
+}
+
+/// One row of a [`Overlay::Toggle`] checklist.
+pub struct ToggleItem {
+    pub section: Section,
+    pub label: String,
+    pub on: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -35,6 +43,7 @@ pub enum Overlay {
     Confirm { title: String, message: String, action: Action },
     Picker { title: String, items: Vec<String>, selected: usize, kind: PickerKind },
     Input { title: String, buffer: String, kind: InputKind },
+    Toggle { title: String, items: Vec<ToggleItem>, selected: usize },
 }
 
 /// What the app should do after feeding a key to the overlay.
@@ -50,7 +59,10 @@ pub enum Outcome {
 impl Overlay {
     pub fn title(&self) -> &str {
         match self {
-            Overlay::Confirm { title, .. } | Overlay::Picker { title, .. } | Overlay::Input { title, .. } => title,
+            Overlay::Confirm { title, .. }
+            | Overlay::Picker { title, .. }
+            | Overlay::Input { title, .. }
+            | Overlay::Toggle { title, .. } => title,
         }
     }
 
@@ -60,6 +72,7 @@ impl Overlay {
             Overlay::Confirm { .. } => vec![("y", "confirm"), ("Esc", "cancel")],
             Overlay::Picker { .. } => vec![("↑↓", "choose"), ("↵", "select"), ("Esc", "cancel")],
             Overlay::Input { .. } => vec![("Esc", "cancel"), ("↵", "submit")],
+            Overlay::Toggle { .. } => vec![("↑↓", "move"), ("space", "toggle"), ("Esc", "apply")],
         }
     }
 
@@ -98,6 +111,39 @@ impl Overlay {
                 }
                 Key::Enter => Outcome::Submit(resolve_input(*kind, buffer.clone())),
                 Key::Escape => Outcome::Cancel,
+                _ => Outcome::Keep,
+            },
+            Overlay::Toggle { items, selected, .. } => match key {
+                Key::Up | Key::Char('k') => {
+                    if !items.is_empty() {
+                        *selected = (*selected + items.len() - 1) % items.len();
+                    }
+                    Outcome::Keep
+                }
+                Key::Down | Key::Char('j') => {
+                    if !items.is_empty() {
+                        *selected = (*selected + 1) % items.len();
+                    }
+                    Outcome::Keep
+                }
+                Key::Char(' ') | Key::Enter => {
+                    let on_count = items.iter().filter(|i| i.on).count();
+                    if let Some(item) = items.get_mut(*selected) {
+                        // Keep at least one section visible.
+                        if item.on {
+                            if on_count > 1 {
+                                item.on = false;
+                            }
+                        } else {
+                            item.on = true;
+                        }
+                    }
+                    Outcome::Keep
+                }
+                Key::Escape => {
+                    let visible = items.iter().filter(|i| i.on).map(|i| i.section).collect();
+                    Outcome::Submit(Action::SetVisibleSections(visible))
+                }
                 _ => Outcome::Keep,
             },
         }
@@ -179,6 +225,40 @@ mod tests {
         match o.handle(Key::Enter) {
             Outcome::Submit(Action::WiComment(text)) => assert_eq!(text, "needs tests"),
             _ => panic!("expected WiComment"),
+        }
+    }
+
+    #[test]
+    fn toggle_keeps_one_on_and_submits_visible_sections() {
+        let mut o = Overlay::Toggle {
+            title: "".into(),
+            items: vec![
+                ToggleItem { section: Section::PullRequests, label: "PR".into(), on: true },
+                ToggleItem { section: Section::WorkItems, label: "WI".into(), on: true },
+                ToggleItem { section: Section::Pipelines, label: "Pipe".into(), on: true },
+            ],
+            selected: 1,
+        };
+        o.handle(Key::Char(' ')); // turn Work Items off
+        match o.handle(Key::Escape) {
+            Outcome::Submit(Action::SetVisibleSections(v)) => {
+                assert_eq!(v, vec![Section::PullRequests, Section::Pipelines]);
+            }
+            _ => panic!("expected SetVisibleSections"),
+        }
+    }
+
+    #[test]
+    fn toggle_refuses_to_hide_the_last_visible_section() {
+        let mut o = Overlay::Toggle {
+            title: "".into(),
+            items: vec![ToggleItem { section: Section::PullRequests, label: "PR".into(), on: true }],
+            selected: 0,
+        };
+        o.handle(Key::Char(' ')); // would hide the only one — ignored
+        match o.handle(Key::Escape) {
+            Outcome::Submit(Action::SetVisibleSections(v)) => assert_eq!(v, vec![Section::PullRequests]),
+            _ => panic!("expected SetVisibleSections"),
         }
     }
 

@@ -29,6 +29,7 @@ pub async fn run(deps: AppDeps, theme_name: &str) -> Result<()> {
     let mut terminal = setup_terminal().map_err(forgetop_core::Error::from)?;
 
     let mut app = App::new(theme_name);
+    app.apply_hidden_sections(&deps.config.snapshot().ui.hidden_sections);
     app.reload_all(&deps).await;
 
     let result = event_loop(&mut terminal, &mut app, &deps).await;

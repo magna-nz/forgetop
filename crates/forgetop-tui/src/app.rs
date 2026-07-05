@@ -9,9 +9,26 @@ use forgetop_core::provider::*;
 use forgetop_core::service::{ConfigService, ConnectionHealth, ConnectionHealthService, SectionService};
 use ratatui::widgets::TableState;
 
-use crate::overlay::{Action, InputKind, Outcome, Overlay, PickerKind};
+use crate::overlay::{Action, InputKind, Outcome, Overlay, PickerKind, ToggleItem};
 use crate::theme::Theme;
 use crate::wizard::{section_label, Wizard, WizardOutcome};
+
+/// The section index behind each tab position (0 = Pull Requests, 1 = Work Items, 2 = Pipelines).
+fn section_of(index: usize) -> Section {
+    match index {
+        0 => Section::PullRequests,
+        1 => Section::WorkItems,
+        _ => Section::Pipelines,
+    }
+}
+
+fn index_of(section: Section) -> usize {
+    match section {
+        Section::PullRequests => 0,
+        Section::WorkItems => 1,
+        Section::Pipelines => 2,
+    }
+}
 
 /// The three top-level tabs, in order.
 pub const TABS: [&str; 3] = ["Pull Requests", "Work Items", "Pipelines"];
@@ -42,6 +59,8 @@ pub struct App {
     pub wi_state: TableState,
     pub pipe_state: TableState,
     pub health: Vec<ConnectionHealth>,
+    /// Which sections are shown in the tab bar, indexed by section (0=PR,1=WI,2=Pipelines).
+    pub visible: [bool; 3],
     pub status: String,
     pub loading: bool,
     pub show_detail: bool,
@@ -218,6 +237,7 @@ impl App {
             wi_state: TableState::default(),
             pipe_state: TableState::default(),
             health: Vec::new(),
+            visible: [true; 3],
             status: "Loading…".into(),
             loading: true,
             show_detail: false,
@@ -295,18 +315,47 @@ impl App {
         self.active_state().select(Some(next));
     }
 
+    /// Section indices currently shown in the tab bar, in order.
+    pub fn visible_indices(&self) -> Vec<usize> {
+        (0..TABS.len()).filter(|i| self.visible[*i]).collect()
+    }
+
+    fn first_visible(&self) -> usize {
+        self.visible_indices().first().copied().unwrap_or(0)
+    }
+
     pub fn switch_tab(&mut self, delta: isize) {
-        let n = TABS.len() as isize;
-        self.active = (((self.active as isize + delta) % n + n) % n) as usize;
+        let vis = self.visible_indices();
+        if vis.is_empty() {
+            return;
+        }
+        let pos = vis.iter().position(|&i| i == self.active).unwrap_or(0) as isize;
+        let n = vis.len() as isize;
+        self.active = vis[(((pos + delta) % n + n) % n) as usize];
         self.show_detail = false;
         self.clamp_selection();
     }
 
+    /// Jumps to the Nth *visible* tab (0-based), for the number keys.
     pub fn set_tab(&mut self, idx: usize) {
-        if idx < TABS.len() {
-            self.active = idx;
+        if let Some(&section) = self.visible_indices().get(idx) {
+            self.active = section;
             self.show_detail = false;
             self.clamp_selection();
+        }
+    }
+
+    /// Applies persisted hidden-section preferences at startup.
+    pub fn apply_hidden_sections(&mut self, hidden: &[Section]) {
+        self.visible = [true; 3];
+        for section in hidden {
+            self.visible[index_of(*section)] = false;
+        }
+        if !self.visible.iter().any(|v| *v) {
+            self.visible[0] = true;
+        }
+        if !self.visible[self.active] {
+            self.active = self.first_visible();
         }
     }
 
@@ -484,6 +533,7 @@ impl App {
             }
             'o' => self.open_selected(),
             'n' => self.start_add_connection(),
+            'v' => self.open_sections_toggle(),
             'C' => self.open_config(deps).await,
             'f' if self.active == 0 => self.cycle_pr_filter(deps).await,
             // PR write actions (Pull Requests tab only; each no-ops off-tab).
@@ -743,6 +793,34 @@ impl App {
         self.rebuild_config_view(deps).await;
     }
 
+    // ---- visible tabs ----
+
+    fn open_sections_toggle(&mut self) {
+        let items = (0..TABS.len())
+            .map(|i| ToggleItem { section: section_of(i), label: TABS[i].to_string(), on: self.visible[i] })
+            .collect();
+        self.overlay = Some(Overlay::Toggle { title: "Visible tabs".into(), items, selected: 0 });
+    }
+
+    async fn apply_visible_sections(&mut self, visible: Vec<Section>, deps: &AppDeps) {
+        let mut vis = [false; 3];
+        for section in &visible {
+            vis[index_of(*section)] = true;
+        }
+        if !vis.iter().any(|v| *v) {
+            vis[0] = true;
+        }
+        self.visible = vis;
+        if !self.visible[self.active] {
+            self.active = self.first_visible();
+            self.show_detail = false;
+            self.clamp_selection();
+        }
+        let hidden: Vec<Section> = (0..3).filter(|i| !self.visible[*i]).map(section_of).collect();
+        let _ = deps.config.set_hidden_sections(hidden).await;
+        self.toast = Some("Updated visible tabs".into());
+    }
+
     // ---- config / connections screen ----
 
     async fn open_config(&mut self, deps: &AppDeps) {
@@ -912,6 +990,7 @@ impl App {
             Action::WiSetState(_) | Action::WiComment(_) => self.execute_wi_action(action, deps).await,
             Action::PipelineTrigger { .. } => self.execute_pipeline_action(action, deps).await,
             Action::RemoveConnection { .. } => self.execute_config_action(action, deps).await,
+            Action::SetVisibleSections(visible) => self.apply_visible_sections(visible, deps).await,
         }
     }
 
@@ -1176,5 +1255,30 @@ mod tests {
         app.prs.push(pr(None));
         app.pr_state.select(Some(0));
         assert_eq!(app.selected_url(), None);
+    }
+
+    #[test]
+    fn hiding_a_section_skips_it_in_tabs_and_navigation() {
+        let mut app = App::new("slate");
+        app.apply_hidden_sections(&[Section::WorkItems]);
+        assert_eq!(app.visible_indices(), vec![0, 2]);
+
+        app.active = 0;
+        app.switch_tab(1); // PR -> Pipelines, skipping the hidden Work Items
+        assert_eq!(app.active, 2);
+        app.switch_tab(1); // wraps back to PR
+        assert_eq!(app.active, 0);
+
+        app.set_tab(1); // 2nd visible tab is Pipelines
+        assert_eq!(app.active, 2);
+    }
+
+    #[test]
+    fn hiding_the_active_section_falls_back_to_first_visible() {
+        let mut app = App::new("slate");
+        app.active = 1; // Work Items
+        app.apply_hidden_sections(&[Section::WorkItems]);
+        assert!(!app.visible[1]);
+        assert_eq!(app.active, 0);
     }
 }

@@ -57,21 +57,22 @@ fn render_tabs(frame: &mut Frame, area: Rect, app: &App) {
         .title(Span::styled(" ▟ forgetop ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)))
         .title_top(Line::from(Span::styled(right, Style::default().fg(theme.dim))).right_aligned());
 
-    let titles: Vec<Line> = TABS
+    let vis = app.visible_indices();
+    let titles: Vec<Line> = vis
         .iter()
-        .enumerate()
-        .map(|(i, t)| {
+        .map(|&i| {
             let count = match i {
                 0 => app.prs.len(),
                 1 => app.wis.len(),
                 _ => app.pipes.len(),
             };
-            Line::from(format!(" {t} {count} "))
+            Line::from(format!(" {} {count} ", TABS[i]))
         })
         .collect();
+    let selected = vis.iter().position(|&i| i == app.active).unwrap_or(0);
 
     let tabs = Tabs::new(titles)
-        .select(app.active)
+        .select(selected)
         .divider(Span::styled("  ", Style::default().fg(theme.dim)))
         .padding("", "")
         .style(Style::default().fg(theme.dim).bg(theme.bg))
@@ -479,7 +480,7 @@ fn footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
         2 => keys.extend([("↵", "drill-in"), ("T", "trigger"), ("o", "open")]),
         _ => {}
     }
-    keys.extend([("C", "config"), ("r", "refresh"), ("t", "theme"), ("q", "quit")]);
+    keys.extend([("v", "tabs"), ("C", "config"), ("r", "refresh"), ("t", "theme"), ("q", "quit")]);
     keys
 }
 
@@ -790,6 +791,29 @@ fn render_overlay(frame: &mut Frame, area: Rect, app: &App) {
                     Span::styled("█", Style::default().fg(theme.accent)),
                 ]),
             ],
+            theme.green,
+        ),
+        Overlay::Toggle { items, selected, .. } => (
+            items
+                .iter()
+                .enumerate()
+                .map(|(i, item)| {
+                    let (arrow, arrow_color) = if item.on { ("▶", theme.green) } else { ("·", theme.dim) };
+                    let cursor = if i == *selected { "▐ " } else { "  " };
+                    let label_style = if i == *selected {
+                        Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)
+                    } else if item.on {
+                        Style::default().fg(theme.fg)
+                    } else {
+                        Style::default().fg(theme.dim)
+                    };
+                    Line::from(vec![
+                        Span::styled(cursor, Style::default().fg(theme.accent)),
+                        Span::styled(format!("{arrow} "), Style::default().fg(arrow_color)),
+                        Span::styled(item.label.clone(), label_style),
+                    ])
+                })
+                .collect(),
             theme.green,
         ),
     };
@@ -1135,6 +1159,35 @@ mod tests {
         for label in ["add", "remove", "bind-PR"] {
             assert!(out.contains(label), "config footer should list '{label}'");
         }
+    }
+
+    #[test]
+    fn tab_bar_hides_hidden_sections() {
+        let mut app = App::new("slate");
+        app.apply_hidden_sections(&[forgetop_core::domain::Section::WorkItems]);
+        let out = render_to_string(&mut app, 100, 24);
+        assert!(out.contains("Pull Requests"), "PR tab shown");
+        assert!(out.contains("Pipelines"), "Pipelines tab shown");
+        assert!(!out.contains("Work Items"), "hidden Work Items tab absent");
+    }
+
+    #[test]
+    fn visible_tabs_toggle_overlay_renders() {
+        use crate::overlay::{Overlay, ToggleItem};
+        use forgetop_core::domain::Section;
+        let mut app = App::new("slate");
+        app.overlay = Some(Overlay::Toggle {
+            title: "Visible tabs".into(),
+            items: vec![
+                ToggleItem { section: Section::PullRequests, label: "Pull Requests".into(), on: true },
+                ToggleItem { section: Section::WorkItems, label: "Work Items".into(), on: false },
+            ],
+            selected: 0,
+        });
+        let out = render_to_string(&mut app, 100, 24);
+        assert!(out.contains("Visible tabs"), "toggle title");
+        assert!(out.contains("▶"), "green arrow marks a visible section");
+        assert!(out.contains("toggle"), "toggle footer hint");
     }
 
     #[test]

@@ -42,6 +42,9 @@ pub struct UiState {
     pub theme: Option<String>,
     #[serde(default)]
     pub active_section: Section,
+    /// Sections the user has hidden from the tab bar.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hidden_sections: Vec<Section>,
 }
 
 /// Root persisted configuration.
