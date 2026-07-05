@@ -15,6 +15,9 @@ use crate::overlay::Overlay;
 use crate::theme::{check_icon, pipeline_icon, Theme};
 use crate::wizard::{Prompt, PromptKind};
 
+/// Shown in empty sections when nothing is configured yet.
+const FIRST_RUN_HINT: &str = "No connections yet — press n to add one, or C for config.";
+
 pub fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     let theme = &app.theme;
@@ -172,7 +175,13 @@ fn render_prs(frame: &mut Frame, area: Rect, app: &mut App) {
     let title = format!("Pull Requests · {}", app.pr_filter_label());
     let block = section_block(theme, &title);
     if app.prs.is_empty() {
-        let msg = if app.loading { "Loading pull requests…" } else { "No pull requests. Press f to change filter, r to refresh." };
+        let msg = if app.health.is_empty() {
+            FIRST_RUN_HINT
+        } else if app.loading {
+            "Loading pull requests…"
+        } else {
+            "No pull requests. Press f to change filter, r to refresh."
+        };
         empty(frame, area, theme, msg, block);
         return;
     }
@@ -233,7 +242,13 @@ fn render_wis(frame: &mut Frame, area: Rect, app: &mut App) {
     let theme = &app.theme;
     let block = section_block(theme, "Work Items");
     if app.wis.is_empty() {
-        let msg = if app.loading { "Loading work items…" } else { "No work items. Press r to refresh." };
+        let msg = if app.health.is_empty() {
+            FIRST_RUN_HINT
+        } else if app.loading {
+            "Loading work items…"
+        } else {
+            "No work items. Press r to refresh."
+        };
         empty(frame, area, theme, msg, block);
         return;
     }
@@ -280,7 +295,13 @@ fn render_pipes(frame: &mut Frame, area: Rect, app: &mut App) {
     let theme = &app.theme;
     let block = section_block(theme, "Pipelines");
     if app.pipes.is_empty() {
-        let msg = if app.loading { "Loading pipeline runs…" } else { "No pipeline runs. Press r to refresh." };
+        let msg = if app.health.is_empty() {
+            FIRST_RUN_HINT
+        } else if app.loading {
+            "Loading pipeline runs…"
+        } else {
+            "No pipeline runs. Press r to refresh."
+        };
         empty(frame, area, theme, msg, block);
         return;
     }
@@ -424,7 +445,7 @@ fn render_health(frame: &mut Frame, area: Rect, app: &App) {
     let theme = &app.theme;
     let mut spans = vec![Span::styled("connections  ", Style::default().fg(theme.dim))];
     if app.health.is_empty() {
-        spans.push(Span::styled("none configured — run the setup wizard", Style::default().fg(theme.dim)));
+        spans.push(Span::styled("none yet — press n to add a connection", Style::default().fg(theme.dim)));
     }
     for h in &app.health {
         let (icon, color) = if h.healthy { ("●", theme.green) } else { ("○", theme.red) };
@@ -1159,6 +1180,14 @@ mod tests {
         for label in ["add", "remove", "bind-PR"] {
             assert!(out.contains(label), "config footer should list '{label}'");
         }
+    }
+
+    #[test]
+    fn empty_state_prompts_to_add_a_connection_on_first_run() {
+        let mut app = App::new("slate"); // no connections/health, no data
+        let out = render_to_string(&mut app, 100, 24);
+        assert!(out.contains("add one"), "empty section should point to adding a connection");
+        assert!(out.contains("add a connection"), "health bar should prompt to add a connection");
     }
 
     #[test]

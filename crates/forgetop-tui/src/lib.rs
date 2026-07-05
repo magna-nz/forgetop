@@ -32,6 +32,12 @@ pub async fn run(deps: AppDeps, theme_name: &str) -> Result<()> {
     app.apply_hidden_sections(&deps.config.snapshot().ui.hidden_sections);
     app.reload_all(&deps).await;
 
+    // First run: nothing configured yet — drop straight into the add-connection wizard.
+    if deps.config.snapshot().connections.is_empty() {
+        app.start_add_connection();
+        app.toast = Some("Welcome to forgetop — add your first connection".into());
+    }
+
     let result = event_loop(&mut terminal, &mut app, &deps).await;
 
     restore_terminal(&mut terminal).map_err(forgetop_core::Error::from)?;
