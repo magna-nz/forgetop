@@ -433,10 +433,10 @@ fn footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
         return overlay.hint();
     }
     if matches!(app.screen, Screen::Diff(_)) {
-        return vec![("↑↓", "file"), ("PgUp/Dn", "scroll"), ("Esc", "back"), ("q", "quit")];
+        return vec![("↑↓", "file"), ("PgUp/Dn", "scroll"), ("o", "open"), ("Esc", "back"), ("q", "quit")];
     }
     if matches!(app.screen, Screen::Pipeline(_)) {
-        return vec![("↑↓", "move"), ("↵", "expand"), ("T", "trigger"), ("Esc", "back"), ("q", "quit")];
+        return vec![("↑↓", "move"), ("↵", "expand"), ("T", "trigger"), ("o", "open"), ("Esc", "back"), ("q", "quit")];
     }
     let mut keys = vec![("↑↓", "move"), ("←→", "tabs")];
     match app.active {
@@ -448,9 +448,10 @@ fn footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
             ("x", "reject"),
             ("m", "merge"),
             ("c", "comment"),
+            ("o", "open"),
         ]),
-        1 => keys.extend([("↵", "detail"), ("s", "state"), ("c", "comment")]),
-        2 => keys.extend([("↵", "drill-in"), ("T", "trigger")]),
+        1 => keys.extend([("↵", "detail"), ("s", "state"), ("c", "comment"), ("o", "open")]),
+        2 => keys.extend([("↵", "drill-in"), ("T", "trigger"), ("o", "open")]),
         _ => {}
     }
     keys.extend([("r", "refresh"), ("t", "theme"), ("q", "quit")]);
@@ -870,6 +871,7 @@ mod tests {
         let mut app = App::new("slate");
         app.screen = Screen::Diff(Box::new(DiffView {
             pr_label: "PR #42".into(),
+            url: Some("http://example/pr/42".into()),
             files: vec![FileChange {
                 path: "src/http/retry.rs".into(),
                 kind: FileChangeKind::Added,

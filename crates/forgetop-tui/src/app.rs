@@ -151,6 +151,7 @@ impl PipelineView {
 /// State for the full-screen PR diff + threads view.
 pub struct DiffView {
     pub pr_label: String,
+    pub url: Option<String>,
     pub files: Vec<FileChange>,
     pub threads: Vec<CommentThread>,
     pub selected: usize,
@@ -443,6 +444,7 @@ impl App {
                 self.theme = Theme::by_name(next);
                 let _ = deps.config.set_theme(Some(next.to_string())).await;
             }
+            'o' => self.open_selected(),
             'f' if self.active == 0 => self.cycle_pr_filter(deps).await,
             // PR write actions (Pull Requests tab only; each no-ops off-tab).
             'a' => self.open_pr_vote(ReviewVote::Approved),
@@ -469,6 +471,7 @@ impl App {
         match key {
             Key::Escape => self.screen = Screen::List,
             Key::Char('q') => self.should_quit = true,
+            Key::Char('o') => self.open_selected(),
             Key::Up | Key::Char('k') => diff.select_file(-1),
             Key::Down | Key::Char('j') => diff.select_file(1),
             Key::PageDown | Key::Char(' ') => diff.scroll_by(10),
@@ -481,6 +484,7 @@ impl App {
         let Some(pr) = self.selected_pr() else { return };
         let id = pr.id.clone();
         let label = pr_label(pr);
+        let url = pr.url.clone();
         let source = match deps.sections.pull_request_source().await {
             Ok(Some(s)) => s,
             _ => {
@@ -496,7 +500,7 @@ impl App {
             }
         };
         let threads = source.threads(&id).await.unwrap_or_default();
-        self.screen = Screen::Diff(Box::new(DiffView { pr_label: label, files, threads, selected: 0, scroll: 0 }));
+        self.screen = Screen::Diff(Box::new(DiffView { pr_label: label, url, files, threads, selected: 0, scroll: 0 }));
     }
 
     // ---- pipeline drill-in + trigger ----
@@ -532,6 +536,7 @@ impl App {
             Key::Escape => self.screen = Screen::List,
             Key::Char('q') => self.should_quit = true,
             Key::Char('T') => self.open_pipeline_trigger(),
+            Key::Char('o') => self.open_selected(),
             other => {
                 if let Screen::Pipeline(view) = &mut self.screen {
                     match other {
@@ -600,6 +605,35 @@ impl App {
             Outcome::Keep => self.overlay = Some(overlay),
             Outcome::Cancel => self.toast = Some("Cancelled".into()),
             Outcome::Submit(action) => self.execute_action(action, deps).await,
+        }
+    }
+
+    // ---- open in browser ----
+
+    /// The web URL of whatever is in focus — the open sub-view, else the selected row.
+    fn selected_url(&self) -> Option<String> {
+        match &self.screen {
+            Screen::Diff(v) => return v.url.clone(),
+            Screen::Pipeline(v) => return v.run.url.clone(),
+            Screen::List => {}
+        }
+        match self.active {
+            0 => self.selected_pr().and_then(|p| p.url.clone()),
+            1 => self.selected_wi().and_then(|w| w.url.clone()),
+            2 => self.selected_pipe().and_then(|p| p.run.url.clone()),
+            _ => None,
+        }
+    }
+
+    fn open_selected(&mut self) {
+        match self.selected_url() {
+            Some(url) => {
+                self.toast = Some(match open::that(&url) {
+                    Ok(()) => format!("Opened {url}"),
+                    Err(e) => format!("Couldn't open browser: {e}"),
+                });
+            }
+            None => self.toast = Some("No web URL for this item".into()),
         }
     }
 
@@ -830,5 +864,84 @@ fn feed_queries(sub: &forgetop_core::config::PipelineSubscription) -> Vec<Pipeli
             .iter()
             .map(|id| PipelineRunQuery { definition_id: Some(id.clone()), branch: None, limit: Some(10) })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pr(url: Option<&str>) -> PullRequest {
+        PullRequest {
+            id: "1".into(),
+            number: Some(1),
+            title: "t".into(),
+            description: None,
+            author: User { id: "a".into(), display_name: "A".into(), handle: None, avatar_url: None },
+            status: PullRequestStatus::Open,
+            is_draft: false,
+            source_ref: None,
+            target_ref: None,
+            reviewers: vec![],
+            labels: vec![],
+            checks: CheckStatus::None,
+            check_summary: None,
+            mergeable: MergeableState::Unknown,
+            changed_files: 0,
+            additions: 0,
+            deletions: 0,
+            created_at: None,
+            updated_at: None,
+            url: url.map(Into::into),
+        }
+    }
+
+    fn wi(url: Option<&str>) -> WorkItem {
+        WorkItem {
+            id: "w".into(),
+            identifier: None,
+            title: "t".into(),
+            description: None,
+            state: "Todo".into(),
+            state_category: WorkItemStateCategory::Backlog,
+            work_item_type: None,
+            assignee: None,
+            created_at: None,
+            updated_at: None,
+            url: url.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn selected_url_reads_active_tab_and_subview() {
+        let mut app = App::new("slate");
+        app.prs.push(pr(Some("http://pr")));
+        app.pr_state.select(Some(0));
+        app.active = 0;
+        assert_eq!(app.selected_url().as_deref(), Some("http://pr"));
+
+        app.wis.push(wi(Some("http://wi")));
+        app.wi_state.select(Some(0));
+        app.active = 1;
+        assert_eq!(app.selected_url().as_deref(), Some("http://wi"));
+
+        // An open sub-view takes precedence over the active tab.
+        app.screen = Screen::Diff(Box::new(DiffView {
+            pr_label: "x".into(),
+            url: Some("http://diff".into()),
+            files: vec![],
+            threads: vec![],
+            selected: 0,
+            scroll: 0,
+        }));
+        assert_eq!(app.selected_url().as_deref(), Some("http://diff"));
+    }
+
+    #[test]
+    fn selected_url_is_none_when_item_has_no_url() {
+        let mut app = App::new("slate");
+        app.prs.push(pr(None));
+        app.pr_state.select(Some(0));
+        assert_eq!(app.selected_url(), None);
     }
 }
