@@ -40,6 +40,7 @@ public static class AppHost
         services.AddSingleton<IConfigService, ConfigService>();
         services.AddSingleton<ConnectionResolver>();
         services.AddSingleton<SectionService>();
+        services.AddSingleton<ConnectionHealthService>();
         services.AddSingleton<SetupService>();
         services.AddSingleton<ForgetopApp>();
 

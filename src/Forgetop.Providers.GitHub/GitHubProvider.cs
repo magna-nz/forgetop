@@ -12,6 +12,7 @@ public sealed class GitHubConnection : IProviderConnection
     {
         ConnectionId = connection.Id;
         DisplayName = connection.DisplayName;
+        _client = client;
         PullRequests = new GitHubPullRequestSource(client);
         WorkItems = new GitHubWorkItemSource(client);
         Pipelines = new GitHubPipelineSource(client);
@@ -25,6 +26,9 @@ public sealed class GitHubConnection : IProviderConnection
     public IPullRequestSource? PullRequests { get; }
     public IWorkItemSource? WorkItems { get; }
     public IPipelineSource? Pipelines { get; }
+
+    private readonly GitHubApiClient _client;
+    public Task<bool> CheckAsync(CancellationToken ct = default) => _client.CheckAsync(ct);
 }
 
 /// <summary>Builds GitHub connections, configuring a PAT-authenticated <see cref="HttpClient"/>.</summary>

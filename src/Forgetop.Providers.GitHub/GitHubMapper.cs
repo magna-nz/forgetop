@@ -25,6 +25,14 @@ public static class GitHubMapper
             : draft ? PullRequestStatus.Draft
             : PullRequestStatus.Open;
 
+        var mergeable = draft ? MergeableState.Blocked : el.Str("mergeable_state") switch
+        {
+            "clean" or "unstable" or "has_hooks" => MergeableState.Mergeable,
+            "dirty" => MergeableState.Conflicting,
+            "blocked" or "behind" or "draft" => MergeableState.Blocked,
+            _ => MergeableState.Unknown,
+        };
+
         var number = el.Int("number");
         return new PullRequest
         {
@@ -43,7 +51,40 @@ public static class GitHubMapper
             Reviewers = el.Arr("requested_reviewers")
                 .Select(r => new Reviewer { User = MapUser(r), Vote = ReviewVote.NoVote })
                 .ToList(),
+            Labels = el.Arr("labels").Select(l => l.Str("name") ?? "").Where(n => n.Length > 0).ToList(),
+            Mergeable = mergeable,
+            ChangedFiles = el.Int("changed_files") ?? 0,
+            Additions = el.Int("additions") ?? 0,
+            Deletions = el.Int("deletions") ?? 0,
         };
+    }
+
+    /// <summary>Aggregates a GitHub check-runs response into a roll-up status + counts.</summary>
+    public static (CheckStatus Status, CheckSummary Summary) MapChecks(JsonElement el)
+    {
+        int successful = 0, inProgress = 0, failed = 0, neutral = 0;
+        foreach (var run in el.Arr("check_runs"))
+        {
+            if (run.Str("status") != "completed")
+            {
+                inProgress++;
+                continue;
+            }
+
+            switch (run.Str("conclusion"))
+            {
+                case "success": successful++; break;
+                case "neutral" or "skipped": neutral++; break;
+                default: failed++; break; // failure, timed_out, cancelled, action_required
+            }
+        }
+
+        var summary = new CheckSummary { Successful = successful, InProgress = inProgress, Failed = failed, Neutral = neutral };
+        var status = summary.Total == 0 ? CheckStatus.None
+            : failed > 0 ? CheckStatus.Failed
+            : inProgress > 0 ? CheckStatus.Pending
+            : CheckStatus.Passed;
+        return (status, summary);
     }
 
     /// <summary>True when an /issues item is actually a pull request (GitHub returns both).</summary>

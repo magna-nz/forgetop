@@ -42,6 +42,7 @@ public sealed class AzureDevOpsConnection : IProviderConnection
     {
         ConnectionId = connection.Id;
         DisplayName = connection.DisplayName;
+        _client = client;
         PullRequests = new AzureDevOpsPullRequestSource(client);
         WorkItems = new AzureDevOpsWorkItemSource(client);
         Pipelines = new AzureDevOpsPipelineSource(client);
@@ -55,6 +56,9 @@ public sealed class AzureDevOpsConnection : IProviderConnection
     public IPullRequestSource? PullRequests { get; }
     public IWorkItemSource? WorkItems { get; }
     public IPipelineSource? Pipelines { get; }
+
+    private readonly AzureDevOpsApiClient _client;
+    public Task<bool> CheckAsync(CancellationToken ct = default) => _client.CheckAsync(ct);
 }
 
 /// <summary>Builds Azure DevOps connections with PAT (Basic) auth.</summary>

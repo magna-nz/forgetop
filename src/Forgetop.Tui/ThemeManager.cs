@@ -5,7 +5,7 @@ namespace Forgetop.Tui;
 /// <summary>Named colour schemes with a cycle-through switcher; the current name persists to config.</summary>
 public sealed class ThemeManager
 {
-    private static readonly string[] AllThemes = ["dark", "light", "matrix"];
+    private static readonly string[] AllThemes = ["dark", "light", "matrix", "ocean"];
 
     public ThemeManager(string? initial)
     {
@@ -24,20 +24,26 @@ public sealed class ThemeManager
         return Current;
     }
 
-    /// <summary>Build the colour scheme for the current theme. Call after <c>Application.Init</c>.</summary>
+    /// <summary>
+    /// Build the colour scheme for the current theme. Call after <c>Application.Init</c>.
+    /// "dark" uses a Black background so it adopts the host terminal's palette (modern,
+    /// native look like azdo / gh-dash); the others are explicit.
+    /// </summary>
     public ColorScheme Scheme() => Current switch
     {
-        "light" => Build(Color.Black, Color.White, Color.White, Color.Blue),
-        "matrix" => Build(Color.BrightGreen, Color.Black, Color.Black, Color.Green),
-        _ => Build(Color.White, Color.Blue, Color.Black, Color.Cyan),
+        "light" => Build(Color.Black, Color.White, Color.Black, Color.Gray),
+        "matrix" => Build(Color.BrightGreen, Color.Black, Color.BrightGreen, Color.DarkGray),
+        "ocean" => Build(Color.White, Color.Blue, Color.White, Color.BrightBlue),
+        _ => Build(Color.White, Color.Black, Color.White, Color.DarkGray), // dark — terminal-native
     };
 
+    // Calm scheme: no loud hotkey colour (HotNormal == Normal), subtle selection bar.
     private static ColorScheme Build(Color fg, Color bg, Color focusFg, Color focusBg) => new()
     {
         Normal = new Terminal.Gui.Attribute(fg, bg),
+        HotNormal = new Terminal.Gui.Attribute(fg, bg),
         Focus = new Terminal.Gui.Attribute(focusFg, focusBg),
-        HotNormal = new Terminal.Gui.Attribute(Color.BrightYellow, bg),
-        HotFocus = new Terminal.Gui.Attribute(Color.BrightYellow, focusBg),
+        HotFocus = new Terminal.Gui.Attribute(focusFg, focusBg),
         Disabled = new Terminal.Gui.Attribute(Color.DarkGray, bg),
     };
 }

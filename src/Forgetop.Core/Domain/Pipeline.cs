@@ -12,6 +12,13 @@ public sealed record PipelineDefinition
     public string? Url { get; init; }
 }
 
+/// <summary>A step / task within a job.</summary>
+public sealed record PipelineStep
+{
+    public required string Name { get; init; }
+    public PipelineRunStatus Status { get; init; }
+}
+
 /// <summary>A single job within a pipeline run.</summary>
 public sealed record PipelineJob
 {
@@ -20,6 +27,7 @@ public sealed record PipelineJob
     public PipelineRunStatus Status { get; init; }
     public DateTimeOffset? StartedAt { get; init; }
     public DateTimeOffset? FinishedAt { get; init; }
+    public IReadOnlyList<PipelineStep> Steps { get; init; } = [];
 }
 
 /// <summary>A stage grouping one or more jobs within a pipeline run.</summary>

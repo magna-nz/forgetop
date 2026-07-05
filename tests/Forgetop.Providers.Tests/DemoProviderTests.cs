@@ -56,4 +56,19 @@ public class DemoProviderTests
         var items = await Connection().WorkItems!.ListAsync(new WorkItemQuery());
         Assert.DoesNotContain(items, w => w.StateCategory == WorkItemStateCategory.Completed);
     }
+
+    [Fact]
+    public async Task Pipeline_run_has_stages_jobs_and_steps_for_drill_in()
+    {
+        var run = await Connection().Pipelines!.GetRunAsync("r500");
+        var stage = run.Stages.Single(s => s.Name == "test");
+        var job = stage.Jobs.Single(j => j.Name == "integration");
+        Assert.Contains(job.Steps, s => s.Status == PipelineRunStatus.Failed);
+    }
+
+    [Fact]
+    public async Task Connection_reports_healthy()
+    {
+        Assert.True(await Connection().CheckAsync());
+    }
 }
