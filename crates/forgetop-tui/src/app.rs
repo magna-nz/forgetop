@@ -8,6 +8,7 @@ use forgetop_core::provider::*;
 use forgetop_core::service::{ConfigService, ConnectionHealth, ConnectionHealthService, SectionService};
 use ratatui::widgets::TableState;
 
+use crate::overlay::{Action, InputKind, Outcome, Overlay, PickerKind};
 use crate::theme::Theme;
 
 /// The three top-level tabs, in order.
@@ -44,6 +45,8 @@ pub struct App {
     pub pr_filter: PullRequestFilter,
     /// Transient one-shot message shown in the footer until the next keypress.
     pub toast: Option<String>,
+    /// Open modal overlay, if any. When set, keys route here instead of the table.
+    pub overlay: Option<Overlay>,
     pub last_refresh: DateTime<Local>,
     pub should_quit: bool,
 }
@@ -65,6 +68,7 @@ impl App {
             show_detail: false,
             pr_filter: PullRequestFilter::All,
             toast: None,
+            overlay: None,
             last_refresh: Local::now(),
             should_quit: false,
         }
@@ -243,12 +247,23 @@ impl App {
 
     // ---- key handling ----
 
-    /// Returns after applying the key. `deps` is used for async refresh / theme persistence.
+    /// Applies a key. `deps` is used for async refresh / actions / theme persistence.
     pub async fn on_key(&mut self, key: Key, deps: &AppDeps) {
+        // Ctrl-C hard-quits from any mode.
+        if key == Key::Quit {
+            self.should_quit = true;
+            return;
+        }
         // Any keypress dismisses the previous one-shot toast.
         self.toast = None;
+
+        // An open overlay swallows all input until it resolves.
+        if self.overlay.is_some() {
+            self.on_overlay_key(key, deps).await;
+            return;
+        }
+
         match key {
-            Key::Quit => self.should_quit = true,
             Key::Escape => {
                 if self.show_detail {
                     self.show_detail = false;
@@ -259,7 +274,6 @@ impl App {
             Key::Left => self.switch_tab(-1),
             Key::Right => self.switch_tab(1),
             Key::Tab => self.switch_tab(1),
-            Key::Num(n) => self.set_tab(n),
             Key::Up => self.move_up(),
             Key::Down => self.move_down(),
             Key::Enter => {
@@ -267,23 +281,144 @@ impl App {
                     self.show_detail = !self.show_detail;
                 }
             }
-            Key::Filter => {
-                if self.active == 0 {
-                    self.cycle_pr_filter(deps).await;
-                }
-            }
-            Key::Refresh => self.reload_all(deps).await,
-            Key::Theme => {
+            Key::Char(c) => self.on_char(c, deps).await,
+            Key::Backspace | Key::Quit | Key::None => {}
+        }
+    }
+
+    /// Normal-mode character commands.
+    async fn on_char(&mut self, c: char, deps: &AppDeps) {
+        match c {
+            'q' => self.should_quit = true,
+            'j' => self.move_down(),
+            'k' => self.move_up(),
+            'h' => self.switch_tab(-1),
+            'l' => self.switch_tab(1),
+            '1'..='3' => self.set_tab(c as usize - '1' as usize),
+            'r' => self.reload_all(deps).await,
+            't' => {
                 let next = Theme::next(self.theme.name);
                 self.theme = Theme::by_name(next);
                 let _ = deps.config.set_theme(Some(next.to_string())).await;
             }
-            Key::None => {}
+            'f' if self.active == 0 => self.cycle_pr_filter(deps).await,
+            // PR write actions (Pull Requests tab only).
+            'a' => self.open_pr_vote(ReviewVote::Approved),
+            'x' => self.open_pr_vote(ReviewVote::Rejected),
+            'm' => self.open_pr_merge(),
+            'c' => self.open_pr_comment(),
+            _ => {}
+        }
+    }
+
+    async fn on_overlay_key(&mut self, key: Key, deps: &AppDeps) {
+        let Some(mut overlay) = self.overlay.take() else { return };
+        match overlay.handle(key) {
+            Outcome::Keep => self.overlay = Some(overlay),
+            Outcome::Cancel => self.toast = Some("Cancelled".into()),
+            Outcome::Submit(action) => self.execute_action(action, deps).await,
+        }
+    }
+
+    // ---- PR write actions ----
+
+    fn selected_pr(&self) -> Option<&PullRequest> {
+        if self.active != 0 {
+            return None;
+        }
+        self.pr_state.selected().and_then(|i| self.prs.get(i))
+    }
+
+    fn open_pr_vote(&mut self, vote: ReviewVote) {
+        let Some(pr) = self.selected_pr() else { return };
+        let verb = match vote {
+            ReviewVote::Approved => "Approve",
+            ReviewVote::Rejected => "Request changes on",
+            _ => "Vote on",
+        };
+        let message = format!("{verb} {}?", pr_label(pr));
+        self.overlay = Some(Overlay::Confirm { title: "Review".into(), message, action: Action::PrVote(vote) });
+    }
+
+    fn open_pr_merge(&mut self) {
+        let Some(pr) = self.selected_pr() else { return };
+        let title = format!("Merge {} via", pr_label(pr));
+        self.overlay = Some(Overlay::Picker {
+            title,
+            items: vec!["Merge commit".into(), "Squash".into(), "Rebase".into()],
+            selected: 0,
+            kind: PickerKind::PrMergeStrategy,
+        });
+    }
+
+    fn open_pr_comment(&mut self) {
+        let Some(pr) = self.selected_pr() else { return };
+        let title = format!("Comment on {}", pr_label(pr));
+        self.overlay = Some(Overlay::Input { title, buffer: String::new(), kind: InputKind::PrComment });
+    }
+
+    async fn execute_action(&mut self, action: Action, deps: &AppDeps) {
+        let Some(id) = self.selected_pr().map(|p| p.id.clone()) else {
+            self.toast = Some("Nothing selected".into());
+            return;
+        };
+        let source = match deps.sections.pull_request_source().await {
+            Ok(Some(s)) => s,
+            _ => {
+                self.toast = Some("No pull-request provider is bound".into());
+                return;
+            }
+        };
+
+        let result = match &action {
+            Action::PrVote(vote) => source.vote(&id, *vote).await.map(|_| vote_message(*vote).to_string()),
+            Action::PrMerge(strategy) => source
+                .merge(&id, &MergeOptions { strategy: *strategy, delete_source_ref: false })
+                .await
+                .map(|_| format!("Merged ({strategy:?})")),
+            Action::PrComment(text) => {
+                if text.trim().is_empty() {
+                    self.toast = Some("Empty comment — nothing sent".into());
+                    return;
+                }
+                source.add_comment(&id, text).await.map(|_| "Comment added".to_string())
+            }
+        };
+
+        match result {
+            Ok(msg) => {
+                self.toast = Some(msg);
+                let mut errors = Vec::new();
+                self.reload_pull_requests(deps, &mut errors).await;
+                self.fix_selection();
+                if let Some(e) = errors.first() {
+                    self.toast = Some(e.clone());
+                }
+            }
+            Err(e) => self.toast = Some(format!("Failed: {e}")),
         }
     }
 }
 
-/// Semantic key events the loop feeds into [`App::on_key`].
+fn pr_label(pr: &PullRequest) -> String {
+    let num = pr.number.map(|n| format!("#{n} ")).unwrap_or_default();
+    let title: String = pr.title.chars().take(40).collect();
+    format!("PR {num}— {title}")
+}
+
+fn vote_message(vote: ReviewVote) -> &'static str {
+    match vote {
+        ReviewVote::Approved => "Approved",
+        ReviewVote::ApprovedWithSuggestions => "Approved with suggestions",
+        ReviewVote::Rejected => "Requested changes",
+        ReviewVote::WaitingForAuthor => "Waiting for author",
+        ReviewVote::NoVote => "Vote reset",
+    }
+}
+
+/// Semantic key events the loop feeds into [`App::on_key`]. Character keys keep
+/// their raw value so the app can treat them as navigation in normal mode or as
+/// literal text while an input overlay is open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Key {
     Up,
@@ -293,11 +428,10 @@ pub enum Key {
     Tab,
     Enter,
     Escape,
-    Filter,
-    Refresh,
-    Theme,
+    Backspace,
+    Char(char),
+    /// Hard quit (Ctrl-C), honoured in every mode.
     Quit,
-    Num(usize),
     None,
 }
 

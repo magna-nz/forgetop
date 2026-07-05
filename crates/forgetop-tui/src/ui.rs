@@ -5,10 +5,11 @@ use forgetop_core::domain::*;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Cell, Paragraph, Row, Table, Tabs, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Cell, Clear, Paragraph, Row, Table, Tabs, Wrap};
 use ratatui::Frame;
 
 use crate::app::{App, PipeRow, TABS};
+use crate::overlay::Overlay;
 use crate::theme::{check_icon, pipeline_icon, Theme};
 
 pub fn render(frame: &mut Frame, app: &mut App) {
@@ -32,6 +33,10 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     render_content(frame, rows[1], app);
     render_health(frame, rows[2], app);
     render_footer(frame, rows[3], app);
+
+    if app.overlay.is_some() {
+        render_overlay(frame, area, app);
+    }
 }
 
 fn render_tabs(frame: &mut Frame, area: Rect, app: &App) {
@@ -409,10 +414,14 @@ fn render_health(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 /// Context-aware key glossary for the active tab (azdo-style bar along the bottom).
+/// While an overlay is open it shows that overlay's own keys instead.
 fn footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
+    if let Some(overlay) = &app.overlay {
+        return overlay.hint();
+    }
     let mut keys = vec![("↑↓", "move"), ("←→", "tabs"), ("↵", "detail")];
     if app.active == 0 {
-        keys.push(("f", "filter"));
+        keys.extend([("f", "filter"), ("a", "approve"), ("x", "reject"), ("m", "merge"), ("c", "comment")]);
     }
     keys.extend([("r", "refresh"), ("t", "theme"), ("q", "quit")]);
     keys
@@ -446,6 +455,83 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         Paragraph::new(Line::from(Span::styled(right, right_style)).right_aligned()).style(bar),
         cols[1],
     );
+}
+
+// ---- overlays ----
+
+fn render_overlay(frame: &mut Frame, area: Rect, app: &App) {
+    let theme = &app.theme;
+    let Some(overlay) = &app.overlay else { return };
+
+    let (body, hint_color): (Vec<Line>, _) = match overlay {
+        Overlay::Confirm { message, .. } => (
+            vec![Line::from(""), Line::from(Span::styled(message.clone(), Style::default().fg(theme.fg)))],
+            theme.yellow,
+        ),
+        Overlay::Picker { items, selected, .. } => (
+            items
+                .iter()
+                .enumerate()
+                .map(|(i, item)| {
+                    if i == *selected {
+                        Line::from(vec![
+                            Span::styled(" ▐ ", Style::default().fg(theme.accent)),
+                            Span::styled(item.clone(), Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+                        ])
+                    } else {
+                        Line::from(Span::styled(format!("   {item}"), Style::default().fg(theme.fg)))
+                    }
+                })
+                .collect(),
+            theme.accent,
+        ),
+        Overlay::Input { buffer, .. } => (
+            vec![
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("> ", Style::default().fg(theme.accent)),
+                    Span::styled(buffer.clone(), Style::default().fg(theme.fg)),
+                    Span::styled("█", Style::default().fg(theme.accent)),
+                ]),
+            ],
+            theme.green,
+        ),
+    };
+
+    let hint = footer_keys(app)
+        .into_iter()
+        .flat_map(|(k, l)| {
+            [
+                Span::styled(format!(" {k} "), Style::default().fg(theme.bg).bg(hint_color).add_modifier(Modifier::BOLD)),
+                Span::styled(format!(" {l}   "), Style::default().fg(theme.dim)),
+            ]
+        })
+        .collect::<Vec<_>>();
+
+    let mut lines = body;
+    lines.push(Line::from(""));
+    lines.push(Line::from(hint));
+
+    let height = lines.len() as u16 + 2;
+    let width = 64.min(area.width.saturating_sub(6));
+    let rect = centered_rect(width, height, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(hint_color))
+        .style(Style::default().bg(theme.panel))
+        .title(Span::styled(format!(" {} ", overlay.title()), Style::default().fg(hint_color).add_modifier(Modifier::BOLD)));
+
+    frame.render_widget(Clear, rect);
+    frame.render_widget(Paragraph::new(lines).block(block).wrap(Wrap { trim: false }), rect);
+}
+
+/// A rectangle of the given size, centred within `area`.
+fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    Rect { x, y, width: width.min(area.width), height: height.min(area.height) }
 }
 
 // ---- helpers ----
@@ -536,6 +622,36 @@ mod tests {
         app.active = 1;
         let wi = render_to_string(&mut app, 100, 24);
         assert!(!wi.contains("filter"), "filter is PR-only");
+    }
+
+    #[test]
+    fn merge_picker_overlay_renders_over_the_list() {
+        use crate::overlay::{Overlay, PickerKind};
+        let mut app = App::new("slate");
+        app.prs.push(sample_pr());
+        app.pr_state.select(Some(0));
+        app.overlay = Some(Overlay::Picker {
+            title: "Merge PR #42 via".into(),
+            items: vec!["Merge commit".into(), "Squash".into(), "Rebase".into()],
+            selected: 1,
+            kind: PickerKind::PrMergeStrategy,
+        });
+
+        let out = render_to_string(&mut app, 100, 24);
+        assert!(out.contains("Merge PR #42 via"), "overlay title should render");
+        assert!(out.contains("Squash") && out.contains("Rebase"), "strategies should render");
+        assert!(out.contains("select") && out.contains("cancel"), "overlay hints in footer");
+    }
+
+    #[test]
+    fn pr_footer_lists_write_action_keys() {
+        let mut app = App::new("slate");
+        app.prs.push(sample_pr());
+        app.pr_state.select(Some(0));
+        let out = render_to_string(&mut app, 120, 24);
+        for label in ["approve", "reject", "merge", "comment"] {
+            assert!(out.contains(label), "PR footer should advertise '{label}'");
+        }
     }
 
     #[test]
