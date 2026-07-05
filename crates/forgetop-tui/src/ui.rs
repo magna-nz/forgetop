@@ -480,6 +480,7 @@ fn footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
             ("a", "add"),
             ("p", "bind-PR"),
             ("w", "bind-WI"),
+            ("s", "pipelines"),
             ("x", "remove"),
             ("Esc", "back"),
             ("q", "quit"),
@@ -1202,14 +1203,15 @@ mod tests {
 
     #[test]
     fn visible_tabs_toggle_overlay_renders() {
-        use crate::overlay::{Overlay, ToggleItem};
-        use forgetop_core::domain::Section;
+        use crate::overlay::{Overlay, ToggleItem, ToggleKind};
         let mut app = App::new("slate");
         app.overlay = Some(Overlay::Toggle {
             title: "Visible tabs".into(),
+            kind: ToggleKind::Sections,
+            min_one: true,
             items: vec![
-                ToggleItem { section: Section::PullRequests, label: "Pull Requests".into(), on: true },
-                ToggleItem { section: Section::WorkItems, label: "Work Items".into(), on: false },
+                ToggleItem { id: "0".into(), label: "Pull Requests".into(), on: true },
+                ToggleItem { id: "1".into(), label: "Work Items".into(), on: false },
             ],
             selected: 0,
         });

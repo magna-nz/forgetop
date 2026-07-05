@@ -2,7 +2,7 @@
 //! When an overlay is open, the app routes every key to it via [`Overlay::handle`]
 //! instead of the table, so there's no ambiguity between typing and navigation.
 
-use forgetop_core::domain::{ReviewVote, Section};
+use forgetop_core::domain::ReviewVote;
 use forgetop_core::provider::MergeStrategy;
 
 use crate::app::Key;
@@ -17,12 +17,22 @@ pub enum Action {
     WiComment(String),
     PipelineTrigger { connection_id: String, definition_id: String, branch: Option<String>, label: String },
     RemoveConnection { id: String, label: String },
-    SetVisibleSections(Vec<Section>),
+    /// Result of a checklist: the ids that ended up ticked, tagged with what they are.
+    ApplyToggle { kind: ToggleKind, ids: Vec<String> },
+}
+
+/// What a [`Overlay::Toggle`] checklist is choosing.
+#[derive(Debug, Clone)]
+pub enum ToggleKind {
+    /// Visible tab sections; item ids are section indices ("0"/"1"/"2").
+    Sections,
+    /// Pipeline definitions to subscribe a connection to; item ids are definition ids.
+    PipelineSubs { connection_id: String },
 }
 
 /// One row of a [`Overlay::Toggle`] checklist.
 pub struct ToggleItem {
-    pub section: Section,
+    pub id: String,
     pub label: String,
     pub on: bool,
 }
@@ -43,7 +53,7 @@ pub enum Overlay {
     Confirm { title: String, message: String, action: Action },
     Picker { title: String, items: Vec<String>, selected: usize, kind: PickerKind },
     Input { title: String, buffer: String, kind: InputKind },
-    Toggle { title: String, items: Vec<ToggleItem>, selected: usize },
+    Toggle { title: String, kind: ToggleKind, min_one: bool, items: Vec<ToggleItem>, selected: usize },
 }
 
 /// What the app should do after feeding a key to the overlay.
@@ -113,7 +123,7 @@ impl Overlay {
                 Key::Escape => Outcome::Cancel,
                 _ => Outcome::Keep,
             },
-            Overlay::Toggle { items, selected, .. } => match key {
+            Overlay::Toggle { items, selected, min_one, kind, .. } => match key {
                 Key::Up | Key::Char('k') => {
                     if !items.is_empty() {
                         *selected = (*selected + items.len() - 1) % items.len();
@@ -129,9 +139,9 @@ impl Overlay {
                 Key::Char(' ') | Key::Enter => {
                     let on_count = items.iter().filter(|i| i.on).count();
                     if let Some(item) = items.get_mut(*selected) {
-                        // Keep at least one section visible.
                         if item.on {
-                            if on_count > 1 {
+                            // Optionally keep at least one ticked (used for visible tabs).
+                            if !*min_one || on_count > 1 {
                                 item.on = false;
                             }
                         } else {
@@ -141,8 +151,8 @@ impl Overlay {
                     Outcome::Keep
                 }
                 Key::Escape => {
-                    let visible = items.iter().filter(|i| i.on).map(|i| i.section).collect();
-                    Outcome::Submit(Action::SetVisibleSections(visible))
+                    let ids = items.iter().filter(|i| i.on).map(|i| i.id.clone()).collect();
+                    Outcome::Submit(Action::ApplyToggle { kind: kind.clone(), ids })
                 }
                 _ => Outcome::Keep,
             },
@@ -228,37 +238,55 @@ mod tests {
         }
     }
 
+    fn item(id: &str, on: bool) -> ToggleItem {
+        ToggleItem { id: id.into(), label: id.into(), on }
+    }
+
     #[test]
-    fn toggle_keeps_one_on_and_submits_visible_sections() {
+    fn toggle_submits_ticked_ids() {
         let mut o = Overlay::Toggle {
             title: "".into(),
-            items: vec![
-                ToggleItem { section: Section::PullRequests, label: "PR".into(), on: true },
-                ToggleItem { section: Section::WorkItems, label: "WI".into(), on: true },
-                ToggleItem { section: Section::Pipelines, label: "Pipe".into(), on: true },
-            ],
+            kind: ToggleKind::Sections,
+            min_one: true,
+            items: vec![item("0", true), item("1", true), item("2", true)],
             selected: 1,
         };
-        o.handle(Key::Char(' ')); // turn Work Items off
+        o.handle(Key::Char(' ')); // turn item 1 off
         match o.handle(Key::Escape) {
-            Outcome::Submit(Action::SetVisibleSections(v)) => {
-                assert_eq!(v, vec![Section::PullRequests, Section::Pipelines]);
-            }
-            _ => panic!("expected SetVisibleSections"),
+            Outcome::Submit(Action::ApplyToggle { ids, .. }) => assert_eq!(ids, vec!["0".to_string(), "2".to_string()]),
+            _ => panic!("expected ApplyToggle"),
         }
     }
 
     #[test]
-    fn toggle_refuses_to_hide_the_last_visible_section() {
+    fn toggle_min_one_refuses_to_clear_the_last() {
         let mut o = Overlay::Toggle {
             title: "".into(),
-            items: vec![ToggleItem { section: Section::PullRequests, label: "PR".into(), on: true }],
+            kind: ToggleKind::Sections,
+            min_one: true,
+            items: vec![item("0", true)],
             selected: 0,
         };
-        o.handle(Key::Char(' ')); // would hide the only one — ignored
+        o.handle(Key::Char(' ')); // would clear the only one — ignored
         match o.handle(Key::Escape) {
-            Outcome::Submit(Action::SetVisibleSections(v)) => assert_eq!(v, vec![Section::PullRequests]),
-            _ => panic!("expected SetVisibleSections"),
+            Outcome::Submit(Action::ApplyToggle { ids, .. }) => assert_eq!(ids, vec!["0".to_string()]),
+            _ => panic!("expected ApplyToggle"),
+        }
+    }
+
+    #[test]
+    fn toggle_without_min_one_allows_empty() {
+        let mut o = Overlay::Toggle {
+            title: "".into(),
+            kind: ToggleKind::PipelineSubs { connection_id: "c".into() },
+            min_one: false,
+            items: vec![item("ci", true)],
+            selected: 0,
+        };
+        o.handle(Key::Char(' ')); // clear it — allowed for pipelines
+        match o.handle(Key::Escape) {
+            Outcome::Submit(Action::ApplyToggle { ids, .. }) => assert!(ids.is_empty()),
+            _ => panic!("expected ApplyToggle"),
         }
     }
 

@@ -9,7 +9,7 @@ use forgetop_core::provider::*;
 use forgetop_core::service::{ConfigService, ConnectionHealth, ConnectionHealthService, SectionService};
 use ratatui::widgets::TableState;
 
-use crate::overlay::{Action, InputKind, Outcome, Overlay, PickerKind, ToggleItem};
+use crate::overlay::{Action, InputKind, Outcome, Overlay, PickerKind, ToggleItem, ToggleKind};
 use crate::theme::Theme;
 use crate::wizard::{section_label, Wizard, WizardOutcome};
 
@@ -797,9 +797,75 @@ impl App {
 
     fn open_sections_toggle(&mut self) {
         let items = (0..TABS.len())
-            .map(|i| ToggleItem { section: section_of(i), label: TABS[i].to_string(), on: self.visible[i] })
+            .map(|i| ToggleItem { id: i.to_string(), label: TABS[i].to_string(), on: self.visible[i] })
             .collect();
-        self.overlay = Some(Overlay::Toggle { title: "Visible tabs".into(), items, selected: 0 });
+        self.overlay =
+            Some(Overlay::Toggle { title: "Visible tabs".into(), kind: ToggleKind::Sections, min_one: true, items, selected: 0 });
+    }
+
+    async fn apply_toggle(&mut self, kind: ToggleKind, ids: Vec<String>, deps: &AppDeps) {
+        match kind {
+            ToggleKind::Sections => {
+                let visible = ids.iter().filter_map(|id| id.parse::<usize>().ok()).map(section_of).collect();
+                self.apply_visible_sections(visible, deps).await;
+            }
+            ToggleKind::PipelineSubs { connection_id } => {
+                self.apply_pipeline_subs(&connection_id, ids, deps).await;
+            }
+        }
+    }
+
+    /// Discovers a connection's pipeline definitions and opens a subscribe checklist.
+    async fn open_pipeline_subs(&mut self, deps: &AppDeps) {
+        let Some((id, display)) = self.config_selected_id() else { return };
+        let source = match deps.sections.pipeline_source_for(&id).await {
+            Ok(Some(s)) => s,
+            _ => {
+                self.toast = Some("That connection doesn't support pipelines".into());
+                return;
+            }
+        };
+        let defs = match source.discover().await {
+            Ok(d) => d,
+            Err(e) => {
+                self.toast = Some(format!("Discover failed: {e}"));
+                return;
+            }
+        };
+        if defs.is_empty() {
+            self.toast = Some("No pipelines found for this connection".into());
+            return;
+        }
+
+        let cfg = deps.config.snapshot();
+        let sub = cfg.pipelines.as_ref().and_then(|p| p.subscriptions.iter().find(|s| s.connection_id == id));
+        let auto = sub.map(|s| s.auto_discover_all).unwrap_or(false);
+        let subscribed: std::collections::HashSet<String> =
+            sub.map(|s| s.definition_ids.iter().cloned().collect()).unwrap_or_default();
+
+        let items = defs
+            .iter()
+            .map(|d| ToggleItem { id: d.id.clone(), label: d.name.clone(), on: auto || subscribed.contains(&d.id) })
+            .collect();
+
+        self.overlay = Some(Overlay::Toggle {
+            title: format!("Subscribe · {display}"),
+            kind: ToggleKind::PipelineSubs { connection_id: id },
+            min_one: false,
+            items,
+            selected: 0,
+        });
+    }
+
+    async fn apply_pipeline_subs(&mut self, connection_id: &str, ids: Vec<String>, deps: &AppDeps) {
+        match deps.config.set_pipeline_definitions(connection_id, ids.clone()).await {
+            Ok(()) => {
+                self.toast = Some(format!("Subscribed to {} pipeline(s)", ids.len()));
+                self.reload_all(deps).await;
+                self.rebuild_config_view(deps).await;
+            }
+            Err(e) => self.toast = Some(format!("{e}")),
+        }
     }
 
     async fn apply_visible_sections(&mut self, visible: Vec<Section>, deps: &AppDeps) {
@@ -884,6 +950,7 @@ impl App {
             Key::Char('a') => self.start_add_connection(),
             Key::Char('p') => self.config_bind(Section::PullRequests, deps).await,
             Key::Char('w') => self.config_bind(Section::WorkItems, deps).await,
+            Key::Char('s') => self.open_pipeline_subs(deps).await,
             Key::Char('x') | Key::Char('d') => self.config_remove_selected(),
             Key::Up | Key::Char('k') => self.config_move(-1),
             Key::Down | Key::Char('j') => self.config_move(1),
@@ -990,7 +1057,7 @@ impl App {
             Action::WiSetState(_) | Action::WiComment(_) => self.execute_wi_action(action, deps).await,
             Action::PipelineTrigger { .. } => self.execute_pipeline_action(action, deps).await,
             Action::RemoveConnection { .. } => self.execute_config_action(action, deps).await,
-            Action::SetVisibleSections(visible) => self.apply_visible_sections(visible, deps).await,
+            Action::ApplyToggle { kind, ids } => self.apply_toggle(kind, ids, deps).await,
         }
     }
 
