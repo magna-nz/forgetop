@@ -9,7 +9,7 @@ namespace Forgetop.Tui;
 /// </summary>
 public abstract class SectionView : View
 {
-    protected readonly TableView Table;
+    protected readonly SectionTableView Table;
     private readonly FrameView _detailPane;
     private readonly TextView _detailText;
     private bool _expanded;
@@ -22,7 +22,7 @@ public abstract class SectionView : View
         Width = Dim.Fill();
         Height = Dim.Fill();
 
-        Table = new TableView
+        Table = new SectionTableView
         {
             X = 0,
             Y = 0,
@@ -36,7 +36,7 @@ public abstract class SectionView : View
         Table.Style.ShowVerticalHeaderLines = false;
         Table.Style.AlwaysShowHeaders = true;
         Table.CellActivated += _ => OnActivated(Table.SelectedRow);
-        Table.KeyPress += OnTableKey;
+        Table.KeyHandler = HandleKey;
 
         _detailPane = new FrameView("Details")
         {
@@ -158,20 +158,21 @@ public abstract class SectionView : View
     /// <summary>Give the row table keyboard focus (so arrows move rows, not tabs).</summary>
     public void FocusContent() => Table.SetFocus();
 
-    private void OnTableKey(KeyEventEventArgs args)
+    /// <summary>
+    /// Intercepts keys *before* the table's own navigation: ←/→ switch tabs,
+    /// ↑/↓ move rows (clamped so focus can't escape to the tab bar), Esc collapses
+    /// the detail, letters are section actions. Returns true if handled.
+    /// </summary>
+    private bool HandleKey(KeyEvent keyEvent)
     {
-        switch (args.KeyEvent.Key)
+        switch (keyEvent.Key)
         {
             case Key.CursorLeft:
                 TabSwitch?.Invoke(-1);
-                args.Handled = true;
-                return;
+                return true;
             case Key.CursorRight:
                 TabSwitch?.Invoke(1);
-                args.Handled = true;
-                return;
-            // Handle up/down ourselves and clamp, so focus never escapes up into the
-            // tab bar (which would turn arrows into tab switches).
+                return true;
             case Key.CursorUp:
                 if (Table.SelectedRow > 0)
                 {
@@ -179,8 +180,7 @@ public abstract class SectionView : View
                     Table.SetNeedsDisplay();
                 }
 
-                args.Handled = true;
-                return;
+                return true;
             case Key.CursorDown:
                 var rowCount = Table.Table?.Rows.Count ?? 0;
                 if (Table.SelectedRow < rowCount - 1)
@@ -189,19 +189,24 @@ public abstract class SectionView : View
                     Table.SetNeedsDisplay();
                 }
 
-                args.Handled = true;
-                return;
+                return true;
             case Key.Esc when _expanded:
                 Collapse();
-                args.Handled = true;
-                return;
+                return true;
             default:
-                if (OnActionKey(args.KeyEvent))
-                {
-                    args.Handled = true;
-                }
-
-                return;
+                return OnActionKey(keyEvent);
         }
     }
+}
+
+/// <summary>
+/// A TableView that lets its host intercept keys before the built-in cell
+/// navigation (which otherwise swallows ←/→ for column movement).
+/// </summary>
+public sealed class SectionTableView : TableView
+{
+    public Func<KeyEvent, bool>? KeyHandler { get; set; }
+
+    public override bool ProcessKey(KeyEvent keyEvent) =>
+        (KeyHandler?.Invoke(keyEvent) ?? false) || base.ProcessKey(keyEvent);
 }
