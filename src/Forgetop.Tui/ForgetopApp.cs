@@ -81,10 +81,22 @@ public sealed class ForgetopApp
         _tabs.AddTab(new TabView.Tab("   Work Items   ", _workItemView), andSelect: false);
         _tabs.AddTab(new TabView.Tab("   Pipelines   ", _pipelineView), andSelect: false);
 
-        foreach (var view in Views)
+        // Switch tabs with ←/→ even while the content table is focused. This fires on
+        // the TabView before the key is delegated down to the table (which would
+        // otherwise consume the arrows for column navigation).
+        _tabs.KeyPress += args =>
         {
-            view.TabSwitch += delta => _tabs.SwitchTabBy(delta);
-        }
+            if (args.KeyEvent.Key == Key.CursorLeft)
+            {
+                _tabs.SwitchTabBy(-1);
+                args.Handled = true;
+            }
+            else if (args.KeyEvent.Key == Key.CursorRight)
+            {
+                _tabs.SwitchTabBy(1);
+                args.Handled = true;
+            }
+        };
 
         _window = new Window("forgetop — htop for your software forges")
         {
