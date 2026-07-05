@@ -143,9 +143,10 @@ fn checks_span(theme: &Theme, pr: &PullRequest) -> Span<'static> {
 
 fn render_prs(frame: &mut Frame, area: Rect, app: &mut App) {
     let theme = &app.theme;
-    let block = section_block(theme, "Pull Requests");
+    let title = format!("Pull Requests · {}", app.pr_filter_label());
+    let block = section_block(theme, &title);
     if app.prs.is_empty() {
-        let msg = if app.loading { "Loading pull requests…" } else { "No pull requests. Press r to refresh." };
+        let msg = if app.loading { "Loading pull requests…" } else { "No pull requests. Press f to change filter, r to refresh." };
         empty(frame, area, theme, msg, block);
         return;
     }
@@ -407,30 +408,42 @@ fn render_health(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
+/// Context-aware key glossary for the active tab (azdo-style bar along the bottom).
+fn footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
+    let mut keys = vec![("↑↓", "move"), ("←→", "tabs"), ("↵", "detail")];
+    if app.active == 0 {
+        keys.push(("f", "filter"));
+    }
+    keys.extend([("r", "refresh"), ("t", "theme"), ("q", "quit")]);
+    keys
+}
+
 fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     let theme = &app.theme;
+    // A subtle bar background so the glossary reads as a distinct strip.
+    let bar = Style::default().bg(theme.panel);
+
+    let mut spans = vec![Span::styled(" ", bar)];
+    for (key, label) in footer_keys(app) {
+        spans.push(Span::styled(format!(" {key} "), bar.fg(theme.bg).bg(theme.accent).add_modifier(Modifier::BOLD)));
+        spans.push(Span::styled(format!(" {label}  "), bar.fg(theme.fg)));
+    }
+
+    // Right side: transient toast (highlighted) or the standing status line.
+    let (right, right_style) = match &app.toast {
+        Some(t) => (format!("{t} "), bar.fg(theme.yellow).add_modifier(Modifier::BOLD)),
+        None => (format!("{} ", app.status), bar.fg(theme.dim)),
+    };
+    let right_w = right.chars().count().min(70) as u16 + 1;
+
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(10), Constraint::Length(app.status.len().min(60) as u16 + 1)])
+        .constraints([Constraint::Min(10), Constraint::Length(right_w)])
         .split(area);
 
-    let keys = Line::from(vec![
-        Span::styled(" ↑↓", Style::default().fg(theme.accent)),
-        Span::styled(" move  ", Style::default().fg(theme.dim)),
-        Span::styled("←→", Style::default().fg(theme.accent)),
-        Span::styled(" tabs  ", Style::default().fg(theme.dim)),
-        Span::styled("↵", Style::default().fg(theme.accent)),
-        Span::styled(" detail  ", Style::default().fg(theme.dim)),
-        Span::styled("r", Style::default().fg(theme.accent)),
-        Span::styled(" refresh  ", Style::default().fg(theme.dim)),
-        Span::styled("t", Style::default().fg(theme.accent)),
-        Span::styled(" theme  ", Style::default().fg(theme.dim)),
-        Span::styled("q", Style::default().fg(theme.accent)),
-        Span::styled(" quit", Style::default().fg(theme.dim)),
-    ]);
-    frame.render_widget(Paragraph::new(keys), cols[0]);
+    frame.render_widget(Paragraph::new(Line::from(spans)).style(bar), cols[0]);
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(app.status.clone(), Style::default().fg(theme.dim))).right_aligned()),
+        Paragraph::new(Line::from(Span::styled(right, right_style)).right_aligned()).style(bar),
         cols[1],
     );
 }
@@ -507,6 +520,30 @@ mod tests {
         let expanded = render_to_string(&mut app, 100, 24);
         assert!(expanded.contains("Detail"), "detail panel should expand on Enter");
         assert!(expanded.contains("Alice Ng"), "detail should show the author");
+    }
+
+    #[test]
+    fn pr_footer_shows_filter_key_and_active_filter() {
+        let mut app = App::new("slate");
+        app.prs.push(sample_pr());
+        app.pr_state.select(Some(0));
+
+        let out = render_to_string(&mut app, 100, 24);
+        assert!(out.contains("filter"), "PR tab footer should advertise the filter key");
+        assert!(out.contains("Pull Requests · all"), "PR title should show the active filter");
+
+        // On the Work Items tab the filter key is not offered.
+        app.active = 1;
+        let wi = render_to_string(&mut app, 100, 24);
+        assert!(!wi.contains("filter"), "filter is PR-only");
+    }
+
+    #[test]
+    fn toast_renders_in_footer() {
+        let mut app = App::new("slate");
+        app.toast = Some("Filter: mine (1 PRs)".into());
+        let out = render_to_string(&mut app, 100, 24);
+        assert!(out.contains("Filter: mine"), "toast should appear in the footer");
     }
 
     #[test]

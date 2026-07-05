@@ -97,6 +97,7 @@ fn map_key(code: KeyCode, mods: KeyModifiers) -> Key {
         KeyCode::Tab => Key::Tab,
         KeyCode::Enter => Key::Enter,
         KeyCode::Esc => Key::Escape,
+        KeyCode::Char('f') => Key::Filter,
         KeyCode::Char('r') => Key::Refresh,
         KeyCode::Char('t') => Key::Theme,
         KeyCode::Char('q') => Key::Quit,

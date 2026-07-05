@@ -41,6 +41,9 @@ pub struct App {
     pub status: String,
     pub loading: bool,
     pub show_detail: bool,
+    pub pr_filter: PullRequestFilter,
+    /// Transient one-shot message shown in the footer until the next keypress.
+    pub toast: Option<String>,
     pub last_refresh: DateTime<Local>,
     pub should_quit: bool,
 }
@@ -60,8 +63,19 @@ impl App {
             status: "Loading…".into(),
             loading: true,
             show_detail: false,
+            pr_filter: PullRequestFilter::All,
+            toast: None,
             last_refresh: Local::now(),
             should_quit: false,
+        }
+    }
+
+    /// Human label for the current PR filter (shown in the section title / footer).
+    pub fn pr_filter_label(&self) -> &'static str {
+        match self.pr_filter {
+            PullRequestFilter::All => "all",
+            PullRequestFilter::Mine => "mine",
+            PullRequestFilter::ReviewRequested => "review-requested",
         }
     }
 
@@ -142,16 +156,33 @@ impl App {
         self.status = "Refreshing…".into();
 
         let mut errors: Vec<String> = Vec::new();
+        self.reload_pull_requests(deps, &mut errors).await;
+        self.reload_work_items(deps, &mut errors).await;
+        self.reload_pipelines(deps, &mut errors).await;
+        self.health = deps.health.check_all().await;
 
+        self.fix_selection();
+        self.last_refresh = Local::now();
+        self.loading = false;
+        self.status = if errors.is_empty() {
+            format!("{} PRs · {} work items · {} runs", self.prs.len(), self.wis.len(), self.pipes.len())
+        } else {
+            errors.join("  |  ")
+        };
+    }
+
+    async fn reload_pull_requests(&mut self, deps: &AppDeps, errors: &mut Vec<String>) {
         match deps.sections.pull_request_source().await {
-            Ok(Some(src)) => match src.list(&pr_query()).await {
+            Ok(Some(src)) => match src.list(&pr_query(self.pr_filter)).await {
                 Ok(list) => self.prs = list,
                 Err(e) => errors.push(format!("PRs: {e}")),
             },
             Ok(None) => self.prs.clear(),
             Err(e) => errors.push(format!("PRs: {e}")),
         }
+    }
 
+    async fn reload_work_items(&mut self, deps: &AppDeps, errors: &mut Vec<String>) {
         match deps.sections.work_item_source().await {
             Ok(Some(src)) => match src.list(&wi_query()).await {
                 Ok(list) => self.wis = list,
@@ -160,15 +191,16 @@ impl App {
             Ok(None) => self.wis.clear(),
             Err(e) => errors.push(format!("Work items: {e}")),
         }
+    }
 
+    async fn reload_pipelines(&mut self, deps: &AppDeps, errors: &mut Vec<String>) {
         self.pipes.clear();
         match deps.sections.pipeline_feeds().await {
             Ok(feeds) => {
                 for feed in feeds {
                     let provider = feed.connection.provider_type();
                     let name = feed.connection.display_name().to_string();
-                    let queries = feed_queries(&feed.subscription);
-                    for q in queries {
+                    for q in feed_queries(&feed.subscription) {
                         match feed.source.list_runs(&q).await {
                             Ok(runs) => {
                                 for run in runs {
@@ -182,27 +214,39 @@ impl App {
             }
             Err(e) => errors.push(format!("Pipelines: {e}")),
         }
+    }
 
-        self.health = deps.health.check_all().await;
-
+    /// Re-selects a valid row per tab after the underlying data changed.
+    fn fix_selection(&mut self) {
         self.clamp_selection();
+        self.pr_state.select((!self.prs.is_empty()).then_some(self.pr_state.selected().unwrap_or(0)));
         self.wi_state.select((!self.wis.is_empty()).then_some(self.wi_state.selected().unwrap_or(0)));
         self.pipe_state.select((!self.pipes.is_empty()).then_some(self.pipe_state.selected().unwrap_or(0)));
-        self.pr_state.select((!self.prs.is_empty()).then_some(self.pr_state.selected().unwrap_or(0)));
+    }
 
-        self.last_refresh = Local::now();
-        self.loading = false;
-        self.status = if errors.is_empty() {
-            format!("{} PRs · {} work items · {} runs", self.prs.len(), self.wis.len(), self.pipes.len())
-        } else {
-            errors.join("  |  ")
+    /// Cycles the PR filter, reloads just the PR list, and toasts the new filter.
+    async fn cycle_pr_filter(&mut self, deps: &AppDeps) {
+        self.pr_filter = match self.pr_filter {
+            PullRequestFilter::All => PullRequestFilter::Mine,
+            PullRequestFilter::Mine => PullRequestFilter::ReviewRequested,
+            PullRequestFilter::ReviewRequested => PullRequestFilter::All,
         };
+        let mut errors = Vec::new();
+        self.reload_pull_requests(deps, &mut errors).await;
+        self.pr_state.select((!self.prs.is_empty()).then_some(0));
+        self.show_detail = false;
+        self.toast = Some(match errors.first() {
+            Some(e) => e.clone(),
+            None => format!("Filter: {} ({} PRs)", self.pr_filter_label(), self.prs.len()),
+        });
     }
 
     // ---- key handling ----
 
     /// Returns after applying the key. `deps` is used for async refresh / theme persistence.
     pub async fn on_key(&mut self, key: Key, deps: &AppDeps) {
+        // Any keypress dismisses the previous one-shot toast.
+        self.toast = None;
         match key {
             Key::Quit => self.should_quit = true,
             Key::Escape => {
@@ -221,6 +265,11 @@ impl App {
             Key::Enter => {
                 if self.selected().is_some() {
                     self.show_detail = !self.show_detail;
+                }
+            }
+            Key::Filter => {
+                if self.active == 0 {
+                    self.cycle_pr_filter(deps).await;
                 }
             }
             Key::Refresh => self.reload_all(deps).await,
@@ -244,6 +293,7 @@ pub enum Key {
     Tab,
     Enter,
     Escape,
+    Filter,
     Refresh,
     Theme,
     Quit,
@@ -251,8 +301,8 @@ pub enum Key {
     None,
 }
 
-fn pr_query() -> PullRequestQuery {
-    PullRequestQuery { filter: PullRequestFilter::All, include_completed: false, limit: Some(50) }
+fn pr_query(filter: PullRequestFilter) -> PullRequestQuery {
+    PullRequestQuery { filter, include_completed: false, limit: Some(50) }
 }
 
 fn wi_query() -> WorkItemQuery {
