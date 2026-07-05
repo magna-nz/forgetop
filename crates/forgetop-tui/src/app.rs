@@ -1,5 +1,6 @@
 //! Application state and the (async) update logic driven by the event loop.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use chrono::{DateTime, Local};
@@ -24,6 +25,7 @@ pub struct AppDeps {
 
 /// One pipeline run, tagged with the connection it came from (for the provider column).
 pub struct PipeRow {
+    pub connection_id: String,
     pub connection: String,
     pub provider: ProviderType,
     pub run: PipelineRun,
@@ -53,10 +55,97 @@ pub struct App {
     pub should_quit: bool,
 }
 
-/// Full-screen views layered above the list.
+/// Full-screen views layered above the list. The large views are boxed so the
+/// common `List` state doesn't bloat every `Screen` value.
 pub enum Screen {
     List,
-    Diff(DiffView),
+    Diff(Box<DiffView>),
+    Pipeline(Box<PipelineView>),
+}
+
+/// One row of the flattened, collapsible pipeline tree.
+pub struct FlatNode {
+    pub depth: usize,
+    pub label: String,
+    pub status: PipelineRunStatus,
+    /// Collapse key when the node has children; `None` for leaf steps.
+    pub key: Option<String>,
+    pub expanded: bool,
+}
+
+/// State for the full-screen pipeline drill-in (stages → jobs → steps).
+pub struct PipelineView {
+    pub title: String,
+    pub run: PipelineRun,
+    pub connection_id: String,
+    pub definition_id: String,
+    pub branch: Option<String>,
+    collapsed: HashSet<String>,
+    pub selected: usize,
+}
+
+impl PipelineView {
+    pub fn new(title: String, run: PipelineRun, connection_id: String, definition_id: String, branch: Option<String>) -> Self {
+        Self { title, run, connection_id, definition_id, branch, collapsed: HashSet::new(), selected: 0 }
+    }
+
+    /// Flattens stages/jobs/steps into visible rows, honouring collapsed nodes.
+    pub fn flatten(&self) -> Vec<FlatNode> {
+        let mut out = Vec::new();
+        for (si, stage) in self.run.stages.iter().enumerate() {
+            let key = format!("s{si}");
+            let expanded = !self.collapsed.contains(&key);
+            out.push(FlatNode {
+                depth: 0,
+                label: stage.name.clone(),
+                status: stage.status,
+                key: (!stage.jobs.is_empty()).then(|| key.clone()),
+                expanded,
+            });
+            if !expanded {
+                continue;
+            }
+            for (ji, job) in stage.jobs.iter().enumerate() {
+                let jkey = format!("s{si}.j{ji}");
+                let jexpanded = !self.collapsed.contains(&jkey);
+                out.push(FlatNode {
+                    depth: 1,
+                    label: job.name.clone(),
+                    status: job.status,
+                    key: (!job.steps.is_empty()).then(|| jkey.clone()),
+                    expanded: jexpanded,
+                });
+                if jexpanded {
+                    for step in &job.steps {
+                        out.push(FlatNode { depth: 2, label: step.name.clone(), status: step.status, key: None, expanded: false });
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn move_sel(&mut self, delta: isize) {
+        let len = self.flatten().len();
+        if len == 0 {
+            return;
+        }
+        let n = len as isize;
+        self.selected = (((self.selected as isize + delta) % n + n) % n) as usize;
+    }
+
+    /// Expands/collapses the node under the cursor (no-op on leaf steps).
+    fn toggle_selected(&mut self) {
+        if let Some(Some(key)) = self.flatten().get(self.selected).map(|n| n.key.clone()) {
+            if !self.collapsed.remove(&key) {
+                self.collapsed.insert(key);
+            }
+            let len = self.flatten().len();
+            if self.selected >= len {
+                self.selected = len.saturating_sub(1);
+            }
+        }
+    }
 }
 
 /// State for the full-screen PR diff + threads view.
@@ -241,11 +330,12 @@ impl App {
                 for feed in feeds {
                     let provider = feed.connection.provider_type();
                     let name = feed.connection.display_name().to_string();
+                    let conn_id = feed.connection.connection_id().to_string();
                     for q in feed_queries(&feed.subscription) {
                         match feed.source.list_runs(&q).await {
                             Ok(runs) => {
                                 for run in runs {
-                                    self.pipes.push(PipeRow { connection: name.clone(), provider, run });
+                                    self.pipes.push(PipeRow { connection_id: conn_id.clone(), connection: name.clone(), provider, run });
                                 }
                             }
                             Err(e) => errors.push(format!("Pipelines ({name}): {e}")),
@@ -300,10 +390,17 @@ impl App {
             return;
         }
 
-        // A full-screen sub-view (e.g. the diff) handles its own keys.
-        if matches!(self.screen, Screen::Diff(_)) {
-            self.on_diff_key(key);
-            return;
+        // Full-screen sub-views handle their own keys.
+        match self.screen {
+            Screen::Diff(_) => {
+                self.on_diff_key(key);
+                return;
+            }
+            Screen::Pipeline(_) => {
+                self.on_pipeline_key(key);
+                return;
+            }
+            Screen::List => {}
         }
 
         match key {
@@ -320,7 +417,9 @@ impl App {
             Key::Up => self.move_up(),
             Key::Down => self.move_down(),
             Key::Enter => {
-                if self.selected().is_some() {
+                if self.active == 2 {
+                    self.open_pipeline(deps).await;
+                } else if self.selected().is_some() {
                     self.show_detail = !self.show_detail;
                 }
             }
@@ -352,6 +451,8 @@ impl App {
             'd' => self.open_diff(deps).await,
             // Work-item actions (Work Items tab only).
             's' => self.open_wi_state(),
+            // Pipeline trigger (Pipelines tab).
+            'T' if self.active == 2 => self.open_pipeline_trigger(),
             // Comment is offered on both PR and work-item tabs.
             'c' => match self.active {
                 0 => self.open_pr_comment(),
@@ -395,7 +496,102 @@ impl App {
             }
         };
         let threads = source.threads(&id).await.unwrap_or_default();
-        self.screen = Screen::Diff(DiffView { pr_label: label, files, threads, selected: 0, scroll: 0 });
+        self.screen = Screen::Diff(Box::new(DiffView { pr_label: label, files, threads, selected: 0, scroll: 0 }));
+    }
+
+    // ---- pipeline drill-in + trigger ----
+
+    fn selected_pipe(&self) -> Option<&PipeRow> {
+        if self.active != 2 {
+            return None;
+        }
+        self.pipe_state.selected().and_then(|i| self.pipes.get(i))
+    }
+
+    async fn open_pipeline(&mut self, deps: &AppDeps) {
+        let Some(pipe) = self.selected_pipe() else { return };
+        let conn_id = pipe.connection_id.clone();
+        let run_id = pipe.run.id.clone();
+        let definition_id = pipe.run.definition_id.clone();
+        let branch = pipe.run.branch.clone();
+        let title = pipe_label(pipe);
+        let fallback = pipe.run.clone();
+
+        // Enrich with full stages/jobs/steps via get_run (list_runs may be shallow).
+        let feeds = deps.sections.pipeline_feeds().await.unwrap_or_default();
+        let run = match feeds.iter().find(|f| f.connection.connection_id() == conn_id) {
+            Some(feed) => feed.source.get_run(&run_id).await.unwrap_or(fallback),
+            None => fallback,
+        };
+
+        self.screen = Screen::Pipeline(Box::new(PipelineView::new(title, run, conn_id, definition_id, branch)));
+    }
+
+    fn on_pipeline_key(&mut self, key: Key) {
+        match key {
+            Key::Escape => self.screen = Screen::List,
+            Key::Char('q') => self.should_quit = true,
+            Key::Char('T') => self.open_pipeline_trigger(),
+            other => {
+                if let Screen::Pipeline(view) = &mut self.screen {
+                    match other {
+                        Key::Up | Key::Char('k') => view.move_sel(-1),
+                        Key::Down | Key::Char('j') => view.move_sel(1),
+                        Key::Enter | Key::Char(' ') | Key::Right | Key::Left => view.toggle_selected(),
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    /// The pipeline to trigger — from the drill-in view if open, else the selected list row.
+    fn pipeline_target(&self) -> Option<(String, String, Option<String>, String)> {
+        if let Screen::Pipeline(v) = &self.screen {
+            return Some((v.connection_id.clone(), v.definition_id.clone(), v.branch.clone(), v.title.clone()));
+        }
+        let pipe = self.selected_pipe()?;
+        Some((pipe.connection_id.clone(), pipe.run.definition_id.clone(), pipe.run.branch.clone(), pipe_label(pipe)))
+    }
+
+    fn open_pipeline_trigger(&mut self) {
+        let Some((connection_id, definition_id, branch, label)) = self.pipeline_target() else { return };
+        let message = match &branch {
+            Some(b) => format!("Trigger {label} on {b}?"),
+            None => format!("Trigger {label}?"),
+        };
+        self.overlay = Some(Overlay::Confirm {
+            title: "Trigger".into(),
+            message,
+            action: Action::PipelineTrigger { connection_id, definition_id, branch, label },
+        });
+    }
+
+    async fn execute_pipeline_action(&mut self, action: Action, deps: &AppDeps) {
+        let Action::PipelineTrigger { connection_id, definition_id, branch, label } = action else { return };
+        let feeds = match deps.sections.pipeline_feeds().await {
+            Ok(f) => f,
+            Err(e) => {
+                self.toast = Some(format!("Trigger failed: {e}"));
+                return;
+            }
+        };
+        let Some(feed) = feeds.iter().find(|f| f.connection.connection_id() == connection_id) else {
+            self.toast = Some("Pipeline connection not found".into());
+            return;
+        };
+        match feed.source.trigger(&definition_id, branch.as_deref()).await {
+            Ok(()) => {
+                self.toast = Some(format!("Triggered {label}"));
+                let mut errors = Vec::new();
+                self.reload_pipelines(deps, &mut errors).await;
+                self.fix_selection();
+                if let Some(e) = errors.first() {
+                    self.toast = Some(e.clone());
+                }
+            }
+            Err(e) => self.toast = Some(format!("Trigger failed: {e}")),
+        }
     }
 
     async fn on_overlay_key(&mut self, key: Key, deps: &AppDeps) {
@@ -448,6 +644,7 @@ impl App {
         match action {
             Action::PrVote(_) | Action::PrMerge(_) | Action::PrComment(_) => self.execute_pr_action(action, deps).await,
             Action::WiSetState(_) | Action::WiComment(_) => self.execute_wi_action(action, deps).await,
+            Action::PipelineTrigger { .. } => self.execute_pipeline_action(action, deps).await,
         }
     }
 
@@ -569,6 +766,14 @@ fn wi_label(wi: &WorkItem) -> String {
     let id = wi.identifier.clone().map(|i| format!("{i} ")).unwrap_or_default();
     let title: String = wi.title.chars().take(40).collect();
     format!("{id}— {title}")
+}
+
+fn pipe_label(pipe: &PipeRow) -> String {
+    let name = pipe.run.name.clone().unwrap_or_else(|| pipe.run.definition_id.clone());
+    match pipe.run.number {
+        Some(n) => format!("{name} #{n}"),
+        None => name,
+    }
 }
 
 fn pr_label(pr: &PullRequest) -> String {
