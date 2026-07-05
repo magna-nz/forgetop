@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/forgetop-core",
+    "crates/forgetop-providers",
+    "crates/forgetop-tui",
+    "crates/forgetop-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["magna-nz"]
+license = "MIT"
+repository = "https://github.com/magna-nz/forgetop"
+
+[workspace.dependencies]
+forgetop-core = { path = "crates/forgetop-core" }
+forgetop-providers = { path = "crates/forgetop-providers" }
+forgetop-tui = { path = "crates/forgetop-tui" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+async-trait = "0.1"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "fs"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+uuid = { version = "1", features = ["v4"] }
+keyring = { version = "3", features = ["apple-native", "windows-native", "linux-native"] }
+dirs = "5"
+base64 = "0.22"
+similar = "2"
+ratatui = "0.29"
+crossterm = "0.28"

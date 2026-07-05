@@ -1,0 +1,152 @@
+//! Persisted configuration: connections + per-section bindings, and the config store.
+//! Note: config NEVER contains secrets — only a `credential_ref` key into the secret store.
+
+use std::path::{Path, PathBuf};
+
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+
+use crate::domain::Section;
+use crate::error::Result;
+use crate::provider::Connection;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PullRequestBinding {
+    pub connection_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkItemBinding {
+    pub connection_id: String,
+}
+
+/// One connection feeding the Pipelines section, plus the pipelines subscribed from it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PipelineSubscription {
+    pub connection_id: String,
+    #[serde(default)]
+    pub definition_ids: Vec<String>,
+    #[serde(default)]
+    pub auto_discover_all: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PipelineBinding {
+    #[serde(default)]
+    pub subscriptions: Vec<PipelineSubscription>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UiState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub theme: Option<String>,
+    #[serde(default)]
+    pub active_section: Section,
+}
+
+/// Root persisted configuration.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ForgetopConfig {
+    #[serde(default)]
+    pub connections: Vec<Connection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull_requests: Option<PullRequestBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_items: Option<WorkItemBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipelines: Option<PipelineBinding>,
+    #[serde(default)]
+    pub ui: UiState,
+}
+
+impl ForgetopConfig {
+    pub fn find_connection(&self, id: &str) -> Option<&Connection> {
+        self.connections.iter().find(|c| c.id == id)
+    }
+}
+
+/// Loads and saves the root configuration.
+#[async_trait]
+pub trait ConfigStore: Send + Sync {
+    async fn load(&self) -> Result<ForgetopConfig>;
+    async fn save(&self, config: &ForgetopConfig) -> Result<()>;
+}
+
+/// Resolves the on-disk config path: `$XDG_CONFIG_HOME/forgetop/config.json` (or the
+/// platform config dir).
+pub fn default_config_path() -> PathBuf {
+    let base = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
+    base.join("forgetop").join("config.json")
+}
+
+/// JSON-file config store with atomic (temp + rename) writes.
+pub struct JsonConfigStore {
+    path: PathBuf,
+}
+
+impl JsonConfigStore {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+
+    pub fn at_default_path() -> Self {
+        Self::new(default_config_path())
+    }
+}
+
+#[async_trait]
+impl ConfigStore for JsonConfigStore {
+    async fn load(&self) -> Result<ForgetopConfig> {
+        if !self.path.exists() {
+            return Ok(ForgetopConfig::default());
+        }
+        let bytes = tokio::fs::read(&self.path).await?;
+        Ok(serde_json::from_slice(&bytes)?)
+    }
+
+    async fn save(&self, config: &ForgetopConfig) -> Result<()> {
+        if let Some(dir) = self.path.parent() {
+            tokio::fs::create_dir_all(dir).await?;
+        }
+        let json = serde_json::to_vec_pretty(config)?;
+        // Write to a temp file then rename so a crash mid-write can't corrupt config.
+        let tmp = with_extension(&self.path, "tmp");
+        tokio::fs::write(&tmp, &json).await?;
+        tokio::fs::rename(&tmp, &self.path).await?;
+        Ok(())
+    }
+}
+
+fn with_extension(path: &Path, ext: &str) -> PathBuf {
+    let mut p = path.to_path_buf();
+    p.set_extension(ext);
+    p
+}
+
+/// Non-persistent config store (used for `--demo` and tests).
+pub struct InMemoryConfigStore {
+    config: std::sync::Mutex<ForgetopConfig>,
+}
+
+impl InMemoryConfigStore {
+    pub fn new(seed: ForgetopConfig) -> Self {
+        Self { config: std::sync::Mutex::new(seed) }
+    }
+}
+
+impl Default for InMemoryConfigStore {
+    fn default() -> Self {
+        Self::new(ForgetopConfig::default())
+    }
+}
+
+#[async_trait]
+impl ConfigStore for InMemoryConfigStore {
+    async fn load(&self) -> Result<ForgetopConfig> {
+        Ok(self.config.lock().unwrap().clone())
+    }
+    async fn save(&self, config: &ForgetopConfig) -> Result<()> {
+        *self.config.lock().unwrap() = config.clone();
+        Ok(())
+    }
+}

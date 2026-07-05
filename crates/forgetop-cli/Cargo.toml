@@ -1,0 +1,15 @@
+[package]
+name = "forgetop-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "forgetop"
+path = "src/main.rs"
+
+[dependencies]
+forgetop-core.workspace = true
+forgetop-providers.workspace = true
+forgetop-tui.workspace = true
+tokio.workspace = true
