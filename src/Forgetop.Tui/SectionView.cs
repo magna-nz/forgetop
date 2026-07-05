@@ -14,6 +14,9 @@ public abstract class SectionView : View
     private readonly TextView _detailText;
     private bool _expanded;
 
+    /// <summary>Raised on ←/→ to move between tabs (-1 / +1).</summary>
+    public event Action<int>? TabSwitch;
+
     protected SectionView()
     {
         Width = Dim.Fill();
@@ -156,22 +159,33 @@ public abstract class SectionView : View
     public void FocusContent() => Table.SetFocus();
 
     /// <summary>
-    /// ←/→ (tab switching) are intercepted by the TabView before the key reaches the
-    /// table; ↑/↓/Enter are the table's own row navigation. Here we only add Esc
-    /// (collapse the detail pane) and the section's letter actions.
+    /// The focused table's KeyPress fires here (via the parent's ProcessKey) BEFORE
+    /// the table's own navigation runs. Marking Handled stops the table consuming the
+    /// key, so ←/→ switch tabs on a single press. ↑/↓/Enter fall through to the table.
     /// </summary>
     private void OnTableKey(KeyEventEventArgs args)
     {
-        if (args.KeyEvent.Key == Key.Esc && _expanded)
+        switch (args.KeyEvent.Key)
         {
-            Collapse();
-            args.Handled = true;
-            return;
-        }
+            case Key.CursorLeft:
+                TabSwitch?.Invoke(-1);
+                args.Handled = true;
+                return;
+            case Key.CursorRight:
+                TabSwitch?.Invoke(1);
+                args.Handled = true;
+                return;
+            case Key.Esc when _expanded:
+                Collapse();
+                args.Handled = true;
+                return;
+            default:
+                if (OnActionKey(args.KeyEvent))
+                {
+                    args.Handled = true;
+                }
 
-        if (OnActionKey(args.KeyEvent))
-        {
-            args.Handled = true;
+                return;
         }
     }
 }
