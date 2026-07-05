@@ -20,6 +20,7 @@ public sealed class LinearConnection : IProviderConnection
     {
         ConnectionId = connection.Id;
         DisplayName = connection.DisplayName;
+        _client = client;
         WorkItems = new LinearWorkItemSource(client);
     }
 
@@ -31,6 +32,9 @@ public sealed class LinearConnection : IProviderConnection
     public IPullRequestSource? PullRequests => null;
     public IWorkItemSource? WorkItems { get; }
     public IPipelineSource? Pipelines => null;
+
+    private readonly LinearApiClient _client;
+    public Task<bool> CheckAsync(CancellationToken ct = default) => _client.CheckAsync(ct);
 }
 
 /// <summary>Builds Linear connections authenticated with a personal API key.</summary>

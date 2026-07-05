@@ -17,4 +17,7 @@ public interface IProviderConnection
     IPullRequestSource? PullRequests { get; }
     IWorkItemSource? WorkItems { get; }
     IPipelineSource? Pipelines { get; }
+
+    /// <summary>Cheap reachability/auth check for the connections health bar.</summary>
+    Task<bool> CheckAsync(CancellationToken ct = default);
 }

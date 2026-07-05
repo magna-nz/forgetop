@@ -15,6 +15,8 @@ public sealed class FakeProviderConnection : IProviderConnection
     public IPullRequestSource? PullRequests => null;
     public IWorkItemSource? WorkItems => null;
     public IPipelineSource? Pipelines => null;
+
+    public Task<bool> CheckAsync(CancellationToken ct = default) => Task.FromResult(true);
 }
 
 /// <summary>A factory whose capabilities are configurable per test.</summary>

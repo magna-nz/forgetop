@@ -20,6 +20,8 @@ public sealed class DemoConnection : IProviderConnection
     public IPullRequestSource? PullRequests { get; } = new DemoPullRequestSource();
     public IWorkItemSource? WorkItems { get; } = new DemoWorkItemSource();
     public IPipelineSource? Pipelines { get; } = new DemoPipelineSource();
+
+    public Task<bool> CheckAsync(CancellationToken ct = default) => Task.FromResult(true);
 }
 
 /// <summary>Factory for the Demo provider (needs no credentials).</summary>

@@ -1,75 +1,139 @@
+using System.Data;
 using Terminal.Gui;
 
 namespace Forgetop.Tui;
 
 /// <summary>
-/// A master/detail section pane: list of rows on the left, selected row's detail
-/// on the right. Subclasses load their data and handle action keys.
+/// A section screen: a one-line header, a full-width column table, and a detail
+/// pane that expands *beneath* the table on Enter (collapses on Esc).
 /// </summary>
-public abstract class SectionView : FrameView
+public abstract class SectionView : View
 {
-    private readonly ListView _list;
-    private readonly TextView _detail;
-    private readonly string _sectionName;
-    private IReadOnlyList<SectionRow> _rows = [];
+    protected readonly TableView Table;
+    private readonly FrameView _detailPane;
+    private readonly TextView _detailText;
+    private bool _expanded;
 
-    protected SectionView(string sectionName)
+    /// <summary>Raised on ←/→ to move between tabs (-1 / +1).</summary>
+    public event Action<int>? TabSwitch;
+
+    protected SectionView()
     {
-        _sectionName = sectionName;
-        Title = sectionName;
+        Width = Dim.Fill();
+        Height = Dim.Fill();
 
-        _list = new ListView
+        Table = new TableView
         {
             X = 0,
             Y = 0,
-            Width = Dim.Percent(45),
-            Height = Dim.Fill(),
-            AllowsMarking = false,
-        };
-        _list.SelectedItemChanged += OnSelectedItemChanged;
-
-        _detail = new TextView
-        {
-            X = Pos.Right(_list) + 1,
-            Y = 0,
             Width = Dim.Fill(),
             Height = Dim.Fill(),
-            ReadOnly = true,
-            WordWrap = true,
+            FullRowSelect = true,
         };
+        Table.Style.ShowHorizontalHeaderUnderline = true;
+        Table.Style.ShowHorizontalHeaderOverline = false;
+        Table.Style.ShowVerticalCellLines = false;
+        Table.Style.ShowVerticalHeaderLines = false;
+        Table.Style.AlwaysShowHeaders = true;
+        Table.CellActivated += _ => OnActivated(Table.SelectedRow);
+        Table.KeyPress += OnTableKey;
 
-        Add(_list, _detail);
+        _detailPane = new FrameView("Details")
+        {
+            X = 0,
+            Y = Pos.Bottom(Table),
+            Width = Dim.Fill(),
+            Height = Dim.Fill(),
+            Visible = false,
+        };
+        _detailText = new TextView { X = 0, Y = 0, Width = Dim.Fill(), Height = Dim.Fill(), ReadOnly = true, WordWrap = true };
+        _detailText.KeyPress += OnDetailEsc;
+
+        Add(Table, _detailPane);
     }
 
-    protected int SelectedIndex => _list.SelectedItem;
+    protected int SelectedRow => Table.SelectedRow;
 
-    /// <summary>Load this section's data (called on initial load and on refresh).</summary>
-    protected abstract Task<SectionData> LoadAsync(CancellationToken ct = default);
-
-    public async Task ReloadAsync(CancellationToken ct = default) => Apply(await LoadAsync(ct).ConfigureAwait(true));
-
-    public void Apply(SectionData data)
+    /// <summary>Apply the active theme so the table (and its status colours) match.</summary>
+    public void ApplyScheme(ColorScheme scheme)
     {
-        Title = $"{_sectionName}  ·  {data.ProviderLabel}";
-        _rows = data.Rows;
-        _list.SetSource(data.Rows.Select(r => r.Display).ToList());
-        UpdateDetail(_rows.Count > 0 ? 0 : -1);
+        ColorScheme = scheme;
+        Table.ColorScheme = scheme;
     }
 
-    public override bool ProcessKey(KeyEvent keyEvent) => OnActionKey(keyEvent) || base.ProcessKey(keyEvent);
+    /// <summary>Fetch data (network) — safe to call off the UI thread.</summary>
+    public abstract Task LoadDataAsync(CancellationToken ct = default);
 
-    /// <summary>Handle a section-specific action key; return true if handled.</summary>
+    /// <summary>Rebuild the table from already-loaded data — must run on the UI thread.</summary>
+    public abstract void Render();
+
+    public async Task RefreshAsync(CancellationToken ct = default)
+    {
+        await LoadDataAsync(ct).ConfigureAwait(true);
+        Render();
+    }
+
+    /// <summary>Called when the user presses Enter on a row.</summary>
+    protected virtual void OnActivated(int row) { }
+
+    /// <summary>Handle a letter action key; return true if handled.</summary>
     protected virtual bool OnActionKey(KeyEvent keyEvent) => false;
 
-    /// <summary>Replace the detail pane text (e.g. pipeline drill-in).</summary>
-    protected void ShowDetail(string text) => _detail.Text = text;
+    protected void SetTable(DataTable table) => Table.Table = table;
 
-    /// <summary>Load detail text asynchronously and show it, surfacing any error.</summary>
-    protected void ShowDetailSafe(Func<Task<string>> load)
+    /// <summary>Show plain-text detail beneath the table.</summary>
+    protected void Expand(string detail)
+    {
+        _detailText.Text = detail;
+        ShowDetailPane(_detailText);
+    }
+
+    /// <summary>Show an arbitrary (navigable) view beneath the table, e.g. a TreeView.</summary>
+    protected void ExpandView(View content)
+    {
+        content.X = 0;
+        content.Y = 0;
+        content.Width = Dim.Fill();
+        content.Height = Dim.Fill();
+        content.KeyPress += OnDetailEsc;
+        ShowDetailPane(content);
+    }
+
+    private void ShowDetailPane(View content)
+    {
+        _detailPane.RemoveAll();
+        _detailPane.Add(content);
+        _detailPane.Visible = true;
+        _expanded = true;
+        Table.Height = Dim.Percent(55);
+        SetNeedsDisplay();
+        content.SetFocus();
+    }
+
+    private void OnDetailEsc(KeyEventEventArgs args)
+    {
+        if (args.KeyEvent.Key == Key.Esc)
+        {
+            Collapse();
+            args.Handled = true;
+        }
+    }
+
+    private void Collapse()
+    {
+        _detailPane.Visible = false;
+        _expanded = false;
+        Table.Height = Dim.Fill();
+        Table.SetFocus();
+        SetNeedsDisplay();
+    }
+
+    protected void RunAction(Func<Task> action)
     {
         try
         {
-            ShowDetail(load().GetAwaiter().GetResult());
+            action().GetAwaiter().GetResult();
+            RefreshAsync().GetAwaiter().GetResult();
         }
         catch (Exception ex)
         {
@@ -77,13 +141,11 @@ public abstract class SectionView : FrameView
         }
     }
 
-    /// <summary>Run an async action, refresh the list, and surface any error.</summary>
-    protected void RunAction(Func<Task> action)
+    protected void ShowDetailSafe(Func<Task<string>> load)
     {
         try
         {
-            action().GetAwaiter().GetResult();
-            ReloadAsync().GetAwaiter().GetResult();
+            Expand(load().GetAwaiter().GetResult());
         }
         catch (Exception ex)
         {
@@ -93,8 +155,53 @@ public abstract class SectionView : FrameView
 
     protected static char KeyChar(KeyEvent keyEvent) => char.ToLowerInvariant((char)keyEvent.KeyValue);
 
-    private void OnSelectedItemChanged(ListViewItemEventArgs args) => UpdateDetail(args.Item);
+    /// <summary>Give the row table keyboard focus (so arrows move rows, not tabs).</summary>
+    public void FocusContent() => Table.SetFocus();
 
-    private void UpdateDetail(int index) =>
-        _detail.Text = index >= 0 && index < _rows.Count ? _rows[index].Detail : string.Empty;
+    private void OnTableKey(KeyEventEventArgs args)
+    {
+        switch (args.KeyEvent.Key)
+        {
+            case Key.CursorLeft:
+                TabSwitch?.Invoke(-1);
+                args.Handled = true;
+                return;
+            case Key.CursorRight:
+                TabSwitch?.Invoke(1);
+                args.Handled = true;
+                return;
+            // Handle up/down ourselves and clamp, so focus never escapes up into the
+            // tab bar (which would turn arrows into tab switches).
+            case Key.CursorUp:
+                if (Table.SelectedRow > 0)
+                {
+                    Table.SelectedRow--;
+                    Table.SetNeedsDisplay();
+                }
+
+                args.Handled = true;
+                return;
+            case Key.CursorDown:
+                var rowCount = Table.Table?.Rows.Count ?? 0;
+                if (Table.SelectedRow < rowCount - 1)
+                {
+                    Table.SelectedRow++;
+                    Table.SetNeedsDisplay();
+                }
+
+                args.Handled = true;
+                return;
+            case Key.Esc when _expanded:
+                Collapse();
+                args.Handled = true;
+                return;
+            default:
+                if (OnActionKey(args.KeyEvent))
+                {
+                    args.Handled = true;
+                }
+
+                return;
+        }
+    }
 }

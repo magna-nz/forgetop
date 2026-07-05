@@ -32,7 +32,46 @@ public sealed class GitHubApiClient
         var prs = doc.RootElement.EnumerateArray().Select(GitHubMapper.MapPullRequest).ToList();
 
         var me = query.Filter == PullRequestFilter.All ? null : await GetSelfLoginAsync(ct).ConfigureAwait(false);
-        return PullRequestFilters.Apply(prs, query.Filter, me);
+        var filtered = PullRequestFilters.Apply(prs, query.Filter, me);
+
+        // The list endpoint omits diff stats / mergeable / checks — enrich the top rows
+        // (each needs 2 extra calls) and leave the rest as the cheap list view.
+        const int enrichCap = 25;
+        var result = new List<PullRequest>(filtered.Count);
+        for (var i = 0; i < filtered.Count; i++)
+        {
+            result.Add(i < enrichCap ? await EnrichAsync(filtered[i], ct).ConfigureAwait(false) : filtered[i]);
+        }
+
+        return result;
+    }
+
+    private async Task<PullRequest> EnrichAsync(PullRequest pr, CancellationToken ct)
+    {
+        if (pr.Number is not { } number)
+        {
+            return pr;
+        }
+
+        try
+        {
+            using var detail = await GetAsync($"{Repo}/pulls/{number}", ct).ConfigureAwait(false);
+            var enriched = GitHubMapper.MapPullRequest(detail.RootElement);
+
+            var sha = detail.RootElement.Obj("head")?.Str("sha");
+            if (sha is not null)
+            {
+                using var checks = await GetAsync($"{Repo}/commits/{sha}/check-runs", ct).ConfigureAwait(false);
+                var (status, summary) = GitHubMapper.MapChecks(checks.RootElement);
+                enriched = enriched with { Checks = status, CheckSummary = summary };
+            }
+
+            return enriched;
+        }
+        catch
+        {
+            return pr; // keep the basic row if enrichment fails
+        }
     }
 
     private async Task<string?> GetSelfLoginAsync(CancellationToken ct)
@@ -174,25 +213,41 @@ public sealed class GitHubApiClient
     public Task TriggerAsync(string definitionId, string? branch, CancellationToken ct) =>
         PostAsync($"{Repo}/actions/workflows/{definitionId}/dispatches", new { @ref = branch ?? "main" }, ct);
 
-    private static PipelineJob MapJob(JsonElement el)
+    private static PipelineJob MapJob(JsonElement el) => new()
+    {
+        Id = el.Int("id")?.ToString() ?? "0",
+        Name = el.Str("name") ?? "(job)",
+        Status = StatusOf(el),
+        StartedAt = el.Date("started_at"),
+        FinishedAt = el.Date("completed_at"),
+        Steps = el.Arr("steps")
+            .Select(s => new PipelineStep { Name = s.Str("name") ?? "step", Status = StatusOf(s) })
+            .ToList(),
+    };
+
+    private static PipelineRunStatus StatusOf(JsonElement el)
     {
         var status = el.Str("status");
         var conclusion = el.Str("conclusion");
-        var runStatus = status == "completed"
+        return status == "completed"
             ? (conclusion == "success" ? PipelineRunStatus.Succeeded
-                : conclusion == "cancelled" ? PipelineRunStatus.Canceled
+                : conclusion is "cancelled" or "skipped" ? PipelineRunStatus.Canceled
                 : PipelineRunStatus.Failed)
             : status == "queued" ? PipelineRunStatus.Queued
             : PipelineRunStatus.Running;
+    }
 
-        return new PipelineJob
+    public async Task<bool> CheckAsync(CancellationToken ct)
+    {
+        try
         {
-            Id = el.Int("id")?.ToString() ?? "0",
-            Name = el.Str("name") ?? "(job)",
-            Status = runStatus,
-            StartedAt = el.Date("started_at"),
-            FinishedAt = el.Date("completed_at"),
-        };
+            using var resp = await _http.GetAsync("user", ct).ConfigureAwait(false);
+            return resp.IsSuccessStatusCode;
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     private async Task<JsonDocument> GetAsync(string path, CancellationToken ct)

@@ -55,6 +55,50 @@ public static class DetailFormatter
         return sb.ToString().TrimEnd();
     }
 
+    /// <summary>The PR overview shown when a PR row is expanded (Enter).</summary>
+    public static string PrOverview(PullRequest pr)
+    {
+        var reviewers = pr.Reviewers.Count == 0
+            ? "none"
+            : string.Join(", ", pr.Reviewers.Select(r => $"{r.User.DisplayName} ({r.Vote})"));
+        var labels = pr.Labels.Count == 0 ? "none" : string.Join(", ", pr.Labels);
+
+        var merge = pr.IsDraft ? "Draft — cannot be merged" : pr.Mergeable switch
+        {
+            MergeableState.Mergeable => "Yes",
+            MergeableState.Conflicting => "No — conflicts",
+            MergeableState.Blocked => "Blocked",
+            _ => "Unknown",
+        };
+
+        var checks = pr.CheckSummary is { } s
+            ? $"{pr.Checks} — {s.Successful} ok, {s.InProgress} running, {s.Failed} failed, {s.Neutral} neutral"
+            : pr.Checks.ToString();
+
+        return string.Join('\n',
+            $"#{pr.Number?.ToString() ?? pr.Id}  {pr.Title}",
+            $"{pr.Author.DisplayName}  ·  {pr.SourceRef} → {pr.TargetRef}",
+            "",
+            $"Mergeable: {merge}",
+            $"Checks:    {checks}",
+            $"Reviewers: {reviewers}",
+            $"Labels:    {labels}",
+            $"Changes:   {pr.ChangedFiles} files  (+{pr.Additions} -{pr.Deletions})",
+            "",
+            "Summary:",
+            pr.Description ?? "(no description)");
+    }
+
+    /// <summary>The work-item detail shown when a row is expanded (Enter).</summary>
+    public static string WorkItemDetail(WorkItem item) => string.Join('\n',
+        $"{item.Identifier ?? item.Id}  {item.Title}",
+        $"State:    {item.State} ({item.StateCategory})",
+        $"Type:     {item.Type ?? "-"}",
+        $"Assignee: {item.Assignee?.DisplayName ?? "unassigned"}",
+        "",
+        "Description:",
+        item.Description ?? "(none)");
+
     private static char Symbol(FileChangeKind kind) => kind switch
     {
         FileChangeKind.Added => 'A',

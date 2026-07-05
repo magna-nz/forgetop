@@ -20,6 +20,9 @@ public sealed class PullRequestController(SectionService sections, IConfigServic
 {
     private List<PullRequest> _items = [];
 
+    public IReadOnlyList<PullRequest> Items => _items;
+    public string Label { get; private set; } = "Pull Requests";
+
     public PullRequestFilter Filter { get; private set; } = PullRequestFilter.All;
 
     public string CycleFilter()
@@ -39,12 +42,13 @@ public sealed class PullRequestController(SectionService sections, IConfigServic
         if (source is null)
         {
             _items = [];
+            Label = "Pull Requests — not configured (F3)";
             return SectionData.Unbound("Pull Requests");
         }
 
         _items = (await source.ListAsync(new PullRequestQuery { Filter = Filter }, ct).ConfigureAwait(false)).ToList();
-        var label = $"{Labels.For(config, config.Current.PullRequests?.ConnectionId)} · {Filter}";
-        return new SectionData(label, _items.Select(RowFormatter.PullRequest).ToList());
+        Label = $"{Labels.For(config, config.Current.PullRequests?.ConnectionId)} · {Filter}";
+        return new SectionData(Label, _items.Select(RowFormatter.PullRequest).ToList());
     }
 
     public PullRequest? At(int index) => index >= 0 && index < _items.Count ? _items[index] : null;
@@ -118,6 +122,9 @@ public sealed class WorkItemController(SectionService sections, IConfigService c
 {
     private List<WorkItem> _items = [];
 
+    public IReadOnlyList<WorkItem> Items => _items;
+    public string Label { get; private set; } = "Work Items";
+
     public bool MineOnly { get; private set; }
 
     public bool ToggleMine()
@@ -132,12 +139,13 @@ public sealed class WorkItemController(SectionService sections, IConfigService c
         if (source is null)
         {
             _items = [];
+            Label = "Work Items — not configured (F3)";
             return SectionData.Unbound("Work Items");
         }
 
         _items = (await source.ListAsync(new WorkItemQuery { MineOnly = MineOnly }, ct).ConfigureAwait(false)).ToList();
-        var label = $"{Labels.For(config, config.Current.WorkItems?.ConnectionId)}{(MineOnly ? " · Mine" : "")}";
-        return new SectionData(label, _items.Select(RowFormatter.WorkItem).ToList());
+        Label = $"{Labels.For(config, config.Current.WorkItems?.ConnectionId)}{(MineOnly ? " · Mine" : "")}";
+        return new SectionData(Label, _items.Select(RowFormatter.WorkItem).ToList());
     }
 
     public WorkItem? At(int index) => index >= 0 && index < _items.Count ? _items[index] : null;
@@ -180,12 +188,18 @@ public sealed class PipelineController(SectionService sections, IConfigService c
 {
     private readonly List<(PipelineFeed Feed, PipelineRun Run)> _items = [];
 
+    public IReadOnlyList<(string Connection, PipelineRun Run)> Items =>
+        _items.Select(x => (x.Feed.Connection.DisplayName, x.Run)).ToList();
+
+    public string Label { get; private set; } = "Pipelines";
+
     public async Task<SectionData> LoadAsync(CancellationToken ct = default)
     {
         _items.Clear();
         var feeds = await sections.GetPipelineFeedsAsync(ct).ConfigureAwait(false);
         if (feeds.Count == 0)
         {
+            Label = "Pipelines — not configured (F3)";
             return SectionData.Unbound("Pipelines");
         }
 
@@ -200,8 +214,20 @@ public sealed class PipelineController(SectionService sections, IConfigService c
             }
         }
 
-        var label = string.Join(" + ", feeds.Select(f => f.Connection.DisplayName));
-        return new SectionData(label, rows);
+        Label = string.Join(" + ", feeds.Select(f => f.Connection.DisplayName));
+        return new SectionData(Label, rows);
+    }
+
+    /// <summary>The fully-detailed run (stages → jobs → steps) for the drill-in tree.</summary>
+    public async Task<PipelineRun?> GetRunAsync(int index, CancellationToken ct = default)
+    {
+        if (index < 0 || index >= _items.Count)
+        {
+            return null;
+        }
+
+        var (feed, run) = _items[index];
+        return await feed.Source.GetRunAsync(run.Id, ct).ConfigureAwait(false);
     }
 
     public async Task<string> GetRunDetailAsync(int index, CancellationToken ct = default)

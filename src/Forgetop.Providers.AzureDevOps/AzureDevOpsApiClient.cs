@@ -289,8 +289,25 @@ public sealed class AzureDevOpsApiClient
                     Status = MapRecord(j),
                     StartedAt = j.Date("startTime"),
                     FinishedAt = j.Date("finishTime"),
+                    Steps = records.Where(r => r.Str("type") == "Task" && r.Str("parentId") == j.Str("id"))
+                        .OrderBy(r => r.Int("order") ?? 0)
+                        .Select(r => new PipelineStep { Name = r.Str("name") ?? "step", Status = MapRecord(r) })
+                        .ToList(),
                 }).ToList(),
         }).ToList();
+    }
+
+    public async Task<bool> CheckAsync(CancellationToken ct)
+    {
+        try
+        {
+            using var resp = await _http.GetAsync($"_apis/connectionData?{Api}", ct).ConfigureAwait(false);
+            return resp.IsSuccessStatusCode;
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     private async Task<string> GetSelfIdAsync(CancellationToken ct)

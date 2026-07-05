@@ -85,6 +85,19 @@ public sealed class LinearApiClient
         };
     }
 
+    public async Task<bool> CheckAsync(CancellationToken ct)
+    {
+        try
+        {
+            using var _ = await PostAsync("query { viewer { id } }", new { }, ct).ConfigureAwait(false);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
     private static JsonElement Data(JsonDocument doc) =>
         doc.RootElement.Obj("data") ?? throw new InvalidOperationException("Linear response had no data.");
 
