@@ -5,7 +5,7 @@ use forgetop_core::domain::*;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Tabs, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Cell, Paragraph, Row, Table, Tabs, Wrap};
 use ratatui::Frame;
 
 use crate::app::{App, PipeRow, TABS};
@@ -41,8 +41,10 @@ fn render_tabs(frame: &mut Frame, area: Rect, app: &App) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.dim))
-        .title(Span::styled(" forgetop ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)))
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.accent))
+        .style(Style::default().bg(theme.bg))
+        .title(Span::styled(" ▟ forgetop ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)))
         .title_top(Line::from(Span::styled(right, Style::default().fg(theme.dim))).right_aligned());
 
     let titles: Vec<Line> = TABS
@@ -60,9 +62,9 @@ fn render_tabs(frame: &mut Frame, area: Rect, app: &App) {
 
     let tabs = Tabs::new(titles)
         .select(app.active)
-        .divider(Span::styled("│", Style::default().fg(theme.dim)))
+        .divider(Span::styled("  ", Style::default().fg(theme.dim)))
         .padding("", "")
-        .style(Style::default().fg(theme.dim))
+        .style(Style::default().fg(theme.dim).bg(theme.bg))
         .highlight_style(Style::default().fg(theme.bg).bg(theme.accent).add_modifier(Modifier::BOLD))
         .block(block);
 
@@ -93,8 +95,10 @@ fn render_table(frame: &mut Frame, area: Rect, app: &mut App) {
 fn section_block<'a>(theme: &Theme, title: &'a str) -> Block<'a> {
     Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.dim))
-        .title(Span::styled(format!(" {title} "), Style::default().fg(theme.fg)))
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.accent))
+        .style(Style::default().bg(theme.bg))
+        .title(Span::styled(format!(" {title} "), Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)))
 }
 
 fn header_row(theme: &Theme, cols: &[&'static str]) -> Row<'static> {
@@ -121,7 +125,7 @@ fn pr_status_span(theme: &Theme, pr: &PullRequest) -> Span<'static> {
     } else {
         match pr.status {
             PullRequestStatus::Open => ("● open", theme.green),
-            PullRequestStatus::Merged => ("✦ merged", theme.accent),
+            PullRequestStatus::Merged => ("✦ merged", theme.magenta),
             PullRequestStatus::Closed => ("✗ closed", theme.red),
             PullRequestStatus::Draft => ("◌ draft", theme.dim),
         }
@@ -182,7 +186,7 @@ fn render_prs(frame: &mut Frame, area: Rect, app: &mut App) {
         .block(block)
         .column_spacing(1)
         .row_highlight_style(highlight(theme))
-        .highlight_symbol("▌");
+        .highlight_symbol("▐ ");
     frame.render_stateful_widget(table, area, &mut app.pr_state);
 }
 
@@ -239,7 +243,7 @@ fn render_wis(frame: &mut Frame, area: Rect, app: &mut App) {
         .block(block)
         .column_spacing(1)
         .row_highlight_style(highlight(theme))
-        .highlight_symbol("▌");
+        .highlight_symbol("▐ ");
     frame.render_stateful_widget(table, area, &mut app.wi_state);
 }
 
@@ -264,7 +268,7 @@ fn render_pipes(frame: &mut Frame, area: Rect, app: &mut App) {
             let num = p.run.number.map(|n| format!("#{n}")).unwrap_or_default();
             Row::new(vec![
                 Cell::from(Span::styled(format!("{} {:?}", pipeline_icon(p.run.status), p.run.status), Style::default().fg(color))),
-                Cell::from(Span::styled(format!("{} · {}", p.provider.as_str(), p.connection), Style::default().fg(theme.blue))),
+                Cell::from(Span::styled(format!("{} · {}", p.provider.as_str(), p.connection), Style::default().fg(theme.cyan))),
                 Cell::from(Span::styled(name, Style::default().fg(theme.fg))),
                 Cell::from(Span::styled(num, Style::default().fg(theme.dim))),
                 Cell::from(Span::styled(p.run.branch.clone().unwrap_or_default(), Style::default().fg(theme.dim))),
@@ -286,7 +290,7 @@ fn render_pipes(frame: &mut Frame, area: Rect, app: &mut App) {
         .block(block)
         .column_spacing(1)
         .row_highlight_style(highlight(theme))
-        .highlight_symbol("▌");
+        .highlight_symbol("▐ ");
     frame.render_stateful_widget(table, area, &mut app.pipe_state);
 }
 
@@ -295,7 +299,12 @@ fn render_pipes(frame: &mut Frame, area: Rect, app: &mut App) {
 fn render_detail(frame: &mut Frame, area: Rect, app: &App) {
     let theme = &app.theme;
     let Some(idx) = app.selected() else { return };
-    let block = section_block(theme, "Detail");
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.magenta))
+        .style(Style::default().bg(theme.panel))
+        .title(Span::styled(" ▼ Detail — Esc to close ", Style::default().fg(theme.magenta).add_modifier(Modifier::BOLD)));
 
     let lines: Vec<Line> = match app.active {
         0 => app.prs.get(idx).map(|pr| pr_detail(theme, pr)).unwrap_or_default(),
@@ -437,5 +446,77 @@ fn rel_age(ts: Option<DateTime<Utc>>) -> String {
         s if s < 86400 => format!("{}h", s / 3600),
         s if s < 2_592_000 => format!("{}d", s / 86400),
         s => format!("{}mo", s / 2_592_000),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::App;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    fn sample_pr() -> PullRequest {
+        PullRequest {
+            id: "1".into(),
+            number: Some(42),
+            title: "Add the widget".into(),
+            description: Some("does the thing".into()),
+            author: User { id: "u".into(), display_name: "Alice Ng".into(), handle: None, avatar_url: None },
+            status: PullRequestStatus::Open,
+            is_draft: false,
+            source_ref: Some("feat".into()),
+            target_ref: Some("main".into()),
+            reviewers: vec![],
+            labels: vec!["backend".into()],
+            checks: CheckStatus::Passed,
+            check_summary: None,
+            mergeable: MergeableState::Mergeable,
+            changed_files: 3,
+            additions: 10,
+            deletions: 2,
+            created_at: None,
+            updated_at: None,
+            url: Some("http://x".into()),
+        }
+    }
+
+    fn render_to_string(app: &mut App, w: u16, h: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal.draw(|f| render(f, app)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn detail_panel_appears_only_when_expanded() {
+        let mut app = App::new("slate");
+        app.prs.push(sample_pr());
+        app.pr_state.select(Some(0));
+
+        let collapsed = render_to_string(&mut app, 100, 24);
+        assert!(collapsed.contains("Add the widget"), "row should render");
+        assert!(!collapsed.contains("Detail"), "no detail panel while collapsed");
+
+        app.show_detail = true;
+        let expanded = render_to_string(&mut app, 100, 24);
+        assert!(expanded.contains("Detail"), "detail panel should expand on Enter");
+        assert!(expanded.contains("Alice Ng"), "detail should show the author");
+    }
+
+    #[test]
+    fn theme_colours_are_indexed_not_truecolor() {
+        // Truecolor RGB is what washed out on non-truecolor terminals; ensure we don't use it.
+        for name in crate::theme::THEMES {
+            let t = Theme::by_name(name);
+            for c in [t.bg, t.fg, t.accent, t.green, t.red, t.sel_bg, t.magenta] {
+                assert!(matches!(c, ratatui::style::Color::Indexed(_)), "{name}: {c:?} must be indexed");
+            }
+        }
     }
 }

@@ -1,4 +1,10 @@
-//! True-colour themes and status colours.
+//! Colour themes and status colours.
+//!
+//! We use **256-colour indexed** palettes (`Color::Indexed`) rather than 24-bit
+//! `Color::Rgb`. Truecolor isn't supported by every terminal (notably macOS
+//! Terminal.app), and when it isn't, RGB backgrounds collapse to a muddy wash.
+//! Indexed colours render correctly on any 256-colour terminal and adapt to the
+//! user's palette, so the UI stays crisp and colourful everywhere.
 
 use forgetop_core::domain::{CheckStatus, PipelineRunStatus};
 use ratatui::style::Color;
@@ -8,15 +14,17 @@ pub const THEMES: [&str; 4] = ["slate", "dark", "light", "matrix"];
 pub struct Theme {
     pub name: &'static str,
     pub bg: Color,
+    pub panel: Color,
     pub fg: Color,
     pub dim: Color,
     pub sel_bg: Color,
-    pub sel_fg: Color,
     pub accent: Color,
     pub green: Color,
     pub red: Color,
     pub blue: Color,
     pub yellow: Color,
+    pub magenta: Color,
+    pub cyan: Color,
 }
 
 impl Theme {
@@ -24,56 +32,64 @@ impl Theme {
         match name {
             "dark" => Theme {
                 name: "dark",
-                bg: Color::Rgb(0x10, 0x10, 0x14),
-                fg: Color::Rgb(0xd0, 0xd0, 0xd0),
-                dim: Color::Rgb(0x70, 0x70, 0x7a),
-                sel_bg: Color::Rgb(0x2a, 0x2a, 0x36),
-                sel_fg: Color::Rgb(0xff, 0xff, 0xff),
-                accent: Color::Rgb(0x7a, 0xa2, 0xf7),
-                green: Color::Rgb(0x9e, 0xce, 0x6a),
-                red: Color::Rgb(0xf7, 0x76, 0x8e),
-                blue: Color::Rgb(0x7a, 0xa2, 0xf7),
-                yellow: Color::Rgb(0xe0, 0xaf, 0x68),
+                bg: Color::Indexed(232),
+                panel: Color::Indexed(234),
+                fg: Color::Indexed(253),
+                dim: Color::Indexed(244),
+                sel_bg: Color::Indexed(238),
+                accent: Color::Indexed(39),
+                green: Color::Indexed(84),
+                red: Color::Indexed(203),
+                blue: Color::Indexed(39),
+                yellow: Color::Indexed(221),
+                magenta: Color::Indexed(177),
+                cyan: Color::Indexed(80),
             },
             "light" => Theme {
                 name: "light",
-                bg: Color::Rgb(0xec, 0xef, 0xf4),
-                fg: Color::Rgb(0x1f, 0x24, 0x30),
-                dim: Color::Rgb(0x6b, 0x72, 0x80),
-                sel_bg: Color::Rgb(0xcf, 0xd8, 0xe3),
-                sel_fg: Color::Rgb(0x1f, 0x24, 0x30),
-                accent: Color::Rgb(0x1e, 0x66, 0xf5),
-                green: Color::Rgb(0x40, 0xa0, 0x2b),
-                red: Color::Rgb(0xd2, 0x0f, 0x39),
-                blue: Color::Rgb(0x1e, 0x66, 0xf5),
-                yellow: Color::Rgb(0xdf, 0x8e, 0x1d),
+                bg: Color::Indexed(255),
+                panel: Color::Indexed(254),
+                fg: Color::Indexed(236),
+                dim: Color::Indexed(245),
+                sel_bg: Color::Indexed(252),
+                accent: Color::Indexed(26),
+                green: Color::Indexed(28),
+                red: Color::Indexed(160),
+                blue: Color::Indexed(26),
+                yellow: Color::Indexed(136),
+                magenta: Color::Indexed(90),
+                cyan: Color::Indexed(30),
             },
             "matrix" => Theme {
                 name: "matrix",
-                bg: Color::Rgb(0x00, 0x00, 0x00),
-                fg: Color::Rgb(0x39, 0xff, 0x14),
-                dim: Color::Rgb(0x1f, 0x6f, 0x1f),
-                sel_bg: Color::Rgb(0x0f, 0x3d, 0x0f),
-                sel_fg: Color::Rgb(0xa9, 0xff, 0x9a),
-                accent: Color::Rgb(0x39, 0xff, 0x14),
-                green: Color::Rgb(0x39, 0xff, 0x14),
-                red: Color::Rgb(0xff, 0x5c, 0x5c),
-                blue: Color::Rgb(0x5c, 0xff, 0xd4),
-                yellow: Color::Rgb(0xd4, 0xff, 0x5c),
+                bg: Color::Indexed(16),
+                panel: Color::Indexed(233),
+                fg: Color::Indexed(46),
+                dim: Color::Indexed(28),
+                sel_bg: Color::Indexed(22),
+                accent: Color::Indexed(46),
+                green: Color::Indexed(46),
+                red: Color::Indexed(203),
+                blue: Color::Indexed(48),
+                yellow: Color::Indexed(190),
+                magenta: Color::Indexed(85),
+                cyan: Color::Indexed(51),
             },
-            // slate (Catppuccin-ish) — default
+            // slate — default, a calm dark theme
             _ => Theme {
                 name: "slate",
-                bg: Color::Rgb(0x1e, 0x1e, 0x2e),
-                fg: Color::Rgb(0xcd, 0xd6, 0xf4),
-                dim: Color::Rgb(0x6c, 0x70, 0x86),
-                sel_bg: Color::Rgb(0x31, 0x32, 0x44),
-                sel_fg: Color::Rgb(0xcd, 0xd6, 0xf4),
-                accent: Color::Rgb(0x89, 0xb4, 0xfa),
-                green: Color::Rgb(0xa6, 0xe3, 0xa1),
-                red: Color::Rgb(0xf3, 0x8b, 0xa8),
-                blue: Color::Rgb(0x89, 0xb4, 0xfa),
-                yellow: Color::Rgb(0xf9, 0xe2, 0xaf),
+                bg: Color::Indexed(234),
+                panel: Color::Indexed(236),
+                fg: Color::Indexed(253),
+                dim: Color::Indexed(245),
+                sel_bg: Color::Indexed(239),
+                accent: Color::Indexed(75),
+                green: Color::Indexed(114),
+                red: Color::Indexed(210),
+                blue: Color::Indexed(75),
+                yellow: Color::Indexed(222),
+                magenta: Color::Indexed(176),
+                cyan: Color::Indexed(80),
             },
         }
     }
@@ -97,7 +113,7 @@ impl Theme {
         match status {
             CheckStatus::Passed => self.green,
             CheckStatus::Failed => self.red,
-            CheckStatus::Pending => self.blue,
+            CheckStatus::Pending => self.yellow,
             CheckStatus::None => self.dim,
         }
     }
@@ -106,7 +122,8 @@ impl Theme {
 pub fn pipeline_icon(status: PipelineRunStatus) -> &'static str {
     match status {
         PipelineRunStatus::Succeeded => "✓",
-        PipelineRunStatus::Running | PipelineRunStatus::Queued => "●",
+        PipelineRunStatus::Running => "◐",
+        PipelineRunStatus::Queued => "◔",
         PipelineRunStatus::Failed => "✗",
         PipelineRunStatus::PartiallySucceeded => "▲",
         PipelineRunStatus::Canceled => "⊘",
@@ -117,7 +134,7 @@ pub fn check_icon(status: CheckStatus) -> &'static str {
     match status {
         CheckStatus::Passed => "✓",
         CheckStatus::Failed => "✗",
-        CheckStatus::Pending => "●",
+        CheckStatus::Pending => "◐",
         CheckStatus::None => "·",
     }
 }
