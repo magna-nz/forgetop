@@ -1,11 +1,7 @@
-<div align="center">
-
 # forgetop
 
-**htop for your software forges.**
-
 A fast, keyboard-driven terminal UI for your pull requests, work items, and CI
-pipelines — across **GitHub**, **GitLab**, **Azure DevOps**, **Linear**, **Jira**, and **Bitbucket** — in one place.
+pipelines - across **GitHub**, **GitLab**, **Azure DevOps**, **Linear**, **Jira**, and **Bitbucket** - in one place.
 
 [![CI](https://github.com/magna-nz/forgetop/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/magna-nz/forgetop/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/magna-nz/forgetop?sort=semver&label=release)](https://github.com/magna-nz/forgetop/releases/latest)
@@ -14,36 +10,32 @@ pipelines — across **GitHub**, **GitLab**, **Azure DevOps**, **Linear**, **Jir
 [![Platforms](https://img.shields.io/badge/runs%20on-macOS%20%7C%20Linux%20%7C%20Windows-success)](#install)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-</div>
-
 <div align="center">
   <img src="docs/demo.gif" alt="forgetop demo" width="820">
   <br/>
-  <sub>Live dashboard — Pull Requests, Work Items, Pipelines.</sub>
+  <sub>Live dashboard - Pull Requests, Work Items, Pipelines.</sub>
 </div>
 
 ---
 
-## Why
-
-Modern teams spread work across several forges — code review in GitHub, tickets
+Modern teams spread work across several forges - code review in GitHub, tickets
 in Linear, pipelines in Azure DevOps. forgetop pulls them into a single terminal
 dashboard so you can triage without tab-hopping. Each section is bound to
 whichever provider owns it, and the Pipelines view can aggregate several at once.
 
 ## Features
 
-- **Three sections** — Pull Requests, Work Items, and Pipelines, each independently
+- **Three sections** - Pull Requests, Work Items, and Pipelines, each independently
   bound to a provider. Pipelines can aggregate multiple connections.
-- **Do work, not just watch it** — approve / merge / comment on PRs, view coloured
+- **Do work, not just watch it** - approve / merge / comment on PRs, view coloured
   diffs and review threads, change work-item states, drill into pipeline
-  stages → jobs → steps, and trigger runs — all from the keyboard.
-- **Multi-provider** — GitHub, GitLab, Azure DevOps, Linear, Jira, and Bitbucket, with a built-in `--demo`.
-- **Guided setup** — a first-run wizard walks you through adding a connection; a
+  stages → jobs → steps, and trigger runs - all from the keyboard.
+- **Multi-provider** - GitHub, GitLab, Azure DevOps, Linear, Jira, and Bitbucket, with a built-in `--demo`.
+- **Guided setup** - a first-run wizard walks you through adding a connection; a
   config screen manages connections and bindings later.
-- **Secure by default** — tokens live in your OS keychain (macOS Keychain, Windows
+- **Secure by default** - tokens live in your OS keychain (macOS Keychain, Windows
   Credential Manager, Linux Secret Service). The config file only stores a reference.
-- **Yours to shape** — show/hide sections, four colour themes, live auto-refresh.
+- **Yours to shape** - show/hide sections, four colour themes, live auto-refresh.
 
 ## Supported providers
 
@@ -55,9 +47,9 @@ capabilities, so a connection only ever offers what it can actually do.
 | **GitHub** | ✅ | ✅ (Issues) | ✅ (Actions) |
 | **GitLab** | ✅ (MRs) | ✅ (Issues) | ✅ (CI) |
 | **Azure DevOps** | ✅ | ✅ | ✅ (Builds) |
-| **Bitbucket** | ✅ | — | ✅ (Pipelines) |
-| **Linear** | — | ✅ | — |
-| **Jira** | — | ✅ | — |
+| **Bitbucket** | ✅ | - | ✅ (Pipelines) |
+| **Linear** | - | ✅ | - |
+| **Jira** | - | ✅ | - |
 | **Demo** | ✅ | ✅ | ✅ |
 
 The Pipelines section can aggregate several providers at once.
@@ -70,7 +62,7 @@ The Pipelines section can aggregate several providers at once.
 brew install magna-nz/tap/forgetop
 ```
 
-**Shell installer** (macOS / Linux) — downloads a prebuilt binary:
+**Shell installer** (macOS / Linux) - downloads a prebuilt binary:
 
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/magna-nz/forgetop/releases/latest/download/forgetop-installer.sh | sh
@@ -82,14 +74,14 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/magna-nz/forgetop/relea
 irm https://github.com/magna-nz/forgetop/releases/latest/download/forgetop-installer.ps1 | iex
 ```
 
-**Download a binary** — grab the archive for your platform from the
+**Download a binary** - grab the archive for your platform from the
 [latest release](https://github.com/magna-nz/forgetop/releases/latest), extract it,
 and put `forgetop` on your `PATH`. Builds are provided for macOS (Apple Silicon +
 Intel), Linux (x86_64 + arm64), and Windows (x86_64).
 
 ## Quick start
 
-Try it with no setup — everything is in-memory, nothing is written:
+Try it with no setup - everything is in-memory, nothing is written:
 
 ```sh
 forgetop --demo
@@ -113,7 +105,7 @@ section. Press **`C`** any time to manage connections and bindings.
 
 ## Keybindings
 
-forgetop shows a **context-aware key glossary** along the bottom — it only lists
+forgetop shows a **context-aware key glossary** along the bottom - it only lists
 the keys valid for wherever you are. The full set:
 
 ### Global
@@ -165,7 +157,7 @@ Config is a small JSON file, created and managed for you:
 | Linux | `~/.config/forgetop/config.json` |
 | Windows | `%APPDATA%\forgetop\config.json` |
 
-**It never contains secrets** — only a reference to each token in the keychain.
+**It never contains secrets** - only a reference to each token in the keychain.
 
 ### Tokens
 
@@ -187,8 +179,8 @@ non-alphanumeric characters become `_`).
 
 ## Themes
 
-Cycle with `t`. Four built-in themes — `slate` (default), `dark`, `light`, and
-`matrix` — using 256-colour palettes so they render correctly on every terminal.
+Cycle with `t`. Four built-in themes - `slate` (default), `dark`, `light`, and
+`matrix` - using 256-colour palettes so they render correctly on every terminal.
 Your choice is remembered.
 
 ## How it works
@@ -203,7 +195,7 @@ forgetop is a Rust [Cargo workspace](https://doc.rust-lang.org/cargo/reference/w
 | `forgetop-cli` | The `forgetop` binary |
 
 Providers advertise *capabilities* (which sections they support), so a connection
-only offers what it can actually do — Linear appears for Work Items but not Pull
+only offers what it can actually do - Linear appears for Work Items but not Pull
 Requests, for example.
 
 ## Development
