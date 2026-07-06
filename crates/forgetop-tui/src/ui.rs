@@ -479,6 +479,24 @@ fn pr_conversation_lines(theme: &Theme, pr: &PullRequest, threads: &[CommentThre
     lines
 }
 
+/// The Commits tab: one line per commit (short sha · message · author · age).
+fn pr_commit_lines(theme: &Theme, commits: &[Commit]) -> Vec<Line<'static>> {
+    if commits.is_empty() {
+        return vec![Line::from(Span::styled("No commits.", Style::default().fg(theme.dim)))];
+    }
+    commits
+        .iter()
+        .map(|c| {
+            Line::from(vec![
+                Span::styled(cell(&c.sha, 9), Style::default().fg(theme.yellow)),
+                Span::styled(cell(&c.message, 56), Style::default().fg(theme.fg)),
+                Span::styled(cell(&c.author, 16), Style::default().fg(theme.blue)),
+                Span::styled(rel_age(c.date), Style::default().fg(theme.dim)),
+            ])
+        })
+        .collect()
+}
+
 /// The Checks tab: one line per named check with its status, like the pipeline steps.
 fn pr_checks_lines(theme: &Theme, checks: &[CheckRun]) -> Vec<Line<'static>> {
     if checks.is_empty() {
@@ -526,7 +544,7 @@ fn render_pr_view(frame: &mut Frame, area: Rect, theme: &Theme, view: &PrView) -
     }
     let (title, lines) = match view.tab {
         0 => ("Conversation", pr_conversation_lines(theme, &view.pr, &view.diff.threads)),
-        1 => ("Commits", vec![Line::from(Span::styled("Commit history arrives in a later update.", Style::default().fg(theme.dim)))]),
+        1 => ("Commits", pr_commit_lines(theme, &view.commits)),
         _ => ("Checks", pr_checks_lines(theme, &view.checks)),
     };
     let inner_h = rows[2].height.saturating_sub(2);
@@ -1143,13 +1161,20 @@ mod tests {
     }
 
     fn pr_view(tab: usize, checks: Vec<CheckRun>, files: Vec<FileChange>) -> crate::app::PrView {
-        use crate::app::{DiffView, PrView};
+        use crate::app::DiffView;
         crate::app::PrView {
             label: "PR #42 — Add the widget".into(),
             url: Some("http://x".into()),
             pr: sample_pr(),
             tab,
             checks,
+            commits: vec![Commit {
+                sha: "abc1234".into(),
+                message: "Add the retry policy".into(),
+                author: "alice".into(),
+                date: None,
+                url: None,
+            }],
             scroll: 0,
             diff: DiffView { pr_label: "PR #42".into(), url: None, files, threads: vec![], selected: 0, scroll: 0 },
         }
@@ -1179,6 +1204,17 @@ mod tests {
         let out = render_to_string(&mut app, 100, 24);
         assert!(out.contains("build") && out.contains("Passed"), "named check + status");
         assert!(out.contains("integration") && out.contains("Failed"), "failed check shown by name");
+    }
+
+    #[test]
+    fn commits_tab_lists_commits() {
+        use crate::app::Screen;
+        let mut app = App::new("slate");
+        app.screen = Screen::PrView(Box::new(pr_view(1, vec![], vec![])));
+        let out = render_to_string(&mut app, 120, 24);
+        assert!(out.contains("abc1234"), "short sha");
+        assert!(out.contains("Add the retry policy"), "commit message");
+        assert!(out.contains("alice"), "commit author");
     }
 
     #[test]

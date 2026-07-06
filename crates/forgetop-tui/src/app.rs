@@ -103,6 +103,7 @@ pub struct PrView {
     pub pr: PullRequest,
     pub tab: usize,
     pub checks: Vec<CheckRun>,
+    pub commits: Vec<Commit>,
     /// Scroll offset for the Conversation / Commits / Checks tabs.
     pub scroll: u16,
     /// Diff-tab state (file list + patch + threads), rendered like the standalone diff.
@@ -586,8 +587,9 @@ impl App {
         let threads = source.threads(&id).await.unwrap_or_default();
         let files = source.changes(&id).await.unwrap_or_default();
         let checks = source.checks(&id).await.unwrap_or_default();
+        let commits = source.commits(&id).await.unwrap_or_default();
         let diff = DiffView { pr_label: label.clone(), url: url.clone(), files, threads, selected: 0, scroll: 0 };
-        self.screen = Screen::PrView(Box::new(PrView { label, url, pr, tab, checks, scroll: 0, diff }));
+        self.screen = Screen::PrView(Box::new(PrView { label, url, pr, tab, checks, commits, scroll: 0, diff }));
     }
 
     async fn open_wi_view(&mut self, deps: &AppDeps) {
@@ -1479,6 +1481,7 @@ mod tests {
             pr: pr(Some("http://pr")),
             tab: 0,
             checks: vec![],
+            commits: vec![],
             scroll: 0,
             diff: DiffView { pr_label: "x".into(), url: None, files: vec![], threads: vec![], selected: 0, scroll: 0 },
         }));

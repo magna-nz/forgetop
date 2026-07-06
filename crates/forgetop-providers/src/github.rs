@@ -123,6 +123,21 @@ pub fn map_check_run(v: &Value) -> CheckRun {
     CheckRun { name: get_str(v, "name").unwrap_or_else(|| "check".into()), status, url: get_str(v, "html_url") }
 }
 
+pub fn map_commit(v: &Value) -> Commit {
+    let commit = get_obj(v, "commit");
+    let author = commit.and_then(|c| get_obj(c, "author"));
+    Commit {
+        sha: get_str(v, "sha").unwrap_or_default(),
+        message: commit.and_then(|c| get_str(c, "message")).unwrap_or_default().lines().next().unwrap_or_default().to_string(),
+        author: author
+            .and_then(|a| get_str(a, "name"))
+            .or_else(|| get_obj(v, "author").and_then(|a| get_str(a, "login")))
+            .unwrap_or_else(|| "unknown".into()),
+        date: author.and_then(|a| get_date(a, "date")),
+        url: get_str(v, "html_url"),
+    }
+}
+
 pub fn map_issue(v: &Value) -> WorkItem {
     let state = get_str(v, "state").unwrap_or_else(|| "open".into());
     let reason = get_str(v, "state_reason");
@@ -342,6 +357,10 @@ impl PullRequestSource for GitHubPr {
         let Some(sha) = get_obj(&detail, "head").and_then(|h| get_str(h, "sha")) else { return Ok(vec![]) };
         let v = self.0.get_json(&self.0.repo_path(&format!("/commits/{sha}/check-runs"))).await?;
         Ok(get_arr(&v, "check_runs").iter().map(map_check_run).collect())
+    }
+    async fn commits(&self, id: &str) -> Result<Vec<Commit>> {
+        let v = self.0.get_json(&self.0.repo_path(&format!("/pulls/{id}/commits?per_page=100"))).await?;
+        Ok(v.as_array().unwrap_or(&vec![]).iter().map(map_commit).collect())
     }
     async fn add_comment(&self, id: &str, body: &str) -> Result<()> {
         self.0.post_json(&self.0.repo_path(&format!("/issues/{id}/comments")), json!({ "body": body })).await
@@ -588,6 +607,29 @@ mod tests {
         )
         .unwrap();
         assert_eq!(map_job(&job).steps.len(), 1);
+    }
+
+    #[test]
+    fn maps_commit() {
+        let v: Value = serde_json::from_str(
+            r#"{ "sha": "abc123", "html_url": "http://c",
+                 "commit": { "message": "Add retry\n\nbody", "author": { "name": "Alice", "date": "2026-06-01T10:00:00Z" } },
+                 "author": { "login": "alice" } }"#,
+        )
+        .unwrap();
+        let c = map_commit(&v);
+        assert_eq!(c.sha, "abc123");
+        assert_eq!(c.message, "Add retry"); // first line only
+        assert_eq!(c.author, "Alice");
+        assert!(c.date.is_some());
+    }
+
+    #[test]
+    fn maps_check_run_status() {
+        let ok: Value = serde_json::from_str(r#"{ "name": "build", "status": "completed", "conclusion": "success" }"#).unwrap();
+        assert_eq!(map_check_run(&ok).status, CheckStatus::Passed);
+        let running: Value = serde_json::from_str(r#"{ "name": "test", "status": "in_progress" }"#).unwrap();
+        assert_eq!(map_check_run(&running).status, CheckStatus::Pending);
     }
 
     #[test]

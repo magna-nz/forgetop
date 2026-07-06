@@ -190,6 +190,37 @@ pub fn map_change_entry(v: &Value) -> FileChange {
     }
 }
 
+pub fn map_az_commit(v: &Value) -> Commit {
+    let author = get_obj(v, "author");
+    Commit {
+        sha: get_str(v, "commitId").map(|s| s.chars().take(8).collect()).unwrap_or_default(),
+        message: get_str(v, "comment").unwrap_or_default().lines().next().unwrap_or_default().to_string(),
+        author: author.and_then(|a| get_str(a, "name")).unwrap_or_else(|| "unknown".into()),
+        date: author.and_then(|a| get_date(a, "date")),
+        url: get_str(v, "url"),
+    }
+}
+
+pub fn az_check_status(state: Option<&str>) -> CheckStatus {
+    match state {
+        Some("succeeded") => CheckStatus::Passed,
+        Some("failed") | Some("error") => CheckStatus::Failed,
+        Some("pending") => CheckStatus::Pending,
+        _ => CheckStatus::None,
+    }
+}
+
+pub fn map_az_status(v: &Value) -> CheckRun {
+    CheckRun {
+        name: get_obj(v, "context")
+            .and_then(|c| get_str(c, "name"))
+            .or_else(|| get_str(v, "description"))
+            .unwrap_or_else(|| "status".into()),
+        status: az_check_status(get_str(v, "state").as_deref()),
+        url: get_str(v, "targetUrl"),
+    }
+}
+
 fn record_status(v: &Value) -> PipelineRunStatus {
     if get_str(v, "state").as_deref() == Some("completed") {
         match get_str(v, "result").as_deref() {
@@ -396,6 +427,14 @@ impl PullRequestSource for AzurePr {
             out.push(change);
         }
         Ok(out)
+    }
+    async fn commits(&self, id: &str) -> Result<Vec<Commit>> {
+        let v = self.0.get_json(&format!("{}/commits?{API}", self.0.pr_base(id))).await?;
+        Ok(get_arr(&v, "value").iter().map(map_az_commit).collect())
+    }
+    async fn checks(&self, id: &str) -> Result<Vec<CheckRun>> {
+        let v = self.0.get_json(&format!("{}/statuses?{API}", self.0.pr_base(id))).await?;
+        Ok(get_arr(&v, "value").iter().map(map_az_status).collect())
     }
     async fn add_comment(&self, id: &str, body: &str) -> Result<()> {
         self.0
@@ -657,5 +696,22 @@ mod tests {
         assert_eq!(dels, 1);
         assert!(patch.contains("+TWO"));
         assert!(patch.contains("-two"));
+    }
+
+    #[test]
+    fn maps_commit_and_status() {
+        let commit: Value = serde_json::from_str(
+            r#"{ "commitId": "0123456789abcdef", "comment": "Add retry\nbody", "author": { "name": "Dana", "date": "2026-06-01T10:00:00Z" } }"#,
+        )
+        .unwrap();
+        let c = map_az_commit(&commit);
+        assert_eq!(c.sha, "01234567"); // truncated to 8
+        assert_eq!(c.message, "Add retry");
+        assert_eq!(c.author, "Dana");
+
+        let status: Value = serde_json::from_str(r#"{ "state": "failed", "context": { "name": "Build validation" }, "targetUrl": "t" }"#).unwrap();
+        let s = map_az_status(&status);
+        assert_eq!(s.name, "Build validation");
+        assert_eq!(s.status, CheckStatus::Failed);
     }
 }
