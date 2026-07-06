@@ -31,6 +31,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             Constraint::Length(3), // tab bar
             Constraint::Min(3),    // content
             Constraint::Length(1), // connections
+            Constraint::Length(1), // spacer (bottom padding under connections)
             Constraint::Length(1), // footer
         ])
         .split(area);
@@ -38,7 +39,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     render_tabs(frame, rows[0], app);
     render_content(frame, rows[1], app);
     render_health(frame, rows[2], app);
-    render_footer(frame, rows[3], app);
+    render_footer(frame, rows[4], app);
 
     if app.wizard.is_some() {
         render_wizard(frame, area, app);
