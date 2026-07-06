@@ -159,6 +159,14 @@ impl CheckSummary {
     }
 }
 
+/// A single named CI check / status on a pull request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckRun {
+    pub name: String,
+    pub status: CheckStatus,
+    pub url: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileChange {
     pub path: String,

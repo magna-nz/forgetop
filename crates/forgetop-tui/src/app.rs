@@ -33,6 +33,9 @@ fn index_of(section: Section) -> usize {
 /// The three top-level tabs, in order.
 pub const TABS: [&str; 3] = ["Pull Requests", "Work Items", "Pipelines"];
 
+/// PR detail sub-tabs, in order.
+pub const PR_TABS: [&str; 4] = ["Conversation", "Commits", "Checks", "Diff"];
+
 /// Live services the app talks to. Cheap to clone (all `Arc`).
 #[derive(Clone)]
 pub struct AppDeps {
@@ -63,7 +66,11 @@ pub struct App {
     pub visible: [bool; 3],
     pub status: String,
     pub loading: bool,
-    pub show_detail: bool,
+    /// Scroll offset for the current list; body height captured during render.
+    pub list_scroll: u16,
+    pub content_h: u16,
+    /// Max scroll offset for the open PR/WI view, captured during render for clamping.
+    pub detail_scroll_max: u16,
     pub pr_filter: PullRequestFilter,
     /// Transient one-shot message shown in the footer until the next keypress.
     pub toast: Option<String>,
@@ -81,9 +88,32 @@ pub struct App {
 /// common `List` state doesn't bloat every `Screen` value.
 pub enum Screen {
     List,
-    Diff(Box<DiffView>),
     Pipeline(Box<PipelineView>),
     Config(Box<ConfigView>),
+    /// Full-screen pull-request view with sub-tabs (Conversation/Commits/Checks/Diff).
+    PrView(Box<PrView>),
+    /// Full-screen work-item view.
+    WiView(Box<WiView>),
+}
+
+/// State for the full-screen PR view.
+pub struct PrView {
+    pub label: String,
+    pub url: Option<String>,
+    pub pr: PullRequest,
+    pub tab: usize,
+    pub checks: Vec<CheckRun>,
+    /// Scroll offset for the Conversation / Commits / Checks tabs.
+    pub scroll: u16,
+    /// Diff-tab state (file list + patch + threads), rendered like the standalone diff.
+    pub diff: DiffView,
+}
+
+/// State for the full-screen work-item view.
+pub struct WiView {
+    pub wi: WorkItem,
+    pub threads: Vec<CommentThread>,
+    pub scroll: u16,
 }
 
 /// A configured connection, as shown in the config screen.
@@ -240,7 +270,9 @@ impl App {
             visible: [true; 3],
             status: "Loading…".into(),
             loading: true,
-            show_detail: false,
+            list_scroll: 0,
+            content_h: 0,
+            detail_scroll_max: 0,
             pr_filter: PullRequestFilter::All,
             toast: None,
             overlay: None,
@@ -332,7 +364,7 @@ impl App {
         let pos = vis.iter().position(|&i| i == self.active).unwrap_or(0) as isize;
         let n = vis.len() as isize;
         self.active = vis[(((pos + delta) % n + n) % n) as usize];
-        self.show_detail = false;
+        self.list_scroll = 0;
         self.clamp_selection();
     }
 
@@ -340,7 +372,7 @@ impl App {
     pub fn set_tab(&mut self, idx: usize) {
         if let Some(&section) = self.visible_indices().get(idx) {
             self.active = section;
-            self.show_detail = false;
+            self.list_scroll = 0;
             self.clamp_selection();
         }
     }
@@ -445,7 +477,7 @@ impl App {
         let mut errors = Vec::new();
         self.reload_pull_requests(deps, &mut errors).await;
         self.pr_state.select((!self.prs.is_empty()).then_some(0));
-        self.show_detail = false;
+        self.list_scroll = 0;
         self.toast = Some(match errors.first() {
             Some(e) => e.clone(),
             None => format!("Filter: {} ({} PRs)", self.pr_filter_label(), self.prs.len()),
@@ -476,10 +508,6 @@ impl App {
 
         // Full-screen sub-views handle their own keys.
         match self.screen {
-            Screen::Diff(_) => {
-                self.on_diff_key(key);
-                return;
-            }
             Screen::Pipeline(_) => {
                 self.on_pipeline_key(key);
                 return;
@@ -488,31 +516,201 @@ impl App {
                 self.on_config_key(key, deps).await;
                 return;
             }
+            Screen::PrView(_) => {
+                self.on_pr_view_key(key);
+                return;
+            }
+            Screen::WiView(_) => {
+                self.on_wi_view_key(key);
+                return;
+            }
             Screen::List => {}
         }
 
         match key {
-            Key::Escape => {
-                if self.show_detail {
-                    self.show_detail = false;
-                } else {
-                    self.should_quit = true;
-                }
-            }
+            Key::Escape => self.should_quit = true,
             Key::Left => self.switch_tab(-1),
             Key::Right => self.switch_tab(1),
             Key::Tab => self.switch_tab(1),
-            Key::Up => self.move_up(),
-            Key::Down => self.move_down(),
-            Key::Enter => {
-                if self.active == 2 {
-                    self.open_pipeline(deps).await;
-                } else if self.selected().is_some() {
-                    self.show_detail = !self.show_detail;
+            Key::Up => {
+                self.move_up();
+                self.ensure_visible();
+            }
+            Key::Down => {
+                self.move_down();
+                self.ensure_visible();
+            }
+            Key::PageDown => self.list_scroll = self.list_scroll.saturating_add(8),
+            Key::PageUp => self.list_scroll = self.list_scroll.saturating_sub(8),
+            Key::Enter => match self.active {
+                0 => self.open_pr_view(deps, 0).await,
+                1 => self.open_wi_view(deps).await,
+                2 => self.open_pipeline(deps).await,
+                _ => {}
+            },
+            Key::Char(c) => self.on_char(c, deps).await,
+            Key::Backspace | Key::Quit | Key::None => {}
+        }
+    }
+
+    fn selected_index(&self) -> usize {
+        self.selected().unwrap_or(0)
+    }
+
+    /// Keeps the selected row within the visible list viewport.
+    fn ensure_visible(&mut self) {
+        let sel = self.selected_index() as u16;
+        let h = self.content_h.max(1);
+        if sel < self.list_scroll {
+            self.list_scroll = sel;
+        } else if sel >= self.list_scroll + h {
+            self.list_scroll = sel - h + 1;
+        }
+    }
+
+    // ---- full-screen PR / work-item views ----
+
+    async fn open_pr_view(&mut self, deps: &AppDeps, tab: usize) {
+        let Some(pr) = self.selected_pr() else { return };
+        let id = pr.id.clone();
+        let label = pr_label(pr);
+        let url = pr.url.clone();
+        let pr = pr.clone();
+        let source = match deps.sections.pull_request_source().await {
+            Ok(Some(s)) => s,
+            _ => {
+                self.toast = Some("No pull-request provider is bound".into());
+                return;
+            }
+        };
+        let threads = source.threads(&id).await.unwrap_or_default();
+        let files = source.changes(&id).await.unwrap_or_default();
+        let checks = source.checks(&id).await.unwrap_or_default();
+        let diff = DiffView { pr_label: label.clone(), url: url.clone(), files, threads, selected: 0, scroll: 0 };
+        self.screen = Screen::PrView(Box::new(PrView { label, url, pr, tab, checks, scroll: 0, diff }));
+    }
+
+    async fn open_wi_view(&mut self, deps: &AppDeps) {
+        let Some(wi) = self.selected_wi() else { return };
+        let id = wi.id.clone();
+        let wi = wi.clone();
+        let threads = match deps.sections.work_item_source().await {
+            Ok(Some(src)) => src.threads(&id).await.unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        self.screen = Screen::WiView(Box::new(WiView { wi, threads, scroll: 0 }));
+    }
+
+    fn on_pr_view_key(&mut self, key: Key) {
+        // Actions and close are handled before borrowing the view (they need &mut self).
+        match key {
+            Key::Escape => {
+                self.screen = Screen::List;
+                return;
+            }
+            Key::Char('q') => {
+                self.should_quit = true;
+                return;
+            }
+            Key::Char('o') => {
+                self.open_selected();
+                return;
+            }
+            Key::Char('a') => {
+                self.open_pr_vote(ReviewVote::Approved);
+                return;
+            }
+            Key::Char('x') => {
+                self.open_pr_vote(ReviewVote::Rejected);
+                return;
+            }
+            Key::Char('m') => {
+                self.open_pr_merge();
+                return;
+            }
+            Key::Char('c') => {
+                self.open_pr_comment();
+                return;
+            }
+            _ => {}
+        }
+        let max = self.detail_scroll_max;
+        let Screen::PrView(v) = &mut self.screen else { return };
+        let n = PR_TABS.len();
+        match key {
+            // Changing tab resets the scroll (each tab starts at the top).
+            Key::Left | Key::Char('h') => {
+                v.tab = (v.tab + n - 1) % n;
+                v.scroll = 0;
+            }
+            Key::Right | Key::Char('l') => {
+                v.tab = (v.tab + 1) % n;
+                v.scroll = 0;
+            }
+            Key::Up | Key::Char('k') => {
+                if v.tab == 3 {
+                    v.diff.select_file(-1);
+                } else {
+                    v.scroll = v.scroll.saturating_sub(1);
                 }
             }
-            Key::Char(c) => self.on_char(c, deps).await,
-            Key::Backspace | Key::PageUp | Key::PageDown | Key::Quit | Key::None => {}
+            Key::Down | Key::Char('j') => {
+                if v.tab == 3 {
+                    v.diff.select_file(1);
+                } else {
+                    v.scroll = (v.scroll + 1).min(max);
+                }
+            }
+            Key::PageDown | Key::Char(' ') => {
+                if v.tab == 3 {
+                    v.diff.scroll_by(10);
+                } else {
+                    v.scroll = (v.scroll + 10).min(max);
+                }
+            }
+            Key::PageUp | Key::Char('b') => {
+                if v.tab == 3 {
+                    v.diff.scroll_by(-10);
+                } else {
+                    v.scroll = v.scroll.saturating_sub(10);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn on_wi_view_key(&mut self, key: Key) {
+        match key {
+            Key::Escape => {
+                self.screen = Screen::List;
+                return;
+            }
+            Key::Char('q') => {
+                self.should_quit = true;
+                return;
+            }
+            Key::Char('o') => {
+                self.open_selected();
+                return;
+            }
+            Key::Char('s') => {
+                self.open_wi_state();
+                return;
+            }
+            Key::Char('c') => {
+                self.open_wi_comment();
+                return;
+            }
+            _ => {}
+        }
+        let max = self.detail_scroll_max;
+        let Screen::WiView(v) = &mut self.screen else { return };
+        match key {
+            Key::Up | Key::Char('k') => v.scroll = v.scroll.saturating_sub(1),
+            Key::Down | Key::Char('j') => v.scroll = (v.scroll + 1).min(max),
+            Key::PageDown | Key::Char(' ') => v.scroll = (v.scroll + 10).min(max),
+            Key::PageUp | Key::Char('b') => v.scroll = v.scroll.saturating_sub(10),
+            _ => {}
         }
     }
 
@@ -520,8 +718,14 @@ impl App {
     async fn on_char(&mut self, c: char, deps: &AppDeps) {
         match c {
             'q' => self.should_quit = true,
-            'j' => self.move_down(),
-            'k' => self.move_up(),
+            'j' => {
+                self.move_down();
+                self.ensure_visible();
+            }
+            'k' => {
+                self.move_up();
+                self.ensure_visible();
+            }
             'h' => self.switch_tab(-1),
             'l' => self.switch_tab(1),
             '1'..='3' => self.set_tab(c as usize - '1' as usize),
@@ -540,7 +744,7 @@ impl App {
             'a' => self.open_pr_vote(ReviewVote::Approved),
             'x' => self.open_pr_vote(ReviewVote::Rejected),
             'm' => self.open_pr_merge(),
-            'd' => self.open_diff(deps).await,
+            'd' if self.active == 0 => self.open_pr_view(deps, 3).await,
             // Work-item actions (Work Items tab only).
             's' => self.open_wi_state(),
             // Pipeline trigger (Pipelines tab).
@@ -553,44 +757,6 @@ impl App {
             },
             _ => {}
         }
-    }
-
-    /// Key handling while the full-screen diff view is open.
-    fn on_diff_key(&mut self, key: Key) {
-        let Screen::Diff(diff) = &mut self.screen else { return };
-        match key {
-            Key::Escape => self.screen = Screen::List,
-            Key::Char('q') => self.should_quit = true,
-            Key::Char('o') => self.open_selected(),
-            Key::Up | Key::Char('k') => diff.select_file(-1),
-            Key::Down | Key::Char('j') => diff.select_file(1),
-            Key::PageDown | Key::Char(' ') => diff.scroll_by(10),
-            Key::PageUp | Key::Char('b') => diff.scroll_by(-10),
-            _ => {}
-        }
-    }
-
-    async fn open_diff(&mut self, deps: &AppDeps) {
-        let Some(pr) = self.selected_pr() else { return };
-        let id = pr.id.clone();
-        let label = pr_label(pr);
-        let url = pr.url.clone();
-        let source = match deps.sections.pull_request_source().await {
-            Ok(Some(s)) => s,
-            _ => {
-                self.toast = Some("No pull-request provider is bound".into());
-                return;
-            }
-        };
-        let files = match source.changes(&id).await {
-            Ok(f) => f,
-            Err(e) => {
-                self.toast = Some(format!("Diff failed: {e}"));
-                return;
-            }
-        };
-        let threads = source.threads(&id).await.unwrap_or_default();
-        self.screen = Screen::Diff(Box::new(DiffView { pr_label: label, url, files, threads, selected: 0, scroll: 0 }));
     }
 
     // ---- pipeline drill-in + trigger ----
@@ -703,7 +869,8 @@ impl App {
     /// The web URL of whatever is in focus — the open sub-view, else the selected row.
     fn selected_url(&self) -> Option<String> {
         match &self.screen {
-            Screen::Diff(v) => return v.url.clone(),
+            Screen::PrView(v) => return v.url.clone(),
+            Screen::WiView(v) => return v.wi.url.clone(),
             Screen::Pipeline(v) => return v.run.url.clone(),
             Screen::List | Screen::Config(_) => {}
         }
@@ -880,7 +1047,7 @@ impl App {
         self.visible = vis;
         if !self.visible[self.active] {
             self.active = self.first_visible();
-            self.show_detail = false;
+            self.list_scroll = 0;
             self.clamp_selection();
         }
         let hidden: Vec<Section> = (0..3).filter(|i| !self.visible[*i]).map(section_of).collect();
@@ -1306,15 +1473,16 @@ mod tests {
         assert_eq!(app.selected_url().as_deref(), Some("http://wi"));
 
         // An open sub-view takes precedence over the active tab.
-        app.screen = Screen::Diff(Box::new(DiffView {
-            pr_label: "x".into(),
-            url: Some("http://diff".into()),
-            files: vec![],
-            threads: vec![],
-            selected: 0,
+        app.screen = Screen::PrView(Box::new(PrView {
+            label: "x".into(),
+            url: Some("http://prview".into()),
+            pr: pr(Some("http://pr")),
+            tab: 0,
+            checks: vec![],
             scroll: 0,
+            diff: DiffView { pr_label: "x".into(), url: None, files: vec![], threads: vec![], selected: 0, scroll: 0 },
         }));
-        assert_eq!(app.selected_url().as_deref(), Some("http://diff"));
+        assert_eq!(app.selected_url().as_deref(), Some("http://prview"));
     }
 
     #[test]

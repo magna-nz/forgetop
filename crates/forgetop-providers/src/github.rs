@@ -110,6 +110,19 @@ pub fn is_pull_request(issue: &Value) -> bool {
     issue.get("pull_request").is_some()
 }
 
+pub fn map_check_run(v: &Value) -> CheckRun {
+    let status = if get_str(v, "status").as_deref() != Some("completed") {
+        CheckStatus::Pending
+    } else {
+        match get_str(v, "conclusion").as_deref() {
+            Some("success") => CheckStatus::Passed,
+            Some("neutral") | Some("skipped") => CheckStatus::None,
+            _ => CheckStatus::Failed,
+        }
+    };
+    CheckRun { name: get_str(v, "name").unwrap_or_else(|| "check".into()), status, url: get_str(v, "html_url") }
+}
+
 pub fn map_issue(v: &Value) -> WorkItem {
     let state = get_str(v, "state").unwrap_or_else(|| "open".into());
     let reason = get_str(v, "state_reason");
@@ -323,6 +336,12 @@ impl PullRequestSource for GitHubPr {
     async fn changes(&self, id: &str) -> Result<Vec<FileChange>> {
         let v = self.0.get_json(&self.0.repo_path(&format!("/pulls/{id}/files?per_page=100"))).await?;
         Ok(v.as_array().unwrap_or(&vec![]).iter().map(map_file_change).collect())
+    }
+    async fn checks(&self, id: &str) -> Result<Vec<CheckRun>> {
+        let detail = self.0.get_json(&self.0.repo_path(&format!("/pulls/{id}"))).await?;
+        let Some(sha) = get_obj(&detail, "head").and_then(|h| get_str(h, "sha")) else { return Ok(vec![]) };
+        let v = self.0.get_json(&self.0.repo_path(&format!("/commits/{sha}/check-runs"))).await?;
+        Ok(get_arr(&v, "check_runs").iter().map(map_check_run).collect())
     }
     async fn add_comment(&self, id: &str, body: &str) -> Result<()> {
         self.0.post_json(&self.0.repo_path(&format!("/issues/{id}/comments")), json!({ "body": body })).await
