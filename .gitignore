@@ -19,3 +19,7 @@
 # Windows
 Thumbs.db
 [Dd]esktop.ini
+
+# Internal working notes (kept local, not published)
+/SPEC.md
+/STATUS.md
