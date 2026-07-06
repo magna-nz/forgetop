@@ -41,7 +41,32 @@ whichever provider owns it, and the Pipelines view can aggregate several at once
 
 ## Install
 
-Requires a [Rust toolchain](https://rustup.rs) (stable).
+**Homebrew** (macOS / Linux):
+
+```sh
+brew install magna-nz/tap/forgetop
+```
+
+**Shell installer** (macOS / Linux) — downloads a prebuilt binary:
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/magna-nz/forgetop/releases/latest/download/forgetop-installer.sh | sh
+```
+
+**Windows** (PowerShell):
+
+```powershell
+irm https://github.com/magna-nz/forgetop/releases/latest/download/forgetop-installer.ps1 | iex
+```
+
+**Cargo** (requires a [Rust toolchain](https://rustup.rs)):
+
+```sh
+cargo install forgetop          # builds from source
+cargo binstall forgetop         # or grabs the prebuilt binary
+```
+
+**From source:**
 
 ```sh
 git clone https://github.com/magna-nz/forgetop
@@ -49,8 +74,8 @@ cd forgetop
 cargo install --path crates/forgetop-cli
 ```
 
-This builds and installs the `forgetop` binary to `~/.cargo/bin`. Or run it in
-place with `cargo run --release`.
+Prebuilt binaries for macOS (Apple Silicon + Intel), Linux (x86_64 + arm64), and
+Windows are attached to every [release](https://github.com/magna-nz/forgetop/releases).
 
 ## Quick start
 
