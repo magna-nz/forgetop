@@ -5,7 +5,14 @@
 **htop for your software forges.**
 
 A fast, keyboard-driven terminal UI for your pull requests, work items, and CI
-pipelines — across **GitHub**, **GitLab**, **Azure DevOps**, **Linear**, and **Jira** — in one place.
+pipelines — across **GitHub**, **GitLab**, **Azure DevOps**, **Linear**, **Jira**, and **Bitbucket** — in one place.
+
+[![CI](https://github.com/magna-nz/forgetop/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/magna-nz/forgetop/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/magna-nz/forgetop?sort=semver&label=release)](https://github.com/magna-nz/forgetop/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/magna-nz/forgetop/total?label=downloads)](https://github.com/magna-nz/forgetop/releases)
+[![Rust](https://img.shields.io/badge/built%20with-Rust-DEA584?logo=rust&logoColor=white)](https://www.rust-lang.org)
+[![Platforms](https://img.shields.io/badge/runs%20on-macOS%20%7C%20Linux%20%7C%20Windows-success)](#install)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 </div>
 
@@ -32,12 +39,29 @@ whichever provider owns it, and the Pipelines view can aggregate several at once
 - **Do work, not just watch it** — approve / merge / comment on PRs, view coloured
   diffs and review threads, change work-item states, drill into pipeline
   stages → jobs → steps, and trigger runs — all from the keyboard.
-- **Multi-provider** — GitHub, GitLab, Azure DevOps, Linear, and Jira, with a built-in `--demo`.
+- **Multi-provider** — GitHub, GitLab, Azure DevOps, Linear, Jira, and Bitbucket, with a built-in `--demo`.
 - **Guided setup** — a first-run wizard walks you through adding a connection; a
   config screen manages connections and bindings later.
 - **Secure by default** — tokens live in your OS keychain (macOS Keychain, Windows
   Credential Manager, Linux Secret Service). The config file only stores a reference.
 - **Yours to shape** — show/hide sections, four colour themes, live auto-refresh.
+
+## Supported providers
+
+Each section binds to a provider that supports it. Providers advertise their
+capabilities, so a connection only ever offers what it can actually do.
+
+| Provider | Pull Requests | Work Items | Pipelines |
+| --- | :---: | :---: | :---: |
+| **GitHub** | ✅ | ✅ (Issues) | ✅ (Actions) |
+| **GitLab** | ✅ (MRs) | ✅ (Issues) | ✅ (CI) |
+| **Azure DevOps** | ✅ | ✅ | ✅ (Builds) |
+| **Bitbucket** | ✅ | — | ✅ (Pipelines) |
+| **Linear** | — | ✅ | — |
+| **Jira** | — | ✅ | — |
+| **Demo** | ✅ | ✅ | ✅ |
+
+The Pipelines section can aggregate several providers at once.
 
 ## Install
 
@@ -161,6 +185,7 @@ non-alphanumeric characters become `_`).
 | **Azure DevOps** | Personal access token | Code *Read*, Work Items *Read & Write*, Build *Read & Execute* |
 | **Linear** | Personal API key (Settings → Security & access → API) | default |
 | **Jira** | API token (id.atlassian.com → Security → API tokens) + your account email | default (account access) |
+| **Bitbucket** | App password (Personal settings → App passwords) + your username | Pull requests, Pipelines (read & write) |
 
 ## Themes
 
@@ -175,7 +200,7 @@ forgetop is a Rust [Cargo workspace](https://doc.rust-lang.org/cargo/reference/w
 | Crate | Responsibility |
 | --- | --- |
 | `forgetop-core` | Domain model, capability-scoped provider traits, config, secrets, services |
-| `forgetop-providers` | GitHub, GitLab, Azure DevOps, Linear, Jira, and Demo implementations |
+| `forgetop-providers` | GitHub, GitLab, Azure DevOps, Linear, Jira, Bitbucket, and Demo implementations |
 | `forgetop-tui` | The [ratatui](https://ratatui.rs) terminal UI |
 | `forgetop-cli` | The `forgetop` binary |
 

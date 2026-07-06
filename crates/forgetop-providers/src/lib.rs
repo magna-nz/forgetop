@@ -1,10 +1,11 @@
-//! forgetop provider adapters: Demo, GitHub, Azure DevOps, Linear, GitLab, Jira.
+//! forgetop provider adapters: Demo, GitHub, Azure DevOps, Linear, GitLab, Jira, Bitbucket.
 
 use std::sync::Arc;
 
 use forgetop_core::provider::ProviderFactory;
 
 pub mod azure;
+pub mod bitbucket;
 pub mod demo;
 pub mod github;
 pub mod gitlab;
@@ -21,5 +22,6 @@ pub fn default_factories() -> Vec<Arc<dyn ProviderFactory>> {
         Arc::new(linear::LinearFactory),
         Arc::new(gitlab::GitLabFactory),
         Arc::new(jira::JiraFactory),
+        Arc::new(bitbucket::BitbucketFactory),
     ]
 }
