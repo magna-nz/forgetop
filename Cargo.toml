@@ -13,6 +13,7 @@ edition = "2021"
 authors = ["magna-nz"]
 license = "MIT"
 repository = "https://github.com/magna-nz/forgetop"
+homepage = "https://github.com/magna-nz/forgetop"
 
 [workspace.dependencies]
 forgetop-core = { path = "crates/forgetop-core" }
@@ -34,3 +35,8 @@ similar = "2"
 ratatui = "0.29"
 crossterm = "0.28"
 open = "5"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
