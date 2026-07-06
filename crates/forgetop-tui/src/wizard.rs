@@ -75,7 +75,7 @@ impl Default for Wizard {
 
 impl Wizard {
     pub fn new() -> Self {
-        let providers = vec!["Demo".into(), "GitHub".into(), "Azure DevOps".into(), "Linear".into()];
+        let providers = vec!["Demo".into(), "GitHub".into(), "Azure DevOps".into(), "Linear".into(), "GitLab".into()];
         let mut queue = VecDeque::new();
         queue.push_back(Prompt::pick(Field::Provider, "Provider", providers, 1));
         Wizard { queue, draft: Draft::default(), done: 0 }
@@ -153,7 +153,8 @@ impl Wizard {
                     0 => ProviderType::Demo,
                     1 => ProviderType::GitHub,
                     2 => ProviderType::AzureDevOps,
-                    _ => ProviderType::Linear,
+                    3 => ProviderType::Linear,
+                    _ => ProviderType::GitLab,
                 });
             }
             (Field::DisplayName, PromptKind::Text { buffer, .. }) => self.draft.display_name = buffer.trim().to_string(),
@@ -186,8 +187,12 @@ impl Wizard {
             ProviderType::Linear => {
                 self.queue.push_back(Prompt::secret(Field::Pat, "API key"));
             }
-            // Not offered by the picker (no factory yet); handled generically for exhaustiveness.
-            ProviderType::GitLab | ProviderType::Bitbucket => {
+            ProviderType::GitLab => {
+                self.queue.push_back(Prompt::text(Field::Repository, "Project (group/project)", true, ""));
+                self.queue.push_back(Prompt::secret(Field::Pat, "Personal access token"));
+            }
+            // Not offered by the picker yet (no factory); handled generically for exhaustiveness.
+            ProviderType::Bitbucket => {
                 self.queue.push_back(Prompt::secret(Field::Pat, "Personal access token"));
             }
         }
@@ -264,9 +269,9 @@ mod tests {
     #[test]
     fn linear_only_asks_for_key_and_binds_work_items() {
         let mut w = Wizard::new();
-        // Move provider selection to Linear (index 3).
-        w.handle(Key::Up); // wraps 1 -> 0 (Demo)
-        w.handle(Key::Up); // 0 -> 3 (Linear)
+        // Move provider selection to Linear (index 3): default is GitHub (1) -> Down twice.
+        w.handle(Key::Down); // 1 -> 2 (Azure DevOps)
+        w.handle(Key::Down); // 2 -> 3 (Linear)
         w.handle(Key::Enter);
         assert_eq!(w.draft.provider, Some(ProviderType::Linear));
         // Display name.
