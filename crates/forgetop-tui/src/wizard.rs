@@ -29,19 +29,21 @@ pub enum PromptKind {
 pub struct Prompt {
     pub field: Field,
     pub label: String,
+    /// One-line guidance shown under the field (where to find it, expected format).
+    pub help: String,
     pub required: bool,
     pub kind: PromptKind,
 }
 
 impl Prompt {
-    fn text(field: Field, label: &str, required: bool, prefill: &str) -> Self {
-        Prompt { field, label: label.into(), required, kind: PromptKind::Text { buffer: prefill.into(), secret: false } }
+    fn text(field: Field, label: &str, help: &str, required: bool, prefill: &str) -> Self {
+        Prompt { field, label: label.into(), help: help.into(), required, kind: PromptKind::Text { buffer: prefill.into(), secret: false } }
     }
-    fn secret(field: Field, label: &str) -> Self {
-        Prompt { field, label: label.into(), required: true, kind: PromptKind::Text { buffer: String::new(), secret: true } }
+    fn secret(field: Field, label: &str, help: &str) -> Self {
+        Prompt { field, label: label.into(), help: help.into(), required: true, kind: PromptKind::Text { buffer: String::new(), secret: true } }
     }
-    fn pick(field: Field, label: &str, items: Vec<String>, selected: usize) -> Self {
-        Prompt { field, label: label.into(), required: true, kind: PromptKind::Pick { items, selected } }
+    fn pick(field: Field, label: &str, help: &str, items: Vec<String>, selected: usize) -> Self {
+        Prompt { field, label: label.into(), help: help.into(), required: true, kind: PromptKind::Pick { items, selected } }
     }
 }
 
@@ -89,7 +91,7 @@ impl Wizard {
             "Bitbucket".into(),
         ];
         let mut queue = VecDeque::new();
-        queue.push_back(Prompt::pick(Field::Provider, "Provider", providers, 1));
+        queue.push_back(Prompt::pick(Field::Provider, "Provider", "Which platform this connection talks to", providers, 1));
         Wizard { queue, draft: Draft::default(), done: 0 }
     }
 
@@ -187,42 +189,62 @@ impl Wizard {
 
     fn enqueue_provider_steps(&mut self) {
         let provider = self.draft.provider.unwrap_or(ProviderType::Demo);
-        self.queue.push_back(Prompt::text(Field::DisplayName, "Display name", true, provider.as_str()));
+        self.queue.push_back(Prompt::text(Field::DisplayName, "Display name", "A label shown in the tab bar and connections list", true, provider.as_str()));
         match provider {
             ProviderType::Demo => {}
             ProviderType::GitHub => {
-                self.queue.push_back(Prompt::text(Field::Repository, "Repository (owner/repo)", false, ""));
-                self.queue.push_back(Prompt::secret(Field::Pat, "Personal access token"));
+                self.queue.push_back(Prompt::text(Field::Repository, "Repository (owner/repo)", "e.g. octocat/hello-world — the owner and repo from the URL", false, ""));
+                self.queue.push_back(Prompt::secret(
+                    Field::Pat,
+                    "Personal access token",
+                    "github.com → Settings → Developer settings → Personal access tokens · scope: repo",
+                ));
             }
             ProviderType::AzureDevOps => {
-                self.queue.push_back(Prompt::text(Field::Organization, "Organization", true, ""));
-                self.queue.push_back(Prompt::text(Field::Project, "Project", false, ""));
-                self.queue.push_back(Prompt::text(Field::Repository, "Repository", false, ""));
-                self.queue.push_back(Prompt::secret(Field::Pat, "Personal access token"));
+                self.queue.push_back(Prompt::text(Field::Organization, "Organization", "The {org} in dev.azure.com/{org}", true, ""));
+                self.queue.push_back(Prompt::text(Field::Project, "Project", "The team project name (leave blank to use the org default)", false, ""));
+                self.queue.push_back(Prompt::text(Field::Repository, "Repository", "The Git repo name (defaults to the project name)", false, ""));
+                self.queue.push_back(Prompt::secret(
+                    Field::Pat,
+                    "Personal access token",
+                    "dev.azure.com → User settings → Personal access tokens · Code, Work Items, Build",
+                ));
             }
             ProviderType::Linear => {
-                self.queue.push_back(Prompt::secret(Field::Pat, "API key"));
+                self.queue.push_back(Prompt::secret(Field::Pat, "API key", "linear.app → Settings → Security & access → API → Personal API keys"));
             }
             ProviderType::GitLab => {
-                self.queue.push_back(Prompt::text(Field::Repository, "Project (group/project)", true, ""));
-                self.queue.push_back(Prompt::secret(Field::Pat, "Personal access token"));
+                self.queue.push_back(Prompt::text(Field::Repository, "Project (group/project)", "e.g. mygroup/myapp — the full path from the URL", true, ""));
+                self.queue.push_back(Prompt::secret(
+                    Field::Pat,
+                    "Personal access token",
+                    "gitlab.com → Preferences → Access Tokens · scope: api",
+                ));
             }
             ProviderType::Jira => {
-                self.queue.push_back(Prompt::text(Field::BaseUrl, "Site URL (https://your-site.atlassian.net)", true, ""));
-                self.queue.push_back(Prompt::text(Field::Project, "Project key (e.g. ENG)", true, ""));
-                self.queue.push_back(Prompt::text(Field::Username, "Email", true, ""));
-                self.queue.push_back(Prompt::secret(Field::Pat, "API token"));
+                self.queue.push_back(Prompt::text(Field::BaseUrl, "Site URL", "Your Atlassian site, e.g. https://your-company.atlassian.net", true, ""));
+                self.queue.push_back(Prompt::text(Field::Project, "Project key", "The prefix on issue keys, e.g. ENG in ENG-123", true, ""));
+                self.queue.push_back(Prompt::text(Field::Username, "Email", "The email of your Atlassian account", true, ""));
+                self.queue.push_back(Prompt::secret(
+                    Field::Pat,
+                    "API token",
+                    "id.atlassian.com → Security → Create and manage API tokens",
+                ));
             }
             ProviderType::Bitbucket => {
-                self.queue.push_back(Prompt::text(Field::Organization, "Workspace", true, ""));
-                self.queue.push_back(Prompt::text(Field::Repository, "Repository (slug)", true, ""));
-                self.queue.push_back(Prompt::text(Field::Username, "Username", true, ""));
-                self.queue.push_back(Prompt::secret(Field::Pat, "App password"));
+                self.queue.push_back(Prompt::text(Field::Organization, "Workspace", "The {workspace} in bitbucket.org/{workspace}", true, ""));
+                self.queue.push_back(Prompt::text(Field::Repository, "Repository (slug)", "The repo slug from the URL, e.g. my-app", true, ""));
+                self.queue.push_back(Prompt::text(Field::Username, "Username", "Your Bitbucket username (not your email)", true, ""));
+                self.queue.push_back(Prompt::secret(
+                    Field::Pat,
+                    "App password",
+                    "Personal settings → App passwords · Pull requests + Pipelines (read & write)",
+                ));
             }
         }
         let mut items: Vec<String> = provider_sections(provider).into_iter().map(|s| section_label(s).to_string()).collect();
         items.push("Don't bind now".into());
-        self.queue.push_back(Prompt::pick(Field::Bind, "Bind to section", items, 0));
+        self.queue.push_back(Prompt::pick(Field::Bind, "Bind to section", "Which section this connection populates", items, 0));
     }
 }
 

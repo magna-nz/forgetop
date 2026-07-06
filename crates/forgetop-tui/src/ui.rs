@@ -1026,10 +1026,11 @@ fn render_wizard(frame: &mut Frame, area: Rect, app: &App) {
     let Some(prompt) = wizard.current() else { return };
     let accent = theme.accent;
 
-    let mut lines: Vec<Line> = vec![
-        Line::from(Span::styled(prompt.label.clone(), Style::default().fg(theme.fg).add_modifier(Modifier::BOLD))),
-        Line::from(""),
-    ];
+    let mut lines: Vec<Line> = vec![Line::from(Span::styled(prompt.label.clone(), Style::default().fg(theme.fg).add_modifier(Modifier::BOLD)))];
+    if !prompt.help.is_empty() {
+        lines.push(Line::from(Span::styled(prompt.help.clone(), Style::default().fg(theme.dim))));
+    }
+    lines.push(Line::from(""));
     match &prompt.kind {
         PromptKind::Text { buffer, secret } => {
             let shown = if *secret { "•".repeat(buffer.chars().count()) } else { buffer.clone() };
@@ -1065,8 +1066,9 @@ fn render_wizard(frame: &mut Frame, area: Rect, app: &App) {
     lines.push(Line::from(""));
     lines.push(Line::from(hint));
 
-    let height = lines.len() as u16 + 2;
-    let width = 64.min(area.width.saturating_sub(6));
+    // Wider so the per-field help fits on one line; +1 row of margin for any wrap.
+    let height = lines.len() as u16 + 3;
+    let width = 84.min(area.width.saturating_sub(6));
     let rect = centered_rect(width, height, area);
 
     let block = Block::default()
@@ -1419,6 +1421,22 @@ mod tests {
         assert!(out.contains("Provider"), "prompt label");
         assert!(out.contains("GitHub") && out.contains("Linear"), "provider options");
         assert!(out.contains("choose") && out.contains("cancel"), "wizard footer hints");
+    }
+
+    #[test]
+    fn wizard_shows_per_field_help() {
+        use crate::app::Key;
+        use crate::wizard::Wizard;
+        let mut w = Wizard::new();
+        w.handle(Key::Enter); // pick provider (defaults to GitHub)
+        w.handle(Key::Enter); // display name (pre-filled)
+        w.handle(Key::Enter); // repository (optional, empty)
+        // Now on the token field.
+        let mut app = App::new("slate");
+        app.wizard = Some(w);
+        let out = render_to_string(&mut app, 120, 24);
+        assert!(out.contains("Personal access token"), "token label");
+        assert!(out.contains("github.com"), "help says where to create the token");
     }
 
     #[test]
