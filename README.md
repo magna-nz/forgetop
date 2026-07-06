@@ -113,6 +113,7 @@ the keys valid for wherever you are. The full set:
 | --- | --- |
 | `←` / `→`, `h` / `l`, `Tab`, `1`–`3` | Switch tab |
 | `↑` / `↓`, `k` / `j` | Move selection |
+| `/` | Quick-filter the current list (type to narrow, `Esc` clears) |
 | `o` | Open selected item in browser |
 | `n` | Add a connection (wizard) |
 | `v` | Choose which tabs are visible |
