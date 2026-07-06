@@ -328,6 +328,13 @@ impl PullRequestSource for DemoPr {
             CheckRun { name: "deploy-preview".into(), status: CheckStatus::Pending, url: None },
         ])
     }
+    async fn commits(&self, _id: &str) -> Result<Vec<Commit>> {
+        Ok(vec![
+            Commit { sha: "a1b2c3d".into(), message: "Add RetryPolicy with jittered backoff".into(), author: "alice".into(), date: Some(base()), url: None },
+            Commit { sha: "e4f5a6b".into(), message: "Wire retry into the HTTP client".into(), author: "alice".into(), date: Some(base() - chrono::Duration::hours(3)), url: None },
+            Commit { sha: "9c8d7e6".into(), message: "Address review: cap max attempts".into(), author: "bob".into(), date: Some(base() - chrono::Duration::hours(1)), url: None },
+        ])
+    }
     async fn add_comment(&self, _id: &str, _body: &str) -> Result<()> {
         Ok(())
     }

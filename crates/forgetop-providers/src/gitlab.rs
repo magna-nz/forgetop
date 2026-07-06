@@ -195,6 +195,33 @@ fn count_diff(diff: &str) -> (i64, i64) {
     (adds, dels)
 }
 
+pub fn map_gl_commit(v: &Value) -> Commit {
+    Commit {
+        sha: get_str(v, "short_id").or_else(|| get_str(v, "id")).unwrap_or_default(),
+        message: get_str(v, "title").or_else(|| get_str(v, "message")).unwrap_or_default(),
+        author: get_str(v, "author_name").unwrap_or_else(|| "unknown".into()),
+        date: get_date(v, "created_at"),
+        url: get_str(v, "web_url"),
+    }
+}
+
+pub fn gl_check_status(status: Option<&str>) -> CheckStatus {
+    match status {
+        Some("success") => CheckStatus::Passed,
+        Some("failed") => CheckStatus::Failed,
+        Some("canceled") | Some("skipped") => CheckStatus::None,
+        _ => CheckStatus::Pending,
+    }
+}
+
+pub fn map_gl_status(v: &Value) -> CheckRun {
+    CheckRun {
+        name: get_str(v, "name").unwrap_or_else(|| "status".into()),
+        status: gl_check_status(get_str(v, "status").as_deref()),
+        url: get_str(v, "target_url"),
+    }
+}
+
 pub fn map_change(v: &Value) -> FileChange {
     let kind = if get_bool(v, "new_file") {
         FileChangeKind::Added
@@ -308,6 +335,16 @@ impl PullRequestSource for GitLabPr {
     async fn changes(&self, id: &str) -> Result<Vec<FileChange>> {
         let v = self.0.get_json(&self.0.project_path(&format!("/merge_requests/{id}/changes"))).await?;
         Ok(get_arr(&v, "changes").iter().map(map_change).collect())
+    }
+    async fn commits(&self, id: &str) -> Result<Vec<Commit>> {
+        let v = self.0.get_json(&self.0.project_path(&format!("/merge_requests/{id}/commits?per_page=100"))).await?;
+        Ok(v.as_array().unwrap_or(&vec![]).iter().map(map_gl_commit).collect())
+    }
+    async fn checks(&self, id: &str) -> Result<Vec<CheckRun>> {
+        let mr = self.0.get_json(&self.0.project_path(&format!("/merge_requests/{id}"))).await?;
+        let Some(sha) = get_str(&mr, "sha") else { return Ok(vec![]) };
+        let v = self.0.get_json(&self.0.project_path(&format!("/repository/commits/{sha}/statuses?per_page=100"))).await?;
+        Ok(v.as_array().unwrap_or(&vec![]).iter().map(map_gl_status).collect())
     }
     async fn add_comment(&self, id: &str, body: &str) -> Result<()> {
         self.0.post_json(&self.0.project_path(&format!("/merge_requests/{id}/notes")), json!({ "body": body })).await
@@ -550,6 +587,21 @@ mod tests {
         assert_eq!(stages[1].name, "test");
         assert_eq!(stages[1].jobs.len(), 2);
         assert_eq!(stages[1].status, PipelineRunStatus::Failed); // worst-of the test jobs
+    }
+
+    #[test]
+    fn maps_commit_and_status() {
+        let commit: Value =
+            serde_json::from_str(r#"{ "short_id": "a1b2c3d", "title": "Fix bug", "author_name": "Dana", "created_at": "2026-06-01T10:00:00Z", "web_url": "u" }"#).unwrap();
+        let c = map_gl_commit(&commit);
+        assert_eq!(c.sha, "a1b2c3d");
+        assert_eq!(c.message, "Fix bug");
+        assert_eq!(c.author, "Dana");
+
+        let status: Value = serde_json::from_str(r#"{ "name": "pipeline", "status": "failed", "target_url": "t" }"#).unwrap();
+        let s = map_gl_status(&status);
+        assert_eq!(s.name, "pipeline");
+        assert_eq!(s.status, CheckStatus::Failed);
     }
 
     #[test]

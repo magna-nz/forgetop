@@ -167,6 +167,16 @@ pub struct CheckRun {
     pub url: Option<String>,
 }
 
+/// A commit on a pull request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Commit {
+    pub sha: String,
+    pub message: String,
+    pub author: String,
+    pub date: Option<DateTime<Utc>>,
+    pub url: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileChange {
     pub path: String,

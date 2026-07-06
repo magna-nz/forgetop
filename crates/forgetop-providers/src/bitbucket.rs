@@ -110,6 +110,36 @@ pub fn map_diffstat(v: &Value) -> FileChange {
     }
 }
 
+pub fn map_bb_commit(v: &Value) -> Commit {
+    let author = get_obj(v, "author");
+    Commit {
+        sha: get_str(v, "hash").map(|h| h.chars().take(8).collect()).unwrap_or_default(),
+        message: get_str(v, "message").unwrap_or_default().lines().next().unwrap_or_default().to_string(),
+        author: author
+            .and_then(|a| get_obj(a, "user").and_then(|u| get_str(u, "display_name")).or_else(|| get_str(a, "raw")))
+            .unwrap_or_else(|| "unknown".into()),
+        date: get_date(v, "date"),
+        url: html_url(v),
+    }
+}
+
+pub fn bb_check_status(state: Option<&str>) -> CheckStatus {
+    match state {
+        Some("SUCCESSFUL") => CheckStatus::Passed,
+        Some("FAILED") | Some("ERROR") => CheckStatus::Failed,
+        Some("STOPPED") => CheckStatus::None,
+        _ => CheckStatus::Pending,
+    }
+}
+
+pub fn map_bb_status(v: &Value) -> CheckRun {
+    CheckRun {
+        name: get_str(v, "name").or_else(|| get_str(v, "key")).unwrap_or_else(|| "status".into()),
+        status: bb_check_status(get_str(v, "state").as_deref()),
+        url: get_str(v, "url"),
+    }
+}
+
 fn map_pr_comment(v: &Value) -> Comment {
     Comment {
         id: get_i64(v, "id").map(|n| n.to_string()).unwrap_or_else(|| "0".into()),
@@ -237,6 +267,18 @@ impl PullRequestSource for BitbucketPr {
     async fn changes(&self, id: &str) -> Result<Vec<FileChange>> {
         let v = self.0.get_json(&self.0.repo_path(&format!("/pullrequests/{id}/diffstat?pagelen=100"))).await?;
         Ok(get_arr(&v, "values").iter().map(map_diffstat).collect())
+    }
+    async fn commits(&self, id: &str) -> Result<Vec<Commit>> {
+        let v = self.0.get_json(&self.0.repo_path(&format!("/pullrequests/{id}/commits?pagelen=100"))).await?;
+        Ok(get_arr(&v, "values").iter().map(map_bb_commit).collect())
+    }
+    async fn checks(&self, id: &str) -> Result<Vec<CheckRun>> {
+        let pr = self.0.get_json(&self.0.repo_path(&format!("/pullrequests/{id}"))).await?;
+        let Some(hash) = get_obj(&pr, "source").and_then(|s| get_obj(s, "commit")).and_then(|c| get_str(c, "hash")) else {
+            return Ok(vec![]);
+        };
+        let v = self.0.get_json(&self.0.repo_path(&format!("/commit/{hash}/statuses?pagelen=100"))).await?;
+        Ok(get_arr(&v, "values").iter().map(map_bb_status).collect())
     }
     async fn add_comment(&self, id: &str, body: &str) -> Result<()> {
         self.0.post_ok(&self.0.repo_path(&format!("/pullrequests/{id}/comments")), json!({ "content": { "raw": body } })).await
@@ -435,6 +477,24 @@ mod tests {
         assert_eq!(map_pipeline(&failed, "a", "b").status, PipelineRunStatus::Failed);
         let running: Value = serde_json::from_str(r#"{ "state": { "name": "IN_PROGRESS" } }"#).unwrap();
         assert_eq!(map_pipeline(&running, "a", "b").status, PipelineRunStatus::Running);
+    }
+
+    #[test]
+    fn maps_commit_and_status() {
+        let commit: Value = serde_json::from_str(
+            r#"{ "hash": "abcdef1234567", "message": "Add cache\nmore", "author": { "user": { "display_name": "Dana" } },
+                 "date": "2026-06-01T10:00:00+00:00", "links": { "html": { "href": "u" } } }"#,
+        )
+        .unwrap();
+        let c = map_bb_commit(&commit);
+        assert_eq!(c.sha, "abcdef12"); // truncated to 8
+        assert_eq!(c.message, "Add cache");
+        assert_eq!(c.author, "Dana");
+
+        let status: Value = serde_json::from_str(r#"{ "key": "build", "name": "Build", "state": "SUCCESSFUL", "url": "u" }"#).unwrap();
+        let s = map_bb_status(&status);
+        assert_eq!(s.name, "Build");
+        assert_eq!(s.status, CheckStatus::Passed);
     }
 
     #[test]
