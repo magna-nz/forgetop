@@ -10,7 +10,7 @@ use ratatui::widgets::{
 };
 use ratatui::Frame;
 
-use crate::app::{App, ConfigView, DiffView, PipeRow, PipelineView, Screen, TABS};
+use crate::app::{App, ConfigView, DiffView, PipelineView, Screen, PR_TABS, TABS};
 use crate::overlay::Overlay;
 use crate::theme::{check_icon, pipeline_icon, Theme};
 use crate::wizard::{Prompt, PromptKind};
@@ -101,16 +101,7 @@ fn render_content(frame: &mut Frame, area: Rect, app: &mut App) {
         }
         Screen::List => {}
     }
-    if app.show_detail && app.selected().is_some() {
-        let split = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(3), Constraint::Length(12)])
-            .split(area);
-        render_table(frame, split[0], app);
-        render_detail(frame, split[1], app);
-    } else {
-        render_table(frame, area, app);
-    }
+    render_table(frame, area, app);
 }
 
 fn render_table(frame: &mut Frame, area: Rect, app: &mut App) {
@@ -146,34 +137,107 @@ fn highlight(theme: &Theme) -> Style {
     Style::default().bg(theme.sel_bg).add_modifier(Modifier::BOLD)
 }
 
-// ---- Pull Requests ----
+// ---- inline list helpers ----
 
-fn pr_status_span(theme: &Theme, pr: &PullRequest) -> Span<'static> {
-    let (icon, color) = if pr.is_draft {
-        ("◌ draft", theme.dim)
-    } else {
-        match pr.status {
-            PullRequestStatus::Open => ("● open", theme.green),
-            PullRequestStatus::Merged => ("✦ merged", theme.magenta),
-            PullRequestStatus::Closed => ("✗ closed", theme.red),
-            PullRequestStatus::Draft => ("◌ draft", theme.dim),
-        }
-    };
-    Span::styled(icon, Style::default().fg(color))
+/// Truncates/pads a string to exactly `w` display columns (approx: char count).
+fn cell(s: &str, w: usize) -> String {
+    let mut t: String = s.chars().take(w).collect();
+    let n = t.chars().count();
+    if n < w {
+        t.push_str(&" ".repeat(w - n));
+    }
+    t
 }
 
-fn checks_span(theme: &Theme, pr: &PullRequest) -> Span<'static> {
+/// Applies the selected-row highlight (background + bold) to a whole line.
+fn mark_selected(line: &mut Line, theme: &Theme) {
+    let hl = Style::default().bg(theme.sel_bg).add_modifier(Modifier::BOLD);
+    for span in &mut line.spans {
+        span.style = span.style.patch(hl);
+    }
+}
+
+/// A detail line prefixed with a coloured left rail so it reads as nested under the row.
+fn rail(theme: &Theme, mut spans: Vec<Span<'static>>) -> Line<'static> {
+    let mut v = vec![Span::styled("  ▌ ", Style::default().fg(theme.magenta))];
+    v.append(&mut spans);
+    Line::from(v)
+}
+
+fn rail_field(theme: &Theme, label: &str, value: String) -> Line<'static> {
+    rail(theme, vec![
+        Span::styled(format!("{label:<11}"), Style::default().fg(theme.dim)),
+        Span::styled(value, Style::default().fg(theme.fg)),
+    ])
+}
+
+/// Renders a section as a fixed header + a scrollable body of rows with the selected
+/// row's detail expanded inline beneath it.
+fn render_inline_list(
+    frame: &mut Frame,
+    area: Rect,
+    app: &mut App,
+    title: &str,
+    header: Line<'static>,
+    rows: Vec<(Line<'static>, Vec<Line<'static>>)>,
+) {
+    let block = section_block(&app.theme, title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let parts = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .split(inner);
+    frame.render_widget(Paragraph::new(header), parts[0]);
+    app.content_h = parts[1].height;
+
+    let selected = app.selected().unwrap_or(0);
+    let show = app.show_detail;
+    let scroll = app.list_scroll;
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, (mut row, detail)) in rows.into_iter().enumerate() {
+        if i == selected {
+            mark_selected(&mut row, &app.theme);
+        }
+        lines.push(row);
+        if i == selected && show {
+            lines.extend(detail);
+        }
+    }
+    frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), parts[1]);
+}
+
+// ---- Pull Requests ----
+
+fn pr_status(theme: &Theme, pr: &PullRequest) -> (&'static str, ratatui::style::Color) {
+    if pr.is_draft {
+        return ("◌ draft", theme.dim);
+    }
+    match pr.status {
+        PullRequestStatus::Open => ("● open", theme.green),
+        PullRequestStatus::Merged => ("✦ merged", theme.magenta),
+        PullRequestStatus::Closed => ("✗ closed", theme.red),
+        PullRequestStatus::Draft => ("◌ draft", theme.dim),
+    }
+}
+
+fn pr_checks(theme: &Theme, pr: &PullRequest) -> (String, ratatui::style::Color) {
     let text = match &pr.check_summary {
         Some(s) => format!("{} {}/{}", check_icon(pr.checks), s.successful, s.successful + s.failed + s.in_progress + s.neutral),
         None => format!("{} —", check_icon(pr.checks)),
     };
-    Span::styled(text, Style::default().fg(theme.check_color(pr.checks)))
+    (text, theme.check_color(pr.checks))
+}
+
+// PR columns: status(9) # (7) TITLE(flex) author(16) checks(10) ±(11) updated(7).
+fn pr_title_width(width: u16) -> usize {
+    (width as usize).saturating_sub(9 + 7 + 16 + 10 + 11 + 7 + 6).max(6)
 }
 
 fn render_prs(frame: &mut Frame, area: Rect, app: &mut App) {
     let theme = &app.theme;
     let title = format!("Pull Requests · {}", app.pr_filter_label());
-    let block = section_block(theme, &title);
     if app.prs.is_empty() {
         let msg = if app.health.is_empty() {
             FIRST_RUN_HINT
@@ -182,48 +246,62 @@ fn render_prs(frame: &mut Frame, area: Rect, app: &mut App) {
         } else {
             "No pull requests. Press f to change filter, r to refresh."
         };
-        empty(frame, area, theme, msg, block);
+        empty(frame, area, theme, msg, section_block(theme, &title));
         return;
     }
 
-    let header = header_row(theme, &["", "#", "Title", "Author", "Checks", "±", "Updated"]);
-    let rows: Vec<Row> = app
+    let inner_w = area.width.saturating_sub(2);
+    let tw = pr_title_width(inner_w);
+    let dim = Style::default().fg(theme.dim).add_modifier(Modifier::BOLD);
+    let header = Line::from(vec![
+        Span::styled(cell("", 9), dim),
+        Span::raw(" "),
+        Span::styled(cell("#", 7), dim),
+        Span::raw(" "),
+        Span::styled(cell("Title", tw), dim),
+        Span::raw(" "),
+        Span::styled(cell("Author", 16), dim),
+        Span::raw(" "),
+        Span::styled(cell("Checks", 10), dim),
+        Span::raw(" "),
+        Span::styled(cell("±", 11), dim),
+        Span::raw(" "),
+        Span::styled(cell("Updated", 7), dim),
+    ]);
+
+    let selected = app.selected().unwrap_or(0);
+    let rows: Vec<(Line, Vec<Line>)> = app
         .prs
         .iter()
-        .map(|pr| {
-            let num = pr.number.map(|n| format!("#{n}")).unwrap_or_default();
-            let diff = Span::styled(
-                format!("+{} -{}", pr.additions, pr.deletions),
-                Style::default().fg(theme.dim),
-            );
-            Row::new(vec![
-                Cell::from(pr_status_span(theme, pr)),
-                Cell::from(Span::styled(num, Style::default().fg(theme.dim))),
-                Cell::from(Span::styled(pr.title.clone(), Style::default().fg(theme.fg))),
-                Cell::from(Span::styled(pr.author.display_name.clone(), Style::default().fg(theme.blue))),
-                Cell::from(checks_span(theme, pr)),
-                Cell::from(diff),
-                Cell::from(Span::styled(rel_age(pr.updated_at), Style::default().fg(theme.dim))),
-            ])
+        .enumerate()
+        .map(|(i, pr)| {
+            let (st, stc) = pr_status(theme, pr);
+            let (ck, ckc) = pr_checks(theme, pr);
+            let row = Line::from(vec![
+                Span::styled(cell(st, 9), Style::default().fg(stc)),
+                Span::raw(" "),
+                Span::styled(cell(&pr.number.map(|n| format!("#{n}")).unwrap_or_default(), 7), Style::default().fg(theme.dim)),
+                Span::raw(" "),
+                Span::styled(cell(&pr.title, tw), Style::default().fg(theme.fg)),
+                Span::raw(" "),
+                Span::styled(cell(&pr.author.display_name, 16), Style::default().fg(theme.blue)),
+                Span::raw(" "),
+                Span::styled(cell(&ck, 10), Style::default().fg(ckc)),
+                Span::raw(" "),
+                Span::styled(cell(&format!("+{} -{}", pr.additions, pr.deletions), 11), Style::default().fg(theme.dim)),
+                Span::raw(" "),
+                Span::styled(cell(&rel_age(pr.updated_at), 7), Style::default().fg(theme.dim)),
+            ]);
+            let detail = if i == selected && app.show_detail {
+                pr_detail_lines(app, pr)
+            } else {
+                Vec::new()
+            };
+            (row, detail)
         })
         .collect();
 
-    let widths = [
-        Constraint::Length(9),
-        Constraint::Length(7),
-        Constraint::Min(24),
-        Constraint::Length(16),
-        Constraint::Length(9),
-        Constraint::Length(11),
-        Constraint::Length(8),
-    ];
-    let table = Table::new(rows, widths)
-        .header(header)
-        .block(block)
-        .column_spacing(1)
-        .row_highlight_style(highlight(theme))
-        .highlight_symbol("▐ ");
-    frame.render_stateful_widget(table, area, &mut app.pr_state);
+    render_inline_list(frame, area, app, &title, header, rows);
 }
 
 // ---- Work Items ----
@@ -238,9 +316,13 @@ fn wi_state_color(theme: &Theme, cat: WorkItemStateCategory) -> ratatui::style::
     }
 }
 
+// WI columns: state(16) id(10) TITLE(flex) type(12) assignee(16) updated(7).
+fn wi_title_width(width: u16) -> usize {
+    (width as usize).saturating_sub(16 + 10 + 12 + 16 + 7 + 5).max(6)
+}
+
 fn render_wis(frame: &mut Frame, area: Rect, app: &mut App) {
     let theme = &app.theme;
-    let block = section_block(theme, "Work Items");
     if app.wis.is_empty() {
         let msg = if app.health.is_empty() {
             FIRST_RUN_HINT
@@ -249,44 +331,54 @@ fn render_wis(frame: &mut Frame, area: Rect, app: &mut App) {
         } else {
             "No work items. Press r to refresh."
         };
-        empty(frame, area, theme, msg, block);
+        empty(frame, area, theme, msg, section_block(theme, "Work Items"));
         return;
     }
 
-    let header = header_row(theme, &["State", "ID", "Title", "Type", "Assignee", "Updated"]);
-    let rows: Vec<Row> = app
+    let tw = wi_title_width(area.width.saturating_sub(2));
+    let dim = Style::default().fg(theme.dim).add_modifier(Modifier::BOLD);
+    let header = Line::from(vec![
+        Span::styled(cell("State", 16), dim),
+        Span::raw(" "),
+        Span::styled(cell("ID", 10), dim),
+        Span::raw(" "),
+        Span::styled(cell("Title", tw), dim),
+        Span::raw(" "),
+        Span::styled(cell("Type", 12), dim),
+        Span::raw(" "),
+        Span::styled(cell("Assignee", 16), dim),
+        Span::raw(" "),
+        Span::styled(cell("Updated", 7), dim),
+    ]);
+
+    let selected = app.selected().unwrap_or(0);
+    let rows: Vec<(Line, Vec<Line>)> = app
         .wis
         .iter()
-        .map(|wi| {
-            Row::new(vec![
-                Cell::from(Span::styled(format!("● {}", wi.state), Style::default().fg(wi_state_color(theme, wi.state_category)))),
-                Cell::from(Span::styled(wi.identifier.clone().unwrap_or_default(), Style::default().fg(theme.dim))),
-                Cell::from(Span::styled(wi.title.clone(), Style::default().fg(theme.fg))),
-                Cell::from(Span::styled(wi.work_item_type.clone().unwrap_or_default(), Style::default().fg(theme.dim))),
-                Cell::from(Span::styled(
-                    wi.assignee.as_ref().map(|a| a.display_name.clone()).unwrap_or_else(|| "—".into()),
+        .enumerate()
+        .map(|(i, wi)| {
+            let row = Line::from(vec![
+                Span::styled(cell(&format!("● {}", wi.state), 16), Style::default().fg(wi_state_color(theme, wi.state_category))),
+                Span::raw(" "),
+                Span::styled(cell(&wi.identifier.clone().unwrap_or_default(), 10), Style::default().fg(theme.dim)),
+                Span::raw(" "),
+                Span::styled(cell(&wi.title, tw), Style::default().fg(theme.fg)),
+                Span::raw(" "),
+                Span::styled(cell(&wi.work_item_type.clone().unwrap_or_default(), 12), Style::default().fg(theme.dim)),
+                Span::raw(" "),
+                Span::styled(
+                    cell(&wi.assignee.as_ref().map(|a| a.display_name.clone()).unwrap_or_else(|| "—".into()), 16),
                     Style::default().fg(theme.blue),
-                )),
-                Cell::from(Span::styled(rel_age(wi.updated_at), Style::default().fg(theme.dim))),
-            ])
+                ),
+                Span::raw(" "),
+                Span::styled(cell(&rel_age(wi.updated_at), 7), Style::default().fg(theme.dim)),
+            ]);
+            let detail = if i == selected && app.show_detail { wi_detail_lines(app, wi) } else { Vec::new() };
+            (row, detail)
         })
         .collect();
 
-    let widths = [
-        Constraint::Length(16),
-        Constraint::Length(10),
-        Constraint::Min(24),
-        Constraint::Length(12),
-        Constraint::Length(16),
-        Constraint::Length(8),
-    ];
-    let table = Table::new(rows, widths)
-        .header(header)
-        .block(block)
-        .column_spacing(1)
-        .row_highlight_style(highlight(theme))
-        .highlight_symbol("▐ ");
-    frame.render_stateful_widget(table, area, &mut app.wi_state);
+    render_inline_list(frame, area, app, "Work Items", header, rows);
 }
 
 // ---- Pipelines ----
@@ -344,98 +436,144 @@ fn render_pipes(frame: &mut Frame, area: Rect, app: &mut App) {
 
 // ---- detail panel ----
 
-fn render_detail(frame: &mut Frame, area: Rect, app: &App) {
-    let theme = &app.theme;
-    let Some(idx) = app.selected() else { return };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(theme.magenta))
-        .style(Style::default().bg(theme.panel))
-        .title(Span::styled(" ▼ Detail — Esc to close ", Style::default().fg(theme.magenta).add_modifier(Modifier::BOLD)));
+// ---- inline detail builders ----
 
-    let lines: Vec<Line> = match app.active {
-        0 => app.prs.get(idx).map(|pr| pr_detail(theme, pr)).unwrap_or_default(),
-        1 => app.wis.get(idx).map(|wi| wi_detail(theme, wi)).unwrap_or_default(),
-        _ => app.pipes.get(idx).map(|p| pipe_detail(theme, p)).unwrap_or_default(),
-    };
-
-    let p = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });
-    frame.render_widget(p, area);
-}
-
-fn field<'a>(theme: &Theme, label: &'a str, value: String) -> Line<'a> {
-    Line::from(vec![
-        Span::styled(format!("{label:<11}"), Style::default().fg(theme.dim)),
-        Span::styled(value, Style::default().fg(theme.fg)),
-    ])
-}
-
-fn pr_detail(theme: &Theme, pr: &PullRequest) -> Vec<Line<'static>> {
-    let mut lines = vec![
-        Line::from(Span::styled(pr.title.clone(), Style::default().fg(theme.accent).add_modifier(Modifier::BOLD))),
-        field(theme, "Author", pr.author.display_name.clone()),
-        field(theme, "Branch", format!("{} → {}", pr.source_ref.clone().unwrap_or_default(), pr.target_ref.clone().unwrap_or_default())),
-        field(theme, "Mergeable", format!("{:?}", pr.mergeable)),
-        field(theme, "Changes", format!("{} files  +{} -{}", pr.changed_files, pr.additions, pr.deletions)),
-    ];
-    if !pr.reviewers.is_empty() {
-        let who = pr.reviewers.iter().map(|r| format!("{} ({:?})", r.user.display_name, r.vote)).collect::<Vec<_>>().join(", ");
-        lines.push(field(theme, "Reviewers", who));
+fn comment_lines(theme: &Theme, threads: &[CommentThread]) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let total: usize = threads.iter().map(|t| t.comments.len()).sum();
+    lines.push(rail(theme, vec![]));
+    lines.push(rail(theme, vec![Span::styled(format!("Comments ({total})"), Style::default().fg(theme.accent).add_modifier(Modifier::BOLD))]));
+    if total == 0 {
+        lines.push(rail(theme, vec![Span::styled("No comments.", Style::default().fg(theme.dim))]));
     }
-    if !pr.labels.is_empty() {
-        lines.push(field(theme, "Labels", pr.labels.join(", ")));
-    }
-    if let Some(url) = &pr.url {
-        lines.push(field(theme, "URL", url.clone()));
-    }
-    if let Some(desc) = &pr.description {
-        if !desc.is_empty() {
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(desc.clone(), Style::default().fg(theme.dim))));
+    for thread in threads {
+        for c in &thread.comments {
+            lines.push(rail(theme, vec![
+                Span::styled(format!("{}: ", c.author.display_name), Style::default().fg(theme.blue)),
+                Span::styled(c.body.replace('\n', " "), Style::default().fg(theme.fg)),
+            ]));
         }
     }
     lines
 }
 
-fn wi_detail(theme: &Theme, wi: &WorkItem) -> Vec<Line<'static>> {
+/// The PR sub-tab bar: Conversation | Commits | Checks | Diff, with the active one lit.
+fn pr_tab_bar(theme: &Theme, active: usize) -> Line<'static> {
+    let mut spans = vec![Span::styled("  ▾ ", Style::default().fg(theme.magenta))];
+    for (i, name) in PR_TABS.iter().enumerate() {
+        let style = if i == active {
+            Style::default().fg(theme.bg).bg(theme.accent).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.dim)
+        };
+        spans.push(Span::styled(format!(" {name} "), style));
+        spans.push(Span::raw(" "));
+    }
+    spans.push(Span::styled("   ←/→ tabs · PgUp/Dn scroll · Esc close", Style::default().fg(theme.dim)));
+    Line::from(spans)
+}
+
+fn pr_detail_lines(app: &App, pr: &PullRequest) -> Vec<Line<'static>> {
+    let theme = &app.theme;
+    let mut lines = vec![pr_tab_bar(theme, app.pr_tab)];
+    match app.pr_tab {
+        // Conversation
+        0 => {
+            lines.push(rail_field(theme, "Author", pr.author.display_name.clone()));
+            lines.push(rail_field(
+                theme,
+                "Branch",
+                format!("{} → {}", pr.source_ref.clone().unwrap_or_default(), pr.target_ref.clone().unwrap_or_default()),
+            ));
+            lines.push(rail_field(theme, "Mergeable", format!("{:?}", pr.mergeable)));
+            lines.push(rail_field(theme, "Changes", format!("{} files  +{} -{}", pr.changed_files, pr.additions, pr.deletions)));
+            if !pr.reviewers.is_empty() {
+                let who = pr.reviewers.iter().map(|r| format!("{} ({:?})", r.user.display_name, r.vote)).collect::<Vec<_>>().join(", ");
+                lines.push(rail_field(theme, "Reviewers", who));
+            }
+            if !pr.labels.is_empty() {
+                lines.push(rail_field(theme, "Labels", pr.labels.join(", ")));
+            }
+            if let Some(url) = &pr.url {
+                lines.push(rail_field(theme, "URL", url.clone()));
+            }
+            if let Some(desc) = pr.description.as_ref().filter(|d| !d.is_empty()) {
+                lines.push(rail(theme, vec![]));
+                for l in desc.lines() {
+                    lines.push(rail(theme, vec![Span::styled(l.to_string(), Style::default().fg(theme.dim))]));
+                }
+            }
+            lines.extend(comment_lines(theme, &app.detail_threads));
+        }
+        // Commits (Phase 2)
+        1 => lines.push(rail(theme, vec![Span::styled("Commit history arrives in a later update.", Style::default().fg(theme.dim))])),
+        // Checks (summary)
+        2 => match &pr.check_summary {
+            Some(s) => {
+                lines.push(rail_field(theme, "Overall", format!("{:?}", pr.checks)));
+                lines.push(rail_field(theme, "Passed", s.successful.to_string()));
+                lines.push(rail_field(theme, "Failed", s.failed.to_string()));
+                lines.push(rail_field(theme, "In progress", s.in_progress.to_string()));
+                if s.neutral > 0 {
+                    lines.push(rail_field(theme, "Neutral", s.neutral.to_string()));
+                }
+            }
+            None => lines.push(rail(theme, vec![Span::styled("No checks reported for this PR.", Style::default().fg(theme.dim))])),
+        },
+        // Diff
+        _ => {
+            if !app.detail_files_loaded {
+                lines.push(rail(theme, vec![Span::styled("Loading diff…", Style::default().fg(theme.dim))]));
+            } else if app.detail_files.is_empty() {
+                lines.push(rail(theme, vec![Span::styled("No file changes.", Style::default().fg(theme.dim))]));
+            } else {
+                for f in &app.detail_files {
+                    lines.push(rail(theme, vec![Span::styled(
+                        format!("{}  (+{} -{})", f.path, f.additions, f.deletions),
+                        Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+                    )]));
+                    if let Some(patch) = &f.patch {
+                        for l in patch.lines() {
+                            let color = if l.starts_with("@@") {
+                                theme.blue
+                            } else if l.starts_with('+') {
+                                theme.green
+                            } else if l.starts_with('-') {
+                                theme.red
+                            } else {
+                                theme.dim
+                            };
+                            lines.push(rail(theme, vec![Span::styled(l.to_string(), Style::default().fg(color))]));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    lines
+}
+
+fn wi_detail_lines(app: &App, wi: &WorkItem) -> Vec<Line<'static>> {
+    let theme = &app.theme;
     let mut lines = vec![
-        Line::from(Span::styled(
+        rail(theme, vec![Span::styled(
             format!("{} {}", wi.identifier.clone().unwrap_or_default(), wi.title),
             Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
-        )),
-        field(theme, "State", format!("{} ({:?})", wi.state, wi.state_category)),
-        field(theme, "Type", wi.work_item_type.clone().unwrap_or_else(|| "—".into())),
-        field(theme, "Assignee", wi.assignee.as_ref().map(|a| a.display_name.clone()).unwrap_or_else(|| "—".into())),
+        )]),
+        rail_field(theme, "State", format!("{} ({:?})", wi.state, wi.state_category)),
+        rail_field(theme, "Type", wi.work_item_type.clone().unwrap_or_else(|| "—".into())),
+        rail_field(theme, "Assignee", wi.assignee.as_ref().map(|a| a.display_name.clone()).unwrap_or_else(|| "—".into())),
     ];
     if let Some(url) = &wi.url {
-        lines.push(field(theme, "URL", url.clone()));
+        lines.push(rail_field(theme, "URL", url.clone()));
     }
-    if let Some(desc) = &wi.description {
-        if !desc.is_empty() {
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(desc.clone(), Style::default().fg(theme.dim))));
+    if let Some(desc) = wi.description.as_ref().filter(|d| !d.is_empty()) {
+        lines.push(rail(theme, vec![]));
+        for l in desc.lines() {
+            lines.push(rail(theme, vec![Span::styled(l.to_string(), Style::default().fg(theme.dim))]));
         }
     }
-    lines
-}
-
-fn pipe_detail(theme: &Theme, p: &PipeRow) -> Vec<Line<'static>> {
-    let name = p.run.name.clone().unwrap_or_else(|| p.run.definition_id.clone());
-    let mut lines = vec![
-        Line::from(Span::styled(name, Style::default().fg(theme.accent).add_modifier(Modifier::BOLD))),
-        field(theme, "Status", format!("{:?}", p.run.status)),
-        field(theme, "Provider", format!("{} · {}", p.provider.as_str(), p.connection)),
-        field(theme, "Branch", p.run.branch.clone().unwrap_or_default()),
-        field(theme, "Triggered", p.run.triggered_by.as_ref().map(|u| u.display_name.clone()).unwrap_or_else(|| "—".into())),
-    ];
-    for stage in &p.run.stages {
-        lines.push(Line::from(vec![
-            Span::styled(format!("  {} ", pipeline_icon(stage.status)), Style::default().fg(theme.pipeline_color(stage.status))),
-            Span::styled(stage.name.clone(), Style::default().fg(theme.fg)),
-            Span::styled(format!("  ({} jobs)", stage.jobs.len()), Style::default().fg(theme.dim)),
-        ]));
-    }
+    lines.extend(comment_lines(theme, &app.detail_threads));
     lines
 }
 
@@ -486,6 +624,16 @@ fn footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
             ("q", "quit"),
         ];
     }
+    // While a PR/work-item detail is expanded, the keys change (sub-tabs, scroll, close).
+    if app.show_detail {
+        let mut keys = vec![("↑↓", "move")];
+        if app.active == 0 {
+            keys.push(("←→", "sub-tabs"));
+        }
+        keys.extend([("PgUp/Dn", "scroll"), ("a", "approve"), ("m", "merge"), ("c", "comment"), ("o", "open"), ("Esc", "close")]);
+        return keys;
+    }
+
     let mut keys = vec![("↑↓", "move"), ("←→", "tabs")];
     match app.active {
         0 => keys.extend([
@@ -995,19 +1143,44 @@ mod tests {
     }
 
     #[test]
-    fn detail_panel_appears_only_when_expanded() {
+    fn detail_expands_inline_with_tabs() {
         let mut app = App::new("slate");
         app.prs.push(sample_pr());
         app.pr_state.select(Some(0));
 
         let collapsed = render_to_string(&mut app, 100, 24);
         assert!(collapsed.contains("Add the widget"), "row should render");
-        assert!(!collapsed.contains("Detail"), "no detail panel while collapsed");
+        assert!(!collapsed.contains("Conversation"), "no sub-tabs while collapsed");
 
         app.show_detail = true;
         let expanded = render_to_string(&mut app, 100, 24);
-        assert!(expanded.contains("Detail"), "detail panel should expand on Enter");
-        assert!(expanded.contains("Alice Ng"), "detail should show the author");
+        // Inline detail shows the PR sub-tab bar and the Conversation overview.
+        assert!(expanded.contains("Conversation") && expanded.contains("Diff"), "sub-tab bar should render");
+        assert!(expanded.contains("Alice Ng"), "Conversation should show the author");
+
+        // Switching to the Checks sub-tab shows the checks view instead.
+        app.pr_tab = 2;
+        let checks = render_to_string(&mut app, 100, 24);
+        assert!(checks.contains("No checks reported"), "Checks tab renders (sample PR has no summary)");
+    }
+
+    #[test]
+    fn detail_expands_directly_under_selected_row() {
+        let mut app = App::new("slate");
+        let mut a = sample_pr();
+        a.title = "First PR".into();
+        let mut b = sample_pr();
+        b.number = Some(43);
+        b.title = "Second PR".into();
+        app.prs.push(a);
+        app.prs.push(b);
+        app.pr_state.select(Some(0));
+        app.show_detail = true;
+
+        let out = render_to_string(&mut app, 100, 24);
+        let conv = out.find("Conversation").expect("sub-tab bar renders");
+        let second = out.find("Second PR").expect("second row renders");
+        assert!(conv < second, "expanded detail should sit under row 0, before row 1 — not at the bottom");
     }
 
     #[test]

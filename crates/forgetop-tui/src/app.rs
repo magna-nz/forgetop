@@ -33,6 +33,9 @@ fn index_of(section: Section) -> usize {
 /// The three top-level tabs, in order.
 pub const TABS: [&str; 3] = ["Pull Requests", "Work Items", "Pipelines"];
 
+/// PR detail sub-tabs, in order.
+pub const PR_TABS: [&str; 4] = ["Conversation", "Commits", "Checks", "Diff"];
+
 /// Live services the app talks to. Cheap to clone (all `Arc`).
 #[derive(Clone)]
 pub struct AppDeps {
@@ -64,6 +67,17 @@ pub struct App {
     pub status: String,
     pub loading: bool,
     pub show_detail: bool,
+    /// Active PR sub-tab while a PR detail is expanded (0=Conversation..3=Diff).
+    pub pr_tab: usize,
+    /// Scroll offset for the inline PR/WI list (rows + expanded detail).
+    pub list_scroll: u16,
+    /// Comment threads for the expanded item.
+    pub detail_threads: Vec<CommentThread>,
+    /// Changed files for the expanded PR (loaded lazily when the Diff tab opens).
+    pub detail_files: Vec<FileChange>,
+    pub detail_files_loaded: bool,
+    /// Body height of the current inline list, captured during render for scrolling.
+    pub content_h: u16,
     pub pr_filter: PullRequestFilter,
     /// Transient one-shot message shown in the footer until the next keypress.
     pub toast: Option<String>,
@@ -241,6 +255,12 @@ impl App {
             status: "Loading…".into(),
             loading: true,
             show_detail: false,
+            pr_tab: 0,
+            list_scroll: 0,
+            detail_threads: Vec::new(),
+            detail_files: Vec::new(),
+            detail_files_loaded: false,
+            content_h: 0,
             pr_filter: PullRequestFilter::All,
             toast: None,
             overlay: None,
@@ -333,6 +353,7 @@ impl App {
         let n = vis.len() as isize;
         self.active = vis[(((pos + delta) % n + n) % n) as usize];
         self.show_detail = false;
+        self.list_scroll = 0;
         self.clamp_selection();
     }
 
@@ -340,6 +361,7 @@ impl App {
     pub fn set_tab(&mut self, idx: usize) {
         if let Some(&section) = self.visible_indices().get(idx) {
             self.active = section;
+            self.list_scroll = 0;
             self.show_detail = false;
             self.clamp_selection();
         }
@@ -494,25 +516,136 @@ impl App {
         match key {
             Key::Escape => {
                 if self.show_detail {
-                    self.show_detail = false;
+                    self.close_detail();
                 } else {
                     self.should_quit = true;
                 }
             }
-            Key::Left => self.switch_tab(-1),
-            Key::Right => self.switch_tab(1),
+            // While a PR detail is open, ←/→ move between its sub-tabs; otherwise switch tabs.
+            Key::Left => {
+                if self.show_detail && self.active == 0 {
+                    self.detail_tab(-1, deps).await;
+                } else {
+                    self.switch_tab(-1);
+                }
+            }
+            Key::Right => {
+                if self.show_detail && self.active == 0 {
+                    self.detail_tab(1, deps).await;
+                } else {
+                    self.switch_tab(1);
+                }
+            }
             Key::Tab => self.switch_tab(1),
-            Key::Up => self.move_up(),
-            Key::Down => self.move_down(),
+            Key::Up => {
+                self.move_up();
+                self.after_move(deps).await;
+            }
+            Key::Down => {
+                self.move_down();
+                self.after_move(deps).await;
+            }
+            Key::PageDown => self.list_scroll = self.list_scroll.saturating_add(8),
+            Key::PageUp => self.list_scroll = self.list_scroll.saturating_sub(8),
             Key::Enter => {
                 if self.active == 2 {
                     self.open_pipeline(deps).await;
                 } else if self.selected().is_some() {
-                    self.show_detail = !self.show_detail;
+                    if self.show_detail {
+                        self.close_detail();
+                    } else {
+                        self.open_detail(deps).await;
+                    }
                 }
             }
             Key::Char(c) => self.on_char(c, deps).await,
-            Key::Backspace | Key::PageUp | Key::PageDown | Key::Quit | Key::None => {}
+            Key::Backspace | Key::Quit | Key::None => {}
+        }
+    }
+
+    // ---- inline detail ----
+
+    fn selected_index(&self) -> usize {
+        self.selected().unwrap_or(0)
+    }
+
+    fn close_detail(&mut self) {
+        self.show_detail = false;
+        self.list_scroll = 0;
+        self.ensure_visible();
+    }
+
+    /// Opens the inline detail under the selected PR/work item and loads its data.
+    async fn open_detail(&mut self, deps: &AppDeps) {
+        self.show_detail = true;
+        self.pr_tab = 0;
+        self.detail_threads.clear();
+        self.detail_files.clear();
+        self.detail_files_loaded = false;
+        self.list_scroll = self.selected_index() as u16;
+        self.load_detail(deps).await;
+    }
+
+    /// Loads comment threads (and the diff when the Diff tab is active) for the selection.
+    async fn load_detail(&mut self, deps: &AppDeps) {
+        match self.active {
+            0 => {
+                let Some(id) = self.selected_pr().map(|p| p.id.clone()) else { return };
+                if let Ok(Some(src)) = deps.sections.pull_request_source().await {
+                    self.detail_threads = src.threads(&id).await.unwrap_or_default();
+                    if self.pr_tab == 3 && !self.detail_files_loaded {
+                        self.detail_files = src.changes(&id).await.unwrap_or_default();
+                        self.detail_files_loaded = true;
+                    }
+                }
+            }
+            1 => {
+                let Some(id) = self.selected_wi().map(|w| w.id.clone()) else { return };
+                if let Ok(Some(src)) = deps.sections.work_item_source().await {
+                    self.detail_threads = src.threads(&id).await.unwrap_or_default();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    async fn detail_tab(&mut self, delta: isize, deps: &AppDeps) {
+        let n = PR_TABS.len() as isize;
+        self.pr_tab = (((self.pr_tab as isize + delta) % n + n) % n) as usize;
+        self.list_scroll = self.selected_index() as u16;
+        if self.pr_tab == 3 && !self.detail_files_loaded {
+            if let Some(id) = self.selected_pr().map(|p| p.id.clone()) {
+                if let Ok(Some(src)) = deps.sections.pull_request_source().await {
+                    self.detail_files = src.changes(&id).await.unwrap_or_default();
+                    self.detail_files_loaded = true;
+                }
+            }
+        }
+    }
+
+    /// After changing the selection: keep it in view and, if a detail is open, reload it.
+    async fn after_move(&mut self, deps: &AppDeps) {
+        self.ensure_visible();
+        if self.show_detail {
+            self.detail_files.clear();
+            self.detail_files_loaded = false;
+            self.load_detail(deps).await;
+        }
+    }
+
+    /// Keeps the selected row within the visible list viewport.
+    fn ensure_visible(&mut self) {
+        let sel = self.selected_index() as u16;
+        if self.show_detail {
+            // Pin the selected row to the top so its expanded detail fills the space below.
+            self.list_scroll = sel;
+        } else {
+            let h = self.content_h.max(1);
+            if sel < self.list_scroll {
+                self.list_scroll = sel;
+            } else if sel >= self.list_scroll + h {
+                self.list_scroll = sel - h + 1;
+            }
         }
     }
 
@@ -520,8 +653,14 @@ impl App {
     async fn on_char(&mut self, c: char, deps: &AppDeps) {
         match c {
             'q' => self.should_quit = true,
-            'j' => self.move_down(),
-            'k' => self.move_up(),
+            'j' => {
+                self.move_down();
+                self.after_move(deps).await;
+            }
+            'k' => {
+                self.move_up();
+                self.after_move(deps).await;
+            }
             'h' => self.switch_tab(-1),
             'l' => self.switch_tab(1),
             '1'..='3' => self.set_tab(c as usize - '1' as usize),
