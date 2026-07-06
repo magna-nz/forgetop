@@ -243,6 +243,15 @@ fn columnize(
     (header, lines)
 }
 
+/// Appends the active quick-filter to a section title (e.g. `Pipelines · /deploy`).
+fn list_title(base: String, filter: &str) -> String {
+    if filter.is_empty() {
+        base
+    } else {
+        format!("{base} · /{filter}")
+    }
+}
+
 // ---- Pull Requests ----
 
 fn pr_status(theme: &Theme, pr: &PullRequest) -> (&'static str, ratatui::style::Color) {
@@ -267,9 +276,12 @@ fn pr_checks(theme: &Theme, pr: &PullRequest) -> (String, ratatui::style::Color)
 
 fn render_prs(frame: &mut Frame, area: Rect, app: &mut App) {
     let theme = &app.theme;
-    let title = format!("Pull Requests · {}", app.pr_filter_label());
-    if app.prs.is_empty() {
-        let msg = if app.health.is_empty() {
+    let idxs = app.filtered_pr_indices();
+    let title = list_title(format!("Pull Requests · {}", app.pr_filter_label()), &app.filters[0]);
+    if idxs.is_empty() {
+        let msg = if !app.filters[0].is_empty() {
+            "No matches. Esc clears the filter."
+        } else if app.health.is_empty() {
             FIRST_RUN_HINT
         } else if app.loading {
             "Loading pull requests…"
@@ -283,9 +295,9 @@ fn render_prs(frame: &mut Frame, area: Rect, app: &mut App) {
     let inner_w = area.width.saturating_sub(2) as usize;
     let dim = Style::default().fg(theme.dim).add_modifier(Modifier::BOLD);
     let headers = ["", "#", "Title", "Author", "Checks", "±", "Updated"];
-    let cells: Vec<Vec<(String, Style)>> = app
-        .prs
+    let cells: Vec<Vec<(String, Style)>> = idxs
         .iter()
+        .map(|&i| &app.prs[i])
         .map(|pr| {
             let (st, stc) = pr_status(theme, pr);
             let (ck, ckc) = pr_checks(theme, pr);
@@ -319,24 +331,28 @@ fn wi_state_color(theme: &Theme, cat: WorkItemStateCategory) -> ratatui::style::
 
 fn render_wis(frame: &mut Frame, area: Rect, app: &mut App) {
     let theme = &app.theme;
-    if app.wis.is_empty() {
-        let msg = if app.health.is_empty() {
+    let idxs = app.filtered_wi_indices();
+    let title = list_title("Work Items".to_string(), &app.filters[1]);
+    if idxs.is_empty() {
+        let msg = if !app.filters[1].is_empty() {
+            "No matches. Esc clears the filter."
+        } else if app.health.is_empty() {
             FIRST_RUN_HINT
         } else if app.loading {
             "Loading work items…"
         } else {
             "No work items. Press r to refresh."
         };
-        empty(frame, area, theme, msg, section_block(theme, "Work Items"));
+        empty(frame, area, theme, msg, section_block(theme, &title));
         return;
     }
 
     let inner_w = area.width.saturating_sub(2) as usize;
     let dim = Style::default().fg(theme.dim).add_modifier(Modifier::BOLD);
     let headers = ["State", "ID", "Title", "Type", "Assignee", "Updated"];
-    let cells: Vec<Vec<(String, Style)>> = app
-        .wis
+    let cells: Vec<Vec<(String, Style)>> = idxs
         .iter()
+        .map(|&i| &app.wis[i])
         .map(|wi| {
             vec![
                 (format!("● {}", wi.state), Style::default().fg(wi_state_color(theme, wi.state_category))),
@@ -350,31 +366,35 @@ fn render_wis(frame: &mut Frame, area: Rect, app: &mut App) {
         .collect();
 
     let (header, rows) = columnize(dim, &headers, &cells, 2, inner_w);
-    render_inline_list(frame, area, app, "Work Items", header, rows);
+    render_inline_list(frame, area, app, &title, header, rows);
 }
 
 // ---- Pipelines ----
 
 fn render_pipes(frame: &mut Frame, area: Rect, app: &mut App) {
     let theme = &app.theme;
-    if app.pipes.is_empty() {
-        let msg = if app.health.is_empty() {
+    let idxs = app.filtered_pipe_indices();
+    let title = list_title("Pipelines".to_string(), &app.filters[2]);
+    if idxs.is_empty() {
+        let msg = if !app.filters[2].is_empty() {
+            "No matches. Esc clears the filter."
+        } else if app.health.is_empty() {
             FIRST_RUN_HINT
         } else if app.loading {
             "Loading pipeline runs…"
         } else {
             "No pipeline runs. Press r to refresh."
         };
-        empty(frame, area, theme, msg, section_block(theme, "Pipelines"));
+        empty(frame, area, theme, msg, section_block(theme, &title));
         return;
     }
 
     let inner_w = area.width.saturating_sub(2) as usize;
     let dim = Style::default().fg(theme.dim).add_modifier(Modifier::BOLD);
     let headers = ["", "Provider", "Pipeline", "#", "Branch", "Started"];
-    let cells: Vec<Vec<(String, Style)>> = app
-        .pipes
+    let cells: Vec<Vec<(String, Style)>> = idxs
         .iter()
+        .map(|&i| &app.pipes[i])
         .map(|p| {
             let color = theme.pipeline_color(p.run.status);
             vec![
@@ -389,7 +409,7 @@ fn render_pipes(frame: &mut Frame, area: Rect, app: &mut App) {
         .collect();
 
     let (header, rows) = columnize(dim, &headers, &cells, 2, inner_w);
-    render_inline_list(frame, area, app, "Pipelines", header, rows);
+    render_inline_list(frame, area, app, &title, header, rows);
 }
 
 // ---- full-screen PR / work-item views ----
@@ -653,6 +673,7 @@ fn footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
         2 => keys.extend([("↵", "drill-in"), ("T", "trigger"), ("o", "open")]),
         _ => {}
     }
+    keys.push(("/", "find"));
     keys.extend([("v", "tabs"), ("C", "config"), ("r", "refresh"), ("t", "theme"), ("q", "quit")]);
     keys
 }
@@ -661,6 +682,18 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     let theme = &app.theme;
     // A subtle bar background so the glossary reads as a distinct strip.
     let bar = Style::default().bg(theme.panel);
+
+    // While the quick-filter input is open, the footer becomes that input.
+    if app.filtering {
+        let spans = vec![
+            Span::styled(" / ", bar.fg(theme.bg).bg(theme.accent).add_modifier(Modifier::BOLD)),
+            Span::styled(format!(" {}", app.active_filter()), bar.fg(theme.fg).add_modifier(Modifier::BOLD)),
+            Span::styled("▌", bar.fg(theme.accent)),
+            Span::styled("   ↵ apply · Esc clear", bar.fg(theme.dim)),
+        ];
+        frame.render_widget(Paragraph::new(Line::from(spans)).style(bar), area);
+        return;
+    }
 
     let mut spans = vec![Span::styled(" ", bar)];
     for (key, label) in footer_keys(app) {

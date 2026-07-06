@@ -72,6 +72,10 @@ pub struct App {
     /// Max scroll offset for the open PR/WI view, captured during render for clamping.
     pub detail_scroll_max: u16,
     pub pr_filter: PullRequestFilter,
+    /// Live per-tab quick-filter text (0=PR, 1=WI, 2=Pipelines). Empty = no filter.
+    pub filters: [String; 3],
+    /// True while the quick-filter input is capturing keystrokes.
+    pub filtering: bool,
     /// Transient one-shot message shown in the footer until the next keypress.
     pub toast: Option<String>,
     /// Open modal overlay, if any. When set, keys route here instead of the table.
@@ -275,6 +279,8 @@ impl App {
             content_h: 0,
             detail_scroll_max: 0,
             pr_filter: PullRequestFilter::All,
+            filters: [String::new(), String::new(), String::new()],
+            filtering: false,
             toast: None,
             overlay: None,
             wizard: None,
@@ -293,14 +299,77 @@ impl App {
         }
     }
 
+    // ---- quick filter ----
+
+    /// Row indices of the PR list matching its quick filter (all rows if empty).
+    pub fn filtered_pr_indices(&self) -> Vec<usize> {
+        let q = self.filters[0].to_lowercase();
+        (0..self.prs.len()).filter(|&i| pr_matches(&self.prs[i], &q)).collect()
+    }
+
+    pub fn filtered_wi_indices(&self) -> Vec<usize> {
+        let q = self.filters[1].to_lowercase();
+        (0..self.wis.len()).filter(|&i| wi_matches(&self.wis[i], &q)).collect()
+    }
+
+    pub fn filtered_pipe_indices(&self) -> Vec<usize> {
+        let q = self.filters[2].to_lowercase();
+        (0..self.pipes.len()).filter(|&i| pipe_matches(&self.pipes[i], &q)).collect()
+    }
+
+    fn filtered_len(&self, section: usize) -> usize {
+        match section {
+            0 => self.filtered_pr_indices().len(),
+            1 => self.filtered_wi_indices().len(),
+            _ => self.filtered_pipe_indices().len(),
+        }
+    }
+
+    /// The active tab's quick-filter text.
+    pub fn active_filter(&self) -> &str {
+        &self.filters[self.active]
+    }
+
+    /// Opens the quick-filter input for the active tab.
+    fn start_filter(&mut self) {
+        self.filtering = true;
+    }
+
+    /// Re-anchors selection to the first match after the filter changes.
+    fn reset_filter_selection(&mut self) {
+        self.list_scroll = 0;
+        let len = self.active_len();
+        self.active_state().select((len > 0).then_some(0));
+    }
+
+    /// Handles keys while the quick-filter input is open.
+    fn on_filter_key(&mut self, key: Key) {
+        match key {
+            Key::Escape => {
+                self.filters[self.active].clear();
+                self.filtering = false;
+                self.reset_filter_selection();
+            }
+            Key::Enter => {
+                self.filtering = false;
+                self.reset_filter_selection();
+            }
+            Key::Backspace => {
+                self.filters[self.active].pop();
+                self.reset_filter_selection();
+            }
+            Key::Char(c) => {
+                self.filters[self.active].push(c);
+                self.reset_filter_selection();
+            }
+            _ => {}
+        }
+    }
+
     // ---- selection ----
 
     pub fn active_len(&self) -> usize {
-        match self.active {
-            0 => self.prs.len(),
-            1 => self.wis.len(),
-            _ => self.pipes.len(),
-        }
+        self.filtered_len(self.active)
     }
 
     fn active_state(&mut self) -> &mut TableState {
@@ -460,12 +529,13 @@ impl App {
         }
     }
 
-    /// Re-selects a valid row per tab after the underlying data changed.
+    /// Re-selects a valid row per tab after the underlying data (or filter) changed.
+    /// Selection is a position within each tab's *filtered* view, so clamp to that.
     fn fix_selection(&mut self) {
-        self.clamp_selection();
-        self.pr_state.select((!self.prs.is_empty()).then_some(self.pr_state.selected().unwrap_or(0)));
-        self.wi_state.select((!self.wis.is_empty()).then_some(self.wi_state.selected().unwrap_or(0)));
-        self.pipe_state.select((!self.pipes.is_empty()).then_some(self.pipe_state.selected().unwrap_or(0)));
+        let (pl, wl, ll) = (self.filtered_len(0), self.filtered_len(1), self.filtered_len(2));
+        self.pr_state.select((pl > 0).then(|| self.pr_state.selected().unwrap_or(0).min(pl - 1)));
+        self.wi_state.select((wl > 0).then(|| self.wi_state.selected().unwrap_or(0).min(wl - 1)));
+        self.pipe_state.select((ll > 0).then(|| self.pipe_state.selected().unwrap_or(0).min(ll - 1)));
     }
 
     /// Cycles the PR filter, reloads just the PR list, and toasts the new filter.
@@ -477,7 +547,7 @@ impl App {
         };
         let mut errors = Vec::new();
         self.reload_pull_requests(deps, &mut errors).await;
-        self.pr_state.select((!self.prs.is_empty()).then_some(0));
+        self.pr_state.select((!self.filtered_pr_indices().is_empty()).then_some(0));
         self.list_scroll = 0;
         self.toast = Some(match errors.first() {
             Some(e) => e.clone(),
@@ -510,6 +580,11 @@ impl App {
             self.on_overlay_key(key, deps).await;
             return;
         }
+        // The quick-filter input (only ever open on the list) captures every key.
+        if self.filtering {
+            self.on_filter_key(key);
+            return;
+        }
 
         // Full-screen sub-views handle their own keys.
         match self.screen {
@@ -533,7 +608,15 @@ impl App {
         }
 
         match key {
-            Key::Escape => self.should_quit = true,
+            // Esc clears an active quick filter first, then quits.
+            Key::Escape => {
+                if self.filters[self.active].is_empty() {
+                    self.should_quit = true;
+                } else {
+                    self.filters[self.active].clear();
+                    self.reset_filter_selection();
+                }
+            }
             Key::Left => self.switch_tab(-1),
             Key::Right => self.switch_tab(1),
             Key::Tab => self.switch_tab(1),
@@ -741,6 +824,7 @@ impl App {
                 self.theme = Theme::by_name(next);
                 let _ = deps.config.set_theme(Some(next.to_string())).await;
             }
+            '/' => self.start_filter(),
             'o' => self.open_selected(),
             'n' => self.start_add_connection(),
             'v' => self.open_sections_toggle(),
@@ -771,7 +855,8 @@ impl App {
         if self.active != 2 {
             return None;
         }
-        self.pipe_state.selected().and_then(|i| self.pipes.get(i))
+        let idxs = self.filtered_pipe_indices();
+        self.pipe_state.selected().and_then(|p| idxs.get(p)).and_then(|&i| self.pipes.get(i))
     }
 
     async fn open_pipeline(&mut self, deps: &AppDeps) {
@@ -1194,7 +1279,8 @@ impl App {
         if self.active != 0 {
             return None;
         }
-        self.pr_state.selected().and_then(|i| self.prs.get(i))
+        let idxs = self.filtered_pr_indices();
+        self.pr_state.selected().and_then(|p| idxs.get(p)).and_then(|&i| self.prs.get(i))
     }
 
     fn open_pr_vote(&mut self, vote: ReviewVote) {
@@ -1284,7 +1370,8 @@ impl App {
         if self.active != 1 {
             return None;
         }
-        self.wi_state.selected().and_then(|i| self.wis.get(i))
+        let idxs = self.filtered_wi_indices();
+        self.wi_state.selected().and_then(|p| idxs.get(p)).and_then(|&i| self.wis.get(i))
     }
 
     fn open_wi_state(&mut self) {
@@ -1367,6 +1454,56 @@ fn pr_label(pr: &PullRequest) -> String {
     let num = pr.number.map(|n| format!("#{n} ")).unwrap_or_default();
     let title: String = pr.title.chars().take(40).collect();
     format!("PR {num}— {title}")
+}
+
+/// Quick-filter match: every whitespace-separated token in `q` (already lowercased)
+/// must appear somewhere in the row's searchable text. Empty query matches everything.
+fn pr_matches(pr: &PullRequest, q: &str) -> bool {
+    if q.is_empty() {
+        return true;
+    }
+    let hay = format!(
+        "{} {} {} {} {}",
+        pr.title,
+        pr.author.display_name,
+        pr.number.map(|n| format!("#{n}")).unwrap_or_default(),
+        pr.source_ref.clone().unwrap_or_default(),
+        pr.labels.join(" "),
+    )
+    .to_lowercase();
+    q.split_whitespace().all(|t| hay.contains(t))
+}
+
+fn wi_matches(wi: &WorkItem, q: &str) -> bool {
+    if q.is_empty() {
+        return true;
+    }
+    let hay = format!(
+        "{} {} {} {} {}",
+        wi.title,
+        wi.identifier.clone().unwrap_or_default(),
+        wi.state,
+        wi.work_item_type.clone().unwrap_or_default(),
+        wi.assignee.as_ref().map(|a| a.display_name.clone()).unwrap_or_default(),
+    )
+    .to_lowercase();
+    q.split_whitespace().all(|t| hay.contains(t))
+}
+
+fn pipe_matches(p: &PipeRow, q: &str) -> bool {
+    if q.is_empty() {
+        return true;
+    }
+    let hay = format!(
+        "{} {} {} {} {:?}",
+        p.run.name.clone().unwrap_or_else(|| p.run.definition_id.clone()),
+        p.provider.as_str(),
+        p.connection,
+        p.run.branch.clone().unwrap_or_default(),
+        p.run.status,
+    )
+    .to_lowercase();
+    q.split_whitespace().all(|t| hay.contains(t))
 }
 
 fn vote_message(vote: ReviewVote) -> &'static str {
@@ -1465,6 +1602,76 @@ mod tests {
             updated_at: None,
             url: url.map(Into::into),
         }
+    }
+
+    #[test]
+    fn quick_filter_narrows_and_maps_selection() {
+        let mut app = App::new("slate");
+        let mut a = pr(None);
+        a.title = "Fix login bug".into();
+        let mut b = pr(None);
+        b.title = "Update deploy pipeline".into();
+        b.author.display_name = "Dana".into();
+        let mut c = pr(None);
+        c.title = "Refactor login flow".into();
+        app.prs = vec![a, b, c];
+        app.active = 0;
+
+        // No filter → all rows.
+        assert_eq!(app.filtered_pr_indices(), vec![0, 1, 2]);
+
+        // Filter by a title token (case-insensitive).
+        app.filters[0] = "LOGIN".into();
+        assert_eq!(app.filtered_pr_indices(), vec![0, 2]);
+
+        // Selection is a position into the filtered view: position 1 → original index 2.
+        app.pr_state.select(Some(1));
+        assert_eq!(app.selected_pr().map(|p| p.title.as_str()), Some("Refactor login flow"));
+
+        // Multi-token AND across fields (title + author).
+        app.filters[0] = "deploy dana".into();
+        assert_eq!(app.filtered_pr_indices(), vec![1]);
+
+        // No match → empty view, and active_len reflects it.
+        app.filters[0] = "zzz".into();
+        assert!(app.filtered_pr_indices().is_empty());
+        assert_eq!(app.active_len(), 0);
+    }
+
+    #[test]
+    fn quick_filter_input_edits_and_clears() {
+        let mut app = App::new("slate");
+        let mut a = pr(None);
+        a.title = "alpha".into();
+        let mut b = pr(None);
+        b.title = "beta".into();
+        app.prs = vec![a, b];
+        app.active = 0;
+
+        app.start_filter();
+        assert!(app.filtering);
+        for ch in "beta".chars() {
+            app.on_filter_key(Key::Char(ch));
+        }
+        assert_eq!(app.filtered_pr_indices(), vec![1]);
+        // Selection re-anchors to the first match as the query changes.
+        assert_eq!(app.pr_state.selected(), Some(0));
+
+        // Backspace widens the match.
+        app.on_filter_key(Key::Backspace);
+        assert_eq!(app.active_filter(), "bet");
+
+        // Enter applies and closes the input, keeping the filter.
+        app.on_filter_key(Key::Enter);
+        assert!(!app.filtering);
+        assert_eq!(app.active_filter(), "bet");
+
+        // Esc while typing clears the filter and closes the input.
+        app.start_filter();
+        app.on_filter_key(Key::Escape);
+        assert!(!app.filtering);
+        assert!(app.active_filter().is_empty());
+        assert_eq!(app.filtered_pr_indices(), vec![0, 1]);
     }
 
     #[test]
