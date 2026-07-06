@@ -79,8 +79,15 @@ impl Default for Wizard {
 
 impl Wizard {
     pub fn new() -> Self {
-        let providers =
-            vec!["Demo".into(), "GitHub".into(), "Azure DevOps".into(), "Linear".into(), "GitLab".into(), "Jira".into()];
+        let providers = vec![
+            "Demo".into(),
+            "GitHub".into(),
+            "Azure DevOps".into(),
+            "Linear".into(),
+            "GitLab".into(),
+            "Jira".into(),
+            "Bitbucket".into(),
+        ];
         let mut queue = VecDeque::new();
         queue.push_back(Prompt::pick(Field::Provider, "Provider", providers, 1));
         Wizard { queue, draft: Draft::default(), done: 0 }
@@ -160,7 +167,8 @@ impl Wizard {
                     2 => ProviderType::AzureDevOps,
                     3 => ProviderType::Linear,
                     4 => ProviderType::GitLab,
-                    _ => ProviderType::Jira,
+                    5 => ProviderType::Jira,
+                    _ => ProviderType::Bitbucket,
                 });
             }
             (Field::DisplayName, PromptKind::Text { buffer, .. }) => self.draft.display_name = buffer.trim().to_string(),
@@ -205,9 +213,11 @@ impl Wizard {
                 self.queue.push_back(Prompt::text(Field::Username, "Email", true, ""));
                 self.queue.push_back(Prompt::secret(Field::Pat, "API token"));
             }
-            // Not offered by the picker yet (no factory); handled generically for exhaustiveness.
             ProviderType::Bitbucket => {
-                self.queue.push_back(Prompt::secret(Field::Pat, "Personal access token"));
+                self.queue.push_back(Prompt::text(Field::Organization, "Workspace", true, ""));
+                self.queue.push_back(Prompt::text(Field::Repository, "Repository (slug)", true, ""));
+                self.queue.push_back(Prompt::text(Field::Username, "Username", true, ""));
+                self.queue.push_back(Prompt::secret(Field::Pat, "App password"));
             }
         }
         let mut items: Vec<String> = provider_sections(provider).into_iter().map(|s| section_label(s).to_string()).collect();
@@ -224,6 +234,7 @@ fn non_empty(s: &str) -> Option<String> {
 pub fn provider_sections(provider: ProviderType) -> Vec<Section> {
     match provider {
         ProviderType::Linear | ProviderType::Jira => vec![Section::WorkItems],
+        ProviderType::Bitbucket => vec![Section::PullRequests, Section::Pipelines],
         _ => vec![Section::PullRequests, Section::WorkItems, Section::Pipelines],
     }
 }

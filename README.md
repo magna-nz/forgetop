@@ -5,7 +5,7 @@
 **htop for your software forges.**
 
 A fast, keyboard-driven terminal UI for your pull requests, work items, and CI
-pipelines — across **GitHub**, **GitLab**, **Azure DevOps**, **Linear**, and **Jira** — in one place.
+pipelines — across **GitHub**, **GitLab**, **Azure DevOps**, **Linear**, **Jira**, and **Bitbucket** — in one place.
 
 </div>
 
@@ -32,7 +32,7 @@ whichever provider owns it, and the Pipelines view can aggregate several at once
 - **Do work, not just watch it** — approve / merge / comment on PRs, view coloured
   diffs and review threads, change work-item states, drill into pipeline
   stages → jobs → steps, and trigger runs — all from the keyboard.
-- **Multi-provider** — GitHub, GitLab, Azure DevOps, Linear, and Jira, with a built-in `--demo`.
+- **Multi-provider** — GitHub, GitLab, Azure DevOps, Linear, Jira, and Bitbucket, with a built-in `--demo`.
 - **Guided setup** — a first-run wizard walks you through adding a connection; a
   config screen manages connections and bindings later.
 - **Secure by default** — tokens live in your OS keychain (macOS Keychain, Windows
@@ -161,6 +161,7 @@ non-alphanumeric characters become `_`).
 | **Azure DevOps** | Personal access token | Code *Read*, Work Items *Read & Write*, Build *Read & Execute* |
 | **Linear** | Personal API key (Settings → Security & access → API) | default |
 | **Jira** | API token (id.atlassian.com → Security → API tokens) + your account email | default (account access) |
+| **Bitbucket** | App password (Personal settings → App passwords) + your username | Pull requests, Pipelines (read & write) |
 
 ## Themes
 
@@ -175,7 +176,7 @@ forgetop is a Rust [Cargo workspace](https://doc.rust-lang.org/cargo/reference/w
 | Crate | Responsibility |
 | --- | --- |
 | `forgetop-core` | Domain model, capability-scoped provider traits, config, secrets, services |
-| `forgetop-providers` | GitHub, GitLab, Azure DevOps, Linear, Jira, and Demo implementations |
+| `forgetop-providers` | GitHub, GitLab, Azure DevOps, Linear, Jira, Bitbucket, and Demo implementations |
 | `forgetop-tui` | The [ratatui](https://ratatui.rs) terminal UI |
 | `forgetop-cli` | The `forgetop` binary |
 
