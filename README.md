@@ -7,6 +7,13 @@
 A fast, keyboard-driven terminal UI for your pull requests, work items, and CI
 pipelines — across **GitHub**, **GitLab**, **Azure DevOps**, **Linear**, **Jira**, and **Bitbucket** — in one place.
 
+[![CI](https://github.com/magna-nz/forgetop/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/magna-nz/forgetop/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/magna-nz/forgetop?sort=semver&label=release)](https://github.com/magna-nz/forgetop/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/magna-nz/forgetop/total?label=downloads)](https://github.com/magna-nz/forgetop/releases)
+[![Rust](https://img.shields.io/badge/built%20with-Rust-DEA584?logo=rust&logoColor=white)](https://www.rust-lang.org)
+[![Platforms](https://img.shields.io/badge/runs%20on-macOS%20%7C%20Linux%20%7C%20Windows-success)](#install)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 </div>
 
 <!-- Replace with a real screen recording once captured. -->
@@ -38,6 +45,23 @@ whichever provider owns it, and the Pipelines view can aggregate several at once
 - **Secure by default** — tokens live in your OS keychain (macOS Keychain, Windows
   Credential Manager, Linux Secret Service). The config file only stores a reference.
 - **Yours to shape** — show/hide sections, four colour themes, live auto-refresh.
+
+## Supported providers
+
+Each section binds to a provider that supports it. Providers advertise their
+capabilities, so a connection only ever offers what it can actually do.
+
+| Provider | Pull Requests | Work Items | Pipelines |
+| --- | :---: | :---: | :---: |
+| **GitHub** | ✅ | ✅ (Issues) | ✅ (Actions) |
+| **GitLab** | ✅ (MRs) | ✅ (Issues) | ✅ (CI) |
+| **Azure DevOps** | ✅ | ✅ | ✅ (Builds) |
+| **Bitbucket** | ✅ | — | ✅ (Pipelines) |
+| **Linear** | — | ✅ | — |
+| **Jira** | — | ✅ | — |
+| **Demo** | ✅ | ✅ | ✅ |
+
+The Pipelines section can aggregate several providers at once.
 
 ## Install
 
