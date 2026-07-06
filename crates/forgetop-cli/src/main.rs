@@ -66,6 +66,7 @@ async fn seed_demo(config: &ConfigService) -> Result<()> {
         organization: None,
         project: None,
         repository: None,
+        username: None,
         credential_ref: None,
     };
     config.add_or_update_connection(conn, None).await?;

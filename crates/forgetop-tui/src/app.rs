@@ -763,10 +763,11 @@ impl App {
             id: id.clone(),
             provider_type: provider,
             display_name: if draft.display_name.is_empty() { provider.as_str().to_string() } else { draft.display_name },
-            base_url: None,
+            base_url: draft.base_url,
             organization: draft.organization,
             project: draft.project,
             repository: draft.repository,
+            username: draft.username,
             credential_ref: None,
         };
 

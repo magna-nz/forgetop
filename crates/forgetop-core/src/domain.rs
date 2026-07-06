@@ -21,6 +21,7 @@ pub enum ProviderType {
     Linear,
     GitLab,
     Bitbucket,
+    Jira,
 }
 
 impl ProviderType {
@@ -32,6 +33,7 @@ impl ProviderType {
             ProviderType::Linear => "Linear",
             ProviderType::GitLab => "GitLab",
             ProviderType::Bitbucket => "Bitbucket",
+            ProviderType::Jira => "Jira",
         }
     }
 }
