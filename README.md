@@ -59,23 +59,10 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/magna-nz/forgetop/relea
 irm https://github.com/magna-nz/forgetop/releases/latest/download/forgetop-installer.ps1 | iex
 ```
 
-**Cargo** (requires a [Rust toolchain](https://rustup.rs)):
-
-```sh
-cargo install forgetop          # builds from source
-cargo binstall forgetop         # or grabs the prebuilt binary
-```
-
-**From source:**
-
-```sh
-git clone https://github.com/magna-nz/forgetop
-cd forgetop
-cargo install --path crates/forgetop-cli
-```
-
-Prebuilt binaries for macOS (Apple Silicon + Intel), Linux (x86_64 + arm64), and
-Windows are attached to every [release](https://github.com/magna-nz/forgetop/releases).
+**Download a binary** — grab the archive for your platform from the
+[latest release](https://github.com/magna-nz/forgetop/releases/latest), extract it,
+and put `forgetop` on your `PATH`. Builds are provided for macOS (Apple Silicon +
+Intel), Linux (x86_64 + arm64), and Windows (x86_64).
 
 ## Quick start
 
