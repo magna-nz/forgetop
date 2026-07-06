@@ -494,6 +494,10 @@ impl App {
             self.should_quit = true;
             return;
         }
+        // A resize just needs the loop to redraw at the new size — nothing else.
+        if key == Key::Redraw {
+            return;
+        }
         // Any keypress dismisses the previous one-shot toast.
         self.toast = None;
 
@@ -550,7 +554,7 @@ impl App {
                 _ => {}
             },
             Key::Char(c) => self.on_char(c, deps).await,
-            Key::Backspace | Key::Quit | Key::None => {}
+            Key::Backspace | Key::Quit | Key::Redraw | Key::None => {}
         }
     }
 
@@ -1393,6 +1397,8 @@ pub enum Key {
     Char(char),
     /// Hard quit (Ctrl-C), honoured in every mode.
     Quit,
+    /// Terminal was resized — no-op, but wakes the loop so it redraws at the new size.
+    Redraw,
     None,
 }
 

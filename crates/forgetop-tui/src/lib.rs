@@ -86,6 +86,8 @@ fn input_reader(tx: mpsc::UnboundedSender<Key>) {
         let Ok(evt) = event::read() else { return };
         let key = match evt {
             Event::Key(k) if k.kind != KeyEventKind::Release => map_key(k.code, k.modifiers),
+            // Wake the loop so it redraws at the new terminal size (fixes zoom/resize).
+            Event::Resize(_, _) => Key::Redraw,
             _ => Key::None,
         };
         if key != Key::None && tx.send(key).is_err() {
