@@ -10,7 +10,7 @@ use ratatui::widgets::{
 };
 use ratatui::Frame;
 
-use crate::app::{App, ConfigView, DiffView, PipelineView, Screen, PR_TABS, TABS};
+use crate::app::{App, ConfigView, DiffView, PipelineView, PrView, Screen, WiView, PR_TABS, TABS};
 use crate::overlay::Overlay;
 use crate::theme::{check_icon, pipeline_icon, Theme};
 use crate::wizard::{Prompt, PromptKind};
@@ -87,16 +87,20 @@ fn render_tabs(frame: &mut Frame, area: Rect, app: &App) {
 
 fn render_content(frame: &mut Frame, area: Rect, app: &mut App) {
     match &app.screen {
-        Screen::Diff(diff) => {
-            render_diff(frame, area, &app.theme, diff);
-            return;
-        }
         Screen::Pipeline(view) => {
             render_pipeline(frame, area, &app.theme, view);
             return;
         }
         Screen::Config(view) => {
             render_config(frame, area, &app.theme, view);
+            return;
+        }
+        Screen::PrView(view) => {
+            render_pr_view(frame, area, &app.theme, view);
+            return;
+        }
+        Screen::WiView(view) => {
+            render_wi_view(frame, area, &app.theme, view);
             return;
         }
         Screen::List => {}
@@ -157,30 +161,9 @@ fn mark_selected(line: &mut Line, theme: &Theme) {
     }
 }
 
-/// A detail line prefixed with a coloured left rail so it reads as nested under the row.
-fn rail(theme: &Theme, mut spans: Vec<Span<'static>>) -> Line<'static> {
-    let mut v = vec![Span::styled("  ▌ ", Style::default().fg(theme.magenta))];
-    v.append(&mut spans);
-    Line::from(v)
-}
-
-fn rail_field(theme: &Theme, label: &str, value: String) -> Line<'static> {
-    rail(theme, vec![
-        Span::styled(format!("{label:<11}"), Style::default().fg(theme.dim)),
-        Span::styled(value, Style::default().fg(theme.fg)),
-    ])
-}
-
-/// Renders a section as a fixed header + a scrollable body of rows with the selected
-/// row's detail expanded inline beneath it.
-fn render_inline_list(
-    frame: &mut Frame,
-    area: Rect,
-    app: &mut App,
-    title: &str,
-    header: Line<'static>,
-    rows: Vec<(Line<'static>, Vec<Line<'static>>)>,
-) {
+/// Renders a section as a fixed column header + a scrollable body of rows, with the
+/// selected row highlighted. Enter opens a full-screen view for the row.
+fn render_inline_list(frame: &mut Frame, area: Rect, app: &mut App, title: &str, header: Line<'static>, rows: Vec<Line<'static>>) {
     let block = section_block(&app.theme, title);
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -193,18 +176,17 @@ fn render_inline_list(
     app.content_h = parts[1].height;
 
     let selected = app.selected().unwrap_or(0);
-    let show = app.show_detail;
     let scroll = app.list_scroll;
-    let mut lines: Vec<Line> = Vec::new();
-    for (i, (mut row, detail)) in rows.into_iter().enumerate() {
-        if i == selected {
-            mark_selected(&mut row, &app.theme);
-        }
-        lines.push(row);
-        if i == selected && show {
-            lines.extend(detail);
-        }
-    }
+    let lines: Vec<Line> = rows
+        .into_iter()
+        .enumerate()
+        .map(|(i, mut row)| {
+            if i == selected {
+                mark_selected(&mut row, &app.theme);
+            }
+            row
+        })
+        .collect();
     frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), parts[1]);
 }
 
@@ -269,15 +251,13 @@ fn render_prs(frame: &mut Frame, area: Rect, app: &mut App) {
         Span::styled(cell("Updated", 7), dim),
     ]);
 
-    let selected = app.selected().unwrap_or(0);
-    let rows: Vec<(Line, Vec<Line>)> = app
+    let rows: Vec<Line> = app
         .prs
         .iter()
-        .enumerate()
-        .map(|(i, pr)| {
+        .map(|pr| {
             let (st, stc) = pr_status(theme, pr);
             let (ck, ckc) = pr_checks(theme, pr);
-            let row = Line::from(vec![
+            Line::from(vec![
                 Span::styled(cell(st, 9), Style::default().fg(stc)),
                 Span::raw(" "),
                 Span::styled(cell(&pr.number.map(|n| format!("#{n}")).unwrap_or_default(), 7), Style::default().fg(theme.dim)),
@@ -291,13 +271,7 @@ fn render_prs(frame: &mut Frame, area: Rect, app: &mut App) {
                 Span::styled(cell(&format!("+{} -{}", pr.additions, pr.deletions), 11), Style::default().fg(theme.dim)),
                 Span::raw(" "),
                 Span::styled(cell(&rel_age(pr.updated_at), 7), Style::default().fg(theme.dim)),
-            ]);
-            let detail = if i == selected && app.show_detail {
-                pr_detail_lines(app, pr)
-            } else {
-                Vec::new()
-            };
-            (row, detail)
+            ])
         })
         .collect();
 
@@ -351,13 +325,11 @@ fn render_wis(frame: &mut Frame, area: Rect, app: &mut App) {
         Span::styled(cell("Updated", 7), dim),
     ]);
 
-    let selected = app.selected().unwrap_or(0);
-    let rows: Vec<(Line, Vec<Line>)> = app
+    let rows: Vec<Line> = app
         .wis
         .iter()
-        .enumerate()
-        .map(|(i, wi)| {
-            let row = Line::from(vec![
+        .map(|wi| {
+            Line::from(vec![
                 Span::styled(cell(&format!("● {}", wi.state), 16), Style::default().fg(wi_state_color(theme, wi.state_category))),
                 Span::raw(" "),
                 Span::styled(cell(&wi.identifier.clone().unwrap_or_default(), 10), Style::default().fg(theme.dim)),
@@ -372,9 +344,7 @@ fn render_wis(frame: &mut Frame, area: Rect, app: &mut App) {
                 ),
                 Span::raw(" "),
                 Span::styled(cell(&rel_age(wi.updated_at), 7), Style::default().fg(theme.dim)),
-            ]);
-            let detail = if i == selected && app.show_detail { wi_detail_lines(app, wi) } else { Vec::new() };
-            (row, detail)
+            ])
         })
         .collect();
 
@@ -434,32 +404,38 @@ fn render_pipes(frame: &mut Frame, area: Rect, app: &mut App) {
     frame.render_stateful_widget(table, area, &mut app.pipe_state);
 }
 
-// ---- detail panel ----
+// ---- full-screen PR / work-item views ----
 
-// ---- inline detail builders ----
+fn field(theme: &Theme, label: &str, value: String) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{label:<12}"), Style::default().fg(theme.dim)),
+        Span::styled(value, Style::default().fg(theme.fg)),
+    ])
+}
 
 fn comment_lines(theme: &Theme, threads: &[CommentThread]) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
     let total: usize = threads.iter().map(|t| t.comments.len()).sum();
-    lines.push(rail(theme, vec![]));
-    lines.push(rail(theme, vec![Span::styled(format!("Comments ({total})"), Style::default().fg(theme.accent).add_modifier(Modifier::BOLD))]));
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(format!("Comments ({total})"), Style::default().fg(theme.accent).add_modifier(Modifier::BOLD))),
+    ];
     if total == 0 {
-        lines.push(rail(theme, vec![Span::styled("No comments.", Style::default().fg(theme.dim))]));
+        lines.push(Line::from(Span::styled("No comments.", Style::default().fg(theme.dim))));
     }
     for thread in threads {
         for c in &thread.comments {
-            lines.push(rail(theme, vec![
-                Span::styled(format!("{}: ", c.author.display_name), Style::default().fg(theme.blue)),
-                Span::styled(c.body.replace('\n', " "), Style::default().fg(theme.fg)),
-            ]));
+            lines.push(Line::from(Span::styled(format!("{}:", c.author.display_name), Style::default().fg(theme.blue))));
+            for l in c.body.lines() {
+                lines.push(Line::from(Span::styled(format!("  {l}"), Style::default().fg(theme.fg))));
+            }
         }
     }
     lines
 }
 
-/// The PR sub-tab bar: Conversation | Commits | Checks | Diff, with the active one lit.
-fn pr_tab_bar(theme: &Theme, active: usize) -> Line<'static> {
-    let mut spans = vec![Span::styled("  ▾ ", Style::default().fg(theme.magenta))];
+/// The PR sub-tab bar rendered as a row of pills (active one lit).
+fn pr_tabs_line(theme: &Theme, active: usize) -> Line<'static> {
+    let mut spans = vec![Span::raw(" ")];
     for (i, name) in PR_TABS.iter().enumerate() {
         let style = if i == active {
             Style::default().fg(theme.bg).bg(theme.accent).add_modifier(Modifier::BOLD)
@@ -469,112 +445,129 @@ fn pr_tab_bar(theme: &Theme, active: usize) -> Line<'static> {
         spans.push(Span::styled(format!(" {name} "), style));
         spans.push(Span::raw(" "));
     }
-    spans.push(Span::styled("   ←/→ tabs · PgUp/Dn scroll · Esc close", Style::default().fg(theme.dim)));
+    spans.push(Span::styled("  ←/→ tabs · Esc close", Style::default().fg(theme.dim)));
     Line::from(spans)
 }
 
-fn pr_detail_lines(app: &App, pr: &PullRequest) -> Vec<Line<'static>> {
-    let theme = &app.theme;
-    let mut lines = vec![pr_tab_bar(theme, app.pr_tab)];
-    match app.pr_tab {
-        // Conversation
-        0 => {
-            lines.push(rail_field(theme, "Author", pr.author.display_name.clone()));
-            lines.push(rail_field(
-                theme,
-                "Branch",
-                format!("{} → {}", pr.source_ref.clone().unwrap_or_default(), pr.target_ref.clone().unwrap_or_default()),
-            ));
-            lines.push(rail_field(theme, "Mergeable", format!("{:?}", pr.mergeable)));
-            lines.push(rail_field(theme, "Changes", format!("{} files  +{} -{}", pr.changed_files, pr.additions, pr.deletions)));
-            if !pr.reviewers.is_empty() {
-                let who = pr.reviewers.iter().map(|r| format!("{} ({:?})", r.user.display_name, r.vote)).collect::<Vec<_>>().join(", ");
-                lines.push(rail_field(theme, "Reviewers", who));
-            }
-            if !pr.labels.is_empty() {
-                lines.push(rail_field(theme, "Labels", pr.labels.join(", ")));
-            }
-            if let Some(url) = &pr.url {
-                lines.push(rail_field(theme, "URL", url.clone()));
-            }
-            if let Some(desc) = pr.description.as_ref().filter(|d| !d.is_empty()) {
-                lines.push(rail(theme, vec![]));
-                for l in desc.lines() {
-                    lines.push(rail(theme, vec![Span::styled(l.to_string(), Style::default().fg(theme.dim))]));
-                }
-            }
-            lines.extend(comment_lines(theme, &app.detail_threads));
-        }
-        // Commits (Phase 2)
-        1 => lines.push(rail(theme, vec![Span::styled("Commit history arrives in a later update.", Style::default().fg(theme.dim))])),
-        // Checks (summary)
-        2 => match &pr.check_summary {
-            Some(s) => {
-                lines.push(rail_field(theme, "Overall", format!("{:?}", pr.checks)));
-                lines.push(rail_field(theme, "Passed", s.successful.to_string()));
-                lines.push(rail_field(theme, "Failed", s.failed.to_string()));
-                lines.push(rail_field(theme, "In progress", s.in_progress.to_string()));
-                if s.neutral > 0 {
-                    lines.push(rail_field(theme, "Neutral", s.neutral.to_string()));
-                }
-            }
-            None => lines.push(rail(theme, vec![Span::styled("No checks reported for this PR.", Style::default().fg(theme.dim))])),
-        },
-        // Diff
-        _ => {
-            if !app.detail_files_loaded {
-                lines.push(rail(theme, vec![Span::styled("Loading diff…", Style::default().fg(theme.dim))]));
-            } else if app.detail_files.is_empty() {
-                lines.push(rail(theme, vec![Span::styled("No file changes.", Style::default().fg(theme.dim))]));
-            } else {
-                for f in &app.detail_files {
-                    lines.push(rail(theme, vec![Span::styled(
-                        format!("{}  (+{} -{})", f.path, f.additions, f.deletions),
-                        Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
-                    )]));
-                    if let Some(patch) = &f.patch {
-                        for l in patch.lines() {
-                            let color = if l.starts_with("@@") {
-                                theme.blue
-                            } else if l.starts_with('+') {
-                                theme.green
-                            } else if l.starts_with('-') {
-                                theme.red
-                            } else {
-                                theme.dim
-                            };
-                            lines.push(rail(theme, vec![Span::styled(l.to_string(), Style::default().fg(color))]));
-                        }
-                    }
-                }
-            }
+fn pr_conversation_lines(theme: &Theme, pr: &PullRequest, threads: &[CommentThread]) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        field(theme, "Author", pr.author.display_name.clone()),
+        field(theme, "Branch", format!("{} → {}", pr.source_ref.clone().unwrap_or_default(), pr.target_ref.clone().unwrap_or_default())),
+        field(theme, "Mergeable", format!("{:?}", pr.mergeable)),
+        field(theme, "Changes", format!("{} files  +{} -{}", pr.changed_files, pr.additions, pr.deletions)),
+    ];
+    if !pr.reviewers.is_empty() {
+        let who = pr.reviewers.iter().map(|r| format!("{} ({:?})", r.user.display_name, r.vote)).collect::<Vec<_>>().join(", ");
+        lines.push(field(theme, "Reviewers", who));
+    }
+    if !pr.labels.is_empty() {
+        lines.push(field(theme, "Labels", pr.labels.join(", ")));
+    }
+    if let Some(url) = &pr.url {
+        lines.push(field(theme, "URL", url.clone()));
+    }
+    if let Some(desc) = pr.description.as_ref().filter(|d| !d.is_empty()) {
+        lines.push(Line::from(""));
+        for l in desc.lines() {
+            lines.push(Line::from(Span::styled(l.to_string(), Style::default().fg(theme.dim))));
         }
     }
+    lines.extend(comment_lines(theme, threads));
     lines
 }
 
-fn wi_detail_lines(app: &App, wi: &WorkItem) -> Vec<Line<'static>> {
-    let theme = &app.theme;
+/// The Checks tab: one line per named check with its status, like the pipeline steps.
+fn pr_checks_lines(theme: &Theme, checks: &[CheckRun]) -> Vec<Line<'static>> {
+    if checks.is_empty() {
+        return vec![Line::from(Span::styled("No checks reported for this pull request.", Style::default().fg(theme.dim)))];
+    }
+    checks
+        .iter()
+        .map(|c| {
+            let color = theme.check_color(c.status);
+            Line::from(vec![
+                Span::styled(format!(" {} ", check_icon(c.status)), Style::default().fg(color)),
+                Span::styled(cell(&c.name, 40), Style::default().fg(theme.fg)),
+                Span::styled(format!("{:?}", c.status), Style::default().fg(color)),
+            ])
+        })
+        .collect()
+}
+
+fn render_pr_view(frame: &mut Frame, area: Rect, theme: &Theme, view: &PrView) {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Length(1), Constraint::Min(3)])
+        .split(area);
+
+    // Header: title + status + branch + author.
+    let (st, stc) = pr_status(theme, &view.pr);
+    let header = Line::from(vec![
+        Span::styled(st, Style::default().fg(stc).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!("   {} → {}", view.pr.source_ref.clone().unwrap_or_default(), view.pr.target_ref.clone().unwrap_or_default()),
+            Style::default().fg(theme.dim),
+        ),
+        Span::styled(format!("   {}", view.pr.author.display_name), Style::default().fg(theme.blue)),
+    ]);
+    frame.render_widget(Paragraph::new(header).block(section_block(theme, &view.label)), rows[0]);
+
+    // Sub-tab bar.
+    frame.render_widget(Paragraph::new(pr_tabs_line(theme, view.tab)), rows[1]);
+
+    // Content.
+    if view.tab == 3 {
+        render_diff(frame, rows[2], theme, &view.diff);
+        return;
+    }
+    let (title, lines) = match view.tab {
+        0 => ("Conversation", pr_conversation_lines(theme, &view.pr, &view.diff.threads)),
+        1 => ("Commits", vec![Line::from(Span::styled("Commit history arrives in a later update.", Style::default().fg(theme.dim)))]),
+        _ => ("Checks", pr_checks_lines(theme, &view.checks)),
+    };
+    frame.render_widget(
+        Paragraph::new(lines).block(section_block(theme, title)).scroll((view.scroll, 0)).wrap(Wrap { trim: false }),
+        rows[2],
+    );
+}
+
+fn render_wi_view(frame: &mut Frame, area: Rect, theme: &Theme, view: &WiView) {
+    let wi = &view.wi;
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(3)])
+        .split(area);
+
+    let label = format!("{} {}", wi.identifier.clone().unwrap_or_default(), wi.title);
+    let header = Line::from(vec![
+        Span::styled(format!("● {}", wi.state), Style::default().fg(wi_state_color(theme, wi.state_category)).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("   {}", wi.work_item_type.clone().unwrap_or_default()), Style::default().fg(theme.dim)),
+        Span::styled(
+            format!("   {}", wi.assignee.as_ref().map(|a| a.display_name.clone()).unwrap_or_else(|| "—".into())),
+            Style::default().fg(theme.blue),
+        ),
+    ]);
+    frame.render_widget(Paragraph::new(header).block(section_block(theme, &label)), rows[0]);
+
     let mut lines = vec![
-        rail(theme, vec![Span::styled(
-            format!("{} {}", wi.identifier.clone().unwrap_or_default(), wi.title),
-            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
-        )]),
-        rail_field(theme, "State", format!("{} ({:?})", wi.state, wi.state_category)),
-        rail_field(theme, "Type", wi.work_item_type.clone().unwrap_or_else(|| "—".into())),
-        rail_field(theme, "Assignee", wi.assignee.as_ref().map(|a| a.display_name.clone()).unwrap_or_else(|| "—".into())),
+        field(theme, "State", format!("{} ({:?})", wi.state, wi.state_category)),
+        field(theme, "Type", wi.work_item_type.clone().unwrap_or_else(|| "—".into())),
+        field(theme, "Assignee", wi.assignee.as_ref().map(|a| a.display_name.clone()).unwrap_or_else(|| "—".into())),
     ];
     if let Some(url) = &wi.url {
-        lines.push(rail_field(theme, "URL", url.clone()));
+        lines.push(field(theme, "URL", url.clone()));
     }
     if let Some(desc) = wi.description.as_ref().filter(|d| !d.is_empty()) {
-        lines.push(rail(theme, vec![]));
+        lines.push(Line::from(""));
         for l in desc.lines() {
-            lines.push(rail(theme, vec![Span::styled(l.to_string(), Style::default().fg(theme.dim))]));
+            lines.push(Line::from(Span::styled(l.to_string(), Style::default().fg(theme.dim))));
         }
     }
-    lines.extend(comment_lines(theme, &app.detail_threads));
-    lines
+    lines.extend(comment_lines(theme, &view.threads));
+    frame.render_widget(
+        Paragraph::new(lines).block(section_block(theme, "Work Item")).scroll((view.scroll, 0)).wrap(Wrap { trim: false }),
+        rows[1],
+    );
 }
 
 // ---- connections + footer ----
@@ -606,8 +599,15 @@ fn footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
     if let Some(overlay) = &app.overlay {
         return overlay.hint();
     }
-    if matches!(app.screen, Screen::Diff(_)) {
-        return vec![("↑↓", "file"), ("PgUp/Dn", "scroll"), ("o", "open"), ("Esc", "back"), ("q", "quit")];
+    if let Screen::PrView(v) = &app.screen {
+        return if v.tab == 3 {
+            vec![("←→", "tabs"), ("↑↓", "file"), ("PgUp/Dn", "scroll"), ("a", "approve"), ("m", "merge"), ("o", "open"), ("Esc", "back")]
+        } else {
+            vec![("←→", "tabs"), ("PgUp/Dn", "scroll"), ("a", "approve"), ("x", "reject"), ("m", "merge"), ("c", "comment"), ("o", "open"), ("Esc", "back")]
+        };
+    }
+    if matches!(app.screen, Screen::WiView(_)) {
+        return vec![("PgUp/Dn", "scroll"), ("s", "state"), ("c", "comment"), ("o", "open"), ("Esc", "back"), ("q", "quit")];
     }
     if matches!(app.screen, Screen::Pipeline(_)) {
         return vec![("↑↓", "move"), ("↵", "expand"), ("T", "trigger"), ("o", "open"), ("Esc", "back"), ("q", "quit")];
@@ -624,29 +624,19 @@ fn footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
             ("q", "quit"),
         ];
     }
-    // While a PR/work-item detail is expanded, the keys change (sub-tabs, scroll, close).
-    if app.show_detail {
-        let mut keys = vec![("↑↓", "move")];
-        if app.active == 0 {
-            keys.push(("←→", "sub-tabs"));
-        }
-        keys.extend([("PgUp/Dn", "scroll"), ("a", "approve"), ("m", "merge"), ("c", "comment"), ("o", "open"), ("Esc", "close")]);
-        return keys;
-    }
-
     let mut keys = vec![("↑↓", "move"), ("←→", "tabs")];
     match app.active {
         0 => keys.extend([
-            ("↵", "detail"),
+            ("↵", "open"),
             ("f", "filter"),
             ("d", "diff"),
             ("a", "approve"),
             ("x", "reject"),
             ("m", "merge"),
             ("c", "comment"),
-            ("o", "open"),
+            ("o", "browser"),
         ]),
-        1 => keys.extend([("↵", "detail"), ("s", "state"), ("c", "comment"), ("o", "open")]),
+        1 => keys.extend([("↵", "open"), ("s", "state"), ("c", "comment"), ("o", "browser")]),
         2 => keys.extend([("↵", "drill-in"), ("T", "trigger"), ("o", "open")]),
         _ => {}
     }
@@ -1142,45 +1132,60 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn detail_expands_inline_with_tabs() {
-        let mut app = App::new("slate");
-        app.prs.push(sample_pr());
-        app.pr_state.select(Some(0));
-
-        let collapsed = render_to_string(&mut app, 100, 24);
-        assert!(collapsed.contains("Add the widget"), "row should render");
-        assert!(!collapsed.contains("Conversation"), "no sub-tabs while collapsed");
-
-        app.show_detail = true;
-        let expanded = render_to_string(&mut app, 100, 24);
-        // Inline detail shows the PR sub-tab bar and the Conversation overview.
-        assert!(expanded.contains("Conversation") && expanded.contains("Diff"), "sub-tab bar should render");
-        assert!(expanded.contains("Alice Ng"), "Conversation should show the author");
-
-        // Switching to the Checks sub-tab shows the checks view instead.
-        app.pr_tab = 2;
-        let checks = render_to_string(&mut app, 100, 24);
-        assert!(checks.contains("No checks reported"), "Checks tab renders (sample PR has no summary)");
+    fn pr_view(tab: usize, checks: Vec<CheckRun>, files: Vec<FileChange>) -> crate::app::PrView {
+        use crate::app::{DiffView, PrView};
+        crate::app::PrView {
+            label: "PR #42 — Add the widget".into(),
+            url: Some("http://x".into()),
+            pr: sample_pr(),
+            tab,
+            checks,
+            scroll: 0,
+            diff: DiffView { pr_label: "PR #42".into(), url: None, files, threads: vec![], selected: 0, scroll: 0 },
+        }
     }
 
     #[test]
-    fn detail_expands_directly_under_selected_row() {
+    fn enter_opens_full_screen_pr_view_with_tabs() {
+        use crate::app::Screen;
         let mut app = App::new("slate");
-        let mut a = sample_pr();
-        a.title = "First PR".into();
-        let mut b = sample_pr();
-        b.number = Some(43);
-        b.title = "Second PR".into();
-        app.prs.push(a);
-        app.prs.push(b);
-        app.pr_state.select(Some(0));
-        app.show_detail = true;
-
+        app.screen = Screen::PrView(Box::new(pr_view(0, vec![], vec![])));
         let out = render_to_string(&mut app, 100, 24);
-        let conv = out.find("Conversation").expect("sub-tab bar renders");
-        let second = out.find("Second PR").expect("second row renders");
-        assert!(conv < second, "expanded detail should sit under row 0, before row 1 — not at the bottom");
+        // Header (label), sub-tab bar, and Conversation content.
+        assert!(out.contains("Add the widget"), "PR label in header");
+        assert!(out.contains("Conversation") && out.contains("Checks") && out.contains("Diff"), "sub-tab bar");
+        assert!(out.contains("Alice Ng"), "Conversation shows the author");
+    }
+
+    #[test]
+    fn checks_tab_lists_named_checks_with_status() {
+        use crate::app::Screen;
+        let checks = vec![
+            CheckRun { name: "build".into(), status: CheckStatus::Passed, url: None },
+            CheckRun { name: "integration".into(), status: CheckStatus::Failed, url: None },
+        ];
+        let mut app = App::new("slate");
+        app.screen = Screen::PrView(Box::new(pr_view(2, checks, vec![])));
+        let out = render_to_string(&mut app, 100, 24);
+        assert!(out.contains("build") && out.contains("Passed"), "named check + status");
+        assert!(out.contains("integration") && out.contains("Failed"), "failed check shown by name");
+    }
+
+    #[test]
+    fn diff_tab_renders_the_diff_screen() {
+        use crate::app::Screen;
+        let files = vec![FileChange {
+            path: "src/retry.rs".into(),
+            kind: FileChangeKind::Added,
+            additions: 2,
+            deletions: 0,
+            patch: Some("@@ -0,0 +1,2 @@\n+one\n+two\n".into()),
+        }];
+        let mut app = App::new("slate");
+        app.screen = Screen::PrView(Box::new(pr_view(3, vec![], files)));
+        let out = render_to_string(&mut app, 120, 30);
+        assert!(out.contains("src/retry.rs"), "diff file list");
+        assert!(out.contains("one"), "diff patch content (same as the d screen)");
     }
 
     #[test]
@@ -1227,43 +1232,6 @@ mod tests {
         for label in ["diff", "approve", "reject", "merge", "comment"] {
             assert!(out.contains(label), "PR footer should advertise '{label}'");
         }
-    }
-
-    #[test]
-    fn diff_view_renders_files_patch_and_comments() {
-        use crate::app::{DiffView, Screen};
-        let mut app = App::new("slate");
-        app.screen = Screen::Diff(Box::new(DiffView {
-            pr_label: "PR #42".into(),
-            url: Some("http://example/pr/42".into()),
-            files: vec![FileChange {
-                path: "src/http/retry.rs".into(),
-                kind: FileChangeKind::Added,
-                additions: 24,
-                deletions: 0,
-                patch: Some("@@ -0,0 +1,2 @@\n+pub struct RetryPolicy;\n-old line\n".into()),
-            }],
-            threads: vec![CommentThread {
-                id: "t1".into(),
-                comments: vec![Comment {
-                    id: "c1".into(),
-                    author: User { id: "b".into(), display_name: "Bob".into(), handle: None, avatar_url: None },
-                    body: "nit here".into(),
-                    created_at: None,
-                }],
-                file_path: None,
-                line: None,
-                is_resolved: false,
-            }],
-            selected: 0,
-            scroll: 0,
-        }));
-
-        let out = render_to_string(&mut app, 120, 30);
-        assert!(out.contains("src/http/retry.rs"), "file path in list");
-        assert!(out.contains("RetryPolicy"), "patch content shown");
-        assert!(out.contains("Bob") && out.contains("nit here"), "thread comment shown");
-        assert!(out.contains("scroll") && out.contains("back"), "diff footer keys");
     }
 
     fn sample_run() -> PipelineRun {

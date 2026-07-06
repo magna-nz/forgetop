@@ -319,6 +319,15 @@ impl PullRequestSource for DemoPr {
             FileChange { path: "src/http/client.rs".into(), kind: FileChangeKind::Modified, additions: 6, deletions: 2, patch: None },
         ])
     }
+    async fn checks(&self, _id: &str) -> Result<Vec<CheckRun>> {
+        Ok(vec![
+            CheckRun { name: "build".into(), status: CheckStatus::Passed, url: None },
+            CheckRun { name: "unit-tests".into(), status: CheckStatus::Passed, url: None },
+            CheckRun { name: "clippy".into(), status: CheckStatus::Passed, url: None },
+            CheckRun { name: "integration".into(), status: CheckStatus::Failed, url: None },
+            CheckRun { name: "deploy-preview".into(), status: CheckStatus::Pending, url: None },
+        ])
+    }
     async fn add_comment(&self, _id: &str, _body: &str) -> Result<()> {
         Ok(())
     }

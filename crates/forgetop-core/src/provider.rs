@@ -157,6 +157,10 @@ pub trait PullRequestSource: Send + Sync {
     async fn get(&self, id: &str) -> Result<PullRequest>;
     async fn threads(&self, pull_request_id: &str) -> Result<Vec<CommentThread>>;
     async fn changes(&self, pull_request_id: &str) -> Result<Vec<FileChange>>;
+    /// Individual named CI checks. Defaults to empty for providers that don't expose them.
+    async fn checks(&self, _pull_request_id: &str) -> Result<Vec<CheckRun>> {
+        Ok(Vec::new())
+    }
     async fn add_comment(&self, pull_request_id: &str, body: &str) -> Result<()>;
     async fn vote(&self, pull_request_id: &str, vote: ReviewVote) -> Result<()>;
     async fn merge(&self, pull_request_id: &str, options: &MergeOptions) -> Result<()>;
