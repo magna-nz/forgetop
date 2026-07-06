@@ -193,6 +193,49 @@ fn render_inline_list(frame: &mut Frame, area: Rect, app: &mut App, title: &str,
     frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), parts[1]);
 }
 
+/// Joins column cells into a line, each padded to its column width, then pads the
+/// whole line to the full body width (so a selected row highlights edge-to-edge).
+fn cells_line(cells: &[(String, Style)], widths: &[usize], inner_w: usize) -> Line<'static> {
+    let mut spans = Vec::new();
+    for (i, (text, style)) in cells.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw(" "));
+        }
+        spans.push(Span::styled(cell(text, widths[i]), *style));
+    }
+    let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+    if used < inner_w {
+        spans.push(Span::raw(" ".repeat(inner_w - used)));
+    }
+    Line::from(spans)
+}
+
+/// Sizes each column to the widest value in it (header or any row), clamping the
+/// `flex` column so the whole row still fits. Returns the header line + row lines.
+fn columnize(
+    header_style: Style,
+    headers: &[&str],
+    rows: &[Vec<(String, Style)>],
+    flex: usize,
+    inner_w: usize,
+) -> (Line<'static>, Vec<Line<'static>>) {
+    let ncol = headers.len();
+    let mut w: Vec<usize> = headers.iter().map(|h| h.chars().count()).collect();
+    for row in rows {
+        for (i, (text, _)) in row.iter().enumerate().take(ncol) {
+            w[i] = w[i].max(text.chars().count());
+        }
+    }
+    // Clamp the flexible column so status/counts/dates stay pinned next to it.
+    let fixed: usize = (0..ncol).filter(|&i| i != flex).map(|i| w[i]).sum::<usize>() + ncol.saturating_sub(1);
+    w[flex] = w[flex].min(inner_w.saturating_sub(fixed)).max(3);
+
+    let header_cells: Vec<(String, Style)> = headers.iter().map(|h| (h.to_string(), header_style)).collect();
+    let header = cells_line(&header_cells, &w, inner_w);
+    let lines = rows.iter().map(|r| cells_line(r, &w, inner_w)).collect();
+    (header, lines)
+}
+
 // ---- Pull Requests ----
 
 fn pr_status(theme: &Theme, pr: &PullRequest) -> (&'static str, ratatui::style::Color) {
@@ -215,11 +258,6 @@ fn pr_checks(theme: &Theme, pr: &PullRequest) -> (String, ratatui::style::Color)
     (text, theme.check_color(pr.checks))
 }
 
-// PR columns: status(9) # (7) TITLE(flex) author(16) checks(10) ±(11) updated(7).
-fn pr_title_width(width: u16) -> usize {
-    (width as usize).saturating_sub(9 + 7 + 16 + 10 + 11 + 7 + 6).max(6)
-}
-
 fn render_prs(frame: &mut Frame, area: Rect, app: &mut App) {
     let theme = &app.theme;
     let title = format!("Pull Requests · {}", app.pr_filter_label());
@@ -235,49 +273,28 @@ fn render_prs(frame: &mut Frame, area: Rect, app: &mut App) {
         return;
     }
 
-    let inner_w = area.width.saturating_sub(2);
-    let tw = pr_title_width(inner_w);
+    let inner_w = area.width.saturating_sub(2) as usize;
     let dim = Style::default().fg(theme.dim).add_modifier(Modifier::BOLD);
-    let header = Line::from(vec![
-        Span::styled(cell("", 9), dim),
-        Span::raw(" "),
-        Span::styled(cell("#", 7), dim),
-        Span::raw(" "),
-        Span::styled(cell("Title", tw), dim),
-        Span::raw(" "),
-        Span::styled(cell("Author", 16), dim),
-        Span::raw(" "),
-        Span::styled(cell("Checks", 10), dim),
-        Span::raw(" "),
-        Span::styled(cell("±", 11), dim),
-        Span::raw(" "),
-        Span::styled(cell("Updated", 7), dim),
-    ]);
-
-    let rows: Vec<Line> = app
+    let headers = ["", "#", "Title", "Author", "Checks", "±", "Updated"];
+    let cells: Vec<Vec<(String, Style)>> = app
         .prs
         .iter()
         .map(|pr| {
             let (st, stc) = pr_status(theme, pr);
             let (ck, ckc) = pr_checks(theme, pr);
-            Line::from(vec![
-                Span::styled(cell(st, 9), Style::default().fg(stc)),
-                Span::raw(" "),
-                Span::styled(cell(&pr.number.map(|n| format!("#{n}")).unwrap_or_default(), 7), Style::default().fg(theme.dim)),
-                Span::raw(" "),
-                Span::styled(cell(&pr.title, tw), Style::default().fg(theme.fg)),
-                Span::raw(" "),
-                Span::styled(cell(&pr.author.display_name, 16), Style::default().fg(theme.blue)),
-                Span::raw(" "),
-                Span::styled(cell(&ck, 10), Style::default().fg(ckc)),
-                Span::raw(" "),
-                Span::styled(cell(&format!("+{} -{}", pr.additions, pr.deletions), 11), Style::default().fg(theme.dim)),
-                Span::raw(" "),
-                Span::styled(cell(&rel_age(pr.updated_at), 7), Style::default().fg(theme.dim)),
-            ])
+            vec![
+                (st.to_string(), Style::default().fg(stc)),
+                (pr.number.map(|n| format!("#{n}")).unwrap_or_default(), Style::default().fg(theme.dim)),
+                (pr.title.clone(), Style::default().fg(theme.fg)),
+                (pr.author.display_name.clone(), Style::default().fg(theme.blue)),
+                (ck, Style::default().fg(ckc)),
+                (format!("+{} -{}", pr.additions, pr.deletions), Style::default().fg(theme.dim)),
+                (rel_age(pr.updated_at), Style::default().fg(theme.dim)),
+            ]
         })
         .collect();
 
+    let (header, rows) = columnize(dim, &headers, &cells, 2, inner_w);
     render_inline_list(frame, area, app, &title, header, rows);
 }
 
@@ -291,11 +308,6 @@ fn wi_state_color(theme: &Theme, cat: WorkItemStateCategory) -> ratatui::style::
         WorkItemStateCategory::Triage => theme.yellow,
         _ => theme.dim,
     }
-}
-
-// WI columns: state(16) id(10) TITLE(flex) type(12) assignee(16) updated(7).
-fn wi_title_width(width: u16) -> usize {
-    (width as usize).saturating_sub(16 + 10 + 12 + 16 + 7 + 5).max(6)
 }
 
 fn render_wis(frame: &mut Frame, area: Rect, app: &mut App) {
@@ -312,45 +324,25 @@ fn render_wis(frame: &mut Frame, area: Rect, app: &mut App) {
         return;
     }
 
-    let tw = wi_title_width(area.width.saturating_sub(2));
+    let inner_w = area.width.saturating_sub(2) as usize;
     let dim = Style::default().fg(theme.dim).add_modifier(Modifier::BOLD);
-    let header = Line::from(vec![
-        Span::styled(cell("State", 16), dim),
-        Span::raw(" "),
-        Span::styled(cell("ID", 10), dim),
-        Span::raw(" "),
-        Span::styled(cell("Title", tw), dim),
-        Span::raw(" "),
-        Span::styled(cell("Type", 12), dim),
-        Span::raw(" "),
-        Span::styled(cell("Assignee", 16), dim),
-        Span::raw(" "),
-        Span::styled(cell("Updated", 7), dim),
-    ]);
-
-    let rows: Vec<Line> = app
+    let headers = ["State", "ID", "Title", "Type", "Assignee", "Updated"];
+    let cells: Vec<Vec<(String, Style)>> = app
         .wis
         .iter()
         .map(|wi| {
-            Line::from(vec![
-                Span::styled(cell(&format!("● {}", wi.state), 16), Style::default().fg(wi_state_color(theme, wi.state_category))),
-                Span::raw(" "),
-                Span::styled(cell(&wi.identifier.clone().unwrap_or_default(), 10), Style::default().fg(theme.dim)),
-                Span::raw(" "),
-                Span::styled(cell(&wi.title, tw), Style::default().fg(theme.fg)),
-                Span::raw(" "),
-                Span::styled(cell(&wi.work_item_type.clone().unwrap_or_default(), 12), Style::default().fg(theme.dim)),
-                Span::raw(" "),
-                Span::styled(
-                    cell(&wi.assignee.as_ref().map(|a| a.display_name.clone()).unwrap_or_else(|| "—".into()), 16),
-                    Style::default().fg(theme.blue),
-                ),
-                Span::raw(" "),
-                Span::styled(cell(&rel_age(wi.updated_at), 7), Style::default().fg(theme.dim)),
-            ])
+            vec![
+                (format!("● {}", wi.state), Style::default().fg(wi_state_color(theme, wi.state_category))),
+                (wi.identifier.clone().unwrap_or_default(), Style::default().fg(theme.dim)),
+                (wi.title.clone(), Style::default().fg(theme.fg)),
+                (wi.work_item_type.clone().unwrap_or_default(), Style::default().fg(theme.dim)),
+                (wi.assignee.as_ref().map(|a| a.display_name.clone()).unwrap_or_else(|| "—".into()), Style::default().fg(theme.blue)),
+                (rel_age(wi.updated_at), Style::default().fg(theme.dim)),
+            ]
         })
         .collect();
 
+    let (header, rows) = columnize(dim, &headers, &cells, 2, inner_w);
     render_inline_list(frame, area, app, "Work Items", header, rows);
 }
 
@@ -1178,6 +1170,22 @@ mod tests {
             scroll: 0,
             diff: DiffView { pr_label: "PR #42".into(), url: None, files, threads: vec![], selected: 0, scroll: 0 },
         }
+    }
+
+    #[test]
+    fn columnize_sizes_the_flex_column_to_content() {
+        let s = Style::default();
+        let headers = ["A", "Title", "B"];
+        let rows = vec![
+            vec![("x".to_string(), s), ("short".to_string(), s), ("yy".to_string(), s)],
+            vec![("xx".to_string(), s), ("longer title".to_string(), s), ("y".to_string(), s)],
+        ];
+        // Wide viewport: the Title (flex) column should size to its longest value (12),
+        // not stretch to fill — so column B lands right after it, not at the far edge.
+        let (_header, lines) = columnize(s, &headers, &rows, 1, 200);
+        let plain: String = lines[0].spans.iter().map(|sp| sp.content.as_ref()).collect::<String>();
+        // A(2) + " " + Title(12) + " " => B starts at index 16.
+        assert_eq!(&plain[16..18], "yy", "B column packs right after the content-sized Title");
     }
 
     #[test]
