@@ -5,7 +5,7 @@
 **htop for your software forges.**
 
 A fast, keyboard-driven terminal UI for your pull requests, work items, and CI
-pipelines — across **GitHub**, **Azure DevOps**, and **Linear** — in one place.
+pipelines — across **GitHub**, **GitLab**, **Azure DevOps**, and **Linear** — in one place.
 
 </div>
 
@@ -32,7 +32,7 @@ whichever provider owns it, and the Pipelines view can aggregate several at once
 - **Do work, not just watch it** — approve / merge / comment on PRs, view coloured
   diffs and review threads, change work-item states, drill into pipeline
   stages → jobs → steps, and trigger runs — all from the keyboard.
-- **Multi-provider** — GitHub, Azure DevOps, and Linear, with a built-in `--demo`.
+- **Multi-provider** — GitHub, GitLab, Azure DevOps, and Linear, with a built-in `--demo`.
 - **Guided setup** — a first-run wizard walks you through adding a connection; a
   config screen manages connections and bindings later.
 - **Secure by default** — tokens live in your OS keychain (macOS Keychain, Windows
@@ -157,6 +157,7 @@ non-alphanumeric characters become `_`).
 | Provider | What to create | Scopes |
 | --- | --- | --- |
 | **GitHub** | Personal access token | `repo` (PRs, issues, checks); `workflow` / Actions read for pipelines |
+| **GitLab** | Personal access token (Settings → Access Tokens) | `api` (merge requests, issues, pipelines) |
 | **Azure DevOps** | Personal access token | Code *Read*, Work Items *Read & Write*, Build *Read & Execute* |
 | **Linear** | Personal API key (Settings → Security & access → API) | default |
 
@@ -173,7 +174,7 @@ forgetop is a Rust [Cargo workspace](https://doc.rust-lang.org/cargo/reference/w
 | Crate | Responsibility |
 | --- | --- |
 | `forgetop-core` | Domain model, capability-scoped provider traits, config, secrets, services |
-| `forgetop-providers` | GitHub, Azure DevOps, Linear, and Demo implementations |
+| `forgetop-providers` | GitHub, GitLab, Azure DevOps, Linear, and Demo implementations |
 | `forgetop-tui` | The [ratatui](https://ratatui.rs) terminal UI |
 | `forgetop-cli` | The `forgetop` binary |
 
