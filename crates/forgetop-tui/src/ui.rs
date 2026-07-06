@@ -193,13 +193,18 @@ fn render_inline_list(frame: &mut Frame, area: Rect, app: &mut App, title: &str,
     frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), parts[1]);
 }
 
+/// Left indent inside the section, and the gap between columns — for breathing room.
+const COL_LEAD: usize = 1;
+const COL_GAP: usize = 3;
+
 /// Joins column cells into a line, each padded to its column width, then pads the
 /// whole line to the full body width (so a selected row highlights edge-to-edge).
 fn cells_line(cells: &[(String, Style)], widths: &[usize], inner_w: usize) -> Line<'static> {
-    let mut spans = Vec::new();
+    let mut spans = vec![Span::raw(" ")]; // COL_LEAD
+
     for (i, (text, style)) in cells.iter().enumerate() {
         if i > 0 {
-            spans.push(Span::raw(" "));
+            spans.push(Span::raw(" ".repeat(COL_GAP)));
         }
         spans.push(Span::styled(cell(text, widths[i]), *style));
     }
@@ -227,7 +232,8 @@ fn columnize(
         }
     }
     // Clamp the flexible column so status/counts/dates stay pinned next to it.
-    let fixed: usize = (0..ncol).filter(|&i| i != flex).map(|i| w[i]).sum::<usize>() + ncol.saturating_sub(1);
+    let padding = COL_LEAD + COL_GAP * ncol.saturating_sub(1);
+    let fixed: usize = (0..ncol).filter(|&i| i != flex).map(|i| w[i]).sum::<usize>() + padding;
     w[flex] = w[flex].min(inner_w.saturating_sub(fixed)).max(3);
 
     let header_cells: Vec<(String, Style)> = headers.iter().map(|h| (h.to_string(), header_style)).collect();
@@ -350,7 +356,6 @@ fn render_wis(frame: &mut Frame, area: Rect, app: &mut App) {
 
 fn render_pipes(frame: &mut Frame, area: Rect, app: &mut App) {
     let theme = &app.theme;
-    let block = section_block(theme, "Pipelines");
     if app.pipes.is_empty() {
         let msg = if app.health.is_empty() {
             FIRST_RUN_HINT
@@ -359,44 +364,31 @@ fn render_pipes(frame: &mut Frame, area: Rect, app: &mut App) {
         } else {
             "No pipeline runs. Press r to refresh."
         };
-        empty(frame, area, theme, msg, block);
+        empty(frame, area, theme, msg, section_block(theme, "Pipelines"));
         return;
     }
 
-    let header = header_row(theme, &["", "Provider", "Pipeline", "#", "Branch", "Started"]);
-    let rows: Vec<Row> = app
+    let inner_w = area.width.saturating_sub(2) as usize;
+    let dim = Style::default().fg(theme.dim).add_modifier(Modifier::BOLD);
+    let headers = ["", "Provider", "Pipeline", "#", "Branch", "Started"];
+    let cells: Vec<Vec<(String, Style)>> = app
         .pipes
         .iter()
         .map(|p| {
             let color = theme.pipeline_color(p.run.status);
-            let name = p.run.name.clone().unwrap_or_else(|| p.run.definition_id.clone());
-            let num = p.run.number.map(|n| format!("#{n}")).unwrap_or_default();
-            Row::new(vec![
-                Cell::from(Span::styled(format!("{} {:?}", pipeline_icon(p.run.status), p.run.status), Style::default().fg(color))),
-                Cell::from(Span::styled(format!("{} · {}", p.provider.as_str(), p.connection), Style::default().fg(theme.cyan))),
-                Cell::from(Span::styled(name, Style::default().fg(theme.fg))),
-                Cell::from(Span::styled(num, Style::default().fg(theme.dim))),
-                Cell::from(Span::styled(p.run.branch.clone().unwrap_or_default(), Style::default().fg(theme.dim))),
-                Cell::from(Span::styled(rel_age(p.run.started_at), Style::default().fg(theme.dim))),
-            ])
+            vec![
+                (format!("{} {:?}", pipeline_icon(p.run.status), p.run.status), Style::default().fg(color)),
+                (format!("{} · {}", p.provider.as_str(), p.connection), Style::default().fg(theme.cyan)),
+                (p.run.name.clone().unwrap_or_else(|| p.run.definition_id.clone()), Style::default().fg(theme.fg)),
+                (p.run.number.map(|n| format!("#{n}")).unwrap_or_default(), Style::default().fg(theme.dim)),
+                (p.run.branch.clone().unwrap_or_default(), Style::default().fg(theme.dim)),
+                (rel_age(p.run.started_at), Style::default().fg(theme.dim)),
+            ]
         })
         .collect();
 
-    let widths = [
-        Constraint::Length(20),
-        Constraint::Length(22),
-        Constraint::Min(20),
-        Constraint::Length(7),
-        Constraint::Length(18),
-        Constraint::Length(8),
-    ];
-    let table = Table::new(rows, widths)
-        .header(header)
-        .block(block)
-        .column_spacing(1)
-        .row_highlight_style(highlight(theme))
-        .highlight_symbol("▐ ");
-    frame.render_stateful_widget(table, area, &mut app.pipe_state);
+    let (header, rows) = columnize(dim, &headers, &cells, 2, inner_w);
+    render_inline_list(frame, area, app, "Pipelines", header, rows);
 }
 
 // ---- full-screen PR / work-item views ----
@@ -1184,8 +1176,8 @@ mod tests {
         // not stretch to fill — so column B lands right after it, not at the far edge.
         let (_header, lines) = columnize(s, &headers, &rows, 1, 200);
         let plain: String = lines[0].spans.iter().map(|sp| sp.content.as_ref()).collect::<String>();
-        // A(2) + " " + Title(12) + " " => B starts at index 16.
-        assert_eq!(&plain[16..18], "yy", "B column packs right after the content-sized Title");
+        // LEAD(1) + A(2) + GAP(3) + Title(12) + GAP(3) => B starts at index 21.
+        assert_eq!(&plain[21..23], "yy", "B column packs right after the content-sized Title");
     }
 
     #[test]
