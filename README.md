@@ -1,175 +1,182 @@
+<div align="center">
+
 # forgetop
 
-**htop for your software forges** — a multi-provider terminal UI for pull
-requests, work items, and CI pipelines across **GitHub, Azure DevOps, and
-Linear**, from one keyboard-driven app.
+**htop for your software forges.**
 
-Inspired by [Elpulgo/azdo](https://github.com/Elpulgo/azdo), but provider-agnostic:
-each of the three sections binds to its **own** provider, so you can review PRs
-on GitHub, watch pipelines on Azure DevOps, and track work items in Linear — at
-the same time. The Pipelines section can aggregate **several** providers at once.
+A fast, keyboard-driven terminal UI for your pull requests, work items, and CI
+pipelines — across **GitHub**, **Azure DevOps**, and **Linear** — in one place.
+
+</div>
+
+<!-- Replace with a real screen recording once captured. -->
+<div align="center">
+  <img src="docs/demo.gif" alt="forgetop demo" width="820">
+  <br/>
+  <sub>Live dashboard — Pull Requests, Work Items, Pipelines.</sub>
+</div>
+
+---
+
+## Why
+
+Modern teams spread work across several forges — code review in GitHub, tickets
+in Linear, pipelines in Azure DevOps. forgetop pulls them into a single terminal
+dashboard so you can triage without tab-hopping. Each section is bound to
+whichever provider owns it, and the Pipelines view can aggregate several at once.
+
+## Features
+
+- **Three sections** — Pull Requests, Work Items, and Pipelines, each independently
+  bound to a provider. Pipelines can aggregate multiple connections.
+- **Do work, not just watch it** — approve / merge / comment on PRs, view coloured
+  diffs and review threads, change work-item states, drill into pipeline
+  stages → jobs → steps, and trigger runs — all from the keyboard.
+- **Multi-provider** — GitHub, Azure DevOps, and Linear, with a built-in `--demo`.
+- **Guided setup** — a first-run wizard walks you through adding a connection; a
+  config screen manages connections and bindings later.
+- **Secure by default** — tokens live in your OS keychain (macOS Keychain, Windows
+  Credential Manager, Linux Secret Service). The config file only stores a reference.
+- **Yours to shape** — show/hide sections, four colour themes, live auto-refresh.
 
 ## Install
 
-**As a .NET global tool (recommended).** Requires the [.NET 10 SDK/runtime](https://dotnet.microsoft.com/download).
+Requires a [Rust toolchain](https://rustup.rs) (stable).
 
-```bash
-dotnet tool install --global forgetop
-forgetop --demo        # try it with mock data, no credentials
-forgetop               # real usage — first run launches the setup wizard
+```sh
+git clone https://github.com/magna-nz/forgetop
+cd forgetop
+cargo install --path crates/forgetop-cli
 ```
 
-Update / uninstall: `dotnet tool update --global forgetop` · `dotnet tool uninstall --global forgetop`.
+This builds and installs the `forgetop` binary to `~/.cargo/bin`. Or run it in
+place with `cargo run --release`.
 
-**From source.**
+## Quick start
 
-```bash
-git clone https://github.com/magna-nz/forgetop.git && cd forgetop
-dotnet run --project src/Forgetop.Cli -- --demo      # run directly, or…
-dotnet pack src/Forgetop.Cli -c Release -o ./nupkg   # …pack and install as a tool:
-dotnet tool install --global --add-source ./nupkg forgetop
+Try it with no setup — everything is in-memory, nothing is written:
+
+```sh
+forgetop --demo
 ```
 
-**Self-contained binary (no .NET install needed).**
+Then run it for real. On first launch (no connections configured) forgetop drops
+straight into the **add-connection wizard**:
 
-```bash
-dotnet publish src/Forgetop.Cli -c Release -r osx-arm64 --self-contained \
-  -p:PublishSingleFile=true -o ./dist
-./dist/forgetop --demo
+```sh
+forgetop
 ```
 
-Swap the runtime id for your platform: `osx-arm64`, `osx-x64`, `linux-x64`, `win-x64`.
+<!-- Replace with a real screen recording once captured. -->
+<div align="center">
+  <img src="docs/wizard.gif" alt="Adding a connection with the wizard" width="720">
+  <br/>
+  <sub>The first-run wizard: pick a provider, enter details, paste a token, bind a section.</sub>
+</div>
 
-**Homebrew** — planned: a tap serving the self-contained binaries above
-(`brew install magna-nz/tap/forgetop`). Not yet available.
+The wizard stores your token in the OS keychain and binds the connection to a
+section. Press **`C`** any time to manage connections and bindings.
 
-> forgetop is a full-screen TUI and needs an interactive terminal. Run it
-> directly in your terminal — piping it / running in CI prints a friendly message and exits.
+## Keybindings
 
-## Setup walkthrough
+forgetop shows a **context-aware key glossary** along the bottom — it only lists
+the keys valid for wherever you are. The full set:
 
-The first time you run `forgetop` (with no config yet) it launches a **setup
-wizard**. Everything is a small modal dialog — **↑/↓** to move in a list, **Enter**
-or **Tab → Enter** to accept, **Esc** (or *Cancel*) to skip a step.
+### Global
 
-**1. Welcome.** A dialog explains there are no connections yet and that you can
-skip any section and finish later with `F3`. Press **Enter** to continue.
+| Key | Action |
+| --- | --- |
+| `←` / `→`, `h` / `l`, `Tab`, `1`–`3` | Switch tab |
+| `↑` / `↓`, `k` / `j` | Move selection |
+| `o` | Open selected item in browser |
+| `n` | Add a connection (wizard) |
+| `v` | Choose which tabs are visible |
+| `C` | Config / connections screen |
+| `r` | Refresh · `t` cycle theme |
+| `q` / `Ctrl-C` | Quit · `Esc` back / close |
 
-**2. For each section, "Configure *X* now?"** You're asked in turn about
-**Pull Requests**, **Work Items**, then **Pipelines**. Choose **Yes** to set it up
-now or **No** to skip (configure it later with `F3`). Sections are independent —
-you don't have to use the same provider for each.
+### Pull Requests
 
-**3. Pick a provider.** Only providers that *can* serve that section are listed
-(e.g. Linear appears for Work Items but not Pull Requests).
+| Key | Action |
+| --- | --- |
+| `Enter` | Expand details |
+| `f` | Cycle filter (All / Mine / Review-requested) |
+| `d` | Open diff + review threads |
+| `a` / `x` | Approve / request changes |
+| `m` | Merge (choose strategy) |
+| `c` | Comment |
 
-**4. Answer the prompts.** What you're asked depends on the provider:
+### Work Items
 
-| Provider | Prompts |
-|----------|---------|
-| **GitHub** | Display name · Organization (owner/org) · Repository · Personal Access Token |
-| **Azure DevOps** | Display name · Organization · Project · Repository · Personal Access Token |
-| **Linear** | Display name · Personal API key |
-| **Demo** | Display name only (no token) |
+| Key | Action |
+| --- | --- |
+| `Enter` | Expand details |
+| `s` | Change state |
+| `c` | Comment |
 
-- **Display name** is just a label shown in the tab header (e.g. `Acme/web`).
-- The **token** is stored in your **OS keychain** (macOS Keychain / Windows DPAPI /
-  Linux libsecret) — never written to disk in plaintext. Paste it and press Enter.
+### Pipelines
 
-**5. Done.** forgetop confirms each section (e.g. *"Pull Requests is now served by
-Acme/web"*) and drops you into the app with your data loaded.
+| Key | Action |
+| --- | --- |
+| `Enter` | Drill in (stages → jobs → steps) |
+| `T` | Trigger a run |
 
-### Worked example — PRs on GitHub, Pipelines on Azure DevOps, Work Items on Linear
+## Configuration
 
-```
-Configure Pull Requests now? → Yes
-  Provider            → GitHub
-  Display name        → Acme/web
-  Organization        → acme
-  Repository          → web
-  Personal Access Token → ghp_xxx           (scopes: repo, workflow)
+Config is a small JSON file, created and managed for you:
 
-Configure Work Items now? → Yes
-  Provider            → Linear
-  Display name        → Acme (Linear)
-  Personal API key    → lin_api_xxx
+| OS | Path |
+| --- | --- |
+| macOS | `~/Library/Application Support/forgetop/config.json` |
+| Linux | `~/.config/forgetop/config.json` |
+| Windows | `%APPDATA%\forgetop\config.json` |
 
-Configure Pipelines now? → Yes
-  Provider            → AzureDevOps
-  Display name        → Acme CI
-  Organization        → acme
-  Project             → Platform
-  Repository          → web
-  Personal Access Token → (PAT: Code read, Build read/execute)
-```
+**It never contains secrets** — only a reference to each token in the keychain.
 
-You now have GitHub PRs, Linear issues, and ADO pipelines side by side. The
-Pipelines section can hold **more than one** connection — add another (e.g. GitHub
-Actions) with `F3` and it aggregates the runs.
+### Tokens
 
-### Changing things later (`F3`)
+Tokens are stored in your OS keychain under the service name `forgetop`. In
+headless environments (CI, containers) you can instead supply a token via an
+environment variable named `FORGETOP_PAT_<CONNECTION_ID>` (uppercased;
+non-alphanumeric characters become `_`).
 
-Press **`F3`** any time to open the config screen:
-- **Add → Pull Requests / Work Items / Pipelines** — runs the same prompts as above
-  to bind (or re-bind) a section.
-- **Remove: *name*** — deletes a connection and unbinds it everywhere.
+### Token scopes
 
-Changes persist and the affected section refreshes immediately.
+| Provider | What to create | Scopes |
+| --- | --- | --- |
+| **GitHub** | Personal access token | `repo` (PRs, issues, checks); `workflow` / Actions read for pipelines |
+| **Azure DevOps** | Personal access token | Code *Read*, Work Items *Read & Write*, Build *Read & Execute* |
+| **Linear** | Personal API key (Settings → Security & access → API) | default |
 
-### Tokens & scopes
+## Themes
 
-| Provider | Suggested scopes |
-|----------|------------------|
-| GitHub | `repo` + `workflow` |
-| Azure DevOps | Code (read), Work Items (read/write), Build (read/execute) |
-| Linear | a personal API key |
+Cycle with `t`. Four built-in themes — `slate` (default), `dark`, `light`, and
+`matrix` — using 256-colour palettes so they render correctly on every terminal.
+Your choice is remembered.
 
-No keychain / prefer env vars? forgetop also reads `FORGETOP_PAT_<connection-id>`
-as a fallback.
+## How it works
 
-## Keys
+forgetop is a Rust [Cargo workspace](https://doc.rust-lang.org/cargo/reference/workspaces.html):
 
-| Scope | Keys |
-|-------|------|
-| Global | `Tab`/`←→` switch section · `↑↓` move · `F5` refresh · `F3` config · `F2` theme · `F1` help · `^Q` quit |
-| Pull Requests | `f` filter (All/Mine/ReviewRequested) · `a` approve · `m` merge · `c` comment · `d` diff/files · `v` comments |
-| Work Items | `f` toggle mine · `s` set state · `c` comment |
-| Pipelines | `↵` drill-in (stages + logs) · `t` trigger/re-run · `d` discover & subscribe · `u` unsubscribe |
+| Crate | Responsibility |
+| --- | --- |
+| `forgetop-core` | Domain model, capability-scoped provider traits, config, secrets, services |
+| `forgetop-providers` | GitHub, Azure DevOps, Linear, and Demo implementations |
+| `forgetop-tui` | The [ratatui](https://ratatui.rs) terminal UI |
+| `forgetop-cli` | The `forgetop` binary |
 
-## Providers & capabilities
-
-| Provider | Pull Requests | Work Items | Pipelines | Auth |
-|----------|:---:|:---:|:---:|------|
-| GitHub | ✅ | ✅ Issues | ✅ Actions | PAT |
-| Azure DevOps | ✅ | ✅ Work Items | ✅ Pipelines | PAT |
-| Linear | — | ✅ | — | API key |
-| Demo | ✅ | ✅ | ✅ | none |
-
-GitLab and Bitbucket are planned for v2. Providers declare their capabilities,
-so the UI hides/relabels what a platform doesn't support (e.g. GitHub "approve"
-vs Azure DevOps numeric votes; "Issues" vs "Work Items"). See
-[Setup walkthrough](#setup-walkthrough) for connecting them and token scopes.
-
-## Architecture
-
-```
-Forgetop.Core            domain model, capability-scoped source interfaces,
-                         connection/binding config, runtime config service, secrets
-Forgetop.Providers.*     GitHub / AzureDevOps / Linear / Demo adapters
-Forgetop.Tui             Terminal.Gui shell, section screens, controllers, wizard
-Forgetop.Cli             entry point + DI composition (the `forgetop` command)
-```
-
-A provider implements only the source interfaces it supports
-(`IPullRequestSource` / `IWorkItemSource` / `IPipelineSource`). Adding a provider
-means writing one adapter and zero UI changes.
+Providers advertise *capabilities* (which sections they support), so a connection
+only offers what it can actually do — Linear appears for Work Items but not Pull
+Requests, for example.
 
 ## Development
 
-```bash
-dotnet build Forgetop.slnx
-dotnet test  Forgetop.slnx
+```sh
+cargo test        # run the test suite
+cargo clippy      # lint
+cargo run -- --demo
 ```
 
-- .NET 10 · Terminal.Gui (v1) · Spectre.Console · xUnit
-- See `SPEC.md` for the full design and `STATUS.md` for current state.
+## License
+
+[MIT](LICENSE)

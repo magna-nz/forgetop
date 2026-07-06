@@ -9,8 +9,26 @@ use forgetop_core::provider::*;
 use forgetop_core::service::{ConfigService, ConnectionHealth, ConnectionHealthService, SectionService};
 use ratatui::widgets::TableState;
 
-use crate::overlay::{Action, InputKind, Outcome, Overlay, PickerKind};
+use crate::overlay::{Action, InputKind, Outcome, Overlay, PickerKind, ToggleItem, ToggleKind};
 use crate::theme::Theme;
+use crate::wizard::{section_label, Wizard, WizardOutcome};
+
+/// The section index behind each tab position (0 = Pull Requests, 1 = Work Items, 2 = Pipelines).
+fn section_of(index: usize) -> Section {
+    match index {
+        0 => Section::PullRequests,
+        1 => Section::WorkItems,
+        _ => Section::Pipelines,
+    }
+}
+
+fn index_of(section: Section) -> usize {
+    match section {
+        Section::PullRequests => 0,
+        Section::WorkItems => 1,
+        Section::Pipelines => 2,
+    }
+}
 
 /// The three top-level tabs, in order.
 pub const TABS: [&str; 3] = ["Pull Requests", "Work Items", "Pipelines"];
@@ -41,6 +59,8 @@ pub struct App {
     pub wi_state: TableState,
     pub pipe_state: TableState,
     pub health: Vec<ConnectionHealth>,
+    /// Which sections are shown in the tab bar, indexed by section (0=PR,1=WI,2=Pipelines).
+    pub visible: [bool; 3],
     pub status: String,
     pub loading: bool,
     pub show_detail: bool,
@@ -49,6 +69,8 @@ pub struct App {
     pub toast: Option<String>,
     /// Open modal overlay, if any. When set, keys route here instead of the table.
     pub overlay: Option<Overlay>,
+    /// Add-connection wizard, if running. Takes priority over the overlay/screens.
+    pub wizard: Option<Wizard>,
     /// Current screen — the list, or a full-screen sub-view like the PR diff.
     pub screen: Screen,
     pub last_refresh: DateTime<Local>,
@@ -61,6 +83,32 @@ pub enum Screen {
     List,
     Diff(Box<DiffView>),
     Pipeline(Box<PipelineView>),
+    Config(Box<ConfigView>),
+}
+
+/// A configured connection, as shown in the config screen.
+pub struct ConnRow {
+    pub id: String,
+    pub display: String,
+    pub provider: ProviderType,
+    pub healthy: bool,
+    /// Which sections this connection is currently bound to.
+    pub bindings: Vec<&'static str>,
+}
+
+/// Snapshot state for the config / connections screen. Rebuilt after each mutation.
+pub struct ConfigView {
+    pub connections: Vec<ConnRow>,
+    pub pr_binding: Option<String>,
+    pub wi_binding: Option<String>,
+    pub pipeline_subs: Vec<String>,
+    pub selected: usize,
+}
+
+impl ConfigView {
+    fn selected_conn(&self) -> Option<&ConnRow> {
+        self.connections.get(self.selected)
+    }
 }
 
 /// One row of the flattened, collapsible pipeline tree.
@@ -189,12 +237,14 @@ impl App {
             wi_state: TableState::default(),
             pipe_state: TableState::default(),
             health: Vec::new(),
+            visible: [true; 3],
             status: "Loading…".into(),
             loading: true,
             show_detail: false,
             pr_filter: PullRequestFilter::All,
             toast: None,
             overlay: None,
+            wizard: None,
             screen: Screen::List,
             last_refresh: Local::now(),
             should_quit: false,
@@ -265,18 +315,47 @@ impl App {
         self.active_state().select(Some(next));
     }
 
+    /// Section indices currently shown in the tab bar, in order.
+    pub fn visible_indices(&self) -> Vec<usize> {
+        (0..TABS.len()).filter(|i| self.visible[*i]).collect()
+    }
+
+    fn first_visible(&self) -> usize {
+        self.visible_indices().first().copied().unwrap_or(0)
+    }
+
     pub fn switch_tab(&mut self, delta: isize) {
-        let n = TABS.len() as isize;
-        self.active = (((self.active as isize + delta) % n + n) % n) as usize;
+        let vis = self.visible_indices();
+        if vis.is_empty() {
+            return;
+        }
+        let pos = vis.iter().position(|&i| i == self.active).unwrap_or(0) as isize;
+        let n = vis.len() as isize;
+        self.active = vis[(((pos + delta) % n + n) % n) as usize];
         self.show_detail = false;
         self.clamp_selection();
     }
 
+    /// Jumps to the Nth *visible* tab (0-based), for the number keys.
     pub fn set_tab(&mut self, idx: usize) {
-        if idx < TABS.len() {
-            self.active = idx;
+        if let Some(&section) = self.visible_indices().get(idx) {
+            self.active = section;
             self.show_detail = false;
             self.clamp_selection();
+        }
+    }
+
+    /// Applies persisted hidden-section preferences at startup.
+    pub fn apply_hidden_sections(&mut self, hidden: &[Section]) {
+        self.visible = [true; 3];
+        for section in hidden {
+            self.visible[index_of(*section)] = false;
+        }
+        if !self.visible.iter().any(|v| *v) {
+            self.visible[0] = true;
+        }
+        if !self.visible[self.active] {
+            self.active = self.first_visible();
         }
     }
 
@@ -385,7 +464,11 @@ impl App {
         // Any keypress dismisses the previous one-shot toast.
         self.toast = None;
 
-        // An open overlay swallows all input until it resolves.
+        // The wizard, then any overlay, swallow all input until they resolve.
+        if self.wizard.is_some() {
+            self.on_wizard_key(key, deps).await;
+            return;
+        }
         if self.overlay.is_some() {
             self.on_overlay_key(key, deps).await;
             return;
@@ -399,6 +482,10 @@ impl App {
             }
             Screen::Pipeline(_) => {
                 self.on_pipeline_key(key);
+                return;
+            }
+            Screen::Config(_) => {
+                self.on_config_key(key, deps).await;
                 return;
             }
             Screen::List => {}
@@ -445,6 +532,9 @@ impl App {
                 let _ = deps.config.set_theme(Some(next.to_string())).await;
             }
             'o' => self.open_selected(),
+            'n' => self.start_add_connection(),
+            'v' => self.open_sections_toggle(),
+            'C' => self.open_config(deps).await,
             'f' if self.active == 0 => self.cycle_pr_filter(deps).await,
             // PR write actions (Pull Requests tab only; each no-ops off-tab).
             'a' => self.open_pr_vote(ReviewVote::Approved),
@@ -615,7 +705,7 @@ impl App {
         match &self.screen {
             Screen::Diff(v) => return v.url.clone(),
             Screen::Pipeline(v) => return v.run.url.clone(),
-            Screen::List => {}
+            Screen::List | Screen::Config(_) => {}
         }
         match self.active {
             0 => self.selected_pr().and_then(|p| p.url.clone()),
@@ -634,6 +724,293 @@ impl App {
                 });
             }
             None => self.toast = Some("No web URL for this item".into()),
+        }
+    }
+
+    // ---- add-connection wizard ----
+
+    pub fn start_add_connection(&mut self) {
+        self.wizard = Some(Wizard::new());
+    }
+
+    async fn on_wizard_key(&mut self, key: Key, deps: &AppDeps) {
+        let outcome = match self.wizard.as_mut() {
+            Some(w) => w.handle(key),
+            None => return,
+        };
+        match outcome {
+            WizardOutcome::Keep => {}
+            WizardOutcome::Cancel => {
+                self.wizard = None;
+                self.toast = Some("Cancelled".into());
+            }
+            WizardOutcome::Commit => {
+                if let Some(w) = self.wizard.take() {
+                    self.commit_wizard(w, deps).await;
+                }
+            }
+        }
+    }
+
+    async fn commit_wizard(&mut self, wizard: Wizard, deps: &AppDeps) {
+        let draft = wizard.draft;
+        let Some(provider) = draft.provider else {
+            self.toast = Some("No provider chosen".into());
+            return;
+        };
+        let id = Connection::new_id(provider);
+        let connection = Connection {
+            id: id.clone(),
+            provider_type: provider,
+            display_name: if draft.display_name.is_empty() { provider.as_str().to_string() } else { draft.display_name },
+            base_url: None,
+            organization: draft.organization,
+            project: draft.project,
+            repository: draft.repository,
+            credential_ref: None,
+        };
+
+        if let Err(e) = deps.config.add_or_update_connection(connection, draft.pat).await {
+            self.toast = Some(format!("Add failed: {e}"));
+            return;
+        }
+
+        if let Some(section) = draft.bind_section {
+            let result = match section {
+                Section::PullRequests => deps.config.bind_pull_requests(&id).await,
+                Section::WorkItems => deps.config.bind_work_items(&id).await,
+                Section::Pipelines => deps.config.set_pipeline_auto_discover(&id, true).await,
+            };
+            if let Err(e) = result {
+                self.toast = Some(format!("Added, but binding failed: {e}"));
+                self.reload_all(deps).await;
+                return;
+            }
+        }
+
+        self.toast = Some(format!("Added {} connection", provider.as_str()));
+        self.reload_all(deps).await;
+        self.rebuild_config_view(deps).await;
+    }
+
+    // ---- visible tabs ----
+
+    fn open_sections_toggle(&mut self) {
+        let items = (0..TABS.len())
+            .map(|i| ToggleItem { id: i.to_string(), label: TABS[i].to_string(), on: self.visible[i] })
+            .collect();
+        self.overlay =
+            Some(Overlay::Toggle { title: "Visible tabs".into(), kind: ToggleKind::Sections, min_one: true, items, selected: 0 });
+    }
+
+    async fn apply_toggle(&mut self, kind: ToggleKind, ids: Vec<String>, deps: &AppDeps) {
+        match kind {
+            ToggleKind::Sections => {
+                let visible = ids.iter().filter_map(|id| id.parse::<usize>().ok()).map(section_of).collect();
+                self.apply_visible_sections(visible, deps).await;
+            }
+            ToggleKind::PipelineSubs { connection_id } => {
+                self.apply_pipeline_subs(&connection_id, ids, deps).await;
+            }
+        }
+    }
+
+    /// Discovers a connection's pipeline definitions and opens a subscribe checklist.
+    async fn open_pipeline_subs(&mut self, deps: &AppDeps) {
+        let Some((id, display)) = self.config_selected_id() else { return };
+        let source = match deps.sections.pipeline_source_for(&id).await {
+            Ok(Some(s)) => s,
+            _ => {
+                self.toast = Some("That connection doesn't support pipelines".into());
+                return;
+            }
+        };
+        let defs = match source.discover().await {
+            Ok(d) => d,
+            Err(e) => {
+                self.toast = Some(format!("Discover failed: {e}"));
+                return;
+            }
+        };
+        if defs.is_empty() {
+            self.toast = Some("No pipelines found for this connection".into());
+            return;
+        }
+
+        let cfg = deps.config.snapshot();
+        let sub = cfg.pipelines.as_ref().and_then(|p| p.subscriptions.iter().find(|s| s.connection_id == id));
+        let auto = sub.map(|s| s.auto_discover_all).unwrap_or(false);
+        let subscribed: std::collections::HashSet<String> =
+            sub.map(|s| s.definition_ids.iter().cloned().collect()).unwrap_or_default();
+
+        let items = defs
+            .iter()
+            .map(|d| ToggleItem { id: d.id.clone(), label: d.name.clone(), on: auto || subscribed.contains(&d.id) })
+            .collect();
+
+        self.overlay = Some(Overlay::Toggle {
+            title: format!("Subscribe · {display}"),
+            kind: ToggleKind::PipelineSubs { connection_id: id },
+            min_one: false,
+            items,
+            selected: 0,
+        });
+    }
+
+    async fn apply_pipeline_subs(&mut self, connection_id: &str, ids: Vec<String>, deps: &AppDeps) {
+        match deps.config.set_pipeline_definitions(connection_id, ids.clone()).await {
+            Ok(()) => {
+                self.toast = Some(format!("Subscribed to {} pipeline(s)", ids.len()));
+                self.reload_all(deps).await;
+                self.rebuild_config_view(deps).await;
+            }
+            Err(e) => self.toast = Some(format!("{e}")),
+        }
+    }
+
+    async fn apply_visible_sections(&mut self, visible: Vec<Section>, deps: &AppDeps) {
+        let mut vis = [false; 3];
+        for section in &visible {
+            vis[index_of(*section)] = true;
+        }
+        if !vis.iter().any(|v| *v) {
+            vis[0] = true;
+        }
+        self.visible = vis;
+        if !self.visible[self.active] {
+            self.active = self.first_visible();
+            self.show_detail = false;
+            self.clamp_selection();
+        }
+        let hidden: Vec<Section> = (0..3).filter(|i| !self.visible[*i]).map(section_of).collect();
+        let _ = deps.config.set_hidden_sections(hidden).await;
+        self.toast = Some("Updated visible tabs".into());
+    }
+
+    // ---- config / connections screen ----
+
+    async fn open_config(&mut self, deps: &AppDeps) {
+        let view = self.build_config_view(deps);
+        self.screen = Screen::Config(Box::new(view));
+    }
+
+    fn build_config_view(&self, deps: &AppDeps) -> ConfigView {
+        let cfg = deps.config.snapshot();
+        let display_of = |id: &str| cfg.find_connection(id).map(|c| c.display_name.clone()).unwrap_or_else(|| id.to_string());
+
+        let pr_binding = cfg.pull_requests.as_ref().map(|b| display_of(&b.connection_id));
+        let wi_binding = cfg.work_items.as_ref().map(|b| display_of(&b.connection_id));
+        let pipeline_subs = cfg
+            .pipelines
+            .as_ref()
+            .map(|p| p.subscriptions.iter().map(|s| display_of(&s.connection_id)).collect())
+            .unwrap_or_default();
+
+        let connections = cfg
+            .connections
+            .iter()
+            .map(|c| {
+                let mut bindings = Vec::new();
+                if cfg.pull_requests.as_ref().is_some_and(|b| b.connection_id == c.id) {
+                    bindings.push("PR");
+                }
+                if cfg.work_items.as_ref().is_some_and(|b| b.connection_id == c.id) {
+                    bindings.push("WI");
+                }
+                if cfg.pipelines.as_ref().is_some_and(|p| p.subscriptions.iter().any(|s| s.connection_id == c.id)) {
+                    bindings.push("Pipe");
+                }
+                ConnRow {
+                    id: c.id.clone(),
+                    display: c.display_name.clone(),
+                    provider: c.provider_type,
+                    healthy: self.health.iter().find(|h| h.connection.id == c.id).map(|h| h.healthy).unwrap_or(false),
+                    bindings,
+                }
+            })
+            .collect();
+
+        ConfigView { connections, pr_binding, wi_binding, pipeline_subs, selected: 0 }
+    }
+
+    async fn rebuild_config_view(&mut self, deps: &AppDeps) {
+        let sel = match &self.screen {
+            Screen::Config(v) => v.selected,
+            _ => return,
+        };
+        let mut view = self.build_config_view(deps);
+        view.selected = sel.min(view.connections.len().saturating_sub(1));
+        self.screen = Screen::Config(Box::new(view));
+    }
+
+    async fn on_config_key(&mut self, key: Key, deps: &AppDeps) {
+        match key {
+            Key::Escape => self.screen = Screen::List,
+            Key::Char('q') => self.should_quit = true,
+            Key::Char('a') => self.start_add_connection(),
+            Key::Char('p') => self.config_bind(Section::PullRequests, deps).await,
+            Key::Char('w') => self.config_bind(Section::WorkItems, deps).await,
+            Key::Char('s') => self.open_pipeline_subs(deps).await,
+            Key::Char('x') | Key::Char('d') => self.config_remove_selected(),
+            Key::Up | Key::Char('k') => self.config_move(-1),
+            Key::Down | Key::Char('j') => self.config_move(1),
+            _ => {}
+        }
+    }
+
+    fn config_move(&mut self, delta: isize) {
+        if let Screen::Config(v) = &mut self.screen {
+            let len = v.connections.len();
+            if len == 0 {
+                return;
+            }
+            let n = len as isize;
+            v.selected = (((v.selected as isize + delta) % n + n) % n) as usize;
+        }
+    }
+
+    fn config_selected_id(&self) -> Option<(String, String)> {
+        if let Screen::Config(v) = &self.screen {
+            return v.selected_conn().map(|c| (c.id.clone(), c.display.clone()));
+        }
+        None
+    }
+
+    async fn config_bind(&mut self, section: Section, deps: &AppDeps) {
+        let Some((id, _)) = self.config_selected_id() else { return };
+        let result = match section {
+            Section::PullRequests => deps.config.bind_pull_requests(&id).await,
+            Section::WorkItems => deps.config.bind_work_items(&id).await,
+            Section::Pipelines => deps.config.set_pipeline_auto_discover(&id, true).await,
+        };
+        match result {
+            Ok(()) => {
+                self.toast = Some(format!("Bound to {}", section_label(section)));
+                self.reload_all(deps).await;
+                self.rebuild_config_view(deps).await;
+            }
+            Err(e) => self.toast = Some(format!("{e}")),
+        }
+    }
+
+    fn config_remove_selected(&mut self) {
+        let Some((id, label)) = self.config_selected_id() else { return };
+        self.overlay = Some(Overlay::Confirm {
+            title: "Remove connection".into(),
+            message: format!("Remove '{label}' and its bindings?"),
+            action: Action::RemoveConnection { id, label },
+        });
+    }
+
+    async fn execute_config_action(&mut self, action: Action, deps: &AppDeps) {
+        let Action::RemoveConnection { id, label } = action else { return };
+        match deps.config.remove_connection(&id).await {
+            Ok(()) => {
+                self.toast = Some(format!("Removed {label}"));
+                self.reload_all(deps).await;
+                self.rebuild_config_view(deps).await;
+            }
+            Err(e) => self.toast = Some(format!("Remove failed: {e}")),
         }
     }
 
@@ -679,6 +1056,8 @@ impl App {
             Action::PrVote(_) | Action::PrMerge(_) | Action::PrComment(_) => self.execute_pr_action(action, deps).await,
             Action::WiSetState(_) | Action::WiComment(_) => self.execute_wi_action(action, deps).await,
             Action::PipelineTrigger { .. } => self.execute_pipeline_action(action, deps).await,
+            Action::RemoveConnection { .. } => self.execute_config_action(action, deps).await,
+            Action::ApplyToggle { kind, ids } => self.apply_toggle(kind, ids, deps).await,
         }
     }
 
@@ -943,5 +1322,30 @@ mod tests {
         app.prs.push(pr(None));
         app.pr_state.select(Some(0));
         assert_eq!(app.selected_url(), None);
+    }
+
+    #[test]
+    fn hiding_a_section_skips_it_in_tabs_and_navigation() {
+        let mut app = App::new("slate");
+        app.apply_hidden_sections(&[Section::WorkItems]);
+        assert_eq!(app.visible_indices(), vec![0, 2]);
+
+        app.active = 0;
+        app.switch_tab(1); // PR -> Pipelines, skipping the hidden Work Items
+        assert_eq!(app.active, 2);
+        app.switch_tab(1); // wraps back to PR
+        assert_eq!(app.active, 0);
+
+        app.set_tab(1); // 2nd visible tab is Pipelines
+        assert_eq!(app.active, 2);
+    }
+
+    #[test]
+    fn hiding_the_active_section_falls_back_to_first_visible() {
+        let mut app = App::new("slate");
+        app.active = 1; // Work Items
+        app.apply_hidden_sections(&[Section::WorkItems]);
+        assert!(!app.visible[1]);
+        assert_eq!(app.active, 0);
     }
 }

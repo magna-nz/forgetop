@@ -5,6 +5,7 @@ pub mod app;
 pub mod overlay;
 pub mod theme;
 pub mod ui;
+pub mod wizard;
 
 use std::io::{self, Stdout};
 use std::time::Duration;
@@ -28,7 +29,14 @@ pub async fn run(deps: AppDeps, theme_name: &str) -> Result<()> {
     let mut terminal = setup_terminal().map_err(forgetop_core::Error::from)?;
 
     let mut app = App::new(theme_name);
+    app.apply_hidden_sections(&deps.config.snapshot().ui.hidden_sections);
     app.reload_all(&deps).await;
+
+    // First run: nothing configured yet — drop straight into the add-connection wizard.
+    if deps.config.snapshot().connections.is_empty() {
+        app.start_add_connection();
+        app.toast = Some("Welcome to forgetop — add your first connection".into());
+    }
 
     let result = event_loop(&mut terminal, &mut app, &deps).await;
 

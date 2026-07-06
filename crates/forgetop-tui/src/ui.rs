@@ -10,9 +10,13 @@ use ratatui::widgets::{
 };
 use ratatui::Frame;
 
-use crate::app::{App, DiffView, PipeRow, PipelineView, Screen, TABS};
+use crate::app::{App, ConfigView, DiffView, PipeRow, PipelineView, Screen, TABS};
 use crate::overlay::Overlay;
 use crate::theme::{check_icon, pipeline_icon, Theme};
+use crate::wizard::{Prompt, PromptKind};
+
+/// Shown in empty sections when nothing is configured yet.
+const FIRST_RUN_HINT: &str = "No connections yet — press n to add one, or C for config.";
 
 pub fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
@@ -36,7 +40,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     render_health(frame, rows[2], app);
     render_footer(frame, rows[3], app);
 
-    if app.overlay.is_some() {
+    if app.wizard.is_some() {
+        render_wizard(frame, area, app);
+    } else if app.overlay.is_some() {
         render_overlay(frame, area, app);
     }
 }
@@ -54,21 +60,22 @@ fn render_tabs(frame: &mut Frame, area: Rect, app: &App) {
         .title(Span::styled(" ▟ forgetop ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)))
         .title_top(Line::from(Span::styled(right, Style::default().fg(theme.dim))).right_aligned());
 
-    let titles: Vec<Line> = TABS
+    let vis = app.visible_indices();
+    let titles: Vec<Line> = vis
         .iter()
-        .enumerate()
-        .map(|(i, t)| {
+        .map(|&i| {
             let count = match i {
                 0 => app.prs.len(),
                 1 => app.wis.len(),
                 _ => app.pipes.len(),
             };
-            Line::from(format!(" {t} {count} "))
+            Line::from(format!(" {} {count} ", TABS[i]))
         })
         .collect();
+    let selected = vis.iter().position(|&i| i == app.active).unwrap_or(0);
 
     let tabs = Tabs::new(titles)
-        .select(app.active)
+        .select(selected)
         .divider(Span::styled("  ", Style::default().fg(theme.dim)))
         .padding("", "")
         .style(Style::default().fg(theme.dim).bg(theme.bg))
@@ -86,6 +93,10 @@ fn render_content(frame: &mut Frame, area: Rect, app: &mut App) {
         }
         Screen::Pipeline(view) => {
             render_pipeline(frame, area, &app.theme, view);
+            return;
+        }
+        Screen::Config(view) => {
+            render_config(frame, area, &app.theme, view);
             return;
         }
         Screen::List => {}
@@ -164,7 +175,13 @@ fn render_prs(frame: &mut Frame, area: Rect, app: &mut App) {
     let title = format!("Pull Requests · {}", app.pr_filter_label());
     let block = section_block(theme, &title);
     if app.prs.is_empty() {
-        let msg = if app.loading { "Loading pull requests…" } else { "No pull requests. Press f to change filter, r to refresh." };
+        let msg = if app.health.is_empty() {
+            FIRST_RUN_HINT
+        } else if app.loading {
+            "Loading pull requests…"
+        } else {
+            "No pull requests. Press f to change filter, r to refresh."
+        };
         empty(frame, area, theme, msg, block);
         return;
     }
@@ -225,7 +242,13 @@ fn render_wis(frame: &mut Frame, area: Rect, app: &mut App) {
     let theme = &app.theme;
     let block = section_block(theme, "Work Items");
     if app.wis.is_empty() {
-        let msg = if app.loading { "Loading work items…" } else { "No work items. Press r to refresh." };
+        let msg = if app.health.is_empty() {
+            FIRST_RUN_HINT
+        } else if app.loading {
+            "Loading work items…"
+        } else {
+            "No work items. Press r to refresh."
+        };
         empty(frame, area, theme, msg, block);
         return;
     }
@@ -272,7 +295,13 @@ fn render_pipes(frame: &mut Frame, area: Rect, app: &mut App) {
     let theme = &app.theme;
     let block = section_block(theme, "Pipelines");
     if app.pipes.is_empty() {
-        let msg = if app.loading { "Loading pipeline runs…" } else { "No pipeline runs. Press r to refresh." };
+        let msg = if app.health.is_empty() {
+            FIRST_RUN_HINT
+        } else if app.loading {
+            "Loading pipeline runs…"
+        } else {
+            "No pipeline runs. Press r to refresh."
+        };
         empty(frame, area, theme, msg, block);
         return;
     }
@@ -416,7 +445,7 @@ fn render_health(frame: &mut Frame, area: Rect, app: &App) {
     let theme = &app.theme;
     let mut spans = vec![Span::styled("connections  ", Style::default().fg(theme.dim))];
     if app.health.is_empty() {
-        spans.push(Span::styled("none configured — run the setup wizard", Style::default().fg(theme.dim)));
+        spans.push(Span::styled("none yet — press n to add a connection", Style::default().fg(theme.dim)));
     }
     for h in &app.health {
         let (icon, color) = if h.healthy { ("●", theme.green) } else { ("○", theme.red) };
@@ -429,6 +458,13 @@ fn render_health(frame: &mut Frame, area: Rect, app: &App) {
 /// Context-aware key glossary for the active tab (azdo-style bar along the bottom).
 /// While an overlay is open it shows that overlay's own keys instead.
 fn footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
+    if let Some(wizard) = &app.wizard {
+        return match wizard.current() {
+            Some(Prompt { kind: PromptKind::Pick { .. }, .. }) => vec![("↑↓", "choose"), ("↵", "next"), ("Esc", "cancel")],
+            Some(_) => vec![("type", "value"), ("↵", "next"), ("Esc", "cancel")],
+            None => vec![("Esc", "cancel")],
+        };
+    }
     if let Some(overlay) = &app.overlay {
         return overlay.hint();
     }
@@ -437,6 +473,18 @@ fn footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
     }
     if matches!(app.screen, Screen::Pipeline(_)) {
         return vec![("↑↓", "move"), ("↵", "expand"), ("T", "trigger"), ("o", "open"), ("Esc", "back"), ("q", "quit")];
+    }
+    if matches!(app.screen, Screen::Config(_)) {
+        return vec![
+            ("↑↓", "move"),
+            ("a", "add"),
+            ("p", "bind-PR"),
+            ("w", "bind-WI"),
+            ("s", "pipelines"),
+            ("x", "remove"),
+            ("Esc", "back"),
+            ("q", "quit"),
+        ];
     }
     let mut keys = vec![("↑↓", "move"), ("←→", "tabs")];
     match app.active {
@@ -454,7 +502,7 @@ fn footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
         2 => keys.extend([("↵", "drill-in"), ("T", "trigger"), ("o", "open")]),
         _ => {}
     }
-    keys.extend([("r", "refresh"), ("t", "theme"), ("q", "quit")]);
+    keys.extend([("v", "tabs"), ("C", "config"), ("r", "refresh"), ("t", "theme"), ("q", "quit")]);
     keys
 }
 
@@ -612,6 +660,66 @@ fn patch_line(theme: &Theme, line: &str) -> Line<'static> {
     Line::from(Span::styled(line.to_string(), Style::default().fg(color)))
 }
 
+// ---- config / connections ----
+
+fn render_config(frame: &mut Frame, area: Rect, theme: &Theme, view: &ConfigView) {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(4), Constraint::Length(6)])
+        .split(area);
+
+    // Connections table.
+    let conns_block = section_block(theme, "Connections");
+    if view.connections.is_empty() {
+        empty(frame, rows[0], theme, "No connections yet. Press a to add one.", conns_block);
+    } else {
+        let header = header_row(theme, &["", "Name", "Provider", "Bound to"]);
+        let table_rows: Vec<Row> = view
+            .connections
+            .iter()
+            .map(|c| {
+                let (dot, color) = if c.healthy { ("●", theme.green) } else { ("○", theme.red) };
+                let bound = if c.bindings.is_empty() { "—".to_string() } else { c.bindings.join(", ") };
+                Row::new(vec![
+                    Cell::from(Span::styled(dot, Style::default().fg(color))),
+                    Cell::from(Span::styled(c.display.clone(), Style::default().fg(theme.fg))),
+                    Cell::from(Span::styled(c.provider.as_str().to_string(), Style::default().fg(theme.cyan))),
+                    Cell::from(Span::styled(bound, Style::default().fg(theme.dim))),
+                ])
+            })
+            .collect();
+        let widths = [Constraint::Length(1), Constraint::Min(16), Constraint::Length(14), Constraint::Length(18)];
+        let table = Table::new(table_rows, widths)
+            .header(header)
+            .block(conns_block)
+            .column_spacing(1)
+            .row_highlight_style(highlight(theme))
+            .highlight_symbol("▐ ");
+        let mut state = TableState::default();
+        state.select(Some(view.selected.min(view.connections.len().saturating_sub(1))));
+        frame.render_stateful_widget(table, rows[0], &mut state);
+    }
+
+    // Section bindings summary.
+    let dash = || "— (unbound)".to_string();
+    let subs = if view.pipeline_subs.is_empty() { dash() } else { view.pipeline_subs.join(", ") };
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("Pull Requests  ", Style::default().fg(theme.dim)),
+            Span::styled(view.pr_binding.clone().unwrap_or_else(dash), Style::default().fg(theme.fg)),
+        ]),
+        Line::from(vec![
+            Span::styled("Work Items     ", Style::default().fg(theme.dim)),
+            Span::styled(view.wi_binding.clone().unwrap_or_else(dash), Style::default().fg(theme.fg)),
+        ]),
+        Line::from(vec![
+            Span::styled("Pipelines      ", Style::default().fg(theme.dim)),
+            Span::styled(subs, Style::default().fg(theme.fg)),
+        ]),
+    ];
+    frame.render_widget(Paragraph::new(lines).block(section_block(theme, "Section bindings")), rows[1]);
+}
+
 // ---- pipeline drill-in ----
 
 fn render_pipeline(frame: &mut Frame, area: Rect, theme: &Theme, view: &PipelineView) {
@@ -707,6 +815,29 @@ fn render_overlay(frame: &mut Frame, area: Rect, app: &App) {
             ],
             theme.green,
         ),
+        Overlay::Toggle { items, selected, .. } => (
+            items
+                .iter()
+                .enumerate()
+                .map(|(i, item)| {
+                    let (arrow, arrow_color) = if item.on { ("▶", theme.green) } else { ("·", theme.dim) };
+                    let cursor = if i == *selected { "▐ " } else { "  " };
+                    let label_style = if i == *selected {
+                        Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)
+                    } else if item.on {
+                        Style::default().fg(theme.fg)
+                    } else {
+                        Style::default().fg(theme.dim)
+                    };
+                    Line::from(vec![
+                        Span::styled(cursor, Style::default().fg(theme.accent)),
+                        Span::styled(format!("{arrow} "), Style::default().fg(arrow_color)),
+                        Span::styled(item.label.clone(), label_style),
+                    ])
+                })
+                .collect(),
+            theme.green,
+        ),
     };
 
     let hint = footer_keys(app)
@@ -733,6 +864,66 @@ fn render_overlay(frame: &mut Frame, area: Rect, app: &App) {
         .border_style(Style::default().fg(hint_color))
         .style(Style::default().bg(theme.panel))
         .title(Span::styled(format!(" {} ", overlay.title()), Style::default().fg(hint_color).add_modifier(Modifier::BOLD)));
+
+    frame.render_widget(Clear, rect);
+    frame.render_widget(Paragraph::new(lines).block(block).wrap(Wrap { trim: false }), rect);
+}
+
+fn render_wizard(frame: &mut Frame, area: Rect, app: &App) {
+    let theme = &app.theme;
+    let Some(wizard) = &app.wizard else { return };
+    let Some(prompt) = wizard.current() else { return };
+    let accent = theme.accent;
+
+    let mut lines: Vec<Line> = vec![
+        Line::from(Span::styled(prompt.label.clone(), Style::default().fg(theme.fg).add_modifier(Modifier::BOLD))),
+        Line::from(""),
+    ];
+    match &prompt.kind {
+        PromptKind::Text { buffer, secret } => {
+            let shown = if *secret { "•".repeat(buffer.chars().count()) } else { buffer.clone() };
+            lines.push(Line::from(vec![
+                Span::styled("> ", Style::default().fg(accent)),
+                Span::styled(shown, Style::default().fg(theme.fg)),
+                Span::styled("█", Style::default().fg(accent)),
+            ]));
+        }
+        PromptKind::Pick { items, selected } => {
+            for (i, item) in items.iter().enumerate() {
+                if i == *selected {
+                    lines.push(Line::from(vec![
+                        Span::styled(" ▐ ", Style::default().fg(accent)),
+                        Span::styled(item.clone(), Style::default().fg(accent).add_modifier(Modifier::BOLD)),
+                    ]));
+                } else {
+                    lines.push(Line::from(Span::styled(format!("   {item}"), Style::default().fg(theme.fg))));
+                }
+            }
+        }
+    }
+
+    let hint = footer_keys(app)
+        .into_iter()
+        .flat_map(|(k, l)| {
+            [
+                Span::styled(format!(" {k} "), Style::default().fg(theme.bg).bg(accent).add_modifier(Modifier::BOLD)),
+                Span::styled(format!(" {l}   "), Style::default().fg(theme.dim)),
+            ]
+        })
+        .collect::<Vec<_>>();
+    lines.push(Line::from(""));
+    lines.push(Line::from(hint));
+
+    let height = lines.len() as u16 + 2;
+    let width = 64.min(area.width.saturating_sub(6));
+    let rect = centered_rect(width, height, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(accent))
+        .style(Style::default().bg(theme.panel))
+        .title(Span::styled(format!(" Add connection · {} ", wizard.step_label()), Style::default().fg(accent).add_modifier(Modifier::BOLD)));
 
     frame.render_widget(Clear, rect);
     frame.render_widget(Paragraph::new(lines).block(block).wrap(Wrap { trim: false }), rect);
@@ -963,6 +1154,83 @@ mod tests {
         app.active = 2;
         let out = render_to_string(&mut app, 120, 24);
         assert!(out.contains("drill-in") && out.contains("trigger"), "pipelines footer");
+    }
+
+    #[test]
+    fn config_screen_renders_connections_and_bindings() {
+        use crate::app::{ConfigView, ConnRow, Screen};
+        let mut app = App::new("slate");
+        app.screen = Screen::Config(Box::new(ConfigView {
+            connections: vec![ConnRow {
+                id: "gh-1".into(),
+                display: "My GitHub".into(),
+                provider: ProviderType::GitHub,
+                healthy: true,
+                bindings: vec!["PR", "Pipe"],
+            }],
+            pr_binding: Some("My GitHub".into()),
+            wi_binding: None,
+            pipeline_subs: vec!["My GitHub".into()],
+            selected: 0,
+        }));
+        let out = render_to_string(&mut app, 100, 24);
+        assert!(out.contains("Connections"), "connections panel");
+        assert!(out.contains("My GitHub"), "connection name");
+        assert!(out.contains("Section bindings"), "bindings panel");
+        assert!(out.contains("unbound"), "unbound work items shown");
+        for label in ["add", "remove", "bind-PR"] {
+            assert!(out.contains(label), "config footer should list '{label}'");
+        }
+    }
+
+    #[test]
+    fn empty_state_prompts_to_add_a_connection_on_first_run() {
+        let mut app = App::new("slate"); // no connections/health, no data
+        let out = render_to_string(&mut app, 100, 24);
+        assert!(out.contains("add one"), "empty section should point to adding a connection");
+        assert!(out.contains("add a connection"), "health bar should prompt to add a connection");
+    }
+
+    #[test]
+    fn tab_bar_hides_hidden_sections() {
+        let mut app = App::new("slate");
+        app.apply_hidden_sections(&[forgetop_core::domain::Section::WorkItems]);
+        let out = render_to_string(&mut app, 100, 24);
+        assert!(out.contains("Pull Requests"), "PR tab shown");
+        assert!(out.contains("Pipelines"), "Pipelines tab shown");
+        assert!(!out.contains("Work Items"), "hidden Work Items tab absent");
+    }
+
+    #[test]
+    fn visible_tabs_toggle_overlay_renders() {
+        use crate::overlay::{Overlay, ToggleItem, ToggleKind};
+        let mut app = App::new("slate");
+        app.overlay = Some(Overlay::Toggle {
+            title: "Visible tabs".into(),
+            kind: ToggleKind::Sections,
+            min_one: true,
+            items: vec![
+                ToggleItem { id: "0".into(), label: "Pull Requests".into(), on: true },
+                ToggleItem { id: "1".into(), label: "Work Items".into(), on: false },
+            ],
+            selected: 0,
+        });
+        let out = render_to_string(&mut app, 100, 24);
+        assert!(out.contains("Visible tabs"), "toggle title");
+        assert!(out.contains("▶"), "green arrow marks a visible section");
+        assert!(out.contains("toggle"), "toggle footer hint");
+    }
+
+    #[test]
+    fn wizard_popup_renders_provider_choices() {
+        use crate::wizard::Wizard;
+        let mut app = App::new("slate");
+        app.wizard = Some(Wizard::new());
+        let out = render_to_string(&mut app, 100, 24);
+        assert!(out.contains("Add connection"), "wizard title");
+        assert!(out.contains("Provider"), "prompt label");
+        assert!(out.contains("GitHub") && out.contains("Linear"), "provider options");
+        assert!(out.contains("choose") && out.contains("cancel"), "wizard footer hints");
     }
 
     #[test]

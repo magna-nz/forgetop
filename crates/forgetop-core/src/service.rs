@@ -170,6 +170,22 @@ impl ConfigService {
         cfg.ui.theme = theme;
         self.persist(cfg).await
     }
+
+    pub async fn set_hidden_sections(&self, hidden: Vec<Section>) -> Result<()> {
+        let mut cfg = self.snapshot();
+        cfg.ui.hidden_sections = hidden;
+        self.persist(cfg).await
+    }
+
+    /// Replaces a connection's tracked pipeline definitions with an explicit set
+    /// (turns off auto-discovery). An empty list tracks nothing.
+    pub async fn set_pipeline_definitions(&self, connection_id: &str, definition_ids: Vec<String>) -> Result<()> {
+        self.mutate_subscription(connection_id, move |s| {
+            s.auto_discover_all = false;
+            s.definition_ids = definition_ids;
+        })
+        .await
+    }
 }
 
 /// Turns a configured connection id into a live [`ProviderConnection`].
@@ -229,6 +245,12 @@ impl SectionService {
         let cfg = self.config.snapshot();
         let Some(binding) = cfg.work_items else { return Ok(None) };
         Ok(self.resolver.resolve(&binding.connection_id).await?.and_then(|c| c.work_items()))
+    }
+
+    /// Resolves a connection's pipeline source directly, regardless of whether it is
+    /// currently subscribed — used to discover definitions before subscribing.
+    pub async fn pipeline_source_for(&self, connection_id: &str) -> Result<Option<Arc<dyn PipelineSource>>> {
+        Ok(self.resolver.resolve(connection_id).await?.and_then(|c| c.pipelines()))
     }
 
     pub async fn pipeline_feeds(&self) -> Result<Vec<PipelineFeed>> {
@@ -388,5 +410,17 @@ mod tests {
         assert_eq!(svc.snapshot().pipelines.unwrap().subscriptions[0].definition_ids.len(), 2);
         svc.unsubscribe_pipeline("gh-1", "ci").await.unwrap();
         assert_eq!(svc.snapshot().pipelines.unwrap().subscriptions[0].definition_ids.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn set_pipeline_definitions_replaces_and_disables_auto() {
+        let (svc, _) = service();
+        svc.add_or_update_connection(conn("gh-1", ProviderType::GitHub), None).await.unwrap();
+        svc.set_pipeline_auto_discover("gh-1", true).await.unwrap();
+        svc.set_pipeline_definitions("gh-1", vec!["ci".into(), "release".into()]).await.unwrap();
+        let cfg = svc.snapshot();
+        let sub = &cfg.pipelines.unwrap().subscriptions[0];
+        assert!(!sub.auto_discover_all);
+        assert_eq!(sub.definition_ids, vec!["ci".to_string(), "release".to_string()]);
     }
 }

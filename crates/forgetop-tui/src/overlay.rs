@@ -16,6 +16,25 @@ pub enum Action {
     WiSetState(String),
     WiComment(String),
     PipelineTrigger { connection_id: String, definition_id: String, branch: Option<String>, label: String },
+    RemoveConnection { id: String, label: String },
+    /// Result of a checklist: the ids that ended up ticked, tagged with what they are.
+    ApplyToggle { kind: ToggleKind, ids: Vec<String> },
+}
+
+/// What a [`Overlay::Toggle`] checklist is choosing.
+#[derive(Debug, Clone)]
+pub enum ToggleKind {
+    /// Visible tab sections; item ids are section indices ("0"/"1"/"2").
+    Sections,
+    /// Pipeline definitions to subscribe a connection to; item ids are definition ids.
+    PipelineSubs { connection_id: String },
+}
+
+/// One row of a [`Overlay::Toggle`] checklist.
+pub struct ToggleItem {
+    pub id: String,
+    pub label: String,
+    pub on: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -34,6 +53,7 @@ pub enum Overlay {
     Confirm { title: String, message: String, action: Action },
     Picker { title: String, items: Vec<String>, selected: usize, kind: PickerKind },
     Input { title: String, buffer: String, kind: InputKind },
+    Toggle { title: String, kind: ToggleKind, min_one: bool, items: Vec<ToggleItem>, selected: usize },
 }
 
 /// What the app should do after feeding a key to the overlay.
@@ -49,7 +69,10 @@ pub enum Outcome {
 impl Overlay {
     pub fn title(&self) -> &str {
         match self {
-            Overlay::Confirm { title, .. } | Overlay::Picker { title, .. } | Overlay::Input { title, .. } => title,
+            Overlay::Confirm { title, .. }
+            | Overlay::Picker { title, .. }
+            | Overlay::Input { title, .. }
+            | Overlay::Toggle { title, .. } => title,
         }
     }
 
@@ -59,6 +82,7 @@ impl Overlay {
             Overlay::Confirm { .. } => vec![("y", "confirm"), ("Esc", "cancel")],
             Overlay::Picker { .. } => vec![("↑↓", "choose"), ("↵", "select"), ("Esc", "cancel")],
             Overlay::Input { .. } => vec![("Esc", "cancel"), ("↵", "submit")],
+            Overlay::Toggle { .. } => vec![("↑↓", "move"), ("space", "toggle"), ("Esc", "apply")],
         }
     }
 
@@ -97,6 +121,39 @@ impl Overlay {
                 }
                 Key::Enter => Outcome::Submit(resolve_input(*kind, buffer.clone())),
                 Key::Escape => Outcome::Cancel,
+                _ => Outcome::Keep,
+            },
+            Overlay::Toggle { items, selected, min_one, kind, .. } => match key {
+                Key::Up | Key::Char('k') => {
+                    if !items.is_empty() {
+                        *selected = (*selected + items.len() - 1) % items.len();
+                    }
+                    Outcome::Keep
+                }
+                Key::Down | Key::Char('j') => {
+                    if !items.is_empty() {
+                        *selected = (*selected + 1) % items.len();
+                    }
+                    Outcome::Keep
+                }
+                Key::Char(' ') | Key::Enter => {
+                    let on_count = items.iter().filter(|i| i.on).count();
+                    if let Some(item) = items.get_mut(*selected) {
+                        if item.on {
+                            // Optionally keep at least one ticked (used for visible tabs).
+                            if !*min_one || on_count > 1 {
+                                item.on = false;
+                            }
+                        } else {
+                            item.on = true;
+                        }
+                    }
+                    Outcome::Keep
+                }
+                Key::Escape => {
+                    let ids = items.iter().filter(|i| i.on).map(|i| i.id.clone()).collect();
+                    Outcome::Submit(Action::ApplyToggle { kind: kind.clone(), ids })
+                }
                 _ => Outcome::Keep,
             },
         }
@@ -178,6 +235,58 @@ mod tests {
         match o.handle(Key::Enter) {
             Outcome::Submit(Action::WiComment(text)) => assert_eq!(text, "needs tests"),
             _ => panic!("expected WiComment"),
+        }
+    }
+
+    fn item(id: &str, on: bool) -> ToggleItem {
+        ToggleItem { id: id.into(), label: id.into(), on }
+    }
+
+    #[test]
+    fn toggle_submits_ticked_ids() {
+        let mut o = Overlay::Toggle {
+            title: "".into(),
+            kind: ToggleKind::Sections,
+            min_one: true,
+            items: vec![item("0", true), item("1", true), item("2", true)],
+            selected: 1,
+        };
+        o.handle(Key::Char(' ')); // turn item 1 off
+        match o.handle(Key::Escape) {
+            Outcome::Submit(Action::ApplyToggle { ids, .. }) => assert_eq!(ids, vec!["0".to_string(), "2".to_string()]),
+            _ => panic!("expected ApplyToggle"),
+        }
+    }
+
+    #[test]
+    fn toggle_min_one_refuses_to_clear_the_last() {
+        let mut o = Overlay::Toggle {
+            title: "".into(),
+            kind: ToggleKind::Sections,
+            min_one: true,
+            items: vec![item("0", true)],
+            selected: 0,
+        };
+        o.handle(Key::Char(' ')); // would clear the only one — ignored
+        match o.handle(Key::Escape) {
+            Outcome::Submit(Action::ApplyToggle { ids, .. }) => assert_eq!(ids, vec!["0".to_string()]),
+            _ => panic!("expected ApplyToggle"),
+        }
+    }
+
+    #[test]
+    fn toggle_without_min_one_allows_empty() {
+        let mut o = Overlay::Toggle {
+            title: "".into(),
+            kind: ToggleKind::PipelineSubs { connection_id: "c".into() },
+            min_one: false,
+            items: vec![item("ci", true)],
+            selected: 0,
+        };
+        o.handle(Key::Char(' ')); // clear it — allowed for pipelines
+        match o.handle(Key::Escape) {
+            Outcome::Submit(Action::ApplyToggle { ids, .. }) => assert!(ids.is_empty()),
+            _ => panic!("expected ApplyToggle"),
         }
     }
 
