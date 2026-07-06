@@ -2,8 +2,6 @@
 
 # forgetop
 
-**htop for your software forges.**
-
 A fast, keyboard-driven terminal UI for your pull requests, work items, and CI
 pipelines — across **GitHub**, **GitLab**, **Azure DevOps**, **Linear**, **Jira**, and **Bitbucket** — in one place.
 
@@ -23,8 +21,6 @@ pipelines — across **GitHub**, **GitLab**, **Azure DevOps**, **Linear**, **Jir
 </div>
 
 ---
-
-## Why
 
 Modern teams spread work across several forges — code review in GitHub, tickets
 in Linear, pipelines in Azure DevOps. forgetop pulls them into a single terminal
