@@ -95,15 +95,18 @@ fn render_content(frame: &mut Frame, area: Rect, app: &mut App) {
             render_config(frame, area, &app.theme, view);
             return;
         }
-        Screen::PrView(view) => {
-            render_pr_view(frame, area, &app.theme, view);
-            return;
-        }
-        Screen::WiView(view) => {
-            render_wi_view(frame, area, &app.theme, view);
-            return;
-        }
-        Screen::List => {}
+        Screen::PrView(_) | Screen::WiView(_) | Screen::List => {}
+    }
+    // The full-screen views report how far they can scroll, so the key handler can clamp.
+    if matches!(app.screen, Screen::PrView(_)) {
+        let max = if let Screen::PrView(view) = &app.screen { render_pr_view(frame, area, &app.theme, view) } else { 0 };
+        app.detail_scroll_max = max;
+        return;
+    }
+    if matches!(app.screen, Screen::WiView(_)) {
+        let max = if let Screen::WiView(view) = &app.screen { render_wi_view(frame, area, &app.theme, view) } else { 0 };
+        app.detail_scroll_max = max;
+        return;
     }
     render_table(frame, area, app);
 }
@@ -494,7 +497,8 @@ fn pr_checks_lines(theme: &Theme, checks: &[CheckRun]) -> Vec<Line<'static>> {
         .collect()
 }
 
-fn render_pr_view(frame: &mut Frame, area: Rect, theme: &Theme, view: &PrView) {
+/// Renders the PR view and returns the maximum scroll offset for the current tab.
+fn render_pr_view(frame: &mut Frame, area: Rect, theme: &Theme, view: &PrView) -> u16 {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(3), Constraint::Length(1), Constraint::Min(3)])
@@ -518,20 +522,23 @@ fn render_pr_view(frame: &mut Frame, area: Rect, theme: &Theme, view: &PrView) {
     // Content.
     if view.tab == 3 {
         render_diff(frame, rows[2], theme, &view.diff);
-        return;
+        return 0; // the Diff tab manages its own scrolling
     }
     let (title, lines) = match view.tab {
         0 => ("Conversation", pr_conversation_lines(theme, &view.pr, &view.diff.threads)),
         1 => ("Commits", vec![Line::from(Span::styled("Commit history arrives in a later update.", Style::default().fg(theme.dim)))]),
         _ => ("Checks", pr_checks_lines(theme, &view.checks)),
     };
+    let inner_h = rows[2].height.saturating_sub(2);
+    let max = (lines.len() as u16).saturating_sub(inner_h);
     frame.render_widget(
-        Paragraph::new(lines).block(section_block(theme, title)).scroll((view.scroll, 0)).wrap(Wrap { trim: false }),
+        Paragraph::new(lines).block(section_block(theme, title)).scroll((view.scroll.min(max), 0)).wrap(Wrap { trim: false }),
         rows[2],
     );
+    max
 }
 
-fn render_wi_view(frame: &mut Frame, area: Rect, theme: &Theme, view: &WiView) {
+fn render_wi_view(frame: &mut Frame, area: Rect, theme: &Theme, view: &WiView) -> u16 {
     let wi = &view.wi;
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -564,10 +571,13 @@ fn render_wi_view(frame: &mut Frame, area: Rect, theme: &Theme, view: &WiView) {
         }
     }
     lines.extend(comment_lines(theme, &view.threads));
+    let inner_h = rows[1].height.saturating_sub(2);
+    let max = (lines.len() as u16).saturating_sub(inner_h);
     frame.render_widget(
-        Paragraph::new(lines).block(section_block(theme, "Work Item")).scroll((view.scroll, 0)).wrap(Wrap { trim: false }),
+        Paragraph::new(lines).block(section_block(theme, "Work Item")).scroll((view.scroll.min(max), 0)).wrap(Wrap { trim: false }),
         rows[1],
     );
+    max
 }
 
 // ---- connections + footer ----

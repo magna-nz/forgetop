@@ -69,6 +69,8 @@ pub struct App {
     /// Scroll offset for the current list; body height captured during render.
     pub list_scroll: u16,
     pub content_h: u16,
+    /// Max scroll offset for the open PR/WI view, captured during render for clamping.
+    pub detail_scroll_max: u16,
     pub pr_filter: PullRequestFilter,
     /// Transient one-shot message shown in the footer until the next keypress.
     pub toast: Option<String>,
@@ -270,6 +272,7 @@ impl App {
             loading: true,
             list_scroll: 0,
             content_h: 0,
+            detail_scroll_max: 0,
             pr_filter: PullRequestFilter::All,
             toast: None,
             overlay: None,
@@ -631,11 +634,19 @@ impl App {
             }
             _ => {}
         }
+        let max = self.detail_scroll_max;
         let Screen::PrView(v) = &mut self.screen else { return };
         let n = PR_TABS.len();
         match key {
-            Key::Left | Key::Char('h') => v.tab = (v.tab + n - 1) % n,
-            Key::Right | Key::Char('l') => v.tab = (v.tab + 1) % n,
+            // Changing tab resets the scroll (each tab starts at the top).
+            Key::Left | Key::Char('h') => {
+                v.tab = (v.tab + n - 1) % n;
+                v.scroll = 0;
+            }
+            Key::Right | Key::Char('l') => {
+                v.tab = (v.tab + 1) % n;
+                v.scroll = 0;
+            }
             Key::Up | Key::Char('k') => {
                 if v.tab == 3 {
                     v.diff.select_file(-1);
@@ -647,14 +658,14 @@ impl App {
                 if v.tab == 3 {
                     v.diff.select_file(1);
                 } else {
-                    v.scroll = v.scroll.saturating_add(1);
+                    v.scroll = (v.scroll + 1).min(max);
                 }
             }
             Key::PageDown | Key::Char(' ') => {
                 if v.tab == 3 {
                     v.diff.scroll_by(10);
                 } else {
-                    v.scroll = v.scroll.saturating_add(10);
+                    v.scroll = (v.scroll + 10).min(max);
                 }
             }
             Key::PageUp | Key::Char('b') => {
@@ -692,11 +703,12 @@ impl App {
             }
             _ => {}
         }
+        let max = self.detail_scroll_max;
         let Screen::WiView(v) = &mut self.screen else { return };
         match key {
             Key::Up | Key::Char('k') => v.scroll = v.scroll.saturating_sub(1),
-            Key::Down | Key::Char('j') => v.scroll = v.scroll.saturating_add(1),
-            Key::PageDown | Key::Char(' ') => v.scroll = v.scroll.saturating_add(10),
+            Key::Down | Key::Char('j') => v.scroll = (v.scroll + 1).min(max),
+            Key::PageDown | Key::Char(' ') => v.scroll = (v.scroll + 10).min(max),
             Key::PageUp | Key::Char('b') => v.scroll = v.scroll.saturating_sub(10),
             _ => {}
         }
