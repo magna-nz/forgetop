@@ -5,7 +5,6 @@ pipelines - across **GitHub**, **GitLab**, **Azure DevOps**, **Linear**, **Jira*
 
 [![CI](https://github.com/magna-nz/forgetop/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/magna-nz/forgetop/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/magna-nz/forgetop?sort=semver&label=release)](https://github.com/magna-nz/forgetop/releases/latest)
-[![Downloads](https://img.shields.io/github/downloads/magna-nz/forgetop/total?label=downloads)](https://github.com/magna-nz/forgetop/releases)
 [![Rust](https://img.shields.io/badge/built%20with-Rust-DEA584?logo=rust&logoColor=white)](https://www.rust-lang.org)
 [![Platforms](https://img.shields.io/badge/runs%20on-macOS%20%7C%20Linux%20%7C%20Windows-success)](#install)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
