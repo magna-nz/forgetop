@@ -354,6 +354,7 @@ mod tests {
             organization: None,
             project: None,
             repository: None,
+            username: None,
             credential_ref: None,
         }
     }

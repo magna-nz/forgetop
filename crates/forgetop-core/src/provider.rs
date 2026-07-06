@@ -27,6 +27,9 @@ pub struct Connection {
     pub project: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repository: Option<String>,
+    /// Identity for Basic-auth providers (e.g. Jira email, Bitbucket username).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_ref: Option<String>,
 }
@@ -293,6 +296,7 @@ mod tests {
             organization: None,
             project: None,
             repository: None,
+            username: None,
             credential_ref: None,
         }
     }

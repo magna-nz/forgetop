@@ -12,9 +12,11 @@ use crate::app::Key;
 pub enum Field {
     Provider,
     DisplayName,
+    BaseUrl,
     Organization,
     Project,
     Repository,
+    Username,
     Pat,
     Bind,
 }
@@ -48,9 +50,11 @@ impl Prompt {
 pub struct Draft {
     pub provider: Option<ProviderType>,
     pub display_name: String,
+    pub base_url: Option<String>,
     pub organization: Option<String>,
     pub project: Option<String>,
     pub repository: Option<String>,
+    pub username: Option<String>,
     pub pat: Option<String>,
     pub bind_section: Option<Section>,
 }
@@ -75,7 +79,8 @@ impl Default for Wizard {
 
 impl Wizard {
     pub fn new() -> Self {
-        let providers = vec!["Demo".into(), "GitHub".into(), "Azure DevOps".into(), "Linear".into(), "GitLab".into()];
+        let providers =
+            vec!["Demo".into(), "GitHub".into(), "Azure DevOps".into(), "Linear".into(), "GitLab".into(), "Jira".into()];
         let mut queue = VecDeque::new();
         queue.push_back(Prompt::pick(Field::Provider, "Provider", providers, 1));
         Wizard { queue, draft: Draft::default(), done: 0 }
@@ -154,10 +159,13 @@ impl Wizard {
                     1 => ProviderType::GitHub,
                     2 => ProviderType::AzureDevOps,
                     3 => ProviderType::Linear,
-                    _ => ProviderType::GitLab,
+                    4 => ProviderType::GitLab,
+                    _ => ProviderType::Jira,
                 });
             }
             (Field::DisplayName, PromptKind::Text { buffer, .. }) => self.draft.display_name = buffer.trim().to_string(),
+            (Field::BaseUrl, PromptKind::Text { buffer, .. }) => self.draft.base_url = non_empty(buffer),
+            (Field::Username, PromptKind::Text { buffer, .. }) => self.draft.username = non_empty(buffer),
             (Field::Organization, PromptKind::Text { buffer, .. }) => self.draft.organization = non_empty(buffer),
             (Field::Project, PromptKind::Text { buffer, .. }) => self.draft.project = non_empty(buffer),
             (Field::Repository, PromptKind::Text { buffer, .. }) => self.draft.repository = non_empty(buffer),
@@ -191,6 +199,12 @@ impl Wizard {
                 self.queue.push_back(Prompt::text(Field::Repository, "Project (group/project)", true, ""));
                 self.queue.push_back(Prompt::secret(Field::Pat, "Personal access token"));
             }
+            ProviderType::Jira => {
+                self.queue.push_back(Prompt::text(Field::BaseUrl, "Site URL (https://your-site.atlassian.net)", true, ""));
+                self.queue.push_back(Prompt::text(Field::Project, "Project key (e.g. ENG)", true, ""));
+                self.queue.push_back(Prompt::text(Field::Username, "Email", true, ""));
+                self.queue.push_back(Prompt::secret(Field::Pat, "API token"));
+            }
             // Not offered by the picker yet (no factory); handled generically for exhaustiveness.
             ProviderType::Bitbucket => {
                 self.queue.push_back(Prompt::secret(Field::Pat, "Personal access token"));
@@ -209,7 +223,7 @@ fn non_empty(s: &str) -> Option<String> {
 
 pub fn provider_sections(provider: ProviderType) -> Vec<Section> {
     match provider {
-        ProviderType::Linear => vec![Section::WorkItems],
+        ProviderType::Linear | ProviderType::Jira => vec![Section::WorkItems],
         _ => vec![Section::PullRequests, Section::WorkItems, Section::Pipelines],
     }
 }
