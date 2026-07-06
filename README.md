@@ -16,7 +16,6 @@ pipelines — across **GitHub**, **GitLab**, **Azure DevOps**, **Linear**, **Jir
 
 </div>
 
-<!-- Replace with a real screen recording once captured. -->
 <div align="center">
   <img src="docs/demo.gif" alt="forgetop demo" width="820">
   <br/>
@@ -103,7 +102,6 @@ straight into the **add-connection wizard**:
 forgetop
 ```
 
-<!-- Replace with a real screen recording once captured. -->
 <div align="center">
   <img src="docs/wizard.gif" alt="Adding a connection with the wizard" width="720">
   <br/>
