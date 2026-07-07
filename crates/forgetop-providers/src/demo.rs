@@ -559,12 +559,14 @@ struct DemoWi;
 #[async_trait]
 impl WorkItemSource for DemoWi {
     async fn list(&self, query: &WorkItemQuery) -> Result<Vec<WorkItem>> {
+        // The demo's "me" is Alice (u1); mine_only keeps only her items.
         Ok(work_items()
             .into_iter()
             .filter(|w| {
                 query.include_completed
                     || !matches!(w.state_category, WorkItemStateCategory::Completed | WorkItemStateCategory::Canceled)
             })
+            .filter(|w| !query.mine_only || w.assignee.as_ref().map(|u| u.id == "u1").unwrap_or(false))
             .collect())
     }
     async fn get(&self, id: &str) -> Result<WorkItem> {
@@ -710,5 +712,17 @@ mod tests {
     #[tokio::test]
     async fn health_is_true() {
         assert!(conn().check().await);
+    }
+
+    #[tokio::test]
+    async fn work_items_mine_only_filters_to_the_current_user() {
+        let src = conn().work_items().unwrap();
+        let all = src.list(&WorkItemQuery { mine_only: false, include_completed: false, limit: None }).await.unwrap();
+        let mine = src.list(&WorkItemQuery { mine_only: true, include_completed: false, limit: None }).await.unwrap();
+        assert!(!mine.is_empty() && mine.len() < all.len(), "mine-only narrows the list");
+        assert!(
+            mine.iter().all(|w| w.assignee.as_ref().map(|u| u.id == "u1").unwrap_or(false)),
+            "only Alice's items remain"
+        );
     }
 }
