@@ -787,6 +787,7 @@ fn footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
     if app.views[app.active].len() > 1 {
         keys.push(("[ ]", "views"));
     }
+    keys.push(("V", "save view"));
     keys.push(("/", "find"));
     keys.extend([("v", "tabs"), ("C", "config"), ("r", "refresh"), ("t", "theme"), ("?", "help"), ("q", "quit")]);
     keys
@@ -1268,10 +1269,18 @@ fn help_sections() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
             ],
         ),
         (
+            "Saved views",
+            vec![
+                ("[  ]", "Previous / next saved view"),
+                ("V", "Save the current filter + sort + states as a view"),
+                ("X", "Delete the current view"),
+            ],
+        ),
+        (
             "Pull Requests (list)",
             vec![
                 ("Enter", "Open the PR view (all actions live there)"),
-                ("f", "Cycle filter (All / Mine / Review)"),
+                ("f", "Next saved view (defaults: All / Mine / Review)"),
             ],
         ),
         (

@@ -25,6 +25,10 @@ pub enum Action {
     SubmitReview(ReviewVote),
     /// Sort a section by the chosen column index (resolved to a key by the app).
     SetSort { section: usize, index: usize },
+    /// Save the current filter/sort/state as a new named view.
+    SaveView(String),
+    /// Delete the active section's current saved view.
+    DeleteView,
 }
 
 /// What a [`Overlay::Toggle`] checklist is choosing.
@@ -66,6 +70,8 @@ pub enum InputKind {
     WorkItemComment,
     /// The body of a pending inline line comment.
     PrLineComment,
+    /// The name for a new saved view.
+    SaveView,
 }
 
 pub enum Overlay {
@@ -231,6 +237,7 @@ fn resolve_input(kind: InputKind, text: String) -> Action {
         InputKind::PrComment => Action::PrComment(text),
         InputKind::WorkItemComment => Action::WiComment(text),
         InputKind::PrLineComment => Action::AddLineComment(text),
+        InputKind::SaveView => Action::SaveView(text),
     }
 }
 

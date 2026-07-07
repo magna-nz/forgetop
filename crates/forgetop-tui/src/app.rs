@@ -752,6 +752,78 @@ impl App {
         self.fix_selection();
     }
 
+    /// Snapshots the active section's current filter/sort/state into a named view.
+    fn current_view_snapshot(&self, name: String) -> SavedView {
+        let section = self.active;
+        let hidden_states = if section == 1 {
+            let mut s: Vec<String> = self.wi_hidden_states.iter().cloned().collect();
+            s.sort();
+            s
+        } else {
+            Vec::new()
+        };
+        SavedView {
+            name,
+            filter: (section == 0).then(|| pr_filter_key(self.pr_filter).to_string()),
+            query: self.filters[section].clone(),
+            sort: self.sort_for(section).cloned(),
+            hidden_states,
+        }
+    }
+
+    /// Opens the name prompt to save the current view.
+    fn open_save_view(&mut self) {
+        self.overlay = Some(Overlay::Input {
+            title: "Save current view as".into(),
+            buffer: String::new(),
+            kind: InputKind::SaveView,
+        });
+    }
+
+    /// Saves the current filter/sort/state as a new view and switches to it.
+    async fn save_view(&mut self, name: String, deps: &AppDeps) {
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+        let section = self.active;
+        let view = self.current_view_snapshot(name.clone());
+        self.views[section].push(view);
+        self.view_idx[section] = self.views[section].len() - 1;
+        let _ = deps.config.set_views(section_of(section), self.views[section].clone()).await;
+        self.toast = Some(format!("Saved view: {name}"));
+    }
+
+    /// Confirms deleting the active section's current view (never the last one).
+    fn open_delete_view(&mut self) {
+        let section = self.active;
+        if self.views[section].len() <= 1 {
+            self.toast = Some("Can't delete the last view".into());
+            return;
+        }
+        let name = self.active_view(section).map(|v| v.name.clone()).unwrap_or_default();
+        self.overlay = Some(Overlay::Confirm {
+            title: "Delete view".into(),
+            message: format!("Delete view '{name}'?"),
+            action: Action::DeleteView,
+        });
+    }
+
+    /// Removes the current view, persists, and applies whatever view is now current.
+    async fn delete_view(&mut self, deps: &AppDeps) {
+        let section = self.active;
+        if self.views[section].len() <= 1 {
+            return;
+        }
+        let idx = self.view_idx[section].min(self.views[section].len() - 1);
+        let removed = self.views[section].remove(idx);
+        self.view_idx[section] = idx.min(self.views[section].len() - 1);
+        let _ = deps.config.set_views(section_of(section), self.views[section].clone()).await;
+        let target = self.view_idx[section];
+        self.apply_view(section, target, deps).await;
+        self.toast = Some(format!("Deleted view: {}", removed.name));
+    }
+
     /// The active sort for a section, if any.
     pub fn sort_for(&self, section: usize) -> Option<&SortPref> {
         match section {
@@ -1491,9 +1563,11 @@ impl App {
             'n' => self.start_add_connection(),
             'v' => self.open_sections_toggle(),
             'C' => self.open_config(deps).await,
-            // Saved views: previous / next on the active section.
+            // Saved views: previous / next on the active section; save / delete.
             '[' => self.switch_view(-1, deps).await,
             ']' => self.switch_view(1, deps).await,
+            'V' => self.open_save_view(),
+            'X' => self.open_delete_view(),
             'f' if self.active == 0 => self.switch_view(1, deps).await,
             'f' if self.active == 1 => self.open_wi_states_toggle(),
             // Pipeline trigger (Pipelines tab).
@@ -2125,6 +2199,8 @@ impl App {
             Action::AddLineComment(body) => self.add_line_comment(body),
             Action::SubmitReview(event) => self.submit_review(event, deps).await,
             Action::SetSort { section, index } => self.apply_sort(section, index, deps).await,
+            Action::SaveView(name) => self.save_view(name, deps).await,
+            Action::DeleteView => self.delete_view(deps).await,
         }
     }
 
@@ -2592,6 +2668,15 @@ fn parse_pr_filter(s: Option<&str>) -> PullRequestFilter {
     }
 }
 
+/// The persisted key for a PR base filter (inverse of [`parse_pr_filter`]).
+fn pr_filter_key(f: PullRequestFilter) -> &'static str {
+    match f {
+        PullRequestFilter::Mine => "mine",
+        PullRequestFilter::ReviewRequested => "review",
+        PullRequestFilter::All => "all",
+    }
+}
+
 /// The built-in views seeded for a section that has none saved.
 fn default_views(section: usize) -> Vec<SavedView> {
     let v = |name: &str, filter: Option<&str>| SavedView {
@@ -2911,6 +2996,30 @@ mod tests {
         app.apply_views(custom, vec![], vec![]);
         assert_eq!(app.views[0].len(), 1);
         assert_eq!(app.views[0][0].name, "Stale");
+    }
+
+    #[test]
+    fn snapshot_captures_current_state_per_section() {
+        let mut app = App::new("slate");
+        app.apply_views(vec![], vec![], vec![]);
+
+        // Pull Requests: records the base filter + quick-filter, no hidden states.
+        app.active = 0;
+        app.pr_filter = PullRequestFilter::Mine;
+        app.filters[0] = "wip".into();
+        let v = app.current_view_snapshot("My PRs".into());
+        assert_eq!(v.name, "My PRs");
+        assert_eq!(v.filter.as_deref(), Some("mine"));
+        assert_eq!(v.query, "wip");
+        assert!(v.hidden_states.is_empty());
+
+        // Work Items: records hidden states (sorted, stable) and no PR filter.
+        app.active = 1;
+        app.wi_hidden_states.insert("Done".into());
+        app.wi_hidden_states.insert("Backlog".into());
+        let w = app.current_view_snapshot("Active".into());
+        assert_eq!(w.filter, None);
+        assert_eq!(w.hidden_states, vec!["Backlog".to_string(), "Done".to_string()]);
     }
 
     #[test]
