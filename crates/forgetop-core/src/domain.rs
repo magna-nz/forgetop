@@ -254,6 +254,8 @@ pub struct PipelineDefinition {
 pub struct PipelineStep {
     pub name: String,
     pub status: PipelineRunStatus,
+    pub started_at: Option<DateTime<Utc>>,
+    pub finished_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -264,6 +266,11 @@ pub struct PipelineJob {
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
     pub steps: Vec<PipelineStep>,
+    /// Deep link to this job in the provider's web UI.
+    pub url: Option<String>,
+    /// A short problem summary for failed jobs (provider-specific: GitLab's
+    /// failure reason, Azure's error/warning counts, etc.).
+    pub problem: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

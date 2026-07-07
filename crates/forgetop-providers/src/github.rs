@@ -216,8 +216,15 @@ pub fn map_job(v: &Value) -> PipelineJob {
         finished_at: get_date(v, "completed_at"),
         steps: get_arr(v, "steps")
             .iter()
-            .map(|s| PipelineStep { name: get_str(s, "name").unwrap_or_else(|| "step".into()), status: status_of(s) })
+            .map(|s| PipelineStep {
+                name: get_str(s, "name").unwrap_or_else(|| "step".into()),
+                status: status_of(s),
+                started_at: get_date(s, "started_at"),
+                finished_at: get_date(s, "completed_at"),
+            })
             .collect(),
+        url: get_str(v, "html_url"),
+        problem: None,
     }
 }
 

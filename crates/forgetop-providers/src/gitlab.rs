@@ -144,6 +144,8 @@ pub fn map_gl_job(v: &Value) -> PipelineJob {
         started_at: get_date(v, "started_at"),
         finished_at: get_date(v, "finished_at"),
         steps: vec![],
+        url: get_str(v, "web_url"),
+        problem: get_str(v, "failure_reason").filter(|s| !s.is_empty()).map(|s| s.replace('_', " ")),
     }
 }
 

@@ -723,8 +723,12 @@ fn footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
     if matches!(app.screen, Screen::WiView(_)) {
         return vec![("PgUp/Dn", "scroll"), ("s", "state"), ("c", "comment"), ("o", "open"), ("Esc", "back"), ("q", "quit")];
     }
-    if matches!(app.screen, Screen::Pipeline(_)) {
-        return vec![("↑↓", "move"), ("↵", "expand"), ("T", "trigger"), ("o", "open"), ("Esc", "back"), ("q", "quit")];
+    if let Screen::Pipeline(v) = &app.screen {
+        return if v.logs.is_some() {
+            vec![("↑↓", "scroll"), ("PgUp/Dn", "jump"), ("Esc", "close logs")]
+        } else {
+            vec![("↑↓", "move"), ("↵", "expand"), ("L", "logs"), ("T", "trigger"), ("o", "open job"), ("Esc", "back"), ("q", "quit")]
+        };
     }
     if matches!(app.screen, Screen::Config(_)) {
         return vec![
@@ -1049,6 +1053,18 @@ fn render_pipeline(frame: &mut Frame, area: Rect, theme: &Theme, view: &Pipeline
     let header_block = section_block(theme, &view.title);
     frame.render_widget(Paragraph::new(header).block(header_block), rows[0]);
 
+    // A log pane, when open, replaces the tree.
+    if let Some(log) = &view.logs {
+        let lines: Vec<Line> = log.lines.iter().map(|l| Line::from(Span::styled(l.clone(), Style::default().fg(theme.fg)))).collect();
+        let inner_h = rows[1].height.saturating_sub(2);
+        let max = (lines.len() as u16).saturating_sub(inner_h);
+        frame.render_widget(
+            Paragraph::new(lines).block(section_block(theme, &log.title)).scroll((log.scroll.min(max), 0)),
+            rows[1],
+        );
+        return;
+    }
+
     // Tree of stages → jobs → steps.
     let nodes = view.flatten();
     let tree_block = section_block(theme, "Stages · jobs · steps");
@@ -1071,12 +1087,19 @@ fn render_pipeline(frame: &mut Frame, area: Rect, theme: &Theme, view: &Pipeline
             } else {
                 Style::default().fg(theme.fg)
             };
-            ListItem::new(Line::from(vec![
+            let mut spans = vec![
                 Span::raw(indent),
                 Span::styled(marker, Style::default().fg(theme.dim)),
                 Span::styled(format!("{} ", pipeline_icon(n.status)), Style::default().fg(theme.pipeline_color(n.status))),
                 Span::styled(n.label.clone(), label_style),
-            ]))
+            ];
+            if let Some(d) = &n.duration {
+                spans.push(Span::styled(format!("  {d}"), Style::default().fg(theme.dim)));
+            }
+            if let Some(p) = &n.problem {
+                spans.push(Span::styled(format!("  ⚠ {p}"), Style::default().fg(theme.red)));
+            }
+            ListItem::new(Line::from(spans))
         })
         .collect();
 
@@ -1238,7 +1261,13 @@ fn help_sections() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
         ),
         (
             "Pipelines",
-            vec![("Enter", "Drill in (stages → jobs → steps)"), ("T", "Trigger a run")],
+            vec![
+                ("Enter", "Drill in (stages → jobs → steps)"),
+                ("Enter (in drill-in)", "Expand / collapse a node"),
+                ("L", "View the selected job's logs"),
+                ("o", "Open the selected job in the browser"),
+                ("T", "Trigger a run"),
+            ],
         ),
         (
             "Config / connections",
@@ -1604,7 +1633,14 @@ mod tests {
                     status: PipelineRunStatus::Succeeded,
                     started_at: None,
                     finished_at: None,
-                    steps: vec![PipelineStep { name: "cargo build".into(), status: PipelineRunStatus::Succeeded }],
+                    steps: vec![PipelineStep {
+                        name: "cargo build".into(),
+                        status: PipelineRunStatus::Succeeded,
+                        started_at: None,
+                        finished_at: None,
+                    }],
+                    url: None,
+                    problem: None,
                 }],
             }],
         }

@@ -189,6 +189,8 @@ pub fn map_step(v: &Value) -> PipelineJob {
         started_at: get_date(v, "started_on"),
         finished_at: get_date(v, "completed_on"),
         steps: vec![],
+        url: None,
+        problem: None,
     }
 }
 

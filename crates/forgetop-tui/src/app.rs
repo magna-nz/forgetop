@@ -4,7 +4,7 @@ use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use chrono::{DateTime, Local};
+use chrono::{DateTime, Local, Utc};
 use forgetop_core::config::SortPref;
 use forgetop_core::domain::*;
 use forgetop_core::provider::*;
@@ -192,6 +192,45 @@ pub struct FlatNode {
     /// Collapse key when the node has children; `None` for leaf steps.
     pub key: Option<String>,
     pub expanded: bool,
+    /// Elapsed time (only for completed nodes), pre-formatted e.g. `3m12s`.
+    pub duration: Option<String>,
+    /// Short failure summary for failed jobs (provider-specific).
+    pub problem: Option<String>,
+    /// Deep link to the job (for `o`); steps inherit their job's link.
+    pub url: Option<String>,
+    /// The job id whose logs this node maps to (for `L`); `None` for stages.
+    pub job_id: Option<String>,
+}
+
+/// A scrollable log view over one job, shown within the pipeline drill-in.
+pub struct LogView {
+    pub title: String,
+    pub lines: Vec<String>,
+    pub scroll: u16,
+}
+
+/// Formats the elapsed time between two instants (only when both are known).
+fn fmt_duration(start: Option<DateTime<Utc>>, finish: Option<DateTime<Utc>>) -> Option<String> {
+    let (s, f) = (start?, finish?);
+    let secs = (f - s).num_seconds().max(0);
+    Some(if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60)
+    })
+}
+
+/// The elapsed span of a whole stage, or `None` if any job is still unfinished.
+fn stage_duration(jobs: &[PipelineJob]) -> Option<String> {
+    let start = jobs.iter().filter_map(|j| j.started_at).min();
+    let finish = if jobs.iter().all(|j| j.finished_at.is_some()) {
+        jobs.iter().filter_map(|j| j.finished_at).max()
+    } else {
+        None
+    };
+    fmt_duration(start, finish)
 }
 
 /// State for the full-screen pipeline drill-in (stages → jobs → steps).
@@ -203,11 +242,13 @@ pub struct PipelineView {
     pub branch: Option<String>,
     collapsed: HashSet<String>,
     pub selected: usize,
+    /// Open log pane over a selected job, if any.
+    pub logs: Option<LogView>,
 }
 
 impl PipelineView {
     pub fn new(title: String, run: PipelineRun, connection_id: String, definition_id: String, branch: Option<String>) -> Self {
-        Self { title, run, connection_id, definition_id, branch, collapsed: HashSet::new(), selected: 0 }
+        Self { title, run, connection_id, definition_id, branch, collapsed: HashSet::new(), selected: 0, logs: None }
     }
 
     /// Flattens stages/jobs/steps into visible rows, honouring collapsed nodes.
@@ -222,6 +263,10 @@ impl PipelineView {
                 status: stage.status,
                 key: (!stage.jobs.is_empty()).then(|| key.clone()),
                 expanded,
+                duration: stage_duration(&stage.jobs),
+                problem: None,
+                url: None,
+                job_id: None,
             });
             if !expanded {
                 continue;
@@ -235,10 +280,24 @@ impl PipelineView {
                     status: job.status,
                     key: (!job.steps.is_empty()).then(|| jkey.clone()),
                     expanded: jexpanded,
+                    duration: fmt_duration(job.started_at, job.finished_at),
+                    problem: job.problem.clone(),
+                    url: job.url.clone(),
+                    job_id: Some(job.id.clone()),
                 });
                 if jexpanded {
                     for step in &job.steps {
-                        out.push(FlatNode { depth: 2, label: step.name.clone(), status: step.status, key: None, expanded: false });
+                        out.push(FlatNode {
+                            depth: 2,
+                            label: step.name.clone(),
+                            status: step.status,
+                            key: None,
+                            expanded: false,
+                            duration: fmt_duration(step.started_at, step.finished_at),
+                            problem: None,
+                            url: job.url.clone(),
+                            job_id: Some(job.id.clone()),
+                        });
                     }
                 }
             }
@@ -773,7 +832,15 @@ impl App {
         // Full-screen sub-views handle their own keys.
         match self.screen {
             Screen::Pipeline(_) => {
-                self.on_pipeline_key(key);
+                // An open log pane captures scroll/close; `L` fetches logs (async).
+                let logs_open = matches!(&self.screen, Screen::Pipeline(v) if v.logs.is_some());
+                if logs_open {
+                    self.on_pipeline_logs_key(key);
+                } else if key == Key::Char('L') {
+                    self.open_pipeline_logs(deps).await;
+                } else {
+                    self.on_pipeline_key(key);
+                }
                 return;
             }
             Screen::Config(_) => {
@@ -1266,6 +1333,53 @@ impl App {
         }
     }
 
+    /// Fetches the selected job's logs and opens the scrollable log pane.
+    async fn open_pipeline_logs(&mut self, deps: &AppDeps) {
+        let (conn_id, run_id, job_id, title) = {
+            let Screen::Pipeline(v) = &self.screen else { return };
+            let nodes = v.flatten();
+            let node = nodes.get(v.selected);
+            let Some(job_id) = node.and_then(|n| n.job_id.clone()) else {
+                self.toast = Some("Select a job or step to view its logs".into());
+                return;
+            };
+            let label = node.map(|n| n.label.clone()).unwrap_or_default();
+            (v.connection_id.clone(), v.run.id.clone(), job_id, format!("Logs · {label}"))
+        };
+
+        self.toast = Some("Fetching logs…".into());
+        let feeds = deps.sections.pipeline_feeds().await.unwrap_or_default();
+        let text = match feeds.iter().find(|f| f.connection.connection_id() == conn_id) {
+            Some(feed) => match feed.source.logs(&run_id, Some(&job_id)).await {
+                Ok(t) => t,
+                Err(e) => format!("Couldn't fetch logs: {e}"),
+            },
+            None => "Pipeline connection not found".into(),
+        };
+        let lines: Vec<String> =
+            if text.trim().is_empty() { vec!["(no logs returned)".into()] } else { text.lines().map(|l| l.to_string()).collect() };
+        if let Screen::Pipeline(v) = &mut self.screen {
+            v.logs = Some(LogView { title, lines, scroll: 0 });
+        }
+        self.toast = None;
+    }
+
+    /// Scroll / close keys while the log pane is open.
+    fn on_pipeline_logs_key(&mut self, key: Key) {
+        if let Screen::Pipeline(v) = &mut self.screen {
+            if let Some(log) = &mut v.logs {
+                match key {
+                    Key::Up | Key::Char('k') => log.scroll = log.scroll.saturating_sub(1),
+                    Key::Down | Key::Char('j') => log.scroll = log.scroll.saturating_add(1),
+                    Key::PageUp | Key::Char('b') => log.scroll = log.scroll.saturating_sub(15),
+                    Key::PageDown | Key::Char(' ') => log.scroll = log.scroll.saturating_add(15),
+                    Key::Escape | Key::Char('L') => v.logs = None,
+                    _ => {}
+                }
+            }
+        }
+    }
+
     /// The pipeline to trigger — from the drill-in view if open, else the selected list row.
     fn pipeline_target(&self) -> Option<(String, String, Option<String>, String)> {
         if let Screen::Pipeline(v) = &self.screen {
@@ -1331,7 +1445,11 @@ impl App {
         match &self.screen {
             Screen::PrView(v) => return v.url.clone(),
             Screen::WiView(v) => return v.wi.url.clone(),
-            Screen::Pipeline(v) => return v.run.url.clone(),
+            Screen::Pipeline(v) => {
+                // Prefer the selected job's deep link, falling back to the whole run.
+                let nodes = v.flatten();
+                return nodes.get(v.selected).and_then(|n| n.url.clone()).or_else(|| v.run.url.clone());
+            }
             Screen::List | Screen::Config(_) => {}
         }
         match self.active {
@@ -2193,6 +2311,88 @@ mod tests {
         // Sort composes with the quick filter (only matching rows, still sorted).
         app.filters[0] = "e".into(); // matches "cherry" and "apple"
         assert_eq!(app.filtered_pr_indices(), vec![2, 1]); // apple(2) then cherry(1)
+    }
+
+    #[test]
+    fn pipeline_duration_formatting_and_stage_span() {
+        use chrono::TimeZone;
+        let t = |s: i64| Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap() + chrono::Duration::seconds(s);
+
+        assert_eq!(fmt_duration(Some(t(0)), Some(t(45))).as_deref(), Some("45s"));
+        assert_eq!(fmt_duration(Some(t(0)), Some(t(75))).as_deref(), Some("1m15s"));
+        assert_eq!(fmt_duration(Some(t(0)), Some(t(3720))).as_deref(), Some("1h02m"));
+        assert_eq!(fmt_duration(Some(t(0)), None), None, "unfinished → no duration");
+        assert_eq!(fmt_duration(None, Some(t(10))), None);
+
+        let mk = |start: i64, fin: Option<i64>| PipelineJob {
+            id: "j".into(),
+            name: "j".into(),
+            status: PipelineRunStatus::Succeeded,
+            started_at: Some(t(start)),
+            finished_at: fin.map(t),
+            steps: vec![],
+            url: None,
+            problem: None,
+        };
+        // Stage spans earliest start → latest finish; any unfinished job → None.
+        assert_eq!(stage_duration(&[mk(0, Some(30)), mk(10, Some(50))]).as_deref(), Some("50s"));
+        assert_eq!(stage_duration(&[mk(0, Some(30)), mk(10, None)]), None);
+    }
+
+    fn failed_run() -> PipelineRun {
+        PipelineRun {
+            id: "r1".into(),
+            definition_id: "ci".into(),
+            number: Some(1),
+            name: Some("CI".into()),
+            status: PipelineRunStatus::Failed,
+            triggered_by: None,
+            branch: Some("main".into()),
+            commit_sha: None,
+            started_at: None,
+            finished_at: None,
+            url: Some("http://run".into()),
+            stages: vec![PipelineStage {
+                name: "test".into(),
+                status: PipelineRunStatus::Failed,
+                jobs: vec![PipelineJob {
+                    id: "j1".into(),
+                    name: "unit".into(),
+                    status: PipelineRunStatus::Failed,
+                    started_at: None,
+                    finished_at: None,
+                    steps: vec![],
+                    url: Some("http://job".into()),
+                    problem: Some("boom".into()),
+                }],
+            }],
+        }
+    }
+
+    #[test]
+    fn pipeline_node_url_and_log_pane() {
+        let mut app = App::new("slate");
+        app.screen = Screen::Pipeline(Box::new(PipelineView::new("CI".into(), failed_run(), "c".into(), "ci".into(), Some("main".into()))));
+
+        // Node 0 is the stage (no deep link) → falls back to the run URL.
+        assert_eq!(app.selected_url().as_deref(), Some("http://run"));
+        // Node 1 is the job → its own deep link.
+        if let Screen::Pipeline(v) = &mut app.screen {
+            v.selected = 1;
+        }
+        assert_eq!(app.selected_url().as_deref(), Some("http://job"));
+
+        // The log pane scrolls and closes on Esc.
+        if let Screen::Pipeline(v) = &mut app.screen {
+            v.logs = Some(LogView { title: "Logs".into(), lines: vec!["x".into(); 50], scroll: 0 });
+        }
+        app.on_pipeline_logs_key(Key::Down);
+        app.on_pipeline_logs_key(Key::Down);
+        let Screen::Pipeline(v) = &app.screen else { panic!() };
+        assert_eq!(v.logs.as_ref().unwrap().scroll, 2);
+        app.on_pipeline_logs_key(Key::Escape);
+        let Screen::Pipeline(v) = &app.screen else { panic!() };
+        assert!(v.logs.is_none(), "Esc closes the log pane");
     }
 
     #[test]

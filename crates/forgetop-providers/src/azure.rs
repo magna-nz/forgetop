@@ -235,6 +235,19 @@ fn record_status(v: &Value) -> PipelineRunStatus {
     }
 }
 
+/// A short error/warning summary from a timeline record, if any.
+fn az_problem(v: &Value) -> Option<String> {
+    let plural = |n: i64, w: &str| format!("{n} {w}{}", if n == 1 { "" } else { "s" });
+    let e = get_i64(v, "errorCount").unwrap_or(0);
+    let w = get_i64(v, "warningCount").unwrap_or(0);
+    match (e, w) {
+        (0, 0) => None,
+        (e, 0) => Some(plural(e, "error")),
+        (0, w) => Some(plural(w, "warning")),
+        (e, w) => Some(format!("{}, {}", plural(e, "error"), plural(w, "warning"))),
+    }
+}
+
 /// Build a `+`/`-`/space line diff (ADO doesn't return patch text).
 pub fn unified_diff(old: &str, new: &str) -> (String, i64, i64) {
     let diff = TextDiff::from_lines(old, new);
@@ -324,7 +337,12 @@ impl AzureClient {
                         let steps = records
                             .iter()
                             .filter(|r| get_str(r, "type").as_deref() == Some("Task") && get_str(r, "parentId") == job_id)
-                            .map(|t| PipelineStep { name: get_str(t, "name").unwrap_or_else(|| "step".into()), status: record_status(t) })
+                            .map(|t| PipelineStep {
+                                name: get_str(t, "name").unwrap_or_else(|| "step".into()),
+                                status: record_status(t),
+                                started_at: get_date(t, "startTime"),
+                                finished_at: get_date(t, "finishTime"),
+                            })
                             .collect();
                         PipelineJob {
                             id: job_id.unwrap_or_else(|| "0".into()),
@@ -333,6 +351,8 @@ impl AzureClient {
                             started_at: get_date(job, "startTime"),
                             finished_at: get_date(job, "finishTime"),
                             steps,
+                            url: None,
+                            problem: az_problem(job),
                         }
                     })
                     .collect();

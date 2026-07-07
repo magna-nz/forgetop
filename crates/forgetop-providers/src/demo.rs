@@ -258,8 +258,28 @@ fn pipeline_defs() -> Vec<PipelineDefinition> {
     ]
 }
 
-fn step(name: &str, status: PipelineRunStatus) -> PipelineStep {
-    PipelineStep { name: name.into(), status }
+fn step(name: &str, status: PipelineRunStatus, secs: i64) -> PipelineStep {
+    let now = base();
+    PipelineStep {
+        name: name.into(),
+        status,
+        started_at: Some(now - chrono::Duration::seconds(secs)),
+        finished_at: Some(now),
+    }
+}
+
+fn job(id: &str, name: &str, status: PipelineRunStatus, secs: i64, steps: Vec<PipelineStep>, problem: Option<&str>) -> PipelineJob {
+    let now = base();
+    PipelineJob {
+        id: id.into(),
+        name: name.into(),
+        status,
+        started_at: Some(now - chrono::Duration::seconds(secs)),
+        finished_at: if matches!(status, PipelineRunStatus::Running) { None } else { Some(now) },
+        steps,
+        url: Some(format!("https://example.test/job/{id}")),
+        problem: problem.map(Into::into),
+    }
 }
 
 fn pipeline_runs() -> Vec<PipelineRun> {
@@ -281,26 +301,19 @@ fn pipeline_runs() -> Vec<PipelineRun> {
                 PipelineStage {
                     name: "build".into(),
                     status: PipelineRunStatus::Succeeded,
-                    jobs: vec![PipelineJob {
-                        id: "j1".into(),
-                        name: "compile".into(),
-                        status: PipelineRunStatus::Succeeded,
-                        started_at: None,
-                        finished_at: None,
-                        steps: vec![],
-                    }],
+                    jobs: vec![job("j1", "compile", PipelineRunStatus::Succeeded, 95, vec![], None)],
                 },
                 PipelineStage {
                     name: "test".into(),
                     status: PipelineRunStatus::Running,
-                    jobs: vec![PipelineJob {
-                        id: "j2".into(),
-                        name: "unit".into(),
-                        status: PipelineRunStatus::Running,
-                        started_at: None,
-                        finished_at: None,
-                        steps: vec![step("restore", PipelineRunStatus::Succeeded), step("dotnet test", PipelineRunStatus::Running)],
-                    }],
+                    jobs: vec![job(
+                        "j2",
+                        "unit",
+                        PipelineRunStatus::Running,
+                        140,
+                        vec![step("restore", PipelineRunStatus::Succeeded, 12), step("dotnet test", PipelineRunStatus::Running, 128)],
+                        None,
+                    )],
                 },
             ],
         },
@@ -320,38 +333,31 @@ fn pipeline_runs() -> Vec<PipelineRun> {
                 PipelineStage {
                     name: "build".into(),
                     status: PipelineRunStatus::Succeeded,
-                    jobs: vec![PipelineJob {
-                        id: "j10".into(),
-                        name: "compile".into(),
-                        status: PipelineRunStatus::Succeeded,
-                        started_at: None,
-                        finished_at: None,
-                        steps: vec![],
-                    }],
+                    jobs: vec![job("j10", "compile", PipelineRunStatus::Succeeded, 88, vec![], None)],
                 },
                 PipelineStage {
                     name: "test".into(),
                     status: PipelineRunStatus::Failed,
                     jobs: vec![
-                        PipelineJob {
-                            id: "j11".into(),
-                            name: "unit".into(),
-                            status: PipelineRunStatus::Succeeded,
-                            started_at: None,
-                            finished_at: None,
-                            steps: vec![step("restore", PipelineRunStatus::Succeeded), step("run", PipelineRunStatus::Succeeded)],
-                        },
-                        PipelineJob {
-                            id: "j12".into(),
-                            name: "integration".into(),
-                            status: PipelineRunStatus::Failed,
-                            started_at: None,
-                            finished_at: None,
-                            steps: vec![
-                                step("spin up containers", PipelineRunStatus::Succeeded),
-                                step("run suite", PipelineRunStatus::Failed),
+                        job(
+                            "j11",
+                            "unit",
+                            PipelineRunStatus::Succeeded,
+                            64,
+                            vec![step("restore", PipelineRunStatus::Succeeded, 11), step("run", PipelineRunStatus::Succeeded, 53)],
+                            None,
+                        ),
+                        job(
+                            "j12",
+                            "integration",
+                            PipelineRunStatus::Failed,
+                            240,
+                            vec![
+                                step("spin up containers", PipelineRunStatus::Succeeded, 30),
+                                step("run suite", PipelineRunStatus::Failed, 210),
                             ],
-                        },
+                            Some("run suite failed (exit 1)"),
+                        ),
                     ],
                 },
             ],
@@ -371,14 +377,14 @@ fn pipeline_runs() -> Vec<PipelineRun> {
             stages: vec![PipelineStage {
                 name: "publish".into(),
                 status: PipelineRunStatus::Succeeded,
-                jobs: vec![PipelineJob {
-                    id: "j20".into(),
-                    name: "deploy".into(),
-                    status: PipelineRunStatus::Succeeded,
-                    started_at: None,
-                    finished_at: None,
-                    steps: vec![step("pack", PipelineRunStatus::Succeeded), step("push", PipelineRunStatus::Succeeded)],
-                }],
+                jobs: vec![job(
+                    "j20",
+                    "deploy",
+                    PipelineRunStatus::Succeeded,
+                    150,
+                    vec![step("pack", PipelineRunStatus::Succeeded, 40), step("push", PipelineRunStatus::Succeeded, 110)],
+                    None,
+                )],
             }],
         },
     ]
@@ -591,7 +597,19 @@ impl PipelineSource for DemoPipe {
         pipeline_runs().into_iter().find(|r| r.id == run_id).ok_or_else(|| forgetop_core::Error::NotFound(run_id.into()))
     }
     async fn logs(&self, run_id: &str, job_id: Option<&str>) -> Result<String> {
-        Ok(format!("[demo] logs for run {run_id}{}\nAll steps completed.", job_id.map(|j| format!(" job {j}")).unwrap_or_default()))
+        let job = job_id.unwrap_or("job");
+        let mut out = format!("=== logs for run {run_id} · {job} ===\n");
+        for i in 1..=24 {
+            out.push_str(&format!("[00:{i:02}] step output line {i}\n"));
+        }
+        if job == "j12" {
+            out.push_str("ERROR: integration suite failed: 2 tests failed\n");
+            out.push_str("  - test_checkout_flow\n  - test_refund\n");
+            out.push_str("Process exited with code 1\n");
+        } else {
+            out.push_str("Done. All steps completed successfully.\n");
+        }
+        Ok(out)
     }
     async fn trigger(&self, _definition_id: &str, _branch: Option<&str>) -> Result<()> {
         Ok(())
