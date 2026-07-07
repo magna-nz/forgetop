@@ -61,7 +61,7 @@ async fn seed_demo(config: &ConfigService) -> Result<()> {
     let conn = Connection {
         id: "demo".into(),
         provider_type: ProviderType::Demo,
-        display_name: "Demo".into(),
+        display_name: "Demo GitHub".into(),
         base_url: None,
         organization: None,
         project: None,
@@ -70,8 +70,26 @@ async fn seed_demo(config: &ConfigService) -> Result<()> {
         credential_ref: None,
     };
     config.add_or_update_connection(conn, None).await?;
+
+    // A second connection so `--demo` shows cross-provider aggregation: its PRs and
+    // work items merge into the same lists, distinguished by the Provider column.
+    let conn2 = Connection {
+        id: "demo2".into(),
+        provider_type: ProviderType::Demo,
+        display_name: "Demo GitLab".into(),
+        base_url: None,
+        organization: None,
+        project: None,
+        repository: None,
+        username: None,
+        credential_ref: None,
+    };
+    config.add_or_update_connection(conn2, None).await?;
+
     config.bind_pull_requests("demo").await?;
+    config.bind_pull_requests("demo2").await?;
     config.bind_work_items("demo").await?;
+    config.bind_work_items("demo2").await?;
     config.set_pipeline_auto_discover("demo", true).await?;
     Ok(())
 }

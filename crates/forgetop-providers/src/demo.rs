@@ -251,6 +251,108 @@ fn work_items() -> Vec<WorkItem> {
     ]
 }
 
+/// A distinct set of PRs for a *second* demo connection, so `--demo` with two
+/// connections shows real cross-provider aggregation (not duplicated rows).
+fn pull_requests_alt() -> Vec<PullRequest> {
+    let now = base();
+    vec![
+        PullRequest {
+            id: "301".into(),
+            number: Some(301),
+            title: "Migrate billing to the new API".into(),
+            description: None,
+            author: alice(),
+            status: PullRequestStatus::Open,
+            is_draft: false,
+            source_ref: Some("feature/billing-v2".into()),
+            target_ref: Some("main".into()),
+            reviewers: vec![Reviewer { user: bob(), vote: ReviewVote::NoVote, is_required: true }],
+            labels: vec!["billing".into()],
+            checks: CheckStatus::Failed,
+            check_summary: Some(CheckSummary { successful: 9, failed: 1, ..Default::default() }),
+            mergeable: MergeableState::Blocked,
+            changed_files: 11,
+            additions: 240,
+            deletions: 88,
+            created_at: Some(now - chrono::Duration::hours(20)),
+            updated_at: Some(now - chrono::Duration::hours(1)),
+            url: Some("https://gitlab.test/mr/301".into()),
+        },
+        PullRequest {
+            id: "302".into(),
+            number: Some(302),
+            title: "Tidy up the logging middleware".into(),
+            description: None,
+            author: carol(),
+            status: PullRequestStatus::Open,
+            is_draft: false,
+            source_ref: Some("chore/logging".into()),
+            target_ref: Some("main".into()),
+            reviewers: vec![Reviewer { user: alice(), vote: ReviewVote::NoVote, is_required: false }],
+            labels: vec!["chore".into()],
+            checks: CheckStatus::Passed,
+            check_summary: Some(CheckSummary { successful: 6, ..Default::default() }),
+            mergeable: MergeableState::Mergeable,
+            changed_files: 3,
+            additions: 30,
+            deletions: 44,
+            created_at: Some(now - chrono::Duration::days(1)),
+            updated_at: Some(now - chrono::Duration::hours(5)),
+            url: Some("https://gitlab.test/mr/302".into()),
+        },
+    ]
+}
+
+/// A distinct set of work items (assigned to Alice) for a second demo connection.
+fn work_items_alt() -> Vec<WorkItem> {
+    let now = base();
+    vec![
+        WorkItem {
+            id: "a1".into(),
+            identifier: Some("OPS-4".into()),
+            title: "Rotate the staging credentials".into(),
+            description: None,
+            state: "In Progress".into(),
+            state_category: WorkItemStateCategory::Started,
+            work_item_type: Some("Task".into()),
+            assignee: Some(alice()),
+            created_at: Some(now - chrono::Duration::days(2)),
+            updated_at: Some(now - chrono::Duration::hours(4)),
+            url: Some("https://gitlab.test/issues/4".into()),
+        },
+        WorkItem {
+            id: "a2".into(),
+            identifier: Some("OPS-9".into()),
+            title: "Add dashboards for the new queue".into(),
+            description: None,
+            state: "Todo".into(),
+            state_category: WorkItemStateCategory::Unstarted,
+            work_item_type: Some("Story".into()),
+            assignee: Some(alice()),
+            created_at: Some(now - chrono::Duration::days(3)),
+            updated_at: None,
+            url: Some("https://gitlab.test/issues/9".into()),
+        },
+    ]
+}
+
+/// The PR set for a demo connection: the main one for `demo`, the alt set otherwise.
+fn prs_for(conn: &str) -> Vec<PullRequest> {
+    if conn == "demo" {
+        pull_requests()
+    } else {
+        pull_requests_alt()
+    }
+}
+
+fn wis_for(conn: &str) -> Vec<WorkItem> {
+    if conn == "demo" {
+        work_items()
+    } else {
+        work_items_alt()
+    }
+}
+
 fn pipeline_defs() -> Vec<PipelineDefinition> {
     vec![
         PipelineDefinition { id: "ci".into(), name: "CI".into(), path: Some(".github/workflows/ci.yml".into()), url: None },
@@ -390,18 +492,20 @@ fn pipeline_runs() -> Vec<PipelineRun> {
     ]
 }
 
-struct DemoPr;
+struct DemoPr {
+    conn: String,
+}
 #[async_trait]
 impl PullRequestSource for DemoPr {
     async fn list(&self, query: &PullRequestQuery) -> Result<Vec<PullRequest>> {
-        let prs: Vec<_> = pull_requests()
+        let prs: Vec<_> = prs_for(&self.conn)
             .into_iter()
             .filter(|p| query.include_completed || matches!(p.status, PullRequestStatus::Open | PullRequestStatus::Draft))
             .collect();
         Ok(apply_pull_request_filter(prs, query.filter, Some("alice")))
     }
     async fn get(&self, id: &str) -> Result<PullRequest> {
-        pull_requests().into_iter().find(|p| p.id == id).ok_or_else(|| forgetop_core::Error::NotFound(id.into()))
+        prs_for(&self.conn).into_iter().find(|p| p.id == id).ok_or_else(|| forgetop_core::Error::NotFound(id.into()))
     }
     async fn threads(&self, _id: &str) -> Result<Vec<CommentThread>> {
         Ok(vec![CommentThread {
@@ -555,12 +659,14 @@ impl PullRequestSource for DemoPr {
     }
 }
 
-struct DemoWi;
+struct DemoWi {
+    conn: String,
+}
 #[async_trait]
 impl WorkItemSource for DemoWi {
     async fn list(&self, query: &WorkItemQuery) -> Result<Vec<WorkItem>> {
         // The demo's "me" is Alice (u1); mine_only keeps only her items.
-        Ok(work_items()
+        Ok(wis_for(&self.conn)
             .into_iter()
             .filter(|w| {
                 query.include_completed
@@ -570,7 +676,7 @@ impl WorkItemSource for DemoWi {
             .collect())
     }
     async fn get(&self, id: &str) -> Result<WorkItem> {
-        work_items().into_iter().find(|w| w.id == id).ok_or_else(|| forgetop_core::Error::NotFound(id.into()))
+        wis_for(&self.conn).into_iter().find(|w| w.id == id).ok_or_else(|| forgetop_core::Error::NotFound(id.into()))
     }
     async fn threads(&self, _id: &str) -> Result<Vec<CommentThread>> {
         Ok(vec![])
@@ -639,10 +745,10 @@ impl ProviderConnection for DemoConnection {
         &self.caps
     }
     fn pull_requests(&self) -> Option<Arc<dyn PullRequestSource>> {
-        Some(Arc::new(DemoPr))
+        Some(Arc::new(DemoPr { conn: self.id.clone() }))
     }
     fn work_items(&self) -> Option<Arc<dyn WorkItemSource>> {
-        Some(Arc::new(DemoWi))
+        Some(Arc::new(DemoWi { conn: self.id.clone() }))
     }
     fn pipelines(&self) -> Option<Arc<dyn PipelineSource>> {
         Some(Arc::new(DemoPipe))
