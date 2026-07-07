@@ -107,10 +107,11 @@ pub struct App {
     pipe_seen: HashMap<String, PipelineRunStatus>,
     /// Whether `pipe_seen` has been seeded (skip notifying on the first load).
     pipe_seeded: bool,
-    /// Per-PR (approved, changes-requested) flags for my PRs, to detect changes.
-    pr_review_seen: HashMap<String, (bool, bool)>,
-    /// PR ids where I'm currently a requested reviewer, to detect new requests.
-    review_req_seen: HashSet<String>,
+    /// Per-PR (approved, changes-requested) flags for my PRs, keyed by
+    /// (connection id, PR id) so ids can't collide across providers.
+    pr_review_seen: HashMap<(String, String), (bool, bool)>,
+    /// PRs where I'm currently a requested reviewer, keyed by (connection, PR id).
+    review_req_seen: HashSet<(String, String)>,
     /// Whether the PR-event scan has been seeded (skip notifying on first load).
     pr_scan_seeded: bool,
     /// Transient one-shot message shown in the footer until the next keypress.
@@ -778,33 +779,53 @@ impl App {
         if !want_review && !want_votes {
             return;
         }
-        let Ok(Some(src)) = deps.sections.pull_request_source().await else { return };
+        let Ok(feeds) = deps.sections.pull_request_feeds().await else { return };
+        if feeds.is_empty() {
+            return;
+        }
 
-        if want_review {
-            if let Ok(review) = src.list(&pr_query(PullRequestFilter::ReviewRequested)).await {
-                if self.pr_scan_seeded {
-                    for pr in new_review_requests(&self.review_req_seen, &review) {
-                        notify("Review requested", &pr_label(pr));
+        let seeded = self.pr_scan_seeded;
+        let mut review_now: HashSet<(String, String)> = HashSet::new();
+        let mut votes_now: HashMap<(String, String), (bool, bool)> = HashMap::new();
+
+        // Scan every bound provider so notifications span the aggregated PR list.
+        for feed in &feeds {
+            let conn = feed.connection.connection_id().to_string();
+            if want_review {
+                if let Ok(review) = feed.source.list(&pr_query(PullRequestFilter::ReviewRequested)).await {
+                    for pr in &review {
+                        let key = (conn.clone(), pr.id.clone());
+                        if seeded && !self.review_req_seen.contains(&key) {
+                            notify("Review requested", &pr_label(pr));
+                        }
+                        review_now.insert(key);
                     }
                 }
-                self.review_req_seen = review.iter().map(|p| p.id.clone()).collect();
+            }
+            if want_votes {
+                if let Ok(mine) = feed.source.list(&pr_query(PullRequestFilter::Mine)).await {
+                    for pr in &mine {
+                        let key = (conn.clone(), pr.id.clone());
+                        if seeded {
+                            let (approved, changes) = pr_review_transitions(self.pr_review_seen.get(&key).copied(), pr);
+                            if approved && self.notifications.pr_approved {
+                                notify("Your PR was approved", &pr_label(pr));
+                            }
+                            if changes && self.notifications.pr_changes_requested {
+                                notify("Changes requested on your PR", &pr_label(pr));
+                            }
+                        }
+                        votes_now.insert(key, pr_vote_flags(pr));
+                    }
+                }
             }
         }
+
+        if want_review {
+            self.review_req_seen = review_now;
+        }
         if want_votes {
-            if let Ok(mine) = src.list(&pr_query(PullRequestFilter::Mine)).await {
-                if self.pr_scan_seeded {
-                    for pr in &mine {
-                        let (approved, changes) = pr_review_transitions(self.pr_review_seen.get(&pr.id).copied(), pr);
-                        if approved && self.notifications.pr_approved {
-                            notify("Your PR was approved", &pr_label(pr));
-                        }
-                        if changes && self.notifications.pr_changes_requested {
-                            notify("Changes requested on your PR", &pr_label(pr));
-                        }
-                    }
-                }
-                self.pr_review_seen = mine.iter().map(|p| (p.id.clone(), pr_vote_flags(p))).collect();
-            }
+            self.pr_review_seen = votes_now;
         }
         self.pr_scan_seeded = true;
     }
@@ -2256,10 +2277,6 @@ fn pr_review_transitions(prev: Option<(bool, bool)>, pr: &PullRequest) -> (bool,
     (a && !pa, c && !pc)
 }
 
-/// PRs where I'm newly a requested reviewer (not seen in the previous set).
-fn new_review_requests<'a>(prev: &HashSet<String>, review: &'a [PullRequest]) -> Vec<&'a PullRequest> {
-    review.iter().filter(|p| !prev.contains(&p.id)).collect()
-}
 
 fn pr_label(pr: &PullRequest) -> String {
     let num = pr.number.map(|n| format!("#{n} ")).unwrap_or_default();
@@ -2742,14 +2759,6 @@ mod tests {
         assert_eq!(pr_review_transitions(None, &approved), (true, false), "first-seen approval fires");
         assert_eq!(pr_review_transitions(Some((true, false)), &approved), (false, false), "already-approved doesn't re-fire");
         assert_eq!(pr_review_transitions(Some((false, false)), &mk(&[ReviewVote::Rejected])), (false, true));
-
-        let mut a = pr(None);
-        a.id = "1".into();
-        let mut b = pr(None);
-        b.id = "2".into();
-        let review = vec![a, b];
-        let prev: HashSet<String> = ["1".to_string()].into_iter().collect();
-        assert_eq!(new_review_requests(&prev, &review).iter().map(|p| p.id.clone()).collect::<Vec<_>>(), vec!["2"]);
     }
 
     #[test]

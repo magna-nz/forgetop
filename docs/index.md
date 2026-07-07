@@ -145,6 +145,9 @@ change the settings — and enabling fires one confirmation notification so you 
 verify they work on your machine. "Me" for the PR events is resolved from your
 token by each provider (`@me` / `currentUser()` / `isMe`).
 
+All events span **every bound provider** — pipeline failures and PR events fire
+across all connections feeding those sections, not just the first.
+
 ## Configuration
 
 Config is a small JSON file, created and managed for you:
