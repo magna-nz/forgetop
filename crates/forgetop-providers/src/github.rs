@@ -362,6 +362,10 @@ impl PullRequestSource for GitHubPr {
         let v = self.0.get_json(&self.0.repo_path(&format!("/pulls/{id}/commits?per_page=100"))).await?;
         Ok(v.as_array().unwrap_or(&vec![]).iter().map(map_commit).collect())
     }
+    async fn commit_changes(&self, _id: &str, sha: &str) -> Result<Vec<FileChange>> {
+        let v = self.0.get_json(&self.0.repo_path(&format!("/commits/{sha}"))).await?;
+        Ok(get_arr(&v, "files").iter().map(map_file_change).collect())
+    }
     async fn add_comment(&self, id: &str, body: &str) -> Result<()> {
         self.0.post_json(&self.0.repo_path(&format!("/issues/{id}/comments")), json!({ "body": body })).await
     }

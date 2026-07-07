@@ -484,6 +484,57 @@ impl PullRequestSource for DemoPr {
             Commit { sha: "9c8d7e6".into(), message: "Address review: cap max attempts".into(), author: "bob".into(), date: Some(base() - chrono::Duration::hours(1)), url: None },
         ])
     }
+    async fn commit_changes(&self, _id: &str, sha: &str) -> Result<Vec<FileChange>> {
+        // Canned per-commit diff so drilling into each commit shows distinct changes.
+        let file = match sha {
+            "a1b2c3d" => FileChange {
+                path: "src/http/retry.rs".into(),
+                kind: FileChangeKind::Added,
+                additions: 6,
+                deletions: 0,
+                patch: Some(
+                    "@@ -0,0 +1,6 @@\n\
+                     +/// Retry policy with jittered exponential backoff.\n\
+                     +pub struct RetryPolicy {\n\
+                     +    pub max_attempts: u32,\n\
+                     +    pub base: Duration,\n\
+                     +}\n\
+                     +\n"
+                        .into(),
+                ),
+            },
+            "e4f5a6b" => FileChange {
+                path: "src/http/client.rs".into(),
+                kind: FileChangeKind::Modified,
+                additions: 2,
+                deletions: 1,
+                patch: Some(
+                    "@@ -12,3 +12,4 @@ impl HttpClient {\n\
+                     \x20    pub async fn send(&self, req: Request) -> Result<Response> {\n\
+                     -        self.inner.execute(req).await\n\
+                     +        let policy = RetryPolicy::new(3);\n\
+                     +        self.send_with_retry(req, &policy).await\n\
+                     \x20    }\n"
+                        .into(),
+                ),
+            },
+            _ => FileChange {
+                path: "src/http/retry.rs".into(),
+                kind: FileChangeKind::Modified,
+                additions: 1,
+                deletions: 1,
+                patch: Some(
+                    "@@ -2,3 +2,3 @@ pub struct RetryPolicy {\n\
+                     \x20pub struct RetryPolicy {\n\
+                     -    pub max_attempts: u32, // unbounded\n\
+                     +    pub max_attempts: u32, // capped at 3\n\
+                     \x20    pub base: Duration,\n"
+                        .into(),
+                ),
+            },
+        };
+        Ok(vec![file])
+    }
     async fn add_comment(&self, _id: &str, _body: &str) -> Result<()> {
         Ok(())
     }

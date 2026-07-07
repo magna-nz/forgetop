@@ -493,19 +493,24 @@ fn pr_conversation_lines(theme: &Theme, pr: &PullRequest, threads: &[CommentThre
 }
 
 /// The Commits tab: one line per commit (short sha · message · author · age).
-fn pr_commit_lines(theme: &Theme, commits: &[Commit]) -> Vec<Line<'static>> {
+fn pr_commit_lines(theme: &Theme, commits: &[Commit], sel: usize) -> Vec<Line<'static>> {
     if commits.is_empty() {
         return vec![Line::from(Span::styled("No commits.", Style::default().fg(theme.dim)))];
     }
     commits
         .iter()
-        .map(|c| {
-            Line::from(vec![
+        .enumerate()
+        .map(|(i, c)| {
+            let mut line = Line::from(vec![
                 Span::styled(cell(&c.sha, 9), Style::default().fg(theme.yellow)),
                 Span::styled(cell(&c.message, 56), Style::default().fg(theme.fg)),
                 Span::styled(cell(&c.author, 16), Style::default().fg(theme.blue)),
                 Span::styled(rel_age(c.date), Style::default().fg(theme.dim)),
-            ])
+            ]);
+            if i == sel {
+                mark_selected(&mut line, theme);
+            }
+            line
         })
         .collect()
 }
@@ -555,9 +560,17 @@ fn render_pr_view(frame: &mut Frame, area: Rect, theme: &Theme, view: &PrView) -
         render_diff(frame, rows[2], theme, &view.diff);
         return 0; // the Diff tab manages its own scrolling
     }
+    // Commits: a row cursor (Enter drills into that commit's diff), scroll follows it.
+    if view.tab == 1 {
+        let lines = pr_commit_lines(theme, &view.commits, view.commit_sel);
+        let inner_h = rows[2].height.saturating_sub(2) as usize;
+        let total = view.commits.len();
+        let scroll = view.commit_sel.saturating_sub(inner_h / 2).min(total.saturating_sub(inner_h.max(1))) as u16;
+        frame.render_widget(Paragraph::new(lines).block(section_block(theme, "Commits")).scroll((scroll, 0)), rows[2]);
+        return 0;
+    }
     let (title, lines) = match view.tab {
         0 => ("Conversation", pr_conversation_lines(theme, &view.pr, &view.diff.threads)),
-        1 => ("Commits", pr_commit_lines(theme, &view.commits)),
         _ => ("Checks", pr_checks_lines(theme, &view.checks)),
     };
     let inner_h = rows[2].height.saturating_sub(2);
@@ -647,6 +660,8 @@ fn footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
             } else {
                 vec![("←→", "tabs"), ("↑↓", "file"), ("↵", "open file"), ("PgUp/Dn", "scroll"), ("a", "approve"), ("m", "merge"), ("o", "open"), ("Esc", "back")]
             }
+        } else if v.tab == 1 {
+            vec![("←→", "tabs"), ("↑↓", "commit"), ("↵", "commit diff"), ("a", "approve"), ("m", "merge"), ("o", "open"), ("Esc", "back")]
         } else {
             vec![("←→", "tabs"), ("PgUp/Dn", "scroll"), ("a", "approve"), ("x", "reject"), ("m", "merge"), ("c", "comment"), ("o", "open"), ("Esc", "back")]
         };
@@ -762,7 +777,10 @@ fn render_diff(frame: &mut Frame, area: Rect, theme: &Theme, diff: &DiffView) {
 }
 
 fn render_diff_files(frame: &mut Frame, area: Rect, theme: &Theme, diff: &DiffView) {
-    let title = format!("{} · files", diff.pr_label);
+    let title = match &diff.commit_label {
+        Some(l) => format!("commit {l} · files"),
+        None => format!("{} · files", diff.pr_label),
+    };
     let block = section_block(theme, &title);
     if diff.files.is_empty() {
         empty(frame, area, theme, "No changed files.", block);
@@ -1322,6 +1340,8 @@ mod tests {
                 date: None,
                 url: None,
             }],
+            commit_sel: 0,
+            pr_files: vec![],
             scroll: 0,
             diff: DiffView {
                 pr_label: "PR #42".into(),
@@ -1332,6 +1352,7 @@ mod tests {
                 scroll: 0,
                 focus: crate::app::DiffFocus::FileList,
                 cursor: 0,
+                commit_label: None,
             },
         }
     }

@@ -111,10 +111,28 @@ pub struct PrView {
     pub tab: usize,
     pub checks: Vec<CheckRun>,
     pub commits: Vec<Commit>,
+    /// Cursor row on the Commits tab.
+    pub commit_sel: usize,
+    /// The whole-PR changed files, cached so the Diff tab can restore them after
+    /// drilling into a single commit's diff.
+    pub pr_files: Vec<FileChange>,
     /// Scroll offset for the Conversation / Commits / Checks tabs.
     pub scroll: u16,
     /// Diff-tab state (file list + patch + threads), rendered like the standalone diff.
     pub diff: DiffView,
+}
+
+impl PrView {
+    /// Restores the whole-PR diff if the view was showing a single commit's changes.
+    fn reset_diff_scope(&mut self) {
+        self.diff.focus = DiffFocus::FileList;
+        if self.diff.commit_label.is_some() {
+            self.diff.files = self.pr_files.clone();
+            self.diff.selected = 0;
+            self.diff.cursor = 0;
+            self.diff.commit_label = None;
+        }
+    }
 }
 
 /// State for the full-screen work-item view.
@@ -255,6 +273,9 @@ pub struct DiffView {
     pub focus: DiffFocus,
     /// Cursor line index into the current file's patch (used in `Patch` focus).
     pub cursor: usize,
+    /// When set, the diff shows a single commit's changes (label shown in the
+    /// file-list title); `None` means the whole-PR diff.
+    pub commit_label: Option<String>,
 }
 
 impl DiffView {
@@ -667,6 +688,15 @@ impl App {
                 return;
             }
             Screen::PrView(_) => {
+                // Enter on the Commits tab drills into that commit's diff (needs async).
+                if key == Key::Enter {
+                    if let Screen::PrView(v) = &self.screen {
+                        if v.tab == 1 {
+                            self.open_commit_diff(deps).await;
+                            return;
+                        }
+                    }
+                }
                 self.on_pr_view_key(key);
                 return;
             }
@@ -748,14 +778,57 @@ impl App {
         let diff = DiffView {
             pr_label: label.clone(),
             url: url.clone(),
-            files,
+            files: files.clone(),
             threads,
             selected: 0,
             scroll: 0,
             focus: DiffFocus::FileList,
             cursor: 0,
+            commit_label: None,
         };
-        self.screen = Screen::PrView(Box::new(PrView { label, url, pr, tab, checks, commits, scroll: 0, diff }));
+        self.screen = Screen::PrView(Box::new(PrView {
+            label,
+            url,
+            pr,
+            tab,
+            checks,
+            commits,
+            commit_sel: 0,
+            pr_files: files,
+            scroll: 0,
+            diff,
+        }));
+    }
+
+    /// Loads the selected commit's diff into the diff view and jumps to the Diff tab.
+    async fn open_commit_diff(&mut self, deps: &AppDeps) {
+        let Screen::PrView(v) = &self.screen else { return };
+        let Some(commit) = v.commits.get(v.commit_sel) else { return };
+        let (sha, msg) = (commit.sha.clone(), commit.message.clone());
+        let pr_id = v.pr.id.clone();
+
+        let source = match deps.sections.pull_request_source().await {
+            Ok(Some(s)) => s,
+            _ => {
+                self.toast = Some("No pull-request provider is bound".into());
+                return;
+            }
+        };
+        let files = source.commit_changes(&pr_id, &sha).await.unwrap_or_default();
+        if files.is_empty() {
+            self.toast = Some("No per-commit diff for this provider".into());
+            return;
+        }
+
+        let short: String = sha.chars().take(7).collect();
+        let title: String = msg.chars().take(50).collect();
+        let Screen::PrView(v) = &mut self.screen else { return };
+        v.diff.files = files;
+        v.diff.selected = 0;
+        v.diff.cursor = 0;
+        v.diff.focus = DiffFocus::FileList;
+        v.diff.commit_label = Some(format!("{short} {title}"));
+        v.tab = 3;
     }
 
     async fn open_wi_view(&mut self, deps: &AppDeps) {
@@ -813,17 +886,17 @@ impl App {
         let Screen::PrView(v) = &mut self.screen else { return };
         let n = PR_TABS.len();
         match key {
-            // Changing tab resets the scroll (each tab starts at the top) and drops
-            // any patch line cursor back to the file list.
+            // Changing tab resets the scroll (each tab starts at the top), drops any
+            // patch line cursor, and restores the whole-PR diff on the Diff tab.
             Key::Left | Key::Char('h') => {
                 v.tab = (v.tab + n - 1) % n;
                 v.scroll = 0;
-                v.diff.focus = DiffFocus::FileList;
+                v.reset_diff_scope();
             }
             Key::Right | Key::Char('l') => {
                 v.tab = (v.tab + 1) % n;
                 v.scroll = 0;
-                v.diff.focus = DiffFocus::FileList;
+                v.reset_diff_scope();
             }
             // Enter on a file drops into a line cursor within its patch.
             Key::Enter if v.tab == 3 => v.diff.enter_patch(),
@@ -834,6 +907,8 @@ impl App {
                     } else {
                         v.diff.select_file(-1);
                     }
+                } else if v.tab == 1 {
+                    v.commit_sel = v.commit_sel.saturating_sub(1);
                 } else {
                     v.scroll = v.scroll.saturating_sub(1);
                 }
@@ -844,6 +919,10 @@ impl App {
                         v.diff.move_cursor(1);
                     } else {
                         v.diff.select_file(1);
+                    }
+                } else if v.tab == 1 {
+                    if !v.commits.is_empty() {
+                        v.commit_sel = (v.commit_sel + 1).min(v.commits.len() - 1);
                     }
                 } else {
                     v.scroll = (v.scroll + 1).min(max);
@@ -1867,6 +1946,7 @@ mod tests {
             scroll: 0,
             focus: DiffFocus::FileList,
             cursor: 0,
+            commit_label: None,
         }
     }
 
@@ -1913,6 +1993,35 @@ mod tests {
     }
 
     #[test]
+    fn commit_diff_scope_restores_whole_pr() {
+        let mut d = diff(vec![changed("b.rs", Some("@@ -1 +1 @@\n-p\n+q"))]);
+        d.selected = 0;
+        d.scroll = 5;
+        d.focus = DiffFocus::Patch;
+        d.cursor = 2;
+        d.commit_label = Some("abc1234 msg".into());
+        let mut v = PrView {
+            label: "PR".into(),
+            url: None,
+            pr: pr(None),
+            tab: 3,
+            checks: vec![],
+            commits: vec![],
+            commit_sel: 0,
+            pr_files: vec![changed("a.rs", Some("@@ -1 +1 @@\n-x\n+y"))],
+            scroll: 0,
+            diff: d,
+        };
+
+        v.reset_diff_scope();
+        assert_eq!(v.diff.commit_label, None, "scope cleared");
+        assert_eq!(v.diff.files.len(), 1);
+        assert_eq!(v.diff.files[0].path, "a.rs", "whole-PR files restored");
+        assert_eq!(v.diff.selected, 0);
+        assert_eq!(v.diff.focus, DiffFocus::FileList);
+    }
+
+    #[test]
     fn selected_url_reads_active_tab_and_subview() {
         let mut app = App::new("slate");
         app.prs.push(pr(Some("http://pr")));
@@ -1933,6 +2042,8 @@ mod tests {
             tab: 0,
             checks: vec![],
             commits: vec![],
+            commit_sel: 0,
+            pr_files: vec![],
             scroll: 0,
             diff: DiffView {
                 pr_label: "x".into(),
@@ -1943,6 +2054,7 @@ mod tests {
                 scroll: 0,
                 focus: DiffFocus::FileList,
                 cursor: 0,
+                commit_label: None,
             },
         }));
         assert_eq!(app.selected_url().as_deref(), Some("http://prview"));
