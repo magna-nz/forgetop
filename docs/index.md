@@ -35,6 +35,7 @@ keys valid for wherever you are. The full set:
 | `v` | Choose which tabs are visible |
 | `C` | Config / connections screen |
 | `r` | Refresh · `t` cycle theme |
+| `N` | Toggle desktop notifications |
 | `?` | Show all keybindings (works anywhere) |
 | `q` / `Ctrl-C` | Quit · `Esc` back / close |
 
@@ -128,6 +129,14 @@ pick the verdict: **Comment**, **Approve**, or **Request changes**.
   and therefore line comments - aren't available there yet.
 
 You can also drill into a single commit's diff from the **Commits** tab (`Enter`).
+
+## Notifications
+
+forgetop raises a native desktop notification when a **pipeline run fails** (a run
+that transitions into a failed state on a refresh). It's on by default, seeded on
+first load so it won't fire for pre-existing failures at startup, and de-duped so
+each failure notifies once. Toggle it with `N` (persisted). More event types
+(review requested, your PR approved / changes-requested) are planned.
 
 ## Configuration
 

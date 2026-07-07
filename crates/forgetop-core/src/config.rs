@@ -56,6 +56,9 @@ pub struct UiState {
     pub work_item_sort: Option<SortPref>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pipeline_sort: Option<SortPref>,
+    /// Desktop notifications on key events. `None` = on by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notifications: Option<bool>,
 }
 
 /// A saved sort: which column (by key) and whether descending.

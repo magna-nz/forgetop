@@ -1224,6 +1224,7 @@ fn help_sections() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
                 ("v", "Choose which tabs are visible"),
                 ("C", "Config / connections"),
                 ("r", "Refresh    t  cycle theme"),
+                ("N", "Toggle desktop notifications"),
                 ("?", "This help"),
                 ("q  Ctrl-C", "Quit    Esc  back / close"),
             ],

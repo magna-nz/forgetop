@@ -35,6 +35,7 @@ pub async fn run(deps: AppDeps, theme_name: &str) -> Result<()> {
     {
         let ui = deps.config.snapshot().ui;
         app.apply_sorts(ui.pr_sort, ui.work_item_sort, ui.pipeline_sort);
+        app.notifications = ui.notifications.unwrap_or(true);
     }
     app.reload_all(&deps).await;
 

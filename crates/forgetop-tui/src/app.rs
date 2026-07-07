@@ -1,7 +1,7 @@
 //! Application state and the (async) update logic driven by the event loop.
 
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::{DateTime, Local, Utc};
@@ -85,6 +85,12 @@ pub struct App {
     pub pr_sort: Option<SortPref>,
     pub wi_sort: Option<SortPref>,
     pub pipe_sort: Option<SortPref>,
+    /// Desktop notifications on key events (e.g. a pipeline failing). Persisted.
+    pub notifications: bool,
+    /// Last-seen status per pipeline run, to detect transitions into failure.
+    pipe_seen: HashMap<String, PipelineRunStatus>,
+    /// Whether `pipe_seen` has been seeded (skip notifying on the first load).
+    pipe_seeded: bool,
     /// Transient one-shot message shown in the footer until the next keypress.
     pub toast: Option<String>,
     /// Open modal overlay, if any. When set, keys route here instead of the table.
@@ -426,6 +432,9 @@ impl App {
             pr_sort: None,
             wi_sort: None,
             pipe_sort: None,
+            notifications: true,
+            pipe_seen: HashMap::new(),
+            pipe_seeded: false,
             toast: None,
             overlay: None,
             wizard: None,
@@ -699,6 +708,17 @@ impl App {
         let _ = deps.config.set_sort(section_of(section), Some(pref)).await;
     }
 
+    /// Toggles desktop notifications and persists the choice.
+    async fn toggle_notifications(&mut self, deps: &AppDeps) {
+        self.notifications = !self.notifications;
+        self.toast = Some(if self.notifications {
+            "Desktop notifications on".into()
+        } else {
+            "Desktop notifications off".into()
+        });
+        let _ = deps.config.set_notifications(self.notifications).await;
+    }
+
     // ---- data loading ----
 
     pub async fn reload_all(&mut self, deps: &AppDeps) {
@@ -765,6 +785,20 @@ impl App {
             }
             Err(e) => errors.push(format!("Pipelines: {e}")),
         }
+        self.notify_pipeline_failures();
+    }
+
+    /// Fires a desktop notification for any run that has just entered a failed
+    /// state since the last refresh. Seeded silently on the first load.
+    fn notify_pipeline_failures(&mut self) {
+        if self.notifications && self.pipe_seeded {
+            for row in new_pipeline_failures(&self.pipe_seen, &self.pipes) {
+                let branch = row.run.branch.clone().unwrap_or_else(|| "—".into());
+                notify("Pipeline failed", &format!("{} · {} on {branch}", row.connection, pipe_label(row)));
+            }
+        }
+        self.pipe_seen = self.pipes.iter().map(|r| (r.run.id.clone(), r.run.status)).collect();
+        self.pipe_seeded = true;
     }
 
     /// Re-selects a valid row per tab after the underlying data (or filter) changed.
@@ -1268,6 +1302,7 @@ impl App {
             }
             '/' => self.start_filter(),
             'S' => self.open_sort_picker(),
+            'N' => self.toggle_notifications(deps).await,
             'o' => self.open_selected(),
             'n' => self.start_add_connection(),
             'v' => self.open_sections_toggle(),
@@ -1982,6 +2017,21 @@ fn pipe_label(pipe: &PipeRow) -> String {
     }
 }
 
+/// Runs that are Failed now but weren't Failed at the previous refresh.
+fn new_pipeline_failures<'a>(prev: &HashMap<String, PipelineRunStatus>, pipes: &'a [PipeRow]) -> Vec<&'a PipeRow> {
+    pipes
+        .iter()
+        .filter(|r| {
+            matches!(r.run.status, PipelineRunStatus::Failed) && !matches!(prev.get(&r.run.id), Some(PipelineRunStatus::Failed))
+        })
+        .collect()
+}
+
+/// Best-effort OS notification (silently ignored if the platform refuses).
+fn notify(title: &str, body: &str) {
+    let _ = notify_rust::Notification::new().summary(title).body(body).appname("forgetop").show();
+}
+
 fn pr_label(pr: &PullRequest) -> String {
     let num = pr.number.map(|n| format!("#{n} ")).unwrap_or_default();
     let title: String = pr.title.chars().take(40).collect();
@@ -2395,6 +2445,41 @@ mod tests {
         app.on_pipeline_logs_key(Key::Escape);
         let Screen::Pipeline(v) = &app.screen else { panic!() };
         assert!(v.logs.is_none(), "Esc closes the log pane");
+    }
+
+    #[test]
+    fn notifies_only_on_new_pipeline_failures() {
+        let row = |id: &str, status: PipelineRunStatus| PipeRow {
+            connection_id: "c".into(),
+            connection: "GH".into(),
+            provider: ProviderType::GitHub,
+            run: PipelineRun {
+                id: id.into(),
+                definition_id: "ci".into(),
+                number: Some(1),
+                name: Some("CI".into()),
+                status,
+                triggered_by: None,
+                branch: Some("main".into()),
+                commit_sha: None,
+                started_at: None,
+                finished_at: None,
+                url: None,
+                stages: vec![],
+            },
+        };
+        let pipes =
+            vec![row("a", PipelineRunStatus::Failed), row("b", PipelineRunStatus::Succeeded), row("c", PipelineRunStatus::Failed)];
+
+        // With no prior state, both current failures are new.
+        let ids = |v: Vec<&PipeRow>| v.iter().map(|r| r.run.id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(new_pipeline_failures(&HashMap::new(), &pipes)), vec!["a", "c"]);
+
+        // 'a' was already failing (skip); 'c' just transitioned Running→Failed (notify).
+        let mut prev = HashMap::new();
+        prev.insert("a".to_string(), PipelineRunStatus::Failed);
+        prev.insert("c".to_string(), PipelineRunStatus::Running);
+        assert_eq!(ids(new_pipeline_failures(&prev, &pipes)), vec!["c"]);
     }
 
     #[test]
