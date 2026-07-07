@@ -63,6 +63,9 @@ The list is browse-and-open; every write action lives inside the PR view.
 
 ### Work Items
 
+The Work Items list only shows items **assigned to you** — each provider resolves
+the current user from your token (`@me`, `currentUser()`, `isMe`, …).
+
 | Key | Action |
 | --- | --- |
 | `Enter` | Expand details |

@@ -2220,7 +2220,9 @@ fn pr_query(filter: PullRequestFilter) -> PullRequestQuery {
 }
 
 fn wi_query() -> WorkItemQuery {
-    WorkItemQuery { mine_only: false, include_completed: false, limit: Some(50) }
+    // Work Items only ever shows items assigned to the authenticated user
+    // (resolved from the token by each provider: @me / currentUser() / isMe).
+    WorkItemQuery { mine_only: true, include_completed: false, limit: Some(50) }
 }
 
 /// One query per subscribed definition, or a single catch-all when auto-discovering.

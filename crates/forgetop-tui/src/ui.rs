@@ -383,9 +383,9 @@ fn render_wis(frame: &mut Frame, area: Rect, app: &mut App) {
     let idxs = app.filtered_wi_indices();
     let hidden_in_view = app.hidden_states_in_view();
     let base = if hidden_in_view == 0 {
-        "Work Items".to_string()
+        "Work Items · mine".to_string()
     } else {
-        format!("Work Items · {hidden_in_view} state(s) hidden")
+        format!("Work Items · mine · {hidden_in_view} state(s) hidden")
     };
     let title = list_title(base, &app.filters[1]);
     if idxs.is_empty() {
