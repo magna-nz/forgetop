@@ -30,16 +30,17 @@ and [azdo](https://github.com/Elpulgo/azdo) (Azure DevOps only). forgetop's angl
 **one keyboard-driven tool across every forge**, with equal footing for code review
 *and* CI.
 
-| | **forgetop** | gh-dash | azdo |
-| --- | :---: | :---: | :---: |
-| Forges | GitHub · GitLab · Azure DevOps · Bitbucket · Linear · Jira | GitHub only | Azure only |
-| PRs · Work items · Pipelines in one tool | ✅ all three | PRs + issues | ✅ (Azure) |
-| Act on items (approve / merge / comment / state) | ✅ | ✅ (PRs) | partial |
-| Inline diff review with **buffered line comments** | ✅ | preview only | ❌ |
-| Pipeline drill-in (stages→jobs→steps, durations, logs) | ✅ | ❌ | ✅ |
-| Quick-filter · sort · per-view prefs (persisted) | ✅ | ✅ | limited |
-| **Desktop notifications** (pipeline fail, review requested, PR approved) | ✅ | ❌ | ❌ |
-| Tokens in the OS keychain | ✅ | via `gh` | PAT in config |
+| Capability | forgetop | gh-dash | azdo |
+| :--- | :---: | :---: | :---: |
+| Forges supported | **6** | GitHub | Azure |
+| PRs + Work items + Pipelines | ✅ | PRs only | ✅ Azure |
+| Act (approve / merge / comment) | ✅ | ✅ PRs | partial |
+| Inline line-comment review | ✅ | preview | ❌ |
+| Pipeline drill-in + logs | ✅ | ❌ | ✅ |
+| Filter · sort · saved prefs | ✅ | ✅ | limited |
+| Cross-provider aggregation | ✅ | ❌ | ❌ |
+| Desktop notifications | ✅ | ❌ | ❌ |
+| Tokens in OS keychain | ✅ | via `gh` | PAT |
 
 Where gh-dash still leads: user-defined saved sections with search queries — on the
 roadmap.

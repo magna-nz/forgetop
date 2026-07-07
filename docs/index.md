@@ -2,25 +2,211 @@
 title: Documentation
 ---
 
-# forgetop documentation
+# forgetop
 
-forgetop is a fast, keyboard-driven terminal UI for pull requests, work items, and
-CI pipelines across GitHub, GitLab, Azure DevOps, Linear, Jira, and Bitbucket.
+A fast, keyboard-driven terminal UI for your **pull requests, work items, and CI
+pipelines** — across GitHub, GitLab, Azure DevOps, Bitbucket, Linear, and Jira —
+in one place. Triage and *act* on everything without leaving the terminal, and
+without tab-hopping between forges.
 
-For install and a quick start, see the [README](https://github.com/magna-nz/forgetop#readme).
-This page is the full reference.
+This is the full reference. For install and a 60-second start, see the
+[README](https://github.com/magna-nz/forgetop#readme).
 
+- [What forgetop does](#what-forgetop-does)
+- [Core concepts](#core-concepts)
+- [Getting started](#getting-started)
+- [Pull Requests](#pull-requests)
+- [Work Items](#work-items)
+- [Pipelines](#pipelines)
+- [Filtering and sorting](#filtering-and-sorting)
+- [Notifications](#notifications)
 - [Keybindings](#keybindings)
-- [Filtering](#filtering)
 - [Configuration](#configuration)
 - [Themes](#themes)
-- [How it works](#how-it-works)
+- [How it works (architecture)](#how-it-works-architecture)
 - [Development](#development)
+
+## What forgetop does
+
+- **Three sections in one dashboard** — Pull Requests, Work Items, and Pipelines,
+  each a tab you can act on.
+- **Six forges** — GitHub, GitLab, Azure DevOps, Bitbucket, Linear, and Jira, plus
+  a built-in `--demo`.
+- **Cross-provider aggregation** — bind several connections to a section and their
+  items merge into one list, tagged by provider. All your PRs across GitHub *and*
+  GitLab *and* Azure, in a single view.
+- **Do work, not just watch it** — approve / request changes / merge / comment on
+  PRs, change work-item states, trigger pipeline runs — all from the keyboard.
+- **Real code review** — a full-screen PR view with Conversation, Commits, Checks,
+  and Diff tabs; a line cursor in the patch; and **inline line comments buffered
+  locally then submitted as one review** (Comment / Approve / Request changes).
+- **Pipeline drill-in** — expand stages → jobs → steps with per-node **durations**,
+  **failure reasons**, a scrollable **logs** pane, and open-in-browser.
+- **Filter, sort, and shape** — a live quick-filter, per-column sorting, work-item
+  state visibility, and pipeline subscriptions — all remembered per view.
+- **Desktop notifications** — get pinged when a pipeline fails, a review is
+  requested, or your PR is approved / gets changes requested — across every
+  connected provider.
+- **Secure by default** — tokens live in your OS keychain; the config file only
+  ever holds a reference.
+
+## Core concepts
+
+### Sections and bindings
+
+forgetop has three **sections**: Pull Requests, Work Items, and Pipelines. Each is
+bound to one or more **connections** (a configured account on a forge). A section
+only shows data from the connections bound to it. You manage bindings on the
+config screen (`C`).
+
+### Providers and capabilities
+
+Each provider advertises **capabilities** — which sections it can serve. A
+connection only ever offers what it can actually do, so the UI never dangles a
+dead option:
+
+| Provider | Pull Requests | Work Items | Pipelines |
+| --- | :---: | :---: | :---: |
+| GitHub | yes | yes (Issues) | yes (Actions) |
+| GitLab | yes (MRs) | yes (Issues) | yes (CI) |
+| Azure DevOps | yes | yes | yes (Builds) |
+| Bitbucket | yes | – | yes (Pipelines) |
+| Linear | – | yes | – |
+| Jira | – | yes | – |
+
+### Cross-provider aggregation
+
+Every section aggregates. Bind two or more connections to Pull Requests (or Work
+Items, or Pipelines) and their items merge into a single list with a **Provider**
+column so you can tell them apart. Filtering, sorting, and actions all work across
+the combined list — and each action targets the row's *own* provider, so
+approving a GitLab MR and merging a GitHub PR just work from the same screen.
+
+Try it live: `forgetop --demo` seeds two demo connections so you can see the
+merged lists immediately.
+
+### Security
+
+Tokens are written to the OS keychain (macOS Keychain, Windows Credential Manager,
+Linux Secret Service). The JSON config only stores a *reference* to each token —
+never the secret itself. For headless use you can supply a token via an
+environment variable instead (see [Configuration](#configuration)).
+
+## Getting started
+
+Try it with no setup — everything is in memory, nothing is written:
+
+```sh
+forgetop --demo
+```
+
+Then run it for real. On first launch (no connections) forgetop drops straight
+into the **add-connection wizard**, which walks you through picking a provider,
+entering details, pasting a token, and binding it to a section. It then offers a
+notifications chooser.
+
+```sh
+forgetop
+```
+
+Press **`C`** any time to open the config screen and manage connections and
+bindings; **`n`** starts the wizard again; **`?`** shows every keybinding.
+
+## Pull Requests
+
+The Pull Requests tab is **browse-and-open**: the list is for finding a PR; every
+write action lives inside the PR view.
+
+**On the list:**
+
+- `Enter` — open the full-screen PR view.
+- `f` — cycle the filter: All / Mine / Review-requested.
+- `/` — quick-filter by typing; `S` — sort by a column; `o` — open in browser.
+
+**Inside the PR view** (four sub-tabs, switch with `←`/`→`):
+
+- **Conversation** — description, reviewers, labels, and comment threads.
+- **Commits** — one row per commit; `Enter` drills into *that commit's* diff.
+- **Checks** — each named CI check with its status.
+- **Diff** — the changed files; `Enter` on a file drops into a **line cursor** in
+  the patch (`↑`/`↓` move line-by-line; the title shows the real file line).
+
+Write actions from the view: `a` approve, `x` request changes, `m` merge (pick a
+strategy), `c` comment, `o` open in browser.
+
+### Reviewing code with line comments
+
+In the Diff tab's line cursor, press `c` on a code line to write an inline
+comment. Comments are **buffered locally** — the line gets a `▎` marker — so you
+can comment on several lines first. Press **`s`** to submit them all as one
+review, choosing the verdict: **Comment**, **Approve**, or **Request changes**.
+
+- **GitHub** posts it as a single native review.
+- **GitLab** posts positioned discussions (and approves if you chose Approve).
+- **Azure DevOps / Bitbucket** don't expose inline patches, so the line cursor —
+  and line comments — aren't available there.
+
+## Work Items
+
+The Work Items tab shows only items **assigned to you** — each provider resolves
+the current user from your token (`@me`, `currentUser()`, `isMe`, …), so there's
+nothing to configure.
+
+- `Enter` — open the item; `s` — change state; `c` — comment.
+- `f` — open a checklist of the **states currently in view** and pick which to
+  show. The list is built from the loaded items, so it's always provider-accurate
+  (`In Progress` vs `Inprogress`). The choice persists.
+
+## Pipelines
+
+- `Enter` — drill into a run: a collapsible **stages → jobs → steps** tree.
+- `T` — trigger a run.
+
+Inside the drill-in each node shows its **duration**, and failed jobs show a short
+**failure reason** (GitLab's reason, Azure's error/warning counts). Then:
+
+- `Enter` — expand / collapse the selected node.
+- `L` — open a scrollable **logs** pane for the selected job (`Esc` closes).
+- `o` — open the selected job in the browser.
+
+For a connection that discovers many pipelines, open the config screen and press
+`s` on it to **subscribe** to just the definitions you care about.
+
+## Filtering and sorting
+
+Four complementary ways to cut a busy view down:
+
+- **Quick-filter (`/`)** — on any list, type to filter rows live; every
+  whitespace-separated token must match (case-insensitive) across the row's key
+  fields. `Enter` applies, `Esc` clears. Remembered per tab.
+- **Sort (`S`)** — pick a column to sort by; re-pick to flip direction. The sorted
+  column shows a `▲`/`▼` arrow. Persisted per view.
+- **Work-item state visibility (`f` on Work Items)** — show only chosen states.
+- **Pipeline subscriptions (`s` in the config screen)** — track only chosen
+  pipeline definitions per connection.
+
+All of these compose, and all work across the aggregated (multi-provider) list.
+
+## Notifications
+
+forgetop raises native desktop notifications on the events you choose:
+
+- **Pipeline failed** — a run transitions into a failed state.
+- **Review requested** — you're newly a requested reviewer on a PR.
+- **Your PR approved** / **changes requested** — a reviewer votes on a PR you
+  authored.
+
+Press **`N`** anywhere to open a checklist and opt in/out of each event; the
+choice is persisted, and the first-run wizard asks after your first connection.
+Detection is seeded on load (no startup spam), de-duped, and re-seeded when you
+change settings — and enabling fires one confirmation notification so you can
+verify it works on your machine. Every event spans **all bound providers**, not
+just the first.
 
 ## Keybindings
 
-forgetop shows a context-aware key glossary along the bottom - it only lists the
-keys valid for wherever you are. The full set:
+forgetop shows a **context-aware key glossary** along the bottom — it only lists
+the keys valid for where you are. Press `?` for the full panel. The complete set:
 
 ### Global
 
@@ -28,50 +214,44 @@ keys valid for wherever you are. The full set:
 | --- | --- |
 | `←` / `→`, `h` / `l`, `Tab`, `1`–`3` | Switch tab |
 | `↑` / `↓`, `k` / `j` | Move selection |
-| `/` | Quick-filter the current list (type to narrow, `Esc` clears) |
-| `S` | Sort the current list by a column (re-pick the column to flip direction) |
+| `/` | Quick-filter the current list |
+| `S` | Sort by a column (re-pick flips direction) |
 | `o` | Open selected item in browser |
 | `n` | Add a connection (wizard) |
 | `v` | Choose which tabs are visible |
 | `C` | Config / connections screen |
 | `r` | Refresh · `t` cycle theme |
-| `N` | Toggle desktop notifications |
-| `?` | Show all keybindings (works anywhere) |
+| `N` | Notifications — choose which events ping you |
+| `?` | Show all keybindings (anywhere) |
 | `q` / `Ctrl-C` | Quit · `Esc` back / close |
 
 ### Pull Requests (list)
 
-The list is browse-and-open; every write action lives inside the PR view.
-
 | Key | Action |
 | --- | --- |
-| `Enter` | Open the full-screen PR view (Conversation / Commits / Checks / Diff) |
+| `Enter` | Open the PR view |
 | `f` | Cycle filter (All / Mine / Review-requested) |
 
-### Inside the PR view (after `Enter`)
+### Inside the PR view
 
 | Key | Action |
 | --- | --- |
 | `←` / `→` | Switch sub-tab |
 | `a` / `x` | Approve / request changes |
 | `m` | Merge (choose strategy) |
-| `c` | Comment (inline on a diff line, otherwise on the PR) |
+| `c` | Comment (inline on a diff line, otherwise the PR) |
 | `Enter` (Commits) | Drill into that commit's diff |
-| `Enter` (Diff, on a file) | Drop into a line cursor within the patch |
-| `↑` / `↓` (line cursor) | Move line-by-line; the title shows the file line |
-| `s` | Submit the buffered comments as one review (Comment / Approve / Request changes) |
+| `Enter` (Diff, on a file) | Line cursor within the patch |
+| `s` | Submit buffered line comments as one review |
 | `Esc` | Step back (line cursor → file list → close) |
 
 ### Work Items
 
-The Work Items list only shows items **assigned to you** — each provider resolves
-the current user from your token (`@me`, `currentUser()`, `isMe`, …).
-
 | Key | Action |
 | --- | --- |
-| `Enter` | Expand details |
+| `Enter` | Open |
 | `s` | Change state |
-| `f` | Choose which states to show (checklist, built from the states in view) |
+| `f` | Choose which states to show |
 | `c` | Comment |
 
 ### Pipelines
@@ -79,74 +259,19 @@ the current user from your token (`@me`, `currentUser()`, `isMe`, …).
 | Key | Action |
 | --- | --- |
 | `Enter` | Drill in (stages → jobs → steps) |
-| `T` | Trigger a run |
-
-The drill-in shows each node's **duration** and a short **failure reason** on
-failed jobs (provider-specific: GitLab's failure reason, Azure's error/warning
-counts). Inside the drill-in:
-
-| Key | Action |
-| --- | --- |
-| `Enter` | Expand / collapse the selected node |
-| `L` | View the selected job's logs (scrollable pane; `Esc` closes) |
+| `Enter` (in drill-in) | Expand / collapse a node |
+| `L` | View the selected job's logs |
 | `o` | Open the selected job in the browser |
 | `T` | Trigger a run |
 
-## Filtering
+### Config / connections
 
-forgetop has three complementary ways to cut a busy list down to what you care
-about:
-
-- **Quick-filter (`/`)** - available on every list. Type to filter rows live;
-  every whitespace-separated token must match (case-insensitive) across the row's
-  key fields (title, author, number, branch, labels/state/provider). `Enter`
-  applies, `Esc` clears. The filter is remembered per tab.
-- **Work-item state visibility (`f` on Work Items)** - opens a checklist of the
-  distinct states currently in view (built from the loaded items, so it is always
-  provider-accurate). Tick the states you want to see; the choice persists.
-- **Pipeline subscriptions (`s` in the config screen)** - for a connection that
-  discovers many pipelines, pick just the definitions you want to track. Persisted
-  per connection.
-
-## Sorting
-
-Press `S` on any list (Pull Requests, Work Items, Pipelines) to pick a sort
-column. Re-pick the same column to flip between ascending and descending; the
-sorted column shows a `▲`/`▼` arrow in its header. Sorting composes with the
-filters above, and each view's sort is remembered across restarts.
-
-## Reviewing code
-
-Open a PR, go to the **Diff** tab, and press `Enter` on a file to get a line
-cursor. On any code line, `c` writes an inline comment - but nothing is sent
-yet: comments are **buffered locally** (the line gets a `▎` marker) so you can
-comment on several lines first. Press `s` to submit them all as one review, and
-pick the verdict: **Comment**, **Approve**, or **Request changes**.
-
-- **GitHub** submits them as a single native review.
-- **GitLab** posts them as positioned discussions (and approves if you chose Approve).
-- **Azure DevOps / Bitbucket** don't return inline patches, so the line cursor -
-  and therefore line comments - aren't available there yet.
-
-You can also drill into a single commit's diff from the **Commits** tab (`Enter`).
-
-## Notifications
-
-forgetop raises native desktop notifications on the events you care about:
-
-- **Pipeline failed** — a run transitions into a failed state.
-- **Review requested** — you're newly added as a reviewer on a PR.
-- **Your PR approved** / **changes requested** — a reviewer votes on a PR you authored.
-
-Press **`N`** anywhere to open a checklist and opt in/out of each event; the choice
-is persisted. The first-run wizard also asks after you add your first connection.
-Detection is seeded on load (no startup spam), de-duped, and re-seeded when you
-change the settings — and enabling fires one confirmation notification so you can
-verify they work on your machine. "Me" for the PR events is resolved from your
-token by each provider (`@me` / `currentUser()` / `isMe`).
-
-All events span **every bound provider** — pipeline failures and PR events fire
-across all connections feeding those sections, not just the first.
+| Key | Action |
+| --- | --- |
+| `a` | Add a connection |
+| `p` / `w` | Bind Pull Requests / Work Items (multi-select) |
+| `s` | Pipeline subscriptions |
+| `x` | Remove connection |
 
 ## Configuration
 
@@ -158,34 +283,35 @@ Config is a small JSON file, created and managed for you:
 | Linux | `~/.config/forgetop/config.json` |
 | Windows | `%APPDATA%\forgetop\config.json` |
 
-**It never contains secrets** - only a reference to each token in the keychain.
+**It never contains secrets** — only a reference to each token in the keychain,
+plus your bindings and view preferences (sorts, hidden states, notification
+choices).
 
 ### Tokens
 
-Tokens are stored in your OS keychain under the service name `forgetop` (macOS
-Keychain, Windows Credential Manager, Linux Secret Service). In headless
-environments (CI, containers) you can instead supply a token via an environment
-variable named `FORGETOP_PAT_<CONNECTION_ID>` (uppercased; non-alphanumeric
-characters become `_`).
+Tokens are stored in your OS keychain under the service name `forgetop`. In
+headless environments (CI, containers) you can instead supply a token via an
+environment variable named `FORGETOP_PAT_<CONNECTION_ID>` (uppercased;
+non-alphanumeric characters become `_`).
 
 ### Token scopes
 
 | Provider | What to create | Scopes |
 | --- | --- | --- |
-| **GitHub** | Personal access token | `repo` (PRs, issues, checks); `workflow` / Actions read for pipelines |
-| **GitLab** | Personal access token (Settings → Access Tokens) | `api` (merge requests, issues, pipelines) |
-| **Azure DevOps** | Personal access token | Code *Read*, Work Items *Read &amp; Write*, Build *Read &amp; Execute* |
-| **Linear** | Personal API key (Settings → Security &amp; access → API) | default |
-| **Jira** | API token (id.atlassian.com → Security → API tokens) + your account email | default (account access) |
-| **Bitbucket** | App password (Personal settings → App passwords) + your username | Pull requests, Pipelines (read &amp; write) |
+| GitHub | Personal access token | `repo` (PRs, issues, checks); `workflow` / Actions read for pipelines |
+| GitLab | Personal access token (Settings → Access Tokens) | `api` (merge requests, issues, pipelines) |
+| Azure DevOps | Personal access token | Code Read, Work Items Read/Write, Build Read/Execute |
+| Linear | Personal API key (Settings → Security and access → API) | default |
+| Jira | API token (id.atlassian.com) + your account email | default (account access) |
+| Bitbucket | App password (Personal settings → App passwords) + your username | Pull requests, Pipelines (read/write) |
 
 ## Themes
 
-Cycle with `t`. Four built-in themes - `slate` (default), `dark`, `light`, and
-`matrix` - using 256-colour palettes so they render correctly on every terminal.
-Your choice is remembered.
+Cycle with `t`. Four built-in themes — `slate` (default), `dark`, `light`, and
+`matrix` — using 256-colour palettes so they render correctly on every terminal
+(including ones without truecolor). Your choice is remembered.
 
-## How it works
+## How it works (architecture)
 
 forgetop is a Rust [Cargo workspace](https://doc.rust-lang.org/cargo/reference/workspaces.html):
 
@@ -196,15 +322,22 @@ forgetop is a Rust [Cargo workspace](https://doc.rust-lang.org/cargo/reference/w
 | `forgetop-tui` | The [ratatui](https://ratatui.rs) terminal UI |
 | `forgetop-cli` | The `forgetop` binary |
 
-Providers advertise *capabilities* (which sections they support), so a connection
-only offers what it can actually do - Linear appears for Work Items but not Pull
-Requests, for example.
+A few design ideas hold it together:
 
-**Every section aggregates across providers.** Bind more than one connection to
-Pull Requests, Work Items, or Pipelines (in the config screen: `p` / `w` open a
-multi-select checklist; pipelines use `s`) and their items merge into one list,
-tagged with a **Provider** column. Filtering, sorting, and actions all work across
-the combined list, and each action targets the row's own provider.
+- **Capability-scoped traits.** Providers implement `PullRequestSource`,
+  `WorkItemSource`, and/or `PipelineSource` — only what they support. The core
+  never assumes a provider can do something it can't, which is how a Linear
+  connection appears for Work Items but not Pull Requests.
+- **Sections resolve to feeds.** A section binds to a set of connections; the
+  service resolves each to a live source (a "feed"). Aggregation is just iterating
+  every feed and tagging each item with its connection — the same shape for PRs,
+  Work Items, and Pipelines.
+- **Config never holds secrets.** The config service persists bindings and
+  preferences and stores only a `credential_ref` per connection; the actual token
+  lives in the OS keychain via a separate secret store.
+- **Immediate-mode UI, own input loop.** The TUI owns a dedicated input reader
+  thread feeding a `tokio` loop, and redraws the whole frame each tick — so there
+  are no framework focus fights, and every keystroke is dispatched explicitly.
 
 ## Development
 
