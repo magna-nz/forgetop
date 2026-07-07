@@ -49,6 +49,20 @@ pub struct UiState {
     /// (provider-specific strings, e.g. "Done"). Anything not listed is shown.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hidden_work_item_states: Vec<String>,
+    /// Per-view sort column + direction. `None` = provider order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_sort: Option<SortPref>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_item_sort: Option<SortPref>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipeline_sort: Option<SortPref>,
+}
+
+/// A saved sort: which column (by key) and whether descending.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SortPref {
+    pub key: String,
+    pub desc: bool,
 }
 
 /// Root persisted configuration.

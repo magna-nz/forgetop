@@ -225,8 +225,19 @@ fn columnize(
     rows: &[Vec<(String, Style)>],
     flex: usize,
     inner_w: usize,
+    sort: Option<(usize, bool)>,
 ) -> (Line<'static>, Vec<Line<'static>>) {
     let ncol = headers.len();
+    // The sorted column's header gets a direction arrow.
+    let headers: Vec<String> = headers
+        .iter()
+        .enumerate()
+        .map(|(i, h)| match sort {
+            Some((col, desc)) if col == i => format!("{h}{}", if desc { " ▼" } else { " ▲" }),
+            _ => h.to_string(),
+        })
+        .collect();
+
     let mut w: Vec<usize> = headers.iter().map(|h| h.chars().count()).collect();
     for row in rows {
         for (i, (text, _)) in row.iter().enumerate().take(ncol) {
@@ -238,10 +249,47 @@ fn columnize(
     let fixed: usize = (0..ncol).filter(|&i| i != flex).map(|i| w[i]).sum::<usize>() + padding;
     w[flex] = w[flex].min(inner_w.saturating_sub(fixed)).max(3);
 
-    let header_cells: Vec<(String, Style)> = headers.iter().map(|h| (h.to_string(), header_style)).collect();
+    let header_cells: Vec<(String, Style)> = headers.iter().map(|h| (h.clone(), header_style)).collect();
     let header = cells_line(&header_cells, &w, inner_w);
     let lines = rows.iter().map(|r| cells_line(r, &w, inner_w)).collect();
     (header, lines)
+}
+
+/// Maps a section's active sort to the header column index that gets the arrow.
+fn sort_header_col(section: usize, key: &str) -> Option<usize> {
+    match section {
+        0 => match key {
+            "status" => Some(0),
+            "number" => Some(1),
+            "title" => Some(2),
+            "author" => Some(3),
+            "checks" => Some(4),
+            "updated" => Some(6),
+            _ => None,
+        },
+        1 => match key {
+            "state" => Some(0),
+            "title" => Some(2),
+            "type" => Some(3),
+            "assignee" => Some(4),
+            "updated" => Some(5),
+            _ => None,
+        },
+        _ => match key {
+            "status" => Some(0),
+            "provider" => Some(1),
+            "pipeline" => Some(2),
+            "branch" => Some(4),
+            "started" => Some(5),
+            _ => None,
+        },
+    }
+}
+
+/// The `(header_col, desc)` arrow marker for a section's active sort, if any.
+fn sort_marker(app: &App, section: usize) -> Option<(usize, bool)> {
+    let s = app.sort_for(section)?;
+    Some((sort_header_col(section, &s.key)?, s.desc))
 }
 
 /// Appends the active quick-filter to a section title (e.g. `Pipelines · /deploy`).
@@ -314,7 +362,7 @@ fn render_prs(frame: &mut Frame, area: Rect, app: &mut App) {
         })
         .collect();
 
-    let (header, rows) = columnize(dim, &headers, &cells, 2, inner_w);
+    let (header, rows) = columnize(dim, &headers, &cells, 2, inner_w, sort_marker(app, 0));
     render_inline_list(frame, area, app, &title, header, rows);
 }
 
@@ -374,7 +422,7 @@ fn render_wis(frame: &mut Frame, area: Rect, app: &mut App) {
         })
         .collect();
 
-    let (header, rows) = columnize(dim, &headers, &cells, 2, inner_w);
+    let (header, rows) = columnize(dim, &headers, &cells, 2, inner_w, sort_marker(app, 1));
     render_inline_list(frame, area, app, &title, header, rows);
 }
 
@@ -417,7 +465,7 @@ fn render_pipes(frame: &mut Frame, area: Rect, app: &mut App) {
         })
         .collect();
 
-    let (header, rows) = columnize(dim, &headers, &cells, 2, inner_w);
+    let (header, rows) = columnize(dim, &headers, &cells, 2, inner_w, sort_marker(app, 2));
     render_inline_list(frame, area, app, &title, header, rows);
 }
 
@@ -692,9 +740,9 @@ fn footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
     }
     let mut keys = vec![("↑↓", "move"), ("←→", "tabs")];
     match app.active {
-        0 => keys.extend([("↵", "open"), ("f", "filter"), ("o", "browser")]),
-        1 => keys.extend([("↵", "open"), ("s", "state"), ("f", "states"), ("c", "comment"), ("o", "browser")]),
-        2 => keys.extend([("↵", "drill-in"), ("T", "trigger"), ("o", "open")]),
+        0 => keys.extend([("↵", "open"), ("f", "filter"), ("S", "sort"), ("o", "browser")]),
+        1 => keys.extend([("↵", "open"), ("s", "state"), ("f", "states"), ("S", "sort"), ("c", "comment"), ("o", "browser")]),
+        2 => keys.extend([("↵", "drill-in"), ("S", "sort"), ("T", "trigger"), ("o", "open")]),
         _ => {}
     }
     keys.push(("/", "find"));
@@ -1147,6 +1195,7 @@ fn help_sections() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
                 ("←/→  h/l  Tab  1–3", "Switch tab"),
                 ("↑/↓  k/j", "Move selection"),
                 ("/", "Quick-filter the list"),
+                ("S", "Sort by column (re-pick flips direction)"),
                 ("o", "Open selected in browser"),
                 ("n", "Add a connection (wizard)"),
                 ("v", "Choose which tabs are visible"),
@@ -1408,7 +1457,7 @@ mod tests {
         ];
         // Wide viewport: the Title (flex) column should size to its longest value (12),
         // not stretch to fill — so column B lands right after it, not at the far edge.
-        let (_header, lines) = columnize(s, &headers, &rows, 1, 200);
+        let (_header, lines) = columnize(s, &headers, &rows, 1, 200, None);
         let plain: String = lines[0].spans.iter().map(|sp| sp.content.as_ref()).collect::<String>();
         // LEAD(1) + A(2) + GAP(3) + Title(12) + GAP(3) => B starts at index 21.
         assert_eq!(&plain[21..23], "yy", "B column packs right after the content-sized Title");

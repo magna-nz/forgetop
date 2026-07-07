@@ -183,6 +183,17 @@ impl ConfigService {
         self.persist(cfg).await
     }
 
+    /// Persists the sort for a section (`None` restores provider order).
+    pub async fn set_sort(&self, section: Section, sort: Option<SortPref>) -> Result<()> {
+        let mut cfg = self.snapshot();
+        match section {
+            Section::PullRequests => cfg.ui.pr_sort = sort,
+            Section::WorkItems => cfg.ui.work_item_sort = sort,
+            Section::Pipelines => cfg.ui.pipeline_sort = sort,
+        }
+        self.persist(cfg).await
+    }
+
     /// Replaces a connection's tracked pipeline definitions with an explicit set
     /// (turns off auto-discovery). An empty list tracks nothing.
     pub async fn set_pipeline_definitions(&self, connection_id: &str, definition_ids: Vec<String>) -> Result<()> {

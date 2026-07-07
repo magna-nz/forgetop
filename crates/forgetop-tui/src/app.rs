@@ -1,9 +1,11 @@
 //! Application state and the (async) update logic driven by the event loop.
 
+use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::sync::Arc;
 
 use chrono::{DateTime, Local};
+use forgetop_core::config::SortPref;
 use forgetop_core::domain::*;
 use forgetop_core::provider::*;
 use forgetop_core::service::{ConfigService, ConnectionHealth, ConnectionHealthService, SectionService};
@@ -79,6 +81,10 @@ pub struct App {
     /// Work-item state names hidden from the list (provider-specific strings).
     /// Persisted; anything not listed is shown.
     pub wi_hidden_states: HashSet<String>,
+    /// Per-view sort (column key + direction); `None` = provider order. Persisted.
+    pub pr_sort: Option<SortPref>,
+    pub wi_sort: Option<SortPref>,
+    pub pipe_sort: Option<SortPref>,
     /// Transient one-shot message shown in the footer until the next keypress.
     pub toast: Option<String>,
     /// Open modal overlay, if any. When set, keys route here instead of the table.
@@ -358,6 +364,9 @@ impl App {
             filters: [String::new(), String::new(), String::new()],
             filtering: false,
             wi_hidden_states: HashSet::new(),
+            pr_sort: None,
+            wi_sort: None,
+            pipe_sort: None,
             toast: None,
             overlay: None,
             wizard: None,
@@ -378,17 +387,26 @@ impl App {
 
     // ---- quick filter ----
 
-    /// Row indices of the PR list matching its quick filter (all rows if empty).
+    /// Row indices of the PR list matching its quick filter (all rows if empty),
+    /// in the active sort order.
     pub fn filtered_pr_indices(&self) -> Vec<usize> {
         let q = self.filters[0].to_lowercase();
-        (0..self.prs.len()).filter(|&i| pr_matches(&self.prs[i], &q)).collect()
+        let mut idx: Vec<usize> = (0..self.prs.len()).filter(|&i| pr_matches(&self.prs[i], &q)).collect();
+        if let Some(s) = &self.pr_sort {
+            idx.sort_by(|&a, &b| ordered(pr_cmp(&self.prs[a], &self.prs[b], &s.key), s.desc));
+        }
+        idx
     }
 
     pub fn filtered_wi_indices(&self) -> Vec<usize> {
         let q = self.filters[1].to_lowercase();
-        (0..self.wis.len())
+        let mut idx: Vec<usize> = (0..self.wis.len())
             .filter(|&i| !self.wi_hidden_states.contains(&self.wis[i].state) && wi_matches(&self.wis[i], &q))
-            .collect()
+            .collect();
+        if let Some(s) = &self.wi_sort {
+            idx.sort_by(|&a, &b| ordered(wi_cmp(&self.wis[a], &self.wis[b], &s.key), s.desc));
+        }
+        idx
     }
 
     /// How many distinct states currently in view are hidden (for the title/toast;
@@ -411,7 +429,11 @@ impl App {
 
     pub fn filtered_pipe_indices(&self) -> Vec<usize> {
         let q = self.filters[2].to_lowercase();
-        (0..self.pipes.len()).filter(|&i| pipe_matches(&self.pipes[i], &q)).collect()
+        let mut idx: Vec<usize> = (0..self.pipes.len()).filter(|&i| pipe_matches(&self.pipes[i], &q)).collect();
+        if let Some(s) = &self.pipe_sort {
+            idx.sort_by(|&a, &b| ordered(pipe_cmp(&self.pipes[a], &self.pipes[b], &s.key), s.desc));
+        }
+        idx
     }
 
     fn filtered_len(&self, section: usize) -> usize {
@@ -561,6 +583,61 @@ impl App {
     /// Applies persisted hidden work-item-state preferences at startup.
     pub fn apply_hidden_work_item_states(&mut self, hidden: &[String]) {
         self.wi_hidden_states = hidden.iter().cloned().collect();
+    }
+
+    /// Applies persisted per-view sort preferences at startup.
+    pub fn apply_sorts(&mut self, pr: Option<SortPref>, wi: Option<SortPref>, pipe: Option<SortPref>) {
+        self.pr_sort = pr;
+        self.wi_sort = wi;
+        self.pipe_sort = pipe;
+    }
+
+    /// The active sort for a section, if any.
+    pub fn sort_for(&self, section: usize) -> Option<&SortPref> {
+        match section {
+            0 => self.pr_sort.as_ref(),
+            1 => self.wi_sort.as_ref(),
+            _ => self.pipe_sort.as_ref(),
+        }
+    }
+
+    /// Opens the sort-column picker for the active list.
+    fn open_sort_picker(&mut self) {
+        let cols = sort_cols(self.active);
+        let items: Vec<String> = cols.iter().map(|c| c.label.to_string()).collect();
+        let selected = self
+            .sort_for(self.active)
+            .and_then(|s| cols.iter().position(|c| c.key == s.key))
+            .unwrap_or(0);
+        self.overlay = Some(Overlay::Picker {
+            title: "Sort by".into(),
+            items,
+            selected,
+            kind: PickerKind::SortColumn { section: self.active },
+        });
+    }
+
+    /// Applies a chosen sort column: same column toggles direction, a new column
+    /// starts at its sensible default direction. Persists the choice.
+    async fn apply_sort(&mut self, section: usize, index: usize, deps: &AppDeps) {
+        let Some(col) = sort_cols(section).get(index) else { return };
+        let key = col.key.to_string();
+        let label = col.label;
+        let desc = match self.sort_for(section) {
+            Some(s) if s.key == key => !s.desc, // re-pick the same column → flip
+            _ => default_desc(&key),
+        };
+        let pref = SortPref { key, desc };
+        match section {
+            0 => self.pr_sort = Some(pref.clone()),
+            1 => self.wi_sort = Some(pref.clone()),
+            _ => self.pipe_sort = Some(pref.clone()),
+        }
+        let arrow = if desc { "↓" } else { "↑" };
+        self.toast = Some(format!("Sorted by {label} {arrow}"));
+        self.list_scroll = 0;
+        self.fix_selection();
+        let _ = deps.config.set_sort(section_of(section), Some(pref)).await;
     }
 
     // ---- data loading ----
@@ -1123,6 +1200,7 @@ impl App {
                 let _ = deps.config.set_theme(Some(next.to_string())).await;
             }
             '/' => self.start_filter(),
+            'S' => self.open_sort_picker(),
             'o' => self.open_selected(),
             'n' => self.start_add_connection(),
             'v' => self.open_sections_toggle(),
@@ -1653,6 +1731,7 @@ impl App {
             Action::ApplyToggle { kind, ids } => self.apply_toggle(kind, ids, deps).await,
             Action::AddLineComment(body) => self.add_line_comment(body),
             Action::SubmitReview(event) => self.submit_review(event, deps).await,
+            Action::SetSort { section, index } => self.apply_sort(section, index, deps).await,
         }
     }
 
@@ -1841,6 +1920,150 @@ fn pipe_matches(p: &PipeRow, q: &str) -> bool {
     q.split_whitespace().all(|t| hay.contains(t))
 }
 
+// ---- sorting ----
+
+/// One sortable column: a stable `key` (persisted) and a display `label`.
+pub struct SortCol {
+    pub key: &'static str,
+    pub label: &'static str,
+}
+
+const PR_SORTS: &[SortCol] = &[
+    SortCol { key: "updated", label: "Updated" },
+    SortCol { key: "number", label: "Number" },
+    SortCol { key: "title", label: "Title" },
+    SortCol { key: "author", label: "Author" },
+    SortCol { key: "checks", label: "Checks" },
+    SortCol { key: "status", label: "Status" },
+];
+const WI_SORTS: &[SortCol] = &[
+    SortCol { key: "updated", label: "Updated" },
+    SortCol { key: "state", label: "State" },
+    SortCol { key: "title", label: "Title" },
+    SortCol { key: "type", label: "Type" },
+    SortCol { key: "assignee", label: "Assignee" },
+];
+const PIPE_SORTS: &[SortCol] = &[
+    SortCol { key: "started", label: "Started" },
+    SortCol { key: "status", label: "Status" },
+    SortCol { key: "pipeline", label: "Pipeline" },
+    SortCol { key: "provider", label: "Provider" },
+    SortCol { key: "branch", label: "Branch" },
+];
+
+/// The sortable columns for a section (0=PR, 1=WI, 2=Pipelines).
+pub fn sort_cols(section: usize) -> &'static [SortCol] {
+    match section {
+        0 => PR_SORTS,
+        1 => WI_SORTS,
+        _ => PIPE_SORTS,
+    }
+}
+
+/// Sensible default direction when first picking a column: newest / highest first
+/// for time, number and status columns; A→Z for text.
+fn default_desc(key: &str) -> bool {
+    matches!(key, "updated" | "created" | "number" | "started" | "checks" | "status")
+}
+
+fn ci(s: &str) -> String {
+    s.to_lowercase()
+}
+
+fn check_rank(s: CheckStatus) -> u8 {
+    match s {
+        CheckStatus::None => 0,
+        CheckStatus::Passed => 1,
+        CheckStatus::Pending => 2,
+        CheckStatus::Failed => 3,
+    }
+}
+
+fn pr_status_rank(pr: &PullRequest) -> u8 {
+    if pr.is_draft {
+        return 0;
+    }
+    match pr.status {
+        PullRequestStatus::Draft => 0,
+        PullRequestStatus::Open => 1,
+        PullRequestStatus::Merged => 2,
+        PullRequestStatus::Closed => 3,
+    }
+}
+
+fn wi_state_rank(c: WorkItemStateCategory) -> u8 {
+    match c {
+        WorkItemStateCategory::Triage => 0,
+        WorkItemStateCategory::Backlog => 1,
+        WorkItemStateCategory::Unstarted => 2,
+        WorkItemStateCategory::Started => 3,
+        WorkItemStateCategory::Completed => 4,
+        WorkItemStateCategory::Canceled => 5,
+    }
+}
+
+fn pipe_status_rank(s: PipelineRunStatus) -> u8 {
+    match s {
+        PipelineRunStatus::Failed => 0,
+        PipelineRunStatus::Canceled => 1,
+        PipelineRunStatus::Running => 2,
+        PipelineRunStatus::Queued => 3,
+        PipelineRunStatus::PartiallySucceeded => 4,
+        PipelineRunStatus::Succeeded => 5,
+    }
+}
+
+fn pr_cmp(a: &PullRequest, b: &PullRequest, key: &str) -> Ordering {
+    match key {
+        "updated" => a.updated_at.cmp(&b.updated_at),
+        "number" => a.number.cmp(&b.number),
+        "title" => ci(&a.title).cmp(&ci(&b.title)),
+        "author" => ci(&a.author.display_name).cmp(&ci(&b.author.display_name)),
+        "checks" => check_rank(a.checks).cmp(&check_rank(b.checks)),
+        "status" => pr_status_rank(a).cmp(&pr_status_rank(b)),
+        _ => Ordering::Equal,
+    }
+}
+
+fn wi_cmp(a: &WorkItem, b: &WorkItem, key: &str) -> Ordering {
+    match key {
+        "updated" => a.updated_at.cmp(&b.updated_at),
+        "state" => wi_state_rank(a.state_category).cmp(&wi_state_rank(b.state_category)).then_with(|| ci(&a.state).cmp(&ci(&b.state))),
+        "title" => ci(&a.title).cmp(&ci(&b.title)),
+        "type" => ci(a.work_item_type.as_deref().unwrap_or("")).cmp(&ci(b.work_item_type.as_deref().unwrap_or(""))),
+        "assignee" => {
+            let an = a.assignee.as_ref().map(|u| ci(&u.display_name)).unwrap_or_default();
+            let bn = b.assignee.as_ref().map(|u| ci(&u.display_name)).unwrap_or_default();
+            an.cmp(&bn)
+        }
+        _ => Ordering::Equal,
+    }
+}
+
+fn pipe_cmp(a: &PipeRow, b: &PipeRow, key: &str) -> Ordering {
+    match key {
+        "started" => a.run.started_at.cmp(&b.run.started_at),
+        "status" => pipe_status_rank(a.run.status).cmp(&pipe_status_rank(b.run.status)),
+        "pipeline" => {
+            let an = a.run.name.clone().unwrap_or_else(|| a.run.definition_id.clone());
+            let bn = b.run.name.clone().unwrap_or_else(|| b.run.definition_id.clone());
+            ci(&an).cmp(&ci(&bn))
+        }
+        "provider" => ci(a.provider.as_str()).cmp(&ci(b.provider.as_str())).then_with(|| ci(&a.connection).cmp(&ci(&b.connection))),
+        "branch" => ci(a.run.branch.as_deref().unwrap_or("")).cmp(&ci(b.run.branch.as_deref().unwrap_or(""))),
+        _ => Ordering::Equal,
+    }
+}
+
+/// Applies the sort direction to a comparison.
+fn ordered(o: Ordering, desc: bool) -> Ordering {
+    if desc {
+        o.reverse()
+    } else {
+        o
+    }
+}
+
 fn vote_message(vote: ReviewVote) -> &'static str {
     match vote {
         ReviewVote::Approved => "Approved",
@@ -1937,6 +2160,39 @@ mod tests {
             updated_at: None,
             url: url.map(Into::into),
         }
+    }
+
+    #[test]
+    fn sort_orders_rows_and_respects_direction() {
+        let mut app = App::new("slate");
+        let mut a = pr(None);
+        a.number = Some(3);
+        a.title = "banana".into();
+        let mut b = pr(None);
+        b.number = Some(1);
+        b.title = "cherry".into();
+        let mut c = pr(None);
+        c.number = Some(2);
+        c.title = "apple".into();
+        app.prs = vec![a, b, c]; // provider order: numbers 3, 1, 2
+        app.active = 0;
+
+        // No sort → provider order.
+        assert_eq!(app.filtered_pr_indices(), vec![0, 1, 2]);
+
+        // By number, ascending then descending.
+        app.pr_sort = Some(SortPref { key: "number".into(), desc: false });
+        assert_eq!(app.filtered_pr_indices(), vec![1, 2, 0]); // 1,2,3
+        app.pr_sort = Some(SortPref { key: "number".into(), desc: true });
+        assert_eq!(app.filtered_pr_indices(), vec![0, 2, 1]); // 3,2,1
+
+        // By title (case-insensitive) ascending: apple, banana, cherry.
+        app.pr_sort = Some(SortPref { key: "title".into(), desc: false });
+        assert_eq!(app.filtered_pr_indices(), vec![2, 0, 1]);
+
+        // Sort composes with the quick filter (only matching rows, still sorted).
+        app.filters[0] = "e".into(); // matches "cherry" and "apple"
+        assert_eq!(app.filtered_pr_indices(), vec![2, 1]); // apple(2) then cherry(1)
     }
 
     #[test]
