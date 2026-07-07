@@ -38,7 +38,17 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         .split(area);
 
     render_tabs(frame, rows[0], app);
-    render_content(frame, rows[1], app);
+    // A saved-views bar sits above the list when the section has more than one view.
+    if matches!(app.screen, Screen::List) && app.views[app.active].len() > 1 {
+        let split = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(3)])
+            .split(rows[1]);
+        render_view_bar(frame, split[0], app);
+        render_content(frame, split[1], app);
+    } else {
+        render_content(frame, rows[1], app);
+    }
     render_health(frame, rows[2], app);
     render_footer(frame, rows[4], app);
 
@@ -85,6 +95,27 @@ fn render_tabs(frame: &mut Frame, area: Rect, app: &App) {
         .block(block);
 
     frame.render_widget(tabs, area);
+}
+
+/// A horizontal strip of the active section's saved views, the current one lit.
+fn render_view_bar(frame: &mut Frame, area: Rect, app: &App) {
+    let theme = &app.theme;
+    let bar = Style::default().bg(theme.panel);
+    let views = &app.views[app.active];
+    let active = app.view_idx[app.active];
+
+    let mut spans = vec![Span::styled(" ", bar)];
+    for (i, v) in views.iter().enumerate() {
+        let style = if i == active {
+            bar.fg(theme.bg).bg(theme.accent).add_modifier(Modifier::BOLD)
+        } else {
+            bar.fg(theme.dim)
+        };
+        spans.push(Span::styled(format!(" {} ", v.name), style));
+        spans.push(Span::styled(" ", bar));
+    }
+    spans.push(Span::styled("  [ ] views", bar.fg(theme.dim)));
+    frame.render_widget(Paragraph::new(Line::from(spans)).style(bar), area);
 }
 
 fn render_content(frame: &mut Frame, area: Rect, app: &mut App) {
@@ -326,7 +357,7 @@ fn pr_checks(theme: &Theme, pr: &PullRequest) -> (String, ratatui::style::Color)
 fn render_prs(frame: &mut Frame, area: Rect, app: &mut App) {
     let theme = &app.theme;
     let idxs = app.filtered_pr_indices();
-    let title = list_title(format!("Pull Requests · {}", app.pr_filter_label()), &app.filters[0]);
+    let title = list_title("Pull Requests".to_string(), &app.filters[0]);
     if idxs.is_empty() {
         let msg = if !app.filters[0].is_empty() {
             "No matches. Esc clears the filter."
@@ -748,11 +779,15 @@ fn footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
     }
     let mut keys = vec![("↑↓", "move"), ("←→", "tabs")];
     match app.active {
-        0 => keys.extend([("↵", "open"), ("f", "filter"), ("S", "sort"), ("o", "browser")]),
+        0 => keys.extend([("↵", "open"), ("f", "view"), ("S", "sort"), ("o", "browser")]),
         1 => keys.extend([("↵", "open"), ("f", "states"), ("S", "sort"), ("o", "browser")]),
         2 => keys.extend([("↵", "drill-in"), ("S", "sort"), ("T", "trigger"), ("o", "open")]),
         _ => {}
     }
+    if app.views[app.active].len() > 1 {
+        keys.push(("[ ]", "views"));
+    }
+    keys.push(("V", "save view"));
     keys.push(("/", "find"));
     keys.extend([("v", "tabs"), ("C", "config"), ("r", "refresh"), ("t", "theme"), ("?", "help"), ("q", "quit")]);
     keys
@@ -1234,10 +1269,18 @@ fn help_sections() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
             ],
         ),
         (
+            "Saved views",
+            vec![
+                ("[  ]", "Previous / next saved view"),
+                ("V", "Save the current filter + sort + states as a view"),
+                ("X", "Delete the current view"),
+            ],
+        ),
+        (
             "Pull Requests (list)",
             vec![
                 ("Enter", "Open the PR view (all actions live there)"),
-                ("f", "Cycle filter (All / Mine / Review)"),
+                ("f", "Next saved view (defaults: All / Mine / Review)"),
             ],
         ),
         (
@@ -1559,19 +1602,15 @@ mod tests {
     }
 
     #[test]
-    fn pr_footer_shows_filter_key_and_active_filter() {
+    fn pr_view_bar_shows_saved_views() {
         let mut app = App::new("slate");
+        app.apply_views(vec![], vec![], vec![]); // seed the default PR views
         app.prs.push(crate::app::PrRow { connection_id: "c".into(), connection: "GH".into(), provider: ProviderType::GitHub, pr: sample_pr() });
         app.pr_state.select(Some(0));
 
         let out = render_to_string(&mut app, 100, 24);
-        assert!(out.contains("filter"), "PR tab footer should advertise the filter key");
-        assert!(out.contains("Pull Requests · all"), "PR title should show the active filter");
-
-        // On the Work Items tab the filter key is not offered.
-        app.active = 1;
-        let wi = render_to_string(&mut app, 100, 24);
-        assert!(!wi.contains("filter"), "filter is PR-only");
+        assert!(out.contains("All") && out.contains("Mine") && out.contains("Review"), "the view bar lists the default PR views");
+        assert!(out.contains("views"), "footer/bar advertises view switching");
     }
 
     #[test]
@@ -1615,7 +1654,7 @@ mod tests {
         app.prs.push(crate::app::PrRow { connection_id: "c".into(), connection: "GH".into(), provider: ProviderType::GitHub, pr: sample_pr() });
         app.pr_state.select(Some(0));
         let list = render_to_string(&mut app, 140, 24);
-        assert!(list.contains("open") && list.contains("filter"), "list keeps open/filter");
+        assert!(list.contains("open") && list.contains("browser"), "list keeps browse/open");
         for gone in ["approve", "reject", "merge"] {
             assert!(!list.contains(gone), "PR list footer should not advertise '{gone}'");
         }

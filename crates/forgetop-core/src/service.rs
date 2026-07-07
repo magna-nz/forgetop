@@ -220,6 +220,17 @@ impl ConfigService {
         self.persist(cfg).await
     }
 
+    /// Persists the saved views for a section.
+    pub async fn set_views(&self, section: Section, views: Vec<SavedView>) -> Result<()> {
+        let mut cfg = self.snapshot();
+        match section {
+            Section::PullRequests => cfg.ui.pr_views = views,
+            Section::WorkItems => cfg.ui.work_item_views = views,
+            Section::Pipelines => cfg.ui.pipeline_views = views,
+        }
+        self.persist(cfg).await
+    }
+
     /// Persists the sort for a section (`None` restores provider order).
     pub async fn set_sort(&self, section: Section, sort: Option<SortPref>) -> Result<()> {
         let mut cfg = self.snapshot();
