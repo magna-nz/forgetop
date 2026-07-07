@@ -138,6 +138,7 @@ the keys valid for wherever you are. The full set:
 | --- | --- |
 | `Enter` | Expand details |
 | `s` | Change state |
+| `f` | Choose which states to show (checklist, built from states in view) |
 | `c` | Comment |
 
 ### Pipelines

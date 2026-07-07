@@ -30,6 +30,7 @@ pub async fn run(deps: AppDeps, theme_name: &str) -> Result<()> {
 
     let mut app = App::new(theme_name);
     app.apply_hidden_sections(&deps.config.snapshot().ui.hidden_sections);
+    app.apply_hidden_work_item_states(&deps.config.snapshot().ui.hidden_work_item_states);
     app.reload_all(&deps).await;
 
     // First run: nothing configured yet — drop straight into the add-connection wizard.

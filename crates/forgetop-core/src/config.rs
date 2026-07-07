@@ -45,6 +45,10 @@ pub struct UiState {
     /// Sections the user has hidden from the tab bar.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hidden_sections: Vec<Section>,
+    /// Work-item state names the user has hidden from the Work Items list
+    /// (provider-specific strings, e.g. "Done"). Anything not listed is shown.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hidden_work_item_states: Vec<String>,
 }
 
 /// Root persisted configuration.

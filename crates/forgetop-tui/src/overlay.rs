@@ -28,6 +28,8 @@ pub enum ToggleKind {
     Sections,
     /// Pipeline definitions to subscribe a connection to; item ids are definition ids.
     PipelineSubs { connection_id: String },
+    /// Work-item states to show; item ids are the state strings themselves.
+    WorkItemStates,
 }
 
 /// One row of a [`Overlay::Toggle`] checklist.
@@ -82,7 +84,7 @@ impl Overlay {
             Overlay::Confirm { .. } => vec![("y", "confirm"), ("Esc", "cancel")],
             Overlay::Picker { .. } => vec![("↑↓", "choose"), ("↵", "select"), ("Esc", "cancel")],
             Overlay::Input { .. } => vec![("Esc", "cancel"), ("↵", "submit")],
-            Overlay::Toggle { .. } => vec![("↑↓", "move"), ("space", "toggle"), ("Esc", "apply")],
+            Overlay::Toggle { .. } => vec![("↑↓", "move"), ("↵/space", "toggle"), ("Esc", "apply")],
         }
     }
 
