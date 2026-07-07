@@ -1,12 +1,13 @@
 # forgetop
 
 A fast, keyboard-driven terminal UI for your pull requests, work items, and CI
-pipelines - across **GitHub**, **GitLab**, **Azure DevOps**, **Linear**, **Jira**, and **Bitbucket** - in one place.
+pipelines - across **GitHub**, **GitLab**, **Azure DevOps**, **Linear**, **Jira**,
+and **Bitbucket** - in one place.
 
 [![CI](https://github.com/magna-nz/forgetop/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/magna-nz/forgetop/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/magna-nz/forgetop?sort=semver&label=release)](https://github.com/magna-nz/forgetop/releases/latest)
+[![Docs](https://img.shields.io/badge/docs-magna--nz.github.io%2Fforgetop-blue)](https://magna-nz.github.io/forgetop/)
 [![Rust](https://img.shields.io/badge/built%20with-Rust-DEA584?logo=rust&logoColor=white)](https://www.rust-lang.org)
-[![Platforms](https://img.shields.io/badge/runs%20on-macOS%20%7C%20Linux%20%7C%20Windows-success)](#install)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 <div align="center">
@@ -17,29 +18,15 @@ pipelines - across **GitHub**, **GitLab**, **Azure DevOps**, **Linear**, **Jira*
 
 ---
 
-Modern teams spread work across several forges - code review in GitHub, tickets
-in Linear, pipelines in Azure DevOps. forgetop pulls them into a single terminal
-dashboard so you can triage without tab-hopping. Each section is bound to
-whichever provider owns it, and the Pipelines view can aggregate several at once.
+Modern teams spread work across several forges. forgetop pulls your pull requests,
+work items, and pipelines into one terminal dashboard - and lets you *act* on them
+(approve, merge, comment, change state, drill into pipeline stages, trigger runs)
+without leaving the keyboard. Tokens live in your OS keychain, never in plaintext.
 
-## Features
+## Providers
 
-- **Three sections** - Pull Requests, Work Items, and Pipelines, each independently
-  bound to a provider. Pipelines can aggregate multiple connections.
-- **Do work, not just watch it** - approve / merge / comment on PRs, view coloured
-  diffs and review threads, change work-item states, drill into pipeline
-  stages → jobs → steps, and trigger runs - all from the keyboard.
-- **Multi-provider** - GitHub, GitLab, Azure DevOps, Linear, Jira, and Bitbucket, with a built-in `--demo`.
-- **Guided setup** - a first-run wizard walks you through adding a connection; a
-  config screen manages connections and bindings later.
-- **Secure by default** - tokens live in your OS keychain (macOS Keychain, Windows
-  Credential Manager, Linux Secret Service). The config file only stores a reference.
-- **Yours to shape** - show/hide sections, four colour themes, live auto-refresh.
-
-## Supported providers
-
-Each section binds to a provider that supports it. Providers advertise their
-capabilities, so a connection only ever offers what it can actually do.
+Each section binds to a provider that supports it; the Pipelines section can
+aggregate several at once.
 
 | Provider | Pull Requests | Work Items | Pipelines |
 | --- | :---: | :---: | :---: |
@@ -51,8 +38,6 @@ capabilities, so a connection only ever offers what it can actually do.
 | **Jira** | - | ✅ | - |
 | **Demo** | ✅ | ✅ | ✅ |
 
-The Pipelines section can aggregate several providers at once.
-
 ## Install
 
 **Homebrew** (macOS / Linux):
@@ -61,7 +46,7 @@ The Pipelines section can aggregate several providers at once.
 brew install magna-nz/tap/forgetop
 ```
 
-**Shell installer** (macOS / Linux) - downloads a prebuilt binary:
+**Shell installer** (macOS / Linux):
 
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/magna-nz/forgetop/releases/latest/download/forgetop-installer.sh | sh
@@ -73,10 +58,9 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/magna-nz/forgetop/relea
 irm https://github.com/magna-nz/forgetop/releases/latest/download/forgetop-installer.ps1 | iex
 ```
 
-**Download a binary** - grab the archive for your platform from the
-[latest release](https://github.com/magna-nz/forgetop/releases/latest), extract it,
-and put `forgetop` on your `PATH`. Builds are provided for macOS (Apple Silicon +
-Intel), Linux (x86_64 + arm64), and Windows (x86_64).
+Or grab a prebuilt binary for your platform from the
+[latest release](https://github.com/magna-nz/forgetop/releases/latest) (macOS
+Apple Silicon + Intel, Linux x86_64 + arm64, Windows x86_64).
 
 ## Quick start
 
@@ -86,8 +70,8 @@ Try it with no setup - everything is in-memory, nothing is written:
 forgetop --demo
 ```
 
-Then run it for real. On first launch (no connections configured) forgetop drops
-straight into the **add-connection wizard**:
+Then run it for real. On first launch forgetop drops straight into the
+**add-connection wizard**:
 
 ```sh
 forgetop
@@ -102,110 +86,25 @@ forgetop
 The wizard stores your token in the OS keychain and binds the connection to a
 section. Press **`C`** any time to manage connections and bindings.
 
-## Keybindings
+## Documentation
 
-forgetop shows a **context-aware key glossary** along the bottom - it only lists
-the keys valid for wherever you are. The full set:
+forgetop shows a **context-aware key glossary** along the bottom, so you rarely
+need a reference. The full docs live at **[magna-nz.github.io/forgetop](https://magna-nz.github.io/forgetop/)**:
 
-### Global
+- [Keybindings](https://magna-nz.github.io/forgetop/#keybindings) - every key, per screen
+- [Configuration &amp; tokens](https://magna-nz.github.io/forgetop/#configuration) - config paths, keychain, token scopes per provider
+- [Themes](https://magna-nz.github.io/forgetop/#themes)
+- [How it works](https://magna-nz.github.io/forgetop/#how-it-works) - architecture
 
-| Key | Action |
-| --- | --- |
-| `←` / `→`, `h` / `l`, `Tab`, `1`–`3` | Switch tab |
-| `↑` / `↓`, `k` / `j` | Move selection |
-| `/` | Quick-filter the current list (type to narrow, `Esc` clears) |
-| `o` | Open selected item in browser |
-| `n` | Add a connection (wizard) |
-| `v` | Choose which tabs are visible |
-| `C` | Config / connections screen |
-| `r` | Refresh · `t` cycle theme |
-| `q` / `Ctrl-C` | Quit · `Esc` back / close |
-
-### Pull Requests
-
-| Key | Action |
-| --- | --- |
-| `Enter` | Expand details |
-| `f` | Cycle filter (All / Mine / Review-requested) |
-| `d` | Open diff + review threads |
-| `a` / `x` | Approve / request changes |
-| `m` | Merge (choose strategy) |
-| `c` | Comment |
-
-### Work Items
-
-| Key | Action |
-| --- | --- |
-| `Enter` | Expand details |
-| `s` | Change state |
-| `f` | Choose which states to show (checklist, built from states in view) |
-| `c` | Comment |
-
-### Pipelines
-
-| Key | Action |
-| --- | --- |
-| `Enter` | Drill in (stages → jobs → steps) |
-| `T` | Trigger a run |
-
-## Configuration
-
-Config is a small JSON file, created and managed for you:
-
-| OS | Path |
-| --- | --- |
-| macOS | `~/Library/Application Support/forgetop/config.json` |
-| Linux | `~/.config/forgetop/config.json` |
-| Windows | `%APPDATA%\forgetop\config.json` |
-
-**It never contains secrets** - only a reference to each token in the keychain.
-
-### Tokens
-
-Tokens are stored in your OS keychain under the service name `forgetop`. In
-headless environments (CI, containers) you can instead supply a token via an
-environment variable named `FORGETOP_PAT_<CONNECTION_ID>` (uppercased;
-non-alphanumeric characters become `_`).
-
-### Token scopes
-
-| Provider | What to create | Scopes |
-| --- | --- | --- |
-| **GitHub** | Personal access token | `repo` (PRs, issues, checks); `workflow` / Actions read for pipelines |
-| **GitLab** | Personal access token (Settings → Access Tokens) | `api` (merge requests, issues, pipelines) |
-| **Azure DevOps** | Personal access token | Code *Read*, Work Items *Read & Write*, Build *Read & Execute* |
-| **Linear** | Personal API key (Settings → Security & access → API) | default |
-| **Jira** | API token (id.atlassian.com → Security → API tokens) + your account email | default (account access) |
-| **Bitbucket** | App password (Personal settings → App passwords) + your username | Pull requests, Pipelines (read & write) |
-
-## Themes
-
-Cycle with `t`. Four built-in themes - `slate` (default), `dark`, `light`, and
-`matrix` - using 256-colour palettes so they render correctly on every terminal.
-Your choice is remembered.
-
-## How it works
-
-forgetop is a Rust [Cargo workspace](https://doc.rust-lang.org/cargo/reference/workspaces.html):
-
-| Crate | Responsibility |
-| --- | --- |
-| `forgetop-core` | Domain model, capability-scoped provider traits, config, secrets, services |
-| `forgetop-providers` | GitHub, GitLab, Azure DevOps, Linear, Jira, Bitbucket, and Demo implementations |
-| `forgetop-tui` | The [ratatui](https://ratatui.rs) terminal UI |
-| `forgetop-cli` | The `forgetop` binary |
-
-Providers advertise *capabilities* (which sections they support), so a connection
-only offers what it can actually do - Linear appears for Work Items but not Pull
-Requests, for example.
-
-## Development
+## Contributing
 
 ```sh
 cargo test        # run the test suite
 cargo clippy      # lint
 cargo run -- --demo
 ```
+
+See [How it works](https://magna-nz.github.io/forgetop/#how-it-works) for the crate layout.
 
 ## License
 
