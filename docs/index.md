@@ -195,7 +195,13 @@ forgetop is a Rust [Cargo workspace](https://doc.rust-lang.org/cargo/reference/w
 
 Providers advertise *capabilities* (which sections they support), so a connection
 only offers what it can actually do - Linear appears for Work Items but not Pull
-Requests, for example. The Pipelines section can aggregate several providers at once.
+Requests, for example.
+
+**Every section aggregates across providers.** Bind more than one connection to
+Pull Requests, Work Items, or Pipelines (in the config screen: `p` / `w` open a
+multi-select checklist; pipelines use `s`) and their items merge into one list,
+tagged with a **Provider** column. Filtering, sorting, and actions all work across
+the combined list, and each action targets the row's own provider.
 
 ## Development
 

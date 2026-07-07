@@ -1278,7 +1278,7 @@ fn help_sections() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
             "Config / connections",
             vec![
                 ("a", "Add a connection"),
-                ("p  w", "Bind Pull Requests / Work Items"),
+                ("p  w", "Bind Pull Requests / Work Items (multi-select)"),
                 ("s", "Pipeline subscriptions"),
                 ("x", "Remove connection"),
             ],

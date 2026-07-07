@@ -13,7 +13,7 @@ use ratatui::widgets::TableState;
 
 use crate::overlay::{Action, InputKind, Outcome, Overlay, PickerKind, ToggleItem, ToggleKind};
 use crate::theme::Theme;
-use crate::wizard::{section_label, Wizard, WizardOutcome};
+use crate::wizard::{provider_sections, section_label, Wizard, WizardOutcome};
 
 /// The section index behind each tab position (0 = Pull Requests, 1 = Work Items, 2 = Pipelines).
 fn section_of(index: usize) -> Section {
@@ -1740,6 +1740,9 @@ impl App {
             ToggleKind::Notifications => {
                 self.apply_notifications(ids, deps).await;
             }
+            ToggleKind::SectionBind { section } => {
+                self.apply_section_bind(section, ids, deps).await;
+            }
         }
     }
 
@@ -1899,8 +1902,8 @@ impl App {
             Key::Escape => self.screen = Screen::List,
             Key::Char('q') => self.should_quit = true,
             Key::Char('a') => self.start_add_connection(),
-            Key::Char('p') => self.config_bind(Section::PullRequests, deps).await,
-            Key::Char('w') => self.config_bind(Section::WorkItems, deps).await,
+            Key::Char('p') => self.open_section_bind(Section::PullRequests, deps),
+            Key::Char('w') => self.open_section_bind(Section::WorkItems, deps),
             Key::Char('s') => self.open_pipeline_subs(deps).await,
             Key::Char('x') | Key::Char('d') => self.config_remove_selected(),
             Key::Up | Key::Char('k') => self.config_move(-1),
@@ -1927,16 +1930,42 @@ impl App {
         None
     }
 
-    async fn config_bind(&mut self, section: Section, deps: &AppDeps) {
-        let Some((id, _)) = self.config_selected_id() else { return };
-        let result = match section {
-            Section::PullRequests => deps.config.bind_pull_requests(&id).await,
-            Section::WorkItems => deps.config.bind_work_items(&id).await,
-            Section::Pipelines => deps.config.set_pipeline_auto_discover(&id, true).await,
+    /// Opens a checklist of which connections feed a section (multi-bind).
+    fn open_section_bind(&mut self, section: Section, deps: &AppDeps) {
+        let cfg = deps.config.snapshot();
+        let bound: HashSet<String> = match section {
+            Section::PullRequests => cfg.pull_requests.as_ref().map(|b| b.ids()).unwrap_or_default(),
+            Section::WorkItems => cfg.work_items.as_ref().map(|b| b.ids()).unwrap_or_default(),
+            Section::Pipelines => return,
+        }
+        .into_iter()
+        .collect();
+
+        let items = section_bind_items(&cfg.connections, section, &bound);
+        if items.is_empty() {
+            self.toast = Some(format!("No connections support {}", section_label(section)));
+            return;
+        }
+
+        let idx = if section == Section::PullRequests { 0 } else { 1 };
+        self.overlay = Some(Overlay::Toggle {
+            title: format!("Bind · {}", section_label(section)),
+            kind: ToggleKind::SectionBind { section: idx },
+            min_one: false,
+            items,
+            selected: 0,
+        });
+    }
+
+    async fn apply_section_bind(&mut self, section: usize, ids: Vec<String>, deps: &AppDeps) {
+        let result = if section == 0 {
+            deps.config.set_pull_request_connections(ids).await
+        } else {
+            deps.config.set_work_item_connections(ids).await
         };
         match result {
             Ok(()) => {
-                self.toast = Some(format!("Bound to {}", section_label(section)));
+                self.toast = Some("Bindings updated".into());
                 self.reload_all(deps).await;
                 self.rebuild_config_view(deps).await;
             }
@@ -2174,6 +2203,15 @@ fn wi_label(wi: &WorkItem) -> String {
     let id = wi.identifier.clone().map(|i| format!("{i} ")).unwrap_or_default();
     let title: String = wi.title.chars().take(40).collect();
     format!("{id}— {title}")
+}
+
+/// Checklist items for binding a section: connections that support it, ticked if bound.
+fn section_bind_items(connections: &[Connection], section: Section, bound: &HashSet<String>) -> Vec<ToggleItem> {
+    connections
+        .iter()
+        .filter(|c| provider_sections(c.provider_type).contains(&section))
+        .map(|c| ToggleItem { id: c.id.clone(), label: c.display_name.clone(), on: bound.contains(&c.id) })
+        .collect()
 }
 
 /// Pulls the (provider, display name, id) tag off a feed's connection.
@@ -2712,6 +2750,32 @@ mod tests {
         let review = vec![a, b];
         let prev: HashSet<String> = ["1".to_string()].into_iter().collect();
         assert_eq!(new_review_requests(&prev, &review).iter().map(|p| p.id.clone()).collect::<Vec<_>>(), vec!["2"]);
+    }
+
+    #[test]
+    fn section_bind_offers_only_capable_connections() {
+        let mk = |id: &str, p: ProviderType| Connection {
+            id: id.into(),
+            provider_type: p,
+            display_name: id.into(),
+            base_url: None,
+            organization: None,
+            project: None,
+            repository: None,
+            username: None,
+            credential_ref: None,
+        };
+        let conns = vec![mk("gh", ProviderType::GitHub), mk("lin", ProviderType::Linear), mk("bb", ProviderType::Bitbucket)];
+        let bound: HashSet<String> = ["gh".to_string()].into_iter().collect();
+
+        // Work Items: GitHub + Linear support it; Bitbucket doesn't.
+        let wi = section_bind_items(&conns, Section::WorkItems, &bound);
+        assert_eq!(wi.iter().map(|i| i.id.clone()).collect::<Vec<_>>(), vec!["gh", "lin"]);
+        assert!(wi.iter().find(|i| i.id == "gh").unwrap().on, "already-bound is ticked");
+
+        // Pull Requests: GitHub + Bitbucket; Linear doesn't.
+        let pr = section_bind_items(&conns, Section::PullRequests, &bound);
+        assert_eq!(pr.iter().map(|i| i.id.clone()).collect::<Vec<_>>(), vec!["gh", "bb"]);
     }
 
     #[test]
