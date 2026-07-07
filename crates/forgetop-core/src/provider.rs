@@ -165,6 +165,11 @@ pub trait PullRequestSource: Send + Sync {
     async fn commits(&self, _pull_request_id: &str) -> Result<Vec<Commit>> {
         Ok(Vec::new())
     }
+    /// Files changed by a single commit on the pull request (with inline patches
+    /// where the provider supplies them). Defaults to unsupported (empty).
+    async fn commit_changes(&self, _pull_request_id: &str, _sha: &str) -> Result<Vec<FileChange>> {
+        Ok(Vec::new())
+    }
     async fn add_comment(&self, pull_request_id: &str, body: &str) -> Result<()>;
     async fn vote(&self, pull_request_id: &str, vote: ReviewVote) -> Result<()>;
     async fn merge(&self, pull_request_id: &str, options: &MergeOptions) -> Result<()>;

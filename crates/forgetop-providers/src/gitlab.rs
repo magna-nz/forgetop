@@ -340,6 +340,10 @@ impl PullRequestSource for GitLabPr {
         let v = self.0.get_json(&self.0.project_path(&format!("/merge_requests/{id}/commits?per_page=100"))).await?;
         Ok(v.as_array().unwrap_or(&vec![]).iter().map(map_gl_commit).collect())
     }
+    async fn commit_changes(&self, _id: &str, sha: &str) -> Result<Vec<FileChange>> {
+        let v = self.0.get_json(&self.0.project_path(&format!("/repository/commits/{sha}/diff?per_page=100"))).await?;
+        Ok(v.as_array().unwrap_or(&vec![]).iter().map(map_change).collect())
+    }
     async fn checks(&self, id: &str) -> Result<Vec<CheckRun>> {
         let mr = self.0.get_json(&self.0.project_path(&format!("/merge_requests/{id}"))).await?;
         let Some(sha) = get_str(&mr, "sha") else { return Ok(vec![]) };
