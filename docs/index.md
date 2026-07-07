@@ -77,6 +77,17 @@ The list is browse-and-open; every write action lives inside the PR view.
 | `Enter` | Drill in (stages → jobs → steps) |
 | `T` | Trigger a run |
 
+The drill-in shows each node's **duration** and a short **failure reason** on
+failed jobs (provider-specific: GitLab's failure reason, Azure's error/warning
+counts). Inside the drill-in:
+
+| Key | Action |
+| --- | --- |
+| `Enter` | Expand / collapse the selected node |
+| `L` | View the selected job's logs (scrollable pane; `Esc` closes) |
+| `o` | Open the selected job in the browser |
+| `T` | Trigger a run |
+
 ## Filtering
 
 forgetop has three complementary ways to cut a busy list down to what you care

@@ -597,7 +597,19 @@ impl PipelineSource for DemoPipe {
         pipeline_runs().into_iter().find(|r| r.id == run_id).ok_or_else(|| forgetop_core::Error::NotFound(run_id.into()))
     }
     async fn logs(&self, run_id: &str, job_id: Option<&str>) -> Result<String> {
-        Ok(format!("[demo] logs for run {run_id}{}\nAll steps completed.", job_id.map(|j| format!(" job {j}")).unwrap_or_default()))
+        let job = job_id.unwrap_or("job");
+        let mut out = format!("=== logs for run {run_id} · {job} ===\n");
+        for i in 1..=24 {
+            out.push_str(&format!("[00:{i:02}] step output line {i}\n"));
+        }
+        if job == "j12" {
+            out.push_str("ERROR: integration suite failed: 2 tests failed\n");
+            out.push_str("  - test_checkout_flow\n  - test_refund\n");
+            out.push_str("Process exited with code 1\n");
+        } else {
+            out.push_str("Done. All steps completed successfully.\n");
+        }
+        Ok(out)
     }
     async fn trigger(&self, _definition_id: &str, _branch: Option<&str>) -> Result<()> {
         Ok(())
