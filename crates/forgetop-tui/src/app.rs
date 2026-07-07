@@ -4,7 +4,7 @@ use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use chrono::{DateTime, Local};
+use chrono::{DateTime, Local, Utc};
 use forgetop_core::config::SortPref;
 use forgetop_core::domain::*;
 use forgetop_core::provider::*;
@@ -192,6 +192,34 @@ pub struct FlatNode {
     /// Collapse key when the node has children; `None` for leaf steps.
     pub key: Option<String>,
     pub expanded: bool,
+    /// Elapsed time (only for completed nodes), pre-formatted e.g. `3m12s`.
+    pub duration: Option<String>,
+    /// Short failure summary for failed jobs (provider-specific).
+    pub problem: Option<String>,
+}
+
+/// Formats the elapsed time between two instants (only when both are known).
+fn fmt_duration(start: Option<DateTime<Utc>>, finish: Option<DateTime<Utc>>) -> Option<String> {
+    let (s, f) = (start?, finish?);
+    let secs = (f - s).num_seconds().max(0);
+    Some(if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60)
+    })
+}
+
+/// The elapsed span of a whole stage, or `None` if any job is still unfinished.
+fn stage_duration(jobs: &[PipelineJob]) -> Option<String> {
+    let start = jobs.iter().filter_map(|j| j.started_at).min();
+    let finish = if jobs.iter().all(|j| j.finished_at.is_some()) {
+        jobs.iter().filter_map(|j| j.finished_at).max()
+    } else {
+        None
+    };
+    fmt_duration(start, finish)
 }
 
 /// State for the full-screen pipeline drill-in (stages → jobs → steps).
@@ -222,6 +250,8 @@ impl PipelineView {
                 status: stage.status,
                 key: (!stage.jobs.is_empty()).then(|| key.clone()),
                 expanded,
+                duration: stage_duration(&stage.jobs),
+                problem: None,
             });
             if !expanded {
                 continue;
@@ -235,10 +265,20 @@ impl PipelineView {
                     status: job.status,
                     key: (!job.steps.is_empty()).then(|| jkey.clone()),
                     expanded: jexpanded,
+                    duration: fmt_duration(job.started_at, job.finished_at),
+                    problem: job.problem.clone(),
                 });
                 if jexpanded {
                     for step in &job.steps {
-                        out.push(FlatNode { depth: 2, label: step.name.clone(), status: step.status, key: None, expanded: false });
+                        out.push(FlatNode {
+                            depth: 2,
+                            label: step.name.clone(),
+                            status: step.status,
+                            key: None,
+                            expanded: false,
+                            duration: fmt_duration(step.started_at, step.finished_at),
+                            problem: None,
+                        });
                     }
                 }
             }
@@ -2193,6 +2233,32 @@ mod tests {
         // Sort composes with the quick filter (only matching rows, still sorted).
         app.filters[0] = "e".into(); // matches "cherry" and "apple"
         assert_eq!(app.filtered_pr_indices(), vec![2, 1]); // apple(2) then cherry(1)
+    }
+
+    #[test]
+    fn pipeline_duration_formatting_and_stage_span() {
+        use chrono::TimeZone;
+        let t = |s: i64| Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap() + chrono::Duration::seconds(s);
+
+        assert_eq!(fmt_duration(Some(t(0)), Some(t(45))).as_deref(), Some("45s"));
+        assert_eq!(fmt_duration(Some(t(0)), Some(t(75))).as_deref(), Some("1m15s"));
+        assert_eq!(fmt_duration(Some(t(0)), Some(t(3720))).as_deref(), Some("1h02m"));
+        assert_eq!(fmt_duration(Some(t(0)), None), None, "unfinished → no duration");
+        assert_eq!(fmt_duration(None, Some(t(10))), None);
+
+        let mk = |start: i64, fin: Option<i64>| PipelineJob {
+            id: "j".into(),
+            name: "j".into(),
+            status: PipelineRunStatus::Succeeded,
+            started_at: Some(t(start)),
+            finished_at: fin.map(t),
+            steps: vec![],
+            url: None,
+            problem: None,
+        };
+        // Stage spans earliest start → latest finish; any unfinished job → None.
+        assert_eq!(stage_duration(&[mk(0, Some(30)), mk(10, Some(50))]).as_deref(), Some("50s"));
+        assert_eq!(stage_duration(&[mk(0, Some(30)), mk(10, None)]), None);
     }
 
     #[test]

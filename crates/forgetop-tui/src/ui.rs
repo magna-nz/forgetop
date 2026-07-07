@@ -1071,12 +1071,19 @@ fn render_pipeline(frame: &mut Frame, area: Rect, theme: &Theme, view: &Pipeline
             } else {
                 Style::default().fg(theme.fg)
             };
-            ListItem::new(Line::from(vec![
+            let mut spans = vec![
                 Span::raw(indent),
                 Span::styled(marker, Style::default().fg(theme.dim)),
                 Span::styled(format!("{} ", pipeline_icon(n.status)), Style::default().fg(theme.pipeline_color(n.status))),
                 Span::styled(n.label.clone(), label_style),
-            ]))
+            ];
+            if let Some(d) = &n.duration {
+                spans.push(Span::styled(format!("  {d}"), Style::default().fg(theme.dim)));
+            }
+            if let Some(p) = &n.problem {
+                spans.push(Span::styled(format!("  ⚠ {p}"), Style::default().fg(theme.red)));
+            }
+            ListItem::new(Line::from(spans))
         })
         .collect();
 
@@ -1604,7 +1611,14 @@ mod tests {
                     status: PipelineRunStatus::Succeeded,
                     started_at: None,
                     finished_at: None,
-                    steps: vec![PipelineStep { name: "cargo build".into(), status: PipelineRunStatus::Succeeded }],
+                    steps: vec![PipelineStep {
+                        name: "cargo build".into(),
+                        status: PipelineRunStatus::Succeeded,
+                        started_at: None,
+                        finished_at: None,
+                    }],
+                    url: None,
+                    problem: None,
                 }],
             }],
         }
