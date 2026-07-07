@@ -234,6 +234,15 @@ impl PipelineView {
     }
 }
 
+/// Where key input lands inside the diff tab: the file list, or a line cursor
+/// inside the selected file's patch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DiffFocus {
+    #[default]
+    FileList,
+    Patch,
+}
+
 /// State for the full-screen PR diff + threads view.
 pub struct DiffView {
     pub pr_label: String,
@@ -242,11 +251,20 @@ pub struct DiffView {
     pub threads: Vec<CommentThread>,
     pub selected: usize,
     pub scroll: u16,
+    /// Whether keys drive the file list or a line cursor in the patch.
+    pub focus: DiffFocus,
+    /// Cursor line index into the current file's patch (used in `Patch` focus).
+    pub cursor: usize,
 }
 
 impl DiffView {
     pub fn current(&self) -> Option<&FileChange> {
         self.files.get(self.selected)
+    }
+
+    /// Number of lines in the current file's patch (0 if none).
+    fn patch_len(&self) -> usize {
+        self.current().and_then(|f| f.patch.as_deref()).map(|p| p.lines().count()).unwrap_or(0)
     }
 
     fn select_file(&mut self, delta: isize) {
@@ -256,6 +274,29 @@ impl DiffView {
         let n = self.files.len() as isize;
         self.selected = (((self.selected as isize + delta) % n + n) % n) as usize;
         self.scroll = 0;
+        self.cursor = 0;
+    }
+
+    /// Enters the patch line cursor for the current file (no-op without a patch).
+    fn enter_patch(&mut self) {
+        if self.patch_len() > 0 {
+            self.focus = DiffFocus::Patch;
+            self.cursor = 0;
+        }
+    }
+
+    /// Returns focus to the file list.
+    fn exit_patch(&mut self) {
+        self.focus = DiffFocus::FileList;
+    }
+
+    /// Moves the patch line cursor, clamped to the patch bounds.
+    fn move_cursor(&mut self, delta: isize) {
+        let n = self.patch_len();
+        if n == 0 {
+            return;
+        }
+        self.cursor = (self.cursor as isize + delta).clamp(0, n as isize - 1) as usize;
     }
 
     fn scroll_by(&mut self, delta: i32) {
@@ -704,7 +745,16 @@ impl App {
         let files = source.changes(&id).await.unwrap_or_default();
         let checks = source.checks(&id).await.unwrap_or_default();
         let commits = source.commits(&id).await.unwrap_or_default();
-        let diff = DiffView { pr_label: label.clone(), url: url.clone(), files, threads, selected: 0, scroll: 0 };
+        let diff = DiffView {
+            pr_label: label.clone(),
+            url: url.clone(),
+            files,
+            threads,
+            selected: 0,
+            scroll: 0,
+            focus: DiffFocus::FileList,
+            cursor: 0,
+        };
         self.screen = Screen::PrView(Box::new(PrView { label, url, pr, tab, checks, commits, scroll: 0, diff }));
     }
 
@@ -723,6 +773,13 @@ impl App {
         // Actions and close are handled before borrowing the view (they need &mut self).
         match key {
             Key::Escape => {
+                // In the patch line cursor, Esc steps back to the file list, not out.
+                if let Screen::PrView(v) = &mut self.screen {
+                    if v.tab == 3 && v.diff.focus == DiffFocus::Patch {
+                        v.diff.exit_patch();
+                        return;
+                    }
+                }
                 self.screen = Screen::List;
                 return;
             }
@@ -756,39 +813,60 @@ impl App {
         let Screen::PrView(v) = &mut self.screen else { return };
         let n = PR_TABS.len();
         match key {
-            // Changing tab resets the scroll (each tab starts at the top).
+            // Changing tab resets the scroll (each tab starts at the top) and drops
+            // any patch line cursor back to the file list.
             Key::Left | Key::Char('h') => {
                 v.tab = (v.tab + n - 1) % n;
                 v.scroll = 0;
+                v.diff.focus = DiffFocus::FileList;
             }
             Key::Right | Key::Char('l') => {
                 v.tab = (v.tab + 1) % n;
                 v.scroll = 0;
+                v.diff.focus = DiffFocus::FileList;
             }
+            // Enter on a file drops into a line cursor within its patch.
+            Key::Enter if v.tab == 3 => v.diff.enter_patch(),
             Key::Up | Key::Char('k') => {
                 if v.tab == 3 {
-                    v.diff.select_file(-1);
+                    if v.diff.focus == DiffFocus::Patch {
+                        v.diff.move_cursor(-1);
+                    } else {
+                        v.diff.select_file(-1);
+                    }
                 } else {
                     v.scroll = v.scroll.saturating_sub(1);
                 }
             }
             Key::Down | Key::Char('j') => {
                 if v.tab == 3 {
-                    v.diff.select_file(1);
+                    if v.diff.focus == DiffFocus::Patch {
+                        v.diff.move_cursor(1);
+                    } else {
+                        v.diff.select_file(1);
+                    }
                 } else {
                     v.scroll = (v.scroll + 1).min(max);
                 }
             }
             Key::PageDown | Key::Char(' ') => {
                 if v.tab == 3 {
-                    v.diff.scroll_by(10);
+                    if v.diff.focus == DiffFocus::Patch {
+                        v.diff.move_cursor(10);
+                    } else {
+                        v.diff.scroll_by(10);
+                    }
                 } else {
                     v.scroll = (v.scroll + 10).min(max);
                 }
             }
             Key::PageUp | Key::Char('b') => {
                 if v.tab == 3 {
-                    v.diff.scroll_by(-10);
+                    if v.diff.focus == DiffFocus::Patch {
+                        v.diff.move_cursor(-10);
+                    } else {
+                        v.diff.scroll_by(-10);
+                    }
                 } else {
                     v.scroll = v.scroll.saturating_sub(10);
                 }
@@ -1779,6 +1857,61 @@ mod tests {
         assert_eq!(app.filtered_wi_indices(), vec![0, 1]);
     }
 
+    fn diff(files: Vec<FileChange>) -> DiffView {
+        DiffView {
+            pr_label: "PR".into(),
+            url: None,
+            files,
+            threads: vec![],
+            selected: 0,
+            scroll: 0,
+            focus: DiffFocus::FileList,
+            cursor: 0,
+        }
+    }
+
+    fn changed(path: &str, patch: Option<&str>) -> FileChange {
+        FileChange {
+            path: path.into(),
+            kind: FileChangeKind::Modified,
+            additions: 1,
+            deletions: 1,
+            patch: patch.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn diff_line_cursor_navigates_and_clamps() {
+        // 4 patch lines (indices 0..3).
+        let mut d = diff(vec![changed("a.rs", Some("@@ -1,2 +1,3 @@\n ctx\n+added\n-removed"))]);
+
+        d.enter_patch();
+        assert_eq!(d.focus, DiffFocus::Patch);
+        assert_eq!(d.cursor, 0);
+
+        d.move_cursor(1);
+        assert_eq!(d.cursor, 1);
+        d.move_cursor(100); // clamps to last line
+        assert_eq!(d.cursor, 3);
+        d.move_cursor(-100); // clamps to first line
+        assert_eq!(d.cursor, 0);
+
+        d.exit_patch();
+        assert_eq!(d.focus, DiffFocus::FileList);
+
+        // Switching files resets the cursor.
+        d.cursor = 2;
+        d.select_file(0);
+        assert_eq!(d.cursor, 0);
+    }
+
+    #[test]
+    fn diff_enter_patch_is_noop_without_a_patch() {
+        let mut d = diff(vec![changed("bin", None)]);
+        d.enter_patch();
+        assert_eq!(d.focus, DiffFocus::FileList, "no patch → stay in the file list");
+    }
+
     #[test]
     fn selected_url_reads_active_tab_and_subview() {
         let mut app = App::new("slate");
@@ -1801,7 +1934,16 @@ mod tests {
             checks: vec![],
             commits: vec![],
             scroll: 0,
-            diff: DiffView { pr_label: "x".into(), url: None, files: vec![], threads: vec![], selected: 0, scroll: 0 },
+            diff: DiffView {
+                pr_label: "x".into(),
+                url: None,
+                files: vec![],
+                threads: vec![],
+                selected: 0,
+                scroll: 0,
+                focus: DiffFocus::FileList,
+                cursor: 0,
+            },
         }));
         assert_eq!(app.selected_url().as_deref(), Some("http://prview"));
     }

@@ -416,11 +416,56 @@ impl PullRequestSource for DemoPr {
             FileChange {
                 path: "src/http/retry.rs".into(),
                 kind: FileChangeKind::Added,
-                additions: 24,
+                additions: 18,
                 deletions: 0,
-                patch: Some("@@ -0,0 +1,3 @@\n+pub struct RetryPolicy;\n+// jittered exponential backoff\n".into()),
+                patch: Some(
+                    "@@ -0,0 +1,18 @@\n\
+                     +use std::time::Duration;\n\
+                     +\n\
+                     +/// Retry policy with jittered exponential backoff.\n\
+                     +pub struct RetryPolicy {\n\
+                     +    pub max_attempts: u32,\n\
+                     +    pub base: Duration,\n\
+                     +}\n\
+                     +\n\
+                     +impl RetryPolicy {\n\
+                     +    pub fn new(max_attempts: u32) -> Self {\n\
+                     +        Self { max_attempts, base: Duration::from_millis(100) }\n\
+                     +    }\n\
+                     +\n\
+                     +    pub fn backoff(&self, attempt: u32) -> Duration {\n\
+                     +        let exp = self.base * 2u32.pow(attempt);\n\
+                     +        exp + jitter(exp)\n\
+                     +    }\n\
+                     +}\n"
+                        .into(),
+                ),
             },
-            FileChange { path: "src/http/client.rs".into(), kind: FileChangeKind::Modified, additions: 6, deletions: 2, patch: None },
+            FileChange {
+                path: "src/http/client.rs".into(),
+                kind: FileChangeKind::Modified,
+                additions: 8,
+                deletions: 1,
+                patch: Some(
+                    "@@ -12,7 +12,9 @@ impl HttpClient {\n\
+                     \x20    pub async fn send(&self, req: Request) -> Result<Response> {\n\
+                     -        self.inner.execute(req).await\n\
+                     +        let policy = RetryPolicy::new(3);\n\
+                     +        self.send_with_retry(req, &policy).await\n\
+                     \x20    }\n\
+                     \x20\n\
+                     \x20    fn base_url(&self) -> &str {\n\
+                     @@ -40,6 +42,12 @@ impl HttpClient {\n\
+                     \x20        &self.base\n\
+                     +    }\n\
+                     +\n\
+                     +    async fn send_with_retry(&self, req: Request, policy: &RetryPolicy) -> Result<Response> {\n\
+                     +        // retry loop with jittered backoff\n\
+                     +        self.inner.execute(req).await\n\
+                     \x20    }\n"
+                        .into(),
+                ),
+            },
         ])
     }
     async fn checks(&self, _id: &str) -> Result<Vec<CheckRun>> {

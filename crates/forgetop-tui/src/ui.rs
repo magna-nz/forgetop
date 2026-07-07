@@ -10,7 +10,7 @@ use ratatui::widgets::{
 };
 use ratatui::Frame;
 
-use crate::app::{App, ConfigView, DiffView, PipelineView, PrView, Screen, WiView, PR_TABS, TABS};
+use crate::app::{App, ConfigView, DiffFocus, DiffView, PipelineView, PrView, Screen, WiView, PR_TABS, TABS};
 use crate::overlay::Overlay;
 use crate::theme::{check_icon, pipeline_icon, Theme};
 use crate::wizard::{Prompt, PromptKind};
@@ -642,7 +642,11 @@ fn footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
     }
     if let Screen::PrView(v) = &app.screen {
         return if v.tab == 3 {
-            vec![("←→", "tabs"), ("↑↓", "file"), ("PgUp/Dn", "scroll"), ("a", "approve"), ("m", "merge"), ("o", "open"), ("Esc", "back")]
+            if v.diff.focus == DiffFocus::Patch {
+                vec![("↑↓", "line"), ("PgUp/Dn", "jump"), ("Esc", "files"), ("a", "approve"), ("m", "merge"), ("o", "open")]
+            } else {
+                vec![("←→", "tabs"), ("↑↓", "file"), ("↵", "open file"), ("PgUp/Dn", "scroll"), ("a", "approve"), ("m", "merge"), ("o", "open"), ("Esc", "back")]
+            }
         } else {
             vec![("←→", "tabs"), ("PgUp/Dn", "scroll"), ("a", "approve"), ("x", "reject"), ("m", "merge"), ("c", "comment"), ("o", "open"), ("Esc", "back")]
         };
@@ -822,23 +826,58 @@ fn render_diff_patch(frame: &mut Frame, area: Rect, theme: &Theme, diff: &DiffVi
         frame.render_widget(section_block(theme, "Patch"), area);
         return;
     };
-    let title = format!("{}  (+{} -{})", file.path, file.additions, file.deletions);
-    let block = section_block(theme, &title);
 
     let Some(patch) = &file.patch else {
+        let title = format!("{}  (+{} -{})", file.path, file.additions, file.deletions);
+        let block = section_block(theme, &title);
         empty(frame, area, theme, "No inline patch for this file (binary, or the provider didn't supply one).", block);
         return;
     };
 
-    let lines: Vec<Line> = patch.lines().map(|l| patch_line(theme, l)).collect();
-    frame.render_widget(
-        Paragraph::new(lines).block(block).scroll((diff.scroll, 0)),
-        area,
-    );
+    let patch_focus = diff.focus == DiffFocus::Patch;
+    // In the line cursor, show where we are; otherwise just the file summary.
+    let title = match patch_focus.then(|| cursor_line_label(patch, diff.cursor)).flatten() {
+        Some(loc) => format!("{}  (+{} -{}) · {loc}", file.path, file.additions, file.deletions),
+        None => format!("{}  (+{} -{})", file.path, file.additions, file.deletions),
+    };
+    let block = section_block(theme, &title);
+
+    let inner_w = area.width.saturating_sub(2) as usize;
+    let inner_h = area.height.saturating_sub(2) as usize;
+    let total = patch.lines().count();
+
+    // In the cursor, derive scroll so the cursor line stays roughly centred; the
+    // stored scroll is only used for the free-scroll (file-list) mode.
+    let scroll = if patch_focus {
+        let half = inner_h / 2;
+        diff.cursor.saturating_sub(half).min(total.saturating_sub(inner_h.max(1))) as u16
+    } else {
+        diff.scroll
+    };
+
+    let lines: Vec<Line> = patch
+        .lines()
+        .enumerate()
+        .map(|(i, l)| {
+            if patch_focus && i == diff.cursor {
+                // Pad to full width so the cursor highlight spans the row.
+                let mut text = l.to_string();
+                let w = text.chars().count();
+                if w < inner_w {
+                    text.push_str(&" ".repeat(inner_w - w));
+                }
+                Line::from(Span::styled(text, Style::default().fg(patch_fg(theme, l)).bg(theme.sel_bg).add_modifier(Modifier::BOLD)))
+            } else {
+                patch_line(theme, l)
+            }
+        })
+        .collect();
+
+    frame.render_widget(Paragraph::new(lines).block(block).scroll((scroll, 0)), area);
 }
 
-fn patch_line(theme: &Theme, line: &str) -> Line<'static> {
-    let color = if line.starts_with("@@") {
+fn patch_fg(theme: &Theme, line: &str) -> ratatui::style::Color {
+    if line.starts_with("@@") {
         theme.accent
     } else if line.starts_with("+++") || line.starts_with("---") {
         theme.dim
@@ -848,8 +887,72 @@ fn patch_line(theme: &Theme, line: &str) -> Line<'static> {
         theme.red
     } else {
         theme.fg
-    };
-    Line::from(Span::styled(line.to_string(), Style::default().fg(color)))
+    }
+}
+
+fn patch_line(theme: &Theme, line: &str) -> Line<'static> {
+    Line::from(Span::styled(line.to_string(), Style::default().fg(patch_fg(theme, line))))
+}
+
+/// Parses a `@@ -old,n +new,n @@` hunk header into (old_start, new_start).
+fn parse_hunk_header(line: &str) -> Option<(i64, i64)> {
+    if !line.starts_with("@@") {
+        return None;
+    }
+    let (mut old_start, mut new_start) = (None, None);
+    for tok in line.split_whitespace() {
+        if let Some(r) = tok.strip_prefix('-') {
+            old_start = r.split(',').next().and_then(|s| s.parse().ok());
+        } else if let Some(r) = tok.strip_prefix('+') {
+            new_start = r.split(',').next().and_then(|s| s.parse().ok());
+        }
+    }
+    Some((old_start?, new_start?))
+}
+
+/// Human label for the file position of patch line `cursor` (e.g. `line 42`),
+/// walking hunk headers to map diff lines to real file lines.
+fn cursor_line_label(patch: &str, cursor: usize) -> Option<String> {
+    let (mut old_ln, mut new_ln) = (0i64, 0i64);
+    for (i, line) in patch.lines().enumerate() {
+        if let Some((o, n)) = parse_hunk_header(line) {
+            old_ln = o;
+            new_ln = n;
+            if i == cursor {
+                return Some(format!("hunk @ {new_ln}"));
+            }
+            continue;
+        }
+        // File headers and anything before the first hunk have no line number.
+        if new_ln == 0 || line.starts_with("+++") || line.starts_with("---") {
+            if i == cursor {
+                return None;
+            }
+            continue;
+        }
+        let label = match line.chars().next() {
+            Some('+') => {
+                let l = new_ln;
+                new_ln += 1;
+                format!("line {l}")
+            }
+            Some('-') => {
+                let l = old_ln;
+                old_ln += 1;
+                format!("line {l} (old)")
+            }
+            _ => {
+                let l = new_ln;
+                old_ln += 1;
+                new_ln += 1;
+                format!("line {l}")
+            }
+        };
+        if i == cursor {
+            return Some(label);
+        }
+    }
+    None
 }
 
 // ---- config / connections ----
@@ -1151,6 +1254,22 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
+    #[test]
+    fn cursor_line_label_maps_hunk_lines_to_file_lines() {
+        let patch = "@@ -10,3 +20,4 @@\n ctx\n+new\n-old";
+        assert_eq!(cursor_line_label(patch, 0).as_deref(), Some("hunk @ 20"));
+        assert_eq!(cursor_line_label(patch, 1).as_deref(), Some("line 20")); // context → new line 20
+        assert_eq!(cursor_line_label(patch, 2).as_deref(), Some("line 21")); // added → new line 21
+        assert_eq!(cursor_line_label(patch, 3).as_deref(), Some("line 11 (old)")); // removed → old line 11
+    }
+
+    #[test]
+    fn parse_hunk_header_reads_starts() {
+        assert_eq!(parse_hunk_header("@@ -10,3 +20,4 @@ fn foo()"), Some((10, 20)));
+        assert_eq!(parse_hunk_header("@@ -1 +1 @@"), Some((1, 1)));
+        assert_eq!(parse_hunk_header(" not a hunk"), None);
+    }
+
     fn sample_pr() -> PullRequest {
         PullRequest {
             id: "1".into(),
@@ -1204,7 +1323,16 @@ mod tests {
                 url: None,
             }],
             scroll: 0,
-            diff: DiffView { pr_label: "PR #42".into(), url: None, files, threads: vec![], selected: 0, scroll: 0 },
+            diff: DiffView {
+                pr_label: "PR #42".into(),
+                url: None,
+                files,
+                threads: vec![],
+                selected: 0,
+                scroll: 0,
+                focus: crate::app::DiffFocus::FileList,
+                cursor: 0,
+            },
         }
     }
 
