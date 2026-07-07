@@ -692,16 +692,7 @@ fn footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
     }
     let mut keys = vec![("↑↓", "move"), ("←→", "tabs")];
     match app.active {
-        0 => keys.extend([
-            ("↵", "open"),
-            ("f", "filter"),
-            ("d", "diff"),
-            ("a", "approve"),
-            ("x", "reject"),
-            ("m", "merge"),
-            ("c", "comment"),
-            ("o", "browser"),
-        ]),
+        0 => keys.extend([("↵", "open"), ("f", "filter"), ("o", "browser")]),
         1 => keys.extend([("↵", "open"), ("s", "state"), ("f", "states"), ("c", "comment"), ("o", "browser")]),
         2 => keys.extend([("↵", "drill-in"), ("T", "trigger"), ("o", "open")]),
         _ => {}
@@ -1166,25 +1157,24 @@ fn help_sections() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
             ],
         ),
         (
-            "Pull Requests",
+            "Pull Requests (list)",
             vec![
-                ("Enter", "Open the PR view"),
+                ("Enter", "Open the PR view (all actions live there)"),
                 ("f", "Cycle filter (All / Mine / Review)"),
-                ("d", "Open straight to the Diff tab"),
-                ("a  x", "Approve / request changes"),
-                ("m", "Merge (choose strategy)"),
-                ("c", "Comment"),
             ],
         ),
         (
-            "PR view",
+            "PR view (after Enter)",
             vec![
                 ("←/→", "Switch sub-tab"),
+                ("a  x", "Approve / request changes"),
+                ("m", "Merge (choose strategy)"),
+                ("c", "Comment (inline on a diff line, else the PR)"),
                 ("Enter (Commits)", "Drill into that commit's diff"),
                 ("Enter (Diff file)", "Line cursor in the patch"),
                 ("↑/↓ (line cursor)", "Move line-by-line"),
-                ("c (line cursor)", "Add an inline comment (buffered)"),
-                ("s", "Submit review (Comment/Approve/Reject)"),
+                ("s", "Submit buffered line comments as a review"),
+                ("o", "Open in browser"),
                 ("Esc", "Step back (line → files → close)"),
             ],
         ),
@@ -1514,13 +1504,22 @@ mod tests {
     }
 
     #[test]
-    fn pr_footer_lists_write_action_keys() {
+    fn pr_write_actions_live_in_the_view_not_the_list() {
+        // The PR list footer offers only browse/open — no write actions.
         let mut app = App::new("slate");
         app.prs.push(sample_pr());
         app.pr_state.select(Some(0));
-        let out = render_to_string(&mut app, 120, 24);
-        for label in ["diff", "approve", "reject", "merge", "comment"] {
-            assert!(out.contains(label), "PR footer should advertise '{label}'");
+        let list = render_to_string(&mut app, 140, 24);
+        assert!(list.contains("open") && list.contains("filter"), "list keeps open/filter");
+        for gone in ["approve", "reject", "merge"] {
+            assert!(!list.contains(gone), "PR list footer should not advertise '{gone}'");
+        }
+
+        // Opening a PR (Enter) surfaces the write actions in the PR view footer.
+        app.screen = Screen::PrView(Box::new(pr_view(0, vec![], vec![])));
+        let view = render_to_string(&mut app, 140, 24);
+        for label in ["approve", "reject", "merge", "comment"] {
+            assert!(view.contains(label), "PR view footer should advertise '{label}'");
         }
     }
 
@@ -1529,7 +1528,7 @@ mod tests {
         let mut app = App::new("slate");
         app.overlay = Some(crate::overlay::Overlay::Help { scroll: 0 });
         let out = render_to_string(&mut app, 100, 44);
-        for expected in ["Keybindings", "Global", "Pull Requests", "PR view", "Pipelines", "Submit review"] {
+        for expected in ["Keybindings", "Global", "Pull Requests", "PR view", "Pipelines", "Merge (choose strategy)"] {
             assert!(out.contains(expected), "help should show '{expected}'");
         }
     }

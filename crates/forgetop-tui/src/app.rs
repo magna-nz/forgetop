@@ -1129,21 +1129,13 @@ impl App {
             'C' => self.open_config(deps).await,
             'f' if self.active == 0 => self.cycle_pr_filter(deps).await,
             'f' if self.active == 1 => self.open_wi_states_toggle(),
-            // PR write actions (Pull Requests tab only; each no-ops off-tab).
-            'a' => self.open_pr_vote(ReviewVote::Approved),
-            'x' => self.open_pr_vote(ReviewVote::Rejected),
-            'm' => self.open_pr_merge(),
-            'd' if self.active == 0 => self.open_pr_view(deps, 3).await,
             // Work-item actions (Work Items tab only).
             's' => self.open_wi_state(),
+            'c' if self.active == 1 => self.open_wi_comment(),
             // Pipeline trigger (Pipelines tab).
             'T' if self.active == 2 => self.open_pipeline_trigger(),
-            // Comment is offered on both PR and work-item tabs.
-            'c' => match self.active {
-                0 => self.open_pr_comment(),
-                1 => self.open_wi_comment(),
-                _ => {}
-            },
+            // PR write actions (approve / reject / merge / comment / diff) live inside
+            // the PR view — press Enter to open a PR first.
             _ => {}
         }
     }

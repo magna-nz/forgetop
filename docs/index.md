@@ -37,26 +37,26 @@ keys valid for wherever you are. The full set:
 | `?` | Show all keybindings (works anywhere) |
 | `q` / `Ctrl-C` | Quit · `Esc` back / close |
 
-### Pull Requests
+### Pull Requests (list)
+
+The list is browse-and-open; every write action lives inside the PR view.
 
 | Key | Action |
 | --- | --- |
 | `Enter` | Open the full-screen PR view (Conversation / Commits / Checks / Diff) |
 | `f` | Cycle filter (All / Mine / Review-requested) |
-| `d` | Open straight to the Diff tab |
-| `a` / `x` | Approve / request changes |
-| `m` | Merge (choose strategy) |
-| `c` | Comment |
 
-Inside the PR view:
+### Inside the PR view (after `Enter`)
 
 | Key | Action |
 | --- | --- |
 | `←` / `→` | Switch sub-tab |
+| `a` / `x` | Approve / request changes |
+| `m` | Merge (choose strategy) |
+| `c` | Comment (inline on a diff line, otherwise on the PR) |
 | `Enter` (Commits) | Drill into that commit's diff |
 | `Enter` (Diff, on a file) | Drop into a line cursor within the patch |
 | `↑` / `↓` (line cursor) | Move line-by-line; the title shows the file line |
-| `c` (line cursor) | Add an inline comment on the current line (buffered) |
 | `s` | Submit the buffered comments as one review (Comment / Approve / Request changes) |
 | `Esc` | Step back (line cursor → file list → close) |
 
