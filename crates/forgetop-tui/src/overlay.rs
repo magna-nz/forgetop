@@ -36,6 +36,8 @@ pub enum ToggleKind {
     PipelineSubs { connection_id: String },
     /// Work-item states to show; item ids are the state strings themselves.
     WorkItemStates,
+    /// Which desktop notifications are enabled; item ids are event keys.
+    Notifications,
 }
 
 /// One row of a [`Overlay::Toggle`] checklist.

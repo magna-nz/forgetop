@@ -183,9 +183,9 @@ impl ConfigService {
         self.persist(cfg).await
     }
 
-    pub async fn set_notifications(&self, on: bool) -> Result<()> {
+    pub async fn set_notifications(&self, prefs: NotificationPrefs) -> Result<()> {
         let mut cfg = self.snapshot();
-        cfg.ui.notifications = Some(on);
+        cfg.ui.notifications = prefs;
         self.persist(cfg).await
     }
 

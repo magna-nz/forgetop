@@ -132,11 +132,18 @@ You can also drill into a single commit's diff from the **Commits** tab (`Enter`
 
 ## Notifications
 
-forgetop raises a native desktop notification when a **pipeline run fails** (a run
-that transitions into a failed state on a refresh). It's on by default, seeded on
-first load so it won't fire for pre-existing failures at startup, and de-duped so
-each failure notifies once. Toggle it with `N` (persisted). More event types
-(review requested, your PR approved / changes-requested) are planned.
+forgetop raises native desktop notifications on the events you care about:
+
+- **Pipeline failed** — a run transitions into a failed state.
+- **Review requested** — you're newly added as a reviewer on a PR.
+- **Your PR approved** / **changes requested** — a reviewer votes on a PR you authored.
+
+Press **`N`** anywhere to open a checklist and opt in/out of each event; the choice
+is persisted. The first-run wizard also asks after you add your first connection.
+Detection is seeded on load (no startup spam), de-duped, and re-seeded when you
+change the settings — and enabling fires one confirmation notification so you can
+verify they work on your machine. "Me" for the PR events is resolved from your
+token by each provider (`@me` / `currentUser()` / `isMe`).
 
 ## Configuration
 
