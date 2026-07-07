@@ -725,7 +725,7 @@ fn footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
         };
     }
     if matches!(app.screen, Screen::WiView(_)) {
-        return vec![("PgUp/Dn", "scroll"), ("s", "state"), ("c", "comment"), ("o", "open"), ("Esc", "back"), ("q", "quit")];
+        return vec![("PgUp/Dn", "scroll"), ("u", "update state"), ("c", "comment"), ("o", "open"), ("Esc", "back"), ("q", "quit")];
     }
     if let Screen::Pipeline(v) = &app.screen {
         return if v.logs.is_some() {
@@ -749,7 +749,7 @@ fn footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
     let mut keys = vec![("↑↓", "move"), ("←→", "tabs")];
     match app.active {
         0 => keys.extend([("↵", "open"), ("f", "filter"), ("S", "sort"), ("o", "browser")]),
-        1 => keys.extend([("↵", "open"), ("s", "state"), ("f", "states"), ("S", "sort"), ("c", "comment"), ("o", "browser")]),
+        1 => keys.extend([("↵", "open"), ("f", "states"), ("S", "sort"), ("o", "browser")]),
         2 => keys.extend([("↵", "drill-in"), ("S", "sort"), ("T", "trigger"), ("o", "open")]),
         _ => {}
     }
@@ -1256,12 +1256,18 @@ fn help_sections() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
             ],
         ),
         (
-            "Work Items",
+            "Work Items (list)",
             vec![
-                ("Enter", "Open"),
-                ("s", "Change state"),
+                ("Enter", "Open the item (actions live there)"),
                 ("f", "Choose which states to show"),
+            ],
+        ),
+        (
+            "Work Item view (after Enter)",
+            vec![
+                ("u", "Update state (pulled from the provider)"),
                 ("c", "Comment"),
+                ("o", "Open in browser"),
             ],
         ),
         (
@@ -1796,12 +1802,35 @@ mod tests {
     }
 
     #[test]
-    fn work_items_footer_lists_state_and_comment_not_pr_keys() {
+    fn work_items_list_is_browse_only_actions_in_the_view() {
+        // The WI list offers browse + the states filter — no state-change / comment.
         let mut app = App::new("slate");
         app.active = 1;
-        let out = render_to_string(&mut app, 120, 24);
-        assert!(out.contains("state") && out.contains("comment"), "WI footer should list state + comment");
-        assert!(!out.contains("approve") && !out.contains("diff"), "PR-only keys hidden on WI tab");
+        let list = render_to_string(&mut app, 140, 24);
+        assert!(list.contains("open") && list.contains("states"), "list keeps open + states filter");
+        assert!(!list.contains("comment") && !list.contains("update state"), "state/comment are not on the list");
+
+        // Opening the item surfaces update-state + comment in its footer.
+        app.screen = Screen::WiView(Box::new(crate::app::WiView {
+            connection_id: "c".into(),
+            wi: WorkItem {
+                id: "w1".into(),
+                identifier: Some("FOR-1".into()),
+                title: "A task".into(),
+                description: None,
+                state: "Todo".into(),
+                state_category: WorkItemStateCategory::Unstarted,
+                work_item_type: None,
+                assignee: None,
+                created_at: None,
+                updated_at: None,
+                url: None,
+            },
+            threads: vec![],
+            scroll: 0,
+        }));
+        let view = render_to_string(&mut app, 140, 24);
+        assert!(view.contains("update state") && view.contains("comment"), "view has update-state + comment");
     }
 
     #[test]

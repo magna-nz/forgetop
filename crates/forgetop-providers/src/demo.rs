@@ -687,6 +687,9 @@ impl WorkItemSource for DemoWi {
     async fn add_comment(&self, _id: &str, _body: &str) -> Result<()> {
         Ok(())
     }
+    async fn available_states(&self, _id: &str) -> Result<Vec<String>> {
+        Ok(["Backlog", "Todo", "In Progress", "In Review", "Blocked", "Done"].iter().map(|s| s.to_string()).collect())
+    }
 }
 
 struct DemoPipe;
@@ -818,6 +821,14 @@ mod tests {
     #[tokio::test]
     async fn health_is_true() {
         assert!(conn().check().await);
+    }
+
+    #[tokio::test]
+    async fn work_items_expose_available_states() {
+        let src = conn().work_items().unwrap();
+        let states = src.available_states("w1").await.unwrap();
+        assert!(states.contains(&"In Progress".to_string()) && states.contains(&"Done".to_string()));
+        assert!(states.len() >= 4, "a meaningful set of states to pick from");
     }
 
     #[tokio::test]

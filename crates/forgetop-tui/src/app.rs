@@ -1031,6 +1031,11 @@ impl App {
                 return;
             }
             Screen::WiView(_) => {
+                // `u` (update state) pulls the provider's states — needs async.
+                if key == Key::Char('u') {
+                    self.open_wi_state(deps).await;
+                    return;
+                }
                 self.on_wi_view_key(key);
                 return;
             }
@@ -1396,10 +1401,6 @@ impl App {
                 self.open_selected();
                 return;
             }
-            Key::Char('s') => {
-                self.open_wi_state();
-                return;
-            }
             Key::Char('c') => {
                 self.open_wi_comment();
                 return;
@@ -1446,13 +1447,10 @@ impl App {
             'C' => self.open_config(deps).await,
             'f' if self.active == 0 => self.cycle_pr_filter(deps).await,
             'f' if self.active == 1 => self.open_wi_states_toggle(),
-            // Work-item actions (Work Items tab only).
-            's' => self.open_wi_state(),
-            'c' if self.active == 1 => self.open_wi_comment(),
             // Pipeline trigger (Pipelines tab).
             'T' if self.active == 2 => self.open_pipeline_trigger(),
-            // PR write actions (approve / reject / merge / comment / diff) live inside
-            // the PR view — press Enter to open a PR first.
+            // Work-item state/comment (u / c) and PR write actions live inside the
+            // opened item's view — press Enter first.
             _ => {}
         }
     }
@@ -2154,25 +2152,35 @@ impl App {
             .map(|f| f.source)
     }
 
-    fn open_wi_state(&mut self) {
-        let Some(wi) = self.selected_wi() else { return };
-        let current = wi.state.clone();
-        let title = format!("Set state — {}", wi_label(wi));
-        // Offer the real state names seen across the current items (provider-accurate);
-        // fall back to a generic set if we can't infer at least two.
-        let mut states: Vec<String> = self.wis.iter().map(|w| w.wi.state.clone()).collect();
-        states.sort();
-        states.dedup();
-        if states.len() < 2 {
-            states = vec!["Todo".into(), "In Progress".into(), "Done".into()];
+    /// State picker for the open work item, pulling the provider's real available
+    /// states (falling back to states seen across the loaded items).
+    async fn open_wi_state(&mut self, deps: &AppDeps) {
+        let (id, current, title, conn_id) = match &self.screen {
+            Screen::WiView(v) => (v.wi.id.clone(), v.wi.state.clone(), format!("Set state — {}", wi_label(&v.wi)), v.connection_id.clone()),
+            _ => return,
+        };
+
+        let mut states = match self.wi_source_for(&conn_id, deps).await {
+            Some(src) => src.available_states(&id).await.unwrap_or_default(),
+            None => Vec::new(),
+        };
+        if states.is_empty() {
+            states = self.distinct_wi_states();
+            if states.len() < 2 {
+                states = vec!["Todo".into(), "In Progress".into(), "Done".into()];
+            }
+        }
+        // Ensure the current state is present so it can be preselected.
+        if !current.is_empty() && !states.iter().any(|s| s == &current) {
+            states.insert(0, current.clone());
         }
         let selected = states.iter().position(|s| *s == current).unwrap_or(0);
         self.overlay = Some(Overlay::Picker { title, items: states, selected, kind: PickerKind::WorkItemState });
     }
 
     fn open_wi_comment(&mut self) {
-        let Some(wi) = self.selected_wi() else { return };
-        let title = format!("Comment on {}", wi_label(wi));
+        let Screen::WiView(v) = &self.screen else { return };
+        let title = format!("Comment on {}", wi_label(&v.wi));
         self.overlay = Some(Overlay::Input { title, buffer: String::new(), kind: InputKind::WorkItemComment });
     }
 
@@ -2208,6 +2216,18 @@ impl App {
         match result {
             Ok(msg) => {
                 self.toast = Some(msg);
+                // Reflect the change in the open view.
+                if let Action::WiSetState(state) = &action {
+                    if let Screen::WiView(v) = &mut self.screen {
+                        v.wi.state = state.clone();
+                    }
+                }
+                if matches!(action, Action::WiComment(_)) {
+                    let threads = source.threads(&id).await.unwrap_or_default();
+                    if let Screen::WiView(v) = &mut self.screen {
+                        v.threads = threads;
+                    }
+                }
                 let mut errors = Vec::new();
                 self.reload_work_items(deps, &mut errors).await;
                 self.fix_selection();

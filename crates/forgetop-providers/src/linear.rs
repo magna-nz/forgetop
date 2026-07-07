@@ -131,6 +131,19 @@ impl WorkItemSource for LinearWi {
         let mutation = "mutation($id:String!,$body:String!){ commentCreate(input:{issueId:$id,body:$body}){ success } }";
         self.0.query(mutation, json!({ "id": id, "body": body })).await.map(|_| ())
     }
+    async fn available_states(&self, id: &str) -> Result<Vec<String>> {
+        let lookup = "query($id:String!){ issue(id:$id){ team { states { nodes { name } } } } }";
+        let data = self.0.query(lookup, json!({ "id": id })).await?;
+        let states = get_obj(&data, "issue")
+            .and_then(|i| get_obj(i, "team"))
+            .and_then(|t| get_obj(t, "states"))
+            .map(|s| get_arr(s, "nodes"))
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(|n| get_str(n, "name"))
+            .collect();
+        Ok(states)
+    }
 }
 
 pub struct LinearConnection {

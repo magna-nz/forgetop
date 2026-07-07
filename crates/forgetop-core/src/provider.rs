@@ -187,6 +187,11 @@ pub trait WorkItemSource: Send + Sync {
     async fn threads(&self, work_item_id: &str) -> Result<Vec<CommentThread>>;
     async fn set_state(&self, work_item_id: &str, state: &str) -> Result<()>;
     async fn add_comment(&self, work_item_id: &str, body: &str) -> Result<()>;
+    /// The states this item can move to (provider-accurate). Defaults to empty,
+    /// letting the caller fall back to the states seen across the loaded items.
+    async fn available_states(&self, _work_item_id: &str) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
 }
 
 #[async_trait]
