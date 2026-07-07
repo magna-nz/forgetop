@@ -10,14 +10,45 @@ use crate::domain::Section;
 use crate::error::Result;
 use crate::provider::Connection;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PullRequestBinding {
-    pub connection_id: String,
+    /// Connections whose pull requests are aggregated into the PR list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub connection_ids: Vec<String>,
+    /// Legacy single-bind field; folded into `connection_ids` on read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WorkItemBinding {
-    pub connection_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub connection_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection_id: Option<String>,
+}
+
+/// Merges the multi-bind list with any legacy single id, de-duplicated.
+fn merged_ids(ids: &[String], legacy: &Option<String>) -> Vec<String> {
+    let mut out = ids.to_vec();
+    if let Some(c) = legacy {
+        if !out.contains(c) {
+            out.push(c.clone());
+        }
+    }
+    out
+}
+
+impl PullRequestBinding {
+    pub fn ids(&self) -> Vec<String> {
+        merged_ids(&self.connection_ids, &self.connection_id)
+    }
+}
+
+impl WorkItemBinding {
+    pub fn ids(&self) -> Vec<String> {
+        merged_ids(&self.connection_ids, &self.connection_id)
+    }
 }
 
 /// One connection feeding the Pipelines section, plus the pipelines subscribed from it.
@@ -169,5 +200,25 @@ impl ConfigStore for InMemoryConfigStore {
     async fn save(&self, config: &ForgetopConfig) -> Result<()> {
         *self.config.lock().unwrap() = config.clone();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn binding_ids_merge_legacy_and_dedup() {
+        // Legacy single-bind config deserializes and migrates via ids().
+        let legacy: PullRequestBinding = serde_json::from_str(r#"{"connection_id":"gh-1"}"#).unwrap();
+        assert_eq!(legacy.ids(), vec!["gh-1".to_string()]);
+
+        // Multi-bind with a legacy id already present is de-duplicated.
+        let b = PullRequestBinding { connection_ids: vec!["a".into(), "b".into()], connection_id: Some("a".into()) };
+        assert_eq!(b.ids(), vec!["a".to_string(), "b".to_string()]);
+
+        // New writes only serialize the list, not the legacy field.
+        let json = serde_json::to_string(&PullRequestBinding { connection_ids: vec!["x".into()], connection_id: None }).unwrap();
+        assert_eq!(json, r#"{"connection_ids":["x"]}"#);
     }
 }

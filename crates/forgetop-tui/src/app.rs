@@ -1686,8 +1686,9 @@ impl App {
         let cfg = deps.config.snapshot();
         let display_of = |id: &str| cfg.find_connection(id).map(|c| c.display_name.clone()).unwrap_or_else(|| id.to_string());
 
-        let pr_binding = cfg.pull_requests.as_ref().map(|b| display_of(&b.connection_id));
-        let wi_binding = cfg.work_items.as_ref().map(|b| display_of(&b.connection_id));
+        let names = |ids: Vec<String>| ids.iter().map(|id| display_of(id)).collect::<Vec<_>>().join(", ");
+        let pr_binding = cfg.pull_requests.as_ref().map(|b| b.ids()).filter(|ids| !ids.is_empty()).map(names);
+        let wi_binding = cfg.work_items.as_ref().map(|b| b.ids()).filter(|ids| !ids.is_empty()).map(names);
         let pipeline_subs = cfg
             .pipelines
             .as_ref()
@@ -1699,10 +1700,10 @@ impl App {
             .iter()
             .map(|c| {
                 let mut bindings = Vec::new();
-                if cfg.pull_requests.as_ref().is_some_and(|b| b.connection_id == c.id) {
+                if cfg.pull_requests.as_ref().is_some_and(|b| b.ids().contains(&c.id)) {
                     bindings.push("PR");
                 }
-                if cfg.work_items.as_ref().is_some_and(|b| b.connection_id == c.id) {
+                if cfg.work_items.as_ref().is_some_and(|b| b.ids().contains(&c.id)) {
                     bindings.push("WI");
                 }
                 if cfg.pipelines.as_ref().is_some_and(|p| p.subscriptions.iter().any(|s| s.connection_id == c.id)) {
