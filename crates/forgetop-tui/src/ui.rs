@@ -707,7 +707,7 @@ fn footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
         _ => {}
     }
     keys.push(("/", "find"));
-    keys.extend([("v", "tabs"), ("C", "config"), ("r", "refresh"), ("t", "theme"), ("q", "quit")]);
+    keys.extend([("v", "tabs"), ("C", "config"), ("r", "refresh"), ("t", "theme"), ("?", "help"), ("q", "quit")]);
     keys
 }
 
@@ -1053,6 +1053,12 @@ fn render_overlay(frame: &mut Frame, area: Rect, app: &App) {
     let theme = &app.theme;
     let Some(overlay) = &app.overlay else { return };
 
+    // Help is a large scrollable panel rather than the small centred card.
+    if let Overlay::Help { scroll } = overlay {
+        render_help(frame, area, theme, *scroll);
+        return;
+    }
+
     let (body, hint_color): (Vec<Line>, _) = match overlay {
         Overlay::Confirm { message, .. } => (
             vec![Line::from(""), Line::from(Span::styled(message.clone(), Style::default().fg(theme.fg)))],
@@ -1109,6 +1115,7 @@ fn render_overlay(frame: &mut Frame, area: Rect, app: &App) {
                 .collect(),
             theme.green,
         ),
+        Overlay::Help { .. } => return, // handled above
     };
 
     let hint = footer_keys(app)
@@ -1138,6 +1145,106 @@ fn render_overlay(frame: &mut Frame, area: Rect, app: &App) {
 
     frame.render_widget(Clear, rect);
     frame.render_widget(Paragraph::new(lines).block(block).wrap(Wrap { trim: false }), rect);
+}
+
+/// Every keybinding, grouped by context — the content of the `?` help panel.
+fn help_sections() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
+    vec![
+        (
+            "Global",
+            vec![
+                ("←/→  h/l  Tab  1–3", "Switch tab"),
+                ("↑/↓  k/j", "Move selection"),
+                ("/", "Quick-filter the list"),
+                ("o", "Open selected in browser"),
+                ("n", "Add a connection (wizard)"),
+                ("v", "Choose which tabs are visible"),
+                ("C", "Config / connections"),
+                ("r", "Refresh    t  cycle theme"),
+                ("?", "This help"),
+                ("q  Ctrl-C", "Quit    Esc  back / close"),
+            ],
+        ),
+        (
+            "Pull Requests",
+            vec![
+                ("Enter", "Open the PR view"),
+                ("f", "Cycle filter (All / Mine / Review)"),
+                ("d", "Open straight to the Diff tab"),
+                ("a  x", "Approve / request changes"),
+                ("m", "Merge (choose strategy)"),
+                ("c", "Comment"),
+            ],
+        ),
+        (
+            "PR view",
+            vec![
+                ("←/→", "Switch sub-tab"),
+                ("Enter (Commits)", "Drill into that commit's diff"),
+                ("Enter (Diff file)", "Line cursor in the patch"),
+                ("↑/↓ (line cursor)", "Move line-by-line"),
+                ("c (line cursor)", "Add an inline comment (buffered)"),
+                ("s", "Submit review (Comment/Approve/Reject)"),
+                ("Esc", "Step back (line → files → close)"),
+            ],
+        ),
+        (
+            "Work Items",
+            vec![
+                ("Enter", "Open"),
+                ("s", "Change state"),
+                ("f", "Choose which states to show"),
+                ("c", "Comment"),
+            ],
+        ),
+        (
+            "Pipelines",
+            vec![("Enter", "Drill in (stages → jobs → steps)"), ("T", "Trigger a run")],
+        ),
+        (
+            "Config / connections",
+            vec![
+                ("a", "Add a connection"),
+                ("p  w", "Bind Pull Requests / Work Items"),
+                ("s", "Pipeline subscriptions"),
+                ("x", "Remove connection"),
+            ],
+        ),
+    ]
+}
+
+fn render_help(frame: &mut Frame, area: Rect, theme: &Theme, scroll: u16) {
+    let mut lines: Vec<Line> = Vec::new();
+    for (section, keys) in help_sections() {
+        lines.push(Line::from(Span::styled(section, Style::default().fg(theme.accent).add_modifier(Modifier::BOLD))));
+        for (k, d) in keys {
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {k:<18}"), Style::default().fg(theme.yellow)),
+                Span::styled(d, Style::default().fg(theme.fg)),
+            ]));
+        }
+        lines.push(Line::from(""));
+    }
+    lines.push(Line::from(Span::styled("↑↓ scroll · Esc close", Style::default().fg(theme.dim))));
+
+    let total = lines.len() as u16;
+    let width = 68.min(area.width.saturating_sub(4));
+    let height = area.height.saturating_sub(4).clamp(10, total + 2);
+    let rect = centered_rect(width, height, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.accent))
+        .style(Style::default().bg(theme.panel))
+        .title(Span::styled(" Keybindings ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)));
+
+    // Clamp scroll so you can't page past the end.
+    let inner_h = height.saturating_sub(2);
+    let max_scroll = total.saturating_sub(inner_h);
+
+    frame.render_widget(Clear, rect);
+    frame.render_widget(Paragraph::new(lines).block(block).scroll((scroll.min(max_scroll), 0)), rect);
 }
 
 fn render_wizard(frame: &mut Frame, area: Rect, app: &App) {
@@ -1414,6 +1521,16 @@ mod tests {
         let out = render_to_string(&mut app, 120, 24);
         for label in ["diff", "approve", "reject", "merge", "comment"] {
             assert!(out.contains(label), "PR footer should advertise '{label}'");
+        }
+    }
+
+    #[test]
+    fn help_overlay_lists_all_sections() {
+        let mut app = App::new("slate");
+        app.overlay = Some(crate::overlay::Overlay::Help { scroll: 0 });
+        let out = render_to_string(&mut app, 100, 44);
+        for expected in ["Keybindings", "Global", "Pull Requests", "PR view", "Pipelines", "Submit review"] {
+            assert!(out.contains(expected), "help should show '{expected}'");
         }
     }
 

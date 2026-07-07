@@ -34,6 +34,7 @@ keys valid for wherever you are. The full set:
 | `v` | Choose which tabs are visible |
 | `C` | Config / connections screen |
 | `r` | Refresh · `t` cycle theme |
+| `?` | Show all keybindings (works anywhere) |
 | `q` / `Ctrl-C` | Quit · `Esc` back / close |
 
 ### Pull Requests

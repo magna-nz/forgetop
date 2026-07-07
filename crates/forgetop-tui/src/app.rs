@@ -687,6 +687,11 @@ impl App {
             self.on_filter_key(key);
             return;
         }
+        // Help is available from the list and every sub-view.
+        if key == Key::Char('?') {
+            self.overlay = Some(Overlay::Help { scroll: 0 });
+            return;
+        }
 
         // Full-screen sub-views handle their own keys.
         match self.screen {
