@@ -201,6 +201,25 @@ pub trait PipelineSource: Send + Sync {
     async fn get_run(&self, run_id: &str) -> Result<PipelineRun>;
     async fn logs(&self, run_id: &str, job_id: Option<&str>) -> Result<String>;
     async fn trigger(&self, definition_id: &str, branch: Option<&str>) -> Result<()>;
+    /// Whether this provider can surface and act on pending run approvals/gates.
+    /// `false` by default — the UI shows the section as unsupported.
+    fn supports_approvals(&self) -> bool {
+        false
+    }
+    /// Gates on a run that are waiting for a decision. Empty by default (unsupported).
+    async fn pending_approvals(&self, _run_id: &str) -> Result<Vec<PipelineApproval>> {
+        Ok(Vec::new())
+    }
+    /// Approve or reject a waiting gate on a run. Unsupported by default.
+    async fn respond_approval(
+        &self,
+        _run_id: &str,
+        _approval_id: &str,
+        _decision: ApprovalDecision,
+        _comment: Option<&str>,
+    ) -> Result<()> {
+        Err(Error::Provider("this provider doesn't support pipeline approvals".into()))
+    }
 }
 
 /// A live, authenticated connection exposing only the sources it supports.

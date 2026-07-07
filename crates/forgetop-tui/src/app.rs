@@ -119,6 +119,9 @@ pub struct App {
     pr_scan_seeded: bool,
     /// Transient one-shot message shown in the footer until the next keypress.
     pub toast: Option<String>,
+    /// Pending-approval gates offered by the current approval picker, indexed by
+    /// the picker selection. Rebuilt each time the picker opens.
+    approval_choices: Vec<ApprovalChoice>,
     /// Open modal overlay, if any. When set, keys route here instead of the table.
     pub overlay: Option<Overlay>,
     /// Add-connection wizard, if running. Takes priority over the overlay/screens.
@@ -237,6 +240,16 @@ pub struct FlatNode {
     pub job_id: Option<String>,
 }
 
+/// One approve/reject option offered by the pipeline-approval picker.
+struct ApprovalChoice {
+    connection_id: String,
+    run_id: String,
+    approval_id: String,
+    decision: ApprovalDecision,
+    /// Gate label, for confirm/toast messages.
+    label: String,
+}
+
 /// A scrollable log view over one job, shown within the pipeline drill-in.
 pub struct LogView {
     pub title: String,
@@ -273,17 +286,39 @@ pub struct PipelineView {
     pub title: String,
     pub run: PipelineRun,
     pub connection_id: String,
+    pub provider: ProviderType,
     pub definition_id: String,
     pub branch: Option<String>,
     collapsed: HashSet<String>,
     pub selected: usize,
     /// Open log pane over a selected job, if any.
     pub logs: Option<LogView>,
+    /// Whether this run's provider can surface/act on approvals.
+    pub supports_approvals: bool,
+    /// Gates on this run currently awaiting a decision.
+    pub approvals: Vec<PipelineApproval>,
 }
 
 impl PipelineView {
-    pub fn new(title: String, run: PipelineRun, connection_id: String, definition_id: String, branch: Option<String>) -> Self {
-        Self { title, run, connection_id, definition_id, branch, collapsed: HashSet::new(), selected: 0, logs: None }
+    pub fn new(title: String, run: PipelineRun, connection_id: String, provider: ProviderType, definition_id: String, branch: Option<String>) -> Self {
+        Self {
+            title,
+            run,
+            connection_id,
+            provider,
+            definition_id,
+            branch,
+            collapsed: HashSet::new(),
+            selected: 0,
+            logs: None,
+            supports_approvals: false,
+            approvals: Vec::new(),
+        }
+    }
+
+    /// Pending gates the authenticated user is allowed to act on.
+    pub fn actionable_approvals(&self) -> Vec<&PipelineApproval> {
+        self.approvals.iter().filter(|a| a.can_respond).collect()
     }
 
     /// Flattens stages/jobs/steps into visible rows, honouring collapsed nodes.
@@ -347,6 +382,14 @@ impl PipelineView {
         }
         let n = len as isize;
         self.selected = (((self.selected as isize + delta) % n + n) % n) as usize;
+    }
+
+    /// Keeps the cursor in range after the tree is refreshed.
+    fn clamp_selection(&mut self) {
+        let len = self.flatten().len();
+        if self.selected >= len {
+            self.selected = len.saturating_sub(1);
+        }
     }
 
     /// Expands/collapses the node under the cursor (no-op on leaf steps).
@@ -470,6 +513,7 @@ impl App {
             review_req_seen: HashSet::new(),
             pr_scan_seeded: false,
             toast: None,
+            approval_choices: Vec::new(),
             overlay: None,
             wizard: None,
             screen: Screen::List,
@@ -975,6 +1019,7 @@ impl App {
         self.reload_pull_requests(deps, &mut errors).await;
         self.reload_work_items(deps, &mut errors).await;
         self.reload_pipelines(deps, &mut errors).await;
+        self.refresh_open_pipeline(deps).await;
         self.scan_pr_notifications(deps).await;
         self.health = deps.health.check_all().await;
 
@@ -1591,20 +1636,123 @@ impl App {
     async fn open_pipeline(&mut self, deps: &AppDeps) {
         let Some(pipe) = self.selected_pipe() else { return };
         let conn_id = pipe.connection_id.clone();
+        let provider = pipe.provider;
         let run_id = pipe.run.id.clone();
         let definition_id = pipe.run.definition_id.clone();
         let branch = pipe.run.branch.clone();
         let title = pipe_label(pipe);
         let fallback = pipe.run.clone();
 
-        // Enrich with full stages/jobs/steps via get_run (list_runs may be shallow).
+        // Enrich with full stages/jobs/steps via get_run (list_runs may be shallow),
+        // plus any pending approval gates.
         let feeds = deps.sections.pipeline_feeds().await.unwrap_or_default();
-        let run = match feeds.iter().find(|f| f.connection.connection_id() == conn_id) {
-            Some(feed) => feed.source.get_run(&run_id).await.unwrap_or(fallback),
-            None => fallback,
+        let (run, supports_approvals, approvals) = match feeds.iter().find(|f| f.connection.connection_id() == conn_id) {
+            Some(feed) => {
+                let run = feed.source.get_run(&run_id).await.unwrap_or(fallback);
+                let supports = feed.source.supports_approvals();
+                let approvals = if supports { feed.source.pending_approvals(&run_id).await.unwrap_or_default() } else { Vec::new() };
+                (run, supports, approvals)
+            }
+            None => (fallback, false, Vec::new()),
         };
 
-        self.screen = Screen::Pipeline(Box::new(PipelineView::new(title, run, conn_id, definition_id, branch)));
+        let mut view = PipelineView::new(title, run, conn_id, provider, definition_id, branch);
+        view.supports_approvals = supports_approvals;
+        view.approvals = approvals;
+        self.screen = Screen::Pipeline(Box::new(view));
+    }
+
+    /// Re-fetches the open pipeline drill-in's run + approvals (called on the 30s tick).
+    async fn refresh_open_pipeline(&mut self, deps: &AppDeps) {
+        let Screen::Pipeline(v) = &self.screen else { return };
+        let (conn_id, run_id) = (v.connection_id.clone(), v.run.id.clone());
+        let feeds = deps.sections.pipeline_feeds().await.unwrap_or_default();
+        let Some(feed) = feeds.iter().find(|f| f.connection.connection_id() == conn_id) else { return };
+        let Ok(run) = feed.source.get_run(&run_id).await else { return };
+        let approvals = if feed.source.supports_approvals() {
+            feed.source.pending_approvals(&run_id).await.unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        if let Screen::Pipeline(v) = &mut self.screen {
+            v.run = run;
+            v.approvals = approvals;
+            v.clamp_selection();
+        }
+    }
+
+    /// Opens the approve/reject picker for the drill-in's actionable gates.
+    fn open_approval_picker(&mut self) {
+        let Screen::Pipeline(v) = &self.screen else { return };
+        if !v.supports_approvals {
+            self.toast = Some("Approvals aren't supported on this provider".into());
+            return;
+        }
+        let actionable = v.actionable_approvals();
+        if actionable.is_empty() {
+            self.toast = Some("Nothing awaiting your approval on this run".into());
+            return;
+        }
+        // Two rows per gate — an explicit Approve and Reject — so the picker choice
+        // already carries the decision; a confirm follows before we act.
+        let (conn_id, run_id) = (v.connection_id.clone(), v.run.id.clone());
+        let mut choices = Vec::new();
+        let mut items = Vec::new();
+        for a in actionable {
+            for decision in [ApprovalDecision::Approve, ApprovalDecision::Reject] {
+                let verb = match decision {
+                    ApprovalDecision::Approve => "Approve",
+                    ApprovalDecision::Reject => "Reject",
+                };
+                items.push(format!("{verb} · {}", a.name));
+                choices.push(ApprovalChoice {
+                    connection_id: conn_id.clone(),
+                    run_id: run_id.clone(),
+                    approval_id: a.id.clone(),
+                    decision,
+                    label: a.name.clone(),
+                });
+            }
+        }
+        self.approval_choices = choices;
+        self.overlay = Some(Overlay::Picker { title: "Pipeline approval".into(), items, selected: 0, kind: PickerKind::ApprovalGate });
+    }
+
+    /// Confirms a picked approval decision before acting.
+    fn confirm_approval(&mut self, index: usize) {
+        let Some(choice) = self.approval_choices.get(index) else { return };
+        let verb = match choice.decision {
+            ApprovalDecision::Approve => "Approve",
+            ApprovalDecision::Reject => "Reject",
+        };
+        self.overlay = Some(Overlay::Confirm {
+            title: "Pipeline approval".into(),
+            message: format!("{verb} deployment to {}?", choice.label),
+            action: Action::RespondApproval { index },
+        });
+    }
+
+    /// Sends the confirmed approve/reject to the provider, then refreshes the run.
+    async fn respond_approval(&mut self, index: usize, deps: &AppDeps) {
+        let Some(choice) = self.approval_choices.get(index) else { return };
+        let (conn_id, run_id, approval_id, decision, label) =
+            (choice.connection_id.clone(), choice.run_id.clone(), choice.approval_id.clone(), choice.decision, choice.label.clone());
+        let feeds = deps.sections.pipeline_feeds().await.unwrap_or_default();
+        let Some(feed) = feeds.iter().find(|f| f.connection.connection_id() == conn_id) else {
+            self.toast = Some("Pipeline connection not found".into());
+            return;
+        };
+        match feed.source.respond_approval(&run_id, &approval_id, decision, None).await {
+            Ok(()) => {
+                let verb = match decision {
+                    ApprovalDecision::Approve => "Approved",
+                    ApprovalDecision::Reject => "Rejected",
+                };
+                self.toast = Some(format!("{verb} {label}"));
+                self.refresh_open_pipeline(deps).await;
+            }
+            Err(e) => self.toast = Some(format!("Approval failed: {e}")),
+        }
     }
 
     fn on_pipeline_key(&mut self, key: Key) {
@@ -1612,6 +1760,7 @@ impl App {
             Key::Escape => self.screen = Screen::List,
             Key::Char('q') => self.should_quit = true,
             Key::Char('T') => self.open_pipeline_trigger(),
+            Key::Char('A') => self.open_approval_picker(),
             Key::Char('o') => self.open_selected(),
             other => {
                 if let Screen::Pipeline(view) = &mut self.screen {
@@ -2201,6 +2350,8 @@ impl App {
             Action::SetSort { section, index } => self.apply_sort(section, index, deps).await,
             Action::SaveView(name) => self.save_view(name, deps).await,
             Action::DeleteView => self.delete_view(deps).await,
+            Action::PickApproval { index } => self.confirm_approval(index),
+            Action::RespondApproval { index } => self.respond_approval(index, deps).await,
         }
     }
 
@@ -2855,7 +3006,7 @@ mod tests {
     #[test]
     fn pipeline_node_url_and_log_pane() {
         let mut app = App::new("slate");
-        app.screen = Screen::Pipeline(Box::new(PipelineView::new("CI".into(), failed_run(), "c".into(), "ci".into(), Some("main".into()))));
+        app.screen = Screen::Pipeline(Box::new(PipelineView::new("CI".into(), failed_run(), "c".into(), ProviderType::GitHub, "ci".into(), Some("main".into()))));
 
         // Node 0 is the stage (no deep link) → falls back to the run URL.
         assert_eq!(app.selected_url().as_deref(), Some("http://run"));
@@ -2876,6 +3027,49 @@ mod tests {
         app.on_pipeline_logs_key(Key::Escape);
         let Screen::Pipeline(v) = &app.screen else { panic!() };
         assert!(v.logs.is_none(), "Esc closes the log pane");
+    }
+
+    #[test]
+    fn approval_picker_offers_only_actionable_gates_and_confirms() {
+        let mut app = App::new("slate");
+        let mut view = PipelineView::new("CI".into(), failed_run(), "c".into(), ProviderType::GitHub, "ci".into(), None);
+        view.supports_approvals = true;
+        view.approvals = vec![
+            PipelineApproval { id: "prod".into(), name: "production".into(), can_respond: true },
+            PipelineApproval { id: "stg".into(), name: "staging".into(), can_respond: false },
+        ];
+        app.screen = Screen::Pipeline(Box::new(view));
+
+        app.open_approval_picker();
+        // Only the actionable gate is offered — as an Approve and a Reject row.
+        assert_eq!(app.approval_choices.len(), 2);
+        assert!(app.approval_choices.iter().all(|c| c.approval_id == "prod"));
+        match &app.overlay {
+            Some(Overlay::Picker { items, kind: PickerKind::ApprovalGate, .. }) => {
+                assert_eq!(items.len(), 2);
+                assert!(items[0].starts_with("Approve"));
+                assert!(items[1].starts_with("Reject"));
+            }
+            _ => panic!("expected an approval picker"),
+        }
+
+        // Picking a row opens a confirm carrying the terminal RespondApproval action.
+        app.confirm_approval(0);
+        match &app.overlay {
+            Some(Overlay::Confirm { action: Action::RespondApproval { index }, .. }) => assert_eq!(*index, 0),
+            _ => panic!("expected a respond-approval confirm"),
+        }
+    }
+
+    #[test]
+    fn approval_picker_is_a_noop_without_actionable_gates() {
+        let mut app = App::new("slate");
+        let mut view = PipelineView::new("CI".into(), failed_run(), "c".into(), ProviderType::Bitbucket, "ci".into(), None);
+        view.supports_approvals = false; // Bitbucket
+        app.screen = Screen::Pipeline(Box::new(view));
+        app.open_approval_picker();
+        assert!(app.overlay.is_none(), "no picker when approvals aren't supported");
+        assert!(app.toast.is_some());
     }
 
     #[test]

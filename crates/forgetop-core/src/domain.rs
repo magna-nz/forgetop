@@ -295,3 +295,23 @@ pub struct PipelineRun {
     pub url: Option<String>,
     pub stages: Vec<PipelineStage>,
 }
+
+/// A gate on a pipeline run that is waiting for a manual decision (a deployment
+/// environment reviewer, an approval check, or a manual job).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PipelineApproval {
+    /// Provider-native identifier used to act on this gate (environment id,
+    /// approval id, or manual job id, depending on the provider).
+    pub id: String,
+    /// Human label for the gate — usually the environment or stage name.
+    pub name: String,
+    /// Whether the authenticated user is allowed to respond to this gate.
+    pub can_respond: bool,
+}
+
+/// A decision on a pending [`PipelineApproval`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ApprovalDecision {
+    Approve,
+    Reject,
+}

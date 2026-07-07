@@ -759,11 +759,15 @@ fn footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
         return vec![("PgUp/Dn", "scroll"), ("u", "update state"), ("c", "comment"), ("o", "open"), ("Esc", "back"), ("q", "quit")];
     }
     if let Screen::Pipeline(v) = &app.screen {
-        return if v.logs.is_some() {
-            vec![("↑↓", "scroll"), ("PgUp/Dn", "jump"), ("Esc", "close logs")]
-        } else {
-            vec![("↑↓", "move"), ("↵", "expand"), ("L", "logs"), ("T", "trigger"), ("o", "open job"), ("Esc", "back"), ("q", "quit")]
-        };
+        if v.logs.is_some() {
+            return vec![("↑↓", "scroll"), ("PgUp/Dn", "jump"), ("Esc", "close logs")];
+        }
+        let mut keys = vec![("↑↓", "move"), ("↵", "expand"), ("L", "logs")];
+        if !v.actionable_approvals().is_empty() {
+            keys.push(("A", "approve"));
+        }
+        keys.extend([("T", "trigger"), ("o", "open job"), ("Esc", "back"), ("q", "quit")]);
+        return keys;
     }
     if matches!(app.screen, Screen::Config(_)) {
         return vec![
@@ -1076,10 +1080,15 @@ fn render_config(frame: &mut Frame, area: Rect, theme: &Theme, view: &ConfigView
 // ---- pipeline drill-in ----
 
 fn render_pipeline(frame: &mut Frame, area: Rect, theme: &Theme, view: &PipelineView) {
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(3)])
-        .split(area);
+    // Reserve a banner row for approvals / unsupported note when there's one to show.
+    let banner = approval_banner(theme, view);
+    let mut constraints = vec![Constraint::Length(3)];
+    if banner.is_some() {
+        constraints.push(Constraint::Length(1));
+    }
+    constraints.push(Constraint::Min(3));
+    let rows = Layout::default().direction(Direction::Vertical).constraints(constraints).split(area);
+    let tree_area = rows[rows.len() - 1];
 
     // Header: run identity + status + branch/trigger.
     let branch = view.branch.clone().unwrap_or_else(|| "—".into());
@@ -1092,14 +1101,18 @@ fn render_pipeline(frame: &mut Frame, area: Rect, theme: &Theme, view: &Pipeline
     let header_block = section_block(theme, &view.title);
     frame.render_widget(Paragraph::new(header).block(header_block), rows[0]);
 
+    if let Some(line) = banner {
+        frame.render_widget(Paragraph::new(line), rows[1]);
+    }
+
     // A log pane, when open, replaces the tree.
     if let Some(log) = &view.logs {
         let lines: Vec<Line> = log.lines.iter().map(|l| Line::from(Span::styled(l.clone(), Style::default().fg(theme.fg)))).collect();
-        let inner_h = rows[1].height.saturating_sub(2);
+        let inner_h = tree_area.height.saturating_sub(2);
         let max = (lines.len() as u16).saturating_sub(inner_h);
         frame.render_widget(
             Paragraph::new(lines).block(section_block(theme, &log.title)).scroll((log.scroll.min(max), 0)),
-            rows[1],
+            tree_area,
         );
         return;
     }
@@ -1108,7 +1121,7 @@ fn render_pipeline(frame: &mut Frame, area: Rect, theme: &Theme, view: &Pipeline
     let nodes = view.flatten();
     let tree_block = section_block(theme, "Stages · jobs · steps");
     if nodes.is_empty() {
-        empty(frame, rows[1], theme, "No stages reported for this run.", tree_block);
+        empty(frame, tree_area, theme, "No stages reported for this run.", tree_block);
         return;
     }
 
@@ -1145,7 +1158,32 @@ fn render_pipeline(frame: &mut Frame, area: Rect, theme: &Theme, view: &Pipeline
     let list = List::new(items).block(tree_block).highlight_style(highlight(theme)).highlight_symbol("▐ ");
     let mut state = ListState::default();
     state.select(Some(view.selected.min(nodes.len().saturating_sub(1))));
-    frame.render_stateful_widget(list, rows[1], &mut state);
+    frame.render_stateful_widget(list, tree_area, &mut state);
+}
+
+/// The approvals banner for the drill-in: pending gates you can act on, a
+/// waiting-on-others note, or an explicit "unsupported" note (e.g. Bitbucket).
+/// `None` when the provider supports approvals and there's nothing pending.
+fn approval_banner<'a>(theme: &Theme, view: &PipelineView) -> Option<Line<'a>> {
+    if !view.supports_approvals {
+        return Some(Line::from(Span::styled(
+            format!("  Approvals not supported on {}", view.provider.as_str()),
+            Style::default().fg(theme.dim),
+        )));
+    }
+    if view.approvals.is_empty() {
+        return None;
+    }
+    let actionable = view.actionable_approvals();
+    if actionable.is_empty() {
+        let names = view.approvals.iter().map(|a| a.name.clone()).collect::<Vec<_>>().join(", ");
+        return Some(Line::from(Span::styled(format!("  ⏸ Waiting on others: {names}"), Style::default().fg(theme.dim))));
+    }
+    let names = actionable.iter().map(|a| a.name.clone()).collect::<Vec<_>>().join(", ");
+    Some(Line::from(vec![
+        Span::styled(format!("  ⏸ Approval needed: {names}"), Style::default().fg(theme.red).add_modifier(Modifier::BOLD)),
+        Span::styled("   press A to approve / reject", Style::default().fg(theme.dim)),
+    ]))
 }
 
 // ---- overlays ----
@@ -1319,6 +1357,7 @@ fn help_sections() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
                 ("Enter", "Drill in (stages → jobs → steps)"),
                 ("Enter (in drill-in)", "Expand / collapse a node"),
                 ("L", "View the selected job's logs"),
+                ("A", "Approve / reject a waiting gate (GitHub; not on Bitbucket)"),
                 ("o", "Open the selected job in the browser"),
                 ("T", "Trigger a run"),
             ],
@@ -1714,7 +1753,7 @@ mod tests {
 
     #[test]
     fn pipeline_view_flattens_stage_job_step() {
-        let view = PipelineView::new("CI #101".into(), sample_run(), "demo".into(), "ci".into(), Some("main".into()));
+        let view = PipelineView::new("CI #101".into(), sample_run(), "demo".into(), ProviderType::GitHub, "ci".into(), Some("main".into()));
         let flat = view.flatten();
         assert_eq!(flat.len(), 3, "one stage + one job + one step");
         assert_eq!(flat[0].depth, 0);
@@ -1729,6 +1768,7 @@ mod tests {
             "CI #101".into(),
             sample_run(),
             "demo".into(),
+            ProviderType::GitHub,
             "ci".into(),
             Some("main".into()),
         )));
@@ -1737,6 +1777,28 @@ mod tests {
         assert!(out.contains("compile"), "job name");
         assert!(out.contains("cargo build"), "step name");
         assert!(out.contains("expand") && out.contains("trigger"), "drill-in footer keys");
+    }
+
+    #[test]
+    fn drill_in_banner_flags_approval_needed_and_unsupported() {
+        use crate::app::Screen;
+
+        // A GitHub run with a gate I can action → red "Approval needed" banner + A key.
+        let mut app = App::new("slate");
+        let mut view = PipelineView::new("CI #101".into(), sample_run(), "demo".into(), ProviderType::GitHub, "ci".into(), None);
+        view.supports_approvals = true;
+        view.approvals = vec![PipelineApproval { id: "prod".into(), name: "production".into(), can_respond: true }];
+        app.screen = Screen::Pipeline(Box::new(view));
+        let out = render_to_string(&mut app, 120, 30);
+        assert!(out.contains("Approval needed") && out.contains("production"), "actionable gate banner");
+        assert!(out.contains("approve"), "footer advertises the approve key");
+
+        // A Bitbucket run → explicit unsupported note.
+        let mut app = App::new("slate");
+        let view = PipelineView::new("Deploy".into(), sample_run(), "bb".into(), ProviderType::Bitbucket, "ci".into(), None);
+        app.screen = Screen::Pipeline(Box::new(view));
+        let out = render_to_string(&mut app, 120, 30);
+        assert!(out.contains("not supported on Bitbucket"), "bitbucket approvals unsupported note");
     }
 
     #[test]
