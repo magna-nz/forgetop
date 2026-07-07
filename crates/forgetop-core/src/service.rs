@@ -177,6 +177,12 @@ impl ConfigService {
         self.persist(cfg).await
     }
 
+    pub async fn set_hidden_work_item_states(&self, hidden: Vec<String>) -> Result<()> {
+        let mut cfg = self.snapshot();
+        cfg.ui.hidden_work_item_states = hidden;
+        self.persist(cfg).await
+    }
+
     /// Replaces a connection's tracked pipeline definitions with an explicit set
     /// (turns off auto-discovery). An empty list tracks nothing.
     pub async fn set_pipeline_definitions(&self, connection_id: &str, definition_ids: Vec<String>) -> Result<()> {

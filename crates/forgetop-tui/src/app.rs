@@ -76,6 +76,9 @@ pub struct App {
     pub filters: [String; 3],
     /// True while the quick-filter input is capturing keystrokes.
     pub filtering: bool,
+    /// Work-item state names hidden from the list (provider-specific strings).
+    /// Persisted; anything not listed is shown.
+    pub wi_hidden_states: HashSet<String>,
     /// Transient one-shot message shown in the footer until the next keypress.
     pub toast: Option<String>,
     /// Open modal overlay, if any. When set, keys route here instead of the table.
@@ -281,6 +284,7 @@ impl App {
             pr_filter: PullRequestFilter::All,
             filters: [String::new(), String::new(), String::new()],
             filtering: false,
+            wi_hidden_states: HashSet::new(),
             toast: None,
             overlay: None,
             wizard: None,
@@ -309,7 +313,27 @@ impl App {
 
     pub fn filtered_wi_indices(&self) -> Vec<usize> {
         let q = self.filters[1].to_lowercase();
-        (0..self.wis.len()).filter(|&i| wi_matches(&self.wis[i], &q)).collect()
+        (0..self.wis.len())
+            .filter(|&i| !self.wi_hidden_states.contains(&self.wis[i].state) && wi_matches(&self.wis[i], &q))
+            .collect()
+    }
+
+    /// How many distinct states currently in view are hidden (for the title/toast;
+    /// ignores stale hidden states left over from another provider).
+    pub fn hidden_states_in_view(&self) -> usize {
+        self.distinct_wi_states().iter().filter(|s| self.wi_hidden_states.contains(*s)).count()
+    }
+
+    /// Distinct work-item states in first-seen order (drives the visibility checklist).
+    fn distinct_wi_states(&self) -> Vec<String> {
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for w in &self.wis {
+            if seen.insert(w.state.clone()) {
+                out.push(w.state.clone());
+            }
+        }
+        out
     }
 
     pub fn filtered_pipe_indices(&self) -> Vec<usize> {
@@ -459,6 +483,11 @@ impl App {
         if !self.visible[self.active] {
             self.active = self.first_visible();
         }
+    }
+
+    /// Applies persisted hidden work-item-state preferences at startup.
+    pub fn apply_hidden_work_item_states(&mut self, hidden: &[String]) {
+        self.wi_hidden_states = hidden.iter().cloned().collect();
     }
 
     // ---- data loading ----
@@ -830,6 +859,7 @@ impl App {
             'v' => self.open_sections_toggle(),
             'C' => self.open_config(deps).await,
             'f' if self.active == 0 => self.cycle_pr_filter(deps).await,
+            'f' if self.active == 1 => self.open_wi_states_toggle(),
             // PR write actions (Pull Requests tab only; each no-ops off-tab).
             'a' => self.open_pr_vote(ReviewVote::Approved),
             'x' => self.open_pr_vote(ReviewVote::Rejected),
@@ -1062,6 +1092,23 @@ impl App {
             Some(Overlay::Toggle { title: "Visible tabs".into(), kind: ToggleKind::Sections, min_one: true, items, selected: 0 });
     }
 
+    // ---- work-item state visibility ----
+
+    /// Opens a checklist of the distinct states currently present, ticked = shown.
+    fn open_wi_states_toggle(&mut self) {
+        let states = self.distinct_wi_states();
+        if states.is_empty() {
+            self.toast = Some("No work-item states to filter yet".into());
+            return;
+        }
+        let items = states
+            .into_iter()
+            .map(|s| ToggleItem { on: !self.wi_hidden_states.contains(&s), id: s.clone(), label: s })
+            .collect();
+        self.overlay =
+            Some(Overlay::Toggle { title: "Show states".into(), kind: ToggleKind::WorkItemStates, min_one: false, items, selected: 0 });
+    }
+
     async fn apply_toggle(&mut self, kind: ToggleKind, ids: Vec<String>, deps: &AppDeps) {
         match kind {
             ToggleKind::Sections => {
@@ -1071,7 +1118,32 @@ impl App {
             ToggleKind::PipelineSubs { connection_id } => {
                 self.apply_pipeline_subs(&connection_id, ids, deps).await;
             }
+            ToggleKind::WorkItemStates => {
+                self.apply_wi_states(ids, deps).await;
+            }
         }
+    }
+
+    /// `ids` are the states left *ticked* (shown). Everything present but unticked
+    /// becomes hidden; states not present now are left untouched.
+    async fn apply_wi_states(&mut self, shown_ids: Vec<String>, deps: &AppDeps) {
+        let shown: HashSet<String> = shown_ids.into_iter().collect();
+        for state in self.distinct_wi_states() {
+            if shown.contains(&state) {
+                self.wi_hidden_states.remove(&state);
+            } else {
+                self.wi_hidden_states.insert(state);
+            }
+        }
+        let hidden: Vec<String> = self.wi_hidden_states.iter().cloned().collect();
+        if let Err(e) = deps.config.set_hidden_work_item_states(hidden).await {
+            self.toast = Some(format!("Couldn't save: {e}"));
+        } else {
+            let n = self.hidden_states_in_view();
+            self.toast = Some(if n == 0 { "Showing all states".into() } else { format!("{n} state(s) hidden") });
+        }
+        self.fix_selection();
+        self.list_scroll = 0;
     }
 
     /// Discovers a connection's pipeline definitions and opens a subscribe checklist.
@@ -1672,6 +1744,39 @@ mod tests {
         assert!(!app.filtering);
         assert!(app.active_filter().is_empty());
         assert_eq!(app.filtered_pr_indices(), vec![0, 1]);
+    }
+
+    #[test]
+    fn wi_state_visibility_hides_and_composes_with_quick_filter() {
+        let mut app = App::new("slate");
+        let mut a = wi(None);
+        a.state = "Todo".into();
+        a.title = "one".into();
+        let mut b = wi(None);
+        b.state = "In Progress".into();
+        b.title = "two".into();
+        let mut c = wi(None);
+        c.state = "Done".into();
+        c.title = "three".into();
+        app.wis = vec![a, b, c];
+        app.active = 1;
+
+        // Nothing hidden → all rows show, distinct states in first-seen order.
+        assert_eq!(app.filtered_wi_indices(), vec![0, 1, 2]);
+        assert_eq!(app.distinct_wi_states(), vec!["Todo", "In Progress", "Done"]);
+
+        // Hiding a state drops its rows.
+        app.wi_hidden_states.insert("Done".into());
+        assert_eq!(app.filtered_wi_indices(), vec![0, 1]);
+
+        // State-visibility composes with the `/` quick filter (AND).
+        app.filters[1] = "two".into();
+        assert_eq!(app.filtered_wi_indices(), vec![1]);
+
+        // A hidden state that isn't currently present is simply inert.
+        app.wi_hidden_states.insert("Archived".into());
+        app.filters[1].clear();
+        assert_eq!(app.filtered_wi_indices(), vec![0, 1]);
     }
 
     #[test]

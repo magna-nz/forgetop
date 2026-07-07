@@ -332,10 +332,18 @@ fn wi_state_color(theme: &Theme, cat: WorkItemStateCategory) -> ratatui::style::
 fn render_wis(frame: &mut Frame, area: Rect, app: &mut App) {
     let theme = &app.theme;
     let idxs = app.filtered_wi_indices();
-    let title = list_title("Work Items".to_string(), &app.filters[1]);
+    let hidden_in_view = app.hidden_states_in_view();
+    let base = if hidden_in_view == 0 {
+        "Work Items".to_string()
+    } else {
+        format!("Work Items · {hidden_in_view} state(s) hidden")
+    };
+    let title = list_title(base, &app.filters[1]);
     if idxs.is_empty() {
         let msg = if !app.filters[1].is_empty() {
             "No matches. Esc clears the filter."
+        } else if hidden_in_view > 0 {
+            "All present states are hidden. Press f to choose states."
         } else if app.health.is_empty() {
             FIRST_RUN_HINT
         } else if app.loading {
@@ -669,7 +677,7 @@ fn footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
             ("c", "comment"),
             ("o", "browser"),
         ]),
-        1 => keys.extend([("↵", "open"), ("s", "state"), ("c", "comment"), ("o", "browser")]),
+        1 => keys.extend([("↵", "open"), ("s", "state"), ("f", "states"), ("c", "comment"), ("o", "browser")]),
         2 => keys.extend([("↵", "drill-in"), ("T", "trigger"), ("o", "open")]),
         _ => {}
     }
