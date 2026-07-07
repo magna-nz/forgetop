@@ -260,19 +260,19 @@ fn sort_header_col(section: usize, key: &str) -> Option<usize> {
     match section {
         0 => match key {
             "status" => Some(0),
-            "number" => Some(1),
-            "title" => Some(2),
-            "author" => Some(3),
-            "checks" => Some(4),
-            "updated" => Some(6),
+            "number" => Some(2),
+            "title" => Some(3),
+            "author" => Some(4),
+            "checks" => Some(5),
+            "updated" => Some(7),
             _ => None,
         },
         1 => match key {
             "state" => Some(0),
-            "title" => Some(2),
-            "type" => Some(3),
-            "assignee" => Some(4),
-            "updated" => Some(5),
+            "title" => Some(3),
+            "type" => Some(4),
+            "assignee" => Some(5),
+            "updated" => Some(6),
             _ => None,
         },
         _ => match key {
@@ -343,15 +343,17 @@ fn render_prs(frame: &mut Frame, area: Rect, app: &mut App) {
 
     let inner_w = area.width.saturating_sub(2) as usize;
     let dim = Style::default().fg(theme.dim).add_modifier(Modifier::BOLD);
-    let headers = ["", "#", "Title", "Author", "Checks", "±", "Updated"];
+    let headers = ["", "Provider", "#", "Title", "Author", "Checks", "±", "Updated"];
     let cells: Vec<Vec<(String, Style)>> = idxs
         .iter()
         .map(|&i| &app.prs[i])
-        .map(|pr| {
+        .map(|row| {
+            let pr = &row.pr;
             let (st, stc) = pr_status(theme, pr);
             let (ck, ckc) = pr_checks(theme, pr);
             vec![
                 (st.to_string(), Style::default().fg(stc)),
+                (format!("{} · {}", row.provider.as_str(), row.connection), Style::default().fg(theme.cyan)),
                 (pr.number.map(|n| format!("#{n}")).unwrap_or_default(), Style::default().fg(theme.dim)),
                 (pr.title.clone(), Style::default().fg(theme.fg)),
                 (pr.author.display_name.clone(), Style::default().fg(theme.blue)),
@@ -362,7 +364,7 @@ fn render_prs(frame: &mut Frame, area: Rect, app: &mut App) {
         })
         .collect();
 
-    let (header, rows) = columnize(dim, &headers, &cells, 2, inner_w, sort_marker(app, 0));
+    let (header, rows) = columnize(dim, &headers, &cells, 3, inner_w, sort_marker(app, 0));
     render_inline_list(frame, area, app, &title, header, rows);
 }
 
@@ -406,13 +408,15 @@ fn render_wis(frame: &mut Frame, area: Rect, app: &mut App) {
 
     let inner_w = area.width.saturating_sub(2) as usize;
     let dim = Style::default().fg(theme.dim).add_modifier(Modifier::BOLD);
-    let headers = ["State", "ID", "Title", "Type", "Assignee", "Updated"];
+    let headers = ["State", "Provider", "ID", "Title", "Type", "Assignee", "Updated"];
     let cells: Vec<Vec<(String, Style)>> = idxs
         .iter()
         .map(|&i| &app.wis[i])
-        .map(|wi| {
+        .map(|row| {
+            let wi = &row.wi;
             vec![
                 (format!("● {}", wi.state), Style::default().fg(wi_state_color(theme, wi.state_category))),
+                (format!("{} · {}", row.provider.as_str(), row.connection), Style::default().fg(theme.cyan)),
                 (wi.identifier.clone().unwrap_or_default(), Style::default().fg(theme.dim)),
                 (wi.title.clone(), Style::default().fg(theme.fg)),
                 (wi.work_item_type.clone().unwrap_or_default(), Style::default().fg(theme.dim)),
@@ -422,7 +426,7 @@ fn render_wis(frame: &mut Frame, area: Rect, app: &mut App) {
         })
         .collect();
 
-    let (header, rows) = columnize(dim, &headers, &cells, 2, inner_w, sort_marker(app, 1));
+    let (header, rows) = columnize(dim, &headers, &cells, 3, inner_w, sort_marker(app, 1));
     render_inline_list(frame, area, app, &title, header, rows);
 }
 
@@ -1447,6 +1451,7 @@ mod tests {
         use crate::app::DiffView;
         crate::app::PrView {
             label: "PR #42 — Add the widget".into(),
+            connection_id: "c".into(),
             url: Some("http://x".into()),
             pr: sample_pr(),
             tab,
@@ -1550,7 +1555,7 @@ mod tests {
     #[test]
     fn pr_footer_shows_filter_key_and_active_filter() {
         let mut app = App::new("slate");
-        app.prs.push(sample_pr());
+        app.prs.push(crate::app::PrRow { connection_id: "c".into(), connection: "GH".into(), provider: ProviderType::GitHub, pr: sample_pr() });
         app.pr_state.select(Some(0));
 
         let out = render_to_string(&mut app, 100, 24);
@@ -1567,7 +1572,7 @@ mod tests {
     fn merge_picker_overlay_renders_over_the_list() {
         use crate::overlay::{Overlay, PickerKind};
         let mut app = App::new("slate");
-        app.prs.push(sample_pr());
+        app.prs.push(crate::app::PrRow { connection_id: "c".into(), connection: "GH".into(), provider: ProviderType::GitHub, pr: sample_pr() });
         app.pr_state.select(Some(0));
         app.overlay = Some(Overlay::Picker {
             title: "Merge PR #42 via".into(),
@@ -1583,10 +1588,25 @@ mod tests {
     }
 
     #[test]
+    fn pr_list_shows_the_provider_column_for_aggregation() {
+        let mut app = App::new("slate");
+        app.prs.push(crate::app::PrRow {
+            connection_id: "c".into(),
+            connection: "MyHub".into(),
+            provider: ProviderType::GitHub,
+            pr: sample_pr(),
+        });
+        app.pr_state.select(Some(0));
+        let out = render_to_string(&mut app, 140, 24);
+        assert!(out.contains("Provider"), "provider header present");
+        assert!(out.contains("GitHub") && out.contains("MyHub"), "row is tagged with its provider · connection");
+    }
+
+    #[test]
     fn pr_write_actions_live_in_the_view_not_the_list() {
         // The PR list footer offers only browse/open — no write actions.
         let mut app = App::new("slate");
-        app.prs.push(sample_pr());
+        app.prs.push(crate::app::PrRow { connection_id: "c".into(), connection: "GH".into(), provider: ProviderType::GitHub, pr: sample_pr() });
         app.pr_state.select(Some(0));
         let list = render_to_string(&mut app, 140, 24);
         assert!(list.contains("open") && list.contains("filter"), "list keeps open/filter");

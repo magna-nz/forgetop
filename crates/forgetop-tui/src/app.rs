@@ -54,11 +54,27 @@ pub struct PipeRow {
     pub run: PipelineRun,
 }
 
+/// A pull request tagged with the connection it came from (for aggregation).
+pub struct PrRow {
+    pub connection_id: String,
+    pub connection: String,
+    pub provider: ProviderType,
+    pub pr: PullRequest,
+}
+
+/// A work item tagged with the connection it came from (for aggregation).
+pub struct WiRow {
+    pub connection_id: String,
+    pub connection: String,
+    pub provider: ProviderType,
+    pub wi: WorkItem,
+}
+
 pub struct App {
     pub theme: Theme,
     pub active: usize,
-    pub prs: Vec<PullRequest>,
-    pub wis: Vec<WorkItem>,
+    pub prs: Vec<PrRow>,
+    pub wis: Vec<WiRow>,
     pub pipes: Vec<PipeRow>,
     pub pr_state: TableState,
     pub wi_state: TableState,
@@ -125,6 +141,8 @@ pub enum Screen {
 pub struct PrView {
     pub label: String,
     pub url: Option<String>,
+    /// The connection this PR came from — actions resolve their source through it.
+    pub connection_id: String,
     pub pr: PullRequest,
     pub tab: usize,
     pub checks: Vec<CheckRun>,
@@ -166,6 +184,7 @@ impl PrView {
 
 /// State for the full-screen work-item view.
 pub struct WiView {
+    pub connection_id: String,
     pub wi: WorkItem,
     pub threads: Vec<CommentThread>,
     pub scroll: u16,
@@ -468,9 +487,9 @@ impl App {
     /// in the active sort order.
     pub fn filtered_pr_indices(&self) -> Vec<usize> {
         let q = self.filters[0].to_lowercase();
-        let mut idx: Vec<usize> = (0..self.prs.len()).filter(|&i| pr_matches(&self.prs[i], &q)).collect();
+        let mut idx: Vec<usize> = (0..self.prs.len()).filter(|&i| pr_matches(&self.prs[i].pr, &q)).collect();
         if let Some(s) = &self.pr_sort {
-            idx.sort_by(|&a, &b| ordered(pr_cmp(&self.prs[a], &self.prs[b], &s.key), s.desc));
+            idx.sort_by(|&a, &b| ordered(pr_cmp(&self.prs[a].pr, &self.prs[b].pr, &s.key), s.desc));
         }
         idx
     }
@@ -478,10 +497,10 @@ impl App {
     pub fn filtered_wi_indices(&self) -> Vec<usize> {
         let q = self.filters[1].to_lowercase();
         let mut idx: Vec<usize> = (0..self.wis.len())
-            .filter(|&i| !self.wi_hidden_states.contains(&self.wis[i].state) && wi_matches(&self.wis[i], &q))
+            .filter(|&i| !self.wi_hidden_states.contains(&self.wis[i].wi.state) && wi_matches(&self.wis[i].wi, &q))
             .collect();
         if let Some(s) = &self.wi_sort {
-            idx.sort_by(|&a, &b| ordered(wi_cmp(&self.wis[a], &self.wis[b], &s.key), s.desc));
+            idx.sort_by(|&a, &b| ordered(wi_cmp(&self.wis[a].wi, &self.wis[b].wi, &s.key), s.desc));
         }
         idx
     }
@@ -497,8 +516,8 @@ impl App {
         let mut seen = HashSet::new();
         let mut out = Vec::new();
         for w in &self.wis {
-            if seen.insert(w.state.clone()) {
-                out.push(w.state.clone());
+            if seen.insert(w.wi.state.clone()) {
+                out.push(w.wi.state.clone());
             }
         }
         out
@@ -814,23 +833,43 @@ impl App {
     }
 
     async fn reload_pull_requests(&mut self, deps: &AppDeps, errors: &mut Vec<String>) {
-        match deps.sections.pull_request_source().await {
-            Ok(Some(src)) => match src.list(&pr_query(self.pr_filter)).await {
-                Ok(list) => self.prs = list,
-                Err(e) => errors.push(format!("PRs: {e}")),
-            },
-            Ok(None) => self.prs.clear(),
+        self.prs.clear();
+        match deps.sections.pull_request_feeds().await {
+            Ok(feeds) => {
+                for feed in feeds {
+                    let (provider, name, conn_id) = feed_tag(&feed.connection);
+                    match feed.source.list(&pr_query(self.pr_filter)).await {
+                        Ok(list) => self.prs.extend(list.into_iter().map(|pr| PrRow {
+                            connection_id: conn_id.clone(),
+                            connection: name.clone(),
+                            provider,
+                            pr,
+                        })),
+                        Err(e) => errors.push(format!("PRs ({name}): {e}")),
+                    }
+                }
+            }
             Err(e) => errors.push(format!("PRs: {e}")),
         }
     }
 
     async fn reload_work_items(&mut self, deps: &AppDeps, errors: &mut Vec<String>) {
-        match deps.sections.work_item_source().await {
-            Ok(Some(src)) => match src.list(&wi_query()).await {
-                Ok(list) => self.wis = list,
-                Err(e) => errors.push(format!("Work items: {e}")),
-            },
-            Ok(None) => self.wis.clear(),
+        self.wis.clear();
+        match deps.sections.work_item_feeds().await {
+            Ok(feeds) => {
+                for feed in feeds {
+                    let (provider, name, conn_id) = feed_tag(&feed.connection);
+                    match feed.source.list(&wi_query()).await {
+                        Ok(list) => self.wis.extend(list.into_iter().map(|wi| WiRow {
+                            connection_id: conn_id.clone(),
+                            connection: name.clone(),
+                            provider,
+                            wi,
+                        })),
+                        Err(e) => errors.push(format!("Work items ({name}): {e}")),
+                    }
+                }
+            }
             Err(e) => errors.push(format!("Work items: {e}")),
         }
     }
@@ -1029,14 +1068,13 @@ impl App {
     // ---- full-screen PR / work-item views ----
 
     async fn open_pr_view(&mut self, deps: &AppDeps, tab: usize) {
-        let Some(pr) = self.selected_pr() else { return };
-        let id = pr.id.clone();
-        let label = pr_label(pr);
-        let url = pr.url.clone();
-        let pr = pr.clone();
-        let source = match deps.sections.pull_request_source().await {
-            Ok(Some(s)) => s,
-            _ => {
+        let (id, label, url, conn_id, pr) = match self.selected_pr_row() {
+            Some(row) => (row.pr.id.clone(), pr_label(&row.pr), row.pr.url.clone(), row.connection_id.clone(), row.pr.clone()),
+            None => return,
+        };
+        let source = match self.pr_source_for(&conn_id, deps).await {
+            Some(s) => s,
+            None => {
                 self.toast = Some("No pull-request provider is bound".into());
                 return;
             }
@@ -1059,6 +1097,7 @@ impl App {
         self.screen = Screen::PrView(Box::new(PrView {
             label,
             url,
+            connection_id: conn_id,
             pr,
             tab,
             checks,
@@ -1132,16 +1171,16 @@ impl App {
 
     /// Submits the buffered line comments as one review with `event`.
     async fn submit_review(&mut self, event: ReviewVote, deps: &AppDeps) {
-        let (pr_id, comments) = match &self.screen {
-            Screen::PrView(v) => (v.pr.id.clone(), v.pending.clone()),
+        let (pr_id, comments, conn_id) = match &self.screen {
+            Screen::PrView(v) => (v.pr.id.clone(), v.pending.clone(), v.connection_id.clone()),
             _ => return,
         };
         if comments.is_empty() {
             return;
         }
-        let source = match deps.sections.pull_request_source().await {
-            Ok(Some(s)) => s,
-            _ => {
+        let source = match self.pr_source_for(&conn_id, deps).await {
+            Some(s) => s,
+            None => {
                 self.toast = Some("No pull-request provider is bound".into());
                 return;
             }
@@ -1166,10 +1205,11 @@ impl App {
         let Some(commit) = v.commits.get(v.commit_sel) else { return };
         let (sha, msg) = (commit.sha.clone(), commit.message.clone());
         let pr_id = v.pr.id.clone();
+        let conn_id = v.connection_id.clone();
 
-        let source = match deps.sections.pull_request_source().await {
-            Ok(Some(s)) => s,
-            _ => {
+        let source = match self.pr_source_for(&conn_id, deps).await {
+            Some(s) => s,
+            None => {
                 self.toast = Some("No pull-request provider is bound".into());
                 return;
             }
@@ -1192,14 +1232,15 @@ impl App {
     }
 
     async fn open_wi_view(&mut self, deps: &AppDeps) {
-        let Some(wi) = self.selected_wi() else { return };
-        let id = wi.id.clone();
-        let wi = wi.clone();
-        let threads = match deps.sections.work_item_source().await {
-            Ok(Some(src)) => src.threads(&id).await.unwrap_or_default(),
-            _ => Vec::new(),
+        let (id, conn_id, wi) = match self.selected_wi_row() {
+            Some(row) => (row.wi.id.clone(), row.connection_id.clone(), row.wi.clone()),
+            None => return,
         };
-        self.screen = Screen::WiView(Box::new(WiView { wi, threads, scroll: 0 }));
+        let threads = match self.wi_source_for(&conn_id, deps).await {
+            Some(src) => src.threads(&id).await.unwrap_or_default(),
+            None => Vec::new(),
+        };
+        self.screen = Screen::WiView(Box::new(WiView { connection_id: conn_id, wi, threads, scroll: 0 }));
     }
 
     fn on_pr_view_key(&mut self, key: Key) {
@@ -1926,12 +1967,27 @@ impl App {
 
     // ---- PR write actions ----
 
-    fn selected_pr(&self) -> Option<&PullRequest> {
+    fn selected_pr_row(&self) -> Option<&PrRow> {
         if self.active != 0 {
             return None;
         }
         let idxs = self.filtered_pr_indices();
         self.pr_state.selected().and_then(|p| idxs.get(p)).and_then(|&i| self.prs.get(i))
+    }
+
+    fn selected_pr(&self) -> Option<&PullRequest> {
+        self.selected_pr_row().map(|r| &r.pr)
+    }
+
+    /// Resolves the PR source backing a specific connection (for per-row actions).
+    async fn pr_source_for(&self, connection_id: &str, deps: &AppDeps) -> Option<Arc<dyn PullRequestSource>> {
+        deps.sections
+            .pull_request_feeds()
+            .await
+            .ok()?
+            .into_iter()
+            .find(|f| f.connection.connection_id() == connection_id)
+            .map(|f| f.source)
     }
 
     fn open_pr_vote(&mut self, vote: ReviewVote) {
@@ -1976,13 +2032,18 @@ impl App {
     }
 
     async fn execute_pr_action(&mut self, action: Action, deps: &AppDeps) {
-        let Some(id) = self.selected_pr().map(|p| p.id.clone()) else {
+        // Resolve the PR + its connection from the open view, else the selected row.
+        let target = match &self.screen {
+            Screen::PrView(v) => Some((v.pr.id.clone(), v.connection_id.clone())),
+            _ => self.selected_pr_row().map(|r| (r.pr.id.clone(), r.connection_id.clone())),
+        };
+        let Some((id, conn_id)) = target else {
             self.toast = Some("Nothing selected".into());
             return;
         };
-        let source = match deps.sections.pull_request_source().await {
-            Ok(Some(s)) => s,
-            _ => {
+        let source = match self.pr_source_for(&conn_id, deps).await {
+            Some(s) => s,
+            None => {
                 self.toast = Some("No pull-request provider is bound".into());
                 return;
             }
@@ -2020,12 +2081,27 @@ impl App {
 
     // ---- work-item write actions ----
 
-    fn selected_wi(&self) -> Option<&WorkItem> {
+    fn selected_wi_row(&self) -> Option<&WiRow> {
         if self.active != 1 {
             return None;
         }
         let idxs = self.filtered_wi_indices();
         self.wi_state.selected().and_then(|p| idxs.get(p)).and_then(|&i| self.wis.get(i))
+    }
+
+    fn selected_wi(&self) -> Option<&WorkItem> {
+        self.selected_wi_row().map(|r| &r.wi)
+    }
+
+    /// Resolves the work-item source backing a specific connection (per-row actions).
+    async fn wi_source_for(&self, connection_id: &str, deps: &AppDeps) -> Option<Arc<dyn WorkItemSource>> {
+        deps.sections
+            .work_item_feeds()
+            .await
+            .ok()?
+            .into_iter()
+            .find(|f| f.connection.connection_id() == connection_id)
+            .map(|f| f.source)
     }
 
     fn open_wi_state(&mut self) {
@@ -2034,7 +2110,7 @@ impl App {
         let title = format!("Set state — {}", wi_label(wi));
         // Offer the real state names seen across the current items (provider-accurate);
         // fall back to a generic set if we can't infer at least two.
-        let mut states: Vec<String> = self.wis.iter().map(|w| w.state.clone()).collect();
+        let mut states: Vec<String> = self.wis.iter().map(|w| w.wi.state.clone()).collect();
         states.sort();
         states.dedup();
         if states.len() < 2 {
@@ -2051,13 +2127,17 @@ impl App {
     }
 
     async fn execute_wi_action(&mut self, action: Action, deps: &AppDeps) {
-        let Some(id) = self.selected_wi().map(|w| w.id.clone()) else {
+        let target = match &self.screen {
+            Screen::WiView(v) => Some((v.wi.id.clone(), v.connection_id.clone())),
+            _ => self.selected_wi_row().map(|r| (r.wi.id.clone(), r.connection_id.clone())),
+        };
+        let Some((id, conn_id)) = target else {
             self.toast = Some("Nothing selected".into());
             return;
         };
-        let source = match deps.sections.work_item_source().await {
-            Ok(Some(s)) => s,
-            _ => {
+        let source = match self.wi_source_for(&conn_id, deps).await {
+            Some(s) => s,
+            None => {
                 self.toast = Some("No work-item provider is bound".into());
                 return;
             }
@@ -2094,6 +2174,11 @@ fn wi_label(wi: &WorkItem) -> String {
     let id = wi.identifier.clone().map(|i| format!("{i} ")).unwrap_or_default();
     let title: String = wi.title.chars().take(40).collect();
     format!("{id}— {title}")
+}
+
+/// Pulls the (provider, display name, id) tag off a feed's connection.
+fn feed_tag(conn: &Arc<dyn ProviderConnection>) -> (ProviderType, String, String) {
+    (conn.provider_type(), conn.display_name().to_string(), conn.connection_id().to_string())
 }
 
 fn pipe_label(pipe: &PipeRow) -> String {
@@ -2438,6 +2523,14 @@ mod tests {
         }
     }
 
+    fn pr_row(pr: PullRequest) -> PrRow {
+        PrRow { connection_id: "c".into(), connection: "GH".into(), provider: ProviderType::GitHub, pr }
+    }
+
+    fn wi_row(wi: WorkItem) -> WiRow {
+        WiRow { connection_id: "c".into(), connection: "GH".into(), provider: ProviderType::GitHub, wi }
+    }
+
     #[test]
     fn sort_orders_rows_and_respects_direction() {
         let mut app = App::new("slate");
@@ -2450,7 +2543,7 @@ mod tests {
         let mut c = pr(None);
         c.number = Some(2);
         c.title = "apple".into();
-        app.prs = vec![a, b, c]; // provider order: numbers 3, 1, 2
+        app.prs = vec![pr_row(a), pr_row(b), pr_row(c)]; // provider order: numbers 3, 1, 2
         app.active = 0;
 
         // No sort → provider order.
@@ -2645,7 +2738,7 @@ mod tests {
         b.author.display_name = "Dana".into();
         let mut c = pr(None);
         c.title = "Refactor login flow".into();
-        app.prs = vec![a, b, c];
+        app.prs = vec![pr_row(a), pr_row(b), pr_row(c)];
         app.active = 0;
 
         // No filter → all rows.
@@ -2676,7 +2769,7 @@ mod tests {
         a.title = "alpha".into();
         let mut b = pr(None);
         b.title = "beta".into();
-        app.prs = vec![a, b];
+        app.prs = vec![pr_row(a), pr_row(b)];
         app.active = 0;
 
         app.start_filter();
@@ -2717,7 +2810,7 @@ mod tests {
         let mut c = wi(None);
         c.state = "Done".into();
         c.title = "three".into();
-        app.wis = vec![a, b, c];
+        app.wis = vec![wi_row(a), wi_row(b), wi_row(c)];
         app.active = 1;
 
         // Nothing hidden → all rows show, distinct states in first-seen order.
@@ -2804,6 +2897,7 @@ mod tests {
         d.commit_label = Some("abc1234 msg".into());
         let mut v = PrView {
             label: "PR".into(),
+            connection_id: "c".into(),
             url: None,
             pr: pr(None),
             tab: 3,
@@ -2830,6 +2924,7 @@ mod tests {
         let mut app = App::new("slate");
         app.screen = Screen::PrView(Box::new(PrView {
             label: "PR".into(),
+            connection_id: "c".into(),
             url: None,
             pr: pr(None),
             tab: 3,
@@ -2860,12 +2955,12 @@ mod tests {
     #[test]
     fn selected_url_reads_active_tab_and_subview() {
         let mut app = App::new("slate");
-        app.prs.push(pr(Some("http://pr")));
+        app.prs.push(pr_row(pr(Some("http://pr"))));
         app.pr_state.select(Some(0));
         app.active = 0;
         assert_eq!(app.selected_url().as_deref(), Some("http://pr"));
 
-        app.wis.push(wi(Some("http://wi")));
+        app.wis.push(wi_row(wi(Some("http://wi"))));
         app.wi_state.select(Some(0));
         app.active = 1;
         assert_eq!(app.selected_url().as_deref(), Some("http://wi"));
@@ -2873,6 +2968,7 @@ mod tests {
         // An open sub-view takes precedence over the active tab.
         app.screen = Screen::PrView(Box::new(PrView {
             label: "x".into(),
+            connection_id: "c".into(),
             url: Some("http://prview".into()),
             pr: pr(Some("http://pr")),
             tab: 0,
@@ -2901,7 +2997,7 @@ mod tests {
     #[test]
     fn selected_url_is_none_when_item_has_no_url() {
         let mut app = App::new("slate");
-        app.prs.push(pr(None));
+        app.prs.push(pr_row(pr(None)));
         app.pr_state.select(Some(0));
         assert_eq!(app.selected_url(), None);
     }
