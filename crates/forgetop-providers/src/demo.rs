@@ -729,8 +729,8 @@ impl PipelineSource for DemoPipe {
         true
     }
     async fn pending_approvals(&self, run_id: &str) -> Result<Vec<PipelineApproval>> {
-        // Run 101 waits on a production deployment gate you can act on.
-        Ok(if run_id == "101" {
+        // The running CI run (#501) waits on a production deployment gate you can act on.
+        Ok(if run_id == "r501" {
             vec![PipelineApproval { id: "production".into(), name: "production".into(), can_respond: true }]
         } else {
             Vec::new()
