@@ -4,6 +4,8 @@ A fast, keyboard-driven terminal UI for your pull requests, work items, and CI
 pipelines - across **GitHub**, **GitLab**, **Azure DevOps**, **Linear**, **Jira**,
 and **Bitbucket** - in one place.
 
+📖 **Docs: [magna-nz.github.io/forgetop](https://magna-nz.github.io/forgetop/)**
+
 [![CI](https://github.com/magna-nz/forgetop/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/magna-nz/forgetop/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/magna-nz/forgetop?sort=semver&label=release)](https://github.com/magna-nz/forgetop/releases/latest)
 [![Docs](https://img.shields.io/badge/docs-magna--nz.github.io%2Fforgetop-blue)](https://magna-nz.github.io/forgetop/)
@@ -41,9 +43,6 @@ and [azdo](https://github.com/Elpulgo/azdo) (Azure DevOps only). forgetop's angl
 | Cross-provider aggregation | ✅ | ❌ | ❌ |
 | Desktop notifications | ✅ | ❌ | ❌ |
 | Tokens in OS keychain | ✅ | via `gh` | PAT |
-
-Where gh-dash still leads: user-defined saved sections with search queries — on the
-roadmap.
 
 ## Providers
 
