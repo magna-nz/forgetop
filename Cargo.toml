@@ -35,6 +35,7 @@ similar = "2"
 ratatui = "0.29"
 crossterm = "0.28"
 open = "5"
+notify-rust = "4"
 
 # The profile that 'dist' will build with
 [profile.dist]

@@ -1,11 +1,11 @@
 //! Application state and the (async) update logic driven by the event loop.
 
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::{DateTime, Local, Utc};
-use forgetop_core::config::SortPref;
+use forgetop_core::config::{NotificationPrefs, SortPref};
 use forgetop_core::domain::*;
 use forgetop_core::provider::*;
 use forgetop_core::service::{ConfigService, ConnectionHealth, ConnectionHealthService, SectionService};
@@ -85,6 +85,18 @@ pub struct App {
     pub pr_sort: Option<SortPref>,
     pub wi_sort: Option<SortPref>,
     pub pipe_sort: Option<SortPref>,
+    /// Which desktop notifications are enabled. Persisted.
+    pub notifications: NotificationPrefs,
+    /// Last-seen status per pipeline run, to detect transitions into failure.
+    pipe_seen: HashMap<String, PipelineRunStatus>,
+    /// Whether `pipe_seen` has been seeded (skip notifying on the first load).
+    pipe_seeded: bool,
+    /// Per-PR (approved, changes-requested) flags for my PRs, to detect changes.
+    pr_review_seen: HashMap<String, (bool, bool)>,
+    /// PR ids where I'm currently a requested reviewer, to detect new requests.
+    review_req_seen: HashSet<String>,
+    /// Whether the PR-event scan has been seeded (skip notifying on first load).
+    pr_scan_seeded: bool,
     /// Transient one-shot message shown in the footer until the next keypress.
     pub toast: Option<String>,
     /// Open modal overlay, if any. When set, keys route here instead of the table.
@@ -426,6 +438,12 @@ impl App {
             pr_sort: None,
             wi_sort: None,
             pipe_sort: None,
+            notifications: NotificationPrefs::default(),
+            pipe_seen: HashMap::new(),
+            pipe_seeded: false,
+            pr_review_seen: HashMap::new(),
+            review_req_seen: HashSet::new(),
+            pr_scan_seeded: false,
             toast: None,
             overlay: None,
             wizard: None,
@@ -699,6 +717,79 @@ impl App {
         let _ = deps.config.set_sort(section_of(section), Some(pref)).await;
     }
 
+    /// Opens the notifications checklist (opt in/out of each event type).
+    fn open_notifications_toggle(&mut self) {
+        let n = &self.notifications;
+        let items = vec![
+            ToggleItem { id: "pipeline_failed".into(), label: "Pipeline failed".into(), on: n.pipeline_failed },
+            ToggleItem { id: "review_requested".into(), label: "Review requested".into(), on: n.review_requested },
+            ToggleItem { id: "pr_approved".into(), label: "Your PR approved".into(), on: n.pr_approved },
+            ToggleItem { id: "pr_changes_requested".into(), label: "Your PR: changes requested".into(), on: n.pr_changes_requested },
+        ];
+        self.overlay =
+            Some(Overlay::Toggle { title: "Notifications".into(), kind: ToggleKind::Notifications, min_one: false, items, selected: 0 });
+    }
+
+    /// Applies the notifications checklist: the ticked ids become the enabled set.
+    async fn apply_notifications(&mut self, ids: Vec<String>, deps: &AppDeps) {
+        let has = |k: &str| ids.iter().any(|i| i == k);
+        self.notifications = NotificationPrefs {
+            pipeline_failed: has("pipeline_failed"),
+            review_requested: has("review_requested"),
+            pr_approved: has("pr_approved"),
+            pr_changes_requested: has("pr_changes_requested"),
+        };
+        // Re-seed silently so newly-enabled events don't fire for pre-existing state.
+        self.pipe_seeded = false;
+        self.pr_scan_seeded = false;
+        let _ = deps.config.set_notifications(self.notifications).await;
+        if self.notifications.any() {
+            // A real notification so you can confirm they work on this machine.
+            notify("forgetop notifications enabled", "You'll be pinged on the events you chose.");
+            self.toast = Some("Notifications updated".into());
+        } else {
+            self.toast = Some("All notifications off".into());
+        }
+    }
+
+    /// Fetches the review-requested and my-PR sets and notifies on new events.
+    async fn scan_pr_notifications(&mut self, deps: &AppDeps) {
+        let want_review = self.notifications.review_requested;
+        let want_votes = self.notifications.pr_approved || self.notifications.pr_changes_requested;
+        if !want_review && !want_votes {
+            return;
+        }
+        let Ok(Some(src)) = deps.sections.pull_request_source().await else { return };
+
+        if want_review {
+            if let Ok(review) = src.list(&pr_query(PullRequestFilter::ReviewRequested)).await {
+                if self.pr_scan_seeded {
+                    for pr in new_review_requests(&self.review_req_seen, &review) {
+                        notify("Review requested", &pr_label(pr));
+                    }
+                }
+                self.review_req_seen = review.iter().map(|p| p.id.clone()).collect();
+            }
+        }
+        if want_votes {
+            if let Ok(mine) = src.list(&pr_query(PullRequestFilter::Mine)).await {
+                if self.pr_scan_seeded {
+                    for pr in &mine {
+                        let (approved, changes) = pr_review_transitions(self.pr_review_seen.get(&pr.id).copied(), pr);
+                        if approved && self.notifications.pr_approved {
+                            notify("Your PR was approved", &pr_label(pr));
+                        }
+                        if changes && self.notifications.pr_changes_requested {
+                            notify("Changes requested on your PR", &pr_label(pr));
+                        }
+                    }
+                }
+                self.pr_review_seen = mine.iter().map(|p| (p.id.clone(), pr_vote_flags(p))).collect();
+            }
+        }
+        self.pr_scan_seeded = true;
+    }
+
     // ---- data loading ----
 
     pub async fn reload_all(&mut self, deps: &AppDeps) {
@@ -709,6 +800,7 @@ impl App {
         self.reload_pull_requests(deps, &mut errors).await;
         self.reload_work_items(deps, &mut errors).await;
         self.reload_pipelines(deps, &mut errors).await;
+        self.scan_pr_notifications(deps).await;
         self.health = deps.health.check_all().await;
 
         self.fix_selection();
@@ -765,6 +857,20 @@ impl App {
             }
             Err(e) => errors.push(format!("Pipelines: {e}")),
         }
+        self.notify_pipeline_failures();
+    }
+
+    /// Fires a desktop notification for any run that has just entered a failed
+    /// state since the last refresh. Seeded silently on the first load.
+    fn notify_pipeline_failures(&mut self) {
+        if self.notifications.pipeline_failed && self.pipe_seeded {
+            for row in new_pipeline_failures(&self.pipe_seen, &self.pipes) {
+                let branch = row.run.branch.clone().unwrap_or_else(|| "—".into());
+                notify("Pipeline failed", &format!("{} · {} on {branch}", row.connection, pipe_label(row)));
+            }
+        }
+        self.pipe_seen = self.pipes.iter().map(|r| (r.run.id.clone(), r.run.status)).collect();
+        self.pipe_seeded = true;
     }
 
     /// Re-selects a valid row per tab after the underlying data (or filter) changed.
@@ -823,9 +929,13 @@ impl App {
             self.on_filter_key(key);
             return;
         }
-        // Help is available from the list and every sub-view.
+        // Help and the notifications chooser are available anywhere.
         if key == Key::Char('?') {
             self.overlay = Some(Overlay::Help { scroll: 0 });
+            return;
+        }
+        if key == Key::Char('N') {
+            self.open_notifications_toggle();
             return;
         }
 
@@ -1498,6 +1608,8 @@ impl App {
     }
 
     async fn commit_wizard(&mut self, wizard: Wizard, deps: &AppDeps) {
+        // Offer the notifications chooser once, right after the very first connection.
+        let first_run = deps.config.snapshot().connections.is_empty();
         let draft = wizard.draft;
         let Some(provider) = draft.provider else {
             self.toast = Some("No provider chosen".into());
@@ -1537,6 +1649,12 @@ impl App {
         self.toast = Some(format!("Added {} connection", provider.as_str()));
         self.reload_all(deps).await;
         self.rebuild_config_view(deps).await;
+
+        // First-run: let them choose which notifications to enable.
+        if first_run {
+            self.open_notifications_toggle();
+            self.toast = Some("Choose which notifications you want".into());
+        }
     }
 
     // ---- visible tabs ----
@@ -1577,6 +1695,9 @@ impl App {
             }
             ToggleKind::WorkItemStates => {
                 self.apply_wi_states(ids, deps).await;
+            }
+            ToggleKind::Notifications => {
+                self.apply_notifications(ids, deps).await;
             }
         }
     }
@@ -1981,6 +2102,40 @@ fn pipe_label(pipe: &PipeRow) -> String {
         Some(n) => format!("{name} #{n}"),
         None => name,
     }
+}
+
+/// Runs that are Failed now but weren't Failed at the previous refresh.
+fn new_pipeline_failures<'a>(prev: &HashMap<String, PipelineRunStatus>, pipes: &'a [PipeRow]) -> Vec<&'a PipeRow> {
+    pipes
+        .iter()
+        .filter(|r| {
+            matches!(r.run.status, PipelineRunStatus::Failed) && !matches!(prev.get(&r.run.id), Some(PipelineRunStatus::Failed))
+        })
+        .collect()
+}
+
+/// Best-effort OS notification (silently ignored if the platform refuses).
+fn notify(title: &str, body: &str) {
+    let _ = notify_rust::Notification::new().summary(title).body(body).appname("forgetop").show();
+}
+
+/// (approved, changes-requested) rollup from a PR's reviewer votes.
+fn pr_vote_flags(pr: &PullRequest) -> (bool, bool) {
+    let approved = pr.reviewers.iter().any(|r| matches!(r.vote, ReviewVote::Approved | ReviewVote::ApprovedWithSuggestions));
+    let changes = pr.reviewers.iter().any(|r| matches!(r.vote, ReviewVote::Rejected));
+    (approved, changes)
+}
+
+/// Which vote states newly flipped on since last scan: (newly approved, newly changes).
+fn pr_review_transitions(prev: Option<(bool, bool)>, pr: &PullRequest) -> (bool, bool) {
+    let (a, c) = pr_vote_flags(pr);
+    let (pa, pc) = prev.unwrap_or((false, false));
+    (a && !pa, c && !pc)
+}
+
+/// PRs where I'm newly a requested reviewer (not seen in the previous set).
+fn new_review_requests<'a>(prev: &HashSet<String>, review: &'a [PullRequest]) -> Vec<&'a PullRequest> {
+    review.iter().filter(|p| !prev.contains(&p.id)).collect()
 }
 
 fn pr_label(pr: &PullRequest) -> String {
@@ -2396,6 +2551,88 @@ mod tests {
         app.on_pipeline_logs_key(Key::Escape);
         let Screen::Pipeline(v) = &app.screen else { panic!() };
         assert!(v.logs.is_none(), "Esc closes the log pane");
+    }
+
+    #[test]
+    fn notifies_only_on_new_pipeline_failures() {
+        let row = |id: &str, status: PipelineRunStatus| PipeRow {
+            connection_id: "c".into(),
+            connection: "GH".into(),
+            provider: ProviderType::GitHub,
+            run: PipelineRun {
+                id: id.into(),
+                definition_id: "ci".into(),
+                number: Some(1),
+                name: Some("CI".into()),
+                status,
+                triggered_by: None,
+                branch: Some("main".into()),
+                commit_sha: None,
+                started_at: None,
+                finished_at: None,
+                url: None,
+                stages: vec![],
+            },
+        };
+        let pipes =
+            vec![row("a", PipelineRunStatus::Failed), row("b", PipelineRunStatus::Succeeded), row("c", PipelineRunStatus::Failed)];
+
+        // With no prior state, both current failures are new.
+        let ids = |v: Vec<&PipeRow>| v.iter().map(|r| r.run.id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(new_pipeline_failures(&HashMap::new(), &pipes)), vec!["a", "c"]);
+
+        // 'a' was already failing (skip); 'c' just transitioned Running→Failed (notify).
+        let mut prev = HashMap::new();
+        prev.insert("a".to_string(), PipelineRunStatus::Failed);
+        prev.insert("c".to_string(), PipelineRunStatus::Running);
+        assert_eq!(ids(new_pipeline_failures(&prev, &pipes)), vec!["c"]);
+    }
+
+    #[test]
+    fn pr_review_event_detection() {
+        let mk = |votes: &[ReviewVote]| {
+            let mut p = pr(None);
+            p.reviewers = votes
+                .iter()
+                .map(|v| Reviewer {
+                    user: User { id: "u".into(), display_name: "U".into(), handle: None, avatar_url: None },
+                    vote: *v,
+                    is_required: false,
+                })
+                .collect();
+            p
+        };
+
+        assert_eq!(pr_vote_flags(&mk(&[])), (false, false));
+        assert_eq!(pr_vote_flags(&mk(&[ReviewVote::Approved])), (true, false));
+        assert_eq!(pr_vote_flags(&mk(&[ReviewVote::Rejected])), (false, true));
+
+        let approved = mk(&[ReviewVote::Approved]);
+        assert_eq!(pr_review_transitions(None, &approved), (true, false), "first-seen approval fires");
+        assert_eq!(pr_review_transitions(Some((true, false)), &approved), (false, false), "already-approved doesn't re-fire");
+        assert_eq!(pr_review_transitions(Some((false, false)), &mk(&[ReviewVote::Rejected])), (false, true));
+
+        let mut a = pr(None);
+        a.id = "1".into();
+        let mut b = pr(None);
+        b.id = "2".into();
+        let review = vec![a, b];
+        let prev: HashSet<String> = ["1".to_string()].into_iter().collect();
+        assert_eq!(new_review_requests(&prev, &review).iter().map(|p| p.id.clone()).collect::<Vec<_>>(), vec!["2"]);
+    }
+
+    #[test]
+    fn notifications_toggle_reflects_current_prefs() {
+        let mut app = App::new("slate");
+        app.notifications =
+            NotificationPrefs { pipeline_failed: true, review_requested: false, pr_approved: true, pr_changes_requested: false };
+        app.open_notifications_toggle();
+        let Some(Overlay::Toggle { kind: ToggleKind::Notifications, items, .. }) = &app.overlay else {
+            panic!("expected the notifications toggle");
+        };
+        assert_eq!(items.len(), 4);
+        let on: Vec<&str> = items.iter().filter(|i| i.on).map(|i| i.id.as_str()).collect();
+        assert_eq!(on, vec!["pipeline_failed", "pr_approved"]);
     }
 
     #[test]

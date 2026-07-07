@@ -214,6 +214,12 @@ impl ConfigService {
         self.persist(cfg).await
     }
 
+    pub async fn set_notifications(&self, prefs: NotificationPrefs) -> Result<()> {
+        let mut cfg = self.snapshot();
+        cfg.ui.notifications = prefs;
+        self.persist(cfg).await
+    }
+
     /// Persists the sort for a section (`None` restores provider order).
     pub async fn set_sort(&self, section: Section, sort: Option<SortPref>) -> Result<()> {
         let mut cfg = self.snapshot();

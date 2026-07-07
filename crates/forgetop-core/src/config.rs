@@ -87,6 +87,39 @@ pub struct UiState {
     pub work_item_sort: Option<SortPref>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pipeline_sort: Option<SortPref>,
+    /// Which desktop notifications are enabled. Defaults to all on.
+    #[serde(default)]
+    pub notifications: NotificationPrefs,
+}
+
+fn yes() -> bool {
+    true
+}
+
+/// Per-event desktop-notification opt-ins. Every event defaults to on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotificationPrefs {
+    #[serde(default = "yes")]
+    pub pipeline_failed: bool,
+    #[serde(default = "yes")]
+    pub review_requested: bool,
+    #[serde(default = "yes")]
+    pub pr_approved: bool,
+    #[serde(default = "yes")]
+    pub pr_changes_requested: bool,
+}
+
+impl Default for NotificationPrefs {
+    fn default() -> Self {
+        Self { pipeline_failed: true, review_requested: true, pr_approved: true, pr_changes_requested: true }
+    }
+}
+
+impl NotificationPrefs {
+    /// True if any event is enabled.
+    pub fn any(&self) -> bool {
+        self.pipeline_failed || self.review_requested || self.pr_approved || self.pr_changes_requested
+    }
 }
 
 /// A saved sort: which column (by key) and whether descending.

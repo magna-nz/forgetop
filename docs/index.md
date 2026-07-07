@@ -35,6 +35,7 @@ keys valid for wherever you are. The full set:
 | `v` | Choose which tabs are visible |
 | `C` | Config / connections screen |
 | `r` | Refresh · `t` cycle theme |
+| `N` | Toggle desktop notifications |
 | `?` | Show all keybindings (works anywhere) |
 | `q` / `Ctrl-C` | Quit · `Esc` back / close |
 
@@ -128,6 +129,21 @@ pick the verdict: **Comment**, **Approve**, or **Request changes**.
   and therefore line comments - aren't available there yet.
 
 You can also drill into a single commit's diff from the **Commits** tab (`Enter`).
+
+## Notifications
+
+forgetop raises native desktop notifications on the events you care about:
+
+- **Pipeline failed** — a run transitions into a failed state.
+- **Review requested** — you're newly added as a reviewer on a PR.
+- **Your PR approved** / **changes requested** — a reviewer votes on a PR you authored.
+
+Press **`N`** anywhere to open a checklist and opt in/out of each event; the choice
+is persisted. The first-run wizard also asks after you add your first connection.
+Detection is seeded on load (no startup spam), de-duped, and re-seeded when you
+change the settings — and enabling fires one confirmation notification so you can
+verify they work on your machine. "Me" for the PR events is resolved from your
+token by each provider (`@me` / `currentUser()` / `isMe`).
 
 ## Configuration
 
