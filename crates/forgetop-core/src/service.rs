@@ -84,11 +84,19 @@ impl ConfigService {
             }
         }
         cfg.connections.retain(|c| c.id != connection_id);
-        if cfg.pull_requests.as_ref().is_some_and(|b| b.connection_id == connection_id) {
-            cfg.pull_requests = None;
+        if let Some(b) = &mut cfg.pull_requests {
+            b.connection_ids.retain(|c| c != connection_id);
+            b.connection_id = b.connection_id.take().filter(|c| c != connection_id);
+            if b.ids().is_empty() {
+                cfg.pull_requests = None;
+            }
         }
-        if cfg.work_items.as_ref().is_some_and(|b| b.connection_id == connection_id) {
-            cfg.work_items = None;
+        if let Some(b) = &mut cfg.work_items {
+            b.connection_ids.retain(|c| c != connection_id);
+            b.connection_id = b.connection_id.take().filter(|c| c != connection_id);
+            if b.ids().is_empty() {
+                cfg.work_items = None;
+            }
         }
         if let Some(p) = &mut cfg.pipelines {
             p.subscriptions.retain(|s| s.connection_id != connection_id);
@@ -99,14 +107,37 @@ impl ConfigService {
     pub async fn bind_pull_requests(&self, connection_id: &str) -> Result<()> {
         let mut cfg = self.snapshot();
         self.ensure_supports(&cfg, connection_id, Section::PullRequests)?;
-        cfg.pull_requests = Some(PullRequestBinding { connection_id: connection_id.into() });
+        let b = cfg.pull_requests.get_or_insert_with(PullRequestBinding::default);
+        let mut ids = b.ids();
+        if !ids.contains(&connection_id.to_string()) {
+            ids.push(connection_id.into());
+        }
+        *b = PullRequestBinding { connection_ids: ids, connection_id: None };
         self.persist(cfg).await
     }
 
     pub async fn bind_work_items(&self, connection_id: &str) -> Result<()> {
         let mut cfg = self.snapshot();
         self.ensure_supports(&cfg, connection_id, Section::WorkItems)?;
-        cfg.work_items = Some(WorkItemBinding { connection_id: connection_id.into() });
+        let b = cfg.work_items.get_or_insert_with(WorkItemBinding::default);
+        let mut ids = b.ids();
+        if !ids.contains(&connection_id.to_string()) {
+            ids.push(connection_id.into());
+        }
+        *b = WorkItemBinding { connection_ids: ids, connection_id: None };
+        self.persist(cfg).await
+    }
+
+    /// Replaces the PR section's connections with an explicit set (multi-bind).
+    pub async fn set_pull_request_connections(&self, connection_ids: Vec<String>) -> Result<()> {
+        let mut cfg = self.snapshot();
+        cfg.pull_requests = Some(PullRequestBinding { connection_ids, connection_id: None });
+        self.persist(cfg).await
+    }
+
+    pub async fn set_work_item_connections(&self, connection_ids: Vec<String>) -> Result<()> {
+        let mut cfg = self.snapshot();
+        cfg.work_items = Some(WorkItemBinding { connection_ids, connection_id: None });
         self.persist(cfg).await
     }
 
@@ -241,6 +272,18 @@ pub struct PipelineFeed {
     pub subscription: PipelineSubscription,
 }
 
+/// One connection feeding the aggregated Pull Requests list.
+pub struct PullRequestFeed {
+    pub connection: Arc<dyn ProviderConnection>,
+    pub source: Arc<dyn PullRequestSource>,
+}
+
+/// One connection feeding the aggregated Work Items list.
+pub struct WorkItemFeed {
+    pub connection: Arc<dyn ProviderConnection>,
+    pub source: Arc<dyn WorkItemSource>,
+}
+
 /// Resolves the live source(s) backing each section from the current bindings.
 pub struct SectionService {
     config: Arc<ConfigService>,
@@ -252,16 +295,42 @@ impl SectionService {
         Self { config, resolver }
     }
 
-    pub async fn pull_request_source(&self) -> Result<Option<Arc<dyn PullRequestSource>>> {
+    /// One connection feeding the PR / Work-Item list (for aggregation).
+    pub async fn pull_request_feeds(&self) -> Result<Vec<PullRequestFeed>> {
         let cfg = self.config.snapshot();
-        let Some(binding) = cfg.pull_requests else { return Ok(None) };
-        Ok(self.resolver.resolve(&binding.connection_id).await?.and_then(|c| c.pull_requests()))
+        let Some(binding) = cfg.pull_requests else { return Ok(Vec::new()) };
+        let mut feeds = Vec::new();
+        for id in binding.ids() {
+            if let Some(conn) = self.resolver.resolve(&id).await? {
+                if let Some(source) = conn.pull_requests() {
+                    feeds.push(PullRequestFeed { connection: conn, source });
+                }
+            }
+        }
+        Ok(feeds)
+    }
+
+    pub async fn work_item_feeds(&self) -> Result<Vec<WorkItemFeed>> {
+        let cfg = self.config.snapshot();
+        let Some(binding) = cfg.work_items else { return Ok(Vec::new()) };
+        let mut feeds = Vec::new();
+        for id in binding.ids() {
+            if let Some(conn) = self.resolver.resolve(&id).await? {
+                if let Some(source) = conn.work_items() {
+                    feeds.push(WorkItemFeed { connection: conn, source });
+                }
+            }
+        }
+        Ok(feeds)
+    }
+
+    /// The first bound PR source (back-compat for single-source call sites).
+    pub async fn pull_request_source(&self) -> Result<Option<Arc<dyn PullRequestSource>>> {
+        Ok(self.pull_request_feeds().await?.into_iter().next().map(|f| f.source))
     }
 
     pub async fn work_item_source(&self) -> Result<Option<Arc<dyn WorkItemSource>>> {
-        let cfg = self.config.snapshot();
-        let Some(binding) = cfg.work_items else { return Ok(None) };
-        Ok(self.resolver.resolve(&binding.connection_id).await?.and_then(|c| c.work_items()))
+        Ok(self.work_item_feeds().await?.into_iter().next().map(|f| f.source))
     }
 
     /// Resolves a connection's pipeline source directly, regardless of whether it is
@@ -400,7 +469,7 @@ mod tests {
         svc.add_or_update_connection(conn("gh-1", ProviderType::GitHub), None).await.unwrap();
         svc.add_or_update_connection(conn("lin-1", ProviderType::Linear), None).await.unwrap();
         svc.bind_pull_requests("gh-1").await.unwrap();
-        assert_eq!(svc.snapshot().pull_requests.unwrap().connection_id, "gh-1");
+        assert_eq!(svc.snapshot().pull_requests.unwrap().ids(), vec!["gh-1".to_string()]);
         assert!(svc.bind_pull_requests("lin-1").await.is_err());
     }
 
