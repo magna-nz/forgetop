@@ -38,6 +38,9 @@ pub enum ToggleKind {
     WorkItemStates,
     /// Which desktop notifications are enabled; item ids are event keys.
     Notifications,
+    /// Which connections feed a section (0 = Pull Requests, 1 = Work Items);
+    /// item ids are connection ids.
+    SectionBind { section: usize },
 }
 
 /// One row of a [`Overlay::Toggle`] checklist.
