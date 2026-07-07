@@ -29,6 +29,7 @@ keys valid for wherever you are. The full set:
 | `←` / `→`, `h` / `l`, `Tab`, `1`–`3` | Switch tab |
 | `↑` / `↓`, `k` / `j` | Move selection |
 | `/` | Quick-filter the current list (type to narrow, `Esc` clears) |
+| `S` | Sort the current list by a column (re-pick the column to flip direction) |
 | `o` | Open selected item in browser |
 | `n` | Add a connection (wizard) |
 | `v` | Choose which tabs are visible |
@@ -91,6 +92,13 @@ about:
 - **Pipeline subscriptions (`s` in the config screen)** - for a connection that
   discovers many pipelines, pick just the definitions you want to track. Persisted
   per connection.
+
+## Sorting
+
+Press `S` on any list (Pull Requests, Work Items, Pipelines) to pick a sort
+column. Re-pick the same column to flip between ascending and descending; the
+sorted column shows a `▲`/`▼` arrow in its header. Sorting composes with the
+filters above, and each view's sort is remembered across restarts.
 
 ## Reviewing code
 

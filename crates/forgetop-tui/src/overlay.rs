@@ -23,6 +23,8 @@ pub enum Action {
     AddLineComment(String),
     /// Submit the buffered line comments as a review with this verdict.
     SubmitReview(ReviewVote),
+    /// Sort a section by the chosen column index (resolved to a key by the app).
+    SetSort { section: usize, index: usize },
 }
 
 /// What a [`Overlay::Toggle`] checklist is choosing.
@@ -49,6 +51,8 @@ pub enum PickerKind {
     WorkItemState,
     /// The verdict for submitting a batch of pending line comments.
     ReviewSubmit,
+    /// Choose the sort column for a section (0=PR, 1=WI, 2=Pipelines).
+    SortColumn { section: usize },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -213,6 +217,7 @@ fn resolve_picker(kind: PickerKind, selected: usize, items: &[String]) -> Action
             };
             Action::SubmitReview(event)
         }
+        PickerKind::SortColumn { section } => Action::SetSort { section, index: selected },
     }
 }
 
