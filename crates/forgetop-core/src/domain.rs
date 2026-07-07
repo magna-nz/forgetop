@@ -177,6 +177,22 @@ pub struct Commit {
     pub url: Option<String>,
 }
 
+/// Which side of a diff a line belongs to: the old (removed) or new (added) file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum DiffSide {
+    Old,
+    New,
+}
+
+/// A pending review comment targeting a specific line of a file in a pull request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LineComment {
+    pub path: String,
+    pub line: i64,
+    pub side: DiffSide,
+    pub body: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileChange {
     pub path: String,

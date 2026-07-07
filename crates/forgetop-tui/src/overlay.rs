@@ -19,6 +19,10 @@ pub enum Action {
     RemoveConnection { id: String, label: String },
     /// Result of a checklist: the ids that ended up ticked, tagged with what they are.
     ApplyToggle { kind: ToggleKind, ids: Vec<String> },
+    /// Buffer an inline line comment (body); the target line is held on the PR view.
+    AddLineComment(String),
+    /// Submit the buffered line comments as a review with this verdict.
+    SubmitReview(ReviewVote),
 }
 
 /// What a [`Overlay::Toggle`] checklist is choosing.
@@ -43,12 +47,16 @@ pub struct ToggleItem {
 pub enum PickerKind {
     PrMergeStrategy,
     WorkItemState,
+    /// The verdict for submitting a batch of pending line comments.
+    ReviewSubmit,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub enum InputKind {
     PrComment,
     WorkItemComment,
+    /// The body of a pending inline line comment.
+    PrLineComment,
 }
 
 pub enum Overlay {
@@ -173,6 +181,14 @@ fn resolve_picker(kind: PickerKind, selected: usize, items: &[String]) -> Action
             Action::PrMerge(strategy)
         }
         PickerKind::WorkItemState => Action::WiSetState(items.get(selected).cloned().unwrap_or_default()),
+        PickerKind::ReviewSubmit => {
+            let event = match selected {
+                1 => ReviewVote::Approved,
+                2 => ReviewVote::Rejected,
+                _ => ReviewVote::NoVote,
+            };
+            Action::SubmitReview(event)
+        }
     }
 }
 
@@ -180,6 +196,7 @@ fn resolve_input(kind: InputKind, text: String) -> Action {
     match kind {
         InputKind::PrComment => Action::PrComment(text),
         InputKind::WorkItemComment => Action::WiComment(text),
+        InputKind::PrLineComment => Action::AddLineComment(text),
     }
 }
 

@@ -11,6 +11,7 @@ use ratatui::widgets::{
 use ratatui::Frame;
 
 use crate::app::{App, ConfigView, DiffFocus, DiffView, PipelineView, PrView, Screen, WiView, PR_TABS, TABS};
+use crate::diff::{cursor_line_label, pending_marks};
 use crate::overlay::Overlay;
 use crate::theme::{check_icon, pipeline_icon, Theme};
 use crate::wizard::{Prompt, PromptKind};
@@ -557,7 +558,7 @@ fn render_pr_view(frame: &mut Frame, area: Rect, theme: &Theme, view: &PrView) -
 
     // Content.
     if view.tab == 3 {
-        render_diff(frame, rows[2], theme, &view.diff);
+        render_diff(frame, rows[2], theme, &view.diff, &view.pending);
         return 0; // the Diff tab manages its own scrolling
     }
     // Commits: a row cursor (Enter drills into that commit's diff), scroll follows it.
@@ -656,7 +657,12 @@ fn footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
     if let Screen::PrView(v) = &app.screen {
         return if v.tab == 3 {
             if v.diff.focus == DiffFocus::Patch {
-                vec![("↑↓", "line"), ("PgUp/Dn", "jump"), ("Esc", "files"), ("a", "approve"), ("m", "merge"), ("o", "open")]
+                let mut keys = vec![("↑↓", "line"), ("c", "comment")];
+                if !v.pending.is_empty() {
+                    keys.push(("s", "submit review"));
+                }
+                keys.extend([("PgUp/Dn", "jump"), ("Esc", "files"), ("o", "open")]);
+                keys
             } else {
                 vec![("←→", "tabs"), ("↑↓", "file"), ("↵", "open file"), ("PgUp/Dn", "scroll"), ("a", "approve"), ("m", "merge"), ("o", "open"), ("Esc", "back")]
             }
@@ -759,7 +765,7 @@ fn kind_badge(theme: &Theme, kind: FileChangeKind) -> Span<'static> {
     Span::styled(letter, Style::default().fg(color).add_modifier(Modifier::BOLD))
 }
 
-fn render_diff(frame: &mut Frame, area: Rect, theme: &Theme, diff: &DiffView) {
+fn render_diff(frame: &mut Frame, area: Rect, theme: &Theme, diff: &DiffView, pending: &[LineComment]) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(44), Constraint::Min(20)])
@@ -773,7 +779,7 @@ fn render_diff(frame: &mut Frame, area: Rect, theme: &Theme, diff: &DiffView) {
 
     render_diff_files(frame, left[0], theme, diff);
     render_diff_threads(frame, left[1], theme, diff);
-    render_diff_patch(frame, cols[1], theme, diff);
+    render_diff_patch(frame, cols[1], theme, diff, pending);
 }
 
 fn render_diff_files(frame: &mut Frame, area: Rect, theme: &Theme, diff: &DiffView) {
@@ -839,7 +845,7 @@ fn render_diff_threads(frame: &mut Frame, area: Rect, theme: &Theme, diff: &Diff
     frame.render_widget(Paragraph::new(lines).block(block).wrap(Wrap { trim: true }), area);
 }
 
-fn render_diff_patch(frame: &mut Frame, area: Rect, theme: &Theme, diff: &DiffView) {
+fn render_diff_patch(frame: &mut Frame, area: Rect, theme: &Theme, diff: &DiffView, pending: &[LineComment]) {
     let Some(file) = diff.current() else {
         frame.render_widget(section_block(theme, "Patch"), area);
         return;
@@ -863,6 +869,8 @@ fn render_diff_patch(frame: &mut Frame, area: Rect, theme: &Theme, diff: &DiffVi
     let inner_w = area.width.saturating_sub(2) as usize;
     let inner_h = area.height.saturating_sub(2) as usize;
     let total = patch.lines().count();
+    // Patch lines (in this file) that carry a pending comment get a gutter bar.
+    let marks = pending_marks(patch, &file.path, pending);
 
     // In the cursor, derive scroll so the cursor line stays roughly centred; the
     // stored scroll is only used for the free-scroll (file-list) mode.
@@ -877,16 +885,27 @@ fn render_diff_patch(frame: &mut Frame, area: Rect, theme: &Theme, diff: &DiffVi
         .lines()
         .enumerate()
         .map(|(i, l)| {
+            // A 1-col gutter: a bar when the line has a pending comment.
+            let gutter = if marks.contains(&i) {
+                Span::styled("▎", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD))
+            } else {
+                Span::raw(" ")
+            };
             if patch_focus && i == diff.cursor {
-                // Pad to full width so the cursor highlight spans the row.
+                // Pad to full width (minus the gutter) so the highlight spans the row.
                 let mut text = l.to_string();
                 let w = text.chars().count();
-                if w < inner_w {
-                    text.push_str(&" ".repeat(inner_w - w));
+                if w + 1 < inner_w {
+                    text.push_str(&" ".repeat(inner_w - 1 - w));
                 }
-                Line::from(Span::styled(text, Style::default().fg(patch_fg(theme, l)).bg(theme.sel_bg).add_modifier(Modifier::BOLD)))
+                Line::from(vec![
+                    gutter,
+                    Span::styled(text, Style::default().fg(patch_fg(theme, l)).bg(theme.sel_bg).add_modifier(Modifier::BOLD)),
+                ])
             } else {
-                patch_line(theme, l)
+                let mut line = patch_line(theme, l);
+                line.spans.insert(0, gutter);
+                line
             }
         })
         .collect();
@@ -910,67 +929,6 @@ fn patch_fg(theme: &Theme, line: &str) -> ratatui::style::Color {
 
 fn patch_line(theme: &Theme, line: &str) -> Line<'static> {
     Line::from(Span::styled(line.to_string(), Style::default().fg(patch_fg(theme, line))))
-}
-
-/// Parses a `@@ -old,n +new,n @@` hunk header into (old_start, new_start).
-fn parse_hunk_header(line: &str) -> Option<(i64, i64)> {
-    if !line.starts_with("@@") {
-        return None;
-    }
-    let (mut old_start, mut new_start) = (None, None);
-    for tok in line.split_whitespace() {
-        if let Some(r) = tok.strip_prefix('-') {
-            old_start = r.split(',').next().and_then(|s| s.parse().ok());
-        } else if let Some(r) = tok.strip_prefix('+') {
-            new_start = r.split(',').next().and_then(|s| s.parse().ok());
-        }
-    }
-    Some((old_start?, new_start?))
-}
-
-/// Human label for the file position of patch line `cursor` (e.g. `line 42`),
-/// walking hunk headers to map diff lines to real file lines.
-fn cursor_line_label(patch: &str, cursor: usize) -> Option<String> {
-    let (mut old_ln, mut new_ln) = (0i64, 0i64);
-    for (i, line) in patch.lines().enumerate() {
-        if let Some((o, n)) = parse_hunk_header(line) {
-            old_ln = o;
-            new_ln = n;
-            if i == cursor {
-                return Some(format!("hunk @ {new_ln}"));
-            }
-            continue;
-        }
-        // File headers and anything before the first hunk have no line number.
-        if new_ln == 0 || line.starts_with("+++") || line.starts_with("---") {
-            if i == cursor {
-                return None;
-            }
-            continue;
-        }
-        let label = match line.chars().next() {
-            Some('+') => {
-                let l = new_ln;
-                new_ln += 1;
-                format!("line {l}")
-            }
-            Some('-') => {
-                let l = old_ln;
-                old_ln += 1;
-                format!("line {l} (old)")
-            }
-            _ => {
-                let l = new_ln;
-                old_ln += 1;
-                new_ln += 1;
-                format!("line {l}")
-            }
-        };
-        if i == cursor {
-            return Some(label);
-        }
-    }
-    None
 }
 
 // ---- config / connections ----
@@ -1272,22 +1230,6 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
-    #[test]
-    fn cursor_line_label_maps_hunk_lines_to_file_lines() {
-        let patch = "@@ -10,3 +20,4 @@\n ctx\n+new\n-old";
-        assert_eq!(cursor_line_label(patch, 0).as_deref(), Some("hunk @ 20"));
-        assert_eq!(cursor_line_label(patch, 1).as_deref(), Some("line 20")); // context → new line 20
-        assert_eq!(cursor_line_label(patch, 2).as_deref(), Some("line 21")); // added → new line 21
-        assert_eq!(cursor_line_label(patch, 3).as_deref(), Some("line 11 (old)")); // removed → old line 11
-    }
-
-    #[test]
-    fn parse_hunk_header_reads_starts() {
-        assert_eq!(parse_hunk_header("@@ -10,3 +20,4 @@ fn foo()"), Some((10, 20)));
-        assert_eq!(parse_hunk_header("@@ -1 +1 @@"), Some((1, 1)));
-        assert_eq!(parse_hunk_header(" not a hunk"), None);
-    }
-
     fn sample_pr() -> PullRequest {
         PullRequest {
             id: "1".into(),
@@ -1354,6 +1296,8 @@ mod tests {
                 cursor: 0,
                 commit_label: None,
             },
+            pending: vec![],
+            review_draft: None,
         }
     }
 

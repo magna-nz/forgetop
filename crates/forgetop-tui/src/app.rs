@@ -120,6 +120,17 @@ pub struct PrView {
     pub scroll: u16,
     /// Diff-tab state (file list + patch + threads), rendered like the standalone diff.
     pub diff: DiffView,
+    /// Line comments buffered locally, submitted together as one review (`s`).
+    pub pending: Vec<LineComment>,
+    /// Target line for a comment being typed (filled in with the body on submit).
+    pub review_draft: Option<DraftComment>,
+}
+
+/// The file line a pending comment is being written against.
+pub struct DraftComment {
+    pub path: String,
+    pub line: i64,
+    pub side: DiffSide,
 }
 
 impl PrView {
@@ -797,7 +808,97 @@ impl App {
             pr_files: files,
             scroll: 0,
             diff,
+            pending: Vec::new(),
+            review_draft: None,
         }));
+    }
+
+    /// Buffers a line comment against the cursor line in the diff patch.
+    fn open_line_comment(&mut self) {
+        // Read the target under an immutable borrow, then mutate.
+        let target = {
+            let Screen::PrView(v) = &self.screen else { return };
+            if v.tab != 3 || v.diff.focus != DiffFocus::Patch {
+                self.open_pr_comment();
+                return;
+            }
+            let Some(file) = v.diff.current() else { return };
+            let Some(patch) = file.patch.as_deref() else { return };
+            crate::diff::comment_target(patch, v.diff.cursor).map(|(line, side)| (file.path.clone(), line, side))
+        };
+        match target {
+            Some((path, line, side)) => {
+                let title = format!("Comment on {path}:{line}");
+                if let Screen::PrView(v) = &mut self.screen {
+                    v.review_draft = Some(DraftComment { path, line, side });
+                }
+                self.overlay = Some(Overlay::Input { title, buffer: String::new(), kind: InputKind::PrLineComment });
+            }
+            None => self.toast = Some("Move to a code line to comment (not a hunk header)".into()),
+        }
+    }
+
+    /// Opens the submit-review verdict picker if there are pending comments.
+    fn open_review_submit(&mut self) {
+        let has_pending = matches!(&self.screen, Screen::PrView(v) if !v.pending.is_empty());
+        if !has_pending {
+            self.toast = Some("No pending comments — press c on a diff line to add one".into());
+            return;
+        }
+        self.overlay = Some(Overlay::Picker {
+            title: "Submit review".into(),
+            items: vec!["Comment".into(), "Approve".into(), "Request changes".into()],
+            selected: 0,
+            kind: PickerKind::ReviewSubmit,
+        });
+    }
+
+    /// Buffers a typed line comment against the stashed draft target.
+    fn add_line_comment(&mut self, body: String) {
+        let msg = if let Screen::PrView(v) = &mut self.screen {
+            match v.review_draft.take() {
+                Some(d) if !body.trim().is_empty() => {
+                    v.pending.push(LineComment { path: d.path, line: d.line, side: d.side, body });
+                    Some(format!("Comment buffered — {} pending (s to submit)", v.pending.len()))
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some(m) = msg {
+            self.toast = Some(m);
+        }
+    }
+
+    /// Submits the buffered line comments as one review with `event`.
+    async fn submit_review(&mut self, event: ReviewVote, deps: &AppDeps) {
+        let (pr_id, comments) = match &self.screen {
+            Screen::PrView(v) => (v.pr.id.clone(), v.pending.clone()),
+            _ => return,
+        };
+        if comments.is_empty() {
+            return;
+        }
+        let source = match deps.sections.pull_request_source().await {
+            Ok(Some(s)) => s,
+            _ => {
+                self.toast = Some("No pull-request provider is bound".into());
+                return;
+            }
+        };
+        match source.submit_review(&pr_id, event, &comments).await {
+            Ok(()) => {
+                let threads = source.threads(&pr_id).await.unwrap_or_default();
+                if let Screen::PrView(v) = &mut self.screen {
+                    v.pending.clear();
+                    v.review_draft = None;
+                    v.diff.threads = threads;
+                }
+                self.toast = Some(format!("Review submitted ({} comment(s))", comments.len()));
+            }
+            Err(e) => self.toast = Some(format!("Submit failed: {e}")),
+        }
     }
 
     /// Loads the selected commit's diff into the diff view and jumps to the Diff tab.
@@ -877,7 +978,13 @@ impl App {
                 return;
             }
             Key::Char('c') => {
-                self.open_pr_comment();
+                // On a diff patch line this buffers a line comment; elsewhere it's a
+                // plain PR comment.
+                self.open_line_comment();
+                return;
+            }
+            Key::Char('s') => {
+                self.open_review_submit();
                 return;
             }
             _ => {}
@@ -1547,6 +1654,8 @@ impl App {
             Action::PipelineTrigger { .. } => self.execute_pipeline_action(action, deps).await,
             Action::RemoveConnection { .. } => self.execute_config_action(action, deps).await,
             Action::ApplyToggle { kind, ids } => self.apply_toggle(kind, ids, deps).await,
+            Action::AddLineComment(body) => self.add_line_comment(body),
+            Action::SubmitReview(event) => self.submit_review(event, deps).await,
         }
     }
 
@@ -2011,6 +2120,8 @@ mod tests {
             pr_files: vec![changed("a.rs", Some("@@ -1 +1 @@\n-x\n+y"))],
             scroll: 0,
             diff: d,
+            pending: vec![],
+            review_draft: None,
         };
 
         v.reset_diff_scope();
@@ -2019,6 +2130,38 @@ mod tests {
         assert_eq!(v.diff.files[0].path, "a.rs", "whole-PR files restored");
         assert_eq!(v.diff.selected, 0);
         assert_eq!(v.diff.focus, DiffFocus::FileList);
+    }
+
+    #[test]
+    fn add_line_comment_buffers_against_draft() {
+        let mut app = App::new("slate");
+        app.screen = Screen::PrView(Box::new(PrView {
+            label: "PR".into(),
+            url: None,
+            pr: pr(None),
+            tab: 3,
+            checks: vec![],
+            commits: vec![],
+            commit_sel: 0,
+            pr_files: vec![],
+            scroll: 0,
+            diff: diff(vec![changed("a.rs", Some("@@ -1 +1 @@\n-x\n+y"))]),
+            pending: vec![],
+            review_draft: Some(DraftComment { path: "a.rs".into(), line: 5, side: DiffSide::New }),
+        }));
+
+        app.add_line_comment("looks off".into());
+        let Screen::PrView(v) = &app.screen else { panic!("expected PrView") };
+        assert_eq!(v.pending.len(), 1);
+        assert_eq!(v.pending[0].path, "a.rs");
+        assert_eq!(v.pending[0].line, 5);
+        assert_eq!(v.pending[0].body, "looks off");
+        assert!(v.review_draft.is_none(), "draft consumed after buffering");
+
+        // A blank body (or no draft) doesn't buffer anything.
+        app.add_line_comment("   ".into());
+        let Screen::PrView(v) = &app.screen else { panic!() };
+        assert_eq!(v.pending.len(), 1, "empty body ignored");
     }
 
     #[test]
@@ -2056,6 +2199,8 @@ mod tests {
                 cursor: 0,
                 commit_label: None,
             },
+            pending: vec![],
+            review_draft: None,
         }));
         assert_eq!(app.selected_url().as_deref(), Some("http://prview"));
     }
