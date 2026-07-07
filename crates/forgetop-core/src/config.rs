@@ -90,6 +90,30 @@ pub struct UiState {
     /// Which desktop notifications are enabled. Defaults to all on.
     #[serde(default)]
     pub notifications: NotificationPrefs,
+    /// Saved views per section (a named bundle of filter + sort + state).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pr_views: Vec<SavedView>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub work_item_views: Vec<SavedView>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pipeline_views: Vec<SavedView>,
+}
+
+/// A named, saved bundle of a section's filter + sort + visible state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SavedView {
+    pub name: String,
+    /// PR base filter: "all" / "mine" / "review" (Pull Requests only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<String>,
+    /// Quick-filter text applied to the list.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub query: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sort: Option<SortPref>,
+    /// Hidden work-item states (Work Items only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hidden_states: Vec<String>,
 }
 
 fn yes() -> bool {

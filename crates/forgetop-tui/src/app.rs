@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::{DateTime, Local, Utc};
-use forgetop_core::config::{NotificationPrefs, SortPref};
+use forgetop_core::config::{NotificationPrefs, SavedView, SortPref};
 use forgetop_core::domain::*;
 use forgetop_core::provider::*;
 use forgetop_core::service::{ConfigService, ConnectionHealth, ConnectionHealthService, SectionService};
@@ -101,6 +101,9 @@ pub struct App {
     pub pr_sort: Option<SortPref>,
     pub wi_sort: Option<SortPref>,
     pub pipe_sort: Option<SortPref>,
+    /// Saved views per section (0=PR, 1=WI, 2=Pipelines) and the active index.
+    pub views: [Vec<SavedView>; 3],
+    pub view_idx: [usize; 3],
     /// Which desktop notifications are enabled. Persisted.
     pub notifications: NotificationPrefs,
     /// Last-seen status per pipeline run, to detect transitions into failure.
@@ -458,6 +461,8 @@ impl App {
             pr_sort: None,
             wi_sort: None,
             pipe_sort: None,
+            views: [Vec::new(), Vec::new(), Vec::new()],
+            view_idx: [0, 0, 0],
             notifications: NotificationPrefs::default(),
             pipe_seen: HashMap::new(),
             pipe_seeded: false,
@@ -687,6 +692,64 @@ impl App {
         self.pr_sort = pr;
         self.wi_sort = wi;
         self.pipe_sort = pipe;
+    }
+
+    // ---- saved views ----
+
+    /// Applies persisted saved views at startup, seeding defaults for empty sections.
+    pub fn apply_views(&mut self, pr: Vec<SavedView>, wi: Vec<SavedView>, pipe: Vec<SavedView>) {
+        self.views = [
+            if pr.is_empty() { default_views(0) } else { pr },
+            if wi.is_empty() { default_views(1) } else { wi },
+            if pipe.is_empty() { default_views(2) } else { pipe },
+        ];
+    }
+
+    /// The active view for a section, if any.
+    pub fn active_view(&self, section: usize) -> Option<&SavedView> {
+        self.views[section].get(self.view_idx[section])
+    }
+
+    /// Moves to the previous/next saved view on the active section and applies it.
+    async fn switch_view(&mut self, delta: isize, deps: &AppDeps) {
+        let n = self.views[self.active].len();
+        if n <= 1 {
+            return;
+        }
+        let idx = (self.view_idx[self.active] as isize + delta).rem_euclid(n as isize) as usize;
+        self.apply_view(self.active, idx, deps).await;
+    }
+
+    /// Applies a saved view: sets the quick-filter, sort, PR base filter, and hidden
+    /// states from the bundle (reloading PRs only if the server-side filter changed).
+    async fn apply_view(&mut self, section: usize, idx: usize, deps: &AppDeps) {
+        let Some(view) = self.views[section].get(idx).cloned() else { return };
+        self.view_idx[section] = idx;
+        self.toast = Some(format!("View: {}", view.name));
+
+        self.filters[section] = view.query.clone();
+        let sort = view.sort.clone();
+        match section {
+            0 => self.pr_sort = sort,
+            1 => self.wi_sort = sort,
+            _ => self.pipe_sort = sort,
+        }
+        if section == 1 {
+            self.wi_hidden_states = view.hidden_states.iter().cloned().collect();
+        }
+        if section == 0 {
+            let want = parse_pr_filter(view.filter.as_deref());
+            if want != self.pr_filter {
+                self.pr_filter = want;
+                let mut errors = Vec::new();
+                self.reload_pull_requests(deps, &mut errors).await;
+                if let Some(e) = errors.first() {
+                    self.toast = Some(e.clone());
+                }
+            }
+        }
+        self.list_scroll = 0;
+        self.fix_selection();
     }
 
     /// The active sort for a section, if any.
@@ -940,23 +1003,6 @@ impl App {
         self.pr_state.select((pl > 0).then(|| self.pr_state.selected().unwrap_or(0).min(pl - 1)));
         self.wi_state.select((wl > 0).then(|| self.wi_state.selected().unwrap_or(0).min(wl - 1)));
         self.pipe_state.select((ll > 0).then(|| self.pipe_state.selected().unwrap_or(0).min(ll - 1)));
-    }
-
-    /// Cycles the PR filter, reloads just the PR list, and toasts the new filter.
-    async fn cycle_pr_filter(&mut self, deps: &AppDeps) {
-        self.pr_filter = match self.pr_filter {
-            PullRequestFilter::All => PullRequestFilter::Mine,
-            PullRequestFilter::Mine => PullRequestFilter::ReviewRequested,
-            PullRequestFilter::ReviewRequested => PullRequestFilter::All,
-        };
-        let mut errors = Vec::new();
-        self.reload_pull_requests(deps, &mut errors).await;
-        self.pr_state.select((!self.filtered_pr_indices().is_empty()).then_some(0));
-        self.list_scroll = 0;
-        self.toast = Some(match errors.first() {
-            Some(e) => e.clone(),
-            None => format!("Filter: {} ({} PRs)", self.pr_filter_label(), self.prs.len()),
-        });
     }
 
     // ---- key handling ----
@@ -1445,7 +1491,10 @@ impl App {
             'n' => self.start_add_connection(),
             'v' => self.open_sections_toggle(),
             'C' => self.open_config(deps).await,
-            'f' if self.active == 0 => self.cycle_pr_filter(deps).await,
+            // Saved views: previous / next on the active section.
+            '[' => self.switch_view(-1, deps).await,
+            ']' => self.switch_view(1, deps).await,
+            'f' if self.active == 0 => self.switch_view(1, deps).await,
             'f' if self.active == 1 => self.open_wi_states_toggle(),
             // Pipeline trigger (Pipelines tab).
             'T' if self.active == 2 => self.open_pipeline_trigger(),
@@ -2535,6 +2584,29 @@ fn pr_query(filter: PullRequestFilter) -> PullRequestQuery {
     PullRequestQuery { filter, include_completed: false, limit: Some(50) }
 }
 
+fn parse_pr_filter(s: Option<&str>) -> PullRequestFilter {
+    match s {
+        Some("mine") => PullRequestFilter::Mine,
+        Some("review") => PullRequestFilter::ReviewRequested,
+        _ => PullRequestFilter::All,
+    }
+}
+
+/// The built-in views seeded for a section that has none saved.
+fn default_views(section: usize) -> Vec<SavedView> {
+    let v = |name: &str, filter: Option<&str>| SavedView {
+        name: name.into(),
+        filter: filter.map(Into::into),
+        query: String::new(),
+        sort: None,
+        hidden_states: Vec::new(),
+    };
+    match section {
+        0 => vec![v("All", Some("all")), v("Mine", Some("mine")), v("Review", Some("review"))],
+        _ => vec![v("All", None)],
+    }
+}
+
 fn wi_query() -> WorkItemQuery {
     // Work Items only ever shows items assigned to the authenticated user
     // (resolved from the token by each provider: @me / currentUser() / isMe).
@@ -2819,6 +2891,26 @@ mod tests {
         assert_eq!(items.len(), 4);
         let on: Vec<&str> = items.iter().filter(|i| i.on).map(|i| i.id.as_str()).collect();
         assert_eq!(on, vec!["pipeline_failed", "pr_approved"]);
+    }
+
+    #[test]
+    fn saved_views_defaults_and_seeding() {
+        assert_eq!(default_views(0).iter().map(|v| v.name.clone()).collect::<Vec<_>>(), vec!["All", "Mine", "Review"]);
+        assert_eq!(default_views(1).len(), 1);
+        assert_eq!(parse_pr_filter(Some("mine")), PullRequestFilter::Mine);
+        assert_eq!(parse_pr_filter(Some("review")), PullRequestFilter::ReviewRequested);
+        assert_eq!(parse_pr_filter(None), PullRequestFilter::All);
+
+        // Empty sections get the defaults; a saved set is kept verbatim.
+        let mut app = App::new("slate");
+        app.apply_views(vec![], vec![], vec![]);
+        assert_eq!(app.views[0].len(), 3);
+        assert_eq!(app.views[1].len(), 1);
+
+        let custom = vec![SavedView { name: "Stale".into(), filter: None, query: "old".into(), sort: None, hidden_states: vec![] }];
+        app.apply_views(custom, vec![], vec![]);
+        assert_eq!(app.views[0].len(), 1);
+        assert_eq!(app.views[0][0].name, "Stale");
     }
 
     #[test]
