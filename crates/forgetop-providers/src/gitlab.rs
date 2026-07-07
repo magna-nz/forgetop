@@ -432,6 +432,9 @@ impl WorkItemSource for GitLabWi {
         let url = self.0.project_path(&format!("/issues/{id}?state_event={event}"));
         self.0.send(self.0.http.put(&url), &format!("PUT {url}")).await
     }
+    async fn available_states(&self, _id: &str) -> Result<Vec<String>> {
+        Ok(vec!["opened".into(), "closed".into()])
+    }
     async fn add_comment(&self, id: &str, body: &str) -> Result<()> {
         self.0.post_json(&self.0.project_path(&format!("/issues/{id}/notes")), json!({ "body": body })).await
     }

@@ -536,6 +536,16 @@ impl WorkItemSource for AzureWi {
         let url = format!("{}/{}/_apis/wit/workItems/{id}/comments?api-version=7.1-preview.3", self.0.base, self.0.project);
         self.0.post_json_read(&url, json!({ "text": body })).await.map(|_| ())
     }
+    async fn available_states(&self, id: &str) -> Result<Vec<String>> {
+        // The states come from the item's work-item type workflow.
+        let item = self.0.get_json(&format!("{}/_apis/wit/workitems/{id}?{API}", self.0.base)).await?;
+        let Some(t) = get_obj(&item, "fields").and_then(|f| get_str(f, "System.WorkItemType")) else {
+            return Ok(Vec::new());
+        };
+        let url = format!("{}/{}/_apis/wit/workItemTypes/{}/states?{API}", self.0.base, self.0.project, urlencoding(&t));
+        let v = self.0.get_json(&url).await?;
+        Ok(get_arr(&v, "value").iter().filter_map(|s| get_str(s, "name")).collect())
+    }
 }
 
 #[async_trait]

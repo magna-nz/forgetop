@@ -152,10 +152,21 @@ The Work Items tab shows only items **assigned to you** — each provider resolv
 the current user from your token (`@me`, `currentUser()`, `isMe`, …), so there's
 nothing to configure.
 
-- `Enter` — open the item; `s` — change state; `c` — comment.
-- `f` — open a checklist of the **states currently in view** and pick which to
-  show. The list is built from the loaded items, so it's always provider-accurate
-  (`In Progress` vs `Inprogress`). The choice persists.
+The list is browse-and-open; the write actions live in the item view:
+
+- `Enter` — open the item.
+- `f` (on the list) — a checklist of the **states currently in view**; pick which
+  to show. Built from the loaded items, so it's always provider-accurate
+  (`In Progress` vs `Inprogress`). Persisted.
+
+Inside the item view (after `Enter`):
+
+- `u` — **update state.** The choices are pulled from the provider itself: Jira's
+  workflow transitions, Linear's team states, Azure's work-item-type states, or
+  open/closed for GitHub/GitLab issues. (Falls back to the states seen across the
+  list if a provider can't report them.)
+- `c` — comment (works on every work-item provider).
+- `o` — open in browser.
 
 ## Pipelines
 
@@ -249,10 +260,10 @@ the keys valid for where you are. Press `?` for the full panel. The complete set
 
 | Key | Action |
 | --- | --- |
-| `Enter` | Open |
-| `s` | Change state |
+| `Enter` | Open the item |
 | `f` | Choose which states to show |
-| `c` | Comment |
+| `u` (in the item view) | Update state (choices pulled from the provider) |
+| `c` (in the item view) | Comment |
 
 ### Pipelines
 

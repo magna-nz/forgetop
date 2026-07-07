@@ -446,6 +446,9 @@ impl WorkItemSource for GitHubWi {
         }
         Ok(())
     }
+    async fn available_states(&self, _id: &str) -> Result<Vec<String>> {
+        Ok(vec!["open".into(), "closed".into()])
+    }
     async fn add_comment(&self, id: &str, body: &str) -> Result<()> {
         self.0.post_json(&self.0.repo_path(&format!("/issues/{id}/comments")), json!({ "body": body })).await
     }

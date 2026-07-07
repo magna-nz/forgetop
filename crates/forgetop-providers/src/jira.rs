@@ -176,6 +176,11 @@ impl WorkItemSource for JiraWi {
     async fn add_comment(&self, id: &str, body: &str) -> Result<()> {
         self.0.post_ok(&format!("{}/issue/{id}/comment", self.0.api), json!({ "body": body })).await
     }
+    async fn available_states(&self, id: &str) -> Result<Vec<String>> {
+        // The states this issue can transition to, from its workflow.
+        let v = self.0.get_json(&format!("{}/issue/{id}/transitions", self.0.api)).await?;
+        Ok(get_arr(&v, "transitions").iter().filter_map(|t| get_obj(t, "to").and_then(|to| get_str(to, "name"))).collect())
+    }
 }
 
 pub struct JiraConnection {
