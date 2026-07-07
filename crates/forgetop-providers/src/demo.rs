@@ -544,6 +544,9 @@ impl PullRequestSource for DemoPr {
     async fn merge(&self, _id: &str, _options: &MergeOptions) -> Result<()> {
         Ok(())
     }
+    async fn submit_review(&self, _id: &str, _event: ReviewVote, _comments: &[LineComment]) -> Result<()> {
+        Ok(())
+    }
 }
 
 struct DemoWi;

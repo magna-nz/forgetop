@@ -19,6 +19,10 @@ pub enum Action {
     RemoveConnection { id: String, label: String },
     /// Result of a checklist: the ids that ended up ticked, tagged with what they are.
     ApplyToggle { kind: ToggleKind, ids: Vec<String> },
+    /// Buffer an inline line comment (body); the target line is held on the PR view.
+    AddLineComment(String),
+    /// Submit the buffered line comments as a review with this verdict.
+    SubmitReview(ReviewVote),
 }
 
 /// What a [`Overlay::Toggle`] checklist is choosing.
@@ -43,12 +47,16 @@ pub struct ToggleItem {
 pub enum PickerKind {
     PrMergeStrategy,
     WorkItemState,
+    /// The verdict for submitting a batch of pending line comments.
+    ReviewSubmit,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub enum InputKind {
     PrComment,
     WorkItemComment,
+    /// The body of a pending inline line comment.
+    PrLineComment,
 }
 
 pub enum Overlay {
@@ -56,6 +64,8 @@ pub enum Overlay {
     Picker { title: String, items: Vec<String>, selected: usize, kind: PickerKind },
     Input { title: String, buffer: String, kind: InputKind },
     Toggle { title: String, kind: ToggleKind, min_one: bool, items: Vec<ToggleItem>, selected: usize },
+    /// A scrollable, context-agnostic reference of every keybinding.
+    Help { scroll: u16 },
 }
 
 /// What the app should do after feeding a key to the overlay.
@@ -75,6 +85,7 @@ impl Overlay {
             | Overlay::Picker { title, .. }
             | Overlay::Input { title, .. }
             | Overlay::Toggle { title, .. } => title,
+            Overlay::Help { .. } => "Keybindings",
         }
     }
 
@@ -85,6 +96,7 @@ impl Overlay {
             Overlay::Picker { .. } => vec![("↑↓", "choose"), ("↵", "select"), ("Esc", "cancel")],
             Overlay::Input { .. } => vec![("Esc", "cancel"), ("↵", "submit")],
             Overlay::Toggle { .. } => vec![("↑↓", "move"), ("↵/space", "toggle"), ("Esc", "apply")],
+            Overlay::Help { .. } => vec![("↑↓", "scroll"), ("Esc", "close")],
         }
     }
 
@@ -158,6 +170,26 @@ impl Overlay {
                 }
                 _ => Outcome::Keep,
             },
+            Overlay::Help { scroll } => match key {
+                Key::Up | Key::Char('k') => {
+                    *scroll = scroll.saturating_sub(1);
+                    Outcome::Keep
+                }
+                Key::Down | Key::Char('j') => {
+                    *scroll = scroll.saturating_add(1);
+                    Outcome::Keep
+                }
+                Key::PageUp => {
+                    *scroll = scroll.saturating_sub(10);
+                    Outcome::Keep
+                }
+                Key::PageDown => {
+                    *scroll = scroll.saturating_add(10);
+                    Outcome::Keep
+                }
+                Key::Escape | Key::Char('?') | Key::Char('q') => Outcome::Cancel,
+                _ => Outcome::Keep,
+            },
         }
     }
 }
@@ -173,6 +205,14 @@ fn resolve_picker(kind: PickerKind, selected: usize, items: &[String]) -> Action
             Action::PrMerge(strategy)
         }
         PickerKind::WorkItemState => Action::WiSetState(items.get(selected).cloned().unwrap_or_default()),
+        PickerKind::ReviewSubmit => {
+            let event = match selected {
+                1 => ReviewVote::Approved,
+                2 => ReviewVote::Rejected,
+                _ => ReviewVote::NoVote,
+            };
+            Action::SubmitReview(event)
+        }
     }
 }
 
@@ -180,6 +220,7 @@ fn resolve_input(kind: InputKind, text: String) -> Action {
     match kind {
         InputKind::PrComment => Action::PrComment(text),
         InputKind::WorkItemComment => Action::WiComment(text),
+        InputKind::PrLineComment => Action::AddLineComment(text),
     }
 }
 

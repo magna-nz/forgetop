@@ -2,6 +2,7 @@
 //! so there are no framework focus fights — every keystroke is dispatched by us.
 
 pub mod app;
+pub mod diff;
 pub mod overlay;
 pub mod theme;
 pub mod ui;

@@ -369,6 +369,41 @@ impl PullRequestSource for GitLabPr {
         let url = self.0.project_path(&format!("/merge_requests/{id}/merge"));
         self.0.send(self.0.http.put(&url).json(&body), &format!("PUT {url}")).await
     }
+    async fn submit_review(&self, id: &str, event: ReviewVote, comments: &[LineComment]) -> Result<()> {
+        // GitLab positions a diff note against the MR's base/head/start commits.
+        let mr = self.0.get_json(&self.0.project_path(&format!("/merge_requests/{id}"))).await?;
+        let refs = get_obj(&mr, "diff_refs");
+        let base = refs.and_then(|r| get_str(r, "base_sha"));
+        let head = refs.and_then(|r| get_str(r, "head_sha"));
+        let start = refs.and_then(|r| get_str(r, "start_sha"));
+        for c in comments {
+            let mut pos = json!({
+                "position_type": "text",
+                "base_sha": base,
+                "head_sha": head,
+                "start_sha": start,
+                "new_path": c.path,
+                "old_path": c.path,
+            });
+            match c.side {
+                DiffSide::New => pos["new_line"] = json!(c.line),
+                DiffSide::Old => pos["old_line"] = json!(c.line),
+            }
+            self.0
+                .post_json(&self.0.project_path(&format!("/merge_requests/{id}/discussions")), json!({ "body": c.body, "position": pos }))
+                .await?;
+        }
+        match event {
+            ReviewVote::Approved | ReviewVote::ApprovedWithSuggestions => {
+                self.0.post_json(&self.0.project_path(&format!("/merge_requests/{id}/approve")), json!({})).await?;
+            }
+            ReviewVote::Rejected => {
+                self.0.post_json(&self.0.project_path(&format!("/merge_requests/{id}/notes")), json!({ "body": "Requested changes" })).await?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]

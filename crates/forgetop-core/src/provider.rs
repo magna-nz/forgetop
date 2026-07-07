@@ -173,6 +173,11 @@ pub trait PullRequestSource: Send + Sync {
     async fn add_comment(&self, pull_request_id: &str, body: &str) -> Result<()>;
     async fn vote(&self, pull_request_id: &str, vote: ReviewVote) -> Result<()>;
     async fn merge(&self, pull_request_id: &str, options: &MergeOptions) -> Result<()>;
+    /// Submits a review with inline line comments. `event` maps to approve /
+    /// request-changes / plain comment. Defaults to unsupported.
+    async fn submit_review(&self, _pull_request_id: &str, _event: ReviewVote, _comments: &[LineComment]) -> Result<()> {
+        Err(Error::Provider("this provider doesn't support line-comment reviews".into()))
+    }
 }
 
 #[async_trait]

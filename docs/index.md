@@ -34,18 +34,31 @@ keys valid for wherever you are. The full set:
 | `v` | Choose which tabs are visible |
 | `C` | Config / connections screen |
 | `r` | Refresh · `t` cycle theme |
+| `?` | Show all keybindings (works anywhere) |
 | `q` / `Ctrl-C` | Quit · `Esc` back / close |
 
 ### Pull Requests
 
 | Key | Action |
 | --- | --- |
-| `Enter` | Expand details |
+| `Enter` | Open the full-screen PR view (Conversation / Commits / Checks / Diff) |
 | `f` | Cycle filter (All / Mine / Review-requested) |
-| `d` | Open diff + review threads |
+| `d` | Open straight to the Diff tab |
 | `a` / `x` | Approve / request changes |
 | `m` | Merge (choose strategy) |
 | `c` | Comment |
+
+Inside the PR view:
+
+| Key | Action |
+| --- | --- |
+| `←` / `→` | Switch sub-tab |
+| `Enter` (Commits) | Drill into that commit's diff |
+| `Enter` (Diff, on a file) | Drop into a line cursor within the patch |
+| `↑` / `↓` (line cursor) | Move line-by-line; the title shows the file line |
+| `c` (line cursor) | Add an inline comment on the current line (buffered) |
+| `s` | Submit the buffered comments as one review (Comment / Approve / Request changes) |
+| `Esc` | Step back (line cursor → file list → close) |
 
 ### Work Items
 
@@ -78,6 +91,21 @@ about:
 - **Pipeline subscriptions (`s` in the config screen)** - for a connection that
   discovers many pipelines, pick just the definitions you want to track. Persisted
   per connection.
+
+## Reviewing code
+
+Open a PR, go to the **Diff** tab, and press `Enter` on a file to get a line
+cursor. On any code line, `c` writes an inline comment - but nothing is sent
+yet: comments are **buffered locally** (the line gets a `▎` marker) so you can
+comment on several lines first. Press `s` to submit them all as one review, and
+pick the verdict: **Comment**, **Approve**, or **Request changes**.
+
+- **GitHub** submits them as a single native review.
+- **GitLab** posts them as positioned discussions (and approves if you chose Approve).
+- **Azure DevOps / Bitbucket** don't return inline patches, so the line cursor -
+  and therefore line comments - aren't available there yet.
+
+You can also drill into a single commit's diff from the **Commits** tab (`Enter`).
 
 ## Configuration
 

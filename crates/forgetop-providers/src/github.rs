@@ -377,6 +377,27 @@ impl PullRequestSource for GitHubPr {
         };
         self.0.post_json(&self.0.repo_path(&format!("/pulls/{id}/reviews")), json!({ "event": event })).await
     }
+    async fn submit_review(&self, id: &str, event: ReviewVote, comments: &[LineComment]) -> Result<()> {
+        let ev = match event {
+            ReviewVote::Approved | ReviewVote::ApprovedWithSuggestions => "APPROVE",
+            ReviewVote::Rejected => "REQUEST_CHANGES",
+            _ => "COMMENT",
+        };
+        let items: Vec<Value> = comments
+            .iter()
+            .map(|c| {
+                json!({
+                    "path": c.path,
+                    "line": c.line,
+                    "side": match c.side { DiffSide::Old => "LEFT", DiffSide::New => "RIGHT" },
+                    "body": c.body,
+                })
+            })
+            .collect();
+        self.0
+            .post_json(&self.0.repo_path(&format!("/pulls/{id}/reviews")), json!({ "event": ev, "comments": items }))
+            .await
+    }
     async fn merge(&self, id: &str, options: &MergeOptions) -> Result<()> {
         let method = match options.strategy {
             MergeStrategy::Squash => "squash",
