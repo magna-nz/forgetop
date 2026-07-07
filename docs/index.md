@@ -19,6 +19,7 @@ This is the full reference. For install and a 60-second start, see the
 - [Work Items](#work-items)
 - [Pipelines](#pipelines)
 - [Filtering and sorting](#filtering-and-sorting)
+- [Saved views](#saved-views)
 - [Notifications](#notifications)
 - [Keybindings](#keybindings)
 - [Configuration](#configuration)
@@ -44,6 +45,8 @@ This is the full reference. For install and a 60-second start, see the
   **failure reasons**, a scrollable **logs** pane, and open-in-browser.
 - **Filter, sort, and shape** — a live quick-filter, per-column sorting, work-item
   state visibility, and pipeline subscriptions — all remembered per view.
+- **Saved views** — bundle a filter + sort + state into a named view and flip
+  between them from an always-visible view bar (`[` / `]`).
 - **Desktop notifications** — get pinged when a pipeline fails, a review is
   requested, or your PR is approved / gets changes requested — across every
   connected provider.
@@ -120,7 +123,8 @@ write action lives inside the PR view.
 **On the list:**
 
 - `Enter` — open the full-screen PR view.
-- `f` — cycle the filter: All / Mine / Review-requested.
+- `f`, `[` / `]` — switch [saved views](#saved-views); PRs default to
+  All / Mine / Review-requested.
 - `/` — quick-filter by typing; `S` — sort by a column; `o` — open in browser.
 
 **Inside the PR view** (four sub-tabs, switch with `←`/`→`):
@@ -198,6 +202,27 @@ Four complementary ways to cut a busy view down:
 
 All of these compose, and all work across the aggregated (multi-provider) list.
 
+## Saved views
+
+A **saved view** is a named bundle of a section's shaping — its base filter, the
+quick-filter text, the sort, and (on Work Items) which states are hidden. Views
+live in a horizontal **view bar** above the list, gh-dash style, with the active
+one highlighted. The bar appears once a section has more than one view.
+
+Every section starts with sensible defaults: Pull Requests get **All**, **Mine**,
+and **Review**; Work Items and Pipelines get a single **All**.
+
+- `[` / `]` — switch to the previous / next view. On Pull Requests, `f` also
+  advances to the next view.
+- `V` — save the current filter + sort + states as a new view (you're prompted for
+  a name), then switch to it.
+- `X` — delete the current view (with a confirm; you can't delete the last one).
+
+Switching a view re-applies the whole bundle at once, so a `Mine` view can pin a
+different sort and quick-filter than `Review`. Views are persisted per section, so
+they're waiting next time — except in `--demo`, where the in-memory config means
+saved views last only for that session.
+
 ## Notifications
 
 forgetop raises native desktop notifications on the events you choose:
@@ -236,12 +261,21 @@ the keys valid for where you are. Press `?` for the full panel. The complete set
 | `?` | Show all keybindings (anywhere) |
 | `q` / `Ctrl-C` | Quit · `Esc` back / close |
 
+### Saved views
+
+| Key | Action |
+| --- | --- |
+| `[` / `]` | Previous / next saved view |
+| `f` (Pull Requests) | Next saved view |
+| `V` | Save the current filter + sort + states as a view |
+| `X` | Delete the current view |
+
 ### Pull Requests (list)
 
 | Key | Action |
 | --- | --- |
 | `Enter` | Open the PR view |
-| `f` | Cycle filter (All / Mine / Review-requested) |
+| `f`, `[` / `]` | Switch saved views (defaults All / Mine / Review-requested) |
 
 ### Inside the PR view
 
@@ -295,8 +329,8 @@ Config is a small JSON file, created and managed for you:
 | Windows | `%APPDATA%\forgetop\config.json` |
 
 **It never contains secrets** — only a reference to each token in the keychain,
-plus your bindings and view preferences (sorts, hidden states, notification
-choices).
+plus your bindings and view preferences (saved views, sorts, hidden states,
+notification choices).
 
 ### Tokens
 
