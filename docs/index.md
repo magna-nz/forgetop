@@ -193,20 +193,24 @@ For a connection that discovers many pipelines, open the config screen and press
 
 ### Approvals
 
-When a run is blocked on a manual gate you can action — a **GitHub** environment
-required-reviewer, an **Azure DevOps** approval check, or a **GitLab** manual job —
-forgetop surfaces it:
+When a run is blocked on a manual gate — a **GitHub** environment required-reviewer,
+an **Azure DevOps** approval check, or a **GitLab** manual job — forgetop surfaces it:
 
 - The Pipelines list shows a red **Approval needed** column on that run, refreshed
   on the normal 30-second poll (and you can opt into a desktop
   [notification](#notifications) when a gate first appears).
-- Inside the run, a banner reads **⏸ Approval needed: {environment}**. Press `A`
-  to open a picker of Approve / Reject options per gate, then confirm.
+- Inside the run, a banner reads **⏸ Approval needed: {environment}**. On providers
+  where forgetop can act (**GitHub**, **GitLab**) press `A` to open a picker of
+  Approve / Reject options per gate, then confirm.
 
-Gates are **capability-scoped**: a provider that doesn't expose approvals shows an
-explicit *"Approvals not supported on {provider}"* note instead. **Bitbucket** is
-that case — its API can't resume a paused manual step. On GitLab a reject cancels
-the manual job.
+Acting is **capability-scoped**:
+- **GitHub / GitLab** — approve or reject in-app (on GitLab a reject cancels the
+  manual job).
+- **Azure DevOps** — **view-only**: the pending gate is surfaced, but Azure doesn't
+  expose the environment check as an actionable approval over the API, so there's no
+  `A` action — approve it in the Azure UI.
+- **Bitbucket** — approvals aren't surfaced at all (its API can't resume a paused
+  manual step); the run shows an explicit *"not supported"* note.
 
 ## Filtering and sorting
 
@@ -329,7 +333,7 @@ the keys valid for where you are. Press `?` for the full panel. The complete set
 | `Enter` | Drill in (stages → jobs → steps) |
 | `Enter` (in drill-in) | Expand / collapse a node |
 | `L` | View the selected job's logs |
-| `A` (in drill-in) | Approve / reject a waiting gate (not supported on Bitbucket) |
+| `A` (in drill-in) | Approve / reject a waiting gate (GitHub, GitLab; Azure view-only) |
 | `o` | Open the selected job in the browser |
 | `T` | Trigger a run |
 

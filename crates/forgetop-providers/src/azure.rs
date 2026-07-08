@@ -626,6 +626,12 @@ impl PipelineSource for AzurePipe {
     fn supports_approvals(&self) -> bool {
         true
     }
+    // Azure can surface a pending environment approval (via the run timeline) but the
+    // check isn't exposed as an actionable `pipelines/approvals` resource, so we can't
+    // submit the decision — approve/reject is view-only, done in the Azure UI.
+    fn can_respond_to_approvals(&self) -> bool {
+        false
+    }
     async fn pending_approvals(&self, run_id: &str) -> Result<Vec<PipelineApproval>> {
         self.0.approval_gates(run_id).await
     }
