@@ -496,6 +496,32 @@ impl PipelineSource for GitHubPipe {
         let url = self.0.repo_path(&format!("/actions/workflows/{definition_id}/dispatches"));
         self.0.post_json(&url, json!({ "ref": branch.unwrap_or("main") })).await
     }
+    fn supports_approvals(&self) -> bool {
+        true
+    }
+    async fn pending_approvals(&self, run_id: &str) -> Result<Vec<PipelineApproval>> {
+        // Environments awaiting a required-reviewer decision on this run.
+        let url = self.0.repo_path(&format!("/actions/runs/{run_id}/pending_deployments"));
+        let v = self.0.get_json(&url).await?;
+        Ok(v.as_array().map(|a| a.as_slice()).unwrap_or(&[]).iter().filter_map(map_pending_deployment).collect())
+    }
+    async fn respond_approval(&self, run_id: &str, approval_id: &str, decision: ApprovalDecision, comment: Option<&str>) -> Result<()> {
+        let env_id: i64 = approval_id.parse().map_err(|_| Error::Provider("invalid environment id".into()))?;
+        let state = match decision {
+            ApprovalDecision::Approve => "approved",
+            ApprovalDecision::Reject => "rejected",
+        };
+        let url = self.0.repo_path(&format!("/actions/runs/{run_id}/pending_deployments"));
+        self.0.post_json(&url, json!({ "environment_ids": [env_id], "state": state, "comment": comment.unwrap_or("") })).await
+    }
+}
+
+/// Maps one entry of the `pending_deployments` array into an approval gate.
+fn map_pending_deployment(v: &Value) -> Option<PipelineApproval> {
+    let env = get_obj(v, "environment")?;
+    let id = get_i64(env, "id")?.to_string();
+    let name = get_str(env, "name").unwrap_or_else(|| "environment".into());
+    Some(PipelineApproval { id, name, can_respond: get_bool(v, "current_user_can_approve") })
 }
 
 pub struct GitHubConnection {
@@ -587,6 +613,24 @@ impl ProviderFactory for GitHubFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn maps_pending_deployment_to_approval() {
+        let v: Value = serde_json::from_str(
+            r#"{ "environment": { "id": 161088068, "name": "production" },
+                 "current_user_can_approve": true }"#,
+        )
+        .unwrap();
+        let a = map_pending_deployment(&v).expect("gate");
+        assert_eq!(a.id, "161088068");
+        assert_eq!(a.name, "production");
+        assert!(a.can_respond);
+
+        // A gate the user can't act on is still surfaced, flagged not-actionable.
+        let other: Value = serde_json::from_str(r#"{ "environment": { "id": 5, "name": "staging" } }"#).unwrap();
+        let b = map_pending_deployment(&other).expect("gate");
+        assert!(!b.can_respond);
+    }
 
     #[test]
     fn maps_open_pr_with_labels_and_stats() {

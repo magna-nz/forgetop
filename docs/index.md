@@ -43,6 +43,9 @@ This is the full reference. For install and a 60-second start, see the
   locally then submitted as one review** (Comment / Approve / Request changes).
 - **Pipeline drill-in** — expand stages → jobs → steps with per-node **durations**,
   **failure reasons**, a scrollable **logs** pane, and open-in-browser.
+- **Pipeline approvals** — see which runs are blocked on a gate you can action
+  (red **Approval needed**), and approve / reject them without leaving the terminal
+  (GitHub, Azure DevOps, GitLab).
 - **Filter, sort, and shape** — a live quick-filter, per-column sorting, work-item
   state visibility, and pipeline subscriptions — all remembered per view.
 - **Saved views** — bundle a filter + sort + state into a named view and flip
@@ -182,10 +185,28 @@ Inside the drill-in each node shows its **duration**, and failed jobs show a sho
 
 - `Enter` — expand / collapse the selected node.
 - `L` — open a scrollable **logs** pane for the selected job (`Esc` closes).
+- `A` — approve / reject a waiting gate (see below).
 - `o` — open the selected job in the browser.
 
 For a connection that discovers many pipelines, open the config screen and press
 `s` on it to **subscribe** to just the definitions you care about.
+
+### Approvals
+
+When a run is blocked on a manual gate you can action — a **GitHub** environment
+required-reviewer, an **Azure DevOps** approval check, or a **GitLab** manual job —
+forgetop surfaces it:
+
+- The Pipelines list shows a red **Approval needed** column on that run, refreshed
+  on the normal 30-second poll (and you can opt into a desktop
+  [notification](#notifications) when a gate first appears).
+- Inside the run, a banner reads **⏸ Approval needed: {environment}**. Press `A`
+  to open a picker of Approve / Reject options per gate, then confirm.
+
+Gates are **capability-scoped**: a provider that doesn't expose approvals shows an
+explicit *"Approvals not supported on {provider}"* note instead. **Bitbucket** is
+that case — its API can't resume a paused manual step. On GitLab a reject cancels
+the manual job.
 
 ## Filtering and sorting
 
@@ -228,6 +249,8 @@ saved views last only for that session.
 forgetop raises native desktop notifications on the events you choose:
 
 - **Pipeline failed** — a run transitions into a failed state.
+- **Pipeline approval needed** — a run first starts waiting on a gate you can
+  approve.
 - **Review requested** — you're newly a requested reviewer on a PR.
 - **Your PR approved** / **changes requested** — a reviewer votes on a PR you
   authored.
@@ -306,6 +329,7 @@ the keys valid for where you are. Press `?` for the full panel. The complete set
 | `Enter` | Drill in (stages → jobs → steps) |
 | `Enter` (in drill-in) | Expand / collapse a node |
 | `L` | View the selected job's logs |
+| `A` (in drill-in) | Approve / reject a waiting gate (not supported on Bitbucket) |
 | `o` | Open the selected job in the browser |
 | `T` | Trigger a run |
 

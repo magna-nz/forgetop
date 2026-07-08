@@ -725,6 +725,20 @@ impl PipelineSource for DemoPipe {
     async fn trigger(&self, _definition_id: &str, _branch: Option<&str>) -> Result<()> {
         Ok(())
     }
+    fn supports_approvals(&self) -> bool {
+        true
+    }
+    async fn pending_approvals(&self, run_id: &str) -> Result<Vec<PipelineApproval>> {
+        // The running CI run (#501) waits on a production deployment gate you can act on.
+        Ok(if run_id == "r501" {
+            vec![PipelineApproval { id: "production".into(), name: "production".into(), can_respond: true }]
+        } else {
+            Vec::new()
+        })
+    }
+    async fn respond_approval(&self, _run_id: &str, _approval_id: &str, _decision: ApprovalDecision, _comment: Option<&str>) -> Result<()> {
+        Ok(())
+    }
 }
 
 pub struct DemoConnection {

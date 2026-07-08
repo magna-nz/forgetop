@@ -29,6 +29,11 @@ pub enum Action {
     SaveView(String),
     /// Delete the active section's current saved view.
     DeleteView,
+    /// A pipeline-approval gate was picked (index into the app's choice list);
+    /// opens a confirm before acting.
+    PickApproval { index: usize },
+    /// Confirmed: respond to the chosen pipeline-approval gate.
+    RespondApproval { index: usize },
 }
 
 /// What a [`Overlay::Toggle`] checklist is choosing.
@@ -62,6 +67,8 @@ pub enum PickerKind {
     ReviewSubmit,
     /// Choose the sort column for a section (0=PR, 1=WI, 2=Pipelines).
     SortColumn { section: usize },
+    /// Choose a pipeline-approval gate + decision; resolves to the picked index.
+    ApprovalGate,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -229,6 +236,7 @@ fn resolve_picker(kind: PickerKind, selected: usize, items: &[String]) -> Action
             Action::SubmitReview(event)
         }
         PickerKind::SortColumn { section } => Action::SetSort { section, index: selected },
+        PickerKind::ApprovalGate => Action::PickApproval { index: selected },
     }
 }
 

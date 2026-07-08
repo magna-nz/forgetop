@@ -114,7 +114,10 @@ pub fn gl_pipeline_status(status: Option<&str>) -> PipelineRunStatus {
         Some("success") => PipelineRunStatus::Succeeded,
         Some("failed") => PipelineRunStatus::Failed,
         Some("running") => PipelineRunStatus::Running,
-        Some("canceled") | Some("skipped") | Some("manual") => PipelineRunStatus::Canceled,
+        Some("canceled") | Some("skipped") => PipelineRunStatus::Canceled,
+        // A `manual` pipeline/job is blocked awaiting a manual action — surface it as
+        // pending (Queued) so it reads as in-flight and its gate can be actioned.
+        Some("manual") => PipelineRunStatus::Queued,
         _ => PipelineRunStatus::Queued,
     }
 }
@@ -476,6 +479,31 @@ impl PipelineSource for GitLabPipe {
         let url = self.0.project_path("/pipeline");
         self.0.post_json(&url, json!({ "ref": branch.unwrap_or("main") })).await
     }
+    fn supports_approvals(&self) -> bool {
+        true
+    }
+    async fn pending_approvals(&self, run_id: &str) -> Result<Vec<PipelineApproval>> {
+        // Unplayed `manual` jobs on the pipeline are the actionable gates.
+        let jobs_v = self.0.get_json(&self.0.project_path(&format!("/pipelines/{run_id}/jobs?per_page=100"))).await?;
+        Ok(jobs_v
+            .as_array()
+            .unwrap_or(&vec![])
+            .iter()
+            .filter(|j| get_str(j, "status").as_deref() == Some("manual"))
+            .filter_map(|j| {
+                let id = get_i64(j, "id")?.to_string();
+                Some(PipelineApproval { id, name: get_str(j, "name").unwrap_or_else(|| "(job)".into()), can_respond: true })
+            })
+            .collect())
+    }
+    async fn respond_approval(&self, _run_id: &str, approval_id: &str, decision: ApprovalDecision, _comment: Option<&str>) -> Result<()> {
+        // A manual job is approved by playing it, rejected by cancelling it.
+        let action = match decision {
+            ApprovalDecision::Approve => "play",
+            ApprovalDecision::Reject => "cancel",
+        };
+        self.0.post_json(&self.0.project_path(&format!("/jobs/{approval_id}/{action}")), json!({})).await
+    }
 }
 
 pub struct GitLabConnection {
@@ -570,6 +598,15 @@ impl ProviderFactory for GitLabFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn manual_status_surfaces_as_pending_not_canceled() {
+        // A manual pipeline/job is a waiting gate — must read as in-flight so the
+        // approval detection kicks in, not discarded as Canceled.
+        assert_eq!(gl_pipeline_status(Some("manual")), PipelineRunStatus::Queued);
+        assert_eq!(gl_pipeline_status(Some("canceled")), PipelineRunStatus::Canceled);
+        assert_eq!(gl_pipeline_status(Some("running")), PipelineRunStatus::Running);
+    }
 
     #[test]
     fn maps_merge_request() {
