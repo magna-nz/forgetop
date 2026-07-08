@@ -13,3 +13,7 @@ mod harness;
 
 mod gh_raw;
 mod github;
+mod gl_raw;
+mod gitlab;
+mod az_raw;
+mod azure;

@@ -63,7 +63,7 @@ async fn github_lists_pipeline_runs_and_supports_approvals() {
 async fn github_pull_request_lifecycle() {
     let gh = skip_if_none!(harness::github(), "github");
     let raw = GhRaw::from_env().expect("github raw client");
-    raw.sweep().await;
+    harness::maybe_sweep(raw.sweep()).await;
     let prefix = harness::run_prefix();
 
     // Fixture: a branch with one file, opened as a PR against the default branch.
@@ -138,7 +138,7 @@ async fn github_work_item_lifecycle() {
 async fn github_pipeline_approval_gate_lifecycle() {
     let gh = skip_if_none!(harness::github(), "github");
     let raw = GhRaw::from_env().expect("github raw client");
-    raw.sweep().await;
+    harness::maybe_sweep(raw.sweep()).await;
     let prefix = harness::run_prefix();
 
     // Fixture: an environment requiring me as reviewer + a workflow_dispatch job

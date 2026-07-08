@@ -70,6 +70,70 @@ pub fn github() -> Option<GitHubIt> {
     Some(GitHubIt { owner: owner.to_string(), repo: repo.to_string(), conn })
 }
 
+/// A live GitLab connection from `FORGETOP_IT_GITLAB_*`, or `None` to skip.
+pub struct GitLabIt {
+    pub project: String,
+    pub conn: Arc<dyn ProviderConnection>,
+}
+
+pub fn gitlab() -> Option<GitLabIt> {
+    init();
+    let token = env("FORGETOP_IT_GITLAB_TOKEN")?;
+    let project = env("FORGETOP_IT_GITLAB_PROJECT")?;
+    let base_url = env("FORGETOP_IT_GITLAB_HOST").map(|h| format!("{}/api/v4", h.trim_end_matches('/')));
+    let conn = Connection {
+        id: "it-gitlab".into(),
+        provider_type: ProviderType::GitLab,
+        display_name: "IT GitLab".into(),
+        base_url,
+        organization: None,
+        project: None,
+        repository: Some(project.clone()),
+        username: None,
+        credential_ref: None,
+    };
+    let conn = registry().create(&conn, Some(token)).ok()?;
+    Some(GitLabIt { project, conn })
+}
+
+/// A live Azure DevOps connection from `FORGETOP_IT_AZURE_*`, or `None` to skip.
+pub struct AzureIt {
+    pub org: String,
+    pub project: String,
+    pub conn: Arc<dyn ProviderConnection>,
+}
+
+pub fn azure() -> Option<AzureIt> {
+    init();
+    let pat = env("FORGETOP_IT_AZURE_PAT")?;
+    let org = env("FORGETOP_IT_AZURE_ORG")?;
+    let project = env("FORGETOP_IT_AZURE_PROJECT")?;
+    let repo = env("FORGETOP_IT_AZURE_REPO").unwrap_or_else(|| project.clone());
+    let conn = Connection {
+        id: "it-azure".into(),
+        provider_type: ProviderType::AzureDevOps,
+        display_name: "IT Azure".into(),
+        base_url: None,
+        organization: Some(org.clone()),
+        project: Some(project.clone()),
+        repository: Some(repo),
+        username: None,
+        credential_ref: None,
+    };
+    let conn = registry().create(&conn, Some(pat)).ok()?;
+    Some(AzureIt { org, project, conn })
+}
+
+/// Runs a provider's sweep future only when `FORGETOP_IT_SWEEP` is set. Sweeping
+/// deletes *all* `forgetop-it-*` fixtures, which is unsafe when CI runs concurrently
+/// (one run would nuke another's in-flight fixtures), so normal runs rely on each
+/// test's own teardown. Set the var locally or in a scheduled cleanup job.
+pub async fn maybe_sweep<F: std::future::Future<Output = ()>>(sweep: F) {
+    if env("FORGETOP_IT_SWEEP").is_some() {
+        sweep.await;
+    }
+}
+
 /// Polls `f` every 2s until it yields `Some`, or `timeout_secs` elapses (→ `None`).
 /// Used to wait on eventually-consistent API state without fixed sleeps.
 #[allow(dead_code)]
