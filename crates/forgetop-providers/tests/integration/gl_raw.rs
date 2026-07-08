@@ -83,11 +83,16 @@ impl GlRaw {
         v["iid"].as_i64().expect("issue iid")
     }
 
-    /// Creates a pipeline on `git_ref` (its `.gitlab-ci.yml` must exist there);
-    /// returns the pipeline id (the adapter's run id).
-    pub async fn create_pipeline(&self, git_ref: &str) -> i64 {
-        let v = self.send(Method::POST, &self.url("/pipeline"), Some(json!({ "ref": git_ref }))).await;
-        v["id"].as_i64().expect("pipeline id")
+    /// Creates a pipeline on `git_ref` (its `.gitlab-ci.yml` must exist there).
+    /// Returns the pipeline id, or `Err(body)` — e.g. when GitLab.com blocks CI on an
+    /// unvalidated account ("Identity verification is required"), which the caller
+    /// treats as a skip rather than a failure.
+    pub async fn create_pipeline(&self, git_ref: &str) -> Result<i64, String> {
+        let (status, text) = self.raw(Method::POST, &self.url("/pipeline"), Some(json!({ "ref": git_ref }))).await;
+        if !status.is_success() {
+            return Err(format!("{status}: {text}"));
+        }
+        Ok(serde_json::from_str::<Value>(&text).ok().and_then(|v| v["id"].as_i64()).unwrap_or_default())
     }
 
     // ---- teardown (best-effort) ----
