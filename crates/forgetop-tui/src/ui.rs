@@ -483,12 +483,17 @@ fn render_pipes(frame: &mut Frame, area: Rect, app: &mut App) {
 
     let inner_w = area.width.saturating_sub(2) as usize;
     let dim = Style::default().fg(theme.dim).add_modifier(Modifier::BOLD);
-    let headers = ["", "Provider", "Pipeline", "#", "Branch", "Started"];
+    let headers = ["", "Provider", "Pipeline", "#", "Branch", "Started", "Approval"];
     let cells: Vec<Vec<(String, Style)>> = idxs
         .iter()
         .map(|&i| &app.pipes[i])
         .map(|p| {
             let color = theme.pipeline_color(p.run.status);
+            let approval = if p.awaiting_approval {
+                ("approval needed".to_string(), Style::default().fg(theme.red).add_modifier(Modifier::BOLD))
+            } else {
+                (String::new(), Style::default().fg(theme.dim))
+            };
             vec![
                 (format!("{} {:?}", pipeline_icon(p.run.status), p.run.status), Style::default().fg(color)),
                 (format!("{} · {}", p.provider.as_str(), p.connection), Style::default().fg(theme.cyan)),
@@ -496,6 +501,7 @@ fn render_pipes(frame: &mut Frame, area: Rect, app: &mut App) {
                 (p.run.number.map(|n| format!("#{n}")).unwrap_or_default(), Style::default().fg(theme.dim)),
                 (p.run.branch.clone().unwrap_or_default(), Style::default().fg(theme.dim)),
                 (rel_age(p.run.started_at), Style::default().fg(theme.dim)),
+                approval,
             ]
         })
         .collect();
@@ -1799,6 +1805,23 @@ mod tests {
         app.screen = Screen::Pipeline(Box::new(view));
         let out = render_to_string(&mut app, 120, 30);
         assert!(out.contains("not supported on Bitbucket"), "bitbucket approvals unsupported note");
+    }
+
+    #[test]
+    fn pipelines_list_flags_approval_needed_column() {
+        let mut app = App::new("slate");
+        app.active = 2;
+        app.pipes.push(crate::app::PipeRow {
+            connection_id: "c".into(),
+            connection: "GH".into(),
+            provider: ProviderType::GitHub,
+            awaiting_approval: true,
+            run: sample_run(),
+        });
+        app.pipe_state.select(Some(0));
+        let out = render_to_string(&mut app, 150, 24);
+        assert!(out.contains("Approval"), "approval column header present");
+        assert!(out.contains("approval needed"), "the awaiting row is flagged");
     }
 
     #[test]

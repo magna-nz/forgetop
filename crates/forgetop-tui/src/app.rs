@@ -52,6 +52,8 @@ pub struct PipeRow {
     pub connection: String,
     pub provider: ProviderType,
     pub run: PipelineRun,
+    /// True when this run has a gate the authenticated user can approve/reject.
+    pub awaiting_approval: bool,
 }
 
 /// A pull request tagged with the connection it came from (for aggregation).
@@ -110,6 +112,11 @@ pub struct App {
     pipe_seen: HashMap<String, PipelineRunStatus>,
     /// Whether `pipe_seen` has been seeded (skip notifying on the first load).
     pipe_seeded: bool,
+    /// Runs currently awaiting the user's approval, keyed by (connection, run id),
+    /// so a pending gate is only notified once.
+    approval_seen: HashSet<(String, String)>,
+    /// Whether `approval_seen` has been seeded (skip notifying on the first load).
+    approval_seeded: bool,
     /// Per-PR (approved, changes-requested) flags for my PRs, keyed by
     /// (connection id, PR id) so ids can't collide across providers.
     pr_review_seen: HashMap<(String, String), (bool, bool)>,
@@ -508,6 +515,8 @@ impl App {
             view_idx: [0, 0, 0],
             notifications: NotificationPrefs::default(),
             pipe_seen: HashMap::new(),
+            approval_seen: HashSet::new(),
+            approval_seeded: false,
             pipe_seeded: false,
             pr_review_seen: HashMap::new(),
             review_req_seen: HashSet::new(),
@@ -924,6 +933,7 @@ impl App {
             ToggleItem { id: "review_requested".into(), label: "Review requested".into(), on: n.review_requested },
             ToggleItem { id: "pr_approved".into(), label: "Your PR approved".into(), on: n.pr_approved },
             ToggleItem { id: "pr_changes_requested".into(), label: "Your PR: changes requested".into(), on: n.pr_changes_requested },
+            ToggleItem { id: "pipeline_approval_needed".into(), label: "Pipeline approval needed".into(), on: n.pipeline_approval_needed },
         ];
         self.overlay =
             Some(Overlay::Toggle { title: "Notifications".into(), kind: ToggleKind::Notifications, min_one: false, items, selected: 0 });
@@ -937,9 +947,11 @@ impl App {
             review_requested: has("review_requested"),
             pr_approved: has("pr_approved"),
             pr_changes_requested: has("pr_changes_requested"),
+            pipeline_approval_needed: has("pipeline_approval_needed"),
         };
         // Re-seed silently so newly-enabled events don't fire for pre-existing state.
         self.pipe_seeded = false;
+        self.approval_seeded = false;
         self.pr_scan_seeded = false;
         let _ = deps.config.set_notifications(self.notifications).await;
         if self.notifications.any() {
@@ -1086,8 +1098,25 @@ impl App {
                     for q in feed_queries(&feed.subscription) {
                         match feed.source.list_runs(&q).await {
                             Ok(runs) => {
+                                let supports = feed.source.supports_approvals();
                                 for run in runs {
-                                    self.pipes.push(PipeRow { connection_id: conn_id.clone(), connection: name.clone(), provider, run });
+                                    // Only in-flight runs can be waiting on a gate — bound the
+                                    // extra per-run approval calls to those.
+                                    let awaiting_approval = supports
+                                        && is_active(run.status)
+                                        && feed
+                                            .source
+                                            .pending_approvals(&run.id)
+                                            .await
+                                            .map(|a| a.iter().any(|x| x.can_respond))
+                                            .unwrap_or(false);
+                                    self.pipes.push(PipeRow {
+                                        connection_id: conn_id.clone(),
+                                        connection: name.clone(),
+                                        provider,
+                                        run,
+                                        awaiting_approval,
+                                    });
                                 }
                             }
                             Err(e) => errors.push(format!("Pipelines ({name}): {e}")),
@@ -1098,6 +1127,20 @@ impl App {
             Err(e) => errors.push(format!("Pipelines: {e}")),
         }
         self.notify_pipeline_failures();
+        self.notify_pending_approvals();
+    }
+
+    /// Fires a desktop notification when a run first starts awaiting the user's
+    /// approval. Seeded silently on the first load and de-duped per (connection, run).
+    fn notify_pending_approvals(&mut self) {
+        if self.notifications.pipeline_approval_needed && self.approval_seeded {
+            for row in new_pending_approvals(&self.approval_seen, &self.pipes) {
+                notify("Approval needed", &format!("{} · {} is awaiting your approval", row.connection, pipe_label(row)));
+            }
+        }
+        self.approval_seen =
+            self.pipes.iter().filter(|r| r.awaiting_approval).map(|r| (r.connection_id.clone(), r.run.id.clone())).collect();
+        self.approval_seeded = true;
     }
 
     /// Fires a desktop notification for any run that has just entered a failed
@@ -2554,6 +2597,19 @@ fn new_pipeline_failures<'a>(prev: &HashMap<String, PipelineRunStatus>, pipes: &
         .collect()
 }
 
+/// Whether a run is still in flight (only these can be waiting on an approval gate).
+fn is_active(status: PipelineRunStatus) -> bool {
+    matches!(status, PipelineRunStatus::Queued | PipelineRunStatus::Running)
+}
+
+/// Runs awaiting the user's approval now that weren't at the previous refresh.
+fn new_pending_approvals<'a>(prev: &HashSet<(String, String)>, pipes: &'a [PipeRow]) -> Vec<&'a PipeRow> {
+    pipes
+        .iter()
+        .filter(|r| r.awaiting_approval && !prev.contains(&(r.connection_id.clone(), r.run.id.clone())))
+        .collect()
+}
+
 /// Best-effort OS notification (silently ignored if the platform refuses).
 fn notify(title: &str, body: &str) {
     let _ = notify_rust::Notification::new().summary(title).body(body).appname("forgetop").show();
@@ -3078,6 +3134,7 @@ mod tests {
             connection_id: "c".into(),
             connection: "GH".into(),
             provider: ProviderType::GitHub,
+            awaiting_approval: false,
             run: PipelineRun {
                 id: id.into(),
                 definition_id: "ci".into(),
@@ -3105,6 +3162,40 @@ mod tests {
         prev.insert("a".to_string(), PipelineRunStatus::Failed);
         prev.insert("c".to_string(), PipelineRunStatus::Running);
         assert_eq!(ids(new_pipeline_failures(&prev, &pipes)), vec!["c"]);
+    }
+
+    #[test]
+    fn detects_only_newly_pending_approvals() {
+        let row = |id: &str, awaiting: bool| PipeRow {
+            connection_id: "c".into(),
+            connection: "GH".into(),
+            provider: ProviderType::GitHub,
+            awaiting_approval: awaiting,
+            run: PipelineRun {
+                id: id.into(),
+                definition_id: "ci".into(),
+                number: None,
+                name: None,
+                status: PipelineRunStatus::Running,
+                triggered_by: None,
+                branch: None,
+                commit_sha: None,
+                started_at: None,
+                finished_at: None,
+                url: None,
+                stages: vec![],
+            },
+        };
+        let pipes = vec![row("a", true), row("b", false), row("c", true)];
+        let ids = |v: Vec<&PipeRow>| v.iter().map(|r| r.run.id.clone()).collect::<Vec<_>>();
+
+        // Nothing seen before → both awaiting runs are new.
+        assert_eq!(ids(new_pending_approvals(&HashSet::new(), &pipes)), vec!["a", "c"]);
+
+        // 'a' already known → only 'c' fires; 'b' (not awaiting) is never included.
+        let mut prev = HashSet::new();
+        prev.insert(("c".to_string(), "a".to_string()));
+        assert_eq!(ids(new_pending_approvals(&prev, &pipes)), vec!["c"]);
     }
 
     #[test]
@@ -3161,13 +3252,18 @@ mod tests {
     #[test]
     fn notifications_toggle_reflects_current_prefs() {
         let mut app = App::new("slate");
-        app.notifications =
-            NotificationPrefs { pipeline_failed: true, review_requested: false, pr_approved: true, pr_changes_requested: false };
+        app.notifications = NotificationPrefs {
+            pipeline_failed: true,
+            review_requested: false,
+            pr_approved: true,
+            pr_changes_requested: false,
+            pipeline_approval_needed: false,
+        };
         app.open_notifications_toggle();
         let Some(Overlay::Toggle { kind: ToggleKind::Notifications, items, .. }) = &app.overlay else {
             panic!("expected the notifications toggle");
         };
-        assert_eq!(items.len(), 4);
+        assert_eq!(items.len(), 5);
         let on: Vec<&str> = items.iter().filter(|i| i.on).map(|i| i.id.as_str()).collect();
         assert_eq!(on, vec!["pipeline_failed", "pr_approved"]);
     }

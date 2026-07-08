@@ -131,18 +131,30 @@ pub struct NotificationPrefs {
     pub pr_approved: bool,
     #[serde(default = "yes")]
     pub pr_changes_requested: bool,
+    #[serde(default = "yes")]
+    pub pipeline_approval_needed: bool,
 }
 
 impl Default for NotificationPrefs {
     fn default() -> Self {
-        Self { pipeline_failed: true, review_requested: true, pr_approved: true, pr_changes_requested: true }
+        Self {
+            pipeline_failed: true,
+            review_requested: true,
+            pr_approved: true,
+            pr_changes_requested: true,
+            pipeline_approval_needed: true,
+        }
     }
 }
 
 impl NotificationPrefs {
     /// True if any event is enabled.
     pub fn any(&self) -> bool {
-        self.pipeline_failed || self.review_requested || self.pr_approved || self.pr_changes_requested
+        self.pipeline_failed
+            || self.review_requested
+            || self.pr_approved
+            || self.pr_changes_requested
+            || self.pipeline_approval_needed
     }
 }
 
