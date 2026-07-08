@@ -39,6 +39,7 @@ and [azdo](https://github.com/Elpulgo/azdo) (Azure DevOps only). forgetop's angl
 | Act (approve / merge / comment) | ✅ | ✅ PRs | partial |
 | Inline line-comment review | ✅ | preview | ❌ |
 | Pipeline drill-in + logs | ✅ | ❌ | ✅ |
+| Approve pipeline gates in-terminal | ✅ | ❌ | ❌ |
 | Filter · sort · saved prefs | ✅ | ✅ | limited |
 | Cross-provider aggregation | ✅ | ❌ | ❌ |
 | Desktop notifications | ✅ | ❌ | ❌ |
