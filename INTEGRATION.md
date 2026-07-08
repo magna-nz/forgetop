@@ -108,19 +108,25 @@ Actions) — same names as the env vars above. Notes:
 
 ### Required checks & merge gating
 
-`main` has a **ruleset** ("Require tests on main", Settings → Rules → Rulesets) that
-makes both **`build · test · clippy`** and **`live provider integration`** required.
-What that means day-to-day:
+`main` has a **ruleset** ("Require tests on main", Settings → Rules → Rulesets). Only
+the fast, hermetic **`build · test · clippy`** (unit/build/clippy) check is *required*
+to merge. What that means day-to-day:
 
-- **On a PR** those two show as *Required*, and the **Merge** button stays disabled
-  until both are green — nothing merges to `main` with failing or unrun tests.
-- **Direct pushes to `main`** are effectively blocked (the commit would need already
-  passing checks), so everything goes through the PR flow.
-- **Fork PRs** skip the integration check (no secrets); GitHub treats a skipped
-  required check as satisfied, so it doesn't block — a non-issue for your own branches.
-- The ruleset uses **non-strict** status checks (`strict_required_status_checks_policy:
-  false`), so a PR needn't be rebased onto the latest `main` before merging. Flip that
-  to `true` if you want every PR up-to-date with `main` first.
+- **On a PR** the unit check must be green before the **Merge** button enables, so
+  nothing merges to `main` with failing unit tests, lint, or a broken build.
+- **`live provider integration` runs on every PR too, but is *not* required** — it's a
+  live-API suite, so it's slower and occasionally flaky (eventual consistency, rate
+  limits). Making it a hard merge gate meant a transient API hiccup could block an
+  unrelated PR. It still runs so you *see* failures; it just doesn't block the merge.
+- Integration is still the real safety net: it runs on **push to `main`** and
+  **nightly**, so a genuine regression surfaces immediately after merge, and leaked
+  fixtures get swept.
+- The ruleset is **non-strict** (`strict_required_status_checks_policy: false`), so a
+  PR needn't be rebased onto the latest `main` first. Flip to `true` if you want that.
+
+To make integration a hard PR gate instead, add `live provider integration` back to
+the ruleset's required checks (accepting that real-API flakes will occasionally block
+merges until re-run).
 
 ### Gating releases on the suite
 
