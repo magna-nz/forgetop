@@ -70,6 +70,26 @@ pub fn github() -> Option<GitHubIt> {
     Some(GitHubIt { owner: owner.to_string(), repo: repo.to_string(), conn })
 }
 
+/// Polls `f` every 2s until it yields `Some`, or `timeout_secs` elapses (→ `None`).
+/// Used to wait on eventually-consistent API state without fixed sleeps.
+#[allow(dead_code)]
+pub async fn poll<T, F, Fut>(timeout_secs: u64, mut f: F) -> Option<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Option<T>>,
+{
+    let start = std::time::Instant::now();
+    loop {
+        if let Some(v) = f().await {
+            return Some(v);
+        }
+        if start.elapsed().as_secs() >= timeout_secs {
+            return None;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+}
+
 /// Skips the current test (returns) with a note when its credentials are absent.
 #[macro_export]
 macro_rules! skip_if_none {

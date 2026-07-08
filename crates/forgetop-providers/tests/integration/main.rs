@@ -11,4 +11,5 @@
 #[macro_use]
 mod harness;
 
+mod gh_raw;
 mod github;
