@@ -35,12 +35,20 @@ impl LnRaw {
         self.query("{ viewer { id } }", json!({})).await["viewer"]["id"].as_str().unwrap_or_default().to_string()
     }
 
-    /// A team id to create issues in — `FORGETOP_IT_LINEAR_TEAM` or the first team.
+    /// A team id to create issues in. `FORGETOP_IT_LINEAR_TEAM` may be the team's id,
+    /// key, or name (resolved here); blank uses the first team.
     pub async fn team_id(&self) -> String {
-        if let Some(t) = harness::env("FORGETOP_IT_LINEAR_TEAM") {
-            return t;
+        let d = self.query("{ teams(first: 250) { nodes { id key name } } }", json!({})).await;
+        let nodes = d["teams"]["nodes"].as_array().cloned().unwrap_or_default();
+        if let Some(want) = harness::env("FORGETOP_IT_LINEAR_TEAM") {
+            if let Some(t) = nodes.iter().find(|t| {
+                [t["id"].as_str(), t["key"].as_str(), t["name"].as_str()].into_iter().flatten().any(|v| v.eq_ignore_ascii_case(&want))
+            }) {
+                return t["id"].as_str().unwrap_or_default().to_string();
+            }
+            panic!("no Linear team matches FORGETOP_IT_LINEAR_TEAM='{want}' (by id/key/name)");
         }
-        self.query("{ teams(first: 1) { nodes { id } } }", json!({})).await["teams"]["nodes"][0]["id"].as_str().expect("a team").to_string()
+        nodes.first().and_then(|t| t["id"].as_str()).expect("at least one team").to_string()
     }
 
     /// Creates an issue assigned to `assignee`; returns its id.

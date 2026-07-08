@@ -24,7 +24,7 @@ impl GhRaw {
     pub fn from_env() -> Option<Self> {
         harness::init();
         let token = harness::env("FORGETOP_IT_GITHUB_TOKEN")?;
-        let (owner, repo) = harness::env("FORGETOP_IT_GITHUB_REPO")?.split_once('/').map(|(o, r)| (o.to_string(), r.to_string()))?;
+        let (owner, repo) = harness::github_owner_repo()?;
         let base = harness::env("FORGETOP_IT_GITHUB_HOST").unwrap_or_else(|| "https://api.github.com".into());
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(reqwest::header::USER_AGENT, "forgetop-it".parse().unwrap());

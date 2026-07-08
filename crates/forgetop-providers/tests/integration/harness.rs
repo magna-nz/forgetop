@@ -50,24 +50,35 @@ pub struct GitHubIt {
     pub conn: Arc<dyn ProviderConnection>,
 }
 
+/// Parses `FORGETOP_IT_GITHUB_REPO` — accepts `owner/repo`, a full
+/// `https://github.com/owner/repo[.git]` URL, or `git@…:owner/repo`.
+pub fn github_owner_repo() -> Option<(String, String)> {
+    let raw = env("FORGETOP_IT_GITHUB_REPO")?;
+    let cleaned = raw.trim().trim_end_matches('/').trim_end_matches(".git");
+    let parts: Vec<&str> = cleaned.split('/').filter(|p| !p.is_empty() && !p.contains(':') && *p != "github.com").collect();
+    match parts.as_slice() {
+        [.., owner, repo] => Some((owner.to_string(), repo.to_string())),
+        _ => None,
+    }
+}
+
 pub fn github() -> Option<GitHubIt> {
     init();
     let token = env("FORGETOP_IT_GITHUB_TOKEN")?;
-    let full = env("FORGETOP_IT_GITHUB_REPO")?; // owner/repo
-    let (owner, repo) = full.split_once('/')?;
+    let (owner, repo) = github_owner_repo()?;
     let conn = Connection {
         id: "it-github".into(),
         provider_type: ProviderType::GitHub,
         display_name: "IT GitHub".into(),
         base_url: env("FORGETOP_IT_GITHUB_HOST"),
-        organization: Some(owner.to_string()),
+        organization: Some(owner.clone()),
         project: None,
-        repository: Some(repo.to_string()),
+        repository: Some(repo.clone()),
         username: None,
         credential_ref: None,
     };
     let conn = registry().create(&conn, Some(token)).ok()?;
-    Some(GitHubIt { owner: owner.to_string(), repo: repo.to_string(), conn })
+    Some(GitHubIt { owner, repo, conn })
 }
 
 /// A live GitLab connection from `FORGETOP_IT_GITLAB_*`, or `None` to skip.
