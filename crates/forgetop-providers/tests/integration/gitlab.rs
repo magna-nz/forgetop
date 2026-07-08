@@ -37,7 +37,13 @@ async fn gitlab_merge_request_lifecycle() {
     let list = prs.list(&PullRequestQuery::default()).await.expect("list");
     assert!(list.iter().any(|p| p.id == id), "created MR appears in the list");
     assert_eq!(prs.get(&id).await.expect("get").id, id);
-    assert!(!prs.commits(&id).await.expect("commits").is_empty());
+    // GitLab can lag on computing a fresh MR's commit list — poll rather than assume.
+    let has_commits = {
+        let prs = &prs;
+        let id = id.as_str();
+        harness::poll(20, move || async move { prs.commits(id).await.ok().filter(|c| !c.is_empty()).map(|_| ()) }).await
+    };
+    assert!(has_commits.is_some(), "the MR reports its commit");
 
     prs.add_comment(&id, &format!("{prefix} comment")).await.expect("comment");
     let threads = prs.threads(&id).await.expect("threads");
