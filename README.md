@@ -108,6 +108,9 @@ forgetop
 The wizard stores your token in the OS keychain and binds the connection to a
 section. Press **`C`** any time to manage connections and bindings.
 
+If something isn't connecting, run `forgetop doctor` — it checks your config,
+keychain access, and each connection's token + connectivity.
+
 ## Documentation
 
 forgetop shows a **context-aware key glossary** along the bottom, so you rarely

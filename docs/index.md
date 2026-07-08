@@ -118,6 +118,19 @@ forgetop
 Press **`C`** any time to open the config screen and manage connections and
 bindings; **`n`** starts the wizard again; **`?`** shows every keybinding.
 
+### Diagnosing setup
+
+If a connection isn't working, run the diagnostic — it checks the config location,
+keychain access, and each connection's token + connectivity, without opening the UI:
+
+```sh
+forgetop doctor
+```
+
+It prints a line per connection (`✓` healthy, `⚠` no token, `✗` token present but
+auth failed), so you can see at a glance whether it's a missing token, a bad scope,
+or an expired credential.
+
 ## Pull Requests
 
 The Pull Requests tab is **browse-and-open**: the list is for finding a PR; every
