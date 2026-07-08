@@ -1363,7 +1363,7 @@ fn help_sections() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
                 ("Enter", "Drill in (stages → jobs → steps)"),
                 ("Enter (in drill-in)", "Expand / collapse a node"),
                 ("L", "View the selected job's logs"),
-                ("A", "Approve / reject a waiting gate (GitHub; not on Bitbucket)"),
+                ("A", "Approve / reject a waiting gate (not supported on Bitbucket)"),
                 ("o", "Open the selected job in the browser"),
                 ("T", "Trigger a run"),
             ],

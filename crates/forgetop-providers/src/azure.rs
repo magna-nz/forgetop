@@ -360,6 +360,43 @@ impl AzureClient {
             })
             .collect()
     }
+
+    /// Pending approval gates on a build run, read from its timeline.
+    async fn approval_gates(&self, run_id: &str) -> Result<Vec<PipelineApproval>> {
+        let url = format!("{}/{}/_apis/build/builds/{run_id}/timeline?{API}", self.base, self.project);
+        let v = self.get_json(&url).await?;
+        Ok(approval_gates_from_timeline(get_arr(&v, "records")))
+    }
+}
+
+/// Extracts pending approval checkpoints from a build timeline. A record of type
+/// `Checkpoint.Approval` carries the approval id as its `id`; its enclosing Stage
+/// gives the gate a human label.
+fn approval_gates_from_timeline(records: &[Value]) -> Vec<PipelineApproval> {
+    use std::collections::HashMap;
+    let by_id: HashMap<String, &Value> = records.iter().filter_map(|r| get_str(r, "id").map(|id| (id, r))).collect();
+    records
+        .iter()
+        .filter(|r| get_str(r, "type").as_deref() == Some("Checkpoint.Approval"))
+        .filter(|r| get_str(r, "state").as_deref() != Some("completed"))
+        .filter_map(|r| {
+            let id = get_str(r, "id")?;
+            let name = enclosing_stage_name(&by_id, r).unwrap_or_else(|| "approval".into());
+            Some(PipelineApproval { id, name, can_respond: true })
+        })
+        .collect()
+}
+
+/// Walks `parentId` up from a record to the enclosing Stage record's name.
+fn enclosing_stage_name(by_id: &std::collections::HashMap<String, &Value>, rec: &Value) -> Option<String> {
+    let mut cur = rec;
+    for _ in 0..6 {
+        if get_str(cur, "type").as_deref() == Some("Stage") {
+            return get_str(cur, "name");
+        }
+        cur = by_id.get(&get_str(cur, "parentId")?)?;
+    }
+    None
 }
 
 fn urlencoding(s: &str) -> String {
@@ -586,6 +623,25 @@ impl PipelineSource for AzurePipe {
         };
         self.0.post_json_read(&format!("{}/{}/_apis/build/builds?{API}", self.0.base, self.0.project), body).await.map(|_| ())
     }
+    fn supports_approvals(&self) -> bool {
+        true
+    }
+    async fn pending_approvals(&self, run_id: &str) -> Result<Vec<PipelineApproval>> {
+        self.0.approval_gates(run_id).await
+    }
+    async fn respond_approval(&self, _run_id: &str, approval_id: &str, decision: ApprovalDecision, comment: Option<&str>) -> Result<()> {
+        let status = match decision {
+            ApprovalDecision::Approve => "approved",
+            ApprovalDecision::Reject => "rejected",
+        };
+        let url = format!("{}/{}/_apis/pipelines/approvals?{API}", self.0.base, self.0.project);
+        let body = json!([{ "approvalId": approval_id, "status": status, "comment": comment.unwrap_or("") }]);
+        let resp = self.0.http.patch(&url).json(&body).send().await.map_err(prov)?;
+        if !resp.status().is_success() {
+            return Err(Error::Provider(format!("PATCH {url} -> {}", resp.status())));
+        }
+        Ok(())
+    }
 }
 
 pub struct AzureConnection {
@@ -668,6 +724,27 @@ impl ProviderFactory for AzureDevOpsFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn approval_gates_from_timeline_picks_pending_with_stage_name() {
+        // Stage → Checkpoint → Checkpoint.Approval (one pending, one already completed).
+        let records: Value = serde_json::from_str(
+            r#"[
+                { "id": "stage1", "type": "Stage", "name": "Deploy prod", "parentId": null },
+                { "id": "chk1", "type": "Checkpoint", "parentId": "stage1" },
+                { "id": "appr-uuid-1", "type": "Checkpoint.Approval", "state": "inProgress", "parentId": "chk1" },
+                { "id": "stage2", "type": "Stage", "name": "Deploy staging", "parentId": null },
+                { "id": "chk2", "type": "Checkpoint", "parentId": "stage2" },
+                { "id": "appr-uuid-2", "type": "Checkpoint.Approval", "state": "completed", "parentId": "chk2" }
+            ]"#,
+        )
+        .unwrap();
+        let gates = approval_gates_from_timeline(records.as_array().unwrap());
+        assert_eq!(gates.len(), 1, "only the pending gate");
+        assert_eq!(gates[0].id, "appr-uuid-1");
+        assert_eq!(gates[0].name, "Deploy prod");
+        assert!(gates[0].can_respond);
+    }
 
     #[test]
     fn maps_votes_both_ways() {
