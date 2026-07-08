@@ -117,8 +117,16 @@ async fn github_work_item_lifecycle() {
 
     let wi = gh.conn.work_items().expect("github work items");
 
-    let list = wi.list(&WorkItemQuery { mine_only: true, ..Default::default() }).await.expect("list work items");
-    assert!(list.iter().any(|w| w.id == id), "the assigned issue appears in the mine-only list");
+    // GitHub's assignee filter can lag a second or two behind creation.
+    let found = {
+        let wi = &wi;
+        let id = id.as_str();
+        harness::poll(20, move || async move {
+            wi.list(&WorkItemQuery { mine_only: true, ..Default::default() }).await.ok().filter(|l| l.iter().any(|w| w.id == id)).map(|_| ())
+        })
+        .await
+    };
+    assert!(found.is_some(), "the assigned issue appears in the mine-only list");
     assert_eq!(wi.get(&id).await.expect("get").id, id);
 
     let states = wi.available_states(&id).await.expect("available states");

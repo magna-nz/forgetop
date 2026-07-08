@@ -63,13 +63,13 @@ impl AzRaw {
 
     /// The authenticated user's unique name (email), for AssignedTo.
     pub async fn me_unique(&self) -> String {
-        let v = self.send(Method::GET, &format!("{}/_apis/connectionData?{API}", self.base), None).await;
+        let v = self.send(Method::GET, &format!("{}/_apis/connectionData?api-version=7.1-preview", self.base), None).await;
         v["authenticatedUser"]["uniqueName"].as_str().unwrap_or_default().to_string()
     }
 
     /// The authenticated user's identity id (GUID), for approval-check approvers.
     pub async fn me_id(&self) -> String {
-        let v = self.send(Method::GET, &format!("{}/_apis/connectionData?{API}", self.base), None).await;
+        let v = self.send(Method::GET, &format!("{}/_apis/connectionData?api-version=7.1-preview", self.base), None).await;
         v["authenticatedUser"]["id"].as_str().unwrap_or_default().to_string()
     }
 
@@ -115,12 +115,13 @@ impl AzRaw {
         v["pullRequestId"].as_i64().expect("pullRequestId")
     }
 
-    /// Creates a $Task work item assigned to `assignee`; returns its id.
+    /// Creates a $Task work item, assigned to `assignee` when non-empty; returns its id.
     pub async fn create_work_item(&self, title: &str, assignee: &str) -> i64 {
-        let patch = json!([
-            { "op": "add", "path": "/fields/System.Title", "value": title },
-            { "op": "add", "path": "/fields/System.AssignedTo", "value": assignee }
-        ]);
+        let mut patch = vec![json!({ "op": "add", "path": "/fields/System.Title", "value": title })];
+        if !assignee.is_empty() {
+            patch.push(json!({ "op": "add", "path": "/fields/System.AssignedTo", "value": assignee }));
+        }
+        let patch = Value::Array(patch);
         let url = self.proj(&format!("/_apis/wit/workitems/$Task?{API}"));
         let (status, text) = self.raw(Method::POST, &url, Some(patch), "application/json-patch+json").await;
         assert!(status.is_success(), "create work item -> {status}: {text}");
