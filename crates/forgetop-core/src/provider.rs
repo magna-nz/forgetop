@@ -206,6 +206,13 @@ pub trait PipelineSource: Send + Sync {
     fn supports_approvals(&self) -> bool {
         false
     }
+    /// Whether the app can actually submit an approve/reject decision. Providers may
+    /// be able to *surface* a pending gate (`supports_approvals`) without being able
+    /// to act on it — e.g. Azure DevOps, where the pending environment check isn't
+    /// exposed as an actionable approval resource. Defaults to `supports_approvals()`.
+    fn can_respond_to_approvals(&self) -> bool {
+        self.supports_approvals()
+    }
     /// Gates on a run that are waiting for a decision. Empty by default (unsupported).
     async fn pending_approvals(&self, _run_id: &str) -> Result<Vec<PipelineApproval>> {
         Ok(Vec::new())

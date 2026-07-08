@@ -769,7 +769,7 @@ fn footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
             return vec![("↑↓", "scroll"), ("PgUp/Dn", "jump"), ("Esc", "close logs")];
         }
         let mut keys = vec![("↑↓", "move"), ("↵", "expand"), ("L", "logs")];
-        if !v.actionable_approvals().is_empty() {
+        if v.can_respond_approvals && !v.actionable_approvals().is_empty() {
             keys.push(("A", "approve"));
         }
         keys.extend([("T", "trigger"), ("o", "open job"), ("Esc", "back"), ("q", "quit")]);
@@ -1186,9 +1186,16 @@ fn approval_banner<'a>(theme: &Theme, view: &PipelineView) -> Option<Line<'a>> {
         return Some(Line::from(Span::styled(format!("  ⏸ Waiting on others: {names}"), Style::default().fg(theme.dim))));
     }
     let names = actionable.iter().map(|a| a.name.clone()).collect::<Vec<_>>().join(", ");
+    // The gate is still surfaced when the provider is view-only (Azure) — just
+    // without the "press A" hint, since we can't submit the decision here.
+    let hint = if view.can_respond_approvals {
+        "   press A to approve / reject"
+    } else {
+        "   view-only — approve in the provider's UI"
+    };
     Some(Line::from(vec![
         Span::styled(format!("  ⏸ Approval needed: {names}"), Style::default().fg(theme.red).add_modifier(Modifier::BOLD)),
-        Span::styled("   press A to approve / reject", Style::default().fg(theme.dim)),
+        Span::styled(hint, Style::default().fg(theme.dim)),
     ]))
 }
 
@@ -1363,7 +1370,7 @@ fn help_sections() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
                 ("Enter", "Drill in (stages → jobs → steps)"),
                 ("Enter (in drill-in)", "Expand / collapse a node"),
                 ("L", "View the selected job's logs"),
-                ("A", "Approve / reject a waiting gate (not supported on Bitbucket)"),
+                ("A", "Approve / reject a waiting gate (GitHub, GitLab; Azure is view-only)"),
                 ("o", "Open the selected job in the browser"),
                 ("T", "Trigger a run"),
             ],
@@ -1793,11 +1800,12 @@ mod tests {
         let mut app = App::new("slate");
         let mut view = PipelineView::new("CI #101".into(), sample_run(), "demo".into(), ProviderType::GitHub, "ci".into(), None);
         view.supports_approvals = true;
+        view.can_respond_approvals = true;
         view.approvals = vec![PipelineApproval { id: "prod".into(), name: "production".into(), can_respond: true }];
         app.screen = Screen::Pipeline(Box::new(view));
         let out = render_to_string(&mut app, 120, 30);
         assert!(out.contains("Approval needed") && out.contains("production"), "actionable gate banner");
-        assert!(out.contains("approve"), "footer advertises the approve key");
+        assert!(out.contains("press A") && out.contains("approve"), "actionable footer + press-A hint");
 
         // A Bitbucket run → explicit unsupported note.
         let mut app = App::new("slate");
@@ -1805,6 +1813,21 @@ mod tests {
         app.screen = Screen::Pipeline(Box::new(view));
         let out = render_to_string(&mut app, 120, 30);
         assert!(out.contains("not supported on Bitbucket"), "bitbucket approvals unsupported note");
+    }
+
+    #[test]
+    fn view_only_provider_shows_gate_without_approve_action() {
+        // Azure: surfaces the pending gate but no `A` action (respond isn't possible).
+        let mut app = App::new("slate");
+        let mut view = PipelineView::new("Deploy".into(), sample_run(), "az".into(), ProviderType::AzureDevOps, "ci".into(), None);
+        view.supports_approvals = true;
+        view.can_respond_approvals = false;
+        view.approvals = vec![PipelineApproval { id: "prod".into(), name: "production".into(), can_respond: true }];
+        app.screen = Screen::Pipeline(Box::new(view));
+        let out = render_to_string(&mut app, 120, 30);
+        assert!(out.contains("Approval needed") && out.contains("production"), "gate still surfaced");
+        assert!(out.contains("view-only"), "banner marks it view-only");
+        assert!(!out.contains("press A"), "no press-A hint when view-only");
     }
 
     #[test]

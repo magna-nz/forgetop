@@ -300,8 +300,11 @@ pub struct PipelineView {
     pub selected: usize,
     /// Open log pane over a selected job, if any.
     pub logs: Option<LogView>,
-    /// Whether this run's provider can surface/act on approvals.
+    /// Whether this run's provider can surface pending approvals.
     pub supports_approvals: bool,
+    /// Whether the app can actually submit an approve/reject here (false = view-only,
+    /// e.g. Azure — we show the gate but can't act on it).
+    pub can_respond_approvals: bool,
     /// Gates on this run currently awaiting a decision.
     pub approvals: Vec<PipelineApproval>,
 }
@@ -319,6 +322,7 @@ impl PipelineView {
             selected: 0,
             logs: None,
             supports_approvals: false,
+            can_respond_approvals: false,
             approvals: Vec::new(),
         }
     }
@@ -1689,18 +1693,20 @@ impl App {
         // Enrich with full stages/jobs/steps via get_run (list_runs may be shallow),
         // plus any pending approval gates.
         let feeds = deps.sections.pipeline_feeds().await.unwrap_or_default();
-        let (run, supports_approvals, approvals) = match feeds.iter().find(|f| f.connection.connection_id() == conn_id) {
+        let (run, supports_approvals, can_respond, approvals) = match feeds.iter().find(|f| f.connection.connection_id() == conn_id) {
             Some(feed) => {
                 let run = feed.source.get_run(&run_id).await.unwrap_or(fallback);
                 let supports = feed.source.supports_approvals();
+                let can_respond = feed.source.can_respond_to_approvals();
                 let approvals = if supports { feed.source.pending_approvals(&run_id).await.unwrap_or_default() } else { Vec::new() };
-                (run, supports, approvals)
+                (run, supports, can_respond, approvals)
             }
-            None => (fallback, false, Vec::new()),
+            None => (fallback, false, false, Vec::new()),
         };
 
         let mut view = PipelineView::new(title, run, conn_id, provider, definition_id, branch);
         view.supports_approvals = supports_approvals;
+        view.can_respond_approvals = can_respond;
         view.approvals = approvals;
         self.screen = Screen::Pipeline(Box::new(view));
     }
@@ -1729,6 +1735,10 @@ impl App {
         let Screen::Pipeline(v) = &self.screen else { return };
         if !v.supports_approvals {
             self.toast = Some("Approvals aren't supported on this provider".into());
+            return;
+        }
+        if !v.can_respond_approvals {
+            self.toast = Some(format!("Approvals are view-only for {} — approve in the browser", v.provider.as_str()));
             return;
         }
         let actionable = v.actionable_approvals();
@@ -3090,6 +3100,7 @@ mod tests {
         let mut app = App::new("slate");
         let mut view = PipelineView::new("CI".into(), failed_run(), "c".into(), ProviderType::GitHub, "ci".into(), None);
         view.supports_approvals = true;
+        view.can_respond_approvals = true;
         view.approvals = vec![
             PipelineApproval { id: "prod".into(), name: "production".into(), can_respond: true },
             PipelineApproval { id: "stg".into(), name: "staging".into(), can_respond: false },

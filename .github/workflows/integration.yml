@@ -1,0 +1,52 @@
+name: Integration
+
+# Live provider integration tests. Runs on every (non-fork) PR, on push to main,
+# and on release tags as a gate. A nightly run sweeps any leaked fixtures.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  schedule:
+    - cron: "0 3 * * *" # nightly cleanup sweep
+  workflow_dispatch:
+
+concurrency:
+  group: integration-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  integration:
+    name: live provider integration
+    runs-on: ubuntu-latest
+    # Fork PRs can't read secrets — skip rather than fail. Same-repo PRs, main,
+    # tags, schedule and manual runs proceed.
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    env:
+      FORGETOP_IT_GITHUB_TOKEN: ${{ secrets.FORGETOP_IT_GITHUB_TOKEN }}
+      FORGETOP_IT_GITHUB_REPO: ${{ secrets.FORGETOP_IT_GITHUB_REPO }}
+      FORGETOP_IT_GITLAB_TOKEN: ${{ secrets.FORGETOP_IT_GITLAB_TOKEN }}
+      FORGETOP_IT_GITLAB_PROJECT: ${{ secrets.FORGETOP_IT_GITLAB_PROJECT }}
+      FORGETOP_IT_AZURE_PAT: ${{ secrets.FORGETOP_IT_AZURE_PAT }}
+      FORGETOP_IT_AZURE_ORG: ${{ secrets.FORGETOP_IT_AZURE_ORG }}
+      FORGETOP_IT_AZURE_PROJECT: ${{ secrets.FORGETOP_IT_AZURE_PROJECT }}
+      FORGETOP_IT_AZURE_REPO: ${{ secrets.FORGETOP_IT_AZURE_REPO }}
+      FORGETOP_IT_LINEAR_KEY: ${{ secrets.FORGETOP_IT_LINEAR_KEY }}
+      FORGETOP_IT_LINEAR_TEAM: ${{ secrets.FORGETOP_IT_LINEAR_TEAM }}
+      FORGETOP_IT_JIRA_TOKEN: ${{ secrets.FORGETOP_IT_JIRA_TOKEN }}
+      FORGETOP_IT_JIRA_EMAIL: ${{ secrets.FORGETOP_IT_JIRA_EMAIL }}
+      FORGETOP_IT_JIRA_SITE: ${{ secrets.FORGETOP_IT_JIRA_SITE }}
+      FORGETOP_IT_JIRA_PROJECT: ${{ secrets.FORGETOP_IT_JIRA_PROJECT }}
+      # The nightly schedule sweeps leaked fixtures; other runs rely on teardown.
+      FORGETOP_IT_SWEEP: ${{ github.event_name == 'schedule' && '1' || '' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Integration tests (serial — shared fixtures)
+        run: cargo test -p forgetop-providers --features integration -- --nocapture --test-threads=1

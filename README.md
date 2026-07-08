@@ -126,7 +126,8 @@ cargo clippy      # lint
 cargo run -- --demo
 ```
 
-See [How it works](https://magna-nz.github.io/forgetop/#how-it-works) for the crate layout.
+See [How it works](https://magna-nz.github.io/forgetop/#how-it-works) for the crate layout,
+and [INTEGRATION.md](INTEGRATION.md) for the live provider integration tests.
 
 ## License
 

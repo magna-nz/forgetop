@@ -426,7 +426,10 @@ impl WorkItemSource for GitHubWi {
         let state = if query.include_completed { "all" } else { "open" };
         let mut url = self.0.repo_path(&format!("/issues?state={state}&per_page={}", query.limit.unwrap_or(50)));
         if query.mine_only {
-            url.push_str("&assignee=@me");
+            // The repo issues endpoint rejects `@me` (422) — it needs the actual login.
+            if let Some(login) = self.0.self_login().await? {
+                url.push_str(&format!("&assignee={login}"));
+            }
         }
         let v = self.0.get_json(&url).await?;
         Ok(v.as_array().unwrap_or(&vec![]).iter().filter(|e| !is_pull_request(e)).map(map_issue).collect())

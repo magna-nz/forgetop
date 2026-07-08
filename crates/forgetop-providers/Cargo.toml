@@ -15,5 +15,22 @@ base64.workspace = true
 similar.workspace = true
 tokio.workspace = true
 
+[features]
+# Opt-in live integration tests that hit real provider APIs. Off by default so
+# `cargo test` stays hermetic; enable with `--features integration` (needs creds).
+integration = []
+
 [dev-dependencies]
 tokio.workspace = true
+forgetop-core.workspace = true
+serde_json.workspace = true
+dotenvy.workspace = true
+uuid.workspace = true
+reqwest.workspace = true
+base64.workspace = true
+
+# Live integration suite — only built when the `integration` feature is on.
+[[test]]
+name = "integration"
+path = "tests/integration/main.rs"
+required-features = ["integration"]

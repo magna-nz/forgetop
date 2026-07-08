@@ -305,7 +305,7 @@ impl AzureClient {
     async fn self_id(&self) -> Result<Option<String>> {
         let mut guard = self.self_id.lock().await;
         if guard.is_none() {
-            let v = self.get_json(&format!("{}/_apis/connectionData?{API}", self.base)).await?;
+            let v = self.get_json(&format!("{}/_apis/connectionData?api-version=7.1-preview", self.base)).await?;
             *guard = get_obj(&v, "authenticatedUser").and_then(|u| get_str(u, "id"));
         }
         Ok(guard.clone())
@@ -626,6 +626,12 @@ impl PipelineSource for AzurePipe {
     fn supports_approvals(&self) -> bool {
         true
     }
+    // Azure can surface a pending environment approval (via the run timeline) but the
+    // check isn't exposed as an actionable `pipelines/approvals` resource, so we can't
+    // submit the decision — approve/reject is view-only, done in the Azure UI.
+    fn can_respond_to_approvals(&self) -> bool {
+        false
+    }
     async fn pending_approvals(&self, run_id: &str) -> Result<Vec<PipelineApproval>> {
         self.0.approval_gates(run_id).await
     }
@@ -675,7 +681,7 @@ impl ProviderConnection for AzureConnection {
         Some(Arc::new(AzurePipe(self.client.clone())))
     }
     async fn check(&self) -> bool {
-        self.client.get_json(&format!("{}/_apis/connectionData?{API}", self.client.base)).await.is_ok()
+        self.client.get_json(&format!("{}/_apis/connectionData?api-version=7.1-preview", self.client.base)).await.is_ok()
     }
 }
 
