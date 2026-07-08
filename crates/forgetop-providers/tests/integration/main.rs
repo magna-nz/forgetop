@@ -17,3 +17,7 @@ mod gl_raw;
 mod gitlab;
 mod az_raw;
 mod azure;
+mod ln_raw;
+mod linear;
+mod jira_raw;
+mod jira;

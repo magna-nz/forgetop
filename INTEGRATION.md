@@ -64,28 +64,24 @@ crashed test can't leak.
 | Token | PAT with **Full access** (it's throwaway). |
 | Env | `FORGETOP_IT_AZURE_PAT`, `FORGETOP_IT_AZURE_ORG`, `FORGETOP_IT_AZURE_PROJECT`, `FORGETOP_IT_AZURE_REPO` |
 
-**Azure approval test — one-time pipeline setup.** Azure can't create an environment
-+ approval check + pipeline definition cleanly via API, so the approval test queues a
-pipeline you create **once** and set `FORGETOP_IT_AZURE_PIPELINE_ID` to its numeric
-id (blank ⇒ that one test skips; PR + work-item tests still run):
+The Azure approval test is **fully self-contained**: it pushes a gated YAML pipeline,
+creates the environment + Approval check (you as approver) + pipeline definition,
+queues a run, approves via the adapter, then deletes all of it. Nothing to pre-make —
+just the org/project/repo container and a Full-access PAT.
 
-1. In the project, add a YAML pipeline (`azure-pipelines.yml`) whose **first stage**
-   deploys to an **Environment** — e.g.
-   ```yaml
-   stages:
-     - stage: gate
-       jobs:
-         - deployment: approve
-           environment: forgetop-it-gate
-           strategy: { runOnce: { deploy: { steps: [ { script: echo approved } ] } } }
-   ```
-2. On that environment (Pipelines → Environments → forgetop-it-gate) add an
-   **Approvals** check with **you** as approver.
-3. Copy the pipeline's id (Pipelines → the pipeline → the `definitionId=` in the URL)
-   into `FORGETOP_IT_AZURE_PIPELINE_ID`.
+### Linear (work items only)
+| | |
+| --- | --- |
+| Container | A workspace; a team (its id is auto-detected, or pin one with `FORGETOP_IT_LINEAR_TEAM`). |
+| Token | Personal API key (Settings → Security & access → API). |
+| Env | `FORGETOP_IT_LINEAR_KEY`, `FORGETOP_IT_LINEAR_TEAM` (optional) |
 
-The test queues a run, waits for the gate, approves via the adapter, and deletes the
-run — so it's still self-cleaning, it just reuses the one gated pipeline.
+### Jira (work items only)
+| | |
+| --- | --- |
+| Container | A project with a **Task** issue type; note its **key** (e.g. `IT`). |
+| Token | API token (id.atlassian.com → API tokens) + your account **email**. |
+| Env | `FORGETOP_IT_JIRA_TOKEN`, `FORGETOP_IT_JIRA_EMAIL`, `FORGETOP_IT_JIRA_SITE` (`https://you.atlassian.net`), `FORGETOP_IT_JIRA_PROJECT` (key) |
 
 ## 3. Run it
 

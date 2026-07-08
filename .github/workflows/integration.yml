@@ -36,7 +36,12 @@ jobs:
       FORGETOP_IT_AZURE_ORG: ${{ secrets.FORGETOP_IT_AZURE_ORG }}
       FORGETOP_IT_AZURE_PROJECT: ${{ secrets.FORGETOP_IT_AZURE_PROJECT }}
       FORGETOP_IT_AZURE_REPO: ${{ secrets.FORGETOP_IT_AZURE_REPO }}
-      FORGETOP_IT_AZURE_PIPELINE_ID: ${{ secrets.FORGETOP_IT_AZURE_PIPELINE_ID }}
+      FORGETOP_IT_LINEAR_KEY: ${{ secrets.FORGETOP_IT_LINEAR_KEY }}
+      FORGETOP_IT_LINEAR_TEAM: ${{ secrets.FORGETOP_IT_LINEAR_TEAM }}
+      FORGETOP_IT_JIRA_TOKEN: ${{ secrets.FORGETOP_IT_JIRA_TOKEN }}
+      FORGETOP_IT_JIRA_EMAIL: ${{ secrets.FORGETOP_IT_JIRA_EMAIL }}
+      FORGETOP_IT_JIRA_SITE: ${{ secrets.FORGETOP_IT_JIRA_SITE }}
+      FORGETOP_IT_JIRA_PROJECT: ${{ secrets.FORGETOP_IT_JIRA_PROJECT }}
       # The nightly schedule sweeps leaked fixtures; other runs rely on teardown.
       FORGETOP_IT_SWEEP: ${{ github.event_name == 'schedule' && '1' || '' }}
     steps:

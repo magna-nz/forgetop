@@ -67,6 +67,18 @@ impl AzRaw {
         v["authenticatedUser"]["uniqueName"].as_str().unwrap_or_default().to_string()
     }
 
+    /// The authenticated user's identity id (GUID), for approval-check approvers.
+    pub async fn me_id(&self) -> String {
+        let v = self.send(Method::GET, &format!("{}/_apis/connectionData?{API}", self.base), None).await;
+        v["authenticatedUser"]["id"].as_str().unwrap_or_default().to_string()
+    }
+
+    /// The repo's id (GUID), for pipeline-definition creation.
+    pub async fn repo_id(&self) -> String {
+        let v = self.send(Method::GET, &self.git(&format!("?{API}")), None).await;
+        v["id"].as_str().unwrap_or_default().to_string()
+    }
+
     /// (default branch name, its tip commit sha).
     pub async fn default_branch(&self) -> (String, String) {
         let repo = self.send(Method::GET, &self.git(&format!("?{API}")), None).await;
@@ -79,8 +91,9 @@ impl AzRaw {
 
     // ---- fixture creation ----
 
-    /// Creates `branch` from `base_sha` with a single added file (one push).
-    pub async fn create_branch_with_file(&self, branch: &str, base_sha: &str, path: &str, content: &str, message: &str) {
+    /// Pushes a single added file to `branch` (whose current tip is `base_sha`).
+    /// Works both to create a new branch and to add a commit to an existing one.
+    pub async fn push_file(&self, branch: &str, base_sha: &str, path: &str, content: &str, message: &str) {
         let body = json!({
             "refUpdates": [{ "name": format!("refs/heads/{branch}"), "oldObjectId": base_sha }],
             "commits": [{
@@ -114,10 +127,72 @@ impl AzRaw {
         serde_json::from_str::<Value>(&text).unwrap()["id"].as_i64().expect("work item id")
     }
 
-    /// Queues a run of a pre-created pipeline; returns the build/run id.
+    /// Queues a run of a pipeline; returns the build/run id.
     pub async fn queue_pipeline(&self, pipeline_id: &str) -> String {
         let v = self.send(Method::POST, &self.proj(&format!("/_apis/pipelines/{pipeline_id}/runs?{API}")), Some(json!({}))).await;
         v["id"].as_i64().map(|n| n.to_string()).expect("run id")
+    }
+
+    /// Creates a deployment environment; returns its id.
+    pub async fn create_environment(&self, name: &str) -> i64 {
+        let v = self.send(Method::POST, &self.proj(&format!("/_apis/distributedtask/environments?{API}")), Some(json!({ "name": name, "description": "forgetop integration fixture" }))).await;
+        v["id"].as_i64().expect("environment id")
+    }
+
+    /// Adds an Approval check to an environment with `approver_id` as sole approver.
+    pub async fn add_approval_check(&self, env_id: i64, env_name: &str, approver_id: &str) -> i64 {
+        let body = json!({
+            "type": { "id": "8c6f20a7-a545-4486-9777-f762fafe0d4d", "name": "Approval" },
+            "settings": {
+                "approvers": [{ "id": approver_id }],
+                "executionOrder": "anyOrder",
+                "minRequiredApprovers": 1,
+                "instructions": "forgetop integration",
+                "blockedApprovers": []
+            },
+            "timeout": 43200,
+            "resource": { "type": "environment", "id": env_id.to_string(), "name": env_name }
+        });
+        let v = self.send(Method::POST, &self.proj("/_apis/pipelines/checks/configurations?api-version=7.1-preview.1"), Some(body)).await;
+        v["id"].as_i64().expect("check id")
+    }
+
+    /// Creates a YAML pipeline definition pointing at `yaml_path` in the repo;
+    /// returns the definition id.
+    pub async fn create_pipeline_def(&self, name: &str, yaml_path: &str, repo_id: &str, repo_name: &str) -> String {
+        let body = json!({
+            "name": name,
+            "folder": "\\",
+            "configuration": {
+                "type": "yaml",
+                "path": yaml_path,
+                "repository": { "id": repo_id, "name": repo_name, "type": "azureReposGit" }
+            }
+        });
+        let v = self.send(Method::POST, &self.proj(&format!("/_apis/pipelines?{API}")), Some(body)).await;
+        v["id"].as_i64().map(|n| n.to_string()).expect("pipeline id")
+    }
+
+    // extra teardown
+    pub async fn delete_environment_by_id(&self, id: i64) {
+        self.try_send(Method::DELETE, &self.proj(&format!("/_apis/distributedtask/environments/{id}?{API}")), None).await;
+    }
+    pub async fn delete_check(&self, id: i64) {
+        self.try_send(Method::DELETE, &self.proj(&format!("/_apis/pipelines/checks/configurations/{id}?api-version=7.1-preview.1")), None).await;
+    }
+    pub async fn delete_pipeline_def(&self, id: &str) {
+        self.try_send(Method::DELETE, &self.proj(&format!("/_apis/build/definitions/{id}?{API}")), None).await;
+    }
+    /// Removes a file from `branch` (a push with a delete change).
+    pub async fn delete_file(&self, path: &str, branch: &str, message: &str) {
+        let refs = self.raw(Method::GET, &self.git(&format!("/refs?filter=heads/{branch}&{API}")), None, "application/json").await;
+        let Ok(v) = serde_json::from_str::<Value>(&refs.1) else { return };
+        let Some(sha) = v["value"][0]["objectId"].as_str() else { return };
+        let body = json!({
+            "refUpdates": [{ "name": format!("refs/heads/{branch}"), "oldObjectId": sha }],
+            "commits": [{ "comment": message, "changes": [{ "changeType": "delete", "item": { "path": format!("/{path}") } }] }]
+        });
+        self.try_send(Method::POST, &self.git(&format!("/pushes?{API}")), Some(body)).await;
     }
 
     // ---- teardown (best-effort) ----

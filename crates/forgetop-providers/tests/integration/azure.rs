@@ -27,7 +27,7 @@ async fn azure_pull_request_lifecycle() {
 
     let (default, base_sha) = raw.default_branch().await;
     let branch = format!("{prefix}-pr");
-    raw.create_branch_with_file(&branch, &base_sha, &format!("{prefix}.txt"), "forgetop integration fixture\n", &format!("{prefix}: fixture")).await;
+    raw.push_file(&branch, &base_sha, &format!("{prefix}.txt"), "forgetop integration fixture\n", &format!("{prefix}: fixture")).await;
     let id = raw.open_pr(&branch, &default, &format!("{prefix} PR")).await.to_string();
 
     let prs = az.conn.pull_requests().expect("azure PRs");
@@ -88,44 +88,58 @@ async fn azure_work_item_lifecycle() {
     raw.delete_work_item(wid).await;
 }
 
+/// Full tear-up/down of an Azure approval gate: create an environment + Approval
+/// check + a YAML pipeline that deploys to it, queue it, approve via the adapter,
+/// then delete everything. Needs agent capacity to *run* — but the approval pauses
+/// before the agent, so a public project (free hosted agents) suffices.
 #[tokio::test]
-async fn azure_pipeline_approval_lifecycle() {
+async fn azure_pipeline_approval_full_lifecycle() {
     let az = skip_if_none!(harness::azure(), "azure");
-    let pipeline_id = match harness::env("FORGETOP_IT_AZURE_PIPELINE_ID") {
-        Some(p) => p,
-        None => {
-            eprintln!("SKIP azure approvals: set FORGETOP_IT_AZURE_PIPELINE_ID to a gated pipeline (see INTEGRATION.md)");
-            return;
-        }
-    };
     let raw = AzRaw::from_env().expect("azure raw");
-    let run_id = raw.queue_pipeline(&pipeline_id).await;
+    let prefix = harness::run_prefix();
+
+    // Fixtures.
+    let (default, sha) = raw.default_branch().await;
+    let approver = raw.me_id().await;
+    let repo_id = raw.repo_id().await;
+    let repo_name = harness::env("FORGETOP_IT_AZURE_REPO").unwrap_or_else(|| az.project.clone());
+    let env_name = format!("{prefix}-env");
+    let yaml_path = format!("{prefix}.yml");
+
+    let yaml = format!(
+        "stages:\n- stage: gate\n  jobs:\n  - deployment: approve\n    pool:\n      vmImage: ubuntu-latest\n    environment: {env_name}\n    strategy:\n      runOnce:\n        deploy:\n          steps:\n          - script: echo approved\n"
+    );
+    raw.push_file(&default, &sha, &yaml_path, &yaml, &format!("{prefix}: gated pipeline")).await;
+    let env_id = raw.create_environment(&env_name).await;
+    let check_id = raw.add_approval_check(env_id, &env_name, &approver).await;
+    let def_id = raw.create_pipeline_def(prefix, &format!("/{yaml_path}"), &repo_id, &repo_name).await;
+    let run_id = raw.queue_pipeline(&def_id).await;
 
     let pipe = az.conn.pipelines().expect("azure pipelines");
     let gate = {
         let pipe = &pipe;
         let run_id = run_id.as_str();
-        harness::poll(120, move || async move {
+        harness::poll(150, move || async move {
             pipe.pending_approvals(run_id).await.ok().and_then(|g| g.into_iter().find(|x| x.can_respond))
         })
         .await
-    }
-    .expect("the queued run reached its approval gate");
-
-    pipe.respond_approval(&run_id, &gate.id, ApprovalDecision::Approve, Some("integration approve")).await.expect("approve");
-    let cleared = {
-        let pipe = &pipe;
-        let run_id = run_id.as_str();
-        let gate_id = gate.id.as_str();
-        harness::poll(60, move || async move {
-            match pipe.pending_approvals(run_id).await {
-                Ok(g) if !g.iter().any(|x| x.id == gate_id) => Some(()),
-                _ => None,
-            }
-        })
-        .await
     };
-    assert!(cleared.is_some(), "the gate cleared after approval");
 
+    // Act + assert only if we reached the gate; always tear down afterwards.
+    let result = if let Some(gate) = &gate {
+        let approved = pipe.respond_approval(&run_id, &gate.id, ApprovalDecision::Approve, Some("integration approve")).await;
+        approved.map(|_| ())
+    } else {
+        Err(forgetop_core::Error::Provider("run never reached the approval gate".into()))
+    };
+
+    // Teardown (best-effort, in reverse order).
     raw.delete_build(&run_id).await;
+    raw.delete_pipeline_def(&def_id).await;
+    raw.delete_check(check_id).await;
+    raw.delete_environment_by_id(env_id).await;
+    raw.delete_file(&yaml_path, &default, &format!("{prefix}: remove pipeline")).await;
+
+    result.expect("reach + approve the gate");
+    assert!(gate.is_some());
 }

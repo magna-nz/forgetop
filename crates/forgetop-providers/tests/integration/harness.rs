@@ -124,6 +124,56 @@ pub fn azure() -> Option<AzureIt> {
     Some(AzureIt { org, project, conn })
 }
 
+/// A live Linear connection from `FORGETOP_IT_LINEAR_KEY`, or `None` to skip.
+pub struct LinearIt {
+    pub conn: Arc<dyn ProviderConnection>,
+}
+
+pub fn linear() -> Option<LinearIt> {
+    init();
+    let key = env("FORGETOP_IT_LINEAR_KEY")?;
+    let conn = Connection {
+        id: "it-linear".into(),
+        provider_type: ProviderType::Linear,
+        display_name: "IT Linear".into(),
+        base_url: None,
+        organization: None,
+        project: None,
+        repository: None,
+        username: None,
+        credential_ref: None,
+    };
+    let conn = registry().create(&conn, Some(key)).ok()?;
+    Some(LinearIt { conn })
+}
+
+/// A live Jira connection from `FORGETOP_IT_JIRA_*`, or `None` to skip.
+pub struct JiraIt {
+    pub project: String,
+    pub conn: Arc<dyn ProviderConnection>,
+}
+
+pub fn jira() -> Option<JiraIt> {
+    init();
+    let token = env("FORGETOP_IT_JIRA_TOKEN")?;
+    let site = env("FORGETOP_IT_JIRA_SITE")?;
+    let email = env("FORGETOP_IT_JIRA_EMAIL")?;
+    let project = env("FORGETOP_IT_JIRA_PROJECT")?;
+    let conn = Connection {
+        id: "it-jira".into(),
+        provider_type: ProviderType::Jira,
+        display_name: "IT Jira".into(),
+        base_url: Some(site),
+        organization: None,
+        project: Some(project.clone()),
+        repository: None,
+        username: Some(email),
+        credential_ref: None,
+    };
+    let conn = registry().create(&conn, Some(token)).ok()?;
+    Some(JiraIt { project, conn })
+}
+
 /// Runs a provider's sweep future only when `FORGETOP_IT_SWEEP` is set. Sweeping
 /// deletes *all* `forgetop-it-*` fixtures, which is unsafe when CI runs concurrently
 /// (one run would nuke another's in-flight fixtures), so normal runs rely on each
