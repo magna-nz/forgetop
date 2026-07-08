@@ -129,4 +129,6 @@ rely on each test's own teardown.
 | `401`/`403` on setup | Token missing a scope, or your user lacks admin/maintainer on the container. |
 | GitHub gate never reaches "waiting" | Repo is **private** on a free plan (no environment required-reviewers), or the token user isn't the environment reviewer. |
 | Azure pipeline never starts | No agent capacity — use a **public** project for free hosted agents. |
+| Azure approval `A` missing / "view-only" | Expected — Azure surfaces the gate but its check isn't an actionable approval over the API; approve in the Azure UI. |
+| `SKIP gitlab manual-job approval: CI can't run` | GitLab.com requires **account identity verification** (credit card/phone) before shared runners will run CI — validate at `https://gitlab.com/-/identity_verification`, or leave it (the other GitLab tests still run). |
 | Leftover `forgetop-it-*` fixtures | A test panicked mid-run; the next run's sweeper removes them, or delete by hand. |
