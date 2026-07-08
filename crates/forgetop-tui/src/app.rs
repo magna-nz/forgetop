@@ -108,6 +108,9 @@ pub struct App {
     pub view_idx: [usize; 3],
     /// Which desktop notifications are enabled. Persisted.
     pub notifications: NotificationPrefs,
+    /// Where desktop notifications are sent. Real OS notifier by default; tests
+    /// swap in a recorder.
+    notifier: Arc<dyn Notifier>,
     /// Last-seen status per pipeline run, to detect transitions into failure.
     pipe_seen: HashMap<String, PipelineRunStatus>,
     /// Whether `pipe_seen` has been seeded (skip notifying on the first load).
@@ -518,6 +521,7 @@ impl App {
             views: [Vec::new(), Vec::new(), Vec::new()],
             view_idx: [0, 0, 0],
             notifications: NotificationPrefs::default(),
+            notifier: Arc::new(SystemNotifier),
             pipe_seen: HashMap::new(),
             approval_seen: HashSet::new(),
             approval_seeded: false,
@@ -960,7 +964,7 @@ impl App {
         let _ = deps.config.set_notifications(self.notifications).await;
         if self.notifications.any() {
             // A real notification so you can confirm they work on this machine.
-            notify("forgetop notifications enabled", "You'll be pinged on the events you chose.");
+            self.notifier.notify("forgetop notifications enabled", "You'll be pinged on the events you chose.");
             self.toast = Some("Notifications updated".into());
         } else {
             self.toast = Some("All notifications off".into());
@@ -991,7 +995,7 @@ impl App {
                     for pr in &review {
                         let key = (conn.clone(), pr.id.clone());
                         if seeded && !self.review_req_seen.contains(&key) {
-                            notify("Review requested", &pr_label(pr));
+                            self.notifier.notify("Review requested", &pr_label(pr));
                         }
                         review_now.insert(key);
                     }
@@ -1004,10 +1008,10 @@ impl App {
                         if seeded {
                             let (approved, changes) = pr_review_transitions(self.pr_review_seen.get(&key).copied(), pr);
                             if approved && self.notifications.pr_approved {
-                                notify("Your PR was approved", &pr_label(pr));
+                                self.notifier.notify("Your PR was approved", &pr_label(pr));
                             }
                             if changes && self.notifications.pr_changes_requested {
-                                notify("Changes requested on your PR", &pr_label(pr));
+                                self.notifier.notify("Changes requested on your PR", &pr_label(pr));
                             }
                         }
                         votes_now.insert(key, pr_vote_flags(pr));
@@ -1139,7 +1143,7 @@ impl App {
     fn notify_pending_approvals(&mut self) {
         if self.notifications.pipeline_approval_needed && self.approval_seeded {
             for row in new_pending_approvals(&self.approval_seen, &self.pipes) {
-                notify("Approval needed", &format!("{} · {} is awaiting your approval", row.connection, pipe_label(row)));
+                self.notifier.notify("Approval needed", &format!("{} · {} is awaiting your approval", row.connection, pipe_label(row)));
             }
         }
         self.approval_seen =
@@ -1153,7 +1157,7 @@ impl App {
         if self.notifications.pipeline_failed && self.pipe_seeded {
             for row in new_pipeline_failures(&self.pipe_seen, &self.pipes) {
                 let branch = row.run.branch.clone().unwrap_or_else(|| "—".into());
-                notify("Pipeline failed", &format!("{} · {} on {branch}", row.connection, pipe_label(row)));
+                self.notifier.notify("Pipeline failed", &format!("{} · {} on {branch}", row.connection, pipe_label(row)));
             }
         }
         self.pipe_seen = self.pipes.iter().map(|r| (r.run.id.clone(), r.run.status)).collect();
@@ -2620,9 +2624,19 @@ fn new_pending_approvals<'a>(prev: &HashSet<(String, String)>, pipes: &'a [PipeR
         .collect()
 }
 
-/// Best-effort OS notification (silently ignored if the platform refuses).
-fn notify(title: &str, body: &str) {
-    let _ = notify_rust::Notification::new().summary(title).body(body).appname("forgetop").show();
+/// Sends desktop notifications. Behind a trait so tests can inject a recorder
+/// instead of firing real OS notifications.
+pub trait Notifier: Send + Sync {
+    fn notify(&self, title: &str, body: &str);
+}
+
+/// The real notifier — best-effort OS notification (silently ignored if refused).
+pub struct SystemNotifier;
+
+impl Notifier for SystemNotifier {
+    fn notify(&self, title: &str, body: &str) {
+        let _ = notify_rust::Notification::new().summary(title).body(body).appname("forgetop").show();
+    }
 }
 
 /// (approved, changes-requested) rollup from a PR's reviewer votes.
@@ -3137,6 +3151,113 @@ mod tests {
         app.open_approval_picker();
         assert!(app.overlay.is_none(), "no picker when approvals aren't supported");
         assert!(app.toast.is_some());
+    }
+
+    /// A notifier that records what it was asked to send, for asserting the glue.
+    #[derive(Clone, Default)]
+    struct RecordingNotifier {
+        events: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    }
+    impl Notifier for RecordingNotifier {
+        fn notify(&self, title: &str, body: &str) {
+            self.events.lock().unwrap().push((title.to_string(), body.to_string()));
+        }
+    }
+    impl RecordingNotifier {
+        fn events(&self) -> Vec<(String, String)> {
+            self.events.lock().unwrap().clone()
+        }
+        fn titles(&self) -> Vec<String> {
+            self.events().into_iter().map(|(t, _)| t).collect()
+        }
+    }
+
+    fn pipe_row(id: &str, status: PipelineRunStatus, awaiting: bool) -> PipeRow {
+        PipeRow {
+            connection_id: "c".into(),
+            connection: "GH".into(),
+            provider: ProviderType::GitHub,
+            awaiting_approval: awaiting,
+            run: PipelineRun {
+                id: id.into(),
+                definition_id: "ci".into(),
+                number: Some(1),
+                name: Some("CI".into()),
+                status,
+                triggered_by: None,
+                branch: Some("main".into()),
+                commit_sha: None,
+                started_at: None,
+                finished_at: None,
+                url: None,
+                stages: vec![],
+            },
+        }
+    }
+
+    #[test]
+    fn fires_pipeline_failed_notification_only_for_new_failures() {
+        let rec = RecordingNotifier::default();
+        let mut app = App::new("slate");
+        app.notifier = Arc::new(rec.clone());
+        app.notifications.pipeline_failed = true;
+        app.pipe_seeded = true; // past the silent first load
+        app.pipe_seen = [("a".to_string(), PipelineRunStatus::Failed), ("c".to_string(), PipelineRunStatus::Running)].into_iter().collect();
+        app.pipes = vec![pipe_row("a", PipelineRunStatus::Failed, false), pipe_row("c", PipelineRunStatus::Failed, false)];
+
+        app.notify_pipeline_failures();
+        // 'a' was already failing; only 'c' transitioned → one notification, right title/body.
+        assert_eq!(rec.titles(), vec!["Pipeline failed"]);
+        assert!(rec.events()[0].1.contains("CI"), "body names the run");
+
+        // A second pass with the same state (now all seen) fires nothing.
+        let rec2 = RecordingNotifier::default();
+        app.notifier = Arc::new(rec2.clone());
+        app.notify_pipeline_failures();
+        assert!(rec2.titles().is_empty(), "already-seen failures don't re-notify");
+    }
+
+    #[test]
+    fn pipeline_notification_respects_pref_and_first_load_seeding() {
+        // Pref off → nothing, even for a brand-new failure.
+        let off = RecordingNotifier::default();
+        let mut app = App::new("slate");
+        app.notifier = Arc::new(off.clone());
+        app.notifications.pipeline_failed = false;
+        app.pipe_seeded = true;
+        app.pipes = vec![pipe_row("a", PipelineRunStatus::Failed, false)];
+        app.notify_pipeline_failures();
+        assert!(off.titles().is_empty(), "pref off suppresses the notification");
+
+        // First load (not seeded) seeds silently, no notification.
+        let first = RecordingNotifier::default();
+        let mut app = App::new("slate");
+        app.notifier = Arc::new(first.clone());
+        app.notifications.pipeline_failed = true;
+        app.pipe_seeded = false;
+        app.pipes = vec![pipe_row("a", PipelineRunStatus::Failed, false)];
+        app.notify_pipeline_failures();
+        assert!(first.titles().is_empty(), "first load seeds silently");
+        assert!(app.pipe_seeded, "and is now seeded");
+    }
+
+    #[test]
+    fn fires_approval_needed_notification_once() {
+        let rec = RecordingNotifier::default();
+        let mut app = App::new("slate");
+        app.notifier = Arc::new(rec.clone());
+        app.notifications.pipeline_approval_needed = true;
+        app.approval_seeded = true;
+        app.pipes = vec![pipe_row("a", PipelineRunStatus::Running, true)];
+
+        app.notify_pending_approvals();
+        assert_eq!(rec.titles(), vec!["Approval needed"]);
+
+        // Same gate already seen → no repeat.
+        let rec2 = RecordingNotifier::default();
+        app.notifier = Arc::new(rec2.clone());
+        app.notify_pending_approvals();
+        assert!(rec2.titles().is_empty(), "the same pending gate isn't re-notified");
     }
 
     #[test]
