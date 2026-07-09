@@ -25,6 +25,17 @@ async fn main() {
 
 async fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
+
+    // Handle --version / --help before touching config or the keychain.
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("forgetop {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print_help();
+        return Ok(());
+    }
+
     let demo = args.iter().any(|a| a == "--demo" || a == "-d");
     let is_doctor = args.get(1).map(String::as_str) == Some("doctor");
 
@@ -113,6 +124,28 @@ fn status_mark(token_found: bool, auth_ok: bool) -> &'static str {
         (false, _) => "⚠",
         (true, false) => "✗",
     }
+}
+
+/// Prints usage for `forgetop --help`.
+fn print_help() {
+    println!(
+        r#"forgetop {version}
+Keyboard-driven terminal UI for pull requests, work items, and CI across six forges.
+
+Usage:
+  forgetop            Launch the dashboard
+  forgetop --demo     Launch with built-in demo data (no setup)
+  forgetop doctor     Diagnose config, keychain access, and connection health
+
+Options:
+  -d, --demo          Run against built-in demo data
+  -V, --version       Print version and exit
+  -h, --help          Show this help and exit
+
+Inside the app, press `?` for every keybinding.
+Docs: https://magna-nz.github.io/forgetop/"#,
+        version = env!("CARGO_PKG_VERSION")
+    );
 }
 
 /// Seeds an in-memory Demo connection bound to all three sections.
