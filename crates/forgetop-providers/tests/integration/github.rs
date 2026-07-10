@@ -94,7 +94,7 @@ async fn github_pull_request_lifecycle() {
 
     // Merge write (the actual adapter action) → PR reads back as merged.
     prs.merge(&id, &MergeOptions { strategy: MergeStrategy::Squash, delete_source_ref: true }).await.expect("merge PR");
-    let after = harness::poll(30, || async {
+    let after = harness::poll(harness::POLL_MERGE, || async {
         prs.get(&id).await.ok().filter(|p| matches!(p.status, PullRequestStatus::Merged))
     })
     .await;
@@ -121,7 +121,7 @@ async fn github_work_item_lifecycle() {
     let found = {
         let wi = &wi;
         let id = id.as_str();
-        harness::poll(20, move || async move {
+        harness::poll(harness::POLL_LIST, move || async move {
             wi.list(&WorkItemQuery { mine_only: true, ..Default::default() }).await.ok().filter(|l| l.iter().any(|w| w.id == id)).map(|_| ())
         })
         .await
@@ -167,7 +167,7 @@ async fn github_pipeline_approval_gate_lifecycle() {
     let run_id = {
         let raw = &raw;
         let wf = wf_file.as_str();
-        harness::poll(120, move || async move {
+        harness::poll(harness::POLL_GATE, move || async move {
             raw.workflow_runs(wf).await.into_iter().find(|(_, s)| s == "waiting").map(|(id, _)| id)
         })
         .await
@@ -190,7 +190,7 @@ async fn github_pipeline_approval_gate_lifecycle() {
         let pipe = &pipe;
         let run_id = run_id.as_str();
         let env_name = env_name.as_str();
-        harness::poll(60, move || async move {
+        harness::poll(harness::POLL_LIST, move || async move {
             match pipe.pending_approvals(run_id).await {
                 Ok(g) if !g.iter().any(|x| x.name == env_name) => Some(()),
                 _ => None,

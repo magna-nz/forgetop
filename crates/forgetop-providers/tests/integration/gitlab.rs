@@ -41,7 +41,7 @@ async fn gitlab_merge_request_lifecycle() {
     let has_commits = {
         let prs = &prs;
         let id = id.as_str();
-        harness::poll(20, move || async move { prs.commits(id).await.ok().filter(|c| !c.is_empty()).map(|_| ()) }).await
+        harness::poll(harness::POLL_LIST, move || async move { prs.commits(id).await.ok().filter(|c| !c.is_empty()).map(|_| ()) }).await
     };
     assert!(has_commits.is_some(), "the MR reports its commit");
 
@@ -50,7 +50,7 @@ async fn gitlab_merge_request_lifecycle() {
     assert!(threads.iter().any(|t| t.comments.iter().any(|c| c.body.contains(prefix))), "comment shows in threads");
 
     // Merge (retry: GitLab may briefly report the MR as still checking mergeability).
-    let merged = harness::poll(40, || async {
+    let merged = harness::poll(harness::POLL_MERGE, || async {
         if prs.merge(&id, &MergeOptions { strategy: MergeStrategy::Merge, delete_source_ref: true }).await.is_ok() {
             prs.get(&id).await.ok().filter(|p| matches!(p.status, PullRequestStatus::Merged))
         } else {
@@ -115,7 +115,7 @@ async fn gitlab_manual_job_approval_lifecycle() {
     let gate = {
         let pipe = &pipe;
         let run_id = run_id.as_str();
-        harness::poll(60, move || async move {
+        harness::poll(harness::POLL_LIST, move || async move {
             pipe.pending_approvals(run_id).await.ok().and_then(|g| g.into_iter().find(|x| x.can_respond))
         })
         .await
@@ -128,7 +128,7 @@ async fn gitlab_manual_job_approval_lifecycle() {
         let pipe = &pipe;
         let run_id = run_id.as_str();
         let gate_id = gate.id.as_str();
-        harness::poll(60, move || async move {
+        harness::poll(harness::POLL_LIST, move || async move {
             match pipe.pending_approvals(run_id).await {
                 Ok(g) if !g.iter().any(|x| x.id == gate_id) => Some(()),
                 _ => None,

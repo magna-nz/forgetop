@@ -45,7 +45,7 @@ async fn azure_pull_request_lifecycle() {
     assert!(threads.iter().any(|t| t.comments.iter().any(|c| c.body.contains(prefix))), "comment shows in threads");
 
     // Merge via the adapter (retry: Azure needs a moment to compute mergeability).
-    let merged = harness::poll(40, || async {
+    let merged = harness::poll(harness::POLL_MERGE, || async {
         if prs.merge(&id, &MergeOptions { strategy: MergeStrategy::Squash, delete_source_ref: true }).await.is_ok() {
             prs.get(&id).await.ok().filter(|p| matches!(p.status, PullRequestStatus::Merged))
         } else {
@@ -123,7 +123,7 @@ async fn azure_pipeline_approval_full_lifecycle() {
     let gate = {
         let pipe = &pipe;
         let run_id = run_id.as_str();
-        harness::poll(150, move || async move {
+        harness::poll(harness::POLL_GATE, move || async move {
             pipe.pending_approvals(run_id).await.ok().and_then(|g| g.into_iter().find(|x| x.can_respond))
         })
         .await
