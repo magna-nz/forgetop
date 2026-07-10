@@ -197,10 +197,14 @@ fn render_lp_column(frame: &mut Frame, area: Rect, app: &App, side: usize, title
     }
 
     let content_w = (area.width.saturating_sub(2) as usize).saturating_sub(2); // borders + highlight symbol
+    // One shared set of column widths for the whole side, so every row lines up.
+    let rows_cells: Vec<Vec<(String, Style)>> = col.iter().map(|&i| lp_cells(theme, &app.lp[i])).collect();
+    let widths = lp_widths(&rows_cells, 3, content_w);
+
     let mut items: Vec<ListItem> = Vec::new();
     let mut visual_sel = 0usize;
     let mut last: Option<Bucket> = None;
-    for (pos, &i) in col.iter().enumerate() {
+    for (pos, (&i, cells)) in col.iter().zip(rows_cells.iter()).enumerate() {
         let e = &app.lp[i];
         if last != Some(e.bucket) {
             let count = col.iter().filter(|&&j| app.lp[j].bucket == e.bucket).count();
@@ -221,7 +225,7 @@ fn render_lp_column(frame: &mut Frame, area: Rect, app: &App, side: usize, title
         if pos == app.lp_sel[side] {
             visual_sel = items.len();
         }
-        items.push(ListItem::new(lp_row_line(theme, e, content_w)));
+        items.push(ListItem::new(lp_cells_line(cells, &widths, content_w)));
     }
 
     let list = List::new(items)
@@ -233,17 +237,6 @@ fn render_lp_column(frame: &mut Frame, area: Rect, app: &App, side: usize, title
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-/// A Launchpad row, rendered to mirror its section's nav list (PR / work item /
-/// pipeline), dispatched on the entry's underlying item.
-fn lp_row_line<'a>(theme: &Theme, e: &crate::launchpad::Entry, content_w: usize) -> Line<'a> {
-    use crate::launchpad::EntryItem;
-    match &e.item {
-        EntryItem::Pr(pr) => lp_pr_line(theme, pr, content_w),
-        EntryItem::Wi(wi) => lp_wi_line(theme, wi, content_w),
-        EntryItem::Pipe(run) => lp_pipe_line(theme, run, e.provider, content_w),
-    }
-}
-
 fn age_color(theme: &Theme, t: Option<DateTime<Utc>>) -> ratatui::style::Color {
     let stale = t.map(|d| (Utc::now() - d).num_days() >= 3).unwrap_or(false);
     if stale {
@@ -253,70 +246,93 @@ fn age_color(theme: &Theme, t: Option<DateTime<Utc>>) -> ratatui::style::Color {
     }
 }
 
-/// Assembles a row from fixed lead spans, a flexible title that truncates, and
-/// right-aligned trailing spans — so every row in a column lines up at both edges.
-fn lp_assemble<'a>(content_w: usize, mut lead: Vec<Span<'a>>, title: String, title_style: Style, trail: Vec<Span<'a>>) -> Line<'a> {
-    let width = |spans: &[Span]| spans.iter().map(|s| s.content.chars().count()).sum::<usize>();
-    let (lead_w, trail_w) = (width(&lead), width(&trail));
-    let room = content_w.saturating_sub(lead_w + 1 + trail_w + 1);
-    let title_trunc: String = title.chars().take(room).collect();
-    let used = lead_w + 1 + title_trunc.chars().count() + trail_w;
-    let pad = content_w.saturating_sub(used).max(1);
-    lead.push(Span::raw(" "));
-    lead.push(Span::styled(title_trunc, title_style));
-    lead.push(Span::raw(" ".repeat(pad)));
-    lead.extend(trail);
-    Line::from(lead)
+/// Number of Launchpad row columns (kept in sync with [`lp_cells`]).
+const LP_NCOL: usize = 7;
+/// Gap between Launchpad columns — tighter than the nav lists since a column is half-width.
+const LP_GAP: usize = 2;
+
+/// The aligned cells for one Launchpad row. Every item type fills the *same* seven
+/// slots — type · status · ref · title · review · info · age — so rows in a column line
+/// up vertically even though PRs, pipelines and work items carry different data.
+fn lp_cells(theme: &Theme, e: &crate::launchpad::Entry) -> Vec<(String, Style)> {
+    use crate::launchpad::EntryItem;
+    let dim = Style::default().fg(theme.dim);
+    let fg = Style::default().fg(theme.fg);
+    let badge = |code: &str, color| (code.to_string(), Style::default().fg(color).add_modifier(Modifier::BOLD));
+    match &e.item {
+        EntryItem::Pr(pr) => {
+            let (st, stc) = pr_status(theme, pr);
+            let approvals = pr.reviewers.iter().filter(|r| matches!(r.vote, ReviewVote::Approved | ReviewVote::ApprovedWithSuggestions)).count();
+            let changes = pr.reviewers.iter().any(|r| r.vote == ReviewVote::Rejected);
+            let (review, rstyle) = if changes {
+                ("✗".to_string(), Style::default().fg(theme.red))
+            } else {
+                ("✓".repeat(approvals), Style::default().fg(theme.green))
+            };
+            vec![
+                badge("PR", theme.blue),
+                (st.to_string(), Style::default().fg(stc)),
+                (pr.number.map(|n| format!("#{n}")).unwrap_or_default(), dim),
+                (pr.title.clone(), fg),
+                (review, rstyle),
+                (format!("+{} -{}", pr.additions, pr.deletions), dim),
+                (rel_age(pr.updated_at), Style::default().fg(age_color(theme, pr.updated_at))),
+            ]
+        }
+        EntryItem::Pipe(run) => {
+            let updated = run.finished_at.or(run.started_at);
+            vec![
+                badge("CI", theme.yellow),
+                (format!("{} {:?}", pipeline_icon(run.status), run.status), Style::default().fg(theme.pipeline_color(run.status))),
+                (run.branch.clone().unwrap_or_default(), dim),
+                (run.name.clone().unwrap_or_else(|| run.definition_id.clone()), fg),
+                (String::new(), dim),
+                (e.provider.as_str().to_string(), Style::default().fg(theme.cyan)),
+                (rel_age(updated), Style::default().fg(age_color(theme, updated))),
+            ]
+        }
+        EntryItem::Wi(wi) => vec![
+            badge("WI", theme.green),
+            (format!("● {}", wi.state), Style::default().fg(wi_state_color(theme, wi.state_category))),
+            (wi.identifier.clone().unwrap_or_default(), dim),
+            (wi.title.clone(), fg),
+            (String::new(), dim),
+            (wi.work_item_type.clone().unwrap_or_default(), dim),
+            (rel_age(wi.updated_at), Style::default().fg(age_color(theme, wi.updated_at))),
+        ],
+    }
 }
 
-/// PR row: status · `#num` · title · `+A -D` · one ✓ per approval (✗ if changes requested).
-fn lp_pr_line<'a>(theme: &Theme, pr: &PullRequest, content_w: usize) -> Line<'a> {
-    let (st, stc) = pr_status(theme, pr);
-    let num = pr.number.map(|n| format!("#{n}")).unwrap_or_default();
-    let lead = vec![
-        Span::styled(format!("{st:<8}"), Style::default().fg(stc)),
-        Span::styled(format!("{num:>4}"), Style::default().fg(theme.dim)),
-    ];
-    let approvals = pr.reviewers.iter().filter(|r| matches!(r.vote, ReviewVote::Approved | ReviewVote::ApprovedWithSuggestions)).count();
-    let changes = pr.reviewers.iter().any(|r| r.vote == ReviewVote::Rejected);
-    let mut trail = Vec::new();
-    if approvals > 0 {
-        trail.push(Span::styled(format!("{} ", "✓".repeat(approvals)), Style::default().fg(theme.green)));
+/// Sizes each Launchpad column to its widest cell, clamping the flexible title column
+/// so the row still fits `inner_w`.
+fn lp_widths(rows: &[Vec<(String, Style)>], flex: usize, inner_w: usize) -> Vec<usize> {
+    let mut w = vec![0usize; LP_NCOL];
+    for row in rows {
+        for (i, (text, _)) in row.iter().enumerate().take(LP_NCOL) {
+            w[i] = w[i].max(text.chars().count());
+        }
     }
-    if changes {
-        trail.push(Span::styled("✗ ", Style::default().fg(theme.red)));
-    }
-    trail.push(Span::styled(format!("+{} -{}", pr.additions, pr.deletions), Style::default().fg(theme.dim)));
-    trail.push(Span::styled(format!("  {}", rel_age(pr.updated_at)), Style::default().fg(age_color(theme, pr.updated_at))));
-    lp_assemble(content_w, lead, pr.title.clone(), Style::default().fg(theme.fg), trail)
+    let padding = COL_LEAD + LP_GAP * (LP_NCOL - 1);
+    let fixed: usize = (0..LP_NCOL).filter(|&i| i != flex).map(|i| w[i]).sum::<usize>() + padding;
+    w[flex] = w[flex].min(inner_w.saturating_sub(fixed)).max(3);
+    w
 }
 
-/// Work-item row: `● State` · ID · title · type.
-fn lp_wi_line<'a>(theme: &Theme, wi: &WorkItem, content_w: usize) -> Line<'a> {
-    let lead = vec![
-        Span::styled(format!("● {}", wi.state), Style::default().fg(wi_state_color(theme, wi.state_category))),
-        Span::styled(format!("  {}", wi.identifier.clone().unwrap_or_default()), Style::default().fg(theme.dim)),
-    ];
-    let mut trail = Vec::new();
-    if let Some(t) = wi.work_item_type.clone().filter(|t| !t.is_empty()) {
-        trail.push(Span::styled(t, Style::default().fg(theme.dim)));
+/// Joins Launchpad cells into a line, each padded to its column width (so columns align),
+/// then pads the whole line so a selected row highlights edge-to-edge.
+fn lp_cells_line(cells: &[(String, Style)], widths: &[usize], inner_w: usize) -> Line<'static> {
+    let mut spans = vec![Span::raw(" ")]; // COL_LEAD
+    for (i, (text, style)) in cells.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw(" ".repeat(LP_GAP)));
+        }
+        spans.push(Span::styled(cell(text, widths[i]), *style));
     }
-    trail.push(Span::styled(format!("  {}", rel_age(wi.updated_at)), Style::default().fg(age_color(theme, wi.updated_at))));
-    lp_assemble(content_w, lead, wi.title.clone(), Style::default().fg(theme.fg), trail)
-}
-
-/// Pipeline row: status icon+name (title) · branch · provider — like the Pipelines list.
-fn lp_pipe_line<'a>(theme: &Theme, run: &PipelineRun, provider: ProviderType, content_w: usize) -> Line<'a> {
-    let color = theme.pipeline_color(run.status);
-    let name = run.name.clone().unwrap_or_else(|| run.definition_id.clone());
-    let lead = vec![Span::styled(format!("{} {:?}", pipeline_icon(run.status), run.status), Style::default().fg(color))];
-    let mut trail = Vec::new();
-    if let Some(b) = run.branch.clone().filter(|b| !b.is_empty()) {
-        trail.push(Span::styled(format!("{b}  "), Style::default().fg(theme.dim)));
+    let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+    if used < inner_w {
+        spans.push(Span::raw(" ".repeat(inner_w - used)));
     }
-    trail.push(Span::styled(provider.as_str().to_string(), Style::default().fg(theme.cyan)));
-    trail.push(Span::styled(format!("  {}", rel_age(run.finished_at.or(run.started_at))), Style::default().fg(theme.dim)));
-    lp_assemble(content_w, lead, name, Style::default().fg(theme.fg), trail)
+    Line::from(spans)
 }
 
 /// Circled numerals for the bucket headers.
@@ -2136,7 +2152,9 @@ mod tests {
         assert!(out.contains("Needs you") && out.contains("Your work"), "two columns");
         // Buckets land in the right columns.
         assert!(out.contains("Needs your review") && out.contains("Needs fixing") && out.contains("Assigned to you"), "bucket headers");
-        // Rows carry nav-style detail: PR number + change stats, WI id/state/type, pipeline branch.
+        // Every row carries a type badge …
+        assert!(out.contains("PR") && out.contains("CI") && out.contains("WI"), "type badges for each kind");
+        // … and nav-style detail: PR number + change stats, WI id/state/type, pipeline branch.
         assert!(out.contains("#42") && out.contains("+10 -2"), "PR row shows number and change stats");
         assert!(out.contains("FOR-1") && out.contains("Todo") && out.contains("Bug"), "work-item row shows id, state, type");
         assert!(out.contains("main"), "pipeline row shows branch");
