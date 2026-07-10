@@ -81,7 +81,7 @@ fn render_tabs(frame: &mut Frame, area: Rect, app: &App) {
                 1 => app.wis.len(),
                 _ => app.pipes.len(),
             };
-            Line::from(format!(" {} {count} ", TABS[i]))
+            Line::from(format!(" {} ({count}) ", TABS[i]))
         })
         .collect();
     let selected = vis.iter().position(|&i| i == app.active).unwrap_or(0);
@@ -539,16 +539,21 @@ fn comment_lines(theme: &Theme, threads: &[CommentThread]) -> Vec<Line<'static>>
     lines
 }
 
-/// The PR sub-tab bar rendered as a row of pills (active one lit).
-fn pr_tabs_line(theme: &Theme, active: usize) -> Line<'static> {
+/// The PR sub-tab bar rendered as a row of pills (active one lit), each with a
+/// count where it's meaningful (comment threads / commits / checks / changed files).
+fn pr_tabs_line(theme: &Theme, view: &PrView) -> Line<'static> {
+    // Conversation, Commits, Checks, Diff.
+    let counts = [view.diff.threads.len(), view.commits.len(), view.checks.len(), view.diff.files.len()];
     let mut spans = vec![Span::raw(" ")];
     for (i, name) in PR_TABS.iter().enumerate() {
-        let style = if i == active {
+        let style = if i == view.tab {
             Style::default().fg(theme.bg).bg(theme.accent).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(theme.dim)
         };
-        spans.push(Span::styled(format!(" {name} "), style));
+        // Show the count only when there's something (avoids "Checks (0)" noise).
+        let label = if counts[i] > 0 { format!(" {name} ({}) ", counts[i]) } else { format!(" {name} ") };
+        spans.push(Span::styled(label, style));
         spans.push(Span::raw(" "));
     }
     spans.push(Span::styled("  ←/→ tabs · Esc close", Style::default().fg(theme.dim)));
@@ -643,7 +648,7 @@ fn render_pr_view(frame: &mut Frame, area: Rect, theme: &Theme, view: &PrView) -
     frame.render_widget(Paragraph::new(header).block(section_block(theme, &view.label)), rows[0]);
 
     // Sub-tab bar.
-    frame.render_widget(Paragraph::new(pr_tabs_line(theme, view.tab)), rows[1]);
+    frame.render_widget(Paragraph::new(pr_tabs_line(theme, view)), rows[1]);
 
     // Content.
     if view.tab == 3 {
@@ -1609,6 +1614,24 @@ mod tests {
         assert!(out.contains("Add the widget"), "PR label in header");
         assert!(out.contains("Conversation") && out.contains("Checks") && out.contains("Diff"), "sub-tab bar");
         assert!(out.contains("Alice Ng"), "Conversation shows the author");
+    }
+
+    #[test]
+    fn pr_sub_tabs_show_counts() {
+        use crate::app::Screen;
+        let checks = vec![
+            CheckRun { name: "build".into(), status: CheckStatus::Passed, url: None },
+            CheckRun { name: "test".into(), status: CheckStatus::Passed, url: None },
+        ];
+        let file = |p: &str| FileChange { path: p.into(), kind: FileChangeKind::Added, additions: 1, deletions: 0, patch: None };
+        let files = vec![file("a.rs"), file("b.rs"), file("c.rs")];
+        let mut app = App::new("slate");
+        app.screen = Screen::PrView(Box::new(pr_view(0, checks, files)));
+        let out = render_to_string(&mut app, 120, 24);
+        assert!(out.contains("Commits (1)"), "commits count");
+        assert!(out.contains("Checks (2)"), "checks count");
+        assert!(out.contains("Diff (3)"), "changed-file count");
+        assert!(!out.contains("Conversation (0)"), "no zero-count noise on empty tabs");
     }
 
     #[test]

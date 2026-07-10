@@ -131,6 +131,16 @@ It prints a line per connection (`✓` healthy, `⚠` no token, `✗` token pres
 auth failed), so you can see at a glance whether it's a missing token, a bad scope,
 or an expired credential.
 
+### Command-line options
+
+| Command | What it does |
+| --- | --- |
+| `forgetop` | Launch the dashboard |
+| `forgetop --demo` (`-d`) | Launch with built-in demo data (no setup) |
+| `forgetop doctor` | Diagnose config, keychain access, and connection health |
+| `forgetop --version` (`-V`) | Print the version and exit |
+| `forgetop --help` (`-h`) | Show usage and exit |
+
 ## Pull Requests
 
 The Pull Requests tab is **browse-and-open**: the list is for finding a PR; every
