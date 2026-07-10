@@ -252,53 +252,56 @@ const LP_NCOL: usize = 7;
 const LP_GAP: usize = 2;
 
 /// The aligned cells for one Launchpad row. Every item type fills the *same* seven
-/// slots — type · status · ref · title · review · info · age — so rows in a column line
-/// up vertically even though PRs, pipelines and work items carry different data.
+/// slots — type · status · #ref · title · detail · provider · age — so rows read as
+/// siblings and line up vertically, even though PRs, pipelines and work items differ.
 fn lp_cells(theme: &Theme, e: &crate::launchpad::Entry) -> Vec<(String, Style)> {
     use crate::launchpad::EntryItem;
     let dim = Style::default().fg(theme.dim);
     let fg = Style::default().fg(theme.fg);
     let badge = |code: &str, color| (code.to_string(), Style::default().fg(color).add_modifier(Modifier::BOLD));
+    let provider = (e.provider.as_str().to_string(), Style::default().fg(theme.cyan));
+    let age = |t| (rel_age(t), Style::default().fg(age_color(theme, t)));
     match &e.item {
         EntryItem::Pr(pr) => {
-            let (st, stc) = pr_status(theme, pr);
+            // Status carries the review signal: approvals so far, changes requested, or draft.
             let approvals = pr.reviewers.iter().filter(|r| matches!(r.vote, ReviewVote::Approved | ReviewVote::ApprovedWithSuggestions)).count();
             let changes = pr.reviewers.iter().any(|r| r.vote == ReviewVote::Rejected);
-            let (review, rstyle) = if changes {
-                ("✗".to_string(), Style::default().fg(theme.red))
+            let (status, sstyle) = if changes {
+                ("✗ changes".to_string(), Style::default().fg(theme.red))
+            } else if approvals > 0 {
+                (format!("{} ok", "✓".repeat(approvals)), Style::default().fg(theme.green))
+            } else if pr.is_draft {
+                ("◌ draft".to_string(), dim)
             } else {
-                ("✓".repeat(approvals), Style::default().fg(theme.green))
+                ("○ review".to_string(), Style::default().fg(theme.yellow))
             };
             vec![
                 badge("PR", theme.blue),
-                (st.to_string(), Style::default().fg(stc)),
+                (status, sstyle),
                 (pr.number.map(|n| format!("#{n}")).unwrap_or_default(), dim),
                 (pr.title.clone(), fg),
-                (review, rstyle),
                 (format!("+{} -{}", pr.additions, pr.deletions), dim),
-                (rel_age(pr.updated_at), Style::default().fg(age_color(theme, pr.updated_at))),
+                provider,
+                age(pr.updated_at),
             ]
         }
-        EntryItem::Pipe(run) => {
-            let updated = run.finished_at.or(run.started_at);
-            vec![
-                badge("CI", theme.yellow),
-                (format!("{} {:?}", pipeline_icon(run.status), run.status), Style::default().fg(theme.pipeline_color(run.status))),
-                (run.branch.clone().unwrap_or_default(), dim),
-                (run.name.clone().unwrap_or_else(|| run.definition_id.clone()), fg),
-                (String::new(), dim),
-                (e.provider.as_str().to_string(), Style::default().fg(theme.cyan)),
-                (rel_age(updated), Style::default().fg(age_color(theme, updated))),
-            ]
-        }
+        EntryItem::Pipe(run) => vec![
+            badge("CI", theme.yellow),
+            (format!("{} {:?}", pipeline_icon(run.status), run.status), Style::default().fg(theme.pipeline_color(run.status))),
+            (run.number.map(|n| format!("#{n}")).unwrap_or_default(), dim),
+            (run.name.clone().unwrap_or_else(|| run.definition_id.clone()), fg),
+            (run.branch.clone().unwrap_or_default(), dim),
+            provider,
+            age(run.finished_at.or(run.started_at)),
+        ],
         EntryItem::Wi(wi) => vec![
             badge("WI", theme.green),
             (format!("● {}", wi.state), Style::default().fg(wi_state_color(theme, wi.state_category))),
             (wi.identifier.clone().unwrap_or_default(), dim),
             (wi.title.clone(), fg),
-            (String::new(), dim),
             (wi.work_item_type.clone().unwrap_or_default(), dim),
-            (rel_age(wi.updated_at), Style::default().fg(age_color(theme, wi.updated_at))),
+            provider,
+            age(wi.updated_at),
         ],
     }
 }
