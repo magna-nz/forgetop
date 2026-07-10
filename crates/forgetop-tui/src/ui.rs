@@ -73,18 +73,22 @@ fn render_tabs(frame: &mut Frame, area: Rect, app: &App) {
         .title_top(Line::from(Span::styled(right, Style::default().fg(theme.dim))).right_aligned());
 
     let vis = app.visible_indices();
-    let titles: Vec<Line> = vis
-        .iter()
-        .map(|&i| {
-            let count = match i {
-                0 => app.prs.len(),
-                1 => app.wis.len(),
-                _ => app.pipes.len(),
-            };
-            Line::from(format!(" {} ({count}) ", TABS[i]))
-        })
-        .collect();
-    let selected = vis.iter().position(|&i| i == app.active).unwrap_or(0);
+    // Launchpad is tab 0; its badge is the count of items that actually need you.
+    let lp_count = app.lp.iter().filter(|e| !e.bucket.muted()).count();
+    let mut titles: Vec<Line> = vec![Line::from(format!(" Launchpad ({lp_count}) "))];
+    titles.extend(vis.iter().map(|&i| {
+        let count = match i {
+            0 => app.prs.len(),
+            1 => app.wis.len(),
+            _ => app.pipes.len(),
+        };
+        Line::from(format!(" {} ({count}) ", TABS[i]))
+    }));
+    let selected = if matches!(app.screen, Screen::Launchpad) {
+        0
+    } else {
+        1 + vis.iter().position(|&i| i == app.active).unwrap_or(0)
+    };
 
     let tabs = Tabs::new(titles)
         .select(selected)
@@ -120,6 +124,10 @@ fn render_view_bar(frame: &mut Frame, area: Rect, app: &App) {
 
 fn render_content(frame: &mut Frame, area: Rect, app: &mut App) {
     match &app.screen {
+        Screen::Launchpad => {
+            render_launchpad(frame, area, app);
+            return;
+        }
         Screen::Pipeline(view) => {
             render_pipeline(frame, area, &app.theme, view);
             return;
@@ -151,6 +159,62 @@ fn render_table(frame: &mut Frame, area: Rect, app: &mut App) {
         _ => render_pipes(frame, area, app),
     }
 }
+
+/// The Launchpad: one page, items grouped into urgency-ordered buckets.
+fn render_launchpad(frame: &mut Frame, area: Rect, app: &mut App) {
+    use crate::launchpad::Bucket;
+    let theme = &app.theme;
+    let block = section_block(theme, "Launchpad · what needs you");
+
+    if app.lp.is_empty() {
+        // Distinguish "nothing set up yet" from "genuinely all clear".
+        let msg = if app.health.is_empty() { FIRST_RUN_HINT } else { "✓ You're all caught up — nothing needs you." };
+        empty(frame, area, theme, msg, block);
+        return;
+    }
+
+    let mut items: Vec<ListItem> = Vec::new();
+    let mut visual_sel = 0usize;
+    let mut last: Option<Bucket> = None;
+    for (i, e) in app.lp.iter().enumerate() {
+        // A header row whenever the bucket changes.
+        if last != Some(e.bucket) {
+            let count = app.lp.iter().filter(|x| x.bucket == e.bucket).count();
+            let rank = Bucket::ORDER.iter().position(|b| *b == e.bucket).unwrap_or(0);
+            let style = if e.bucket.muted() {
+                Style::default().fg(theme.dim)
+            } else {
+                Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)
+            };
+            if !items.is_empty() {
+                items.push(ListItem::new(Line::from("")));
+            }
+            items.push(ListItem::new(Line::from(Span::styled(format!("{}  {} ({count})", CIRCLED[rank.min(7)], e.bucket.title()), style))));
+            last = Some(e.bucket);
+        }
+        if i == app.lp_sel {
+            visual_sel = items.len();
+        }
+        // Staleness: highlight items sitting untouched for a few days.
+        let age = rel_age(e.updated_at);
+        let stale = e.updated_at.map(|d| (chrono::Utc::now() - d).num_days() >= 3).unwrap_or(false);
+        let title: String = e.title.chars().take(72).collect();
+        items.push(ListItem::new(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(format!("{:<12}", e.provider.as_str()), Style::default().fg(theme.cyan)),
+            Span::styled(title, Style::default().fg(theme.fg)),
+            Span::styled(format!("   {age}"), Style::default().fg(if stale { theme.red } else { theme.dim })),
+        ])));
+    }
+
+    let list = List::new(items).block(block).highlight_style(highlight(theme)).highlight_symbol("▐ ");
+    let mut state = ListState::default();
+    state.select(Some(visual_sel));
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
+/// Circled numerals for the bucket headers.
+const CIRCLED: [&str; 8] = ["①", "②", "③", "④", "⑤", "⑥", "⑦", "⑧"];
 
 fn section_block<'a>(theme: &Theme, title: &'a str) -> Block<'a> {
     Block::default()
@@ -747,6 +811,9 @@ fn footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
     }
     if let Some(overlay) = &app.overlay {
         return overlay.hint();
+    }
+    if matches!(app.screen, Screen::Launchpad) {
+        return vec![("↑↓", "move"), ("↵", "open"), ("←→", "tabs"), ("r", "refresh"), ("N", "notifications"), ("?", "help"), ("q", "quit")];
     }
     if let Screen::PrView(v) = &app.screen {
         return if v.tab == 3 {
@@ -1679,6 +1746,7 @@ mod tests {
     #[test]
     fn pr_view_bar_shows_saved_views() {
         let mut app = App::new("slate");
+        app.screen = Screen::List;
         app.apply_views(vec![], vec![], vec![]); // seed the default PR views
         app.prs.push(crate::app::PrRow { connection_id: "c".into(), connection: "GH".into(), provider: ProviderType::GitHub, pr: sample_pr() });
         app.pr_state.select(Some(0));
@@ -1710,6 +1778,7 @@ mod tests {
     #[test]
     fn pr_list_shows_the_provider_column_for_aggregation() {
         let mut app = App::new("slate");
+        app.screen = Screen::List;
         app.prs.push(crate::app::PrRow {
             connection_id: "c".into(),
             connection: "MyHub".into(),
@@ -1726,6 +1795,7 @@ mod tests {
     fn pr_write_actions_live_in_the_view_not_the_list() {
         // The PR list footer offers only browse/open — no write actions.
         let mut app = App::new("slate");
+        app.screen = Screen::List;
         app.prs.push(crate::app::PrRow { connection_id: "c".into(), connection: "GH".into(), provider: ProviderType::GitHub, pr: sample_pr() });
         app.pr_state.select(Some(0));
         let list = render_to_string(&mut app, 140, 24);
@@ -1856,6 +1926,7 @@ mod tests {
     #[test]
     fn pipelines_list_flags_approval_needed_column() {
         let mut app = App::new("slate");
+        app.screen = Screen::List;
         app.active = 2;
         app.pipes.push(crate::app::PipeRow {
             connection_id: "c".into(),
@@ -1873,6 +1944,7 @@ mod tests {
     #[test]
     fn pipelines_footer_lists_drillin_and_trigger() {
         let mut app = App::new("slate");
+        app.screen = Screen::List;
         app.active = 2;
         let out = render_to_string(&mut app, 120, 24);
         assert!(out.contains("drill-in") && out.contains("trigger"), "pipelines footer");
@@ -1975,6 +2047,7 @@ mod tests {
     fn work_items_list_is_browse_only_actions_in_the_view() {
         // The WI list offers browse + the states filter — no state-change / comment.
         let mut app = App::new("slate");
+        app.screen = Screen::List;
         app.active = 1;
         let list = render_to_string(&mut app, 140, 24);
         assert!(list.contains("open") && list.contains("states"), "list keeps open + states filter");

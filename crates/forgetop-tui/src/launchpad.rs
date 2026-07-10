@@ -2,9 +2,10 @@
 //! Pure logic (no UI, no fetching) so the rules are unit-tested in isolation — this
 //! is the part it's most important to get right.
 
-use forgetop_core::domain::{CheckStatus, MergeableState, PipelineRunStatus, PullRequest};
+use chrono::{DateTime, Utc};
+use forgetop_core::domain::{CheckStatus, MergeableState, PipelineRunStatus, ProviderType, PullRequest};
 
-use crate::app::{pr_vote_flags, PipeRow};
+use crate::app::{pr_vote_flags, PipeRow, PrRow, WiRow};
 
 /// The action bucket an item lands in. `ORDER` is the display/urgency order — the
 /// things others are blocked on first, then what you can ship, then bounce-backs,
@@ -94,6 +95,81 @@ pub fn classify_pipe(row: &PipeRow) -> Option<Bucket> {
     } else {
         None
     }
+}
+
+/// The kind of item behind a Launchpad row (drives what `Enter` opens).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryKind {
+    Pr,
+    Wi,
+    Pipe,
+}
+
+/// One actionable item on the Launchpad, resolved to its bucket + display fields.
+pub struct Entry {
+    pub bucket: Bucket,
+    pub kind: EntryKind,
+    pub connection_id: String,
+    pub item_id: String,
+    pub provider: ProviderType,
+    pub title: String,
+    /// Last activity, for the staleness cue + oldest-first ordering.
+    pub updated_at: Option<DateTime<Utc>>,
+}
+
+fn bucket_rank(b: Bucket) -> usize {
+    Bucket::ORDER.iter().position(|&x| x == b).unwrap_or(usize::MAX)
+}
+
+/// Sort key: known-and-older sorts before newer, unknown sorts last.
+fn age_key(t: Option<DateTime<Utc>>) -> (u8, i64) {
+    match t {
+        Some(d) => (0, d.timestamp()),
+        None => (1, 0),
+    }
+}
+
+/// Builds the Launchpad rows from the aggregated feeds, already sorted into display
+/// order: bucket by urgency, then oldest-activity first within each bucket.
+pub fn build(prs_review: &[PrRow], prs_mine: &[PrRow], wis: &[WiRow], pipes: &[PipeRow]) -> Vec<Entry> {
+    let pr_entry = |row: &PrRow, bucket: Bucket| Entry {
+        bucket,
+        kind: EntryKind::Pr,
+        connection_id: row.connection_id.clone(),
+        item_id: row.pr.id.clone(),
+        provider: row.provider,
+        title: row.pr.title.clone(),
+        updated_at: row.pr.updated_at,
+    };
+
+    let mut out: Vec<Entry> = Vec::new();
+    out.extend(prs_review.iter().map(|r| pr_entry(r, classify_pr(&r.pr, PrRole::Reviewer))));
+    out.extend(prs_mine.iter().map(|r| pr_entry(r, classify_pr(&r.pr, PrRole::Author))));
+    out.extend(wis.iter().map(|r| Entry {
+        bucket: Bucket::YourWork,
+        kind: EntryKind::Wi,
+        connection_id: r.connection_id.clone(),
+        item_id: r.wi.id.clone(),
+        provider: r.provider,
+        title: r.wi.title.clone(),
+        updated_at: r.wi.updated_at,
+    }));
+    for r in pipes {
+        if let Some(bucket) = classify_pipe(r) {
+            out.push(Entry {
+                bucket,
+                kind: EntryKind::Pipe,
+                connection_id: r.connection_id.clone(),
+                item_id: r.run.id.clone(),
+                provider: r.provider,
+                title: r.run.name.clone().unwrap_or_else(|| r.run.definition_id.clone()),
+                updated_at: r.run.finished_at.or(r.run.started_at),
+            });
+        }
+    }
+
+    out.sort_by(|a, b| bucket_rank(a.bucket).cmp(&bucket_rank(b.bucket)).then_with(|| age_key(a.updated_at).cmp(&age_key(b.updated_at))));
+    out
 }
 
 #[cfg(test)]
