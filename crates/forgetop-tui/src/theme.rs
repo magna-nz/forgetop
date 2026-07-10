@@ -130,11 +130,44 @@ pub fn pipeline_icon(status: PipelineRunStatus) -> &'static str {
     }
 }
 
+/// Frames of the "running" spinner — a rotating disc, advanced by the animation tick.
+pub const SPINNER: [&str; 4] = ["◐", "◓", "◑", "◒"];
+
+/// Like [`pipeline_icon`], but a *running* pipeline spins through [`SPINNER`] using
+/// `frame` (the app's animation counter), so it reads as live rather than static.
+pub fn pipeline_glyph(status: PipelineRunStatus, frame: usize) -> &'static str {
+    match status {
+        PipelineRunStatus::Running => SPINNER[frame % SPINNER.len()],
+        other => pipeline_icon(other),
+    }
+}
+
 pub fn check_icon(status: CheckStatus) -> &'static str {
     match status {
         CheckStatus::Passed => "✓",
         CheckStatus::Failed => "✗",
         CheckStatus::Pending => "◐",
         CheckStatus::None => "·",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn running_pipeline_spins_others_are_static() {
+        // Running cycles through the spinner frames and wraps.
+        assert_eq!(pipeline_glyph(PipelineRunStatus::Running, 0), SPINNER[0]);
+        assert_eq!(pipeline_glyph(PipelineRunStatus::Running, 1), SPINNER[1]);
+        assert_eq!(pipeline_glyph(PipelineRunStatus::Running, SPINNER.len()), SPINNER[0]);
+        assert_ne!(
+            pipeline_glyph(PipelineRunStatus::Running, 0),
+            pipeline_glyph(PipelineRunStatus::Running, 1),
+            "the frame actually changes"
+        );
+        // Non-running statuses ignore the frame and match the static icon.
+        assert_eq!(pipeline_glyph(PipelineRunStatus::Failed, 3), pipeline_icon(PipelineRunStatus::Failed));
+        assert_eq!(pipeline_glyph(PipelineRunStatus::Succeeded, 7), pipeline_icon(PipelineRunStatus::Succeeded));
     }
 }

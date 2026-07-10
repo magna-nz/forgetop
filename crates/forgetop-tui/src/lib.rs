@@ -23,8 +23,9 @@ use tokio::sync::mpsc;
 pub use app::{App, AppDeps, Key};
 
 const REFRESH_SECS: u64 = 30;
-/// How often the selected row's long title advances one step (marquee scroll).
-const MARQUEE_MS: u64 = 300;
+/// How often the shared animation frame advances (running spinner; the marquee
+/// scroll advances every other frame). ~6.7 fps.
+const ANIM_MS: u64 = 150;
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
@@ -63,10 +64,10 @@ async fn event_loop(terminal: &mut Term, app: &mut App, deps: &AppDeps) -> Resul
     let mut ticker = tokio::time::interval(Duration::from_secs(REFRESH_SECS));
     ticker.tick().await; // consume the immediate first tick
 
-    // A fast tick drives the marquee that scrolls the selected row's long title so it
-    // can be read in full. Idle frames are identical, so ratatui writes nothing.
-    let mut marquee = tokio::time::interval(Duration::from_millis(MARQUEE_MS));
-    marquee.tick().await;
+    // A fast tick drives animations (the running-pipeline spinner and the selected-row
+    // title marquee). Idle frames are identical, so ratatui writes nothing.
+    let mut anim = tokio::time::interval(Duration::from_millis(ANIM_MS));
+    anim.tick().await;
 
     loop {
         terminal.draw(|f| ui::render(f, app)).map_err(forgetop_core::Error::from)?;
@@ -80,7 +81,7 @@ async fn event_loop(terminal: &mut Term, app: &mut App, deps: &AppDeps) -> Resul
                 None => break, // reader thread gone
             },
             _ = ticker.tick() => app.reload_all(deps).await,
-            _ = marquee.tick() => app.tick_marquee(),
+            _ = anim.tick() => app.tick_anim(),
         }
     }
     Ok(())

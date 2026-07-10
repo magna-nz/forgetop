@@ -13,7 +13,7 @@ use ratatui::Frame;
 use crate::app::{App, ConfigView, DiffFocus, DiffView, PipelineView, PrView, Screen, WiView, PR_TABS, TABS};
 use crate::diff::{cursor_line_label, pending_marks};
 use crate::overlay::Overlay;
-use crate::theme::{check_icon, pipeline_icon, Theme};
+use crate::theme::{check_icon, pipeline_glyph, Theme};
 use crate::wizard::{Prompt, PromptKind};
 
 /// Shown in empty sections when nothing is configured yet.
@@ -129,7 +129,7 @@ fn render_content(frame: &mut Frame, area: Rect, app: &mut App) {
             return;
         }
         Screen::Pipeline(view) => {
-            render_pipeline(frame, area, &app.theme, view);
+            render_pipeline(frame, area, &app.theme, view, app.anim);
             return;
         }
         Screen::Config(view) => {
@@ -198,7 +198,7 @@ fn render_lp_column(frame: &mut Frame, area: Rect, app: &App, side: usize, title
 
     let content_w = (area.width.saturating_sub(2) as usize).saturating_sub(2); // borders + highlight symbol
     // One shared set of column widths for the whole side, so every row lines up.
-    let rows_cells: Vec<Vec<(String, Style)>> = col.iter().map(|&i| lp_cells(theme, &app.lp[i])).collect();
+    let rows_cells: Vec<Vec<(String, Style)>> = col.iter().map(|&i| lp_cells(theme, &app.lp[i], app.anim)).collect();
     let widths = lp_widths(&rows_cells, 3, content_w);
 
     let mut items: Vec<ListItem> = Vec::new();
@@ -229,7 +229,7 @@ fn render_lp_column(frame: &mut Frame, area: Rect, app: &App, side: usize, title
         // The focused row's title scrolls if it's wider than its column, so it's readable.
         let line = if selected && focused && cells[LP_TITLE_COL].0.chars().count() > widths[LP_TITLE_COL] {
             let mut c = cells.clone();
-            c[LP_TITLE_COL].0 = marquee_window(&cells[LP_TITLE_COL].0, widths[LP_TITLE_COL], app.marquee);
+            c[LP_TITLE_COL].0 = marquee_window(&cells[LP_TITLE_COL].0, widths[LP_TITLE_COL], app.anim / 2);
             lp_cells_line(&c, &widths, content_w)
         } else {
             lp_cells_line(cells, &widths, content_w)
@@ -265,7 +265,7 @@ const LP_GAP: usize = 2;
 /// The aligned cells for one Launchpad row. Every item type fills the *same* seven
 /// slots — type · status · #ref · title · detail · provider · age — so rows read as
 /// siblings and line up vertically, even though PRs, pipelines and work items differ.
-fn lp_cells(theme: &Theme, e: &crate::launchpad::Entry) -> Vec<(String, Style)> {
+fn lp_cells(theme: &Theme, e: &crate::launchpad::Entry, anim: usize) -> Vec<(String, Style)> {
     use crate::launchpad::EntryItem;
     let dim = Style::default().fg(theme.dim);
     let fg = Style::default().fg(theme.fg);
@@ -310,7 +310,7 @@ fn lp_cells(theme: &Theme, e: &crate::launchpad::Entry) -> Vec<(String, Style)> 
             };
             vec![
                 badge("CI", theme.yellow),
-                (format!("{} {:?}", pipeline_icon(run.status), run.status), Style::default().fg(theme.pipeline_color(run.status))),
+                (format!("{} {:?}", pipeline_glyph(run.status, anim), run.status), Style::default().fg(theme.pipeline_color(run.status))),
                 (reference, dim),
                 (title, fg),
                 (run.branch.clone().unwrap_or_default(), dim),
@@ -733,7 +733,7 @@ fn render_pipes(frame: &mut Frame, area: Rect, app: &mut App) {
                 None => num(),
             };
             vec![
-                (format!("{} {:?}", pipeline_icon(p.run.status), p.run.status), Style::default().fg(color)),
+                (format!("{} {:?}", pipeline_glyph(p.run.status, app.anim), p.run.status), Style::default().fg(color)),
                 (format!("{} · {}", p.provider.as_str(), p.connection), Style::default().fg(theme.cyan)),
                 (pipeline, Style::default().fg(theme.fg)),
                 (run, Style::default().fg(theme.dim)),
@@ -1331,7 +1331,7 @@ fn render_config(frame: &mut Frame, area: Rect, theme: &Theme, view: &ConfigView
 
 // ---- pipeline drill-in ----
 
-fn render_pipeline(frame: &mut Frame, area: Rect, theme: &Theme, view: &PipelineView) {
+fn render_pipeline(frame: &mut Frame, area: Rect, theme: &Theme, view: &PipelineView, anim: usize) {
     // Reserve a banner row for approvals / unsupported note when there's one to show.
     let banner = approval_banner(theme, view);
     let mut constraints = vec![Constraint::Length(3)];
@@ -1346,7 +1346,7 @@ fn render_pipeline(frame: &mut Frame, area: Rect, theme: &Theme, view: &Pipeline
     let branch = view.branch.clone().unwrap_or_else(|| "—".into());
     let who = view.run.triggered_by.as_ref().map(|u| u.display_name.clone()).unwrap_or_else(|| "—".into());
     let header = Line::from(vec![
-        Span::styled(format!("{} ", pipeline_icon(view.run.status)), Style::default().fg(theme.pipeline_color(view.run.status))),
+        Span::styled(format!("{} ", pipeline_glyph(view.run.status, anim)), Style::default().fg(theme.pipeline_color(view.run.status))),
         Span::styled(format!("{:?}", view.run.status), Style::default().fg(theme.pipeline_color(view.run.status)).add_modifier(Modifier::BOLD)),
         Span::styled(format!("   branch {branch}   triggered by {who}"), Style::default().fg(theme.dim)),
     ]);
@@ -1394,7 +1394,7 @@ fn render_pipeline(frame: &mut Frame, area: Rect, theme: &Theme, view: &Pipeline
             let mut spans = vec![
                 Span::raw(indent),
                 Span::styled(marker, Style::default().fg(theme.dim)),
-                Span::styled(format!("{} ", pipeline_icon(n.status)), Style::default().fg(theme.pipeline_color(n.status))),
+                Span::styled(format!("{} ", pipeline_glyph(n.status, anim)), Style::default().fg(theme.pipeline_color(n.status))),
                 Span::styled(n.label.clone(), label_style),
             ];
             if let Some(d) = &n.duration {

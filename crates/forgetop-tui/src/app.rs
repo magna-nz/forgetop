@@ -161,9 +161,10 @@ pub struct App {
     /// True when the currently-open item view was opened from the Launchpad, so Esc
     /// returns there (with the same row still selected) instead of to the section list.
     lp_origin: bool,
-    /// Animation frame for the marquee that scrolls the selected row's long title.
-    /// Reset to 0 whenever the selection moves so each title starts from the beginning.
-    pub marquee: usize,
+    /// Shared animation frame, advanced by a fast timer. Drives the selected-row title
+    /// marquee (see `anim / 2` at the call site) and the running-pipeline spinner. Reset
+    /// to 0 when the Launchpad selection moves so each title starts from the beginning.
+    pub anim: usize,
     pub last_refresh: DateTime<Local>,
     pub should_quit: bool,
 }
@@ -570,7 +571,7 @@ impl App {
             lp_prs_review: Vec::new(),
             lp_dismissed: HashSet::new(),
             lp_origin: false,
-            marquee: 0,
+            anim: 0,
             last_refresh: Local::now(),
             should_quit: false,
         }
@@ -1138,17 +1139,18 @@ impl App {
             let cur = self.lp_sel[self.lp_side] as isize;
             self.lp_sel[self.lp_side] = (cur + delta).clamp(0, len as isize - 1) as usize;
         }
-        self.marquee = 0; // restart the title scroll on the newly-selected row
+        self.anim = 0; // restart the title scroll on the newly-selected row
     }
 
     fn lp_switch_side(&mut self, delta: isize) {
         self.lp_side = (self.lp_side as isize + delta).clamp(0, 1) as usize;
-        self.marquee = 0;
+        self.anim = 0;
     }
 
-    /// Advances the selected-row title marquee by one step (driven by a fast timer).
-    pub fn tick_marquee(&mut self) {
-        self.marquee = self.marquee.wrapping_add(1);
+    /// Advances the shared animation frame one step (driven by a fast timer): the
+    /// selected-row title marquee and the running-pipeline spinner.
+    pub fn tick_anim(&mut self) {
+        self.anim = self.anim.wrapping_add(1);
     }
 
     async fn on_launchpad_key(&mut self, key: Key, deps: &AppDeps) {
