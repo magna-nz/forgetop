@@ -195,6 +195,13 @@ pub async fn maybe_sweep<F: std::future::Future<Output = ()>>(sweep: F) {
     }
 }
 
+/// Poll windows sized for real APIs that are eventually-consistent and occasionally
+/// slow. Generous on purpose — a degraded-but-working API shouldn't flake a test
+/// (a whole run has been observed at ~4× normal duration when a provider is degraded).
+pub const POLL_LIST: u64 = 45; // find a just-created item / commits / a gate clearing
+pub const POLL_MERGE: u64 = 90; // a PR/MR settling to "merged"
+pub const POLL_GATE: u64 = 180; // a pipeline run reaching its approval gate
+
 /// Polls `f` every 2s until it yields `Some`, or `timeout_secs` elapses (→ `None`).
 /// Used to wait on eventually-consistent API state without fixed sleeps.
 #[allow(dead_code)]

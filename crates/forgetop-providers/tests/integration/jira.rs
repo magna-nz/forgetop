@@ -28,7 +28,7 @@ async fn jira_work_item_lifecycle() {
     let id = {
         let wi = &wi;
         let title = title.as_str();
-        harness::poll(30, move || async move {
+        harness::poll(harness::POLL_LIST, move || async move {
             wi.list(&WorkItemQuery { mine_only: true, include_completed: true, limit: Some(100) })
                 .await
                 .ok()
