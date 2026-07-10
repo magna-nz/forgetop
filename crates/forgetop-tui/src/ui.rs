@@ -160,8 +160,8 @@ fn render_table(frame: &mut Frame, area: Rect, app: &mut App) {
     }
 }
 
-/// The Launchpad: two columns of urgency-ordered buckets — left is "act on it"
-/// (others blocked / ready to ship), right is "your court" + informational.
+/// The Launchpad: two columns of urgency-ordered buckets — left "Needs you"
+/// (ripe for action), right "Your work" (your backlog + parked PRs).
 fn render_launchpad(frame: &mut Frame, area: Rect, app: &mut App) {
     let theme = &app.theme;
     if app.lp.is_empty() {
@@ -205,10 +205,12 @@ fn render_lp_column(frame: &mut Frame, area: Rect, app: &App, side: usize, title
         if last != Some(e.bucket) {
             let count = col.iter().filter(|&&j| app.lp[j].bucket == e.bucket).count();
             let rank = Bucket::ORDER.iter().position(|b| *b == e.bucket).unwrap_or(0);
+            // Headings use magenta so they read as section labels, not PR rows (the
+            // PR colour is blue, which equals the accent in every theme).
             let style = if e.bucket.muted() {
                 Style::default().fg(theme.dim)
             } else {
-                Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)
+                Style::default().fg(theme.magenta).add_modifier(Modifier::BOLD)
             };
             if !items.is_empty() {
                 items.push(ListItem::new(Line::from("")));
@@ -231,30 +233,90 @@ fn render_lp_column(frame: &mut Frame, area: Rect, app: &App, side: usize, title
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-/// A Launchpad row: a colored type badge, the title, and a right-aligned age.
+/// A Launchpad row, rendered to mirror its section's nav list (PR / work item /
+/// pipeline), dispatched on the entry's underlying item.
 fn lp_row_line<'a>(theme: &Theme, e: &crate::launchpad::Entry, content_w: usize) -> Line<'a> {
-    use crate::launchpad::EntryKind;
-    let badge_color = match e.kind() {
-        EntryKind::Pr => theme.blue,
-        EntryKind::Wi => theme.green,
-        EntryKind::Pipe => theme.yellow,
-    };
-    let age = rel_age(e.updated_at());
-    let stale = e.updated_at().map(|d| (chrono::Utc::now() - d).num_days() >= 3).unwrap_or(false);
-    let age_w = age.chars().count();
-    // Layout: " " badge(8) " " title …pad… age
-    let fixed = 1 + 8 + 1 + age_w + 1;
-    let title: String = e.title().chars().take(content_w.saturating_sub(fixed)).collect();
-    let used = 1 + 8 + 1 + title.chars().count() + age_w;
-    let pad = content_w.saturating_sub(used);
-    Line::from(vec![
-        Span::raw(" "),
-        Span::styled(format!("{:<8}", e.kind().label()), Style::default().fg(badge_color).add_modifier(Modifier::BOLD)),
-        Span::raw(" "),
-        Span::styled(title, Style::default().fg(theme.fg)),
-        Span::raw(" ".repeat(pad)),
-        Span::styled(age, Style::default().fg(if stale { theme.red } else { theme.dim })),
-    ])
+    use crate::launchpad::EntryItem;
+    match &e.item {
+        EntryItem::Pr(pr) => lp_pr_line(theme, pr, content_w),
+        EntryItem::Wi(wi) => lp_wi_line(theme, wi, content_w),
+        EntryItem::Pipe(run) => lp_pipe_line(theme, run, e.provider, content_w),
+    }
+}
+
+fn age_color(theme: &Theme, t: Option<DateTime<Utc>>) -> ratatui::style::Color {
+    let stale = t.map(|d| (Utc::now() - d).num_days() >= 3).unwrap_or(false);
+    if stale {
+        theme.red
+    } else {
+        theme.dim
+    }
+}
+
+/// Assembles a row from fixed lead spans, a flexible title that truncates, and
+/// right-aligned trailing spans — so every row in a column lines up at both edges.
+fn lp_assemble<'a>(content_w: usize, mut lead: Vec<Span<'a>>, title: String, title_style: Style, trail: Vec<Span<'a>>) -> Line<'a> {
+    let width = |spans: &[Span]| spans.iter().map(|s| s.content.chars().count()).sum::<usize>();
+    let (lead_w, trail_w) = (width(&lead), width(&trail));
+    let room = content_w.saturating_sub(lead_w + 1 + trail_w + 1);
+    let title_trunc: String = title.chars().take(room).collect();
+    let used = lead_w + 1 + title_trunc.chars().count() + trail_w;
+    let pad = content_w.saturating_sub(used).max(1);
+    lead.push(Span::raw(" "));
+    lead.push(Span::styled(title_trunc, title_style));
+    lead.push(Span::raw(" ".repeat(pad)));
+    lead.extend(trail);
+    Line::from(lead)
+}
+
+/// PR row: status · `#num` · title · `+A -D` · one ✓ per approval (✗ if changes requested).
+fn lp_pr_line<'a>(theme: &Theme, pr: &PullRequest, content_w: usize) -> Line<'a> {
+    let (st, stc) = pr_status(theme, pr);
+    let num = pr.number.map(|n| format!("#{n}")).unwrap_or_default();
+    let lead = vec![
+        Span::styled(format!("{st:<8}"), Style::default().fg(stc)),
+        Span::styled(format!("{num:>4}"), Style::default().fg(theme.dim)),
+    ];
+    let approvals = pr.reviewers.iter().filter(|r| matches!(r.vote, ReviewVote::Approved | ReviewVote::ApprovedWithSuggestions)).count();
+    let changes = pr.reviewers.iter().any(|r| r.vote == ReviewVote::Rejected);
+    let mut trail = Vec::new();
+    if approvals > 0 {
+        trail.push(Span::styled(format!("{} ", "✓".repeat(approvals)), Style::default().fg(theme.green)));
+    }
+    if changes {
+        trail.push(Span::styled("✗ ", Style::default().fg(theme.red)));
+    }
+    trail.push(Span::styled(format!("+{} -{}", pr.additions, pr.deletions), Style::default().fg(theme.dim)));
+    trail.push(Span::styled(format!("  {}", rel_age(pr.updated_at)), Style::default().fg(age_color(theme, pr.updated_at))));
+    lp_assemble(content_w, lead, pr.title.clone(), Style::default().fg(theme.fg), trail)
+}
+
+/// Work-item row: `● State` · ID · title · type.
+fn lp_wi_line<'a>(theme: &Theme, wi: &WorkItem, content_w: usize) -> Line<'a> {
+    let lead = vec![
+        Span::styled(format!("● {}", wi.state), Style::default().fg(wi_state_color(theme, wi.state_category))),
+        Span::styled(format!("  {}", wi.identifier.clone().unwrap_or_default()), Style::default().fg(theme.dim)),
+    ];
+    let mut trail = Vec::new();
+    if let Some(t) = wi.work_item_type.clone().filter(|t| !t.is_empty()) {
+        trail.push(Span::styled(t, Style::default().fg(theme.dim)));
+    }
+    trail.push(Span::styled(format!("  {}", rel_age(wi.updated_at)), Style::default().fg(age_color(theme, wi.updated_at))));
+    lp_assemble(content_w, lead, wi.title.clone(), Style::default().fg(theme.fg), trail)
+}
+
+/// Pipeline row: status icon+name (title) · branch · provider — like the Pipelines list.
+fn lp_pipe_line<'a>(theme: &Theme, run: &PipelineRun, provider: ProviderType, content_w: usize) -> Line<'a> {
+    let color = theme.pipeline_color(run.status);
+    let name = run.name.clone().unwrap_or_else(|| run.definition_id.clone());
+    let lead = vec![Span::styled(format!("{} {:?}", pipeline_icon(run.status), run.status), Style::default().fg(color))];
+    let mut trail = Vec::new();
+    if let Some(b) = run.branch.clone().filter(|b| !b.is_empty()) {
+        trail.push(Span::styled(format!("{b}  "), Style::default().fg(theme.dim)));
+    }
+    trail.push(Span::styled(provider.as_str().to_string(), Style::default().fg(theme.cyan)));
+    trail.push(Span::styled(format!("  {}", rel_age(run.finished_at.or(run.started_at))), Style::default().fg(theme.dim)));
+    lp_assemble(content_w, lead, name, Style::default().fg(theme.fg), trail)
 }
 
 /// Circled numerals for the bucket headers.
@@ -2074,8 +2136,10 @@ mod tests {
         assert!(out.contains("Needs you") && out.contains("Your work"), "two columns");
         // Buckets land in the right columns.
         assert!(out.contains("Needs your review") && out.contains("Needs fixing") && out.contains("Assigned to you"), "bucket headers");
-        // Type badges present.
-        assert!(out.contains("PR") && out.contains("Issue") && out.contains("Pipeline"), "type badges");
+        // Rows carry nav-style detail: PR number + change stats, WI id/state/type, pipeline branch.
+        assert!(out.contains("#42") && out.contains("+10 -2"), "PR row shows number and change stats");
+        assert!(out.contains("FOR-1") && out.contains("Todo") && out.contains("Bug"), "work-item row shows id, state, type");
+        assert!(out.contains("main"), "pipeline row shows branch");
     }
 
     #[test]
