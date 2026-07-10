@@ -465,7 +465,8 @@ fn pr_checks(theme: &Theme, pr: &PullRequest) -> (String, ratatui::style::Color)
 fn render_prs(frame: &mut Frame, area: Rect, app: &mut App) {
     let theme = &app.theme;
     let idxs = app.filtered_pr_indices();
-    let title = list_title("Pull Requests".to_string(), &app.filters[0]);
+    let base = format!("Pull Requests · {}", crate::app::pr_status_summary(&app.pr_shown_statuses));
+    let title = list_title(base, &app.filters[0]);
     if idxs.is_empty() {
         let msg = if !app.filters[0].is_empty() {
             "No matches. Esc clears the filter."
@@ -905,7 +906,7 @@ fn footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
     }
     let mut keys = vec![("↑↓", "move"), ("←→", "tabs")];
     match app.active {
-        0 => keys.extend([("↵", "open"), ("f", "view"), ("S", "sort"), ("o", "browser")]),
+        0 => keys.extend([("↵", "open"), ("f", "status"), ("S", "sort"), ("o", "browser")]),
         1 => keys.extend([("↵", "open"), ("f", "states"), ("S", "sort"), ("o", "browser")]),
         2 => keys.extend([("↵", "drill-in"), ("S", "sort"), ("T", "trigger"), ("o", "open")]),
         _ => {}
@@ -1447,7 +1448,7 @@ fn help_sections() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
             "Pull Requests (list)",
             vec![
                 ("Enter", "Open the PR view (all actions live there)"),
-                ("f", "Next saved view (defaults: All / Mine / Review)"),
+                ("f", "Filter by status (Open / Draft / Merged / Closed)"),
             ],
         ),
         (

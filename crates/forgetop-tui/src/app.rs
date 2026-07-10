@@ -93,6 +93,9 @@ pub struct App {
     /// Max scroll offset for the open PR/WI view, captured during render for clamping.
     pub detail_scroll_max: u16,
     pub pr_filter: PullRequestFilter,
+    /// PR statuses shown in the list (session-only). Default is Open + Draft; ticking
+    /// Merged/Closed also flips the fetch to include completed PRs.
+    pub pr_shown_statuses: HashSet<PullRequestStatus>,
     /// Live per-tab quick-filter text (0=PR, 1=WI, 2=Pipelines). Empty = no filter.
     pub filters: [String; 3],
     /// True while the quick-filter input is capturing keystrokes.
@@ -528,6 +531,7 @@ impl App {
             content_h: 0,
             detail_scroll_max: 0,
             pr_filter: PullRequestFilter::All,
+            pr_shown_statuses: [PullRequestStatus::Open, PullRequestStatus::Draft].into_iter().collect(),
             filters: [String::new(), String::new(), String::new()],
             filtering: false,
             wi_hidden_states: HashSet::new(),
@@ -576,7 +580,9 @@ impl App {
     /// in the active sort order.
     pub fn filtered_pr_indices(&self) -> Vec<usize> {
         let q = self.filters[0].to_lowercase();
-        let mut idx: Vec<usize> = (0..self.prs.len()).filter(|&i| pr_matches(&self.prs[i].pr, &q)).collect();
+        let mut idx: Vec<usize> = (0..self.prs.len())
+            .filter(|&i| self.pr_shown_statuses.contains(&self.prs[i].pr.status) && pr_matches(&self.prs[i].pr, &q))
+            .collect();
         if let Some(s) = &self.pr_sort {
             idx.sort_by(|&a, &b| ordered(pr_cmp(&self.prs[a].pr, &self.prs[b].pr, &s.key), s.desc));
         }
@@ -1211,9 +1217,14 @@ impl App {
         self.prs.clear();
         match deps.sections.pull_request_feeds().await {
             Ok(feeds) => {
+                let query = PullRequestQuery {
+                    filter: self.pr_filter,
+                    include_completed: self.pr_wants_completed(),
+                    limit: Some(50),
+                };
                 for feed in feeds {
                     let (provider, name, conn_id) = feed_tag(&feed.connection);
-                    match feed.source.list(&pr_query(self.pr_filter)).await {
+                    match feed.source.list(&query).await {
                         Ok(list) => self.prs.extend(list.into_iter().map(|pr| PrRow {
                             connection_id: conn_id.clone(),
                             connection: name.clone(),
@@ -1837,7 +1848,8 @@ impl App {
             ']' => self.switch_view(1, deps).await,
             'V' => self.open_save_view(),
             'X' => self.open_delete_view(),
-            'f' if self.active == 0 => self.switch_view(1, deps).await,
+            // Filter by status (PRs) / by state (Work Items) — 'f' = filter on both tabs.
+            'f' if self.active == 0 => self.open_pr_status_toggle(),
             'f' if self.active == 1 => self.open_wi_states_toggle(),
             // Pipeline trigger (Pipelines tab).
             'T' if self.active == 2 => self.open_pipeline_trigger(),
@@ -2251,6 +2263,33 @@ impl App {
     // ---- work-item state visibility ----
 
     /// Opens a checklist of the distinct states currently present, ticked = shown.
+    /// True when the shown-status set includes a completed status, so the fetch must
+    /// ask the provider for closed/merged PRs (not just open ones).
+    fn pr_wants_completed(&self) -> bool {
+        self.pr_shown_statuses.iter().any(|s| matches!(s, PullRequestStatus::Merged | PullRequestStatus::Closed))
+    }
+
+    /// Opens the "Show statuses" checklist for the PR list (Open/Draft/Merged/Closed).
+    fn open_pr_status_toggle(&mut self) {
+        let items = PR_STATUS_ORDER
+            .iter()
+            .map(|&s| ToggleItem { on: self.pr_shown_statuses.contains(&s), id: pr_status_key(s).into(), label: pr_status_key(s).into() })
+            .collect();
+        self.overlay =
+            Some(Overlay::Toggle { title: "Show statuses".into(), kind: ToggleKind::PrStatuses, min_one: true, items, selected: 0 });
+    }
+
+    /// `ids` are the statuses left ticked. Rebuilds the shown set, then refetches so a
+    /// newly-ticked Merged/Closed pulls completed PRs from the provider.
+    async fn apply_pr_statuses(&mut self, shown_ids: Vec<String>, deps: &AppDeps) {
+        self.pr_shown_statuses = shown_ids.iter().filter_map(|id| parse_pr_status(id)).collect();
+        let mut errors = Vec::new();
+        self.reload_pull_requests(deps, &mut errors).await;
+        self.fix_selection();
+        self.list_scroll = 0;
+        self.toast = Some(if let Some(e) = errors.first() { e.clone() } else { format!("Showing {}", pr_status_summary(&self.pr_shown_statuses)) });
+    }
+
     fn open_wi_states_toggle(&mut self) {
         let states = self.distinct_wi_states();
         if states.is_empty() {
@@ -2276,6 +2315,9 @@ impl App {
             }
             ToggleKind::WorkItemStates => {
                 self.apply_wi_states(ids, deps).await;
+            }
+            ToggleKind::PrStatuses => {
+                self.apply_pr_statuses(ids, deps).await;
             }
             ToggleKind::Notifications => {
                 self.apply_notifications(ids, deps).await;
@@ -3087,6 +3129,31 @@ fn pr_query(filter: PullRequestFilter) -> PullRequestQuery {
     PullRequestQuery { filter, include_completed: false, limit: Some(50) }
 }
 
+/// PR statuses in display order — drives the "Show statuses" checklist and the header.
+const PR_STATUS_ORDER: [PullRequestStatus; 4] =
+    [PullRequestStatus::Open, PullRequestStatus::Draft, PullRequestStatus::Merged, PullRequestStatus::Closed];
+
+fn pr_status_key(s: PullRequestStatus) -> &'static str {
+    match s {
+        PullRequestStatus::Open => "Open",
+        PullRequestStatus::Draft => "Draft",
+        PullRequestStatus::Merged => "Merged",
+        PullRequestStatus::Closed => "Closed",
+    }
+}
+
+fn parse_pr_status(s: &str) -> Option<PullRequestStatus> {
+    PR_STATUS_ORDER.iter().copied().find(|&st| pr_status_key(st) == s)
+}
+
+/// Human summary of the shown-status set, in canonical order (e.g. "Open, Merged").
+pub fn pr_status_summary(shown: &HashSet<PullRequestStatus>) -> String {
+    if shown.len() == PR_STATUS_ORDER.len() {
+        return "all statuses".into();
+    }
+    PR_STATUS_ORDER.iter().filter(|s| shown.contains(s)).map(|&s| pr_status_key(s)).collect::<Vec<_>>().join(", ")
+}
+
 fn parse_pr_filter(s: Option<&str>) -> PullRequestFilter {
     match s {
         Some("mine") => PullRequestFilter::Mine,
@@ -3204,6 +3271,41 @@ mod tests {
         assert!(app.lp.is_empty(), "reviewed PR is dismissed");
         app.rebuild_launchpad();
         assert!(app.lp.is_empty(), "still gone until the provider feed catches up");
+    }
+
+    #[test]
+    fn pr_status_filter_limits_the_list_and_drives_completed_fetch() {
+        let mut app = App::new("slate");
+        let mk = |id: &str, status| {
+            let mut p = pr(None);
+            p.id = id.into();
+            p.status = status;
+            pr_row(p)
+        };
+        app.prs = vec![
+            mk("1", PullRequestStatus::Open),
+            mk("2", PullRequestStatus::Merged),
+            mk("3", PullRequestStatus::Draft),
+            mk("4", PullRequestStatus::Closed),
+        ];
+        app.active = 0;
+
+        // Default (Open + Draft) shows only those, and doesn't need completed PRs.
+        assert!(!app.pr_wants_completed());
+        assert_eq!(app.filtered_pr_indices(), vec![0, 2]);
+
+        // Ticking Merged shows it and flips the fetch to include completed PRs.
+        app.pr_shown_statuses = [PullRequestStatus::Open, PullRequestStatus::Merged].into_iter().collect();
+        assert!(app.pr_wants_completed());
+        assert_eq!(app.filtered_pr_indices(), vec![0, 1]);
+    }
+
+    #[test]
+    fn pr_status_summary_reads_in_canonical_order() {
+        let set: HashSet<_> = [PullRequestStatus::Merged, PullRequestStatus::Open].into_iter().collect();
+        assert_eq!(pr_status_summary(&set), "Open, Merged");
+        let all: HashSet<_> = PR_STATUS_ORDER.into_iter().collect();
+        assert_eq!(pr_status_summary(&all), "all statuses");
     }
 
     #[test]
