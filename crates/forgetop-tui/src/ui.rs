@@ -234,22 +234,22 @@ fn render_lp_column(frame: &mut Frame, area: Rect, app: &App, side: usize, title
 /// A Launchpad row: a colored type badge, the title, and a right-aligned age.
 fn lp_row_line<'a>(theme: &Theme, e: &crate::launchpad::Entry, content_w: usize) -> Line<'a> {
     use crate::launchpad::EntryKind;
-    let badge_color = match e.kind {
+    let badge_color = match e.kind() {
         EntryKind::Pr => theme.blue,
         EntryKind::Wi => theme.green,
         EntryKind::Pipe => theme.yellow,
     };
-    let age = rel_age(e.updated_at);
-    let stale = e.updated_at.map(|d| (chrono::Utc::now() - d).num_days() >= 3).unwrap_or(false);
+    let age = rel_age(e.updated_at());
+    let stale = e.updated_at().map(|d| (chrono::Utc::now() - d).num_days() >= 3).unwrap_or(false);
     let age_w = age.chars().count();
     // Layout: " " badge(8) " " title …pad… age
     let fixed = 1 + 8 + 1 + age_w + 1;
-    let title: String = e.title.chars().take(content_w.saturating_sub(fixed)).collect();
+    let title: String = e.title().chars().take(content_w.saturating_sub(fixed)).collect();
     let used = 1 + 8 + 1 + title.chars().count() + age_w;
     let pad = content_w.saturating_sub(used);
     Line::from(vec![
         Span::raw(" "),
-        Span::styled(format!("{:<8}", e.kind.label()), Style::default().fg(badge_color).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("{:<8}", e.kind().label()), Style::default().fg(badge_color).add_modifier(Modifier::BOLD)),
         Span::raw(" "),
         Span::styled(title, Style::default().fg(theme.fg)),
         Span::raw(" ".repeat(pad)),
@@ -2032,21 +2032,42 @@ mod tests {
 
     #[test]
     fn launchpad_renders_two_columns_with_typed_rows() {
-        use crate::launchpad::{Bucket, Entry, EntryKind};
-        let mk = |bucket, kind, title: &str| Entry {
+        use crate::launchpad::{Bucket, Entry, EntryItem};
+        let entry = |bucket, item| Entry {
             bucket,
-            kind,
             connection_id: "c".into(),
-            item_id: title.into(),
+            connection: "GH".into(),
             provider: ProviderType::GitHub,
-            title: title.into(),
+            item,
+        };
+        let pr = {
+            let mut p = sample_pr();
+            p.title = "Add retry policy".into();
+            p
+        };
+        let run = {
+            let mut r = sample_run();
+            r.name = Some("nightly".into());
+            r
+        };
+        let wi = WorkItem {
+            id: "w".into(),
+            identifier: Some("FOR-1".into()),
+            title: "Investigate flake".into(),
+            description: None,
+            state: "Todo".into(),
+            state_category: WorkItemStateCategory::Unstarted,
+            work_item_type: Some("Bug".into()),
+            assignee: None,
+            created_at: None,
             updated_at: None,
+            url: None,
         };
         let mut app = App::new("slate"); // defaults to the Launchpad screen
         app.lp = vec![
-            mk(Bucket::NeedsReview, EntryKind::Pr, "Add retry policy"),
-            mk(Bucket::NeedsFixing, EntryKind::Pipe, "nightly"),
-            mk(Bucket::YourWork, EntryKind::Wi, "Investigate flake"),
+            entry(Bucket::NeedsReview, EntryItem::Pr(pr)),
+            entry(Bucket::NeedsFixing, EntryItem::Pipe(run)),
+            entry(Bucket::YourWork, EntryItem::Wi(wi)),
         ];
         let out = render_to_string(&mut app, 140, 24);
         // Two named columns.

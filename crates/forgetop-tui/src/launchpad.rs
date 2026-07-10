@@ -3,7 +3,7 @@
 //! is the part it's most important to get right.
 
 use chrono::{DateTime, Utc};
-use forgetop_core::domain::{CheckStatus, MergeableState, PipelineRunStatus, ProviderType, PullRequest};
+use forgetop_core::domain::{CheckStatus, MergeableState, PipelineRun, PipelineRunStatus, ProviderType, PullRequest, WorkItem};
 
 use crate::app::{pr_vote_flags, PipeRow, PrRow, WiRow};
 
@@ -122,19 +122,58 @@ impl EntryKind {
     }
 }
 
-/// One actionable item on the Launchpad, resolved to its bucket + display fields.
+/// The underlying domain object behind a Launchpad row, kept whole so a row can render
+/// the same detail as its section's nav list.
+pub enum EntryItem {
+    Pr(PullRequest),
+    Wi(WorkItem),
+    Pipe(PipelineRun),
+}
+
+/// One actionable item on the Launchpad, resolved to its bucket + the full domain object.
 pub struct Entry {
     pub bucket: Bucket,
-    pub kind: EntryKind,
     pub connection_id: String,
-    pub item_id: String,
+    /// Display name of the connection (for the "provider · connection" tag).
+    pub connection: String,
     pub provider: ProviderType,
-    pub title: String,
-    /// Last activity, for the staleness cue + oldest-first ordering.
-    pub updated_at: Option<DateTime<Utc>>,
+    pub item: EntryItem,
 }
 
 impl Entry {
+    pub fn kind(&self) -> EntryKind {
+        match self.item {
+            EntryItem::Pr(_) => EntryKind::Pr,
+            EntryItem::Wi(_) => EntryKind::Wi,
+            EntryItem::Pipe(_) => EntryKind::Pipe,
+        }
+    }
+
+    pub fn item_id(&self) -> &str {
+        match &self.item {
+            EntryItem::Pr(pr) => &pr.id,
+            EntryItem::Wi(wi) => &wi.id,
+            EntryItem::Pipe(run) => &run.id,
+        }
+    }
+
+    pub fn title(&self) -> &str {
+        match &self.item {
+            EntryItem::Pr(pr) => &pr.title,
+            EntryItem::Wi(wi) => &wi.title,
+            EntryItem::Pipe(run) => run.name.as_deref().unwrap_or(&run.definition_id),
+        }
+    }
+
+    /// Last activity, for the staleness cue + oldest-first ordering.
+    pub fn updated_at(&self) -> Option<DateTime<Utc>> {
+        match &self.item {
+            EntryItem::Pr(pr) => pr.updated_at,
+            EntryItem::Wi(wi) => wi.updated_at,
+            EntryItem::Pipe(run) => run.finished_at.or(run.started_at),
+        }
+    }
+
     /// Stable identity of the underlying item, used to dismiss it from the Launchpad
     /// once you've acted on it (e.g. reviewed the PR) even before the next refetch.
     pub fn key(connection_id: &str, item_id: &str) -> String {
@@ -159,12 +198,10 @@ fn age_key(t: Option<DateTime<Utc>>) -> (u8, i64) {
 pub fn build(prs_review: &[PrRow], prs_mine: &[PrRow], wis: &[WiRow], pipes: &[PipeRow]) -> Vec<Entry> {
     let pr_entry = |row: &PrRow, bucket: Bucket| Entry {
         bucket,
-        kind: EntryKind::Pr,
         connection_id: row.connection_id.clone(),
-        item_id: row.pr.id.clone(),
+        connection: row.connection.clone(),
         provider: row.provider,
-        title: row.pr.title.clone(),
-        updated_at: row.pr.updated_at,
+        item: EntryItem::Pr(row.pr.clone()),
     };
 
     let mut out: Vec<Entry> = Vec::new();
@@ -172,28 +209,24 @@ pub fn build(prs_review: &[PrRow], prs_mine: &[PrRow], wis: &[WiRow], pipes: &[P
     out.extend(prs_mine.iter().map(|r| pr_entry(r, classify_pr(&r.pr, PrRole::Author))));
     out.extend(wis.iter().map(|r| Entry {
         bucket: Bucket::YourWork,
-        kind: EntryKind::Wi,
         connection_id: r.connection_id.clone(),
-        item_id: r.wi.id.clone(),
+        connection: r.connection.clone(),
         provider: r.provider,
-        title: r.wi.title.clone(),
-        updated_at: r.wi.updated_at,
+        item: EntryItem::Wi(r.wi.clone()),
     }));
     for r in pipes {
         if let Some(bucket) = classify_pipe(r) {
             out.push(Entry {
                 bucket,
-                kind: EntryKind::Pipe,
                 connection_id: r.connection_id.clone(),
-                item_id: r.run.id.clone(),
+                connection: r.connection.clone(),
                 provider: r.provider,
-                title: r.run.name.clone().unwrap_or_else(|| r.run.definition_id.clone()),
-                updated_at: r.run.finished_at.or(r.run.started_at),
+                item: EntryItem::Pipe(r.run.clone()),
             });
         }
     }
 
-    out.sort_by(|a, b| bucket_rank(a.bucket).cmp(&bucket_rank(b.bucket)).then_with(|| age_key(a.updated_at).cmp(&age_key(b.updated_at))));
+    out.sort_by(|a, b| bucket_rank(a.bucket).cmp(&bucket_rank(b.bucket)).then_with(|| age_key(a.updated_at()).cmp(&age_key(b.updated_at()))));
     out
 }
 

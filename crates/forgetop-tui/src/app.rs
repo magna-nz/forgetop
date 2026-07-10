@@ -1093,7 +1093,7 @@ impl App {
     fn rebuild_launchpad(&mut self) {
         self.lp = launchpad::build(&self.lp_prs_review, &self.lp_prs_mine, &self.wis, &self.pipes);
         // Drop anything already acted on this session (e.g. a PR you've reviewed).
-        self.lp.retain(|e| !self.lp_dismissed.contains(&launchpad::Entry::key(&e.connection_id, &e.item_id)));
+        self.lp.retain(|e| !self.lp_dismissed.contains(&launchpad::Entry::key(&e.connection_id, e.item_id())));
         for side in 0..2 {
             let len = self.lp_column(side).len();
             if self.lp_sel[side] >= len {
@@ -1157,7 +1157,7 @@ impl App {
     /// Opens the selected Launchpad row in its full item view.
     async fn open_launchpad_selected(&mut self, deps: &AppDeps) {
         let Some(entry) = self.lp_selected().and_then(|i| self.lp.get(i)) else { return };
-        let (kind, conn, id) = (entry.kind, entry.connection_id.clone(), entry.item_id.clone());
+        let (kind, conn, id) = (entry.kind(), entry.connection_id.clone(), entry.item_id().to_string());
         match kind {
             launchpad::EntryKind::Pr => {
                 let found = self
