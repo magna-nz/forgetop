@@ -222,10 +222,19 @@ fn render_lp_column(frame: &mut Frame, area: Rect, app: &App, side: usize, title
             items.push(ListItem::new(Line::from(Span::styled(format!("{}  {} ({count})", CIRCLED[rank.min(7)], e.bucket.title()), style))));
             last = Some(e.bucket);
         }
-        if pos == app.lp_sel[side] {
+        let selected = pos == app.lp_sel[side];
+        if selected {
             visual_sel = items.len();
         }
-        items.push(ListItem::new(lp_cells_line(cells, &widths, content_w)));
+        // The focused row's title scrolls if it's wider than its column, so it's readable.
+        let line = if selected && focused && cells[LP_TITLE_COL].0.chars().count() > widths[LP_TITLE_COL] {
+            let mut c = cells.clone();
+            c[LP_TITLE_COL].0 = marquee_window(&cells[LP_TITLE_COL].0, widths[LP_TITLE_COL], app.marquee);
+            lp_cells_line(&c, &widths, content_w)
+        } else {
+            lp_cells_line(cells, &widths, content_w)
+        };
+        items.push(ListItem::new(line));
     }
 
     let list = List::new(items)
@@ -248,6 +257,8 @@ fn age_color(theme: &Theme, t: Option<DateTime<Utc>>) -> ratatui::style::Color {
 
 /// Number of Launchpad row columns (kept in sync with [`lp_cells`]).
 const LP_NCOL: usize = 7;
+/// The flexible title column in a Launchpad row (the one that marquee-scrolls).
+const LP_TITLE_COL: usize = 3;
 /// Gap between Launchpad columns — tighter than the nav lists since a column is half-width.
 const LP_GAP: usize = 2;
 
@@ -332,6 +343,22 @@ fn lp_widths(rows: &[Vec<(String, Style)>], flex: usize, inner_w: usize) -> Vec<
     let fixed: usize = (0..LP_NCOL).filter(|&i| i != flex).map(|i| w[i]).sum::<usize>() + padding;
     w[flex] = w[flex].min(inner_w.saturating_sub(fixed)).max(3);
     w
+}
+
+/// A horizontally-scrolling window of `text`, `width` columns wide, advancing with
+/// `frame`. Holds at the start briefly, then scrolls, wrapping past a gap — so a long
+/// selected title can be read in full. Returns `text` unchanged when it already fits.
+fn marquee_window(text: &str, width: usize, frame: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if width == 0 || chars.len() <= width {
+        return text.to_string();
+    }
+    const GAP: usize = 4; // blank run between the end and the wrapped-around start
+    const HOLD: usize = 6; // frames held at the start before scrolling
+    let gapped: Vec<char> = chars.into_iter().chain(std::iter::repeat_n(' ', GAP)).collect();
+    let period = gapped.len();
+    let pos = (frame % (period + HOLD)).saturating_sub(HOLD);
+    (0..width).map(|i| gapped[(pos + i) % period]).collect()
 }
 
 /// Joins Launchpad cells into a line, each padded to its column width (so columns align),
@@ -1753,6 +1780,24 @@ mod tests {
             updated_at: None,
             url: Some("http://x".into()),
         }
+    }
+
+    #[test]
+    fn marquee_scrolls_only_overflowing_text() {
+        // Fits → returned unchanged (no scrolling).
+        assert_eq!(marquee_window("short", 10, 3), "short");
+        assert_eq!(marquee_window("short", 10, 99), "short");
+
+        let text = "Tidy up the logging middleware";
+        // Held at the start for the first few frames, exactly the window width.
+        let start = marquee_window(text, 12, 0);
+        assert_eq!(start.chars().count(), 12);
+        assert_eq!(start, "Tidy up the ");
+        assert_eq!(marquee_window(text, 12, 3), start, "held at start");
+        // Later it has advanced (shows text further along).
+        let later = marquee_window(text, 12, 12);
+        assert_ne!(later, start);
+        assert!(later.chars().count() == 12);
     }
 
     fn render_to_string(app: &mut App, w: u16, h: u16) -> String {
