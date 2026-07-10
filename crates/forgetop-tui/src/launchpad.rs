@@ -52,6 +52,15 @@ impl Bucket {
     pub fn muted(&self) -> bool {
         matches!(self, Bucket::WaitingOnOthers | Bucket::Drafts)
     }
+
+    /// Which Launchpad column this bucket lives in: 0 = left ("others blocked / you
+    /// can ship"), 1 = right ("back in your court" + muted).
+    pub fn column(&self) -> usize {
+        match self {
+            Bucket::NeedsReview | Bucket::ApprovalsWaiting | Bucket::ReadyToMerge => 0,
+            _ => 1,
+        }
+    }
 }
 
 /// Which feed a PR came from — i.e. the current user's relationship to it.
@@ -103,6 +112,17 @@ pub enum EntryKind {
     Pr,
     Wi,
     Pipe,
+}
+
+impl EntryKind {
+    /// Short type badge shown on each row.
+    pub fn label(&self) -> &'static str {
+        match self {
+            EntryKind::Pr => "PR",
+            EntryKind::Wi => "Issue",
+            EntryKind::Pipe => "Pipe",
+        }
+    }
 }
 
 /// One actionable item on the Launchpad, resolved to its bucket + display fields.

@@ -160,26 +160,50 @@ fn render_table(frame: &mut Frame, area: Rect, app: &mut App) {
     }
 }
 
-/// The Launchpad: one page, items grouped into urgency-ordered buckets.
+/// The Launchpad: two columns of urgency-ordered buckets — left is "act on it"
+/// (others blocked / ready to ship), right is "your court" + informational.
 fn render_launchpad(frame: &mut Frame, area: Rect, app: &mut App) {
+    let theme = &app.theme;
+    if app.lp.is_empty() {
+        let msg = if app.health.is_empty() { FIRST_RUN_HINT } else { "✓ You're all caught up — nothing needs you." };
+        empty(frame, area, theme, msg, section_block(theme, "Launchpad · what needs you"));
+        return;
+    }
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area);
+    render_lp_column(frame, cols[0], app, 0, "Act on it");
+    render_lp_column(frame, cols[1], app, 1, "Your court");
+}
+
+/// One Launchpad column: a bordered box stacking its buckets. The focused column
+/// gets an accent border + a lit selection.
+fn render_lp_column(frame: &mut Frame, area: Rect, app: &App, side: usize, title: &str) {
     use crate::launchpad::Bucket;
     let theme = &app.theme;
-    let block = section_block(theme, "Launchpad · what needs you");
+    let focused = app.lp_side == side;
+    let border = if focused { theme.accent } else { theme.dim };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border))
+        .title(Span::styled(format!(" {title} "), Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)));
 
-    if app.lp.is_empty() {
-        // Distinguish "nothing set up yet" from "genuinely all clear".
-        let msg = if app.health.is_empty() { FIRST_RUN_HINT } else { "✓ You're all caught up — nothing needs you." };
-        empty(frame, area, theme, msg, block);
+    let col = app.lp_column(side);
+    if col.is_empty() {
+        empty(frame, area, theme, "— nothing here —", block);
         return;
     }
 
+    let content_w = (area.width.saturating_sub(2) as usize).saturating_sub(2); // borders + highlight symbol
     let mut items: Vec<ListItem> = Vec::new();
     let mut visual_sel = 0usize;
     let mut last: Option<Bucket> = None;
-    for (i, e) in app.lp.iter().enumerate() {
-        // A header row whenever the bucket changes.
+    for (pos, &i) in col.iter().enumerate() {
+        let e = &app.lp[i];
         if last != Some(e.bucket) {
-            let count = app.lp.iter().filter(|x| x.bucket == e.bucket).count();
+            let count = col.iter().filter(|&&j| app.lp[j].bucket == e.bucket).count();
             let rank = Bucket::ORDER.iter().position(|b| *b == e.bucket).unwrap_or(0);
             let style = if e.bucket.muted() {
                 Style::default().fg(theme.dim)
@@ -192,25 +216,45 @@ fn render_launchpad(frame: &mut Frame, area: Rect, app: &mut App) {
             items.push(ListItem::new(Line::from(Span::styled(format!("{}  {} ({count})", CIRCLED[rank.min(7)], e.bucket.title()), style))));
             last = Some(e.bucket);
         }
-        if i == app.lp_sel {
+        if pos == app.lp_sel[side] {
             visual_sel = items.len();
         }
-        // Staleness: highlight items sitting untouched for a few days.
-        let age = rel_age(e.updated_at);
-        let stale = e.updated_at.map(|d| (chrono::Utc::now() - d).num_days() >= 3).unwrap_or(false);
-        let title: String = e.title.chars().take(72).collect();
-        items.push(ListItem::new(Line::from(vec![
-            Span::raw("  "),
-            Span::styled(format!("{:<12}", e.provider.as_str()), Style::default().fg(theme.cyan)),
-            Span::styled(title, Style::default().fg(theme.fg)),
-            Span::styled(format!("   {age}"), Style::default().fg(if stale { theme.red } else { theme.dim })),
-        ])));
+        items.push(ListItem::new(lp_row_line(theme, e, content_w)));
     }
 
-    let list = List::new(items).block(block).highlight_style(highlight(theme)).highlight_symbol("▐ ");
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(if focused { highlight(theme) } else { Style::default() })
+        .highlight_symbol(if focused { "▐ " } else { "  " });
     let mut state = ListState::default();
     state.select(Some(visual_sel));
     frame.render_stateful_widget(list, area, &mut state);
+}
+
+/// A Launchpad row: a colored type badge, the title, and a right-aligned age.
+fn lp_row_line<'a>(theme: &Theme, e: &crate::launchpad::Entry, content_w: usize) -> Line<'a> {
+    use crate::launchpad::EntryKind;
+    let badge_color = match e.kind {
+        EntryKind::Pr => theme.blue,
+        EntryKind::Wi => theme.green,
+        EntryKind::Pipe => theme.yellow,
+    };
+    let age = rel_age(e.updated_at);
+    let stale = e.updated_at.map(|d| (chrono::Utc::now() - d).num_days() >= 3).unwrap_or(false);
+    let age_w = age.chars().count();
+    // Layout: " " badge(5) " " title …pad… age
+    let fixed = 1 + 5 + 1 + age_w + 1;
+    let title: String = e.title.chars().take(content_w.saturating_sub(fixed)).collect();
+    let used = 1 + 5 + 1 + title.chars().count() + age_w;
+    let pad = content_w.saturating_sub(used);
+    Line::from(vec![
+        Span::raw(" "),
+        Span::styled(format!("{:<5}", e.kind.label()), Style::default().fg(badge_color).add_modifier(Modifier::BOLD)),
+        Span::raw(" "),
+        Span::styled(title, Style::default().fg(theme.fg)),
+        Span::raw(" ".repeat(pad)),
+        Span::styled(age, Style::default().fg(if stale { theme.red } else { theme.dim })),
+    ])
 }
 
 /// Circled numerals for the bucket headers.
@@ -813,7 +857,7 @@ fn footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
         return overlay.hint();
     }
     if matches!(app.screen, Screen::Launchpad) {
-        return vec![("↑↓", "move"), ("↵", "open"), ("←→", "tabs"), ("r", "refresh"), ("N", "notifications"), ("?", "help"), ("q", "quit")];
+        return vec![("↑↓", "move"), ("←→", "columns"), ("↵", "open"), ("Tab", "sections"), ("r", "refresh"), ("?", "help"), ("q", "quit")];
     }
     if let Screen::PrView(v) = &app.screen {
         return if v.tab == 3 {
@@ -1983,6 +2027,33 @@ mod tests {
         let out = render_to_string(&mut app, 100, 24);
         assert!(out.contains("add one"), "empty section should point to adding a connection");
         assert!(out.contains("add a connection"), "health bar should prompt to add a connection");
+    }
+
+    #[test]
+    fn launchpad_renders_two_columns_with_typed_rows() {
+        use crate::launchpad::{Bucket, Entry, EntryKind};
+        let mk = |bucket, kind, title: &str| Entry {
+            bucket,
+            kind,
+            connection_id: "c".into(),
+            item_id: title.into(),
+            provider: ProviderType::GitHub,
+            title: title.into(),
+            updated_at: None,
+        };
+        let mut app = App::new("slate"); // defaults to the Launchpad screen
+        app.lp = vec![
+            mk(Bucket::NeedsReview, EntryKind::Pr, "Add retry policy"),
+            mk(Bucket::YourWork, EntryKind::Wi, "Investigate flake"),
+            mk(Bucket::Broken, EntryKind::Pipe, "nightly"),
+        ];
+        let out = render_to_string(&mut app, 140, 24);
+        // Two named columns.
+        assert!(out.contains("Act on it") && out.contains("Your court"), "two columns");
+        // Buckets land in the right columns.
+        assert!(out.contains("Needs your review") && out.contains("Your work") && out.contains("Broken"), "bucket headers");
+        // Type badges present.
+        assert!(out.contains("PR") && out.contains("Issue") && out.contains("Pipe"), "type badges");
     }
 
     #[test]

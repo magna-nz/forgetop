@@ -139,10 +139,12 @@ pub struct App {
     pub wizard: Option<Wizard>,
     /// Current screen — the list, or a full-screen sub-view like the PR diff.
     pub screen: Screen,
-    /// Launchpad rows (grouped + sorted), rebuilt each refresh; the selection into it.
+    /// Launchpad rows (grouped + sorted), rebuilt each refresh.
     pub lp: Vec<launchpad::Entry>,
-    pub lp_sel: usize,
-    pub lp_scroll: u16,
+    /// Focused column (0 = left, 1 = right) and the selected row within each — the
+    /// Launchpad is a two-column layout.
+    pub lp_side: usize,
+    pub lp_sel: [usize; 2],
     /// PRs feeding the Launchpad — the mine + review-requested union (the section list
     /// uses a single filter, so Launchpad fetches its own).
     lp_prs_mine: Vec<PrRow>,
@@ -546,8 +548,8 @@ impl App {
             wizard: None,
             screen: Screen::Launchpad,
             lp: Vec::new(),
-            lp_sel: 0,
-            lp_scroll: 0,
+            lp_side: 0,
+            lp_sel: [0, 0],
             lp_prs_mine: Vec::new(),
             lp_prs_review: Vec::new(),
             last_refresh: Local::now(),
@@ -737,7 +739,6 @@ impl App {
     fn go_to_tab(&mut self, pos: usize) {
         if pos == 0 {
             self.screen = Screen::Launchpad;
-            self.lp_scroll = 0;
         } else if let Some(&section) = self.visible_indices().get(pos - 1) {
             self.active = section;
             self.screen = Screen::List;
@@ -1081,16 +1082,34 @@ impl App {
     /// Rebuilds the Launchpad rows from the current feeds (no fetch) and clamps selection.
     fn rebuild_launchpad(&mut self) {
         self.lp = launchpad::build(&self.lp_prs_review, &self.lp_prs_mine, &self.wis, &self.pipes);
-        if self.lp_sel >= self.lp.len() {
-            self.lp_sel = self.lp.len().saturating_sub(1);
+        for side in 0..2 {
+            let len = self.lp_column(side).len();
+            if self.lp_sel[side] >= len {
+                self.lp_sel[side] = len.saturating_sub(1);
+            }
         }
     }
 
+    /// Indices into `self.lp` for a column (0 = left, 1 = right), in display order.
+    pub fn lp_column(&self, side: usize) -> Vec<usize> {
+        self.lp.iter().enumerate().filter(|(_, e)| e.bucket.column() == side).map(|(i, _)| i).collect()
+    }
+
+    /// The `self.lp` index of the currently-focused Launchpad row, if any.
+    fn lp_selected(&self) -> Option<usize> {
+        self.lp_column(self.lp_side).get(self.lp_sel[self.lp_side]).copied()
+    }
+
     fn lp_move(&mut self, delta: isize) {
-        let n = self.lp.len();
-        if n > 0 {
-            self.lp_sel = (self.lp_sel as isize + delta).clamp(0, n as isize - 1) as usize;
+        let len = self.lp_column(self.lp_side).len();
+        if len > 0 {
+            let cur = self.lp_sel[self.lp_side] as isize;
+            self.lp_sel[self.lp_side] = (cur + delta).clamp(0, len as isize - 1) as usize;
         }
+    }
+
+    fn lp_switch_side(&mut self, delta: isize) {
+        self.lp_side = (self.lp_side as isize + delta).clamp(0, 1) as usize;
     }
 
     async fn on_launchpad_key(&mut self, key: Key, deps: &AppDeps) {
@@ -1098,8 +1117,10 @@ impl App {
             Key::Char('q') => self.should_quit = true,
             Key::Up | Key::Char('k') => self.lp_move(-1),
             Key::Down | Key::Char('j') => self.lp_move(1),
-            Key::Left | Key::Char('h') => self.switch_tab(-1),
-            Key::Right | Key::Char('l') | Key::Tab => self.switch_tab(1),
+            // Left/right move between the two columns; Tab leaves for the section tabs.
+            Key::Left | Key::Char('h') => self.lp_switch_side(-1),
+            Key::Right | Key::Char('l') => self.lp_switch_side(1),
+            Key::Tab => self.switch_tab(1),
             Key::Char(c @ '1'..='4') => self.set_tab(c as usize - '1' as usize),
             Key::Enter => self.open_launchpad_selected(deps).await,
             Key::Char('r') => self.reload_all(deps).await,
@@ -1116,7 +1137,7 @@ impl App {
 
     /// Opens the selected Launchpad row in its full item view.
     async fn open_launchpad_selected(&mut self, deps: &AppDeps) {
-        let Some(entry) = self.lp.get(self.lp_sel) else { return };
+        let Some(entry) = self.lp_selected().and_then(|i| self.lp.get(i)) else { return };
         let (kind, conn, id) = (entry.kind, entry.connection_id.clone(), entry.item_id.clone());
         match kind {
             launchpad::EntryKind::Pr => {
