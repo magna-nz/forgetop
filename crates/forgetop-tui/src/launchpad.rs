@@ -15,8 +15,7 @@ pub enum Bucket {
     NeedsReview,
     ApprovalsWaiting,
     ReadyToMerge,
-    NeedsAttention,
-    Broken,
+    NeedsFixing,
     YourWork,
     WaitingOnOthers,
     Drafts,
@@ -24,12 +23,11 @@ pub enum Bucket {
 
 impl Bucket {
     /// Every bucket, in display (urgency) order.
-    pub const ORDER: [Bucket; 8] = [
+    pub const ORDER: [Bucket; 7] = [
         Bucket::NeedsReview,
         Bucket::ApprovalsWaiting,
         Bucket::ReadyToMerge,
-        Bucket::NeedsAttention,
-        Bucket::Broken,
+        Bucket::NeedsFixing,
         Bucket::YourWork,
         Bucket::WaitingOnOthers,
         Bucket::Drafts,
@@ -40,9 +38,8 @@ impl Bucket {
             Bucket::NeedsReview => "Needs your review",
             Bucket::ApprovalsWaiting => "Approvals waiting",
             Bucket::ReadyToMerge => "Ready to merge",
-            Bucket::NeedsAttention => "Needs your attention",
-            Bucket::Broken => "Broken",
-            Bucket::YourWork => "Your work",
+            Bucket::NeedsFixing => "Needs fixing",
+            Bucket::YourWork => "Assigned to you",
             Bucket::WaitingOnOthers => "Waiting on others",
             Bucket::Drafts => "Drafts",
         }
@@ -53,11 +50,11 @@ impl Bucket {
         matches!(self, Bucket::WaitingOnOthers | Bucket::Drafts)
     }
 
-    /// Which Launchpad column this bucket lives in: 0 = left ("others blocked / you
-    /// can ship"), 1 = right ("back in your court" + muted).
+    /// Which Launchpad column this bucket lives in: 0 = left ("Needs you" — things
+    /// ripe for action now), 1 = right ("Your work" — your backlog + parked PRs).
     pub fn column(&self) -> usize {
         match self {
-            Bucket::NeedsReview | Bucket::ApprovalsWaiting | Bucket::ReadyToMerge => 0,
+            Bucket::NeedsReview | Bucket::ApprovalsWaiting | Bucket::ReadyToMerge | Bucket::NeedsFixing => 0,
             _ => 1,
         }
     }
@@ -85,7 +82,7 @@ pub fn classify_pr(pr: &PullRequest, role: PrRole) -> Bucket {
             let checks_failing = pr.checks == CheckStatus::Failed;
             let conflict = matches!(pr.mergeable, MergeableState::Conflicting);
             if changes || checks_failing || conflict {
-                Bucket::NeedsAttention
+                Bucket::NeedsFixing
             } else if approved && matches!(pr.mergeable, MergeableState::Mergeable) {
                 Bucket::ReadyToMerge
             } else {
@@ -100,7 +97,7 @@ pub fn classify_pipe(row: &PipeRow) -> Option<Bucket> {
     if row.awaiting_approval {
         Some(Bucket::ApprovalsWaiting)
     } else if matches!(row.run.status, PipelineRunStatus::Failed) {
-        Some(Bucket::Broken)
+        Some(Bucket::NeedsFixing)
     } else {
         None
     }
@@ -120,7 +117,7 @@ impl EntryKind {
         match self {
             EntryKind::Pr => "PR",
             EntryKind::Wi => "Issue",
-            EntryKind::Pipe => "Pipe",
+            EntryKind::Pipe => "Pipeline",
         }
     }
 }
@@ -135,6 +132,14 @@ pub struct Entry {
     pub title: String,
     /// Last activity, for the staleness cue + oldest-first ordering.
     pub updated_at: Option<DateTime<Utc>>,
+}
+
+impl Entry {
+    /// Stable identity of the underlying item, used to dismiss it from the Launchpad
+    /// once you've acted on it (e.g. reviewed the PR) even before the next refetch.
+    pub fn key(connection_id: &str, item_id: &str) -> String {
+        format!("{connection_id}:{item_id}")
+    }
 }
 
 fn bucket_rank(b: Bucket) -> usize {
@@ -262,10 +267,10 @@ mod tests {
         let case = |draft, votes: &[ReviewVote], checks, merge| classify_pr(&authored(draft, votes, checks, merge), PrRole::Author);
 
         assert_eq!(case(true, &[], CheckStatus::None, MergeableState::Mergeable), Drafts);
-        // Bounce-backs → attention.
-        assert_eq!(case(false, &[ReviewVote::Rejected], CheckStatus::Passed, MergeableState::Mergeable), NeedsAttention);
-        assert_eq!(case(false, &[], CheckStatus::Failed, MergeableState::Mergeable), NeedsAttention);
-        assert_eq!(case(false, &[], CheckStatus::Passed, MergeableState::Conflicting), NeedsAttention);
+        // Bounce-backs → needs fixing.
+        assert_eq!(case(false, &[ReviewVote::Rejected], CheckStatus::Passed, MergeableState::Mergeable), NeedsFixing);
+        assert_eq!(case(false, &[], CheckStatus::Failed, MergeableState::Mergeable), NeedsFixing);
+        assert_eq!(case(false, &[], CheckStatus::Passed, MergeableState::Conflicting), NeedsFixing);
         // Approved + mergeable + checks fine → ship it.
         assert_eq!(case(false, &[ReviewVote::Approved], CheckStatus::Passed, MergeableState::Mergeable), ReadyToMerge);
         // Open, nothing wrong, but not yet approved → waiting on others.
@@ -273,9 +278,9 @@ mod tests {
     }
 
     #[test]
-    fn pipelines_route_to_approval_or_broken() {
+    fn pipelines_route_to_approval_or_fixing() {
         assert_eq!(classify_pipe(&pipe(PipelineRunStatus::Running, true)), Some(Bucket::ApprovalsWaiting));
-        assert_eq!(classify_pipe(&pipe(PipelineRunStatus::Failed, false)), Some(Bucket::Broken));
+        assert_eq!(classify_pipe(&pipe(PipelineRunStatus::Failed, false)), Some(Bucket::NeedsFixing));
         assert_eq!(classify_pipe(&pipe(PipelineRunStatus::Succeeded, false)), None);
         // Awaiting approval outranks a failed status.
         assert_eq!(classify_pipe(&pipe(PipelineRunStatus::Failed, true)), Some(Bucket::ApprovalsWaiting));

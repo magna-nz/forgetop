@@ -149,6 +149,9 @@ pub struct App {
     /// uses a single filter, so Launchpad fetches its own).
     lp_prs_mine: Vec<PrRow>,
     lp_prs_review: Vec<PrRow>,
+    /// Items dismissed from the Launchpad once acted on (e.g. a PR you've reviewed), so
+    /// they drop off immediately without waiting for the provider's feed to catch up.
+    lp_dismissed: HashSet<String>,
     pub last_refresh: DateTime<Local>,
     pub should_quit: bool,
 }
@@ -552,6 +555,7 @@ impl App {
             lp_sel: [0, 0],
             lp_prs_mine: Vec::new(),
             lp_prs_review: Vec::new(),
+            lp_dismissed: HashSet::new(),
             last_refresh: Local::now(),
             should_quit: false,
         }
@@ -1082,12 +1086,21 @@ impl App {
     /// Rebuilds the Launchpad rows from the current feeds (no fetch) and clamps selection.
     fn rebuild_launchpad(&mut self) {
         self.lp = launchpad::build(&self.lp_prs_review, &self.lp_prs_mine, &self.wis, &self.pipes);
+        // Drop anything already acted on this session (e.g. a PR you've reviewed).
+        self.lp.retain(|e| !self.lp_dismissed.contains(&launchpad::Entry::key(&e.connection_id, &e.item_id)));
         for side in 0..2 {
             let len = self.lp_column(side).len();
             if self.lp_sel[side] >= len {
                 self.lp_sel[side] = len.saturating_sub(1);
             }
         }
+    }
+
+    /// Removes an item from the Launchpad now that you've acted on it, so it disappears
+    /// immediately instead of lingering until the provider's feed catches up.
+    fn dismiss_from_launchpad(&mut self, connection_id: &str, item_id: &str) {
+        self.lp_dismissed.insert(launchpad::Entry::key(connection_id, item_id));
+        self.rebuild_launchpad();
     }
 
     /// Indices into `self.lp` for a column (0 = left, 1 = right), in display order.
@@ -1585,6 +1598,8 @@ impl App {
                     v.review_draft = None;
                     v.diff.threads = threads;
                 }
+                // You've reviewed it — it no longer needs you on the Launchpad.
+                self.dismiss_from_launchpad(&conn_id, &pr_id);
                 self.toast = Some(format!("Review submitted ({} comment(s))", comments.len()));
             }
             Err(e) => self.toast = Some(format!("Submit failed: {e}")),
@@ -2626,6 +2641,10 @@ impl App {
         match result {
             Ok(msg) => {
                 self.toast = Some(msg);
+                // Voting on (reviewing) or merging a PR clears it from the Launchpad now.
+                if matches!(action, Action::PrVote(_) | Action::PrMerge(_)) {
+                    self.dismiss_from_launchpad(&conn_id, &id);
+                }
                 let mut errors = Vec::new();
                 self.reload_pull_requests(deps, &mut errors).await;
                 self.fix_selection();
@@ -3169,6 +3188,22 @@ mod tests {
 
     fn wi_row(wi: WorkItem) -> WiRow {
         WiRow { connection_id: "c".into(), connection: "GH".into(), provider: ProviderType::GitHub, wi }
+    }
+
+    #[test]
+    fn reviewing_a_pr_drops_it_from_the_launchpad() {
+        let mut app = App::new("slate");
+        let mut p = pr(None);
+        p.id = "pr1".into();
+        app.lp_prs_review = vec![pr_row(p)];
+        app.rebuild_launchpad();
+        assert_eq!(app.lp.len(), 1, "the PR shows in the review bucket");
+
+        // Acting on it removes it immediately, and it stays gone across a refetch.
+        app.dismiss_from_launchpad("c", "pr1");
+        assert!(app.lp.is_empty(), "reviewed PR is dismissed");
+        app.rebuild_launchpad();
+        assert!(app.lp.is_empty(), "still gone until the provider feed catches up");
     }
 
     #[test]
