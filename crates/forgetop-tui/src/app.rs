@@ -53,6 +53,9 @@ pub struct PipeRow {
     pub connection: String,
     pub provider: ProviderType,
     pub run: PipelineRun,
+    /// The pipeline (definition) name — e.g. "CI Build" — resolved from the run's
+    /// definition_id, distinct from the run's own name (e.g. a release like "10.1.100").
+    pub definition_name: Option<String>,
     /// True when this run has a gate the authenticated user can approve/reject.
     pub awaiting_approval: bool,
 }
@@ -1275,6 +1278,10 @@ impl App {
                     let provider = feed.connection.provider_type();
                     let name = feed.connection.display_name().to_string();
                     let conn_id = feed.connection.connection_id().to_string();
+                    // Map definition_id → pipeline name so rows can show the pipeline
+                    // (e.g. "CI Build") separately from the run/release (e.g. "10.1.100").
+                    let def_names: HashMap<String, String> =
+                        feed.source.discover().await.unwrap_or_default().into_iter().map(|d| (d.id, d.name)).collect();
                     for q in feed_queries(&feed.subscription) {
                         match feed.source.list_runs(&q).await {
                             Ok(runs) => {
@@ -1290,11 +1297,13 @@ impl App {
                                             .await
                                             .map(|a| a.iter().any(|x| x.can_respond))
                                             .unwrap_or(false);
+                                    let definition_name = def_names.get(&run.definition_id).cloned();
                                     self.pipes.push(PipeRow {
                                         connection_id: conn_id.clone(),
                                         connection: name.clone(),
                                         provider,
                                         run,
+                                        definition_name,
                                         awaiting_approval,
                                     });
                                 }
@@ -3093,9 +3102,10 @@ fn pipe_cmp(a: &PipeRow, b: &PipeRow, key: &str) -> Ordering {
         "started" => a.run.started_at.cmp(&b.run.started_at),
         "status" => pipe_status_rank(a.run.status).cmp(&pipe_status_rank(b.run.status)),
         "pipeline" => {
-            let an = a.run.name.clone().unwrap_or_else(|| a.run.definition_id.clone());
-            let bn = b.run.name.clone().unwrap_or_else(|| b.run.definition_id.clone());
-            ci(&an).cmp(&ci(&bn))
+            // Sort by the pipeline (definition) name shown in the column, falling back to
+            // the run name / id when it's unknown.
+            let name = |r: &PipeRow| r.definition_name.clone().or_else(|| r.run.name.clone()).unwrap_or_else(|| r.run.definition_id.clone());
+            ci(&name(a)).cmp(&ci(&name(b)))
         }
         "provider" => ci(a.provider.as_str()).cmp(&ci(b.provider.as_str())).then_with(|| ci(&a.connection).cmp(&ci(&b.connection))),
         "branch" => ci(a.run.branch.as_deref().unwrap_or("")).cmp(&ci(b.run.branch.as_deref().unwrap_or(""))),
@@ -3529,6 +3539,7 @@ mod tests {
             connection_id: "c".into(),
             connection: "GH".into(),
             provider: ProviderType::GitHub,
+            definition_name: None,
             awaiting_approval: awaiting,
             run: PipelineRun {
                 id: id.into(),
@@ -3618,6 +3629,7 @@ mod tests {
             connection_id: "c".into(),
             connection: "GH".into(),
             provider: ProviderType::GitHub,
+            definition_name: None,
             awaiting_approval: false,
             run: PipelineRun {
                 id: id.into(),
@@ -3654,6 +3666,7 @@ mod tests {
             connection_id: "c".into(),
             connection: "GH".into(),
             provider: ProviderType::GitHub,
+            definition_name: None,
             awaiting_approval: awaiting,
             run: PipelineRun {
                 id: id.into(),

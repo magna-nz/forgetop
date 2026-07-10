@@ -289,15 +289,24 @@ fn lp_cells(theme: &Theme, e: &crate::launchpad::Entry) -> Vec<(String, Style)> 
                 age(pr.updated_at),
             ]
         }
-        EntryItem::Pipe(run) => vec![
-            badge("CI", theme.yellow),
-            (format!("{} {:?}", pipeline_icon(run.status), run.status), Style::default().fg(theme.pipeline_color(run.status))),
-            (run.number.map(|n| format!("#{n}")).unwrap_or_default(), dim),
-            (run.name.clone().unwrap_or_else(|| run.definition_id.clone()), fg),
-            (run.branch.clone().unwrap_or_default(), dim),
-            provider,
-            age(run.finished_at.or(run.started_at)),
-        ],
+        EntryItem::Pipe { run, definition_name } => {
+            // Title is the pipeline (e.g. "CI Build"); ref is the run/release. When we
+            // don't know the pipeline name, fall back to the run name as the title.
+            let num = || run.number.map(|n| format!("#{n}")).unwrap_or_default();
+            let (title, reference) = match definition_name {
+                Some(def) => (def.clone(), run.name.clone().unwrap_or_else(num)),
+                None => (run.name.clone().unwrap_or_else(|| run.definition_id.clone()), num()),
+            };
+            vec![
+                badge("CI", theme.yellow),
+                (format!("{} {:?}", pipeline_icon(run.status), run.status), Style::default().fg(theme.pipeline_color(run.status))),
+                (reference, dim),
+                (title, fg),
+                (run.branch.clone().unwrap_or_default(), dim),
+                provider,
+                age(run.finished_at.or(run.started_at)),
+            ]
+        }
         EntryItem::Wi(wi) => vec![
             badge("WI", theme.green),
             (format!("● {}", wi.state), Style::default().fg(wi_state_color(theme, wi.state_category))),
@@ -677,7 +686,7 @@ fn render_pipes(frame: &mut Frame, area: Rect, app: &mut App) {
 
     let inner_w = area.width.saturating_sub(2) as usize;
     let dim = Style::default().fg(theme.dim).add_modifier(Modifier::BOLD);
-    let headers = ["", "Provider", "Pipeline", "#", "Branch", "Started", "Approval"];
+    let headers = ["", "Provider", "Pipeline", "Run", "Branch", "Started", "Approval"];
     let cells: Vec<Vec<(String, Style)>> = idxs
         .iter()
         .map(|&i| &app.pipes[i])
@@ -688,11 +697,19 @@ fn render_pipes(frame: &mut Frame, area: Rect, app: &mut App) {
             } else {
                 (String::new(), Style::default().fg(theme.dim))
             };
+            // Pipeline = definition name ("CI Build"); Run = the run/release ("10.1.100"),
+            // or the run number when it has no name.
+            let num = || p.run.number.map(|n| format!("#{n}")).unwrap_or_default();
+            let pipeline = p.definition_name.clone().or_else(|| p.run.name.clone()).unwrap_or_else(|| p.run.definition_id.clone());
+            let run = match &p.definition_name {
+                Some(_) => p.run.name.clone().unwrap_or_else(num),
+                None => num(),
+            };
             vec![
                 (format!("{} {:?}", pipeline_icon(p.run.status), p.run.status), Style::default().fg(color)),
                 (format!("{} · {}", p.provider.as_str(), p.connection), Style::default().fg(theme.cyan)),
-                (p.run.name.clone().unwrap_or_else(|| p.run.definition_id.clone()), Style::default().fg(theme.fg)),
-                (p.run.number.map(|n| format!("#{n}")).unwrap_or_default(), Style::default().fg(theme.dim)),
+                (pipeline, Style::default().fg(theme.fg)),
+                (run, Style::default().fg(theme.dim)),
                 (p.run.branch.clone().unwrap_or_default(), Style::default().fg(theme.dim)),
                 (rel_age(p.run.started_at), Style::default().fg(theme.dim)),
                 approval,
@@ -2062,6 +2079,7 @@ mod tests {
             connection_id: "c".into(),
             connection: "GH".into(),
             provider: ProviderType::GitHub,
+            definition_name: Some("CI Build".into()),
             awaiting_approval: true,
             run: sample_run(),
         });
@@ -2151,7 +2169,7 @@ mod tests {
         let mut app = App::new("slate"); // defaults to the Launchpad screen
         app.lp = vec![
             entry(Bucket::NeedsReview, EntryItem::Pr(pr)),
-            entry(Bucket::NeedsFixing, EntryItem::Pipe(run)),
+            entry(Bucket::NeedsFixing, EntryItem::Pipe { run, definition_name: Some("CI Build".into()) }),
             entry(Bucket::YourWork, EntryItem::Wi(wi)),
         ];
         let out = render_to_string(&mut app, 140, 24);
@@ -2164,7 +2182,7 @@ mod tests {
         // … and nav-style detail: PR number + change stats, WI id/state/type, pipeline branch.
         assert!(out.contains("#42") && out.contains("+10 -2"), "PR row shows number and change stats");
         assert!(out.contains("FOR-1") && out.contains("Todo") && out.contains("Bug"), "work-item row shows id, state, type");
-        assert!(out.contains("main"), "pipeline row shows branch");
+        assert!(out.contains("CI Build") && out.contains("main"), "pipeline row shows pipeline name + branch");
     }
 
     #[test]

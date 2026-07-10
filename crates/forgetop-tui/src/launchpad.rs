@@ -139,7 +139,7 @@ impl EntryKind {
 pub enum EntryItem {
     Pr(PullRequest),
     Wi(WorkItem),
-    Pipe(PipelineRun),
+    Pipe { run: PipelineRun, definition_name: Option<String> },
 }
 
 /// One actionable item on the Launchpad, resolved to its bucket + the full domain object.
@@ -157,7 +157,7 @@ impl Entry {
         match self.item {
             EntryItem::Pr(_) => EntryKind::Pr,
             EntryItem::Wi(_) => EntryKind::Wi,
-            EntryItem::Pipe(_) => EntryKind::Pipe,
+            EntryItem::Pipe { .. } => EntryKind::Pipe,
         }
     }
 
@@ -165,7 +165,7 @@ impl Entry {
         match &self.item {
             EntryItem::Pr(pr) => &pr.id,
             EntryItem::Wi(wi) => &wi.id,
-            EntryItem::Pipe(run) => &run.id,
+            EntryItem::Pipe { run, .. } => &run.id,
         }
     }
 
@@ -173,7 +173,10 @@ impl Entry {
         match &self.item {
             EntryItem::Pr(pr) => &pr.title,
             EntryItem::Wi(wi) => &wi.title,
-            EntryItem::Pipe(run) => run.name.as_deref().unwrap_or(&run.definition_id),
+            // The pipeline name (e.g. "CI Build"), falling back to the run name / id.
+            EntryItem::Pipe { run, definition_name } => {
+                definition_name.as_deref().or(run.name.as_deref()).unwrap_or(&run.definition_id)
+            }
         }
     }
 
@@ -182,7 +185,7 @@ impl Entry {
         match &self.item {
             EntryItem::Pr(pr) => pr.updated_at,
             EntryItem::Wi(wi) => wi.updated_at,
-            EntryItem::Pipe(run) => run.finished_at.or(run.started_at),
+            EntryItem::Pipe { run, .. } => run.finished_at.or(run.started_at),
         }
     }
 
@@ -258,7 +261,7 @@ pub fn build(prs_review: &[PrRow], prs_mine: &[PrRow], wis: &[WiRow], pipes: &[P
                 connection_id: r.connection_id.clone(),
                 connection: r.connection.clone(),
                 provider: r.provider,
-                item: EntryItem::Pipe(r.run.clone()),
+                item: EntryItem::Pipe { run: r.run.clone(), definition_name: r.definition_name.clone() },
             });
         }
     }
@@ -325,6 +328,7 @@ mod tests {
             connection_id: "c".into(),
             connection: "GH".into(),
             provider: ProviderType::GitHub,
+            definition_name: Some("CI Build".into()),
             awaiting_approval: awaiting,
             run: PipelineRun {
                 id: "r".into(),
