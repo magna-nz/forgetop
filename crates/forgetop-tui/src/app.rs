@@ -2640,7 +2640,7 @@ impl Notifier for SystemNotifier {
 }
 
 /// (approved, changes-requested) rollup from a PR's reviewer votes.
-fn pr_vote_flags(pr: &PullRequest) -> (bool, bool) {
+pub(crate) fn pr_vote_flags(pr: &PullRequest) -> (bool, bool) {
     let approved = pr.reviewers.iter().any(|r| matches!(r.vote, ReviewVote::Approved | ReviewVote::ApprovedWithSuggestions));
     let changes = pr.reviewers.iter().any(|r| matches!(r.vote, ReviewVote::Rejected));
     (approved, changes)
