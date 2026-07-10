@@ -155,6 +155,9 @@ pub struct App {
     /// Items dismissed from the Launchpad once acted on (e.g. a PR you've reviewed), so
     /// they drop off immediately without waiting for the provider's feed to catch up.
     lp_dismissed: HashSet<String>,
+    /// True when the currently-open item view was opened from the Launchpad, so Esc
+    /// returns there (with the same row still selected) instead of to the section list.
+    lp_origin: bool,
     pub last_refresh: DateTime<Local>,
     pub should_quit: bool,
 }
@@ -560,6 +563,7 @@ impl App {
             lp_prs_mine: Vec::new(),
             lp_prs_review: Vec::new(),
             lp_dismissed: HashSet::new(),
+            lp_origin: false,
             last_refresh: Local::now(),
             should_quit: false,
         }
@@ -1157,6 +1161,7 @@ impl App {
     /// Opens the selected Launchpad row in its full item view.
     async fn open_launchpad_selected(&mut self, deps: &AppDeps) {
         let Some(entry) = self.lp_selected().and_then(|i| self.lp.get(i)) else { return };
+        self.lp_origin = true; // opened from the Launchpad, so Esc returns there
         let (kind, conn, id) = (entry.kind(), entry.connection_id.clone(), entry.item_id().to_string());
         match kind {
             launchpad::EntryKind::Pr => {
@@ -1448,12 +1453,15 @@ impl App {
             }
             Key::PageDown => self.list_scroll = self.list_scroll.saturating_add(8),
             Key::PageUp => self.list_scroll = self.list_scroll.saturating_sub(8),
-            Key::Enter => match self.active {
-                0 => self.open_pr_view(deps, 0).await,
-                1 => self.open_wi_view(deps).await,
-                2 => self.open_pipeline(deps).await,
-                _ => {}
-            },
+            Key::Enter => {
+                self.lp_origin = false; // opened from the section list, so Esc returns there
+                match self.active {
+                    0 => self.open_pr_view(deps, 0).await,
+                    1 => self.open_wi_view(deps).await,
+                    2 => self.open_pipeline(deps).await,
+                    _ => {}
+                }
+            }
             Key::Char(c) => self.on_char(c, deps).await,
             Key::Backspace | Key::Quit | Key::Redraw | Key::None => {}
         }
@@ -1666,6 +1674,16 @@ impl App {
         self.screen = Screen::WiView(Box::new(WiView { connection_id: conn_id, wi, threads, scroll: 0 }));
     }
 
+    /// Where Esc lands when closing an item view: back to the Launchpad if it was
+    /// opened from there (row still selected), otherwise the section list.
+    fn view_origin(&self) -> Screen {
+        if self.lp_origin {
+            Screen::Launchpad
+        } else {
+            Screen::List
+        }
+    }
+
     fn on_pr_view_key(&mut self, key: Key) {
         // Actions and close are handled before borrowing the view (they need &mut self).
         match key {
@@ -1677,7 +1695,7 @@ impl App {
                         return;
                     }
                 }
-                self.screen = Screen::List;
+                self.screen = self.view_origin();
                 return;
             }
             Key::Char('q') => {
@@ -1787,7 +1805,7 @@ impl App {
     fn on_wi_view_key(&mut self, key: Key) {
         match key {
             Key::Escape => {
-                self.screen = Screen::List;
+                self.screen = self.view_origin();
                 return;
             }
             Key::Char('q') => {
@@ -2016,7 +2034,7 @@ impl App {
 
     fn on_pipeline_key(&mut self, key: Key) {
         match key {
-            Key::Escape => self.screen = Screen::List,
+            Key::Escape => self.screen = self.view_origin(),
             Key::Char('q') => self.should_quit = true,
             Key::Char('T') => self.open_pipeline_trigger(),
             Key::Char('A') => self.open_approval_picker(),
@@ -3271,6 +3289,24 @@ mod tests {
         assert!(app.lp.is_empty(), "reviewed PR is dismissed");
         app.rebuild_launchpad();
         assert!(app.lp.is_empty(), "still gone until the provider feed catches up");
+    }
+
+    #[test]
+    fn escape_returns_to_the_launchpad_when_opened_from_it() {
+        let mut app = App::new("slate");
+        let view = || Screen::WiView(Box::new(WiView { connection_id: "c".into(), wi: wi(None), threads: vec![], scroll: 0 }));
+
+        // Opened from the Launchpad → Esc goes back to the Launchpad (row still selected).
+        app.lp_origin = true;
+        app.screen = view();
+        app.on_wi_view_key(Key::Escape);
+        assert!(matches!(app.screen, Screen::Launchpad));
+
+        // Opened from the section list → Esc goes back to the list.
+        app.lp_origin = false;
+        app.screen = view();
+        app.on_wi_view_key(Key::Escape);
+        assert!(matches!(app.screen, Screen::List));
     }
 
     #[test]
