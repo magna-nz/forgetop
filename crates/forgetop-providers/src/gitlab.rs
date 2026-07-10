@@ -370,7 +370,17 @@ impl PullRequestSource for GitLabPr {
         }
     }
     async fn merge(&self, id: &str, options: &MergeOptions) -> Result<()> {
-        let body = json!({ "squash": matches!(options.strategy, MergeStrategy::Squash) });
+        // GitLab requires the head SHA to confirm exactly what's being merged
+        // ("SHA must be provided when merging"), so fetch the MR's current head first.
+        let mr = self.0.get_json(&self.0.project_path(&format!("/merge_requests/{id}"))).await?;
+        let sha = get_str(&mr, "sha")
+            .or_else(|| get_obj(&mr, "diff_refs").and_then(|d| get_str(d, "head_sha")))
+            .ok_or_else(|| Error::Provider(format!("merge request '{id}' has no head SHA")))?;
+        let body = json!({
+            "squash": matches!(options.strategy, MergeStrategy::Squash),
+            "should_remove_source_branch": options.delete_source_ref,
+            "sha": sha,
+        });
         let url = self.0.project_path(&format!("/merge_requests/{id}/merge"));
         self.0.send(self.0.http.put(&url).json(&body), &format!("PUT {url}")).await
     }
