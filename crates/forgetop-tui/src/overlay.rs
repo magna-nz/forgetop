@@ -45,6 +45,8 @@ pub enum ToggleKind {
     PipelineSubs { connection_id: String },
     /// Work-item states to show; item ids are the state strings themselves.
     WorkItemStates,
+    /// PR statuses to show; item ids are the status names ("Open"/"Merged"/…).
+    PrStatuses,
     /// Which desktop notifications are enabled; item ids are event keys.
     Notifications,
     /// Which connections feed a section (0 = Pull Requests, 1 = Work Items);

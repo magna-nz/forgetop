@@ -15,6 +15,7 @@ This is the full reference. For install and a 60-second start, see the
 - [What forgetop does](#what-forgetop-does)
 - [Core concepts](#core-concepts)
 - [Getting started](#getting-started)
+- [Launchpad](#launchpad)
 - [Pull Requests](#pull-requests)
 - [Work Items](#work-items)
 - [Pipelines](#pipelines)
@@ -29,6 +30,9 @@ This is the full reference. For install and a 60-second start, see the
 
 ## What forgetop does
 
+- **The Launchpad** — the default landing screen: one cross-provider **action inbox**
+  that triages every PR, work item, and pipeline into "what needs you", so you start
+  on your queue instead of scrolling three separate lists.
 - **Three sections in one dashboard** — Pull Requests, Work Items, and Pipelines,
   each a tab you can act on.
 - **Six forges** — GitHub, GitLab, Azure DevOps, Bitbucket, Linear, and Jira, plus
@@ -141,6 +145,52 @@ or an expired credential.
 | `forgetop --version` (`-V`) | Print the version and exit |
 | `forgetop --help` (`-h`) | Show usage and exit |
 
+## Launchpad
+
+The **Launchpad** is the screen forgetop opens on (tab `1`). Instead of browsing by
+type, it answers one question — *what needs me right now?* — by pulling every PR,
+work item, and pipeline across every connected provider into a single, prioritised
+page. The Pull Requests / Work Items / Pipelines tabs are still there as drill-downs
+to their right.
+
+It's split into **two columns**:
+
+- **Needs you** (left) — things ripe for action now, in urgency order:
+  - **Needs your review** — PRs where you're a requested reviewer.
+  - **Approvals waiting** — pipeline runs blocked on a gate you can approve.
+  - **Ready to merge** — your PRs that are approved, mergeable, and green.
+  - **Needs fixing** — your PRs with changes requested / failing checks / conflicts,
+    **and** failed pipeline runs.
+- **Your work** (right) — your own things:
+  - **Assigned to you** — work items assigned to you.
+  - **Your open pull requests** — the full list of your open authored PRs (a PR that's
+    also an action item on the left still appears here; this is the complete list).
+  - **Recently merged** — your PRs merged in the last few days.
+
+Every row is laid out on one aligned grid so PRs, pipelines (`CI`), and work items
+(`WI`) read as siblings: a coloured **type badge**, a **status** signal (a PR shows
+its review state — `✓ ok`, `○ review`, `✗ changes`, `◌ draft`; a pipeline its run
+status; a work item its state), a short **#ref**, the **title**, one type-specific
+**detail** (PR `+/-`, pipeline branch, work-item type), the **provider**, and the
+**age** (which reddens once it's stale). For pipelines the title is the **pipeline
+name** (e.g. `CI Build`) and the ref is the **run/release** (e.g. `10.1.100`).
+
+**Getting around:**
+
+- `↑` / `↓` (or `k` / `j`) — move within the focused column.
+- `←` / `→` (or `h` / `l`) — switch between the two columns.
+- `Enter` — open the selected item in its **full view** (the same PR / work-item /
+  pipeline view as from the section tabs, with all its actions).
+- `Esc` — from an item opened here, return to the Launchpad with the **same row still
+  selected**.
+- `Tab`, `1`–`4` — switch top-level tabs. `r` — refresh.
+
+Two touches make it feel live: when you **act** on an item — submit a review, approve,
+or merge a PR — it drops off the Launchpad immediately rather than lingering until the
+next poll; and the **selected row's title scrolls** horizontally when it's too long to
+fit, so you can always read it in full. The `Launchpad (N)` tab badge counts the items
+that actually need you (the reference sections don't inflate it).
+
 ## Pull Requests
 
 The Pull Requests tab is **browse-and-open**: the list is for finding a PR; every
@@ -149,8 +199,12 @@ write action lives inside the PR view.
 **On the list:**
 
 - `Enter` — open the full-screen PR view.
-- `f`, `[` / `]` — switch [saved views](#saved-views); PRs default to
-  All / Mine / Review-requested.
+- `f` — **filter by status**: a checklist of Open / Draft / Merged / Closed; tick which
+  to show. Defaults to Open + Draft; ticking Merged or Closed transparently widens the
+  fetch to include completed PRs, so you can e.g. keep the **Mine** view but see your
+  open *and* recently-merged PRs together. The list title shows the active set
+  (`Pull Requests · Open, Merged`). Session-only.
+- `[` / `]` — switch [saved views](#saved-views); PRs default to All / Mine / Review-requested.
 - `/` — quick-filter by typing; `S` — sort by a column; `o` — open in browser.
 
 **Inside the PR view** (four sub-tabs, switch with `←`/`→`):
@@ -200,6 +254,11 @@ Inside the item view (after `Enter`):
 
 ## Pipelines
 
+The list shows a **Pipeline** column — the pipeline (definition) name, e.g. `CI Build`
+or `CD (Release)` — separate from the **Run** column, which is the run's own name or
+release (e.g. `10.1.100`, or its number when it has none). Sort by `Pipeline` to group
+runs by their definition.
+
 - `Enter` — drill into a run: a collapsible **stages → jobs → steps** tree.
 - `T` — trigger a run.
 
@@ -244,6 +303,8 @@ Four complementary ways to cut a busy view down:
   fields. `Enter` applies, `Esc` clears. Remembered per tab.
 - **Sort (`S`)** — pick a column to sort by; re-pick to flip direction. The sorted
   column shows a `▲`/`▼` arrow. Persisted per view.
+- **PR status (`f` on Pull Requests)** — show only chosen statuses (Open / Draft /
+  Merged / Closed); see [Pull Requests](#pull-requests).
 - **Work-item state visibility (`f` on Work Items)** — show only chosen states.
 - **Pipeline subscriptions (`s` in the config screen)** — track only chosen
   pipeline definitions per connection.
@@ -260,8 +321,7 @@ one highlighted. The bar appears once a section has more than one view.
 Every section starts with sensible defaults: Pull Requests get **All**, **Mine**,
 and **Review**; Work Items and Pipelines get a single **All**.
 
-- `[` / `]` — switch to the previous / next view. On Pull Requests, `f` also
-  advances to the next view.
+- `[` / `]` — switch to the previous / next view.
 - `V` — save the current filter + sort + states as a new view (you're prompted for
   a name), then switch to it.
 - `X` — delete the current view (with a confirm; you can't delete the last one).
@@ -298,7 +358,7 @@ the keys valid for where you are. Press `?` for the full panel. The complete set
 
 | Key | Action |
 | --- | --- |
-| `←` / `→`, `h` / `l`, `Tab`, `1`–`3` | Switch tab |
+| `←` / `→`, `h` / `l`, `Tab`, `1`–`4` | Switch tab (`1` = Launchpad) |
 | `↑` / `↓`, `k` / `j` | Move selection |
 | `/` | Quick-filter the current list |
 | `S` | Sort by a column (re-pick flips direction) |
@@ -311,12 +371,20 @@ the keys valid for where you are. Press `?` for the full panel. The complete set
 | `?` | Show all keybindings (anywhere) |
 | `q` / `Ctrl-C` | Quit · `Esc` back / close |
 
+### Launchpad
+
+| Key | Action |
+| --- | --- |
+| `↑` / `↓`, `k` / `j` | Move within the focused column |
+| `←` / `→`, `h` / `l` | Switch between the two columns |
+| `Enter` | Open the selected item in its full view |
+| `Esc` (in the opened item) | Return to the Launchpad, same row selected |
+
 ### Saved views
 
 | Key | Action |
 | --- | --- |
 | `[` / `]` | Previous / next saved view |
-| `f` (Pull Requests) | Next saved view |
 | `V` | Save the current filter + sort + states as a view |
 | `X` | Delete the current view |
 
@@ -325,7 +393,8 @@ the keys valid for where you are. Press `?` for the full panel. The complete set
 | Key | Action |
 | --- | --- |
 | `Enter` | Open the PR view |
-| `f`, `[` / `]` | Switch saved views (defaults All / Mine / Review-requested) |
+| `f` | Filter by status (Open / Draft / Merged / Closed) |
+| `[` / `]` | Switch saved views (defaults All / Mine / Review-requested) |
 
 ### Inside the PR view
 

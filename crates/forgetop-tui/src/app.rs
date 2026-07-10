@@ -11,6 +11,7 @@ use forgetop_core::provider::*;
 use forgetop_core::service::{ConfigService, ConnectionHealth, ConnectionHealthService, SectionService};
 use ratatui::widgets::TableState;
 
+use crate::launchpad;
 use crate::overlay::{Action, InputKind, Outcome, Overlay, PickerKind, ToggleItem, ToggleKind};
 use crate::theme::Theme;
 use crate::wizard::{provider_sections, section_label, Wizard, WizardOutcome};
@@ -52,6 +53,9 @@ pub struct PipeRow {
     pub connection: String,
     pub provider: ProviderType,
     pub run: PipelineRun,
+    /// The pipeline (definition) name — e.g. "CI Build" — resolved from the run's
+    /// definition_id, distinct from the run's own name (e.g. a release like "10.1.100").
+    pub definition_name: Option<String>,
     /// True when this run has a gate the authenticated user can approve/reject.
     pub awaiting_approval: bool,
 }
@@ -92,6 +96,9 @@ pub struct App {
     /// Max scroll offset for the open PR/WI view, captured during render for clamping.
     pub detail_scroll_max: u16,
     pub pr_filter: PullRequestFilter,
+    /// PR statuses shown in the list (session-only). Default is Open + Draft; ticking
+    /// Merged/Closed also flips the fetch to include completed PRs.
+    pub pr_shown_statuses: HashSet<PullRequestStatus>,
     /// Live per-tab quick-filter text (0=PR, 1=WI, 2=Pipelines). Empty = no filter.
     pub filters: [String; 3],
     /// True while the quick-filter input is capturing keystrokes.
@@ -138,6 +145,25 @@ pub struct App {
     pub wizard: Option<Wizard>,
     /// Current screen — the list, or a full-screen sub-view like the PR diff.
     pub screen: Screen,
+    /// Launchpad rows (grouped + sorted), rebuilt each refresh.
+    pub lp: Vec<launchpad::Entry>,
+    /// Focused column (0 = left, 1 = right) and the selected row within each — the
+    /// Launchpad is a two-column layout.
+    pub lp_side: usize,
+    pub lp_sel: [usize; 2],
+    /// PRs feeding the Launchpad — the mine + review-requested union (the section list
+    /// uses a single filter, so Launchpad fetches its own).
+    lp_prs_mine: Vec<PrRow>,
+    lp_prs_review: Vec<PrRow>,
+    /// Items dismissed from the Launchpad once acted on (e.g. a PR you've reviewed), so
+    /// they drop off immediately without waiting for the provider's feed to catch up.
+    lp_dismissed: HashSet<String>,
+    /// True when the currently-open item view was opened from the Launchpad, so Esc
+    /// returns there (with the same row still selected) instead of to the section list.
+    lp_origin: bool,
+    /// Animation frame for the marquee that scrolls the selected row's long title.
+    /// Reset to 0 whenever the selection moves so each title starts from the beginning.
+    pub marquee: usize,
     pub last_refresh: DateTime<Local>,
     pub should_quit: bool,
 }
@@ -145,6 +171,8 @@ pub struct App {
 /// Full-screen views layered above the list. The large views are boxed so the
 /// common `List` state doesn't bloat every `Screen` value.
 pub enum Screen {
+    /// The default landing: a unified, grouped action inbox across every provider.
+    Launchpad,
     List,
     Pipeline(Box<PipelineView>),
     Config(Box<ConfigView>),
@@ -512,6 +540,7 @@ impl App {
             content_h: 0,
             detail_scroll_max: 0,
             pr_filter: PullRequestFilter::All,
+            pr_shown_statuses: [PullRequestStatus::Open, PullRequestStatus::Draft].into_iter().collect(),
             filters: [String::new(), String::new(), String::new()],
             filtering: false,
             wi_hidden_states: HashSet::new(),
@@ -533,7 +562,15 @@ impl App {
             approval_choices: Vec::new(),
             overlay: None,
             wizard: None,
-            screen: Screen::List,
+            screen: Screen::Launchpad,
+            lp: Vec::new(),
+            lp_side: 0,
+            lp_sel: [0, 0],
+            lp_prs_mine: Vec::new(),
+            lp_prs_review: Vec::new(),
+            lp_dismissed: HashSet::new(),
+            lp_origin: false,
+            marquee: 0,
             last_refresh: Local::now(),
             should_quit: false,
         }
@@ -554,7 +591,9 @@ impl App {
     /// in the active sort order.
     pub fn filtered_pr_indices(&self) -> Vec<usize> {
         let q = self.filters[0].to_lowercase();
-        let mut idx: Vec<usize> = (0..self.prs.len()).filter(|&i| pr_matches(&self.prs[i].pr, &q)).collect();
+        let mut idx: Vec<usize> = (0..self.prs.len())
+            .filter(|&i| self.pr_shown_statuses.contains(&self.prs[i].pr.status) && pr_matches(&self.prs[i].pr, &q))
+            .collect();
         if let Some(s) = &self.pr_sort {
             idx.sort_by(|&a, &b| ordered(pr_cmp(&self.prs[a].pr, &self.prs[b].pr, &s.key), s.desc));
         }
@@ -708,25 +747,37 @@ impl App {
         self.visible_indices().first().copied().unwrap_or(0)
     }
 
-    pub fn switch_tab(&mut self, delta: isize) {
-        let vis = self.visible_indices();
-        if vis.is_empty() {
-            return;
+    /// The top-level tab position: 0 = Launchpad, then each visible section.
+    fn top_pos(&self) -> usize {
+        if matches!(self.screen, Screen::Launchpad) {
+            0
+        } else {
+            1 + self.visible_indices().iter().position(|&i| i == self.active).unwrap_or(0)
         }
-        let pos = vis.iter().position(|&i| i == self.active).unwrap_or(0) as isize;
-        let n = vis.len() as isize;
-        self.active = vis[(((pos + delta) % n + n) % n) as usize];
-        self.list_scroll = 0;
-        self.clamp_selection();
     }
 
-    /// Jumps to the Nth *visible* tab (0-based), for the number keys.
-    pub fn set_tab(&mut self, idx: usize) {
-        if let Some(&section) = self.visible_indices().get(idx) {
+    /// Moves to a top-level tab position (0 = Launchpad, 1.. = sections).
+    fn go_to_tab(&mut self, pos: usize) {
+        if pos == 0 {
+            self.screen = Screen::Launchpad;
+        } else if let Some(&section) = self.visible_indices().get(pos - 1) {
             self.active = section;
+            self.screen = Screen::List;
             self.list_scroll = 0;
             self.clamp_selection();
         }
+    }
+
+    /// Cycles across the tab strip [Launchpad, …visible sections] with wraparound.
+    pub fn switch_tab(&mut self, delta: isize) {
+        let n = (1 + self.visible_indices().len()) as isize;
+        let next = (((self.top_pos() as isize + delta) % n) + n) % n;
+        self.go_to_tab(next as usize);
+    }
+
+    /// Jumps to the Nth tab (0 = Launchpad), for the number keys.
+    pub fn set_tab(&mut self, idx: usize) {
+        self.go_to_tab(idx);
     }
 
     /// Applies persisted hidden-section preferences at startup.
@@ -1029,6 +1080,135 @@ impl App {
         self.pr_scan_seeded = true;
     }
 
+    /// Fetches the mine + review-requested PR union (the section list uses one filter)
+    /// and rebuilds the Launchpad rows.
+    async fn reload_launchpad(&mut self, deps: &AppDeps) {
+        self.lp_prs_mine.clear();
+        self.lp_prs_review.clear();
+        if let Ok(feeds) = deps.sections.pull_request_feeds().await {
+            for feed in feeds {
+                let (provider, name, conn_id) = feed_tag(&feed.connection);
+                let row = |pr: PullRequest| PrRow { connection_id: conn_id.clone(), connection: name.clone(), provider, pr };
+                // Include completed so "Recently merged" has data; open PRs still drive the rest.
+                let mine = PullRequestQuery { filter: PullRequestFilter::Mine, include_completed: true, limit: Some(50) };
+                if let Ok(list) = feed.source.list(&mine).await {
+                    self.lp_prs_mine.extend(list.into_iter().map(row));
+                }
+                if let Ok(list) = feed.source.list(&pr_query(PullRequestFilter::ReviewRequested)).await {
+                    self.lp_prs_review.extend(list.into_iter().map(row));
+                }
+            }
+        }
+        self.rebuild_launchpad();
+    }
+
+    /// Rebuilds the Launchpad rows from the current feeds (no fetch) and clamps selection.
+    fn rebuild_launchpad(&mut self) {
+        self.lp = launchpad::build(&self.lp_prs_review, &self.lp_prs_mine, &self.wis, &self.pipes);
+        // Drop anything already acted on this session (e.g. a PR you've reviewed).
+        self.lp.retain(|e| !self.lp_dismissed.contains(&launchpad::Entry::key(&e.connection_id, e.item_id())));
+        for side in 0..2 {
+            let len = self.lp_column(side).len();
+            if self.lp_sel[side] >= len {
+                self.lp_sel[side] = len.saturating_sub(1);
+            }
+        }
+    }
+
+    /// Removes an item from the Launchpad now that you've acted on it, so it disappears
+    /// immediately instead of lingering until the provider's feed catches up.
+    fn dismiss_from_launchpad(&mut self, connection_id: &str, item_id: &str) {
+        self.lp_dismissed.insert(launchpad::Entry::key(connection_id, item_id));
+        self.rebuild_launchpad();
+    }
+
+    /// Indices into `self.lp` for a column (0 = left, 1 = right), in display order.
+    pub fn lp_column(&self, side: usize) -> Vec<usize> {
+        self.lp.iter().enumerate().filter(|(_, e)| e.bucket.column() == side).map(|(i, _)| i).collect()
+    }
+
+    /// The `self.lp` index of the currently-focused Launchpad row, if any.
+    fn lp_selected(&self) -> Option<usize> {
+        self.lp_column(self.lp_side).get(self.lp_sel[self.lp_side]).copied()
+    }
+
+    fn lp_move(&mut self, delta: isize) {
+        let len = self.lp_column(self.lp_side).len();
+        if len > 0 {
+            let cur = self.lp_sel[self.lp_side] as isize;
+            self.lp_sel[self.lp_side] = (cur + delta).clamp(0, len as isize - 1) as usize;
+        }
+        self.marquee = 0; // restart the title scroll on the newly-selected row
+    }
+
+    fn lp_switch_side(&mut self, delta: isize) {
+        self.lp_side = (self.lp_side as isize + delta).clamp(0, 1) as usize;
+        self.marquee = 0;
+    }
+
+    /// Advances the selected-row title marquee by one step (driven by a fast timer).
+    pub fn tick_marquee(&mut self) {
+        self.marquee = self.marquee.wrapping_add(1);
+    }
+
+    async fn on_launchpad_key(&mut self, key: Key, deps: &AppDeps) {
+        match key {
+            Key::Char('q') => self.should_quit = true,
+            Key::Up | Key::Char('k') => self.lp_move(-1),
+            Key::Down | Key::Char('j') => self.lp_move(1),
+            // Left/right move between the two columns; Tab leaves for the section tabs.
+            Key::Left | Key::Char('h') => self.lp_switch_side(-1),
+            Key::Right | Key::Char('l') => self.lp_switch_side(1),
+            Key::Tab => self.switch_tab(1),
+            Key::Char(c @ '1'..='4') => self.set_tab(c as usize - '1' as usize),
+            Key::Enter => self.open_launchpad_selected(deps).await,
+            Key::Char('r') => self.reload_all(deps).await,
+            Key::Char('n') => self.start_add_connection(),
+            Key::Char('C') => self.open_config(deps).await,
+            Key::Char('t') => {
+                let next = Theme::next(self.theme.name);
+                self.theme = Theme::by_name(next);
+                let _ = deps.config.set_theme(Some(next.to_string())).await;
+            }
+            _ => {}
+        }
+    }
+
+    /// Opens the selected Launchpad row in its full item view.
+    async fn open_launchpad_selected(&mut self, deps: &AppDeps) {
+        let Some(entry) = self.lp_selected().and_then(|i| self.lp.get(i)) else { return };
+        self.lp_origin = true; // opened from the Launchpad, so Esc returns there
+        let (kind, conn, id) = (entry.kind(), entry.connection_id.clone(), entry.item_id().to_string());
+        match kind {
+            launchpad::EntryKind::Pr => {
+                let found = self
+                    .lp_prs_review
+                    .iter()
+                    .chain(self.lp_prs_mine.iter())
+                    .find(|r| r.connection_id == conn && r.pr.id == id)
+                    .map(|r| (pr_label(&r.pr), r.pr.url.clone(), r.pr.clone()));
+                if let Some((label, url, pr)) = found {
+                    self.open_pr_view_for(deps, 0, id, label, url, conn, pr).await;
+                }
+            }
+            launchpad::EntryKind::Wi => {
+                if let Some(wi) = self.wis.iter().find(|r| r.connection_id == conn && r.wi.id == id).map(|r| r.wi.clone()) {
+                    self.open_wi_view_for(deps, id, conn, wi).await;
+                }
+            }
+            launchpad::EntryKind::Pipe => {
+                let found = self
+                    .pipes
+                    .iter()
+                    .find(|r| r.connection_id == conn && r.run.id == id)
+                    .map(|r| (r.provider, r.run.definition_id.clone(), r.run.branch.clone(), pipe_label(r), r.run.clone()));
+                if let Some((provider, def, branch, title, fallback)) = found {
+                    self.open_pipeline_for(deps, conn, provider, id, def, branch, title, fallback).await;
+                }
+            }
+        }
+    }
+
     // ---- data loading ----
 
     pub async fn reload_all(&mut self, deps: &AppDeps) {
@@ -1040,6 +1220,7 @@ impl App {
         self.reload_work_items(deps, &mut errors).await;
         self.reload_pipelines(deps, &mut errors).await;
         self.refresh_open_pipeline(deps).await;
+        self.reload_launchpad(deps).await;
         self.scan_pr_notifications(deps).await;
         self.health = deps.health.check_all().await;
 
@@ -1057,9 +1238,14 @@ impl App {
         self.prs.clear();
         match deps.sections.pull_request_feeds().await {
             Ok(feeds) => {
+                let query = PullRequestQuery {
+                    filter: self.pr_filter,
+                    include_completed: self.pr_wants_completed(),
+                    limit: Some(50),
+                };
                 for feed in feeds {
                     let (provider, name, conn_id) = feed_tag(&feed.connection);
-                    match feed.source.list(&pr_query(self.pr_filter)).await {
+                    match feed.source.list(&query).await {
                         Ok(list) => self.prs.extend(list.into_iter().map(|pr| PrRow {
                             connection_id: conn_id.clone(),
                             connection: name.clone(),
@@ -1103,6 +1289,10 @@ impl App {
                     let provider = feed.connection.provider_type();
                     let name = feed.connection.display_name().to_string();
                     let conn_id = feed.connection.connection_id().to_string();
+                    // Map definition_id → pipeline name so rows can show the pipeline
+                    // (e.g. "CI Build") separately from the run/release (e.g. "10.1.100").
+                    let def_names: HashMap<String, String> =
+                        feed.source.discover().await.unwrap_or_default().into_iter().map(|d| (d.id, d.name)).collect();
                     for q in feed_queries(&feed.subscription) {
                         match feed.source.list_runs(&q).await {
                             Ok(runs) => {
@@ -1118,11 +1308,13 @@ impl App {
                                             .await
                                             .map(|a| a.iter().any(|x| x.can_respond))
                                             .unwrap_or(false);
+                                    let definition_name = def_names.get(&run.definition_id).cloned();
                                     self.pipes.push(PipeRow {
                                         connection_id: conn_id.clone(),
                                         connection: name.clone(),
                                         provider,
                                         run,
+                                        definition_name,
                                         awaiting_approval,
                                     });
                                 }
@@ -1253,6 +1445,10 @@ impl App {
                 self.on_wi_view_key(key);
                 return;
             }
+            Screen::Launchpad => {
+                self.on_launchpad_key(key, deps).await;
+                return;
+            }
             Screen::List => {}
         }
 
@@ -1279,12 +1475,15 @@ impl App {
             }
             Key::PageDown => self.list_scroll = self.list_scroll.saturating_add(8),
             Key::PageUp => self.list_scroll = self.list_scroll.saturating_sub(8),
-            Key::Enter => match self.active {
-                0 => self.open_pr_view(deps, 0).await,
-                1 => self.open_wi_view(deps).await,
-                2 => self.open_pipeline(deps).await,
-                _ => {}
-            },
+            Key::Enter => {
+                self.lp_origin = false; // opened from the section list, so Esc returns there
+                match self.active {
+                    0 => self.open_pr_view(deps, 0).await,
+                    1 => self.open_wi_view(deps).await,
+                    2 => self.open_pipeline(deps).await,
+                    _ => {}
+                }
+            }
             Key::Char(c) => self.on_char(c, deps).await,
             Key::Backspace | Key::Quit | Key::Redraw | Key::None => {}
         }
@@ -1312,6 +1511,13 @@ impl App {
             Some(row) => (row.pr.id.clone(), pr_label(&row.pr), row.pr.url.clone(), row.connection_id.clone(), row.pr.clone()),
             None => return,
         };
+        self.open_pr_view_for(deps, tab, id, label, url, conn_id, pr).await;
+    }
+
+    /// Opens the PR view for an explicit PR (used by the Launchpad, where the item
+    /// isn't the section list's selected row).
+    #[allow(clippy::too_many_arguments)]
+    async fn open_pr_view_for(&mut self, deps: &AppDeps, tab: usize, id: String, label: String, url: Option<String>, conn_id: String, pr: PullRequest) {
         let source = match self.pr_source_for(&conn_id, deps).await {
             Some(s) => s,
             None => {
@@ -1433,6 +1639,8 @@ impl App {
                     v.review_draft = None;
                     v.diff.threads = threads;
                 }
+                // You've reviewed it — it no longer needs you on the Launchpad.
+                self.dismiss_from_launchpad(&conn_id, &pr_id);
                 self.toast = Some(format!("Review submitted ({} comment(s))", comments.len()));
             }
             Err(e) => self.toast = Some(format!("Submit failed: {e}")),
@@ -1476,11 +1684,26 @@ impl App {
             Some(row) => (row.wi.id.clone(), row.connection_id.clone(), row.wi.clone()),
             None => return,
         };
+        self.open_wi_view_for(deps, id, conn_id, wi).await;
+    }
+
+    /// Opens the work-item view for an explicit item (used by the Launchpad).
+    async fn open_wi_view_for(&mut self, deps: &AppDeps, id: String, conn_id: String, wi: WorkItem) {
         let threads = match self.wi_source_for(&conn_id, deps).await {
             Some(src) => src.threads(&id).await.unwrap_or_default(),
             None => Vec::new(),
         };
         self.screen = Screen::WiView(Box::new(WiView { connection_id: conn_id, wi, threads, scroll: 0 }));
+    }
+
+    /// Where Esc lands when closing an item view: back to the Launchpad if it was
+    /// opened from there (row still selected), otherwise the section list.
+    fn view_origin(&self) -> Screen {
+        if self.lp_origin {
+            Screen::Launchpad
+        } else {
+            Screen::List
+        }
     }
 
     fn on_pr_view_key(&mut self, key: Key) {
@@ -1494,7 +1717,7 @@ impl App {
                         return;
                     }
                 }
-                self.screen = Screen::List;
+                self.screen = self.view_origin();
                 return;
             }
             Key::Char('q') => {
@@ -1604,7 +1827,7 @@ impl App {
     fn on_wi_view_key(&mut self, key: Key) {
         match key {
             Key::Escape => {
-                self.screen = Screen::List;
+                self.screen = self.view_origin();
                 return;
             }
             Key::Char('q') => {
@@ -1646,7 +1869,8 @@ impl App {
             }
             'h' => self.switch_tab(-1),
             'l' => self.switch_tab(1),
-            '1'..='3' => self.set_tab(c as usize - '1' as usize),
+            // 1 = Launchpad, then the sections.
+            '1'..='4' => self.set_tab(c as usize - '1' as usize),
             'r' => self.reload_all(deps).await,
             't' => {
                 let next = Theme::next(self.theme.name);
@@ -1664,7 +1888,8 @@ impl App {
             ']' => self.switch_view(1, deps).await,
             'V' => self.open_save_view(),
             'X' => self.open_delete_view(),
-            'f' if self.active == 0 => self.switch_view(1, deps).await,
+            // Filter by status (PRs) / by state (Work Items) — 'f' = filter on both tabs.
+            'f' if self.active == 0 => self.open_pr_status_toggle(),
             'f' if self.active == 1 => self.open_wi_states_toggle(),
             // Pipeline trigger (Pipelines tab).
             'T' if self.active == 2 => self.open_pipeline_trigger(),
@@ -1686,14 +1911,31 @@ impl App {
 
     async fn open_pipeline(&mut self, deps: &AppDeps) {
         let Some(pipe) = self.selected_pipe() else { return };
-        let conn_id = pipe.connection_id.clone();
-        let provider = pipe.provider;
-        let run_id = pipe.run.id.clone();
-        let definition_id = pipe.run.definition_id.clone();
-        let branch = pipe.run.branch.clone();
-        let title = pipe_label(pipe);
-        let fallback = pipe.run.clone();
+        let (conn_id, provider, run_id, definition_id, branch, title, fallback) = (
+            pipe.connection_id.clone(),
+            pipe.provider,
+            pipe.run.id.clone(),
+            pipe.run.definition_id.clone(),
+            pipe.run.branch.clone(),
+            pipe_label(pipe),
+            pipe.run.clone(),
+        );
+        self.open_pipeline_for(deps, conn_id, provider, run_id, definition_id, branch, title, fallback).await;
+    }
 
+    /// Opens the pipeline drill-in for an explicit run (used by the Launchpad).
+    #[allow(clippy::too_many_arguments)]
+    async fn open_pipeline_for(
+        &mut self,
+        deps: &AppDeps,
+        conn_id: String,
+        provider: ProviderType,
+        run_id: String,
+        definition_id: String,
+        branch: Option<String>,
+        title: String,
+        fallback: PipelineRun,
+    ) {
         // Enrich with full stages/jobs/steps via get_run (list_runs may be shallow),
         // plus any pending approval gates.
         let feeds = deps.sections.pipeline_feeds().await.unwrap_or_default();
@@ -1814,7 +2056,7 @@ impl App {
 
     fn on_pipeline_key(&mut self, key: Key) {
         match key {
-            Key::Escape => self.screen = Screen::List,
+            Key::Escape => self.screen = self.view_origin(),
             Key::Char('q') => self.should_quit = true,
             Key::Char('T') => self.open_pipeline_trigger(),
             Key::Char('A') => self.open_approval_picker(),
@@ -1949,7 +2191,9 @@ impl App {
                 let nodes = v.flatten();
                 return nodes.get(v.selected).and_then(|n| n.url.clone()).or_else(|| v.run.url.clone());
             }
-            Screen::List | Screen::Config(_) => {}
+            // Launchpad has no single "selected URL" here — Enter opens the item's view,
+            // where `o` then works.
+            Screen::Launchpad | Screen::List | Screen::Config(_) => {}
         }
         match self.active {
             0 => self.selected_pr().and_then(|p| p.url.clone()),
@@ -2059,6 +2303,33 @@ impl App {
     // ---- work-item state visibility ----
 
     /// Opens a checklist of the distinct states currently present, ticked = shown.
+    /// True when the shown-status set includes a completed status, so the fetch must
+    /// ask the provider for closed/merged PRs (not just open ones).
+    fn pr_wants_completed(&self) -> bool {
+        self.pr_shown_statuses.iter().any(|s| matches!(s, PullRequestStatus::Merged | PullRequestStatus::Closed))
+    }
+
+    /// Opens the "Show statuses" checklist for the PR list (Open/Draft/Merged/Closed).
+    fn open_pr_status_toggle(&mut self) {
+        let items = PR_STATUS_ORDER
+            .iter()
+            .map(|&s| ToggleItem { on: self.pr_shown_statuses.contains(&s), id: pr_status_key(s).into(), label: pr_status_key(s).into() })
+            .collect();
+        self.overlay =
+            Some(Overlay::Toggle { title: "Show statuses".into(), kind: ToggleKind::PrStatuses, min_one: true, items, selected: 0 });
+    }
+
+    /// `ids` are the statuses left ticked. Rebuilds the shown set, then refetches so a
+    /// newly-ticked Merged/Closed pulls completed PRs from the provider.
+    async fn apply_pr_statuses(&mut self, shown_ids: Vec<String>, deps: &AppDeps) {
+        self.pr_shown_statuses = shown_ids.iter().filter_map(|id| parse_pr_status(id)).collect();
+        let mut errors = Vec::new();
+        self.reload_pull_requests(deps, &mut errors).await;
+        self.fix_selection();
+        self.list_scroll = 0;
+        self.toast = Some(if let Some(e) = errors.first() { e.clone() } else { format!("Showing {}", pr_status_summary(&self.pr_shown_statuses)) });
+    }
+
     fn open_wi_states_toggle(&mut self) {
         let states = self.distinct_wi_states();
         if states.is_empty() {
@@ -2084,6 +2355,9 @@ impl App {
             }
             ToggleKind::WorkItemStates => {
                 self.apply_wi_states(ids, deps).await;
+            }
+            ToggleKind::PrStatuses => {
+                self.apply_pr_statuses(ids, deps).await;
             }
             ToggleKind::Notifications => {
                 self.apply_notifications(ids, deps).await;
@@ -2449,6 +2723,10 @@ impl App {
         match result {
             Ok(msg) => {
                 self.toast = Some(msg);
+                // Voting on (reviewing) or merging a PR clears it from the Launchpad now.
+                if matches!(action, Action::PrVote(_) | Action::PrMerge(_)) {
+                    self.dismiss_from_launchpad(&conn_id, &id);
+                }
                 let mut errors = Vec::new();
                 self.reload_pull_requests(deps, &mut errors).await;
                 self.fix_selection();
@@ -2640,7 +2918,7 @@ impl Notifier for SystemNotifier {
 }
 
 /// (approved, changes-requested) rollup from a PR's reviewer votes.
-fn pr_vote_flags(pr: &PullRequest) -> (bool, bool) {
+pub(crate) fn pr_vote_flags(pr: &PullRequest) -> (bool, bool) {
     let approved = pr.reviewers.iter().any(|r| matches!(r.vote, ReviewVote::Approved | ReviewVote::ApprovedWithSuggestions));
     let changes = pr.reviewers.iter().any(|r| matches!(r.vote, ReviewVote::Rejected));
     (approved, changes)
@@ -2835,9 +3113,10 @@ fn pipe_cmp(a: &PipeRow, b: &PipeRow, key: &str) -> Ordering {
         "started" => a.run.started_at.cmp(&b.run.started_at),
         "status" => pipe_status_rank(a.run.status).cmp(&pipe_status_rank(b.run.status)),
         "pipeline" => {
-            let an = a.run.name.clone().unwrap_or_else(|| a.run.definition_id.clone());
-            let bn = b.run.name.clone().unwrap_or_else(|| b.run.definition_id.clone());
-            ci(&an).cmp(&ci(&bn))
+            // Sort by the pipeline (definition) name shown in the column, falling back to
+            // the run name / id when it's unknown.
+            let name = |r: &PipeRow| r.definition_name.clone().or_else(|| r.run.name.clone()).unwrap_or_else(|| r.run.definition_id.clone());
+            ci(&name(a)).cmp(&ci(&name(b)))
         }
         "provider" => ci(a.provider.as_str()).cmp(&ci(b.provider.as_str())).then_with(|| ci(&a.connection).cmp(&ci(&b.connection))),
         "branch" => ci(a.run.branch.as_deref().unwrap_or("")).cmp(&ci(b.run.branch.as_deref().unwrap_or(""))),
@@ -2889,6 +3168,31 @@ pub enum Key {
 
 fn pr_query(filter: PullRequestFilter) -> PullRequestQuery {
     PullRequestQuery { filter, include_completed: false, limit: Some(50) }
+}
+
+/// PR statuses in display order — drives the "Show statuses" checklist and the header.
+const PR_STATUS_ORDER: [PullRequestStatus; 4] =
+    [PullRequestStatus::Open, PullRequestStatus::Draft, PullRequestStatus::Merged, PullRequestStatus::Closed];
+
+fn pr_status_key(s: PullRequestStatus) -> &'static str {
+    match s {
+        PullRequestStatus::Open => "Open",
+        PullRequestStatus::Draft => "Draft",
+        PullRequestStatus::Merged => "Merged",
+        PullRequestStatus::Closed => "Closed",
+    }
+}
+
+fn parse_pr_status(s: &str) -> Option<PullRequestStatus> {
+    PR_STATUS_ORDER.iter().copied().find(|&st| pr_status_key(st) == s)
+}
+
+/// Human summary of the shown-status set, in canonical order (e.g. "Open, Merged").
+pub fn pr_status_summary(shown: &HashSet<PullRequestStatus>) -> String {
+    if shown.len() == PR_STATUS_ORDER.len() {
+        return "all statuses".into();
+    }
+    PR_STATUS_ORDER.iter().filter(|s| shown.contains(s)).map(|&s| pr_status_key(s)).collect::<Vec<_>>().join(", ")
 }
 
 fn parse_pr_filter(s: Option<&str>) -> PullRequestFilter {
@@ -2992,6 +3296,75 @@ mod tests {
 
     fn wi_row(wi: WorkItem) -> WiRow {
         WiRow { connection_id: "c".into(), connection: "GH".into(), provider: ProviderType::GitHub, wi }
+    }
+
+    #[test]
+    fn reviewing_a_pr_drops_it_from_the_launchpad() {
+        let mut app = App::new("slate");
+        let mut p = pr(None);
+        p.id = "pr1".into();
+        app.lp_prs_review = vec![pr_row(p)];
+        app.rebuild_launchpad();
+        assert_eq!(app.lp.len(), 1, "the PR shows in the review bucket");
+
+        // Acting on it removes it immediately, and it stays gone across a refetch.
+        app.dismiss_from_launchpad("c", "pr1");
+        assert!(app.lp.is_empty(), "reviewed PR is dismissed");
+        app.rebuild_launchpad();
+        assert!(app.lp.is_empty(), "still gone until the provider feed catches up");
+    }
+
+    #[test]
+    fn escape_returns_to_the_launchpad_when_opened_from_it() {
+        let mut app = App::new("slate");
+        let view = || Screen::WiView(Box::new(WiView { connection_id: "c".into(), wi: wi(None), threads: vec![], scroll: 0 }));
+
+        // Opened from the Launchpad → Esc goes back to the Launchpad (row still selected).
+        app.lp_origin = true;
+        app.screen = view();
+        app.on_wi_view_key(Key::Escape);
+        assert!(matches!(app.screen, Screen::Launchpad));
+
+        // Opened from the section list → Esc goes back to the list.
+        app.lp_origin = false;
+        app.screen = view();
+        app.on_wi_view_key(Key::Escape);
+        assert!(matches!(app.screen, Screen::List));
+    }
+
+    #[test]
+    fn pr_status_filter_limits_the_list_and_drives_completed_fetch() {
+        let mut app = App::new("slate");
+        let mk = |id: &str, status| {
+            let mut p = pr(None);
+            p.id = id.into();
+            p.status = status;
+            pr_row(p)
+        };
+        app.prs = vec![
+            mk("1", PullRequestStatus::Open),
+            mk("2", PullRequestStatus::Merged),
+            mk("3", PullRequestStatus::Draft),
+            mk("4", PullRequestStatus::Closed),
+        ];
+        app.active = 0;
+
+        // Default (Open + Draft) shows only those, and doesn't need completed PRs.
+        assert!(!app.pr_wants_completed());
+        assert_eq!(app.filtered_pr_indices(), vec![0, 2]);
+
+        // Ticking Merged shows it and flips the fetch to include completed PRs.
+        app.pr_shown_statuses = [PullRequestStatus::Open, PullRequestStatus::Merged].into_iter().collect();
+        assert!(app.pr_wants_completed());
+        assert_eq!(app.filtered_pr_indices(), vec![0, 1]);
+    }
+
+    #[test]
+    fn pr_status_summary_reads_in_canonical_order() {
+        let set: HashSet<_> = [PullRequestStatus::Merged, PullRequestStatus::Open].into_iter().collect();
+        assert_eq!(pr_status_summary(&set), "Open, Merged");
+        let all: HashSet<_> = PR_STATUS_ORDER.into_iter().collect();
+        assert_eq!(pr_status_summary(&all), "all statuses");
     }
 
     #[test]
@@ -3177,6 +3550,7 @@ mod tests {
             connection_id: "c".into(),
             connection: "GH".into(),
             provider: ProviderType::GitHub,
+            definition_name: None,
             awaiting_approval: awaiting,
             run: PipelineRun {
                 id: id.into(),
@@ -3266,6 +3640,7 @@ mod tests {
             connection_id: "c".into(),
             connection: "GH".into(),
             provider: ProviderType::GitHub,
+            definition_name: None,
             awaiting_approval: false,
             run: PipelineRun {
                 id: id.into(),
@@ -3302,6 +3677,7 @@ mod tests {
             connection_id: "c".into(),
             connection: "GH".into(),
             provider: ProviderType::GitHub,
+            definition_name: None,
             awaiting_approval: awaiting,
             run: PipelineRun {
                 id: id.into(),
@@ -3724,13 +4100,20 @@ mod tests {
         app.apply_hidden_sections(&[Section::WorkItems]);
         assert_eq!(app.visible_indices(), vec![0, 2]);
 
-        app.active = 0;
+        // Tab strip is [Launchpad, Pull Requests, Pipelines] (Work Items hidden).
+        // Start on the Launchpad (the default screen).
+        app.switch_tab(1); // Launchpad -> PR
+        assert!(matches!(app.screen, Screen::List));
+        assert_eq!(app.active, 0);
         app.switch_tab(1); // PR -> Pipelines, skipping the hidden Work Items
         assert_eq!(app.active, 2);
-        app.switch_tab(1); // wraps back to PR
-        assert_eq!(app.active, 0);
+        app.switch_tab(1); // wraps back to the Launchpad
+        assert!(matches!(app.screen, Screen::Launchpad));
 
-        app.set_tab(1); // 2nd visible tab is Pipelines
+        app.set_tab(1); // tab 1 = Pull Requests
+        assert!(matches!(app.screen, Screen::List));
+        assert_eq!(app.active, 0);
+        app.set_tab(2); // tab 2 = Pipelines
         assert_eq!(app.active, 2);
     }
 

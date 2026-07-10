@@ -73,18 +73,22 @@ fn render_tabs(frame: &mut Frame, area: Rect, app: &App) {
         .title_top(Line::from(Span::styled(right, Style::default().fg(theme.dim))).right_aligned());
 
     let vis = app.visible_indices();
-    let titles: Vec<Line> = vis
-        .iter()
-        .map(|&i| {
-            let count = match i {
-                0 => app.prs.len(),
-                1 => app.wis.len(),
-                _ => app.pipes.len(),
-            };
-            Line::from(format!(" {} ({count}) ", TABS[i]))
-        })
-        .collect();
-    let selected = vis.iter().position(|&i| i == app.active).unwrap_or(0);
+    // Launchpad is tab 0; its badge is the count of items that actually need you.
+    let lp_count = app.lp.iter().filter(|e| !e.bucket.muted()).count();
+    let mut titles: Vec<Line> = vec![Line::from(format!(" Launchpad ({lp_count}) "))];
+    titles.extend(vis.iter().map(|&i| {
+        let count = match i {
+            0 => app.prs.len(),
+            1 => app.wis.len(),
+            _ => app.pipes.len(),
+        };
+        Line::from(format!(" {} ({count}) ", TABS[i]))
+    }));
+    let selected = if matches!(app.screen, Screen::Launchpad) {
+        0
+    } else {
+        1 + vis.iter().position(|&i| i == app.active).unwrap_or(0)
+    };
 
     let tabs = Tabs::new(titles)
         .select(selected)
@@ -120,6 +124,10 @@ fn render_view_bar(frame: &mut Frame, area: Rect, app: &App) {
 
 fn render_content(frame: &mut Frame, area: Rect, app: &mut App) {
     match &app.screen {
+        Screen::Launchpad => {
+            render_launchpad(frame, area, app);
+            return;
+        }
         Screen::Pipeline(view) => {
             render_pipeline(frame, area, &app.theme, view);
             return;
@@ -151,6 +159,227 @@ fn render_table(frame: &mut Frame, area: Rect, app: &mut App) {
         _ => render_pipes(frame, area, app),
     }
 }
+
+/// The Launchpad: two columns of urgency-ordered buckets — left "Needs you"
+/// (ripe for action), right "Your work" (your backlog + parked PRs).
+fn render_launchpad(frame: &mut Frame, area: Rect, app: &mut App) {
+    let theme = &app.theme;
+    if app.lp.is_empty() {
+        let msg = if app.health.is_empty() { FIRST_RUN_HINT } else { "✓ You're all caught up — nothing needs you." };
+        empty(frame, area, theme, msg, section_block(theme, "Launchpad · what needs you"));
+        return;
+    }
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area);
+    render_lp_column(frame, cols[0], app, 0, "Needs you");
+    render_lp_column(frame, cols[1], app, 1, "Your work");
+}
+
+/// One Launchpad column: a bordered box stacking its buckets. The focused column
+/// gets an accent border + a lit selection.
+fn render_lp_column(frame: &mut Frame, area: Rect, app: &App, side: usize, title: &str) {
+    use crate::launchpad::Bucket;
+    let theme = &app.theme;
+    let focused = app.lp_side == side;
+    let border = if focused { theme.accent } else { theme.dim };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border))
+        .title(Span::styled(format!(" {title} "), Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)));
+
+    let col = app.lp_column(side);
+    if col.is_empty() {
+        empty(frame, area, theme, "— nothing here —", block);
+        return;
+    }
+
+    let content_w = (area.width.saturating_sub(2) as usize).saturating_sub(2); // borders + highlight symbol
+    // One shared set of column widths for the whole side, so every row lines up.
+    let rows_cells: Vec<Vec<(String, Style)>> = col.iter().map(|&i| lp_cells(theme, &app.lp[i])).collect();
+    let widths = lp_widths(&rows_cells, 3, content_w);
+
+    let mut items: Vec<ListItem> = Vec::new();
+    let mut visual_sel = 0usize;
+    let mut last: Option<Bucket> = None;
+    for (pos, (&i, cells)) in col.iter().zip(rows_cells.iter()).enumerate() {
+        let e = &app.lp[i];
+        if last != Some(e.bucket) {
+            let count = col.iter().filter(|&&j| app.lp[j].bucket == e.bucket).count();
+            let rank = Bucket::ORDER.iter().position(|b| *b == e.bucket).unwrap_or(0);
+            // Headings use magenta so they read as section labels, not PR rows (the
+            // PR colour is blue, which equals the accent in every theme).
+            let style = if e.bucket.muted() {
+                Style::default().fg(theme.dim)
+            } else {
+                Style::default().fg(theme.magenta).add_modifier(Modifier::BOLD)
+            };
+            if !items.is_empty() {
+                items.push(ListItem::new(Line::from("")));
+            }
+            items.push(ListItem::new(Line::from(Span::styled(format!("{}  {} ({count})", CIRCLED[rank.min(7)], e.bucket.title()), style))));
+            last = Some(e.bucket);
+        }
+        let selected = pos == app.lp_sel[side];
+        if selected {
+            visual_sel = items.len();
+        }
+        // The focused row's title scrolls if it's wider than its column, so it's readable.
+        let line = if selected && focused && cells[LP_TITLE_COL].0.chars().count() > widths[LP_TITLE_COL] {
+            let mut c = cells.clone();
+            c[LP_TITLE_COL].0 = marquee_window(&cells[LP_TITLE_COL].0, widths[LP_TITLE_COL], app.marquee);
+            lp_cells_line(&c, &widths, content_w)
+        } else {
+            lp_cells_line(cells, &widths, content_w)
+        };
+        items.push(ListItem::new(line));
+    }
+
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(if focused { highlight(theme) } else { Style::default() })
+        .highlight_symbol(if focused { "▐ " } else { "  " });
+    let mut state = ListState::default();
+    state.select(Some(visual_sel));
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
+fn age_color(theme: &Theme, t: Option<DateTime<Utc>>) -> ratatui::style::Color {
+    let stale = t.map(|d| (Utc::now() - d).num_days() >= 3).unwrap_or(false);
+    if stale {
+        theme.red
+    } else {
+        theme.dim
+    }
+}
+
+/// Number of Launchpad row columns (kept in sync with [`lp_cells`]).
+const LP_NCOL: usize = 7;
+/// The flexible title column in a Launchpad row (the one that marquee-scrolls).
+const LP_TITLE_COL: usize = 3;
+/// Gap between Launchpad columns — tighter than the nav lists since a column is half-width.
+const LP_GAP: usize = 2;
+
+/// The aligned cells for one Launchpad row. Every item type fills the *same* seven
+/// slots — type · status · #ref · title · detail · provider · age — so rows read as
+/// siblings and line up vertically, even though PRs, pipelines and work items differ.
+fn lp_cells(theme: &Theme, e: &crate::launchpad::Entry) -> Vec<(String, Style)> {
+    use crate::launchpad::EntryItem;
+    let dim = Style::default().fg(theme.dim);
+    let fg = Style::default().fg(theme.fg);
+    let badge = |code: &str, color| (code.to_string(), Style::default().fg(color).add_modifier(Modifier::BOLD));
+    let provider = (e.provider.as_str().to_string(), Style::default().fg(theme.cyan));
+    let age = |t| (rel_age(t), Style::default().fg(age_color(theme, t)));
+    match &e.item {
+        EntryItem::Pr(pr) => {
+            // For merged/closed PRs (the "Recently merged" footer) show that state; for open
+            // ones the status carries the review signal: approvals, changes requested, or draft.
+            let approvals = pr.reviewers.iter().filter(|r| matches!(r.vote, ReviewVote::Approved | ReviewVote::ApprovedWithSuggestions)).count();
+            let changes = pr.reviewers.iter().any(|r| r.vote == ReviewVote::Rejected);
+            let (status, sstyle) = if matches!(pr.status, PullRequestStatus::Merged | PullRequestStatus::Closed) {
+                let (s, c) = pr_status(theme, pr);
+                (s.to_string(), Style::default().fg(c))
+            } else if changes {
+                ("✗ changes".to_string(), Style::default().fg(theme.red))
+            } else if approvals > 0 {
+                (format!("{} ok", "✓".repeat(approvals)), Style::default().fg(theme.green))
+            } else if pr.is_draft || pr.status == PullRequestStatus::Draft {
+                ("◌ draft".to_string(), dim)
+            } else {
+                ("○ review".to_string(), Style::default().fg(theme.yellow))
+            };
+            vec![
+                badge("PR", theme.blue),
+                (status, sstyle),
+                (pr.number.map(|n| format!("#{n}")).unwrap_or_default(), dim),
+                (pr.title.clone(), fg),
+                (format!("+{} -{}", pr.additions, pr.deletions), dim),
+                provider,
+                age(pr.updated_at),
+            ]
+        }
+        EntryItem::Pipe { run, definition_name } => {
+            // Title is the pipeline (e.g. "CI Build"); ref is the run/release. When we
+            // don't know the pipeline name, fall back to the run name as the title.
+            let num = || run.number.map(|n| format!("#{n}")).unwrap_or_default();
+            let (title, reference) = match definition_name {
+                Some(def) => (def.clone(), run.name.clone().unwrap_or_else(num)),
+                None => (run.name.clone().unwrap_or_else(|| run.definition_id.clone()), num()),
+            };
+            vec![
+                badge("CI", theme.yellow),
+                (format!("{} {:?}", pipeline_icon(run.status), run.status), Style::default().fg(theme.pipeline_color(run.status))),
+                (reference, dim),
+                (title, fg),
+                (run.branch.clone().unwrap_or_default(), dim),
+                provider,
+                age(run.finished_at.or(run.started_at)),
+            ]
+        }
+        EntryItem::Wi(wi) => vec![
+            badge("WI", theme.green),
+            (format!("● {}", wi.state), Style::default().fg(wi_state_color(theme, wi.state_category))),
+            (wi.identifier.clone().unwrap_or_default(), dim),
+            (wi.title.clone(), fg),
+            (wi.work_item_type.clone().unwrap_or_default(), dim),
+            provider,
+            age(wi.updated_at),
+        ],
+    }
+}
+
+/// Sizes each Launchpad column to its widest cell, clamping the flexible title column
+/// so the row still fits `inner_w`.
+fn lp_widths(rows: &[Vec<(String, Style)>], flex: usize, inner_w: usize) -> Vec<usize> {
+    let mut w = vec![0usize; LP_NCOL];
+    for row in rows {
+        for (i, (text, _)) in row.iter().enumerate().take(LP_NCOL) {
+            w[i] = w[i].max(text.chars().count());
+        }
+    }
+    let padding = COL_LEAD + LP_GAP * (LP_NCOL - 1);
+    let fixed: usize = (0..LP_NCOL).filter(|&i| i != flex).map(|i| w[i]).sum::<usize>() + padding;
+    w[flex] = w[flex].min(inner_w.saturating_sub(fixed)).max(3);
+    w
+}
+
+/// A horizontally-scrolling window of `text`, `width` columns wide, advancing with
+/// `frame`. Holds at the start briefly, then scrolls, wrapping past a gap — so a long
+/// selected title can be read in full. Returns `text` unchanged when it already fits.
+fn marquee_window(text: &str, width: usize, frame: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if width == 0 || chars.len() <= width {
+        return text.to_string();
+    }
+    const GAP: usize = 4; // blank run between the end and the wrapped-around start
+    const HOLD: usize = 2; // frames held at the start before scrolling (~1s at 300ms/frame)
+    let gapped: Vec<char> = chars.into_iter().chain(std::iter::repeat_n(' ', GAP)).collect();
+    let period = gapped.len();
+    let pos = (frame % (period + HOLD)).saturating_sub(HOLD);
+    (0..width).map(|i| gapped[(pos + i) % period]).collect()
+}
+
+/// Joins Launchpad cells into a line, each padded to its column width (so columns align),
+/// then pads the whole line so a selected row highlights edge-to-edge.
+fn lp_cells_line(cells: &[(String, Style)], widths: &[usize], inner_w: usize) -> Line<'static> {
+    let mut spans = vec![Span::raw(" ")]; // COL_LEAD
+    for (i, (text, style)) in cells.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw(" ".repeat(LP_GAP)));
+        }
+        spans.push(Span::styled(cell(text, widths[i]), *style));
+    }
+    let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+    if used < inner_w {
+        spans.push(Span::raw(" ".repeat(inner_w - used)));
+    }
+    Line::from(spans)
+}
+
+/// Circled numerals for the bucket headers.
+const CIRCLED: [&str; 8] = ["①", "②", "③", "④", "⑤", "⑥", "⑦", "⑧"];
 
 fn section_block<'a>(theme: &Theme, title: &'a str) -> Block<'a> {
     Block::default()
@@ -357,7 +586,8 @@ fn pr_checks(theme: &Theme, pr: &PullRequest) -> (String, ratatui::style::Color)
 fn render_prs(frame: &mut Frame, area: Rect, app: &mut App) {
     let theme = &app.theme;
     let idxs = app.filtered_pr_indices();
-    let title = list_title("Pull Requests".to_string(), &app.filters[0]);
+    let base = format!("Pull Requests · {}", crate::app::pr_status_summary(&app.pr_shown_statuses));
+    let title = list_title(base, &app.filters[0]);
     if idxs.is_empty() {
         let msg = if !app.filters[0].is_empty() {
             "No matches. Esc clears the filter."
@@ -483,7 +713,7 @@ fn render_pipes(frame: &mut Frame, area: Rect, app: &mut App) {
 
     let inner_w = area.width.saturating_sub(2) as usize;
     let dim = Style::default().fg(theme.dim).add_modifier(Modifier::BOLD);
-    let headers = ["", "Provider", "Pipeline", "#", "Branch", "Started", "Approval"];
+    let headers = ["", "Provider", "Pipeline", "Run", "Branch", "Started", "Approval"];
     let cells: Vec<Vec<(String, Style)>> = idxs
         .iter()
         .map(|&i| &app.pipes[i])
@@ -494,11 +724,19 @@ fn render_pipes(frame: &mut Frame, area: Rect, app: &mut App) {
             } else {
                 (String::new(), Style::default().fg(theme.dim))
             };
+            // Pipeline = definition name ("CI Build"); Run = the run/release ("10.1.100"),
+            // or the run number when it has no name.
+            let num = || p.run.number.map(|n| format!("#{n}")).unwrap_or_default();
+            let pipeline = p.definition_name.clone().or_else(|| p.run.name.clone()).unwrap_or_else(|| p.run.definition_id.clone());
+            let run = match &p.definition_name {
+                Some(_) => p.run.name.clone().unwrap_or_else(num),
+                None => num(),
+            };
             vec![
                 (format!("{} {:?}", pipeline_icon(p.run.status), p.run.status), Style::default().fg(color)),
                 (format!("{} · {}", p.provider.as_str(), p.connection), Style::default().fg(theme.cyan)),
-                (p.run.name.clone().unwrap_or_else(|| p.run.definition_id.clone()), Style::default().fg(theme.fg)),
-                (p.run.number.map(|n| format!("#{n}")).unwrap_or_default(), Style::default().fg(theme.dim)),
+                (pipeline, Style::default().fg(theme.fg)),
+                (run, Style::default().fg(theme.dim)),
                 (p.run.branch.clone().unwrap_or_default(), Style::default().fg(theme.dim)),
                 (rel_age(p.run.started_at), Style::default().fg(theme.dim)),
                 approval,
@@ -748,6 +986,9 @@ fn footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
     if let Some(overlay) = &app.overlay {
         return overlay.hint();
     }
+    if matches!(app.screen, Screen::Launchpad) {
+        return vec![("↑↓", "move"), ("←→", "columns"), ("↵", "open"), ("Tab", "sections"), ("r", "refresh"), ("?", "help"), ("q", "quit")];
+    }
     if let Screen::PrView(v) = &app.screen {
         return if v.tab == 3 {
             if v.diff.focus == DiffFocus::Patch {
@@ -794,7 +1035,7 @@ fn footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
     }
     let mut keys = vec![("↑↓", "move"), ("←→", "tabs")];
     match app.active {
-        0 => keys.extend([("↵", "open"), ("f", "view"), ("S", "sort"), ("o", "browser")]),
+        0 => keys.extend([("↵", "open"), ("f", "status"), ("S", "sort"), ("o", "browser")]),
         1 => keys.extend([("↵", "open"), ("f", "states"), ("S", "sort"), ("o", "browser")]),
         2 => keys.extend([("↵", "drill-in"), ("S", "sort"), ("T", "trigger"), ("o", "open")]),
         _ => {}
@@ -1336,7 +1577,7 @@ fn help_sections() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
             "Pull Requests (list)",
             vec![
                 ("Enter", "Open the PR view (all actions live there)"),
-                ("f", "Next saved view (defaults: All / Mine / Review)"),
+                ("f", "Filter by status (Open / Draft / Merged / Closed)"),
             ],
         ),
         (
@@ -1541,6 +1782,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn marquee_scrolls_only_overflowing_text() {
+        // Fits → returned unchanged (no scrolling).
+        assert_eq!(marquee_window("short", 10, 3), "short");
+        assert_eq!(marquee_window("short", 10, 99), "short");
+
+        let text = "Tidy up the logging middleware";
+        // Held at the start for the first few frames, exactly the window width.
+        let start = marquee_window(text, 12, 0);
+        assert_eq!(start.chars().count(), 12);
+        assert_eq!(start, "Tidy up the ");
+        assert_eq!(marquee_window(text, 12, 2), start, "held at start (~1s)");
+        assert_ne!(marquee_window(text, 12, 3), start, "scrolls after the hold");
+        // Later it has advanced (shows text further along).
+        let later = marquee_window(text, 12, 12);
+        assert_ne!(later, start);
+        assert!(later.chars().count() == 12);
+    }
+
     fn render_to_string(app: &mut App, w: u16, h: u16) -> String {
         let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
         terminal.draw(|f| render(f, app)).unwrap();
@@ -1679,6 +1939,7 @@ mod tests {
     #[test]
     fn pr_view_bar_shows_saved_views() {
         let mut app = App::new("slate");
+        app.screen = Screen::List;
         app.apply_views(vec![], vec![], vec![]); // seed the default PR views
         app.prs.push(crate::app::PrRow { connection_id: "c".into(), connection: "GH".into(), provider: ProviderType::GitHub, pr: sample_pr() });
         app.pr_state.select(Some(0));
@@ -1710,6 +1971,7 @@ mod tests {
     #[test]
     fn pr_list_shows_the_provider_column_for_aggregation() {
         let mut app = App::new("slate");
+        app.screen = Screen::List;
         app.prs.push(crate::app::PrRow {
             connection_id: "c".into(),
             connection: "MyHub".into(),
@@ -1726,6 +1988,7 @@ mod tests {
     fn pr_write_actions_live_in_the_view_not_the_list() {
         // The PR list footer offers only browse/open — no write actions.
         let mut app = App::new("slate");
+        app.screen = Screen::List;
         app.prs.push(crate::app::PrRow { connection_id: "c".into(), connection: "GH".into(), provider: ProviderType::GitHub, pr: sample_pr() });
         app.pr_state.select(Some(0));
         let list = render_to_string(&mut app, 140, 24);
@@ -1856,11 +2119,13 @@ mod tests {
     #[test]
     fn pipelines_list_flags_approval_needed_column() {
         let mut app = App::new("slate");
+        app.screen = Screen::List;
         app.active = 2;
         app.pipes.push(crate::app::PipeRow {
             connection_id: "c".into(),
             connection: "GH".into(),
             provider: ProviderType::GitHub,
+            definition_name: Some("CI Build".into()),
             awaiting_approval: true,
             run: sample_run(),
         });
@@ -1873,6 +2138,7 @@ mod tests {
     #[test]
     fn pipelines_footer_lists_drillin_and_trigger() {
         let mut app = App::new("slate");
+        app.screen = Screen::List;
         app.active = 2;
         let out = render_to_string(&mut app, 120, 24);
         assert!(out.contains("drill-in") && out.contains("trigger"), "pipelines footer");
@@ -1911,6 +2177,58 @@ mod tests {
         let out = render_to_string(&mut app, 100, 24);
         assert!(out.contains("add one"), "empty section should point to adding a connection");
         assert!(out.contains("add a connection"), "health bar should prompt to add a connection");
+    }
+
+    #[test]
+    fn launchpad_renders_two_columns_with_typed_rows() {
+        use crate::launchpad::{Bucket, Entry, EntryItem};
+        let entry = |bucket, item| Entry {
+            bucket,
+            connection_id: "c".into(),
+            connection: "GH".into(),
+            provider: ProviderType::GitHub,
+            item,
+        };
+        let pr = {
+            let mut p = sample_pr();
+            p.title = "Add retry policy".into();
+            p
+        };
+        let run = {
+            let mut r = sample_run();
+            r.name = Some("nightly".into());
+            r
+        };
+        let wi = WorkItem {
+            id: "w".into(),
+            identifier: Some("FOR-1".into()),
+            title: "Investigate flake".into(),
+            description: None,
+            state: "Todo".into(),
+            state_category: WorkItemStateCategory::Unstarted,
+            work_item_type: Some("Bug".into()),
+            assignee: None,
+            created_at: None,
+            updated_at: None,
+            url: None,
+        };
+        let mut app = App::new("slate"); // defaults to the Launchpad screen
+        app.lp = vec![
+            entry(Bucket::NeedsReview, EntryItem::Pr(pr)),
+            entry(Bucket::NeedsFixing, EntryItem::Pipe { run, definition_name: Some("CI Build".into()) }),
+            entry(Bucket::YourWork, EntryItem::Wi(wi)),
+        ];
+        let out = render_to_string(&mut app, 140, 24);
+        // Two named columns.
+        assert!(out.contains("Needs you") && out.contains("Your work"), "two columns");
+        // Buckets land in the right columns.
+        assert!(out.contains("Needs your review") && out.contains("Needs fixing") && out.contains("Assigned to you"), "bucket headers");
+        // Every row carries a type badge …
+        assert!(out.contains("PR") && out.contains("CI") && out.contains("WI"), "type badges for each kind");
+        // … and nav-style detail: PR number + change stats, WI id/state/type, pipeline branch.
+        assert!(out.contains("#42") && out.contains("+10 -2"), "PR row shows number and change stats");
+        assert!(out.contains("FOR-1") && out.contains("Todo") && out.contains("Bug"), "work-item row shows id, state, type");
+        assert!(out.contains("CI Build") && out.contains("main"), "pipeline row shows pipeline name + branch");
     }
 
     #[test]
@@ -1975,6 +2293,7 @@ mod tests {
     fn work_items_list_is_browse_only_actions_in_the_view() {
         // The WI list offers browse + the states filter — no state-change / comment.
         let mut app = App::new("slate");
+        app.screen = Screen::List;
         app.active = 1;
         let list = render_to_string(&mut app, 140, 24);
         assert!(list.contains("open") && list.contains("states"), "list keeps open + states filter");
