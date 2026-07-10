@@ -263,14 +263,18 @@ fn lp_cells(theme: &Theme, e: &crate::launchpad::Entry) -> Vec<(String, Style)> 
     let age = |t| (rel_age(t), Style::default().fg(age_color(theme, t)));
     match &e.item {
         EntryItem::Pr(pr) => {
-            // Status carries the review signal: approvals so far, changes requested, or draft.
+            // For merged/closed PRs (the "Recently merged" footer) show that state; for open
+            // ones the status carries the review signal: approvals, changes requested, or draft.
             let approvals = pr.reviewers.iter().filter(|r| matches!(r.vote, ReviewVote::Approved | ReviewVote::ApprovedWithSuggestions)).count();
             let changes = pr.reviewers.iter().any(|r| r.vote == ReviewVote::Rejected);
-            let (status, sstyle) = if changes {
+            let (status, sstyle) = if matches!(pr.status, PullRequestStatus::Merged | PullRequestStatus::Closed) {
+                let (s, c) = pr_status(theme, pr);
+                (s.to_string(), Style::default().fg(c))
+            } else if changes {
                 ("✗ changes".to_string(), Style::default().fg(theme.red))
             } else if approvals > 0 {
                 (format!("{} ok", "✓".repeat(approvals)), Style::default().fg(theme.green))
-            } else if pr.is_draft {
+            } else if pr.is_draft || pr.status == PullRequestStatus::Draft {
                 ("◌ draft".to_string(), dim)
             } else {
                 ("○ review".to_string(), Style::default().fg(theme.yellow))

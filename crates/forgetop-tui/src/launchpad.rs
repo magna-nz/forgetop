@@ -3,7 +3,7 @@
 //! is the part it's most important to get right.
 
 use chrono::{DateTime, Utc};
-use forgetop_core::domain::{CheckStatus, MergeableState, PipelineRun, PipelineRunStatus, ProviderType, PullRequest, WorkItem};
+use forgetop_core::domain::{CheckStatus, MergeableState, PipelineRun, PipelineRunStatus, ProviderType, PullRequest, PullRequestStatus, WorkItem};
 
 use crate::app::{pr_vote_flags, PipeRow, PrRow, WiRow};
 
@@ -17,8 +17,8 @@ pub enum Bucket {
     ReadyToMerge,
     NeedsFixing,
     YourWork,
-    WaitingOnOthers,
-    Drafts,
+    YourOpenPrs,
+    RecentlyMerged,
 }
 
 impl Bucket {
@@ -29,8 +29,8 @@ impl Bucket {
         Bucket::ReadyToMerge,
         Bucket::NeedsFixing,
         Bucket::YourWork,
-        Bucket::WaitingOnOthers,
-        Bucket::Drafts,
+        Bucket::YourOpenPrs,
+        Bucket::RecentlyMerged,
     ];
 
     pub fn title(&self) -> &'static str {
@@ -40,18 +40,19 @@ impl Bucket {
             Bucket::ReadyToMerge => "Ready to merge",
             Bucket::NeedsFixing => "Needs fixing",
             Bucket::YourWork => "Assigned to you",
-            Bucket::WaitingOnOthers => "Waiting on others",
-            Bucket::Drafts => "Drafts",
+            Bucket::YourOpenPrs => "Your open pull requests",
+            Bucket::RecentlyMerged => "Recently merged",
         }
     }
 
-    /// Muted buckets are informational — nothing for you to do right now.
+    /// Muted buckets are reference lists (dim heading, not counted in the tab badge) —
+    /// your full open-PR list and recently-merged, which restate items shown elsewhere.
     pub fn muted(&self) -> bool {
-        matches!(self, Bucket::WaitingOnOthers | Bucket::Drafts)
+        matches!(self, Bucket::YourOpenPrs | Bucket::RecentlyMerged)
     }
 
     /// Which Launchpad column this bucket lives in: 0 = left ("Needs you" — things
-    /// ripe for action now), 1 = right ("Your work" — your backlog + parked PRs).
+    /// ripe for action now), 1 = right ("Your work" — your PRs, items, recently merged).
     pub fn column(&self) -> usize {
         match self {
             Bucket::NeedsReview | Bucket::ApprovalsWaiting | Bucket::ReadyToMerge | Bucket::NeedsFixing => 0,
@@ -69,27 +70,38 @@ pub enum PrRole {
     Author,
 }
 
-/// Classifies a pull request into its action bucket.
-pub fn classify_pr(pr: &PullRequest, role: PrRole) -> Bucket {
+/// The left-column action bucket a PR lands in, or `None` when there's nothing to act
+/// on right now (a draft, or one just waiting on others' review — those still show in
+/// your full open-PR list on the right, but not as an action item).
+pub fn classify_pr(pr: &PullRequest, role: PrRole) -> Option<Bucket> {
     match role {
         // If you're a requested reviewer, someone is blocked on you — top priority.
-        PrRole::Reviewer => Bucket::NeedsReview,
+        PrRole::Reviewer => Some(Bucket::NeedsReview),
         PrRole::Author => {
             if pr.is_draft {
-                return Bucket::Drafts;
+                return None;
             }
             let (approved, changes) = pr_vote_flags(pr);
             let checks_failing = pr.checks == CheckStatus::Failed;
             let conflict = matches!(pr.mergeable, MergeableState::Conflicting);
             if changes || checks_failing || conflict {
-                Bucket::NeedsFixing
+                Some(Bucket::NeedsFixing)
             } else if approved && matches!(pr.mergeable, MergeableState::Mergeable) {
-                Bucket::ReadyToMerge
+                Some(Bucket::ReadyToMerge)
             } else {
-                Bucket::WaitingOnOthers
+                None // open, nothing wrong, just waiting on others
             }
         }
     }
+}
+
+/// Recency window for the "Recently merged" section, and how many to show.
+const RECENT_MERGE_DAYS: i64 = 7;
+const RECENT_MERGE_MAX: usize = 5;
+
+/// True for your PRs merged within the recency window (shown in "Recently merged").
+fn merged_recently(pr: &PullRequest, now: DateTime<Utc>) -> bool {
+    pr.status == PullRequestStatus::Merged && pr.updated_at.map(|t| (now - t).num_days() <= RECENT_MERGE_DAYS).unwrap_or(false)
 }
 
 /// Classifies a pipeline run, or `None` when it needs no attention.
@@ -204,9 +216,34 @@ pub fn build(prs_review: &[PrRow], prs_mine: &[PrRow], wis: &[WiRow], pipes: &[P
         item: EntryItem::Pr(row.pr.clone()),
     };
 
+    let now = Utc::now();
     let mut out: Vec<Entry> = Vec::new();
-    out.extend(prs_review.iter().map(|r| pr_entry(r, classify_pr(&r.pr, PrRole::Reviewer))));
-    out.extend(prs_mine.iter().map(|r| pr_entry(r, classify_pr(&r.pr, PrRole::Author))));
+
+    // PRs where you're a requested reviewer → Needs your review.
+    for r in prs_review {
+        if let Some(bucket) = classify_pr(&r.pr, PrRole::Reviewer) {
+            out.push(pr_entry(r, bucket));
+        }
+    }
+    // Your own PRs: an action bucket on the left when there's something to do, the full
+    // open-PR list on the right, and recently-merged ones as a "shipped" footer.
+    for r in prs_mine {
+        match r.pr.status {
+            PullRequestStatus::Merged => {
+                if merged_recently(&r.pr, now) {
+                    out.push(pr_entry(r, Bucket::RecentlyMerged));
+                }
+            }
+            PullRequestStatus::Closed => {} // abandoned — don't surface
+            _ => {
+                if let Some(bucket) = classify_pr(&r.pr, PrRole::Author) {
+                    out.push(pr_entry(r, bucket));
+                }
+                out.push(pr_entry(r, Bucket::YourOpenPrs));
+            }
+        }
+    }
+    // Work items assigned to you → Assigned to you.
     out.extend(wis.iter().map(|r| Entry {
         bucket: Bucket::YourWork,
         connection_id: r.connection_id.clone(),
@@ -226,7 +263,26 @@ pub fn build(prs_review: &[PrRow], prs_mine: &[PrRow], wis: &[WiRow], pipes: &[P
         }
     }
 
-    out.sort_by(|a, b| bucket_rank(a.bucket).cmp(&bucket_rank(b.bucket)).then_with(|| age_key(a.updated_at()).cmp(&age_key(b.updated_at()))));
+    // Bucket by urgency; within a bucket oldest-first, except Recently merged (newest first).
+    out.sort_by(|a, b| {
+        bucket_rank(a.bucket).cmp(&bucket_rank(b.bucket)).then_with(|| {
+            if a.bucket == Bucket::RecentlyMerged {
+                age_key(b.updated_at()).cmp(&age_key(a.updated_at()))
+            } else {
+                age_key(a.updated_at()).cmp(&age_key(b.updated_at()))
+            }
+        })
+    });
+    // Keep the recently-merged footer short (it's already newest-first after the sort).
+    let mut merged = 0;
+    out.retain(|e| {
+        if e.bucket == Bucket::RecentlyMerged {
+            merged += 1;
+            merged <= RECENT_MERGE_MAX
+        } else {
+            true
+        }
+    });
     out
 }
 
@@ -291,7 +347,7 @@ mod tests {
     fn reviewer_prs_always_need_review() {
         // Regardless of the PR's own state, being a requested reviewer wins.
         let pr = authored(false, &[ReviewVote::Approved], CheckStatus::Passed, MergeableState::Mergeable);
-        assert_eq!(classify_pr(&pr, PrRole::Reviewer), Bucket::NeedsReview);
+        assert_eq!(classify_pr(&pr, PrRole::Reviewer), Some(Bucket::NeedsReview));
     }
 
     #[test]
@@ -299,15 +355,15 @@ mod tests {
         use Bucket::*;
         let case = |draft, votes: &[ReviewVote], checks, merge| classify_pr(&authored(draft, votes, checks, merge), PrRole::Author);
 
-        assert_eq!(case(true, &[], CheckStatus::None, MergeableState::Mergeable), Drafts);
+        // Drafts and open-but-waiting PRs aren't action items (they show in your open-PR list).
+        assert_eq!(case(true, &[], CheckStatus::None, MergeableState::Mergeable), None);
+        assert_eq!(case(false, &[], CheckStatus::Passed, MergeableState::Mergeable), None);
         // Bounce-backs → needs fixing.
-        assert_eq!(case(false, &[ReviewVote::Rejected], CheckStatus::Passed, MergeableState::Mergeable), NeedsFixing);
-        assert_eq!(case(false, &[], CheckStatus::Failed, MergeableState::Mergeable), NeedsFixing);
-        assert_eq!(case(false, &[], CheckStatus::Passed, MergeableState::Conflicting), NeedsFixing);
+        assert_eq!(case(false, &[ReviewVote::Rejected], CheckStatus::Passed, MergeableState::Mergeable), Some(NeedsFixing));
+        assert_eq!(case(false, &[], CheckStatus::Failed, MergeableState::Mergeable), Some(NeedsFixing));
+        assert_eq!(case(false, &[], CheckStatus::Passed, MergeableState::Conflicting), Some(NeedsFixing));
         // Approved + mergeable + checks fine → ship it.
-        assert_eq!(case(false, &[ReviewVote::Approved], CheckStatus::Passed, MergeableState::Mergeable), ReadyToMerge);
-        // Open, nothing wrong, but not yet approved → waiting on others.
-        assert_eq!(case(false, &[], CheckStatus::Passed, MergeableState::Mergeable), WaitingOnOthers);
+        assert_eq!(case(false, &[ReviewVote::Approved], CheckStatus::Passed, MergeableState::Mergeable), Some(ReadyToMerge));
     }
 
     #[test]
@@ -322,6 +378,53 @@ mod tests {
     #[test]
     fn bucket_order_is_urgency_first() {
         assert_eq!(Bucket::ORDER[0], Bucket::NeedsReview);
-        assert!(!Bucket::NeedsReview.muted() && Bucket::Drafts.muted());
+        assert!(!Bucket::NeedsReview.muted() && Bucket::RecentlyMerged.muted());
+    }
+
+    #[test]
+    fn build_places_your_prs_in_the_full_list_and_recent_merges() {
+        let row = |id: &str, pr: PullRequest| {
+            let mut pr = pr;
+            pr.id = id.into();
+            PrRow { connection_id: "c".into(), connection: "GH".into(), provider: ProviderType::GitHub, pr }
+        };
+        let now = Utc::now();
+        let mut merged = authored(false, &[], CheckStatus::Passed, MergeableState::Mergeable);
+        merged.status = PullRequestStatus::Merged;
+        merged.updated_at = Some(now - chrono::Duration::days(1));
+        let mut old = authored(false, &[], CheckStatus::Passed, MergeableState::Mergeable);
+        old.status = PullRequestStatus::Merged;
+        old.updated_at = Some(now - chrono::Duration::days(60));
+
+        let mine = vec![
+            row("ready", authored(false, &[ReviewVote::Approved], CheckStatus::Passed, MergeableState::Mergeable)),
+            row("draft", authored(true, &[], CheckStatus::None, MergeableState::Mergeable)),
+            row("merged", merged),
+            row("old", old),
+        ];
+        let out = build(&[], &mine, &[], &[]);
+        let buckets = |id: &str| out.iter().filter(|e| e.item_id() == id).map(|e| e.bucket).collect::<Vec<_>>();
+
+        // A ready-to-merge PR shows both as a left action and in the full open-PR list.
+        assert!(buckets("ready").contains(&Bucket::ReadyToMerge) && buckets("ready").contains(&Bucket::YourOpenPrs));
+        // A draft is only in the full list (no action).
+        assert_eq!(buckets("draft"), vec![Bucket::YourOpenPrs]);
+        // A fresh merge shows in Recently merged; a 60-day-old one is dropped entirely.
+        assert_eq!(buckets("merged"), vec![Bucket::RecentlyMerged]);
+        assert!(buckets("old").is_empty());
+    }
+
+    #[test]
+    fn merged_recently_respects_the_window() {
+        let now = Utc::now();
+        let mut pr = authored(false, &[], CheckStatus::Passed, MergeableState::Mergeable);
+        pr.status = PullRequestStatus::Merged;
+        pr.updated_at = Some(now - chrono::Duration::days(2));
+        assert!(merged_recently(&pr, now));
+        pr.updated_at = Some(now - chrono::Duration::days(30));
+        assert!(!merged_recently(&pr, now), "old merges drop off");
+        pr.status = PullRequestStatus::Open;
+        pr.updated_at = Some(now);
+        assert!(!merged_recently(&pr, now), "open PRs aren't 'recently merged'");
     }
 }

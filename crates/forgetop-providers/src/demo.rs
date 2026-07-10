@@ -99,6 +99,28 @@ fn pull_requests() -> Vec<PullRequest> {
             updated_at: Some(now - chrono::Duration::days(2)),
             url: Some("https://example.test/pr/100".into()),
         },
+        PullRequest {
+            id: "98".into(),
+            number: Some(98),
+            title: "Cache the provider capability probe".into(),
+            description: None,
+            author: alice(),
+            status: PullRequestStatus::Merged,
+            is_draft: false,
+            source_ref: Some("perf/cap-cache".into()),
+            target_ref: Some("main".into()),
+            reviewers: vec![Reviewer { user: bob(), vote: ReviewVote::Approved, is_required: true }],
+            labels: vec!["performance".into()],
+            checks: CheckStatus::Passed,
+            check_summary: None,
+            mergeable: MergeableState::Unknown,
+            changed_files: 4,
+            additions: 63,
+            deletions: 18,
+            created_at: Some(now - chrono::Duration::days(2)),
+            updated_at: Some(now - chrono::Duration::hours(20)),
+            url: Some("https://example.test/pr/98".into()),
+        },
     ]
 }
 

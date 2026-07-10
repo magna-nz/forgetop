@@ -1082,7 +1082,9 @@ impl App {
             for feed in feeds {
                 let (provider, name, conn_id) = feed_tag(&feed.connection);
                 let row = |pr: PullRequest| PrRow { connection_id: conn_id.clone(), connection: name.clone(), provider, pr };
-                if let Ok(list) = feed.source.list(&pr_query(PullRequestFilter::Mine)).await {
+                // Include completed so "Recently merged" has data; open PRs still drive the rest.
+                let mine = PullRequestQuery { filter: PullRequestFilter::Mine, include_completed: true, limit: Some(50) };
+                if let Ok(list) = feed.source.list(&mine).await {
                     self.lp_prs_mine.extend(list.into_iter().map(row));
                 }
                 if let Ok(list) = feed.source.list(&pr_query(PullRequestFilter::ReviewRequested)).await {
