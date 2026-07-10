@@ -354,7 +354,7 @@ fn marquee_window(text: &str, width: usize, frame: usize) -> String {
         return text.to_string();
     }
     const GAP: usize = 4; // blank run between the end and the wrapped-around start
-    const HOLD: usize = 6; // frames held at the start before scrolling
+    const HOLD: usize = 2; // frames held at the start before scrolling (~1s at 300ms/frame)
     let gapped: Vec<char> = chars.into_iter().chain(std::iter::repeat_n(' ', GAP)).collect();
     let period = gapped.len();
     let pos = (frame % (period + HOLD)).saturating_sub(HOLD);
@@ -1793,7 +1793,8 @@ mod tests {
         let start = marquee_window(text, 12, 0);
         assert_eq!(start.chars().count(), 12);
         assert_eq!(start, "Tidy up the ");
-        assert_eq!(marquee_window(text, 12, 3), start, "held at start");
+        assert_eq!(marquee_window(text, 12, 2), start, "held at start (~1s)");
+        assert_ne!(marquee_window(text, 12, 3), start, "scrolls after the hold");
         // Later it has advanced (shows text further along).
         let later = marquee_window(text, 12, 12);
         assert_ne!(later, start);
