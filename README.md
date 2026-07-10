@@ -25,6 +25,26 @@ work items, and pipelines into one terminal dashboard - and lets you *act* on th
 (approve, merge, comment, change state, drill into pipeline stages, trigger runs)
 without leaving the keyboard. Tokens live in your OS keychain, never in plaintext.
 
+## The Launchpad
+
+forgetop opens on the **Launchpad** - a single, cross-provider **action inbox** that
+answers *what needs me right now?* It triages every PR, work item, and pipeline across
+every connected provider into two prioritised columns:
+
+- **Needs you** - PRs awaiting your review, pipeline gates you can approve, your PRs
+  that are ready to merge, and anything of yours that's failing.
+- **Your work** - work items assigned to you, your open pull requests, and what you've
+  recently merged.
+
+Every row reads the same way - a `PR` / `CI` / `WI` type badge, a status signal, the
+title, change stats / branch, provider, and age - so a review, a broken build, and a
+task line up at a glance. `Enter` opens any item in its full view; `Esc` brings you back
+to the same row; and acting on something (review, approve, merge) clears it from the
+queue immediately. The Pull Requests / Work Items / Pipelines tabs remain as drill-downs.
+
+See the [Launchpad docs](https://magna-nz.github.io/forgetop/#launchpad) for the full
+bucket rules and keys.
+
 ## Why forgetop
 
 Two popular TUIs inspired this: [gh-dash](https://github.com/dlvhdr/gh-dash) (GitHub only)
@@ -35,6 +55,7 @@ and [azdo](https://github.com/Elpulgo/azdo) (Azure DevOps only). forgetop's angl
 | Capability | forgetop | gh-dash | azdo |
 | :--- | :---: | :---: | :---: |
 | Forges supported | **6** | GitHub | Azure |
+| Cross-provider action inbox (Launchpad) | ✅ | ❌ | ❌ |
 | PRs + Work items + Pipelines | ✅ | PRs only | ✅ Azure |
 | Act (approve / merge / comment) | ✅ | ✅ PRs | partial |
 | Inline line-comment review | ✅ | preview | ❌ |
@@ -92,6 +113,10 @@ Try it with no setup - everything is in-memory, nothing is written:
 forgetop --demo
 ```
 
+It opens on the **[Launchpad](https://magna-nz.github.io/forgetop/#launchpad)** — your
+triaged queue across both demo connections; press `Tab` (or `2`–`4`) for the per-type
+lists.
+
 Then run it for real. On first launch forgetop drops straight into the
 **add-connection wizard**:
 
@@ -116,6 +141,7 @@ keychain access, and each connection's token + connectivity.
 forgetop shows a **context-aware key glossary** along the bottom, so you rarely
 need a reference. The full docs live at **[magna-nz.github.io/forgetop](https://magna-nz.github.io/forgetop/)**:
 
+- [Launchpad](https://magna-nz.github.io/forgetop/#launchpad) - the cross-provider action inbox
 - [Keybindings](https://magna-nz.github.io/forgetop/#keybindings) - every key, per screen
 - [Configuration &amp; tokens](https://magna-nz.github.io/forgetop/#configuration) - config paths, keychain, token scopes per provider
 - [Themes](https://magna-nz.github.io/forgetop/#themes)
