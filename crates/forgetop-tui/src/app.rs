@@ -64,6 +64,8 @@ struct ReloadParams {
     pr_review_seen: HashMap<(String, String), (bool, bool)>,
     scan_seeded: bool,
     notifier: Arc<dyn Notifier>,
+    /// The open pipeline view's (connection_id, run_id), so the refresh keeps it live.
+    open_pipeline: Option<(String, String)>,
 }
 
 /// The PR-notification scan's new seen-sets (notifications are fired during the scan).
@@ -81,6 +83,8 @@ pub struct Reloaded {
     lp_prs_review: Vec<PrRow>,
     health: Vec<ConnectionHealth>,
     scan: Option<PrScan>,
+    /// Fresh (run_id, run, approvals) for the open pipeline view, if one is open.
+    open_pipeline: Option<(String, PipelineRun, Vec<PipelineApproval>)>,
     errors: Vec<String>,
 }
 
@@ -1192,8 +1196,6 @@ impl App {
     pub async fn reload_all(&mut self, deps: &AppDeps) {
         self.loading = true;
         self.status = "Refreshing…".into();
-        // The open-pipeline view is refreshed inline here; the background path skips it.
-        self.refresh_open_pipeline(deps).await;
         let fetched = self.fetch_bundle(deps).await;
         self.apply_reloaded(fetched);
     }
@@ -1208,6 +1210,10 @@ impl App {
             pr_review_seen: self.pr_review_seen.clone(),
             scan_seeded: self.pr_scan_seeded,
             notifier: self.notifier.clone(),
+            open_pipeline: match &self.screen {
+                Screen::Pipeline(v) => Some((v.connection_id.clone(), v.run.id.clone())),
+                _ => None,
+            },
         }
     }
 
@@ -1221,7 +1227,11 @@ impl App {
         let (lp_prs_mine, lp_prs_review) = fetch_launchpad_prs(&deps).await;
         let health = deps.health.check_all().await;
         let scan = scan_pr_notifications(&deps, &p).await;
-        Reloaded { prs, wis, pipes, lp_prs_mine, lp_prs_review, health, scan, errors }
+        let open_pipeline = match &p.open_pipeline {
+            Some((conn_id, run_id)) => fetch_open_pipeline(&deps, conn_id, run_id).await,
+            None => None,
+        };
+        Reloaded { prs, wis, pipes, lp_prs_mine, lp_prs_review, health, scan, open_pipeline, errors }
     }
 
     /// The inline (blocking) variant used by [`reload_all`].
@@ -1246,6 +1256,17 @@ impl App {
                 self.pr_review_seen = seen;
             }
             self.pr_scan_seeded = true;
+        }
+        // Keep the open pipeline view live, but only if it's still the same run (the user
+        // may have navigated away during the fetch).
+        if let Some((run_id, run, approvals)) = r.open_pipeline {
+            if let Screen::Pipeline(v) = &mut self.screen {
+                if v.run.id == run_id {
+                    v.run = run;
+                    v.approvals = approvals;
+                    v.clamp_selection();
+                }
+            }
         }
         self.rebuild_launchpad();
         self.notify_pipeline_failures();
@@ -3284,6 +3305,20 @@ async fn fetch_pipelines(deps: &AppDeps, errors: &mut Vec<String>) -> Vec<PipeRo
     out
 }
 
+/// Re-fetches the open pipeline run + its pending approvals (mirrors
+/// [`App::refresh_open_pipeline`]), so the background refresh keeps the view live.
+async fn fetch_open_pipeline(deps: &AppDeps, conn_id: &str, run_id: &str) -> Option<(String, PipelineRun, Vec<PipelineApproval>)> {
+    let feeds = deps.sections.pipeline_feeds().await.unwrap_or_default();
+    let feed = feeds.iter().find(|f| f.connection.connection_id() == conn_id)?;
+    let run = feed.source.get_run(run_id).await.ok()?;
+    let approvals = if feed.source.supports_approvals() {
+        feed.source.pending_approvals(run_id).await.unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    Some((run_id.to_string(), run, approvals))
+}
+
 async fn fetch_launchpad_prs(deps: &AppDeps) -> (Vec<PrRow>, Vec<PrRow>) {
     let (mut mine_out, mut review_out) = (Vec::new(), Vec::new());
     if let Ok(feeds) = deps.sections.pull_request_feeds().await {
@@ -3495,6 +3530,7 @@ mod tests {
             lp_prs_review: vec![],
             health: vec![],
             scan: None,
+            open_pipeline: None,
             errors: vec![],
         });
         assert_eq!(app.prs.len(), 2);
