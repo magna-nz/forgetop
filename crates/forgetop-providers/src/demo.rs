@@ -26,361 +26,183 @@ fn user(id: &str, name: &str, handle: &str) -> User {
     User { id: id.into(), display_name: name.into(), handle: Some(handle.into()), avatar_url: None }
 }
 
+/// The current user ("you") — a backend engineer at Northwind. `is_user` matches on
+/// handle, so PR filters pass "you".
+fn me() -> User {
+    user("me", "Sam Rivera", "you")
+}
+// Teammates (function names kept short; these are the people around you at Northwind).
 fn alice() -> User {
-    user("u1", "Alice Ng", "alice")
+    user("u1", "Priya Nair", "priya")
 }
 fn bob() -> User {
-    user("u2", "Bob Reyes", "bob")
+    user("u2", "Marcus Lee", "marcus")
 }
 fn carol() -> User {
-    user("u3", "Carol Diaz", "carol")
+    user("u3", "Elena Sokolova", "elena")
+}
+fn dev() -> User {
+    user("u4", "Tom Becker", "tom")
 }
 
-fn pull_requests() -> Vec<PullRequest> {
+fn rev(u: User, vote: ReviewVote) -> Reviewer {
+    Reviewer { user: u, vote, is_required: true }
+}
+
+/// Compact PR/MR builder for the demo data.
+#[allow(clippy::too_many_arguments)]
+fn pr(
+    n: i64,
+    title: &str,
+    author: User,
+    status: PullRequestStatus,
+    checks: CheckStatus,
+    mergeable: MergeableState,
+    reviewers: Vec<Reviewer>,
+    add: i64,
+    del: i64,
+    updated_h: i64,
+    branch: &str,
+    labels: &[&str],
+) -> PullRequest {
     let now = base();
+    PullRequest {
+        id: n.to_string(),
+        number: Some(n),
+        title: title.into(),
+        description: None,
+        author,
+        is_draft: matches!(status, PullRequestStatus::Draft),
+        status,
+        source_ref: Some(branch.into()),
+        target_ref: Some("main".into()),
+        reviewers,
+        labels: labels.iter().map(|s| s.to_string()).collect(),
+        checks,
+        check_summary: None,
+        mergeable,
+        changed_files: 0,
+        additions: add,
+        deletions: del,
+        created_at: Some(now - chrono::Duration::days(3)),
+        updated_at: Some(now - chrono::Duration::hours(updated_h)),
+        url: Some(format!("https://example.test/pr/{n}")),
+    }
+}
+
+/// Compact work-item builder. `mine` assigns it to you; otherwise unassigned.
+fn wi(id: &str, title: &str, state: &str, cat: WorkItemStateCategory, ty: &str, mine: bool, updated_h: i64) -> WorkItem {
+    let now = base();
+    WorkItem {
+        id: id.into(),
+        identifier: Some(id.into()),
+        title: title.into(),
+        description: None,
+        state: state.into(),
+        state_category: cat,
+        work_item_type: Some(ty.into()),
+        assignee: mine.then(me),
+        created_at: Some(now - chrono::Duration::days(4)),
+        updated_at: Some(now - chrono::Duration::hours(updated_h)),
+        url: Some(format!("https://example.test/issue/{id}")),
+    }
+}
+
+use CheckStatus as CS;
+use MergeableState as MS;
+use PullRequestStatus as PS;
+use ReviewVote as RV;
+
+/// GitHub — the payments product repos (`northwind/payments`).
+fn github_prs() -> Vec<PullRequest> {
     vec![
-        PullRequest {
-            id: "101".into(),
-            number: Some(101),
-            title: "Add retry policy to HTTP client".into(),
-            description: Some("Wraps outbound calls in a retry with jitter.\n\nReduces 5xx-related flakiness in the banking sync job.".into()),
-            author: alice(),
-            status: PullRequestStatus::Open,
-            is_draft: false,
-            source_ref: Some("feature/retry".into()),
-            target_ref: Some("main".into()),
-            reviewers: vec![
-                Reviewer { user: bob(), vote: ReviewVote::Approved, is_required: false },
-                Reviewer { user: carol(), vote: ReviewVote::WaitingForAuthor, is_required: true },
-            ],
-            labels: vec!["banking".into(), "enhancement".into()],
-            checks: CheckStatus::Passed,
-            check_summary: Some(CheckSummary { successful: 14, neutral: 1, ..Default::default() }),
-            mergeable: MergeableState::Mergeable,
-            changed_files: 2,
-            additions: 24,
-            deletions: 2,
-            created_at: Some(now - chrono::Duration::hours(30)),
-            updated_at: Some(now - chrono::Duration::hours(2)),
-            url: Some("https://example.test/pr/101".into()),
-        },
-        PullRequest {
-            id: "102".into(),
-            number: Some(102),
-            title: "Fix flaky pipeline cache key".into(),
-            description: Some("WIP — still narrowing down the cache key collision.".into()),
-            author: bob(),
-            status: PullRequestStatus::Draft,
-            is_draft: true,
-            source_ref: Some("fix/cache".into()),
-            target_ref: Some("main".into()),
-            reviewers: vec![Reviewer { user: alice(), vote: ReviewVote::NoVote, is_required: false }],
-            labels: vec!["wip".into(), "ci".into()],
-            checks: CheckStatus::Pending,
-            check_summary: Some(CheckSummary { successful: 2, in_progress: 12, neutral: 1, ..Default::default() }),
-            mergeable: MergeableState::Blocked,
-            changed_files: 3,
-            additions: 12,
-            deletions: 5,
-            created_at: Some(now - chrono::Duration::hours(6)),
-            updated_at: None,
-            url: Some("https://example.test/pr/102".into()),
-        },
-        PullRequest {
-            id: "100".into(),
-            number: Some(100),
-            title: "Bump dependencies".into(),
-            description: None,
-            author: carol(),
-            status: PullRequestStatus::Merged,
-            is_draft: false,
-            source_ref: Some("chore/bump".into()),
-            target_ref: Some("main".into()),
-            reviewers: vec![],
-            labels: vec!["chore".into()],
-            checks: CheckStatus::Passed,
-            check_summary: None,
-            mergeable: MergeableState::Unknown,
-            changed_files: 8,
-            additions: 120,
-            deletions: 60,
-            created_at: Some(now - chrono::Duration::days(3)),
-            updated_at: Some(now - chrono::Duration::days(2)),
-            url: Some("https://example.test/pr/100".into()),
-        },
-        PullRequest {
-            id: "98".into(),
-            number: Some(98),
-            title: "Cache the provider capability probe".into(),
-            description: None,
-            author: alice(),
-            status: PullRequestStatus::Merged,
-            is_draft: false,
-            source_ref: Some("perf/cap-cache".into()),
-            target_ref: Some("main".into()),
-            reviewers: vec![Reviewer { user: bob(), vote: ReviewVote::Approved, is_required: true }],
-            labels: vec!["performance".into()],
-            checks: CheckStatus::Passed,
-            check_summary: None,
-            mergeable: MergeableState::Unknown,
-            changed_files: 4,
-            additions: 63,
-            deletions: 18,
-            created_at: Some(now - chrono::Duration::days(2)),
-            updated_at: Some(now - chrono::Duration::hours(20)),
-            url: Some("https://example.test/pr/98".into()),
-        },
+        // Ready to merge: yours, approved, green.
+        pr(1487, "Add idempotency keys to the payments API", me(), PS::Open, CS::Passed, MS::Mergeable, vec![rev(alice(), RV::Approved), rev(bob(), RV::Approved)], 132, 18, 3, "feat/idempotency-keys", &["payments", "api"]),
+        // Needs fixing: yours, CI red.
+        pr(1492, "Bump Next.js to 14.2.5", me(), PS::Open, CS::Failed, MS::Blocked, vec![rev(bob(), RV::NoVote)], 40, 12, 5, "chore/next-14-2-5", &["frontend", "dependencies"]),
+        // Needs your review: a teammate's PR, you're a reviewer.
+        pr(1501, "Refactor the webhook retry queue", bob(), PS::Open, CS::Passed, MS::Mergeable, vec![rev(me(), RV::NoVote), rev(alice(), RV::Approved)], 210, 64, 4, "refactor/webhook-retry", &["reliability"]),
+        pr(1495, "Tighten CORS on the admin API", carol(), PS::Open, CS::Passed, MS::Mergeable, vec![rev(me(), RV::NoVote)], 18, 6, 9, "security/admin-cors", &["security"]),
+        // Draft (yours).
+        pr(1476, "Checkout redesign", me(), PS::Draft, CS::Pending, MS::Blocked, vec![], 88, 20, 26, "feat/checkout-redesign", &["frontend", "wip"]),
+        // Recently merged (yours).
+        pr(1450, "Cache the customer risk score", me(), PS::Merged, CS::Passed, MS::Unknown, vec![rev(alice(), RV::Approved)], 63, 18, 20, "perf/risk-score-cache", &["performance"]),
     ]
 }
 
-fn work_items() -> Vec<WorkItem> {
-    let now = base();
+/// GitHub Issues on the product repos.
+fn github_wis() -> Vec<WorkItem> {
+    use WorkItemStateCategory as C;
     vec![
-        WorkItem {
-            id: "w1".into(),
-            identifier: Some("FOR-12".into()),
-            title: "Design the provider abstraction".into(),
-            description: Some("Capability-scoped source traits.".into()),
-            state: "In Progress".into(),
-            state_category: WorkItemStateCategory::Started,
-            work_item_type: Some("Story".into()),
-            assignee: Some(alice()),
-            created_at: Some(now - chrono::Duration::days(5)),
-            updated_at: Some(now - chrono::Duration::hours(3)),
-            url: Some("https://example.test/wi/12".into()),
-        },
-        WorkItem {
-            id: "w2".into(),
-            identifier: Some("FOR-13".into()),
-            title: "Pipeline auto-discovery".into(),
-            description: None,
-            state: "Todo".into(),
-            state_category: WorkItemStateCategory::Unstarted,
-            work_item_type: Some("Task".into()),
-            assignee: Some(bob()),
-            created_at: Some(now - chrono::Duration::days(4)),
-            updated_at: None,
-            url: Some("https://example.test/wi/13".into()),
-        },
-        WorkItem {
-            id: "w3".into(),
-            identifier: Some("FOR-9".into()),
-            title: "Spike: ratatui".into(),
-            description: None,
-            state: "Done".into(),
-            state_category: WorkItemStateCategory::Completed,
-            work_item_type: Some("Spike".into()),
-            assignee: Some(carol()),
-            created_at: Some(now - chrono::Duration::days(9)),
-            updated_at: Some(now - chrono::Duration::days(6)),
-            url: Some("https://example.test/wi/9".into()),
-        },
-        WorkItem {
-            id: "w4".into(),
-            identifier: Some("FOR-20".into()),
-            title: "Add GitLab merge-request support".into(),
-            description: None,
-            state: "In Progress".into(),
-            state_category: WorkItemStateCategory::Started,
-            work_item_type: Some("Story".into()),
-            assignee: Some(bob()),
-            created_at: Some(now - chrono::Duration::days(3)),
-            updated_at: Some(now - chrono::Duration::hours(6)),
-            url: Some("https://example.test/wi/20".into()),
-        },
-        WorkItem {
-            id: "w5".into(),
-            identifier: Some("FOR-21".into()),
-            title: "Bitbucket pipelines pagination".into(),
-            description: None,
-            state: "In Review".into(),
-            state_category: WorkItemStateCategory::Started,
-            work_item_type: Some("Task".into()),
-            assignee: Some(carol()),
-            created_at: Some(now - chrono::Duration::days(2)),
-            updated_at: Some(now - chrono::Duration::hours(2)),
-            url: Some("https://example.test/wi/21".into()),
-        },
-        WorkItem {
-            id: "w6".into(),
-            identifier: Some("FOR-22".into()),
-            title: "Keychain error handling on Linux".into(),
-            description: None,
-            state: "Blocked".into(),
-            state_category: WorkItemStateCategory::Started,
-            work_item_type: Some("Bug".into()),
-            assignee: Some(alice()),
-            created_at: Some(now - chrono::Duration::days(7)),
-            updated_at: Some(now - chrono::Duration::days(1)),
-            url: Some("https://example.test/wi/22".into()),
-        },
-        WorkItem {
-            id: "w7".into(),
-            identifier: Some("FOR-23".into()),
-            title: "High-contrast theme".into(),
-            description: None,
-            state: "Backlog".into(),
-            state_category: WorkItemStateCategory::Backlog,
-            work_item_type: Some("Story".into()),
-            assignee: None,
-            created_at: Some(now - chrono::Duration::days(12)),
-            updated_at: None,
-            url: Some("https://example.test/wi/23".into()),
-        },
-        WorkItem {
-            id: "w8".into(),
-            identifier: Some("FOR-24".into()),
-            title: "Investigate flaky pipeline cache test".into(),
-            description: None,
-            state: "Triage".into(),
-            state_category: WorkItemStateCategory::Triage,
-            work_item_type: Some("Bug".into()),
-            assignee: Some(bob()),
-            created_at: Some(now - chrono::Duration::hours(20)),
-            updated_at: Some(now - chrono::Duration::hours(20)),
-            url: Some("https://example.test/wi/24".into()),
-        },
-        WorkItem {
-            id: "w9".into(),
-            identifier: Some("FOR-25".into()),
-            title: "Docs: token scopes table".into(),
-            description: None,
-            state: "Todo".into(),
-            state_category: WorkItemStateCategory::Unstarted,
-            work_item_type: Some("Task".into()),
-            assignee: Some(carol()),
-            created_at: Some(now - chrono::Duration::days(1)),
-            updated_at: None,
-            url: Some("https://example.test/wi/25".into()),
-        },
-        WorkItem {
-            id: "w10".into(),
-            identifier: Some("FOR-26".into()),
-            title: "Cross-provider aggregation for PRs".into(),
-            description: None,
-            state: "Backlog".into(),
-            state_category: WorkItemStateCategory::Backlog,
-            work_item_type: Some("Epic".into()),
-            assignee: Some(alice()),
-            created_at: Some(now - chrono::Duration::days(15)),
-            updated_at: Some(now - chrono::Duration::days(2)),
-            url: Some("https://example.test/wi/26".into()),
-        },
-        WorkItem {
-            id: "w11".into(),
-            identifier: Some("FOR-27".into()),
-            title: "Jira epic linking".into(),
-            description: None,
-            state: "In Review".into(),
-            state_category: WorkItemStateCategory::Started,
-            work_item_type: Some("Story".into()),
-            assignee: Some(bob()),
-            created_at: Some(now - chrono::Duration::days(4)),
-            updated_at: Some(now - chrono::Duration::hours(9)),
-            url: Some("https://example.test/wi/27".into()),
-        },
+        wi("#842", "Investigate elevated p99 on POST /charge", "In Progress", C::Started, "Bug", true, 3),
+        wi("#851", "Add retry-budget metrics to the sync worker", "Todo", C::Unstarted, "Task", true, 26),
+        // Unassigned (not yours) — the mine-only filter drops it.
+        wi("#860", "Flaky test: webhook_delivery_spec", "Backlog", C::Backlog, "Bug", false, 30),
     ]
 }
 
-/// A distinct set of PRs for a *second* demo connection, so `--demo` with two
-/// connections shows real cross-provider aggregation (not duplicated rows).
-fn pull_requests_alt() -> Vec<PullRequest> {
-    let now = base();
+/// GitLab — the platform / infra group (`northwind-infra`). Merge Requests.
+fn gitlab_prs() -> Vec<PullRequest> {
     vec![
-        PullRequest {
-            id: "301".into(),
-            number: Some(301),
-            title: "Migrate billing to the new API".into(),
-            description: None,
-            author: alice(),
-            status: PullRequestStatus::Open,
-            is_draft: false,
-            source_ref: Some("feature/billing-v2".into()),
-            target_ref: Some("main".into()),
-            reviewers: vec![Reviewer { user: bob(), vote: ReviewVote::NoVote, is_required: true }],
-            labels: vec!["billing".into()],
-            checks: CheckStatus::Failed,
-            check_summary: Some(CheckSummary { successful: 9, failed: 1, ..Default::default() }),
-            mergeable: MergeableState::Blocked,
-            changed_files: 11,
-            additions: 240,
-            deletions: 88,
-            created_at: Some(now - chrono::Duration::hours(20)),
-            updated_at: Some(now - chrono::Duration::hours(1)),
-            url: Some("https://gitlab.test/mr/301".into()),
-        },
-        PullRequest {
-            id: "302".into(),
-            number: Some(302),
-            title: "Tidy up the logging middleware".into(),
-            description: None,
-            author: carol(),
-            status: PullRequestStatus::Open,
-            is_draft: false,
-            source_ref: Some("chore/logging".into()),
-            target_ref: Some("main".into()),
-            reviewers: vec![Reviewer { user: alice(), vote: ReviewVote::NoVote, is_required: false }],
-            labels: vec!["chore".into()],
-            checks: CheckStatus::Passed,
-            check_summary: Some(CheckSummary { successful: 6, ..Default::default() }),
-            mergeable: MergeableState::Mergeable,
-            changed_files: 3,
-            additions: 30,
-            deletions: 44,
-            created_at: Some(now - chrono::Duration::days(1)),
-            updated_at: Some(now - chrono::Duration::hours(5)),
-            url: Some("https://gitlab.test/mr/302".into()),
-        },
+        // Yours, open, waiting on review (no action → your open PRs).
+        pr(312, "Terraform: add a Postgres read replica", me(), PS::Open, CS::Passed, MS::Mergeable, vec![rev(alice(), RV::NoVote)], 96, 4, 6, "infra/read-replica", &["terraform"]),
+        // A teammate's, you're the reviewer → needs your review.
+        pr(318, "Rotate the KMS signing keys", alice(), PS::Open, CS::Passed, MS::Mergeable, vec![rev(me(), RV::NoVote)], 22, 8, 10, "security/kms-rotation", &["security"]),
+        // Yours, merged recently.
+        pr(305, "Bump the base image to alpine 3.20", me(), PS::Merged, CS::Passed, MS::Unknown, vec![rev(bob(), RV::Approved)], 6, 6, 40, "chore/alpine-3-20", &["docker"]),
     ]
 }
 
-/// A distinct set of work items (assigned to Alice) for a second demo connection.
-fn work_items_alt() -> Vec<WorkItem> {
-    let now = base();
+fn gitlab_wis() -> Vec<WorkItem> {
+    use WorkItemStateCategory as C;
+    vec![wi("#77", "Right-size the staging cluster", "In Progress", C::Started, "Task", true, 5)]
+}
+
+/// Bitbucket — the data team's dbt/ingestion repo (`northwind-data`).
+fn bitbucket_prs() -> Vec<PullRequest> {
     vec![
-        WorkItem {
-            id: "a1".into(),
-            identifier: Some("OPS-4".into()),
-            title: "Rotate the staging credentials".into(),
-            description: None,
-            state: "In Progress".into(),
-            state_category: WorkItemStateCategory::Started,
-            work_item_type: Some("Task".into()),
-            assignee: Some(alice()),
-            created_at: Some(now - chrono::Duration::days(2)),
-            updated_at: Some(now - chrono::Duration::hours(4)),
-            url: Some("https://gitlab.test/issues/4".into()),
-        },
-        WorkItem {
-            id: "a2".into(),
-            identifier: Some("OPS-9".into()),
-            title: "Add dashboards for the new queue".into(),
-            description: None,
-            state: "Todo".into(),
-            state_category: WorkItemStateCategory::Unstarted,
-            work_item_type: Some("Story".into()),
-            assignee: Some(alice()),
-            created_at: Some(now - chrono::Duration::days(3)),
-            updated_at: None,
-            url: Some("https://gitlab.test/issues/9".into()),
-        },
+        // Yours, changes requested → needs fixing.
+        pr(64, "dbt: add revenue recognition model", me(), PS::Open, CS::Passed, MS::Blocked, vec![rev(dev(), RV::Rejected)], 180, 12, 7, "feat/rev-rec", &["dbt"]),
+        // A teammate's, you're the reviewer → needs your review.
+        pr(61, "Fix the nightly ingestion retry", dev(), PS::Open, CS::Passed, MS::Mergeable, vec![rev(me(), RV::NoVote)], 34, 10, 12, "fix/ingestion-retry", &["airflow"]),
     ]
 }
 
-/// The PR set for a demo connection: the main one for `demo`, the alt set otherwise.
+/// Linear — the Engineering team's tickets, all assigned to you.
+fn linear_wis() -> Vec<WorkItem> {
+    use WorkItemStateCategory as C;
+    vec![
+        wi("ENG-231", "Design the ledger reconciliation job", "In Progress", C::Started, "Story", true, 4),
+        wi("ENG-245", "Spike: event sourcing for the payments ledger", "Todo", C::Unstarted, "Spike", true, 28),
+        wi("ENG-250", "Add SLO dashboards for the charge API", "Backlog", C::Backlog, "Task", true, 50),
+        wi("ENG-198", "Migrate feature flags to OpenFeature", "Blocked", C::Started, "Story", true, 18),
+    ]
+}
+
+/// Jira — company ops / security tickets, all assigned to you.
+fn jira_wis() -> Vec<WorkItem> {
+    use WorkItemStateCategory as C;
+    vec![
+        wi("OPS-1423", "SOC2: collect access-review evidence for Q3", "In Progress", C::Started, "Task", true, 2),
+        wi("SEC-88", "INC-4821 postmortem action items", "To Do", C::Unstarted, "Bug", true, 22),
+        wi("OPS-1440", "Upgrade Vault to 1.16", "Backlog", C::Backlog, "Task", true, 60),
+    ]
+}
+
 fn prs_for(conn: &str) -> Vec<PullRequest> {
-    if conn == "demo" {
-        pull_requests()
-    } else {
-        pull_requests_alt()
+    match conn {
+        "gitlab" => gitlab_prs(),
+        "bitbucket" => bitbucket_prs(),
+        _ => github_prs(),
     }
 }
 
 fn wis_for(conn: &str) -> Vec<WorkItem> {
-    if conn == "demo" {
-        work_items()
-    } else {
-        work_items_alt()
+    match conn {
+        "gitlab" => gitlab_wis(),
+        "linear" => linear_wis(),
+        "jira" => jira_wis(),
+        _ => github_wis(),
     }
 }
 
@@ -412,6 +234,60 @@ fn job(id: &str, name: &str, status: PipelineRunStatus, secs: i64, steps: Vec<Pi
         steps,
         url: Some(format!("https://example.test/job/{id}")),
         problem: problem.map(Into::into),
+    }
+}
+
+/// Compact (stage-less) run builder for the secondary CI providers.
+#[allow(clippy::too_many_arguments)]
+fn run(id: &str, def: &str, num: i64, name: &str, status: PipelineRunStatus, branch: &str, who: User, updated_h: i64) -> PipelineRun {
+    let now = base();
+    let started = now - chrono::Duration::hours(updated_h);
+    PipelineRun {
+        id: id.into(),
+        definition_id: def.into(),
+        number: Some(num),
+        name: Some(name.into()),
+        status,
+        triggered_by: Some(who),
+        branch: Some(branch.into()),
+        commit_sha: Some("abc1234".into()),
+        started_at: Some(started),
+        finished_at: matches!(status, PipelineRunStatus::Running | PipelineRunStatus::Queued).then(|| started + chrono::Duration::minutes(6)),
+        url: None,
+        stages: vec![],
+    }
+}
+
+fn gitlab_pipeline_defs() -> Vec<PipelineDefinition> {
+    vec![PipelineDefinition { id: "gl-pipeline".into(), name: "pipeline".into(), path: Some(".gitlab-ci.yml".into()), url: None }]
+}
+fn gitlab_runs() -> Vec<PipelineRun> {
+    vec![
+        run("gl-9902", "gl-pipeline", 9902, "#9902", PipelineRunStatus::Running, "infra/read-replica", me(), 1),
+        run("gl-9901", "gl-pipeline", 9901, "#9901", PipelineRunStatus::Succeeded, "main", alice(), 6),
+    ]
+}
+fn bitbucket_pipeline_defs() -> Vec<PipelineDefinition> {
+    vec![PipelineDefinition { id: "bb-default".into(), name: "default".into(), path: Some("bitbucket-pipelines.yml".into()), url: None }]
+}
+fn bitbucket_runs() -> Vec<PipelineRun> {
+    vec![
+        run("bb-441", "bb-default", 441, "#441", PipelineRunStatus::Failed, "feat/rev-rec", me(), 2),
+        run("bb-440", "bb-default", 440, "#440", PipelineRunStatus::Succeeded, "main", dev(), 10),
+    ]
+}
+fn pipeline_defs_for(conn: &str) -> Vec<PipelineDefinition> {
+    match conn {
+        "gitlab" => gitlab_pipeline_defs(),
+        "bitbucket" => bitbucket_pipeline_defs(),
+        _ => pipeline_defs(),
+    }
+}
+fn pipeline_runs_for(conn: &str) -> Vec<PipelineRun> {
+    match conn {
+        "gitlab" => gitlab_runs(),
+        "bitbucket" => bitbucket_runs(),
+        _ => pipeline_runs(),
     }
 }
 
@@ -548,7 +424,7 @@ impl PullRequestSource for DemoPr {
             .into_iter()
             .filter(|p| query.include_completed || matches!(p.status, PullRequestStatus::Open | PullRequestStatus::Draft))
             .collect();
-        Ok(apply_pull_request_filter(prs, query.filter, Some("alice")))
+        Ok(apply_pull_request_filter(prs, query.filter, Some("you")))
     }
     async fn get(&self, id: &str) -> Result<PullRequest> {
         prs_for(&self.conn).into_iter().find(|p| p.id == id).ok_or_else(|| forgetop_core::Error::NotFound(id.into()))
@@ -719,7 +595,7 @@ impl WorkItemSource for DemoWi {
                 query.include_completed
                     || !matches!(w.state_category, WorkItemStateCategory::Completed | WorkItemStateCategory::Canceled)
             })
-            .filter(|w| !query.mine_only || w.assignee.as_ref().map(|u| u.id == "u1").unwrap_or(false))
+            .filter(|w| !query.mine_only || w.assignee.as_ref().map(|u| u.id == "me").unwrap_or(false))
             .collect())
     }
     async fn get(&self, id: &str) -> Result<WorkItem> {
@@ -739,21 +615,23 @@ impl WorkItemSource for DemoWi {
     }
 }
 
-struct DemoPipe;
+struct DemoPipe {
+    conn: String,
+}
 #[async_trait]
 impl PipelineSource for DemoPipe {
     async fn discover(&self) -> Result<Vec<PipelineDefinition>> {
-        Ok(pipeline_defs())
+        Ok(pipeline_defs_for(&self.conn))
     }
     async fn list_runs(&self, query: &PipelineRunQuery) -> Result<Vec<PipelineRun>> {
         demo_latency().await;
-        Ok(pipeline_runs()
+        Ok(pipeline_runs_for(&self.conn)
             .into_iter()
             .filter(|r| query.definition_id.as_ref().is_none_or(|d| &r.definition_id == d))
             .collect())
     }
     async fn get_run(&self, run_id: &str) -> Result<PipelineRun> {
-        pipeline_runs().into_iter().find(|r| r.id == run_id).ok_or_else(|| forgetop_core::Error::NotFound(run_id.into()))
+        pipeline_runs_for(&self.conn).into_iter().find(|r| r.id == run_id).ok_or_else(|| forgetop_core::Error::NotFound(run_id.into()))
     }
     async fn logs(&self, run_id: &str, job_id: Option<&str>) -> Result<String> {
         let job = job_id.unwrap_or("job");
@@ -792,6 +670,7 @@ impl PipelineSource for DemoPipe {
 pub struct DemoConnection {
     id: String,
     display_name: String,
+    provider: ProviderType,
     caps: Capabilities,
 }
 
@@ -801,7 +680,7 @@ impl ProviderConnection for DemoConnection {
         &self.id
     }
     fn provider_type(&self) -> ProviderType {
-        ProviderType::Demo
+        self.provider
     }
     fn display_name(&self) -> &str {
         &self.display_name
@@ -810,48 +689,59 @@ impl ProviderConnection for DemoConnection {
         &self.caps
     }
     fn pull_requests(&self) -> Option<Arc<dyn PullRequestSource>> {
-        Some(Arc::new(DemoPr { conn: self.id.clone() }))
+        self.caps.supports_pull_requests.then(|| Arc::new(DemoPr { conn: self.id.clone() }) as Arc<dyn PullRequestSource>)
     }
     fn work_items(&self) -> Option<Arc<dyn WorkItemSource>> {
-        Some(Arc::new(DemoWi { conn: self.id.clone() }))
+        self.caps.supports_work_items.then(|| Arc::new(DemoWi { conn: self.id.clone() }) as Arc<dyn WorkItemSource>)
     }
     fn pipelines(&self) -> Option<Arc<dyn PipelineSource>> {
-        Some(Arc::new(DemoPipe))
+        self.caps.supports_pipelines.then(|| Arc::new(DemoPipe { conn: self.id.clone() }) as Arc<dyn PipelineSource>)
     }
     async fn check(&self) -> bool {
         true
     }
 }
 
-pub fn demo_capabilities() -> Capabilities {
-    Capabilities {
-        supports_pull_requests: true,
-        supports_work_items: true,
-        supports_pipelines: true,
-        supports_merge: true,
-        supports_inline_comments: true,
-        supports_pipeline_trigger: true,
-        supports_pipeline_discovery: true,
-        ..Default::default()
+/// Capabilities for a demo connection — mirrors the real provider so the UI gates
+/// sections and labels (MRs vs PRs, Issues) exactly as it would live.
+pub fn demo_capabilities(provider: ProviderType) -> Capabilities {
+    match provider {
+        ProviderType::GitLab => crate::gitlab::gitlab_capabilities(),
+        ProviderType::Bitbucket => crate::bitbucket::bitbucket_capabilities(),
+        ProviderType::Linear => crate::linear::linear_capabilities(),
+        ProviderType::Jira => crate::jira::jira_capabilities(),
+        _ => crate::github::github_capabilities(),
     }
 }
 
-pub struct DemoFactory;
+pub struct DemoFactory {
+    provider: ProviderType,
+}
 
 impl ProviderFactory for DemoFactory {
     fn provider_type(&self) -> ProviderType {
-        ProviderType::Demo
+        self.provider
     }
     fn describe_capabilities(&self) -> Capabilities {
-        demo_capabilities()
+        demo_capabilities(self.provider)
     }
     fn create(&self, connection: &Connection, _secret: Option<String>) -> Result<Arc<dyn ProviderConnection>> {
         Ok(Arc::new(DemoConnection {
             id: connection.id.clone(),
             display_name: connection.display_name.clone(),
-            caps: demo_capabilities(),
+            provider: self.provider,
+            caps: demo_capabilities(self.provider),
         }))
     }
+}
+
+/// One demo factory per real provider type, so `--demo` connections report their real
+/// provider (and the Provider column reads correctly) while serving canned data.
+pub fn demo_factories() -> Vec<Arc<dyn ProviderFactory>> {
+    [ProviderType::GitHub, ProviderType::GitLab, ProviderType::Linear, ProviderType::Bitbucket, ProviderType::Jira]
+        .into_iter()
+        .map(|p| Arc::new(DemoFactory { provider: p }) as Arc<dyn ProviderFactory>)
+        .collect()
 }
 
 #[cfg(test)]
@@ -859,7 +749,12 @@ mod tests {
     use super::*;
 
     fn conn() -> DemoConnection {
-        DemoConnection { id: "demo".into(), display_name: "Demo".into(), caps: demo_capabilities() }
+        DemoConnection {
+            id: "github".into(),
+            display_name: "GitHub".into(),
+            provider: ProviderType::GitHub,
+            caps: demo_capabilities(ProviderType::GitHub),
+        }
     }
 
     #[tokio::test]
@@ -868,7 +763,7 @@ mod tests {
         let all = src.list(&PullRequestQuery::default()).await.unwrap();
         assert!(all.iter().all(|p| matches!(p.status, PullRequestStatus::Open | PullRequestStatus::Draft)));
         let mine = src.list(&PullRequestQuery { filter: PullRequestFilter::Mine, ..Default::default() }).await.unwrap();
-        assert!(mine.iter().all(|p| p.author.handle.as_deref() == Some("alice")));
+        assert!(mine.iter().all(|p| p.author.handle.as_deref() == Some("you")));
     }
 
     #[tokio::test]
@@ -883,6 +778,30 @@ mod tests {
     #[tokio::test]
     async fn health_is_true() {
         assert!(conn().check().await);
+    }
+
+    fn demo_conn(id: &str, p: ProviderType) -> DemoConnection {
+        DemoConnection { id: id.into(), display_name: p.as_str().into(), provider: p, caps: demo_capabilities(p) }
+    }
+
+    #[test]
+    fn connections_report_their_real_provider_and_gate_sections() {
+        // Each demo connection reports its real provider type (for the Provider column)…
+        let gh = demo_conn("github", ProviderType::GitHub);
+        assert_eq!(gh.provider_type(), ProviderType::GitHub);
+        assert!(gh.pull_requests().is_some() && gh.work_items().is_some() && gh.pipelines().is_some());
+
+        // …and only offers what that provider really supports.
+        let linear = demo_conn("linear", ProviderType::Linear);
+        assert!(linear.work_items().is_some() && linear.pull_requests().is_none() && linear.pipelines().is_none());
+
+        let bb = demo_conn("bitbucket", ProviderType::Bitbucket);
+        assert!(bb.pull_requests().is_some() && bb.pipelines().is_some() && bb.work_items().is_none());
+
+        // Five factories, one per real provider — none report "Demo".
+        let providers: Vec<ProviderType> = demo_factories().iter().map(|f| f.provider_type()).collect();
+        assert_eq!(providers.len(), 5);
+        assert!(!providers.contains(&ProviderType::Demo));
     }
 
     #[tokio::test]
@@ -900,7 +819,7 @@ mod tests {
         let mine = src.list(&WorkItemQuery { mine_only: true, include_completed: false, limit: None }).await.unwrap();
         assert!(!mine.is_empty() && mine.len() < all.len(), "mine-only narrows the list");
         assert!(
-            mine.iter().all(|w| w.assignee.as_ref().map(|u| u.id == "u1").unwrap_or(false)),
+            mine.iter().all(|w| w.assignee.as_ref().map(|u| u.id == "me").unwrap_or(false)),
             "only Alice's items remain"
         );
     }

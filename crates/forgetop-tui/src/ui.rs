@@ -545,7 +545,16 @@ fn sort_marker(app: &App, section: usize) -> Option<(usize, bool)> {
     Some((sort_header_col(section, &s.key)?, s.desc))
 }
 
-/// Appends the active quick-filter to a section title (e.g. `Pipelines · /deploy`).
+/// The Provider column value: "provider · connection", collapsed to just the provider
+/// when the connection is named after it (e.g. a demo "GitHub" connection of type GitHub).
+fn provider_tag(provider: ProviderType, connection: &str) -> String {
+    if connection.eq_ignore_ascii_case(provider.as_str()) {
+        provider.as_str().to_string()
+    } else {
+        format!("{} · {}", provider.as_str(), connection)
+    }
+}
+
 /// A "Loading…" empty-state message with the refresh spinner, so a cold fetch looks live.
 fn loading_msg(app: &App, base: &str) -> String {
     format!("{} {base}", crate::theme::SPINNER[app.anim % crate::theme::SPINNER.len()])
@@ -612,7 +621,7 @@ fn render_prs(frame: &mut Frame, area: Rect, app: &mut App) {
             let (ck, ckc) = pr_checks(theme, pr);
             vec![
                 (st.to_string(), Style::default().fg(stc)),
-                (format!("{} · {}", row.provider.as_str(), row.connection), Style::default().fg(theme.cyan)),
+                (provider_tag(row.provider, &row.connection), Style::default().fg(theme.cyan)),
                 (pr.number.map(|n| format!("#{n}")).unwrap_or_default(), Style::default().fg(theme.dim)),
                 (pr.title.clone(), Style::default().fg(theme.fg)),
                 (pr.author.display_name.clone(), Style::default().fg(theme.blue)),
@@ -675,7 +684,7 @@ fn render_wis(frame: &mut Frame, area: Rect, app: &mut App) {
             let wi = &row.wi;
             vec![
                 (format!("● {}", wi.state), Style::default().fg(wi_state_color(theme, wi.state_category))),
-                (format!("{} · {}", row.provider.as_str(), row.connection), Style::default().fg(theme.cyan)),
+                (provider_tag(row.provider, &row.connection), Style::default().fg(theme.cyan)),
                 (wi.identifier.clone().unwrap_or_default(), Style::default().fg(theme.dim)),
                 (wi.title.clone(), Style::default().fg(theme.fg)),
                 (wi.work_item_type.clone().unwrap_or_default(), Style::default().fg(theme.dim)),
@@ -732,7 +741,7 @@ fn render_pipes(frame: &mut Frame, area: Rect, app: &mut App) {
             };
             vec![
                 (format!("{} {:?}", pipeline_glyph(p.run.status, app.anim), p.run.status), Style::default().fg(color)),
-                (format!("{} · {}", p.provider.as_str(), p.connection), Style::default().fg(theme.cyan)),
+                (provider_tag(p.provider, &p.connection), Style::default().fg(theme.cyan)),
                 (pipeline, Style::default().fg(theme.fg)),
                 (run, Style::default().fg(theme.dim)),
                 (p.run.branch.clone().unwrap_or_default(), Style::default().fg(theme.dim)),
@@ -1964,6 +1973,15 @@ mod tests {
         assert!(out.contains("Merge PR #42 via"), "overlay title should render");
         assert!(out.contains("Squash") && out.contains("Rebase"), "strategies should render");
         assert!(out.contains("select") && out.contains("cancel"), "overlay hints in footer");
+    }
+
+    #[test]
+    fn provider_tag_collapses_when_connection_is_the_provider() {
+        // A connection named after its provider shows just the provider (no "GitHub · GitHub").
+        assert_eq!(provider_tag(ProviderType::GitHub, "GitHub"), "GitHub");
+        assert_eq!(provider_tag(ProviderType::GitLab, "gitlab"), "GitLab");
+        // Otherwise it disambiguates with the connection name.
+        assert_eq!(provider_tag(ProviderType::GitHub, "acme-corp"), "GitHub · acme-corp");
     }
 
     #[test]

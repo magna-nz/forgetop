@@ -13,10 +13,10 @@ pub mod jira;
 pub mod json;
 pub mod linear;
 
-/// All provider factories, for building a `ProviderRegistry`.
+/// All real provider factories, for building a `ProviderRegistry`. The demo provider is
+/// registered separately (see [`demo::demo_factories`]) only under `--demo`.
 pub fn default_factories() -> Vec<Arc<dyn ProviderFactory>> {
     vec![
-        Arc::new(demo::DemoFactory),
         Arc::new(github::GitHubFactory),
         Arc::new(azure::AzureDevOpsFactory),
         Arc::new(linear::LinearFactory),
