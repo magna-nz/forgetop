@@ -99,23 +99,14 @@ impl Theme {
         THEMES[(idx + 1) % THEMES.len()]
     }
 
+    /// Green = succeeded (good), red = failed (needs a look), grey = in-flight/neutral
+    /// (running, queued, canceled). Yellow is the one partial-success exception.
     pub fn pipeline_color(&self, status: PipelineRunStatus) -> Color {
         match status {
             PipelineRunStatus::Succeeded => self.green,
-            PipelineRunStatus::Running | PipelineRunStatus::Queued => self.blue,
             PipelineRunStatus::Failed => self.red,
             PipelineRunStatus::PartiallySucceeded => self.yellow,
-            PipelineRunStatus::Canceled => self.dim,
-        }
-    }
-
-    /// Like [`pipeline_color`], but a *queued* run gently pulses between its colour and
-    /// dim (a slow "waiting to start" breath) using the animation `frame`.
-    pub fn pipeline_color_anim(&self, status: PipelineRunStatus, frame: usize) -> Color {
-        match status {
-            // Toggle every 4 frames (~0.6s at the 150ms tick) for a calm pulse.
-            PipelineRunStatus::Queued if (frame / 4) % 2 == 1 => self.dim,
-            other => self.pipeline_color(other),
+            PipelineRunStatus::Running | PipelineRunStatus::Queued | PipelineRunStatus::Canceled => self.dim,
         }
     }
 
@@ -182,14 +173,13 @@ mod tests {
     }
 
     #[test]
-    fn queued_pipeline_pulses_others_are_steady() {
+    fn pipeline_colours_follow_the_green_red_grey_model() {
         let t = Theme::by_name("slate");
-        // Queued alternates its colour with dim over the frame cycle.
-        assert_eq!(t.pipeline_color_anim(PipelineRunStatus::Queued, 0), t.blue);
-        assert_eq!(t.pipeline_color_anim(PipelineRunStatus::Queued, 4), t.dim);
-        assert_eq!(t.pipeline_color_anim(PipelineRunStatus::Queued, 8), t.blue);
-        // Every other status ignores the frame.
-        assert_eq!(t.pipeline_color_anim(PipelineRunStatus::Running, 4), t.pipeline_color(PipelineRunStatus::Running));
-        assert_eq!(t.pipeline_color_anim(PipelineRunStatus::Failed, 4), t.pipeline_color(PipelineRunStatus::Failed));
+        assert_eq!(t.pipeline_color(PipelineRunStatus::Succeeded), t.green);
+        assert_eq!(t.pipeline_color(PipelineRunStatus::Failed), t.red);
+        // In-flight / neutral states are grey.
+        assert_eq!(t.pipeline_color(PipelineRunStatus::Running), t.dim);
+        assert_eq!(t.pipeline_color(PipelineRunStatus::Queued), t.dim);
+        assert_eq!(t.pipeline_color(PipelineRunStatus::Canceled), t.dim);
     }
 }

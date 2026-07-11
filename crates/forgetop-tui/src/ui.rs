@@ -298,7 +298,7 @@ fn lp_cells(theme: &Theme, e: &crate::launchpad::Entry, anim: usize) -> Vec<Vec<
             };
             vec![
                 cell("CI".into(), dim),
-                cell(format!("{} {:?}", pipeline_glyph(run.status, anim), run.status), Style::default().fg(theme.pipeline_color_anim(run.status, anim))),
+                cell(format!("{} {:?}", pipeline_glyph(run.status, anim), run.status), Style::default().fg(theme.pipeline_color(run.status))),
                 cell(reference, dim),
                 cell(title, fg),
                 cell(run.branch.clone().unwrap_or_default(), dim),
@@ -308,7 +308,7 @@ fn lp_cells(theme: &Theme, e: &crate::launchpad::Entry, anim: usize) -> Vec<Vec<
         }
         EntryItem::Wi(wi) => vec![
             cell("WI".into(), dim),
-            cell(format!("● {}", wi.state), Style::default().fg(wi_state_color(theme, wi.state_category))),
+            cell(format!("● {}", wi.state), Style::default().fg(wi_state_color(theme, &wi.state, wi.state_category))),
             cell(wi.identifier.clone().unwrap_or_default(), dim),
             cell(wi.title.clone(), fg),
             cell(wi.work_item_type.clone().unwrap_or_default(), dim),
@@ -590,8 +590,9 @@ fn pr_status(theme: &Theme, pr: &PullRequest) -> (&'static str, ratatui::style::
         return ("◌ draft", theme.dim);
     }
     match pr.status {
+        // Green = healthy/done (open, merged); red = closed unmerged (worth a look).
         PullRequestStatus::Open => ("● open", theme.green),
-        PullRequestStatus::Merged => ("✦ merged", theme.magenta),
+        PullRequestStatus::Merged => ("✦ merged", theme.green),
         PullRequestStatus::Closed => ("✗ closed", theme.red),
         PullRequestStatus::Draft => ("◌ draft", theme.dim),
     }
@@ -653,12 +654,15 @@ fn render_prs(frame: &mut Frame, area: Rect, app: &mut App) {
 
 // ---- Work Items ----
 
-fn wi_state_color(theme: &Theme, cat: WorkItemStateCategory) -> ratatui::style::Color {
+/// Green = done, red = blocked (worth a look), grey = everything else in-flight/neutral
+/// (in-progress, backlog, todo, triage, canceled). "Blocked" is matched by name since it
+/// isn't its own state category.
+fn wi_state_color(theme: &Theme, state: &str, cat: WorkItemStateCategory) -> ratatui::style::Color {
+    if state.eq_ignore_ascii_case("blocked") {
+        return theme.red;
+    }
     match cat {
         WorkItemStateCategory::Completed => theme.green,
-        WorkItemStateCategory::Started => theme.blue,
-        WorkItemStateCategory::Canceled => theme.red,
-        WorkItemStateCategory::Triage => theme.yellow,
         _ => theme.dim,
     }
 }
@@ -698,7 +702,7 @@ fn render_wis(frame: &mut Frame, area: Rect, app: &mut App) {
         .map(|row| {
             let wi = &row.wi;
             vec![
-                (format!("● {}", wi.state), Style::default().fg(wi_state_color(theme, wi.state_category))),
+                (format!("● {}", wi.state), Style::default().fg(wi_state_color(theme, &wi.state, wi.state_category))),
                 (provider_tag(row.provider, &row.connection), Style::default().fg(theme.cyan)),
                 (wi.identifier.clone().unwrap_or_default(), Style::default().fg(theme.dim)),
                 (wi.title.clone(), Style::default().fg(theme.fg)),
@@ -740,7 +744,7 @@ fn render_pipes(frame: &mut Frame, area: Rect, app: &mut App) {
         .iter()
         .map(|&i| &app.pipes[i])
         .map(|p| {
-            let color = theme.pipeline_color_anim(p.run.status, app.anim);
+            let color = theme.pipeline_color(p.run.status);
             let approval = if p.awaiting_approval {
                 ("approval needed".to_string(), Style::default().fg(theme.red).add_modifier(Modifier::BOLD))
             } else {
@@ -946,7 +950,7 @@ fn render_wi_view(frame: &mut Frame, area: Rect, theme: &Theme, view: &WiView) -
 
     let label = format!("{} {}", wi.identifier.clone().unwrap_or_default(), wi.title);
     let header = Line::from(vec![
-        Span::styled(format!("● {}", wi.state), Style::default().fg(wi_state_color(theme, wi.state_category)).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("● {}", wi.state), Style::default().fg(wi_state_color(theme, &wi.state, wi.state_category)).add_modifier(Modifier::BOLD)),
         Span::styled(format!("   {}", wi.work_item_type.clone().unwrap_or_default()), Style::default().fg(theme.dim)),
         Span::styled(
             format!("   {}", wi.assignee.as_ref().map(|a| a.display_name.clone()).unwrap_or_else(|| "—".into())),
@@ -1374,8 +1378,8 @@ fn render_pipeline(frame: &mut Frame, area: Rect, theme: &Theme, view: &Pipeline
     let branch = view.branch.clone().unwrap_or_else(|| "—".into());
     let who = view.run.triggered_by.as_ref().map(|u| u.display_name.clone()).unwrap_or_else(|| "—".into());
     let header = Line::from(vec![
-        Span::styled(format!("{} ", pipeline_glyph(view.run.status, anim)), Style::default().fg(theme.pipeline_color_anim(view.run.status, anim))),
-        Span::styled(format!("{:?}", view.run.status), Style::default().fg(theme.pipeline_color_anim(view.run.status, anim)).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("{} ", pipeline_glyph(view.run.status, anim)), Style::default().fg(theme.pipeline_color(view.run.status))),
+        Span::styled(format!("{:?}", view.run.status), Style::default().fg(theme.pipeline_color(view.run.status)).add_modifier(Modifier::BOLD)),
         Span::styled(format!("   branch {branch}   triggered by {who}"), Style::default().fg(theme.dim)),
     ]);
     let header_block = section_block(theme, &view.title);
@@ -1422,7 +1426,7 @@ fn render_pipeline(frame: &mut Frame, area: Rect, theme: &Theme, view: &Pipeline
             let mut spans = vec![
                 Span::raw(indent),
                 Span::styled(marker, Style::default().fg(theme.dim)),
-                Span::styled(format!("{} ", pipeline_glyph(n.status, anim)), Style::default().fg(theme.pipeline_color_anim(n.status, anim))),
+                Span::styled(format!("{} ", pipeline_glyph(n.status, anim)), Style::default().fg(theme.pipeline_color(n.status))),
                 Span::styled(n.label.clone(), label_style),
             ];
             if let Some(d) = &n.duration {
