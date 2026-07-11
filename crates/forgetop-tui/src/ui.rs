@@ -215,13 +215,8 @@ fn render_lp_column(frame: &mut Frame, area: Rect, app: &App, side: usize, title
         if last != Some(e.bucket) {
             let count = col.iter().filter(|&&j| app.lp[j].bucket == e.bucket).count();
             let rank = Bucket::ORDER.iter().position(|b| *b == e.bucket).unwrap_or(0);
-            // Headings use magenta so they read as section labels, not PR rows (the
-            // PR colour is blue, which equals the accent in every theme).
-            let style = if e.bucket.muted() {
-                Style::default().fg(theme.dim)
-            } else {
-                Style::default().fg(theme.magenta).add_modifier(Modifier::BOLD)
-            };
+            // All headings share one calm grey so they read uniformly as section labels.
+            let style = Style::default().fg(theme.dim).add_modifier(Modifier::BOLD);
             if !items.is_empty() {
                 items.push(ListItem::new(Line::from("")));
             }
@@ -232,10 +227,14 @@ fn render_lp_column(frame: &mut Frame, area: Rect, app: &App, side: usize, title
         if selected {
             visual_sel = items.len();
         }
-        // The focused row's title scrolls if it's wider than its column, so it's readable.
-        let line = if selected && focused && cells[LP_TITLE_COL].0.chars().count() > widths[LP_TITLE_COL] {
+        // On the focused row, any overflowing column (title, person) scrolls so it's readable.
+        let line = if selected && focused {
             let mut c = cells.clone();
-            c[LP_TITLE_COL].0 = marquee_window(&cells[LP_TITLE_COL].0, widths[LP_TITLE_COL], app.anim / 2);
+            for col in [LP_TITLE_COL, LP_PERSON_COL] {
+                if c[col].0.chars().count() > widths[col] {
+                    c[col].0 = marquee_window(&c[col].0, widths[col], app.anim / 2);
+                }
+            }
             lp_cells_line(&c, &widths, content_w)
         } else {
             lp_cells_line(cells, &widths, content_w)
@@ -265,18 +264,25 @@ fn age_color(theme: &Theme, t: Option<DateTime<Utc>>) -> ratatui::style::Color {
 const LP_NCOL: usize = 7;
 /// The flexible title column in a Launchpad row (the one that marquee-scrolls).
 const LP_TITLE_COL: usize = 3;
+/// The person column (author / who-ran / assignee); capped, and scrolls when selected.
+const LP_PERSON_COL: usize = 5;
+/// Max width for the person column before it truncates (and marquees on the focused row).
+const LP_PERSON_MAX: usize = 16;
 /// Gap between Launchpad columns — tighter than the nav lists since a column is half-width.
 const LP_GAP: usize = 2;
 
 /// The aligned cells for one Launchpad row. Every item type fills the *same* seven
-/// slots — type · status · #ref · title · detail · provider · age — so rows read as
+/// slots — type · status · #ref · title · detail · person · age — so rows read as
 /// siblings and line up vertically, even though PRs, pipelines and work items differ.
+/// The "person" is the PR author / who ran the pipeline / the work-item assignee.
 fn lp_cells(theme: &Theme, e: &crate::launchpad::Entry, anim: usize) -> Vec<(String, Style)> {
     use crate::launchpad::EntryItem;
     let dim = Style::default().fg(theme.dim);
     let fg = Style::default().fg(theme.fg);
     let badge = |code: &str, color| (code.to_string(), Style::default().fg(color).add_modifier(Modifier::BOLD));
-    let provider = (e.provider.as_str().to_string(), Style::default().fg(theme.cyan));
+    let person = |u: Option<&forgetop_core::domain::User>| {
+        (u.map(|u| u.display_name.clone()).unwrap_or_else(|| "—".into()), Style::default().fg(theme.blue))
+    };
     let age = |t| (rel_age(t), Style::default().fg(age_color(theme, t)));
     match &e.item {
         EntryItem::Pr(pr) => {
@@ -289,7 +295,7 @@ fn lp_cells(theme: &Theme, e: &crate::launchpad::Entry, anim: usize) -> Vec<(Str
                 (pr.number.map(|n| format!("#{n}")).unwrap_or_default(), dim),
                 (pr.title.clone(), fg),
                 (format!("+{} -{}", pr.additions, pr.deletions), dim),
-                provider,
+                person(Some(&pr.author)),
                 age(pr.updated_at),
             ]
         }
@@ -307,7 +313,7 @@ fn lp_cells(theme: &Theme, e: &crate::launchpad::Entry, anim: usize) -> Vec<(Str
                 (reference, dim),
                 (title, fg),
                 (run.branch.clone().unwrap_or_default(), dim),
-                provider,
+                person(run.triggered_by.as_ref()),
                 age(run.finished_at.or(run.started_at)),
             ]
         }
@@ -317,7 +323,7 @@ fn lp_cells(theme: &Theme, e: &crate::launchpad::Entry, anim: usize) -> Vec<(Str
             (wi.identifier.clone().unwrap_or_default(), dim),
             (wi.title.clone(), fg),
             (wi.work_item_type.clone().unwrap_or_default(), dim),
-            provider,
+            person(wi.assignee.as_ref()),
             age(wi.updated_at),
         ],
     }
@@ -332,6 +338,8 @@ fn lp_widths(rows: &[Vec<(String, Style)>], flex: usize, inner_w: usize) -> Vec<
             w[i] = w[i].max(text.chars().count());
         }
     }
+    // Cap the person column so a long name doesn't crowd out the title (it scrolls instead).
+    w[LP_PERSON_COL] = w[LP_PERSON_COL].min(LP_PERSON_MAX);
     let padding = COL_LEAD + LP_GAP * (LP_NCOL - 1);
     let fixed: usize = (0..LP_NCOL).filter(|&i| i != flex).map(|i| w[i]).sum::<usize>() + padding;
     w[flex] = w[flex].min(inner_w.saturating_sub(fixed)).max(3);
@@ -2245,6 +2253,8 @@ mod tests {
         assert!(out.contains("#42") && out.contains("+10 -2"), "PR row shows number and change stats");
         assert!(out.contains("FOR-1") && out.contains("Todo") && out.contains("Bug"), "work-item row shows id, state, type");
         assert!(out.contains("CI Build") && out.contains("main"), "pipeline row shows pipeline name + branch");
+        // The person column shows the PR author (not the provider).
+        assert!(out.contains("Alice Ng"), "PR row shows the author");
     }
 
     #[test]
