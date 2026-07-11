@@ -61,14 +61,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
 fn render_tabs(frame: &mut Frame, area: Rect, app: &App) {
     let theme = &app.theme;
+    // Refresh state now shows as an animated "Refreshing…" in the footer, not up here.
     let clock = app.last_refresh.format("%H:%M:%S");
-    // A live refresh spins the glyph; otherwise it's absent.
-    let refresh = if app.reloading {
-        format!("{} ", crate::theme::SPINNER[app.anim % crate::theme::SPINNER.len()])
-    } else {
-        String::new()
-    };
-    let right = format!("{} · {}{} ", theme.name, refresh, clock);
+    let right = format!("{} · {} ", theme.name, clock);
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -204,7 +199,7 @@ fn render_lp_column(frame: &mut Frame, area: Rect, app: &App, side: usize, title
 
     let content_w = (area.width.saturating_sub(2) as usize).saturating_sub(2); // borders + highlight symbol
     // One shared set of column widths for the whole side, so every row lines up.
-    let rows_cells: Vec<Vec<(String, Style)>> = col.iter().map(|&i| lp_cells(theme, &app.lp[i], app.anim)).collect();
+    let rows_cells: Vec<Vec<Vec<Span>>> = col.iter().map(|&i| lp_cells(theme, &app.lp[i], app.anim)).collect();
     let widths = lp_widths(&rows_cells, 3, content_w);
 
     let mut items: Vec<ListItem> = Vec::new();
@@ -231,8 +226,10 @@ fn render_lp_column(frame: &mut Frame, area: Rect, app: &App, side: usize, title
         let line = if selected && focused {
             let mut c = cells.clone();
             for col in [LP_TITLE_COL, LP_PERSON_COL] {
-                if c[col].0.chars().count() > widths[col] {
-                    c[col].0 = marquee_window(&c[col].0, widths[col], app.anim / 2);
+                if cell_width(&c[col]) > widths[col] {
+                    let text: String = c[col].iter().map(|s| s.content.as_ref()).collect();
+                    let style = c[col].first().map(|s| s.style).unwrap_or_default();
+                    c[col] = vec![Span::styled(marquee_window(&text, widths[col], app.anim / 2), style)];
                 }
             }
             lp_cells_line(&c, &widths, content_w)
@@ -251,15 +248,6 @@ fn render_lp_column(frame: &mut Frame, area: Rect, app: &App, side: usize, title
     frame.render_stateful_widget(list, area, &mut state);
 }
 
-fn age_color(theme: &Theme, t: Option<DateTime<Utc>>) -> ratatui::style::Color {
-    let stale = t.map(|d| (Utc::now() - d).num_days() >= 3).unwrap_or(false);
-    if stale {
-        theme.red
-    } else {
-        theme.dim
-    }
-}
-
 /// Number of Launchpad row columns (kept in sync with [`lp_cells`]).
 const LP_NCOL: usize = 7;
 /// The flexible title column in a Launchpad row (the one that marquee-scrolls).
@@ -275,67 +263,73 @@ const LP_GAP: usize = 2;
 /// slots — type · status · #ref · title · detail · person · age — so rows read as
 /// siblings and line up vertically, even though PRs, pipelines and work items differ.
 /// The "person" is the PR author / who ran the pipeline / the work-item assignee.
-fn lp_cells(theme: &Theme, e: &crate::launchpad::Entry, anim: usize) -> Vec<(String, Style)> {
+fn lp_cells(theme: &Theme, e: &crate::launchpad::Entry, anim: usize) -> Vec<Vec<Span<'static>>> {
     use crate::launchpad::EntryItem;
     let dim = Style::default().fg(theme.dim);
     let fg = Style::default().fg(theme.fg);
-    let badge = |code: &str, color| (code.to_string(), Style::default().fg(color).add_modifier(Modifier::BOLD));
-    let person = |u: Option<&forgetop_core::domain::User>| {
-        (u.map(|u| u.display_name.clone()).unwrap_or_else(|| "—".into()), Style::default().fg(theme.blue))
-    };
-    let age = |t| (rel_age(t), Style::default().fg(age_color(theme, t)));
+    // Kept calm: type badge, ref, person and age are all grey; only the status and the
+    // git-diff +/- carry colour.
+    let cell = |s: String, st: Style| vec![Span::styled(s, st)];
+    let person = |u: Option<&forgetop_core::domain::User>| cell(u.map(|u| u.display_name.clone()).unwrap_or_else(|| "—".into()), dim);
+    let age = |t| cell(rel_age(t), dim);
     match &e.item {
         EntryItem::Pr(pr) => {
-            // Status is the PR's lifecycle state (Open / Draft / Merged / Closed). The
-            // review situation is conveyed by the bucket the row is in, not the row.
+            // Status is the PR's lifecycle state (Open / Draft / Merged / Closed).
             let (st, stc) = pr_status(theme, pr);
             vec![
-                badge("PR", theme.blue),
-                (st.to_string(), Style::default().fg(stc)),
-                (pr.number.map(|n| format!("#{n}")).unwrap_or_default(), dim),
-                (pr.title.clone(), fg),
-                (format!("+{} -{}", pr.additions, pr.deletions), dim),
+                cell("PR".into(), dim),
+                cell(st.to_string(), Style::default().fg(stc)),
+                cell(pr.number.map(|n| format!("#{n}")).unwrap_or_default(), dim),
+                cell(pr.title.clone(), fg),
+                vec![
+                    Span::styled(format!("+{}", pr.additions), Style::default().fg(theme.green)),
+                    Span::raw(" "),
+                    Span::styled(format!("-{}", pr.deletions), Style::default().fg(theme.red)),
+                ],
                 person(Some(&pr.author)),
                 age(pr.updated_at),
             ]
         }
         EntryItem::Pipe { run, definition_name } => {
-            // Title is the pipeline (e.g. "CI Build"); ref is the run/release. When we
-            // don't know the pipeline name, fall back to the run name as the title.
             let num = || run.number.map(|n| format!("#{n}")).unwrap_or_default();
             let (title, reference) = match definition_name {
                 Some(def) => (def.clone(), run.name.clone().unwrap_or_else(num)),
                 None => (run.name.clone().unwrap_or_else(|| run.definition_id.clone()), num()),
             };
             vec![
-                badge("CI", theme.yellow),
-                (format!("{} {:?}", pipeline_glyph(run.status, anim), run.status), Style::default().fg(theme.pipeline_color_anim(run.status, anim))),
-                (reference, dim),
-                (title, fg),
-                (run.branch.clone().unwrap_or_default(), dim),
+                cell("CI".into(), dim),
+                cell(format!("{} {:?}", pipeline_glyph(run.status, anim), run.status), Style::default().fg(theme.pipeline_color_anim(run.status, anim))),
+                cell(reference, dim),
+                cell(title, fg),
+                cell(run.branch.clone().unwrap_or_default(), dim),
                 person(run.triggered_by.as_ref()),
                 age(run.finished_at.or(run.started_at)),
             ]
         }
         EntryItem::Wi(wi) => vec![
-            badge("WI", theme.green),
-            (format!("● {}", wi.state), Style::default().fg(wi_state_color(theme, wi.state_category))),
-            (wi.identifier.clone().unwrap_or_default(), dim),
-            (wi.title.clone(), fg),
-            (wi.work_item_type.clone().unwrap_or_default(), dim),
+            cell("WI".into(), dim),
+            cell(format!("● {}", wi.state), Style::default().fg(wi_state_color(theme, wi.state_category))),
+            cell(wi.identifier.clone().unwrap_or_default(), dim),
+            cell(wi.title.clone(), fg),
+            cell(wi.work_item_type.clone().unwrap_or_default(), dim),
             person(wi.assignee.as_ref()),
             age(wi.updated_at),
         ],
     }
 }
 
+/// Total display width of a Launchpad cell (its spans).
+fn cell_width(cell: &[Span]) -> usize {
+    cell.iter().map(|s| s.content.chars().count()).sum()
+}
+
 /// Sizes each Launchpad column to its widest cell, clamping the flexible title column
 /// so the row still fits `inner_w`.
-fn lp_widths(rows: &[Vec<(String, Style)>], flex: usize, inner_w: usize) -> Vec<usize> {
+fn lp_widths(rows: &[Vec<Vec<Span>>], flex: usize, inner_w: usize) -> Vec<usize> {
     let mut w = vec![0usize; LP_NCOL];
     for row in rows {
-        for (i, (text, _)) in row.iter().enumerate().take(LP_NCOL) {
-            w[i] = w[i].max(text.chars().count());
+        for (i, cell) in row.iter().enumerate().take(LP_NCOL) {
+            w[i] = w[i].max(cell_width(cell));
         }
     }
     // Cap the person column so a long name doesn't crowd out the title (it scrolls instead).
@@ -364,13 +358,26 @@ fn marquee_window(text: &str, width: usize, frame: usize) -> String {
 
 /// Joins Launchpad cells into a line, each padded to its column width (so columns align),
 /// then pads the whole line so a selected row highlights edge-to-edge.
-fn lp_cells_line(cells: &[(String, Style)], widths: &[usize], inner_w: usize) -> Line<'static> {
+fn lp_cells_line(cells: &[Vec<Span<'static>>], widths: &[usize], inner_w: usize) -> Line<'static> {
     let mut spans = vec![Span::raw(" ")]; // COL_LEAD
-    for (i, (text, style)) in cells.iter().enumerate() {
+    for (i, col) in cells.iter().enumerate() {
         if i > 0 {
             spans.push(Span::raw(" ".repeat(LP_GAP)));
         }
-        spans.push(Span::styled(cell(text, widths[i]), *style));
+        // Render the cell's spans, truncating to the column width, then pad to it.
+        let mut used = 0usize;
+        for s in col {
+            if used >= widths[i] {
+                break;
+            }
+            let take = widths[i] - used;
+            let t: String = s.content.chars().take(take).collect();
+            used += t.chars().count();
+            spans.push(Span::styled(t, s.style));
+        }
+        if used < widths[i] {
+            spans.push(Span::raw(" ".repeat(widths[i] - used)));
+        }
     }
     let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
     if used < inner_w {
@@ -1087,10 +1094,16 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         spans.push(Span::styled(format!(" {label}  "), bar.fg(theme.fg)));
     }
 
-    // Right side: transient toast (highlighted) or the standing status line.
-    let (right, right_style) = match &app.toast {
-        Some(t) => (format!("{t} "), bar.fg(theme.yellow).add_modifier(Modifier::BOLD)),
-        None => (format!("{} ", app.status), bar.fg(theme.dim)),
+    // Right side: a transient toast, an animated "Refreshing…" while a refresh is in
+    // flight, else the standing status line.
+    let (right, right_style) = if let Some(t) = &app.toast {
+        (format!("{t} "), bar.fg(theme.yellow).add_modifier(Modifier::BOLD))
+    } else if app.reloading {
+        // Dots appear one at a time; padded to a constant width so nothing jitters.
+        let n = (app.anim / 2) % 4;
+        (format!("Refreshing{}{} ", ".".repeat(n), " ".repeat(3 - n)), bar.fg(theme.dim))
+    } else {
+        (format!("{} ", app.status), bar.fg(theme.dim))
     };
     let right_w = right.chars().count().min(70) as u16 + 1;
 
@@ -2354,6 +2367,17 @@ mod tests {
         app.toast = Some("Filter: mine (1 PRs)".into());
         let out = render_to_string(&mut app, 100, 24);
         assert!(out.contains("Filter: mine"), "toast should appear in the footer");
+    }
+
+    #[test]
+    fn refreshing_shows_in_the_footer_not_the_header() {
+        let mut app = App::new("slate");
+        app.status = "9 PRs · 10 work items · 8 runs".into();
+        app.reloading = true;
+        let out = render_to_string(&mut app, 100, 24);
+        assert!(out.contains("Refreshing"), "a refresh shows 'Refreshing…' in the footer");
+        // The header keeps just the theme + clock — no refresh glyph up there.
+        assert!(!out.contains("⟳"), "no spinner in the top-right");
     }
 
     #[test]
