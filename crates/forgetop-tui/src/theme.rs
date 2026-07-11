@@ -109,6 +109,16 @@ impl Theme {
         }
     }
 
+    /// Like [`pipeline_color`], but a *queued* run gently pulses between its colour and
+    /// dim (a slow "waiting to start" breath) using the animation `frame`.
+    pub fn pipeline_color_anim(&self, status: PipelineRunStatus, frame: usize) -> Color {
+        match status {
+            // Toggle every 4 frames (~0.6s at the 150ms tick) for a calm pulse.
+            PipelineRunStatus::Queued if (frame / 4) % 2 == 1 => self.dim,
+            other => self.pipeline_color(other),
+        }
+    }
+
     pub fn check_color(&self, status: CheckStatus) -> Color {
         match status {
             CheckStatus::Passed => self.green,
@@ -169,5 +179,17 @@ mod tests {
         // Non-running statuses ignore the frame and match the static icon.
         assert_eq!(pipeline_glyph(PipelineRunStatus::Failed, 3), pipeline_icon(PipelineRunStatus::Failed));
         assert_eq!(pipeline_glyph(PipelineRunStatus::Succeeded, 7), pipeline_icon(PipelineRunStatus::Succeeded));
+    }
+
+    #[test]
+    fn queued_pipeline_pulses_others_are_steady() {
+        let t = Theme::by_name("slate");
+        // Queued alternates its colour with dim over the frame cycle.
+        assert_eq!(t.pipeline_color_anim(PipelineRunStatus::Queued, 0), t.blue);
+        assert_eq!(t.pipeline_color_anim(PipelineRunStatus::Queued, 4), t.dim);
+        assert_eq!(t.pipeline_color_anim(PipelineRunStatus::Queued, 8), t.blue);
+        // Every other status ignores the frame.
+        assert_eq!(t.pipeline_color_anim(PipelineRunStatus::Running, 4), t.pipeline_color(PipelineRunStatus::Running));
+        assert_eq!(t.pipeline_color_anim(PipelineRunStatus::Failed, 4), t.pipeline_color(PipelineRunStatus::Failed));
     }
 }

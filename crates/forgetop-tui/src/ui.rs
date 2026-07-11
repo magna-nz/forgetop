@@ -310,7 +310,7 @@ fn lp_cells(theme: &Theme, e: &crate::launchpad::Entry, anim: usize) -> Vec<(Str
             };
             vec![
                 badge("CI", theme.yellow),
-                (format!("{} {:?}", pipeline_glyph(run.status, anim), run.status), Style::default().fg(theme.pipeline_color(run.status))),
+                (format!("{} {:?}", pipeline_glyph(run.status, anim), run.status), Style::default().fg(theme.pipeline_color_anim(run.status, anim))),
                 (reference, dim),
                 (title, fg),
                 (run.branch.clone().unwrap_or_default(), dim),
@@ -718,7 +718,7 @@ fn render_pipes(frame: &mut Frame, area: Rect, app: &mut App) {
         .iter()
         .map(|&i| &app.pipes[i])
         .map(|p| {
-            let color = theme.pipeline_color(p.run.status);
+            let color = theme.pipeline_color_anim(p.run.status, app.anim);
             let approval = if p.awaiting_approval {
                 ("approval needed".to_string(), Style::default().fg(theme.red).add_modifier(Modifier::BOLD))
             } else {
@@ -1346,8 +1346,8 @@ fn render_pipeline(frame: &mut Frame, area: Rect, theme: &Theme, view: &Pipeline
     let branch = view.branch.clone().unwrap_or_else(|| "—".into());
     let who = view.run.triggered_by.as_ref().map(|u| u.display_name.clone()).unwrap_or_else(|| "—".into());
     let header = Line::from(vec![
-        Span::styled(format!("{} ", pipeline_glyph(view.run.status, anim)), Style::default().fg(theme.pipeline_color(view.run.status))),
-        Span::styled(format!("{:?}", view.run.status), Style::default().fg(theme.pipeline_color(view.run.status)).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("{} ", pipeline_glyph(view.run.status, anim)), Style::default().fg(theme.pipeline_color_anim(view.run.status, anim))),
+        Span::styled(format!("{:?}", view.run.status), Style::default().fg(theme.pipeline_color_anim(view.run.status, anim)).add_modifier(Modifier::BOLD)),
         Span::styled(format!("   branch {branch}   triggered by {who}"), Style::default().fg(theme.dim)),
     ]);
     let header_block = section_block(theme, &view.title);
@@ -1394,7 +1394,7 @@ fn render_pipeline(frame: &mut Frame, area: Rect, theme: &Theme, view: &Pipeline
             let mut spans = vec![
                 Span::raw(indent),
                 Span::styled(marker, Style::default().fg(theme.dim)),
-                Span::styled(format!("{} ", pipeline_glyph(n.status, anim)), Style::default().fg(theme.pipeline_color(n.status))),
+                Span::styled(format!("{} ", pipeline_glyph(n.status, anim)), Style::default().fg(theme.pipeline_color_anim(n.status, anim))),
                 Span::styled(n.label.clone(), label_style),
             ];
             if let Some(d) = &n.duration {
