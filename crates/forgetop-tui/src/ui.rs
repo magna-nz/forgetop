@@ -280,28 +280,25 @@ fn lp_cells(theme: &Theme, e: &crate::launchpad::Entry, anim: usize) -> Vec<(Str
     let age = |t| (rel_age(t), Style::default().fg(age_color(theme, t)));
     match &e.item {
         EntryItem::Pr(pr) => {
-            // For merged/closed PRs (the "Recently merged" footer) show that state; for open
-            // ones the status carries the review signal: approvals, changes requested, or draft.
+            // Status is the PR's lifecycle state (Open / Draft / Merged / Closed) — the
+            // review state (approvals / changes requested) is conveyed by the bucket, and
+            // shown as a compact ✓/✗ suffix on the change stats.
+            let (st, stc) = pr_status(theme, pr);
             let approvals = pr.reviewers.iter().filter(|r| matches!(r.vote, ReviewVote::Approved | ReviewVote::ApprovedWithSuggestions)).count();
             let changes = pr.reviewers.iter().any(|r| r.vote == ReviewVote::Rejected);
-            let (status, sstyle) = if matches!(pr.status, PullRequestStatus::Merged | PullRequestStatus::Closed) {
-                let (s, c) = pr_status(theme, pr);
-                (s.to_string(), Style::default().fg(c))
-            } else if changes {
-                ("✗ changes".to_string(), Style::default().fg(theme.red))
+            let review = if changes {
+                "  ✗".to_string()
             } else if approvals > 0 {
-                (format!("{} ok", "✓".repeat(approvals)), Style::default().fg(theme.green))
-            } else if pr.is_draft || pr.status == PullRequestStatus::Draft {
-                ("◌ draft".to_string(), dim)
+                format!("  {}", "✓".repeat(approvals))
             } else {
-                ("○ review".to_string(), Style::default().fg(theme.yellow))
+                String::new()
             };
             vec![
                 badge("PR", theme.blue),
-                (status, sstyle),
+                (st.to_string(), Style::default().fg(stc)),
                 (pr.number.map(|n| format!("#{n}")).unwrap_or_default(), dim),
                 (pr.title.clone(), fg),
-                (format!("+{} -{}", pr.additions, pr.deletions), dim),
+                (format!("+{} -{}{review}", pr.additions, pr.deletions), dim),
                 provider,
                 age(pr.updated_at),
             ]
