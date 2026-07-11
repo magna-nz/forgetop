@@ -654,15 +654,16 @@ fn render_prs(frame: &mut Frame, area: Rect, app: &mut App) {
 
 // ---- Work Items ----
 
-/// Green = done, red = blocked (worth a look), grey = everything else in-flight/neutral
-/// (in-progress, backlog, todo, triage, canceled). "Blocked" is matched by name since it
-/// isn't its own state category.
+/// Green = done, blue = actively in progress, red = blocked (worth a look), grey =
+/// waiting/neutral (backlog, todo, triage, canceled). "Blocked" is matched by name since
+/// it isn't its own state category.
 fn wi_state_color(theme: &Theme, state: &str, cat: WorkItemStateCategory) -> ratatui::style::Color {
     if state.eq_ignore_ascii_case("blocked") {
         return theme.red;
     }
     match cat {
         WorkItemStateCategory::Completed => theme.green,
+        WorkItemStateCategory::Started => theme.blue,
         _ => theme.dim,
     }
 }
