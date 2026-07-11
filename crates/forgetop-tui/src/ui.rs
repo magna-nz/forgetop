@@ -62,7 +62,13 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 fn render_tabs(frame: &mut Frame, area: Rect, app: &App) {
     let theme = &app.theme;
     let clock = app.last_refresh.format("%H:%M:%S");
-    let right = format!("{} · {}{} ", theme.name, if app.loading { "⟳ " } else { "" }, clock);
+    // A live refresh spins the glyph; otherwise it's absent.
+    let refresh = if app.reloading {
+        format!("{} ", crate::theme::SPINNER[app.anim % crate::theme::SPINNER.len()])
+    } else {
+        String::new()
+    };
+    let right = format!("{} · {}{} ", theme.name, refresh, clock);
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -553,6 +559,11 @@ fn sort_marker(app: &App, section: usize) -> Option<(usize, bool)> {
 }
 
 /// Appends the active quick-filter to a section title (e.g. `Pipelines · /deploy`).
+/// A "Loading…" empty-state message with the refresh spinner, so a cold fetch looks live.
+fn loading_msg(app: &App, base: &str) -> String {
+    format!("{} {base}", crate::theme::SPINNER[app.anim % crate::theme::SPINNER.len()])
+}
+
 fn list_title(base: String, filter: &str) -> String {
     if filter.is_empty() {
         base
@@ -590,15 +601,15 @@ fn render_prs(frame: &mut Frame, area: Rect, app: &mut App) {
     let title = list_title(base, &app.filters[0]);
     if idxs.is_empty() {
         let msg = if !app.filters[0].is_empty() {
-            "No matches. Esc clears the filter."
+            "No matches. Esc clears the filter.".to_string()
         } else if app.health.is_empty() {
-            FIRST_RUN_HINT
+            FIRST_RUN_HINT.to_string()
         } else if app.loading {
-            "Loading pull requests…"
+            loading_msg(app, "Loading pull requests…")
         } else {
-            "No pull requests. Press f to change filter, r to refresh."
+            "No pull requests. Press f to change filter, r to refresh.".to_string()
         };
-        empty(frame, area, theme, msg, section_block(theme, &title));
+        empty(frame, area, theme, &msg, section_block(theme, &title));
         return;
     }
 
@@ -653,17 +664,17 @@ fn render_wis(frame: &mut Frame, area: Rect, app: &mut App) {
     let title = list_title(base, &app.filters[1]);
     if idxs.is_empty() {
         let msg = if !app.filters[1].is_empty() {
-            "No matches. Esc clears the filter."
+            "No matches. Esc clears the filter.".to_string()
         } else if hidden_in_view > 0 {
-            "All present states are hidden. Press f to choose states."
+            "All present states are hidden. Press f to choose states.".to_string()
         } else if app.health.is_empty() {
-            FIRST_RUN_HINT
+            FIRST_RUN_HINT.to_string()
         } else if app.loading {
-            "Loading work items…"
+            loading_msg(app, "Loading work items…")
         } else {
-            "No work items. Press r to refresh."
+            "No work items. Press r to refresh.".to_string()
         };
-        empty(frame, area, theme, msg, section_block(theme, &title));
+        empty(frame, area, theme, &msg, section_block(theme, &title));
         return;
     }
 
@@ -699,15 +710,15 @@ fn render_pipes(frame: &mut Frame, area: Rect, app: &mut App) {
     let title = list_title("Pipelines".to_string(), &app.filters[2]);
     if idxs.is_empty() {
         let msg = if !app.filters[2].is_empty() {
-            "No matches. Esc clears the filter."
+            "No matches. Esc clears the filter.".to_string()
         } else if app.health.is_empty() {
-            FIRST_RUN_HINT
+            FIRST_RUN_HINT.to_string()
         } else if app.loading {
-            "Loading pipeline runs…"
+            loading_msg(app, "Loading pipeline runs…")
         } else {
-            "No pipeline runs. Press r to refresh."
+            "No pipeline runs. Press r to refresh.".to_string()
         };
-        empty(frame, area, theme, msg, section_block(theme, &title));
+        empty(frame, area, theme, &msg, section_block(theme, &title));
         return;
     }
 
