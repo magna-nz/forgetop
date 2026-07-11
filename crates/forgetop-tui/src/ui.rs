@@ -280,25 +280,15 @@ fn lp_cells(theme: &Theme, e: &crate::launchpad::Entry, anim: usize) -> Vec<(Str
     let age = |t| (rel_age(t), Style::default().fg(age_color(theme, t)));
     match &e.item {
         EntryItem::Pr(pr) => {
-            // Status is the PR's lifecycle state (Open / Draft / Merged / Closed) — the
-            // review state (approvals / changes requested) is conveyed by the bucket, and
-            // shown as a compact ✓/✗ suffix on the change stats.
+            // Status is the PR's lifecycle state (Open / Draft / Merged / Closed). The
+            // review situation is conveyed by the bucket the row is in, not the row.
             let (st, stc) = pr_status(theme, pr);
-            let approvals = pr.reviewers.iter().filter(|r| matches!(r.vote, ReviewVote::Approved | ReviewVote::ApprovedWithSuggestions)).count();
-            let changes = pr.reviewers.iter().any(|r| r.vote == ReviewVote::Rejected);
-            let review = if changes {
-                "  ✗".to_string()
-            } else if approvals > 0 {
-                format!("  {}", "✓".repeat(approvals))
-            } else {
-                String::new()
-            };
             vec![
                 badge("PR", theme.blue),
                 (st.to_string(), Style::default().fg(stc)),
                 (pr.number.map(|n| format!("#{n}")).unwrap_or_default(), dim),
                 (pr.title.clone(), fg),
-                (format!("+{} -{}{review}", pr.additions, pr.deletions), dim),
+                (format!("+{} -{}", pr.additions, pr.deletions), dim),
                 provider,
                 age(pr.updated_at),
             ]
