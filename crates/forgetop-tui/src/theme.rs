@@ -99,14 +99,15 @@ impl Theme {
         THEMES[(idx + 1) % THEMES.len()]
     }
 
-    /// Green = succeeded (good), red = failed (needs a look), grey = in-flight/neutral
-    /// (running, queued, canceled). Yellow is the one partial-success exception.
+    /// Green = succeeded, blue = actively running, red = failed (needs a look), grey =
+    /// waiting/neutral (queued, canceled). Yellow is the one partial-success exception.
     pub fn pipeline_color(&self, status: PipelineRunStatus) -> Color {
         match status {
             PipelineRunStatus::Succeeded => self.green,
+            PipelineRunStatus::Running => self.blue,
             PipelineRunStatus::Failed => self.red,
             PipelineRunStatus::PartiallySucceeded => self.yellow,
-            PipelineRunStatus::Running | PipelineRunStatus::Queued | PipelineRunStatus::Canceled => self.dim,
+            PipelineRunStatus::Queued | PipelineRunStatus::Canceled => self.dim,
         }
     }
 
@@ -177,8 +178,8 @@ mod tests {
         let t = Theme::by_name("slate");
         assert_eq!(t.pipeline_color(PipelineRunStatus::Succeeded), t.green);
         assert_eq!(t.pipeline_color(PipelineRunStatus::Failed), t.red);
-        // In-flight / neutral states are grey.
-        assert_eq!(t.pipeline_color(PipelineRunStatus::Running), t.dim);
+        assert_eq!(t.pipeline_color(PipelineRunStatus::Running), t.blue, "actively running is blue");
+        // Waiting / neutral states are grey.
         assert_eq!(t.pipeline_color(PipelineRunStatus::Queued), t.dim);
         assert_eq!(t.pipeline_color(PipelineRunStatus::Canceled), t.dim);
     }
