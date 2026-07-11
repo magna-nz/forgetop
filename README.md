@@ -27,20 +27,18 @@ without leaving the keyboard. Tokens live in your OS keychain, never in plaintex
 
 ## The Launchpad
 
-forgetop opens on the **Launchpad** - a single, cross-provider **action inbox** that
-answers *what needs me right now?* It triages every PR, work item, and pipeline across
-every connected provider into two prioritised columns:
+forgetop opens on the **Launchpad** - one cross-provider queue answering *what needs me
+right now?* Every PR, work item, and pipeline that needs you - across every connected
+forge - lands on a single page, ordered by urgency, in two columns:
 
-- **Needs you** - PRs awaiting your review, pipeline gates you can approve, your PRs
-  that are ready to merge, and anything of yours that's failing.
-- **Your work** - work items assigned to you, your open pull requests, and what you've
-  recently merged.
+- **Needs you** - reviews requested of you, pipeline gates to approve, PRs ready to
+  merge, and anything of yours that's broken.
+- **Your work** - your assigned tickets, open PRs, and recent merges.
 
-Every row reads the same way - a `PR` / `CI` / `WI` type badge, a status signal, the
-title, change stats / branch, provider, and age - so a review, a broken build, and a
-task line up at a glance. `Enter` opens any item in its full view; `Esc` brings you back
-to the same row; and acting on something (review, approve, merge) clears it from the
-queue immediately. The Pull Requests / Work Items / Pipelines tabs remain as drill-downs.
+So instead of checking GitHub for reviews, Azure for failing builds, and Jira for
+tickets, you start your day on one triaged list - every item in the same shape, so
+they're comparable at a glance - and act on any of them inline. No tab-hopping, nothing
+slipping through the cracks.
 
 See the [Launchpad docs](https://magna-nz.github.io/forgetop/#launchpad) for the full
 bucket rules and keys.
