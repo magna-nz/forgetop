@@ -2696,6 +2696,15 @@ impl App {
         self.selected_pr_row().map(|r| &r.pr)
     }
 
+    /// The PR a view action targets: the open PR view's PR when one is open (e.g. opened
+    /// from the Launchpad, where there's no matching list selection), else the list row.
+    fn active_pr(&self) -> Option<&PullRequest> {
+        match &self.screen {
+            Screen::PrView(v) => Some(&v.pr),
+            _ => self.selected_pr(),
+        }
+    }
+
     /// Resolves the PR source backing a specific connection (for per-row actions).
     async fn pr_source_for(&self, connection_id: &str, deps: &AppDeps) -> Option<Arc<dyn PullRequestSource>> {
         deps.sections
@@ -2708,7 +2717,7 @@ impl App {
     }
 
     fn open_pr_vote(&mut self, vote: ReviewVote) {
-        let Some(pr) = self.selected_pr() else { return };
+        let Some(pr) = self.active_pr() else { return };
         let verb = match vote {
             ReviewVote::Approved => "Approve",
             ReviewVote::Rejected => "Request changes on",
@@ -2719,7 +2728,7 @@ impl App {
     }
 
     fn open_pr_merge(&mut self) {
-        let Some(pr) = self.selected_pr() else { return };
+        let Some(pr) = self.active_pr() else { return };
         let title = format!("Merge {} via", pr_label(pr));
         self.overlay = Some(Overlay::Picker {
             title,
@@ -2730,7 +2739,7 @@ impl App {
     }
 
     fn open_pr_comment(&mut self) {
-        let Some(pr) = self.selected_pr() else { return };
+        let Some(pr) = self.active_pr() else { return };
         let title = format!("Comment on {}", pr_label(pr));
         self.overlay = Some(Overlay::Input { title, buffer: String::new(), kind: InputKind::PrComment });
     }
@@ -4283,6 +4292,40 @@ mod tests {
         app.add_line_comment("   ".into());
         let Screen::PrView(v) = &app.screen else { panic!() };
         assert_eq!(v.pending.len(), 1, "empty body ignored");
+    }
+
+    #[test]
+    fn pr_view_vote_dialog_targets_the_open_pr_without_a_list_selection() {
+        // Opened from the Launchpad: there's no matching PR-list selection.
+        let mut app = App::new("slate");
+        app.prs.clear();
+        app.pr_state.select(None);
+        let mut p = pr(None);
+        p.title = "Wire up retries".into();
+        app.screen = Screen::PrView(Box::new(PrView {
+            label: "PR".into(),
+            connection_id: "c".into(),
+            url: None,
+            pr: p,
+            tab: 0,
+            checks: vec![],
+            commits: vec![],
+            commit_sel: 0,
+            pr_files: vec![],
+            scroll: 0,
+            diff: diff(vec![]),
+            pending: vec![],
+            review_draft: None,
+        }));
+
+        app.open_pr_vote(ReviewVote::Approved);
+        match &app.overlay {
+            Some(crate::overlay::Overlay::Confirm { message, action, .. }) => {
+                assert!(message.contains("Wire up retries"), "dialog names the open PR");
+                assert!(matches!(action, Action::PrVote(ReviewVote::Approved)));
+            }
+            _ => panic!("expected the approve confirm dialog to open"),
+        }
     }
 
     #[test]
