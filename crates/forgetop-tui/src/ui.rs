@@ -61,14 +61,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
 fn render_tabs(frame: &mut Frame, area: Rect, app: &App) {
     let theme = &app.theme;
+    // Refresh state now shows as an animated "Refreshing…" in the footer, not up here.
     let clock = app.last_refresh.format("%H:%M:%S");
-    // A live refresh spins the glyph; otherwise it's absent.
-    let refresh = if app.reloading {
-        format!("{} ", crate::theme::SPINNER[app.anim % crate::theme::SPINNER.len()])
-    } else {
-        String::new()
-    };
-    let right = format!("{} · {}{} ", theme.name, refresh, clock);
+    let right = format!("{} · {} ", theme.name, clock);
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1099,10 +1094,16 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         spans.push(Span::styled(format!(" {label}  "), bar.fg(theme.fg)));
     }
 
-    // Right side: transient toast (highlighted) or the standing status line.
-    let (right, right_style) = match &app.toast {
-        Some(t) => (format!("{t} "), bar.fg(theme.yellow).add_modifier(Modifier::BOLD)),
-        None => (format!("{} ", app.status), bar.fg(theme.dim)),
+    // Right side: a transient toast, an animated "Refreshing…" while a refresh is in
+    // flight, else the standing status line.
+    let (right, right_style) = if let Some(t) = &app.toast {
+        (format!("{t} "), bar.fg(theme.yellow).add_modifier(Modifier::BOLD))
+    } else if app.reloading {
+        // Dots appear one at a time; padded to a constant width so nothing jitters.
+        let n = (app.anim / 2) % 4;
+        (format!("Refreshing{}{} ", ".".repeat(n), " ".repeat(3 - n)), bar.fg(theme.dim))
+    } else {
+        (format!("{} ", app.status), bar.fg(theme.dim))
     };
     let right_w = right.chars().count().min(70) as u16 + 1;
 
@@ -2366,6 +2367,17 @@ mod tests {
         app.toast = Some("Filter: mine (1 PRs)".into());
         let out = render_to_string(&mut app, 100, 24);
         assert!(out.contains("Filter: mine"), "toast should appear in the footer");
+    }
+
+    #[test]
+    fn refreshing_shows_in_the_footer_not_the_header() {
+        let mut app = App::new("slate");
+        app.status = "9 PRs · 10 work items · 8 runs".into();
+        app.reloading = true;
+        let out = render_to_string(&mut app, 100, 24);
+        assert!(out.contains("Refreshing"), "a refresh shows 'Refreshing…' in the footer");
+        // The header keeps just the theme + clock — no refresh glyph up there.
+        assert!(!out.contains("⟳"), "no spinner in the top-right");
     }
 
     #[test]
