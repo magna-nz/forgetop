@@ -10,6 +10,7 @@ use forgetop_core::domain::*;
 use forgetop_core::provider::*;
 use forgetop_core::service::{ConfigService, ConnectionHealth, ConnectionHealthService, SectionService};
 use ratatui::widgets::TableState;
+use tokio::sync::mpsc;
 
 use crate::launchpad;
 use crate::overlay::{Action, InputKind, Outcome, Overlay, PickerKind, ToggleItem, ToggleKind};
@@ -45,6 +46,46 @@ pub struct AppDeps {
     pub sections: Arc<SectionService>,
     pub health: Arc<ConnectionHealthService>,
     pub config: Arc<ConfigService>,
+}
+
+/// A completed background job, applied to the app on the render loop.
+pub enum AppEvent {
+    /// A full refresh finished fetching.
+    Reloaded(Box<Reloaded>),
+}
+
+/// A snapshot of everything the background fetch needs from `self` at spawn time, so it
+/// can run without borrowing the app.
+struct ReloadParams {
+    pr_filter: PullRequestFilter,
+    pr_completed: bool,
+    notifications: NotificationPrefs,
+    review_seen: HashSet<(String, String)>,
+    pr_review_seen: HashMap<(String, String), (bool, bool)>,
+    scan_seeded: bool,
+    notifier: Arc<dyn Notifier>,
+    /// The open pipeline view's (connection_id, run_id), so the refresh keeps it live.
+    open_pipeline: Option<(String, String)>,
+}
+
+/// The PR-notification scan's new seen-sets (notifications are fired during the scan).
+struct PrScan {
+    review_seen: Option<HashSet<(String, String)>>,
+    pr_review_seen: Option<HashMap<(String, String), (bool, bool)>>,
+}
+
+/// The result of a full fetch, ready to be folded back into the app.
+pub struct Reloaded {
+    prs: Vec<PrRow>,
+    wis: Vec<WiRow>,
+    pipes: Vec<PipeRow>,
+    lp_prs_mine: Vec<PrRow>,
+    lp_prs_review: Vec<PrRow>,
+    health: Vec<ConnectionHealth>,
+    scan: Option<PrScan>,
+    /// Fresh (run_id, run, approvals) for the open pipeline view, if one is open.
+    open_pipeline: Option<(String, PipelineRun, Vec<PipelineApproval>)>,
+    errors: Vec<String>,
 }
 
 /// One pipeline run, tagged with the connection it came from (for the provider column).
@@ -161,6 +202,10 @@ pub struct App {
     /// True when the currently-open item view was opened from the Launchpad, so Esc
     /// returns there (with the same row still selected) instead of to the section list.
     lp_origin: bool,
+    /// True while a background refresh is in flight (drives the header spinner + loading text).
+    pub reloading: bool,
+    /// Sender for completed background jobs; set once the event loop is running.
+    pub job_tx: Option<mpsc::UnboundedSender<AppEvent>>,
     /// Shared animation frame, advanced by a fast timer. Drives the selected-row title
     /// marquee (see `anim / 2` at the call site) and the running-pipeline spinner. Reset
     /// to 0 when the Launchpad selection moves so each title starts from the beginning.
@@ -571,6 +616,8 @@ impl App {
             lp_prs_review: Vec::new(),
             lp_dismissed: HashSet::new(),
             lp_origin: false,
+            reloading: false,
+            job_tx: None,
             anim: 0,
             last_refresh: Local::now(),
             should_quit: false,
@@ -1024,84 +1071,13 @@ impl App {
     }
 
     /// Fetches the review-requested and my-PR sets and notifies on new events.
-    async fn scan_pr_notifications(&mut self, deps: &AppDeps) {
-        let want_review = self.notifications.review_requested;
-        let want_votes = self.notifications.pr_approved || self.notifications.pr_changes_requested;
-        if !want_review && !want_votes {
-            return;
+    /// Applies a completed background job on the render loop.
+    pub fn on_event(&mut self, event: AppEvent) {
+        match event {
+            AppEvent::Reloaded(r) => self.apply_reloaded(*r),
         }
-        let Ok(feeds) = deps.sections.pull_request_feeds().await else { return };
-        if feeds.is_empty() {
-            return;
-        }
-
-        let seeded = self.pr_scan_seeded;
-        let mut review_now: HashSet<(String, String)> = HashSet::new();
-        let mut votes_now: HashMap<(String, String), (bool, bool)> = HashMap::new();
-
-        // Scan every bound provider so notifications span the aggregated PR list.
-        for feed in &feeds {
-            let conn = feed.connection.connection_id().to_string();
-            if want_review {
-                if let Ok(review) = feed.source.list(&pr_query(PullRequestFilter::ReviewRequested)).await {
-                    for pr in &review {
-                        let key = (conn.clone(), pr.id.clone());
-                        if seeded && !self.review_req_seen.contains(&key) {
-                            self.notifier.notify("Review requested", &pr_label(pr));
-                        }
-                        review_now.insert(key);
-                    }
-                }
-            }
-            if want_votes {
-                if let Ok(mine) = feed.source.list(&pr_query(PullRequestFilter::Mine)).await {
-                    for pr in &mine {
-                        let key = (conn.clone(), pr.id.clone());
-                        if seeded {
-                            let (approved, changes) = pr_review_transitions(self.pr_review_seen.get(&key).copied(), pr);
-                            if approved && self.notifications.pr_approved {
-                                self.notifier.notify("Your PR was approved", &pr_label(pr));
-                            }
-                            if changes && self.notifications.pr_changes_requested {
-                                self.notifier.notify("Changes requested on your PR", &pr_label(pr));
-                            }
-                        }
-                        votes_now.insert(key, pr_vote_flags(pr));
-                    }
-                }
-            }
-        }
-
-        if want_review {
-            self.review_req_seen = review_now;
-        }
-        if want_votes {
-            self.pr_review_seen = votes_now;
-        }
-        self.pr_scan_seeded = true;
     }
 
-    /// Fetches the mine + review-requested PR union (the section list uses one filter)
-    /// and rebuilds the Launchpad rows.
-    async fn reload_launchpad(&mut self, deps: &AppDeps) {
-        self.lp_prs_mine.clear();
-        self.lp_prs_review.clear();
-        if let Ok(feeds) = deps.sections.pull_request_feeds().await {
-            for feed in feeds {
-                let (provider, name, conn_id) = feed_tag(&feed.connection);
-                let row = |pr: PullRequest| PrRow { connection_id: conn_id.clone(), connection: name.clone(), provider, pr };
-                // Include completed so "Recently merged" has data; open PRs still drive the rest.
-                let mine = PullRequestQuery { filter: PullRequestFilter::Mine, include_completed: true, limit: Some(50) };
-                if let Ok(list) = feed.source.list(&mine).await {
-                    self.lp_prs_mine.extend(list.into_iter().map(row));
-                }
-                if let Ok(list) = feed.source.list(&pr_query(PullRequestFilter::ReviewRequested)).await {
-                    self.lp_prs_review.extend(list.into_iter().map(row));
-                }
-            }
-        }
-        self.rebuild_launchpad();
-    }
 
     /// Rebuilds the Launchpad rows from the current feeds (no fetch) and clamps selection.
     fn rebuild_launchpad(&mut self) {
@@ -1164,7 +1140,7 @@ impl App {
             Key::Tab => self.switch_tab(1),
             Key::Char(c @ '1'..='4') => self.set_tab(c as usize - '1' as usize),
             Key::Enter => self.open_launchpad_selected(deps).await,
-            Key::Char('r') => self.reload_all(deps).await,
+            Key::Char('r') => self.request_reload(deps),
             Key::Char('n') => self.start_add_connection(),
             Key::Char('C') => self.open_config(deps).await,
             Key::Char('t') => {
@@ -1213,27 +1189,115 @@ impl App {
 
     // ---- data loading ----
 
+    /// A full refresh, run inline (blocking). Used for the initial load and after write
+    /// actions, where the caller wants the fresh data before continuing. The periodic
+    /// poll and manual `r` refresh go through [`request_reload`] instead, which runs the
+    /// same fetch off the render loop so the UI stays live (see the header spinner).
     pub async fn reload_all(&mut self, deps: &AppDeps) {
         self.loading = true;
         self.status = "Refreshing…".into();
+        let fetched = self.fetch_bundle(deps).await;
+        self.apply_reloaded(fetched);
+    }
 
-        let mut errors: Vec<String> = Vec::new();
-        self.reload_pull_requests(deps, &mut errors).await;
-        self.reload_work_items(deps, &mut errors).await;
-        self.reload_pipelines(deps, &mut errors).await;
-        self.refresh_open_pipeline(deps).await;
-        self.reload_launchpad(deps).await;
-        self.scan_pr_notifications(deps).await;
-        self.health = deps.health.check_all().await;
+    /// Parameters the background fetch needs, snapshotted from `self` at spawn time.
+    fn reload_params(&self) -> ReloadParams {
+        ReloadParams {
+            pr_filter: self.pr_filter,
+            pr_completed: self.pr_wants_completed(),
+            notifications: self.notifications,
+            review_seen: self.review_req_seen.clone(),
+            pr_review_seen: self.pr_review_seen.clone(),
+            scan_seeded: self.pr_scan_seeded,
+            notifier: self.notifier.clone(),
+            open_pipeline: match &self.screen {
+                Screen::Pipeline(v) => Some((v.connection_id.clone(), v.run.id.clone())),
+                _ => None,
+            },
+        }
+    }
 
+    /// Runs the whole network fetch (no `&mut self`), firing PR-notification pings along
+    /// the way. Safe to call from a spawned task — everything it needs is owned.
+    async fn fetch_all(deps: AppDeps, p: ReloadParams) -> Reloaded {
+        let mut errors = Vec::new();
+        let prs = fetch_pull_requests(&deps, p.pr_filter, p.pr_completed, &mut errors).await;
+        let wis = fetch_work_items(&deps, &mut errors).await;
+        let pipes = fetch_pipelines(&deps, &mut errors).await;
+        let (lp_prs_mine, lp_prs_review) = fetch_launchpad_prs(&deps).await;
+        let health = deps.health.check_all().await;
+        let scan = scan_pr_notifications(&deps, &p).await;
+        let open_pipeline = match &p.open_pipeline {
+            Some((conn_id, run_id)) => fetch_open_pipeline(&deps, conn_id, run_id).await,
+            None => None,
+        };
+        Reloaded { prs, wis, pipes, lp_prs_mine, lp_prs_review, health, scan, open_pipeline, errors }
+    }
+
+    /// The inline (blocking) variant used by [`reload_all`].
+    async fn fetch_bundle(&self, deps: &AppDeps) -> Reloaded {
+        Self::fetch_all(deps.clone(), self.reload_params()).await
+    }
+
+    /// Folds a completed fetch back into the app state: the lists, the Launchpad, the
+    /// pipeline notifications (which compare against the seen-sets), and the status line.
+    fn apply_reloaded(&mut self, r: Reloaded) {
+        self.prs = r.prs;
+        self.wis = r.wis;
+        self.pipes = r.pipes;
+        self.lp_prs_mine = r.lp_prs_mine;
+        self.lp_prs_review = r.lp_prs_review;
+        self.health = r.health;
+        if let Some(scan) = r.scan {
+            if let Some(seen) = scan.review_seen {
+                self.review_req_seen = seen;
+            }
+            if let Some(seen) = scan.pr_review_seen {
+                self.pr_review_seen = seen;
+            }
+            self.pr_scan_seeded = true;
+        }
+        // Keep the open pipeline view live, but only if it's still the same run (the user
+        // may have navigated away during the fetch).
+        if let Some((run_id, run, approvals)) = r.open_pipeline {
+            if let Screen::Pipeline(v) = &mut self.screen {
+                if v.run.id == run_id {
+                    v.run = run;
+                    v.approvals = approvals;
+                    v.clamp_selection();
+                }
+            }
+        }
+        self.rebuild_launchpad();
+        self.notify_pipeline_failures();
+        self.notify_pending_approvals();
         self.fix_selection();
         self.last_refresh = Local::now();
         self.loading = false;
-        self.status = if errors.is_empty() {
+        self.reloading = false;
+        self.status = if r.errors.is_empty() {
             format!("{} PRs · {} work items · {} runs", self.prs.len(), self.wis.len(), self.pipes.len())
         } else {
-            errors.join("  |  ")
+            r.errors.join("  |  ")
         };
+    }
+
+    /// Kicks off a background refresh (periodic poll / manual `r`) without blocking the
+    /// render loop, so the header spinner keeps animating. Single-flight: a refresh
+    /// already in progress is left to finish.
+    pub fn request_reload(&mut self, deps: &AppDeps) {
+        let Some(tx) = self.job_tx.clone() else {
+            return;
+        };
+        if self.reloading {
+            return;
+        }
+        self.reloading = true;
+        self.loading = true;
+        let (deps, params) = (deps.clone(), self.reload_params());
+        tokio::spawn(async move {
+            let _ = tx.send(AppEvent::Reloaded(Box::new(App::fetch_all(deps, params).await)));
+        });
     }
 
     async fn reload_pull_requests(&mut self, deps: &AppDeps, errors: &mut Vec<String>) {
@@ -1873,7 +1937,7 @@ impl App {
             'l' => self.switch_tab(1),
             // 1 = Launchpad, then the sections.
             '1'..='4' => self.set_tab(c as usize - '1' as usize),
-            'r' => self.reload_all(deps).await,
+            'r' => self.request_reload(deps),
             't' => {
                 let next = Theme::next(self.theme.name);
                 self.theme = Theme::by_name(next);
@@ -2632,6 +2696,15 @@ impl App {
         self.selected_pr_row().map(|r| &r.pr)
     }
 
+    /// The PR a view action targets: the open PR view's PR when one is open (e.g. opened
+    /// from the Launchpad, where there's no matching list selection), else the list row.
+    fn active_pr(&self) -> Option<&PullRequest> {
+        match &self.screen {
+            Screen::PrView(v) => Some(&v.pr),
+            _ => self.selected_pr(),
+        }
+    }
+
     /// Resolves the PR source backing a specific connection (for per-row actions).
     async fn pr_source_for(&self, connection_id: &str, deps: &AppDeps) -> Option<Arc<dyn PullRequestSource>> {
         deps.sections
@@ -2644,7 +2717,7 @@ impl App {
     }
 
     fn open_pr_vote(&mut self, vote: ReviewVote) {
-        let Some(pr) = self.selected_pr() else { return };
+        let Some(pr) = self.active_pr() else { return };
         let verb = match vote {
             ReviewVote::Approved => "Approve",
             ReviewVote::Rejected => "Request changes on",
@@ -2655,7 +2728,7 @@ impl App {
     }
 
     fn open_pr_merge(&mut self) {
-        let Some(pr) = self.selected_pr() else { return };
+        let Some(pr) = self.active_pr() else { return };
         let title = format!("Merge {} via", pr_label(pr));
         self.overlay = Some(Overlay::Picker {
             title,
@@ -2666,7 +2739,7 @@ impl App {
     }
 
     fn open_pr_comment(&mut self) {
-        let Some(pr) = self.selected_pr() else { return };
+        let Some(pr) = self.active_pr() else { return };
         let title = format!("Comment on {}", pr_label(pr));
         self.overlay = Some(Overlay::Input { title, buffer: String::new(), kind: InputKind::PrComment });
     }
@@ -3172,6 +3245,159 @@ fn pr_query(filter: PullRequestFilter) -> PullRequestQuery {
     PullRequestQuery { filter, include_completed: false, limit: Some(50) }
 }
 
+// ---- background fetch helpers (no `&mut self`, safe to run in a spawned task) ----
+
+async fn fetch_pull_requests(deps: &AppDeps, filter: PullRequestFilter, completed: bool, errors: &mut Vec<String>) -> Vec<PrRow> {
+    let mut out = Vec::new();
+    match deps.sections.pull_request_feeds().await {
+        Ok(feeds) => {
+            let query = PullRequestQuery { filter, include_completed: completed, limit: Some(50) };
+            for feed in feeds {
+                let (provider, name, conn_id) = feed_tag(&feed.connection);
+                match feed.source.list(&query).await {
+                    Ok(list) => out.extend(list.into_iter().map(|pr| PrRow { connection_id: conn_id.clone(), connection: name.clone(), provider, pr })),
+                    Err(e) => errors.push(format!("PRs ({name}): {e}")),
+                }
+            }
+        }
+        Err(e) => errors.push(format!("PRs: {e}")),
+    }
+    out
+}
+
+async fn fetch_work_items(deps: &AppDeps, errors: &mut Vec<String>) -> Vec<WiRow> {
+    let mut out = Vec::new();
+    match deps.sections.work_item_feeds().await {
+        Ok(feeds) => {
+            for feed in feeds {
+                let (provider, name, conn_id) = feed_tag(&feed.connection);
+                match feed.source.list(&wi_query()).await {
+                    Ok(list) => out.extend(list.into_iter().map(|wi| WiRow { connection_id: conn_id.clone(), connection: name.clone(), provider, wi })),
+                    Err(e) => errors.push(format!("Work items ({name}): {e}")),
+                }
+            }
+        }
+        Err(e) => errors.push(format!("Work items: {e}")),
+    }
+    out
+}
+
+async fn fetch_pipelines(deps: &AppDeps, errors: &mut Vec<String>) -> Vec<PipeRow> {
+    let mut out = Vec::new();
+    match deps.sections.pipeline_feeds().await {
+        Ok(feeds) => {
+            for feed in feeds {
+                let provider = feed.connection.provider_type();
+                let name = feed.connection.display_name().to_string();
+                let conn_id = feed.connection.connection_id().to_string();
+                let def_names: HashMap<String, String> =
+                    feed.source.discover().await.unwrap_or_default().into_iter().map(|d| (d.id, d.name)).collect();
+                for q in feed_queries(&feed.subscription) {
+                    match feed.source.list_runs(&q).await {
+                        Ok(runs) => {
+                            let supports = feed.source.supports_approvals();
+                            for run in runs {
+                                let awaiting_approval = supports
+                                    && is_active(run.status)
+                                    && feed.source.pending_approvals(&run.id).await.map(|a| a.iter().any(|x| x.can_respond)).unwrap_or(false);
+                                let definition_name = def_names.get(&run.definition_id).cloned();
+                                out.push(PipeRow { connection_id: conn_id.clone(), connection: name.clone(), provider, run, definition_name, awaiting_approval });
+                            }
+                        }
+                        Err(e) => errors.push(format!("Pipelines ({name}): {e}")),
+                    }
+                }
+            }
+        }
+        Err(e) => errors.push(format!("Pipelines: {e}")),
+    }
+    out
+}
+
+/// Re-fetches the open pipeline run + its pending approvals (mirrors
+/// [`App::refresh_open_pipeline`]), so the background refresh keeps the view live.
+async fn fetch_open_pipeline(deps: &AppDeps, conn_id: &str, run_id: &str) -> Option<(String, PipelineRun, Vec<PipelineApproval>)> {
+    let feeds = deps.sections.pipeline_feeds().await.unwrap_or_default();
+    let feed = feeds.iter().find(|f| f.connection.connection_id() == conn_id)?;
+    let run = feed.source.get_run(run_id).await.ok()?;
+    let approvals = if feed.source.supports_approvals() {
+        feed.source.pending_approvals(run_id).await.unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    Some((run_id.to_string(), run, approvals))
+}
+
+async fn fetch_launchpad_prs(deps: &AppDeps) -> (Vec<PrRow>, Vec<PrRow>) {
+    let (mut mine_out, mut review_out) = (Vec::new(), Vec::new());
+    if let Ok(feeds) = deps.sections.pull_request_feeds().await {
+        for feed in feeds {
+            let (provider, name, conn_id) = feed_tag(&feed.connection);
+            let mine_q = PullRequestQuery { filter: PullRequestFilter::Mine, include_completed: true, limit: Some(50) };
+            if let Ok(list) = feed.source.list(&mine_q).await {
+                mine_out.extend(list.into_iter().map(|pr| PrRow { connection_id: conn_id.clone(), connection: name.clone(), provider, pr }));
+            }
+            if let Ok(list) = feed.source.list(&pr_query(PullRequestFilter::ReviewRequested)).await {
+                review_out.extend(list.into_iter().map(|pr| PrRow { connection_id: conn_id.clone(), connection: name.clone(), provider, pr }));
+            }
+        }
+    }
+    (mine_out, review_out)
+}
+
+/// The PR-notification scan, firing pings for newly-seen review requests / vote changes
+/// and returning the fresh seen-sets. Mirrors the inline logic but takes a snapshot so
+/// it can run off the render loop.
+async fn scan_pr_notifications(deps: &AppDeps, p: &ReloadParams) -> Option<PrScan> {
+    let want_review = p.notifications.review_requested;
+    let want_votes = p.notifications.pr_approved || p.notifications.pr_changes_requested;
+    if !want_review && !want_votes {
+        return None;
+    }
+    let feeds = deps.sections.pull_request_feeds().await.ok()?;
+    if feeds.is_empty() {
+        return None;
+    }
+    let seeded = p.scan_seeded;
+    let mut review_now: HashSet<(String, String)> = HashSet::new();
+    let mut votes_now: HashMap<(String, String), (bool, bool)> = HashMap::new();
+    for feed in &feeds {
+        let conn = feed.connection.connection_id().to_string();
+        if want_review {
+            if let Ok(review) = feed.source.list(&pr_query(PullRequestFilter::ReviewRequested)).await {
+                for pr in &review {
+                    let key = (conn.clone(), pr.id.clone());
+                    if seeded && !p.review_seen.contains(&key) {
+                        p.notifier.notify("Review requested", &pr_label(pr));
+                    }
+                    review_now.insert(key);
+                }
+            }
+        }
+        if want_votes {
+            if let Ok(mine) = feed.source.list(&pr_query(PullRequestFilter::Mine)).await {
+                for pr in &mine {
+                    let key = (conn.clone(), pr.id.clone());
+                    if seeded {
+                        let (approved, changes) = pr_review_transitions(p.pr_review_seen.get(&key).copied(), pr);
+                        if approved && p.notifications.pr_approved {
+                            p.notifier.notify("Your PR was approved", &pr_label(pr));
+                        }
+                        if changes && p.notifications.pr_changes_requested {
+                            p.notifier.notify("Changes requested on your PR", &pr_label(pr));
+                        }
+                    }
+                    votes_now.insert(key, pr_vote_flags(pr));
+                }
+            }
+        }
+    }
+    Some(PrScan {
+        review_seen: want_review.then_some(review_now),
+        pr_review_seen: want_votes.then_some(votes_now),
+    })
+}
+
 /// PR statuses in display order — drives the "Show statuses" checklist and the header.
 const PR_STATUS_ORDER: [PullRequestStatus; 4] =
     [PullRequestStatus::Open, PullRequestStatus::Draft, PullRequestStatus::Merged, PullRequestStatus::Closed];
@@ -3298,6 +3524,28 @@ mod tests {
 
     fn wi_row(wi: WorkItem) -> WiRow {
         WiRow { connection_id: "c".into(), connection: "GH".into(), provider: ProviderType::GitHub, wi }
+    }
+
+    #[test]
+    fn apply_reloaded_swaps_data_and_clears_refresh_flags() {
+        let mut app = App::new("slate");
+        app.reloading = true;
+        app.loading = true;
+        app.apply_reloaded(Reloaded {
+            prs: vec![pr_row(pr(None)), pr_row(pr(None))],
+            wis: vec![wi_row(wi(None))],
+            pipes: vec![],
+            lp_prs_mine: vec![],
+            lp_prs_review: vec![],
+            health: vec![],
+            scan: None,
+            open_pipeline: None,
+            errors: vec![],
+        });
+        assert_eq!(app.prs.len(), 2);
+        assert_eq!(app.wis.len(), 1);
+        assert!(!app.reloading && !app.loading, "refresh flags cleared");
+        assert!(app.status.contains("2 PRs") && app.status.contains("1 work items"), "status summarises");
     }
 
     #[test]
@@ -4044,6 +4292,40 @@ mod tests {
         app.add_line_comment("   ".into());
         let Screen::PrView(v) = &app.screen else { panic!() };
         assert_eq!(v.pending.len(), 1, "empty body ignored");
+    }
+
+    #[test]
+    fn pr_view_vote_dialog_targets_the_open_pr_without_a_list_selection() {
+        // Opened from the Launchpad: there's no matching PR-list selection.
+        let mut app = App::new("slate");
+        app.prs.clear();
+        app.pr_state.select(None);
+        let mut p = pr(None);
+        p.title = "Wire up retries".into();
+        app.screen = Screen::PrView(Box::new(PrView {
+            label: "PR".into(),
+            connection_id: "c".into(),
+            url: None,
+            pr: p,
+            tab: 0,
+            checks: vec![],
+            commits: vec![],
+            commit_sel: 0,
+            pr_files: vec![],
+            scroll: 0,
+            diff: diff(vec![]),
+            pending: vec![],
+            review_draft: None,
+        }));
+
+        app.open_pr_vote(ReviewVote::Approved);
+        match &app.overlay {
+            Some(crate::overlay::Overlay::Confirm { message, action, .. }) => {
+                assert!(message.contains("Wire up retries"), "dialog names the open PR");
+                assert!(matches!(action, Action::PrVote(ReviewVote::Approved)));
+            }
+            _ => panic!("expected the approve confirm dialog to open"),
+        }
     }
 
     #[test]

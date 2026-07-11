@@ -18,18 +18,20 @@ pub enum Bucket {
     NeedsFixing,
     YourWork,
     YourOpenPrs,
+    RecentPipelines,
     RecentlyMerged,
 }
 
 impl Bucket {
     /// Every bucket, in display (urgency) order.
-    pub const ORDER: [Bucket; 7] = [
+    pub const ORDER: [Bucket; 8] = [
         Bucket::NeedsReview,
         Bucket::ApprovalsWaiting,
         Bucket::ReadyToMerge,
         Bucket::NeedsFixing,
         Bucket::YourWork,
         Bucket::YourOpenPrs,
+        Bucket::RecentPipelines,
         Bucket::RecentlyMerged,
     ];
 
@@ -41,14 +43,16 @@ impl Bucket {
             Bucket::NeedsFixing => "Needs fixing",
             Bucket::YourWork => "Assigned to you",
             Bucket::YourOpenPrs => "Your open pull requests",
+            Bucket::RecentPipelines => "Recent pipelines",
             Bucket::RecentlyMerged => "Recently merged",
         }
     }
 
     /// Muted buckets are reference lists (dim heading, not counted in the tab badge) —
-    /// your full open-PR list and recently-merged, which restate items shown elsewhere.
+    /// they restate items shown elsewhere (your full open-PR list, recent pipelines,
+    /// recently-merged).
     pub fn muted(&self) -> bool {
-        matches!(self, Bucket::YourOpenPrs | Bucket::RecentlyMerged)
+        matches!(self, Bucket::YourOpenPrs | Bucket::RecentPipelines | Bucket::RecentlyMerged)
     }
 
     /// Which Launchpad column this bucket lives in: 0 = left ("Needs you" — things
@@ -98,6 +102,8 @@ pub fn classify_pr(pr: &PullRequest, role: PrRole) -> Option<Bucket> {
 /// Recency window for the "Recently merged" section, and how many to show.
 const RECENT_MERGE_DAYS: i64 = 7;
 const RECENT_MERGE_MAX: usize = 5;
+/// How many recent pipeline runs to show in the right-column reference list.
+const RECENT_PIPELINE_MAX: usize = 6;
 
 /// True for your PRs merged within the recency window (shown in "Recently merged").
 fn merged_recently(pr: &PullRequest, now: DateTime<Utc>) -> bool {
@@ -218,6 +224,13 @@ pub fn build(prs_review: &[PrRow], prs_mine: &[PrRow], wis: &[WiRow], pipes: &[P
         provider: row.provider,
         item: EntryItem::Pr(row.pr.clone()),
     };
+    let pipe_entry = |r: &PipeRow, bucket: Bucket| Entry {
+        bucket,
+        connection_id: r.connection_id.clone(),
+        connection: r.connection.clone(),
+        provider: r.provider,
+        item: EntryItem::Pipe { run: r.run.clone(), definition_name: r.definition_name.clone() },
+    };
 
     let now = Utc::now();
     let mut out: Vec<Entry> = Vec::new();
@@ -254,37 +267,39 @@ pub fn build(prs_review: &[PrRow], prs_mine: &[PrRow], wis: &[WiRow], pipes: &[P
         provider: r.provider,
         item: EntryItem::Wi(r.wi.clone()),
     }));
+    // Pipelines: a left action bucket when they need you (approval gate / failed), and
+    // the recent-runs reference list on the right.
     for r in pipes {
         if let Some(bucket) = classify_pipe(r) {
-            out.push(Entry {
-                bucket,
-                connection_id: r.connection_id.clone(),
-                connection: r.connection.clone(),
-                provider: r.provider,
-                item: EntryItem::Pipe { run: r.run.clone(), definition_name: r.definition_name.clone() },
-            });
+            out.push(pipe_entry(r, bucket));
         }
+        out.push(pipe_entry(r, Bucket::RecentPipelines));
     }
 
-    // Bucket by urgency; within a bucket oldest-first, except Recently merged (newest first).
+    // Bucket by urgency; within a bucket oldest-first, except the recent reference lists
+    // (recently merged / recent pipelines), which read newest-first.
+    let newest_first = |b: Bucket| matches!(b, Bucket::RecentlyMerged | Bucket::RecentPipelines);
     out.sort_by(|a, b| {
         bucket_rank(a.bucket).cmp(&bucket_rank(b.bucket)).then_with(|| {
-            if a.bucket == Bucket::RecentlyMerged {
+            if newest_first(a.bucket) {
                 age_key(b.updated_at()).cmp(&age_key(a.updated_at()))
             } else {
                 age_key(a.updated_at()).cmp(&age_key(b.updated_at()))
             }
         })
     });
-    // Keep the recently-merged footer short (it's already newest-first after the sort).
-    let mut merged = 0;
-    out.retain(|e| {
-        if e.bucket == Bucket::RecentlyMerged {
+    // Keep the reference footers short (already newest-first after the sort).
+    let (mut merged, mut pipelines) = (0, 0);
+    out.retain(|e| match e.bucket {
+        Bucket::RecentlyMerged => {
             merged += 1;
             merged <= RECENT_MERGE_MAX
-        } else {
-            true
         }
+        Bucket::RecentPipelines => {
+            pipelines += 1;
+            pipelines <= RECENT_PIPELINE_MAX
+        }
+        _ => true,
     });
     out
 }
@@ -377,6 +392,18 @@ mod tests {
         assert_eq!(classify_pipe(&pipe(PipelineRunStatus::Succeeded, false)), None);
         // Awaiting approval outranks a failed status.
         assert_eq!(classify_pipe(&pipe(PipelineRunStatus::Failed, true)), Some(Bucket::ApprovalsWaiting));
+    }
+
+    #[test]
+    fn build_lists_every_run_in_recent_pipelines() {
+        let out = build(&[], &[], &[], &[pipe(PipelineRunStatus::Failed, false), pipe(PipelineRunStatus::Succeeded, false)]);
+        let buckets: Vec<Bucket> = out.iter().map(|e| e.bucket).collect();
+        // Both runs show in the recent-pipelines reference list …
+        assert_eq!(buckets.iter().filter(|&&b| b == Bucket::RecentPipelines).count(), 2);
+        // … and the failed one *also* surfaces as a left-column action.
+        assert!(buckets.contains(&Bucket::NeedsFixing));
+        // The succeeded run only appears in the reference list, not as an action.
+        assert_eq!(buckets.iter().filter(|&&b| b == Bucket::ApprovalsWaiting).count(), 0);
     }
 
     #[test]

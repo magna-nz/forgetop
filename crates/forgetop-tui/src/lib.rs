@@ -69,6 +69,11 @@ async fn event_loop(terminal: &mut Term, app: &mut App, deps: &AppDeps) -> Resul
     let mut anim = tokio::time::interval(Duration::from_millis(ANIM_MS));
     anim.tick().await;
 
+    // Completed background jobs (refreshes) are delivered here and applied on the loop,
+    // so network work never blocks rendering — the header spinner keeps animating.
+    let (job_tx, mut job_rx) = mpsc::unbounded_channel::<app::AppEvent>();
+    app.job_tx = Some(job_tx);
+
     loop {
         terminal.draw(|f| ui::render(f, app)).map_err(forgetop_core::Error::from)?;
         if app.should_quit {
@@ -80,7 +85,8 @@ async fn event_loop(terminal: &mut Term, app: &mut App, deps: &AppDeps) -> Resul
                 Some(key) => app.on_key(key, deps).await,
                 None => break, // reader thread gone
             },
-            _ = ticker.tick() => app.reload_all(deps).await,
+            _ = ticker.tick() => app.request_reload(deps),
+            Some(event) = job_rx.recv() => app.on_event(event),
             _ = anim.tick() => app.tick_anim(),
         }
     }

@@ -62,7 +62,13 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 fn render_tabs(frame: &mut Frame, area: Rect, app: &App) {
     let theme = &app.theme;
     let clock = app.last_refresh.format("%H:%M:%S");
-    let right = format!("{} · {}{} ", theme.name, if app.loading { "⟳ " } else { "" }, clock);
+    // A live refresh spins the glyph; otherwise it's absent.
+    let refresh = if app.reloading {
+        format!("{} ", crate::theme::SPINNER[app.anim % crate::theme::SPINNER.len()])
+    } else {
+        String::new()
+    };
+    let right = format!("{} · {}{} ", theme.name, refresh, clock);
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -274,25 +280,12 @@ fn lp_cells(theme: &Theme, e: &crate::launchpad::Entry, anim: usize) -> Vec<(Str
     let age = |t| (rel_age(t), Style::default().fg(age_color(theme, t)));
     match &e.item {
         EntryItem::Pr(pr) => {
-            // For merged/closed PRs (the "Recently merged" footer) show that state; for open
-            // ones the status carries the review signal: approvals, changes requested, or draft.
-            let approvals = pr.reviewers.iter().filter(|r| matches!(r.vote, ReviewVote::Approved | ReviewVote::ApprovedWithSuggestions)).count();
-            let changes = pr.reviewers.iter().any(|r| r.vote == ReviewVote::Rejected);
-            let (status, sstyle) = if matches!(pr.status, PullRequestStatus::Merged | PullRequestStatus::Closed) {
-                let (s, c) = pr_status(theme, pr);
-                (s.to_string(), Style::default().fg(c))
-            } else if changes {
-                ("✗ changes".to_string(), Style::default().fg(theme.red))
-            } else if approvals > 0 {
-                (format!("{} ok", "✓".repeat(approvals)), Style::default().fg(theme.green))
-            } else if pr.is_draft || pr.status == PullRequestStatus::Draft {
-                ("◌ draft".to_string(), dim)
-            } else {
-                ("○ review".to_string(), Style::default().fg(theme.yellow))
-            };
+            // Status is the PR's lifecycle state (Open / Draft / Merged / Closed). The
+            // review situation is conveyed by the bucket the row is in, not the row.
+            let (st, stc) = pr_status(theme, pr);
             vec![
                 badge("PR", theme.blue),
-                (status, sstyle),
+                (st.to_string(), Style::default().fg(stc)),
                 (pr.number.map(|n| format!("#{n}")).unwrap_or_default(), dim),
                 (pr.title.clone(), fg),
                 (format!("+{} -{}", pr.additions, pr.deletions), dim),
@@ -310,7 +303,7 @@ fn lp_cells(theme: &Theme, e: &crate::launchpad::Entry, anim: usize) -> Vec<(Str
             };
             vec![
                 badge("CI", theme.yellow),
-                (format!("{} {:?}", pipeline_glyph(run.status, anim), run.status), Style::default().fg(theme.pipeline_color(run.status))),
+                (format!("{} {:?}", pipeline_glyph(run.status, anim), run.status), Style::default().fg(theme.pipeline_color_anim(run.status, anim))),
                 (reference, dim),
                 (title, fg),
                 (run.branch.clone().unwrap_or_default(), dim),
@@ -553,6 +546,11 @@ fn sort_marker(app: &App, section: usize) -> Option<(usize, bool)> {
 }
 
 /// Appends the active quick-filter to a section title (e.g. `Pipelines · /deploy`).
+/// A "Loading…" empty-state message with the refresh spinner, so a cold fetch looks live.
+fn loading_msg(app: &App, base: &str) -> String {
+    format!("{} {base}", crate::theme::SPINNER[app.anim % crate::theme::SPINNER.len()])
+}
+
 fn list_title(base: String, filter: &str) -> String {
     if filter.is_empty() {
         base
@@ -590,15 +588,15 @@ fn render_prs(frame: &mut Frame, area: Rect, app: &mut App) {
     let title = list_title(base, &app.filters[0]);
     if idxs.is_empty() {
         let msg = if !app.filters[0].is_empty() {
-            "No matches. Esc clears the filter."
+            "No matches. Esc clears the filter.".to_string()
         } else if app.health.is_empty() {
-            FIRST_RUN_HINT
+            FIRST_RUN_HINT.to_string()
         } else if app.loading {
-            "Loading pull requests…"
+            loading_msg(app, "Loading pull requests…")
         } else {
-            "No pull requests. Press f to change filter, r to refresh."
+            "No pull requests. Press f to change filter, r to refresh.".to_string()
         };
-        empty(frame, area, theme, msg, section_block(theme, &title));
+        empty(frame, area, theme, &msg, section_block(theme, &title));
         return;
     }
 
@@ -653,17 +651,17 @@ fn render_wis(frame: &mut Frame, area: Rect, app: &mut App) {
     let title = list_title(base, &app.filters[1]);
     if idxs.is_empty() {
         let msg = if !app.filters[1].is_empty() {
-            "No matches. Esc clears the filter."
+            "No matches. Esc clears the filter.".to_string()
         } else if hidden_in_view > 0 {
-            "All present states are hidden. Press f to choose states."
+            "All present states are hidden. Press f to choose states.".to_string()
         } else if app.health.is_empty() {
-            FIRST_RUN_HINT
+            FIRST_RUN_HINT.to_string()
         } else if app.loading {
-            "Loading work items…"
+            loading_msg(app, "Loading work items…")
         } else {
-            "No work items. Press r to refresh."
+            "No work items. Press r to refresh.".to_string()
         };
-        empty(frame, area, theme, msg, section_block(theme, &title));
+        empty(frame, area, theme, &msg, section_block(theme, &title));
         return;
     }
 
@@ -699,15 +697,15 @@ fn render_pipes(frame: &mut Frame, area: Rect, app: &mut App) {
     let title = list_title("Pipelines".to_string(), &app.filters[2]);
     if idxs.is_empty() {
         let msg = if !app.filters[2].is_empty() {
-            "No matches. Esc clears the filter."
+            "No matches. Esc clears the filter.".to_string()
         } else if app.health.is_empty() {
-            FIRST_RUN_HINT
+            FIRST_RUN_HINT.to_string()
         } else if app.loading {
-            "Loading pipeline runs…"
+            loading_msg(app, "Loading pipeline runs…")
         } else {
-            "No pipeline runs. Press r to refresh."
+            "No pipeline runs. Press r to refresh.".to_string()
         };
-        empty(frame, area, theme, msg, section_block(theme, &title));
+        empty(frame, area, theme, &msg, section_block(theme, &title));
         return;
     }
 
@@ -718,7 +716,7 @@ fn render_pipes(frame: &mut Frame, area: Rect, app: &mut App) {
         .iter()
         .map(|&i| &app.pipes[i])
         .map(|p| {
-            let color = theme.pipeline_color(p.run.status);
+            let color = theme.pipeline_color_anim(p.run.status, app.anim);
             let approval = if p.awaiting_approval {
                 ("approval needed".to_string(), Style::default().fg(theme.red).add_modifier(Modifier::BOLD))
             } else {
@@ -1346,8 +1344,8 @@ fn render_pipeline(frame: &mut Frame, area: Rect, theme: &Theme, view: &Pipeline
     let branch = view.branch.clone().unwrap_or_else(|| "—".into());
     let who = view.run.triggered_by.as_ref().map(|u| u.display_name.clone()).unwrap_or_else(|| "—".into());
     let header = Line::from(vec![
-        Span::styled(format!("{} ", pipeline_glyph(view.run.status, anim)), Style::default().fg(theme.pipeline_color(view.run.status))),
-        Span::styled(format!("{:?}", view.run.status), Style::default().fg(theme.pipeline_color(view.run.status)).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("{} ", pipeline_glyph(view.run.status, anim)), Style::default().fg(theme.pipeline_color_anim(view.run.status, anim))),
+        Span::styled(format!("{:?}", view.run.status), Style::default().fg(theme.pipeline_color_anim(view.run.status, anim)).add_modifier(Modifier::BOLD)),
         Span::styled(format!("   branch {branch}   triggered by {who}"), Style::default().fg(theme.dim)),
     ]);
     let header_block = section_block(theme, &view.title);
@@ -1394,7 +1392,7 @@ fn render_pipeline(frame: &mut Frame, area: Rect, theme: &Theme, view: &Pipeline
             let mut spans = vec![
                 Span::raw(indent),
                 Span::styled(marker, Style::default().fg(theme.dim)),
-                Span::styled(format!("{} ", pipeline_glyph(n.status, anim)), Style::default().fg(theme.pipeline_color(n.status))),
+                Span::styled(format!("{} ", pipeline_glyph(n.status, anim)), Style::default().fg(theme.pipeline_color_anim(n.status, anim))),
                 Span::styled(n.label.clone(), label_style),
             ];
             if let Some(d) = &n.duration {

@@ -9,6 +9,15 @@ use forgetop_core::filter::apply_pull_request_filter;
 use forgetop_core::provider::*;
 use forgetop_core::Result;
 
+/// A little simulated network latency so `--demo` visibly shows the loading / refresh
+/// spinners (the canned data is otherwise instant). Skipped under `cargo test` so the
+/// suite stays fast.
+async fn demo_latency() {
+    if !cfg!(test) {
+        tokio::time::sleep(std::time::Duration::from_millis(70)).await;
+    }
+}
+
 fn base() -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 6, 30, 9, 0, 0).unwrap()
 }
@@ -511,6 +520,20 @@ fn pipeline_runs() -> Vec<PipelineRun> {
                 )],
             }],
         },
+        PipelineRun {
+            id: "r502".into(),
+            definition_id: "ci".into(),
+            number: Some(502),
+            name: Some("10.1.101".into()),
+            status: PipelineRunStatus::Queued,
+            triggered_by: Some(alice()),
+            branch: Some("main".into()),
+            commit_sha: Some("cafe123".into()),
+            started_at: None,
+            finished_at: None,
+            url: None,
+            stages: vec![],
+        },
     ]
 }
 
@@ -520,6 +543,7 @@ struct DemoPr {
 #[async_trait]
 impl PullRequestSource for DemoPr {
     async fn list(&self, query: &PullRequestQuery) -> Result<Vec<PullRequest>> {
+        demo_latency().await;
         let prs: Vec<_> = prs_for(&self.conn)
             .into_iter()
             .filter(|p| query.include_completed || matches!(p.status, PullRequestStatus::Open | PullRequestStatus::Draft))
@@ -687,6 +711,7 @@ struct DemoWi {
 #[async_trait]
 impl WorkItemSource for DemoWi {
     async fn list(&self, query: &WorkItemQuery) -> Result<Vec<WorkItem>> {
+        demo_latency().await;
         // The demo's "me" is Alice (u1); mine_only keeps only her items.
         Ok(wis_for(&self.conn)
             .into_iter()
@@ -721,6 +746,7 @@ impl PipelineSource for DemoPipe {
         Ok(pipeline_defs())
     }
     async fn list_runs(&self, query: &PipelineRunQuery) -> Result<Vec<PipelineRun>> {
+        demo_latency().await;
         Ok(pipeline_runs()
             .into_iter()
             .filter(|r| query.definition_id.as_ref().is_none_or(|d| &r.definition_id == d))
