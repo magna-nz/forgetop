@@ -80,6 +80,7 @@ pub struct Reloaded {
     prs: Vec<PrRow>,
     wis: Vec<WiRow>,
     pipes: Vec<PipeRow>,
+    inbox: Vec<NotifRow>,
     lp_prs_mine: Vec<PrRow>,
     lp_prs_review: Vec<PrRow>,
     health: Vec<ConnectionHealth>,
@@ -118,12 +119,23 @@ pub struct WiRow {
     pub wi: WorkItem,
 }
 
+/// One notification tagged with the connection it came from (for the inbox).
+pub struct NotifRow {
+    pub connection_id: String,
+    pub connection: String,
+    pub provider: ProviderType,
+    pub notification: Notification,
+}
+
 pub struct App {
     pub theme: Theme,
     pub active: usize,
     pub prs: Vec<PrRow>,
     pub wis: Vec<WiRow>,
     pub pipes: Vec<PipeRow>,
+    /// The cross-provider notification inbox (distinct from `notifications`, the desktop-ping prefs).
+    pub inbox: Vec<NotifRow>,
+    pub inbox_sel: usize,
     pub pr_state: TableState,
     pub wi_state: TableState,
     pub pipe_state: TableState,
@@ -203,6 +215,9 @@ pub struct App {
     /// True when the currently-open item view was opened from the Launchpad, so Esc
     /// returns there (with the same row still selected) instead of to the section list.
     lp_origin: bool,
+    /// True when the open item view was opened from the notification inbox, so Esc returns
+    /// there. Takes precedence over `lp_origin`.
+    from_inbox: bool,
     /// True while a background refresh is in flight (drives the header spinner + loading text).
     pub reloading: bool,
     /// Sender for completed background jobs; set once the event loop is running.
@@ -227,6 +242,8 @@ pub enum Screen {
     PrView(Box<PrView>),
     /// Full-screen work-item view.
     WiView(Box<WiView>),
+    /// The cross-provider notification inbox.
+    Inbox,
 }
 
 /// State for the full-screen PR view.
@@ -623,6 +640,8 @@ impl App {
             prs: Vec::new(),
             wis: Vec::new(),
             pipes: Vec::new(),
+            inbox: Vec::new(),
+            inbox_sel: 0,
             pr_state: TableState::default(),
             wi_state: TableState::default(),
             pipe_state: TableState::default(),
@@ -664,6 +683,7 @@ impl App {
             lp_prs_review: Vec::new(),
             lp_dismissed: HashSet::new(),
             lp_origin: false,
+            from_inbox: false,
             reloading: false,
             job_tx: None,
             anim: 0,
@@ -1204,6 +1224,7 @@ impl App {
     async fn open_launchpad_selected(&mut self, deps: &AppDeps) {
         let Some(entry) = self.lp_selected().and_then(|i| self.lp.get(i)) else { return };
         self.lp_origin = true; // opened from the Launchpad, so Esc returns there
+        self.from_inbox = false;
         let (kind, conn, id) = (entry.kind(), entry.connection_id.clone(), entry.item_id().to_string());
         match kind {
             launchpad::EntryKind::Pr => {
@@ -1250,6 +1271,7 @@ impl App {
     async fn open_palette_item(&mut self, kind: PaletteKind, id: String, conn: String, deps: &AppDeps) {
         // Esc from the opened view should return to wherever the palette was invoked from.
         self.lp_origin = matches!(self.screen, Screen::Launchpad);
+        self.from_inbox = false;
         match kind {
             PaletteKind::Pr => {
                 let found = self
@@ -1277,6 +1299,120 @@ impl App {
                 }
             }
         }
+    }
+
+    // ---- notification inbox ----
+
+    /// Number of unread notifications — drives the header indicator.
+    pub fn unread_count(&self) -> usize {
+        self.inbox.iter().filter(|r| r.notification.unread).count()
+    }
+
+    fn inbox_move(&mut self, delta: isize) {
+        let n = self.inbox.len();
+        if n == 0 {
+            return;
+        }
+        self.inbox_sel = (self.inbox_sel as isize + delta).rem_euclid(n as isize) as usize;
+    }
+
+    async fn on_inbox_key(&mut self, key: Key, deps: &AppDeps) {
+        match key {
+            Key::Escape => self.screen = Screen::Launchpad,
+            Key::Up | Key::Char('k') => self.inbox_move(-1),
+            Key::Down | Key::Char('j') => self.inbox_move(1),
+            Key::Enter => self.open_inbox_selected(deps).await,
+            Key::Char('o') => {
+                if let Some(url) = self.inbox.get(self.inbox_sel).and_then(|r| r.notification.url.clone()) {
+                    self.toast = Some(match open::that(&url) {
+                        Ok(_) => "Opened in browser".into(),
+                        Err(e) => format!("Couldn't open: {e}"),
+                    });
+                }
+            }
+            Key::Char('x') => self.mark_selected_inbox_read(deps).await,
+            Key::Char('A') => self.mark_all_inbox_read(deps).await,
+            Key::Char('r') => self.request_reload(deps),
+            _ => {}
+        }
+    }
+
+    /// Drill into the item a notification points at (fetching it), or open the browser when
+    /// there's no in-app target. Opening also marks the notification read.
+    async fn open_inbox_selected(&mut self, deps: &AppDeps) {
+        let Some(row) = self.inbox.get(self.inbox_sel) else { return };
+        let conn = row.connection_id.clone();
+        let n = &row.notification;
+        let (item_type, item_id, url, notif_id) = (n.item_type, n.item_id.clone(), n.url.clone(), n.id.clone());
+
+        self.mark_inbox_read(&conn, &notif_id, deps).await;
+
+        match (item_type, item_id) {
+            (NotificationItemType::PullRequest, Some(id)) => {
+                if let Some(src) = self.pr_source_for(&conn, deps).await {
+                    if let Ok(pr) = src.get(&id).await {
+                        self.from_inbox = true;
+                        self.lp_origin = false;
+                        let (label, purl) = (pr_label(&pr), pr.url.clone());
+                        self.open_pr_view_for(deps, 0, id, label, purl, conn, pr).await;
+                        return;
+                    }
+                }
+            }
+            (NotificationItemType::WorkItem, Some(id)) => {
+                if let Some(src) = self.wi_source_for(&conn, deps).await {
+                    if let Ok(wi) = src.get(&id).await {
+                        self.from_inbox = true;
+                        self.lp_origin = false;
+                        self.open_wi_view_for(deps, id, conn, wi).await;
+                        return;
+                    }
+                }
+            }
+            _ => {}
+        }
+        // No in-app target (or the fetch failed) — fall back to the browser.
+        match url {
+            Some(u) => {
+                self.toast = Some(match open::that(&u) {
+                    Ok(_) => "Opened in browser".into(),
+                    Err(e) => format!("Couldn't open: {e}"),
+                })
+            }
+            None => self.toast = Some("Nothing to open for this notification".into()),
+        }
+    }
+
+    async fn mark_selected_inbox_read(&mut self, deps: &AppDeps) {
+        if let Some((conn, id)) = self.inbox.get(self.inbox_sel).map(|r| (r.connection_id.clone(), r.notification.id.clone())) {
+            self.mark_inbox_read(&conn, &id, deps).await;
+            self.toast = Some("Marked read".into());
+        }
+    }
+
+    async fn mark_inbox_read(&mut self, conn: &str, notif_id: &str, deps: &AppDeps) {
+        for row in &mut self.inbox {
+            if row.connection_id == conn && row.notification.id == notif_id {
+                row.notification.unread = false;
+            }
+        }
+        if let Ok(feeds) = deps.sections.notification_feeds().await {
+            if let Some(feed) = feeds.iter().find(|f| f.connection.connection_id() == conn) {
+                let _ = feed.source.mark_read(notif_id).await;
+            }
+        }
+    }
+
+    async fn mark_all_inbox_read(&mut self, deps: &AppDeps) {
+        for row in &mut self.inbox {
+            row.notification.unread = false;
+        }
+        if let Ok(feeds) = deps.sections.notification_feeds().await {
+            for feed in feeds {
+                let _ = feed.source.mark_all_read().await;
+            }
+        }
+        self.toast = Some("All marked read".into());
     }
 
     // ---- data loading ----
@@ -1316,6 +1452,7 @@ impl App {
         let prs = fetch_pull_requests(&deps, p.pr_filter, p.pr_completed, &mut errors).await;
         let wis = fetch_work_items(&deps, &mut errors).await;
         let pipes = fetch_pipelines(&deps, &mut errors).await;
+        let inbox = fetch_notifications(&deps, &mut errors).await;
         let (lp_prs_mine, lp_prs_review) = fetch_launchpad_prs(&deps).await;
         let health = deps.health.check_all().await;
         let scan = scan_pr_notifications(&deps, &p).await;
@@ -1323,7 +1460,7 @@ impl App {
             Some((conn_id, run_id)) => fetch_open_pipeline(&deps, conn_id, run_id).await,
             None => None,
         };
-        Reloaded { prs, wis, pipes, lp_prs_mine, lp_prs_review, health, scan, open_pipeline, errors }
+        Reloaded { prs, wis, pipes, inbox, lp_prs_mine, lp_prs_review, health, scan, open_pipeline, errors }
     }
 
     /// The inline (blocking) variant used by [`reload_all`].
@@ -1337,6 +1474,10 @@ impl App {
         self.prs = r.prs;
         self.wis = r.wis;
         self.pipes = r.pipes;
+        self.inbox = r.inbox;
+        if self.inbox_sel >= self.inbox.len() {
+            self.inbox_sel = self.inbox.len().saturating_sub(1);
+        }
         self.lp_prs_mine = r.lp_prs_mine;
         self.lp_prs_review = r.lp_prs_review;
         self.health = r.health;
@@ -1567,6 +1708,12 @@ impl App {
             self.open_palette();
             return;
         }
+        // `i` opens the notification inbox from the list screens and the Launchpad.
+        if key == Key::Char('i') && matches!(self.screen, Screen::List | Screen::Launchpad) {
+            self.inbox_sel = self.inbox_sel.min(self.inbox.len().saturating_sub(1));
+            self.screen = Screen::Inbox;
+            return;
+        }
 
         // Full-screen sub-views handle their own keys.
         match self.screen {
@@ -1612,6 +1759,10 @@ impl App {
                 self.on_launchpad_key(key, deps).await;
                 return;
             }
+            Screen::Inbox => {
+                self.on_inbox_key(key, deps).await;
+                return;
+            }
             Screen::List => {}
         }
 
@@ -1640,6 +1791,7 @@ impl App {
             Key::PageUp => self.list_scroll = self.list_scroll.saturating_sub(8),
             Key::Enter => {
                 self.lp_origin = false; // opened from the section list, so Esc returns there
+                self.from_inbox = false;
                 match self.active {
                     0 => self.open_pr_view(deps, 0).await,
                     1 => self.open_wi_view(deps).await,
@@ -1880,7 +2032,9 @@ impl App {
     /// Where Esc lands when closing an item view: back to the Launchpad if it was
     /// opened from there (row still selected), otherwise the section list.
     fn view_origin(&self) -> Screen {
-        if self.lp_origin {
+        if self.from_inbox {
+            Screen::Inbox
+        } else if self.lp_origin {
             Screen::Launchpad
         } else {
             Screen::List
@@ -2387,6 +2541,8 @@ impl App {
                 let nodes = v.flatten();
                 return nodes.get(v.selected).and_then(|n| n.url.clone()).or_else(|| v.run.url.clone());
             }
+            // The Inbox opens the selected notification's URL directly.
+            Screen::Inbox => return self.inbox.get(self.inbox_sel).and_then(|r| r.notification.url.clone()),
             // Launchpad has no single "selected URL" here — Enter opens the item's view,
             // where `o` then works.
             Screen::Launchpad | Screen::List | Screen::Config(_) => {}
@@ -3429,6 +3585,29 @@ async fn fetch_work_items(deps: &AppDeps, errors: &mut Vec<String>) -> Vec<WiRow
     out
 }
 
+async fn fetch_notifications(deps: &AppDeps, errors: &mut Vec<String>) -> Vec<NotifRow> {
+    let mut out = Vec::new();
+    match deps.sections.notification_feeds().await {
+        Ok(feeds) => {
+            for feed in feeds {
+                let (provider, name, conn_id) = feed_tag(&feed.connection);
+                match feed.source.list().await {
+                    Ok(list) => out.extend(list.into_iter().map(|n| NotifRow {
+                        connection_id: conn_id.clone(),
+                        connection: name.clone(),
+                        provider,
+                        notification: n,
+                    })),
+                    Err(e) => errors.push(format!("Notifications ({name}): {e}")),
+                }
+            }
+        }
+        Err(e) => errors.push(format!("Notifications: {e}")),
+    }
+    out.sort_by(|a, b| b.notification.updated_at.cmp(&a.notification.updated_at)); // newest first
+    out
+}
+
 async fn fetch_pipelines(deps: &AppDeps, errors: &mut Vec<String>) -> Vec<PipeRow> {
     let mut out = Vec::new();
     match deps.sections.pipeline_feeds().await {
@@ -3674,6 +3853,35 @@ mod tests {
     }
 
     #[test]
+    fn inbox_unread_count_and_move_wraps() {
+        let mut app = App::new("slate");
+        let n = |id: &str, unread: bool| NotifRow {
+            connection_id: "github".into(),
+            connection: "GitHub".into(),
+            provider: ProviderType::GitHub,
+            notification: Notification {
+                id: id.into(),
+                kind: NotificationKind::Mention,
+                item_type: NotificationItemType::WorkItem,
+                item_id: None,
+                title: "t".into(),
+                context: "c".into(),
+                url: None,
+                unread,
+                updated_at: None,
+            },
+        };
+        app.inbox = vec![n("a", true), n("b", false), n("c", true)];
+        assert_eq!(app.unread_count(), 2);
+        app.inbox_move(1);
+        assert_eq!(app.inbox_sel, 1);
+        app.inbox_move(-1);
+        assert_eq!(app.inbox_sel, 0);
+        app.inbox_move(-1);
+        assert_eq!(app.inbox_sel, 2, "moving up past the top wraps to the end");
+    }
+
+    #[test]
     fn palette_candidates_map_rows_to_searchable_items() {
         let mut p = pr(None);
         p.id = "pr1".into();
@@ -3708,6 +3916,7 @@ mod tests {
             prs: vec![pr_row(pr(None)), pr_row(pr(None))],
             wis: vec![wi_row(wi(None))],
             pipes: vec![],
+            inbox: vec![],
             lp_prs_mine: vec![],
             lp_prs_review: vec![],
             health: vec![],

@@ -301,6 +301,13 @@ pub struct WorkItemFeed {
     pub source: Arc<dyn WorkItemSource>,
 }
 
+/// One connection contributing to the notification inbox. Unlike the section feeds this
+/// isn't binding-scoped — every connection with a notification feed contributes.
+pub struct NotificationFeed {
+    pub connection: Arc<dyn ProviderConnection>,
+    pub source: Arc<dyn NotificationSource>,
+}
+
 /// Resolves the live source(s) backing each section from the current bindings.
 pub struct SectionService {
     config: Arc<ConfigService>,
@@ -335,6 +342,21 @@ impl SectionService {
             if let Some(conn) = self.resolver.resolve(&id).await? {
                 if let Some(source) = conn.work_items() {
                     feeds.push(WorkItemFeed { connection: conn, source });
+                }
+            }
+        }
+        Ok(feeds)
+    }
+
+    /// Every connection that exposes a notification feed (across all connections, not just
+    /// section-bound ones) — the inbox aggregates them all.
+    pub async fn notification_feeds(&self) -> Result<Vec<NotificationFeed>> {
+        let cfg = self.config.snapshot();
+        let mut feeds = Vec::new();
+        for c in &cfg.connections {
+            if let Some(conn) = self.resolver.resolve(&c.id).await? {
+                if let Some(source) = conn.notifications() {
+                    feeds.push(NotificationFeed { connection: conn, source });
                 }
             }
         }

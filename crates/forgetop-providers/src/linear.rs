@@ -65,6 +65,40 @@ pub fn map_comment(v: &Value) -> Comment {
     }
 }
 
+/// Linear notification `type` → our unified kind.
+fn linear_type_kind(t: &str) -> NotificationKind {
+    match t {
+        "issueAssignedToYou" => NotificationKind::Assigned,
+        "issueMention" | "issueCommentMention" => NotificationKind::Mention,
+        "issueStatusChanged" => NotificationKind::StateChange,
+        "issueNewComment" => NotificationKind::Comment,
+        _ => NotificationKind::Other,
+    }
+}
+
+/// Map a Linear notification node to a [`Notification`]. Linear only notifies about issues,
+/// so the item id is the issue id (which the work-item source can open).
+pub fn map_linear_notification(v: &Value) -> Notification {
+    let issue = get_obj(v, "issue");
+    Notification {
+        id: get_str(v, "id").unwrap_or_default(),
+        kind: linear_type_kind(&get_str(v, "type").unwrap_or_default()),
+        item_type: if issue.is_some() { NotificationItemType::WorkItem } else { NotificationItemType::Other },
+        item_id: issue.and_then(|i| get_str(i, "id")),
+        title: issue.and_then(|i| get_str(i, "title")).unwrap_or_default(),
+        context: issue
+            .and_then(|i| get_obj(i, "team"))
+            .and_then(|t| get_str(t, "name"))
+            .or_else(|| issue.and_then(|i| get_str(i, "identifier")))
+            .unwrap_or_else(|| "Linear".into()),
+        url: issue.and_then(|i| get_str(i, "url")),
+        unread: get_str(v, "readAt").is_none(),
+        updated_at: get_date(v, "createdAt"),
+    }
+}
+
+const NOTIFICATIONS_QUERY: &str = r#"query { notifications(first: 50) { nodes { id type readAt createdAt ... on IssueNotification { issue { id title url identifier team { name } } } } } }"#;
+
 pub struct LinearClient {
     http: reqwest::Client,
     base: String,
@@ -146,6 +180,22 @@ impl WorkItemSource for LinearWi {
     }
 }
 
+pub struct LinearNotif(pub Arc<LinearClient>);
+
+#[async_trait]
+impl NotificationSource for LinearNotif {
+    async fn list(&self) -> Result<Vec<Notification>> {
+        let data = self.0.query(NOTIFICATIONS_QUERY, Value::Null).await?;
+        Ok(get_obj(&data, "notifications")
+            .map(|n| get_arr(n, "nodes").iter().map(map_linear_notification).collect())
+            .unwrap_or_default())
+    }
+    async fn mark_read(&self, id: &str) -> Result<()> {
+        let mutation = "mutation($id:String!,$readAt:DateTime!){ notificationUpdate(id:$id,input:{readAt:$readAt}){ success } }";
+        self.0.query(mutation, json!({ "id": id, "readAt": chrono::Utc::now().to_rfc3339() })).await.map(|_| ())
+    }
+}
+
 pub struct LinearConnection {
     id: String,
     display_name: String,
@@ -176,13 +226,21 @@ impl ProviderConnection for LinearConnection {
     fn pipelines(&self) -> Option<Arc<dyn PipelineSource>> {
         None
     }
+    fn notifications(&self) -> Option<Arc<dyn NotificationSource>> {
+        Some(Arc::new(LinearNotif(self.client.clone())))
+    }
     async fn check(&self) -> bool {
         self.client.query("query { viewer { id } }", Value::Null).await.is_ok()
     }
 }
 
 pub fn linear_capabilities() -> Capabilities {
-    Capabilities { supports_work_items: true, terminology: Terminology { work_items: "Issues".into(), ..Default::default() }, ..Default::default() }
+    Capabilities {
+        supports_work_items: true,
+        supports_notifications: true,
+        terminology: Terminology { work_items: "Issues".into(), ..Default::default() },
+        ..Default::default()
+    }
 }
 
 pub struct LinearFactory;
@@ -209,6 +267,33 @@ impl ProviderFactory for LinearFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn maps_notification_type_and_issue() {
+        let v: Value = serde_json::from_str(
+            r#"{ "id": "n-1", "type": "issueAssignedToYou", "readAt": null, "createdAt": "2026-07-10T08:00:00Z",
+                 "issue": { "id": "iss-123", "title": "Design the ledger job", "url": "https://linear.app/x/issue/ENG-231",
+                            "identifier": "ENG-231", "team": { "name": "Engineering" } } }"#,
+        )
+        .unwrap();
+        let n = map_linear_notification(&v);
+        assert_eq!(n.id, "n-1");
+        assert_eq!(n.kind, NotificationKind::Assigned);
+        assert_eq!(n.item_type, NotificationItemType::WorkItem);
+        assert_eq!(n.item_id.as_deref(), Some("iss-123"), "issue id for in-app drill-in");
+        assert_eq!(n.context, "Engineering");
+        assert!(n.unread, "no readAt → unread");
+
+        // A read mention.
+        let read: Value = serde_json::from_str(
+            r#"{ "id": "n-2", "type": "issueCommentMention", "readAt": "2026-07-10T09:00:00Z",
+                 "issue": { "id": "iss-9", "title": "x", "url": "u", "identifier": "ENG-9" } }"#,
+        )
+        .unwrap();
+        let m = map_linear_notification(&read);
+        assert_eq!(m.kind, NotificationKind::Mention);
+        assert!(!m.unread, "readAt set → read");
+    }
 
     #[test]
     fn maps_issue_with_state_and_assignee() {

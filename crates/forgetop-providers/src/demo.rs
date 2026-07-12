@@ -809,6 +809,83 @@ impl PipelineSource for DemoPipe {
     }
 }
 
+/// Notification ids marked read this `--demo` session, so mark_read persists like real.
+fn read_notifications() -> &'static Mutex<HashSet<String>> {
+    static STORE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn notif(
+    id: &str,
+    kind: NotificationKind,
+    item: NotificationItemType,
+    item_id: Option<&str>,
+    title: &str,
+    context: &str,
+    url: &str,
+    updated_h: i64,
+) -> Notification {
+    Notification {
+        id: id.into(),
+        kind,
+        item_type: item,
+        item_id: item_id.map(Into::into),
+        title: title.into(),
+        context: context.into(),
+        url: Some(url.into()),
+        unread: true,
+        updated_at: Some(base() - chrono::Duration::hours(updated_h)),
+    }
+}
+
+/// Canned notifications per demo connection, each pointing at one of that connection's real
+/// demo items (by id) so pressing it drills into the actual PR / work item.
+fn demo_notifications_for(conn: &str) -> Vec<Notification> {
+    use NotificationItemType as IT;
+    use NotificationKind as K;
+    match conn {
+        "github" => vec![
+            notif("gh-1", K::ReviewRequested, IT::PullRequest, Some("1501"), "Refactor the webhook retry queue", "northwind/payments", "https://example.test/pr/1501", 1),
+            notif("gh-2", K::CiFailed, IT::PullRequest, Some("1492"), "Bump Next.js to 14.2.5", "northwind/web", "https://example.test/pr/1492", 3),
+            notif("gh-3", K::Mention, IT::WorkItem, Some("#842"), "Investigate elevated p99 on POST /charge", "northwind/payments", "https://example.test/issue/842", 5),
+            notif("gh-4", K::Comment, IT::PullRequest, Some("1487"), "Add idempotency keys to the payments API", "northwind/payments", "https://example.test/pr/1487", 26),
+        ],
+        "gitlab" => vec![
+            notif("gl-1", K::ReviewRequested, IT::PullRequest, Some("318"), "Rotate the KMS signing keys", "platform/infra", "https://example.test/mr/318", 2),
+            notif("gl-2", K::Assigned, IT::WorkItem, Some("#77"), "Right-size the staging cluster", "platform/infra", "https://example.test/issue/77", 6),
+        ],
+        "linear" => vec![
+            notif("ln-1", K::Assigned, IT::WorkItem, Some("ENG-231"), "Design the ledger reconciliation job", "Engineering", "https://example.test/issue/ENG-231", 4),
+            notif("ln-2", K::StateChange, IT::WorkItem, Some("ENG-198"), "Migrate feature flags to OpenFeature", "Engineering", "https://example.test/issue/ENG-198", 18),
+        ],
+        _ => vec![],
+    }
+}
+
+struct DemoNotifications {
+    conn: String,
+}
+#[async_trait]
+impl NotificationSource for DemoNotifications {
+    async fn list(&self) -> Result<Vec<Notification>> {
+        demo_latency().await;
+        let read = read_notifications().lock().unwrap();
+        let mut ns = demo_notifications_for(&self.conn);
+        for n in ns.iter_mut() {
+            if read.contains(&n.id) {
+                n.unread = false;
+            }
+        }
+        ns.sort_by(|a, b| b.updated_at.cmp(&a.updated_at)); // newest first
+        Ok(ns)
+    }
+    async fn mark_read(&self, id: &str) -> Result<()> {
+        read_notifications().lock().unwrap().insert(id.to_string());
+        Ok(())
+    }
+}
+
 pub struct DemoConnection {
     id: String,
     display_name: String,
@@ -839,6 +916,9 @@ impl ProviderConnection for DemoConnection {
     fn pipelines(&self) -> Option<Arc<dyn PipelineSource>> {
         self.caps.supports_pipelines.then(|| Arc::new(DemoPipe { conn: self.id.clone() }) as Arc<dyn PipelineSource>)
     }
+    fn notifications(&self) -> Option<Arc<dyn NotificationSource>> {
+        self.caps.supports_notifications.then(|| Arc::new(DemoNotifications { conn: self.id.clone() }) as Arc<dyn NotificationSource>)
+    }
     async fn check(&self) -> bool {
         true
     }
@@ -847,13 +927,16 @@ impl ProviderConnection for DemoConnection {
 /// Capabilities for a demo connection — mirrors the real provider so the UI gates
 /// sections and labels (MRs vs PRs, Issues) exactly as it would live.
 pub fn demo_capabilities(provider: ProviderType) -> Capabilities {
-    match provider {
+    let mut caps = match provider {
         ProviderType::GitLab => crate::gitlab::gitlab_capabilities(),
         ProviderType::Bitbucket => crate::bitbucket::bitbucket_capabilities(),
         ProviderType::Linear => crate::linear::linear_capabilities(),
         ProviderType::Jira => crate::jira::jira_capabilities(),
         _ => crate::github::github_capabilities(),
-    }
+    };
+    // The demo shows the inbox for the providers that have a real notification feed.
+    caps.supports_notifications = matches!(provider, ProviderType::GitHub | ProviderType::GitLab | ProviderType::Linear);
+    caps
 }
 
 pub struct DemoFactory {
@@ -945,6 +1028,32 @@ mod tests {
         let after = src.threads(id).await.unwrap();
         assert_eq!(after.len(), before + 1);
         assert!(after.iter().any(|t| t.comments.iter().any(|c| c.body == "on it")));
+    }
+
+    #[tokio::test]
+    async fn demo_notifications_list_mark_and_targets_resolve() {
+        // Capability gating: only GitHub/GitLab/Linear have a feed.
+        assert!(demo_capabilities(ProviderType::GitHub).supports_notifications);
+        assert!(demo_capabilities(ProviderType::Linear).supports_notifications);
+        assert!(!demo_capabilities(ProviderType::Jira).supports_notifications);
+
+        let src = DemoNotifications { conn: "github".into() };
+        let ns = src.list().await.unwrap();
+        assert!(!ns.is_empty());
+        assert!(ns.windows(2).all(|w| w[0].updated_at >= w[1].updated_at), "newest first");
+        assert!(ns.iter().any(|n| n.unread), "some are unread");
+
+        // The review-request points at a real demo PR the source can open (in-app drill-in).
+        let review = ns.iter().find(|n| n.kind == NotificationKind::ReviewRequested).unwrap();
+        assert_eq!(review.item_type, NotificationItemType::PullRequest);
+        let pr_id = review.item_id.clone().expect("has an item to open");
+        let pr = DemoPr { conn: "github".into() }.get(&pr_id).await.unwrap();
+        assert_eq!(pr.id, pr_id, "item_id resolves to a real demo PR");
+
+        // Marking read persists for the session.
+        src.mark_read(&review.id).await.unwrap();
+        let after = src.list().await.unwrap();
+        assert!(!after.iter().find(|n| n.id == review.id).unwrap().unread);
     }
 
     #[tokio::test]

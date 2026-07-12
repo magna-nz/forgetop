@@ -268,11 +268,51 @@ fn notes_to_thread(prefix: &str, id: &str, notes: &[Value]) -> Vec<CommentThread
 
 // ---- client ----
 
+/// GitLab todo `action_name` → our unified kind.
+fn gitlab_action_kind(action: &str) -> NotificationKind {
+    match action {
+        "assigned" => NotificationKind::Assigned,
+        "review_requested" | "approval_required" => NotificationKind::ReviewRequested,
+        "mentioned" | "directly_addressed" => NotificationKind::Mention,
+        "build_failed" => NotificationKind::CiFailed,
+        _ => NotificationKind::Other,
+    }
+}
+
+/// Map a GitLab todo (`GET /todos`) to a [`Notification`]. `iid` is safe to drill into
+/// because the source scopes todos to this project.
+pub fn map_todo(v: &Value) -> Notification {
+    let target = get_obj(v, "target");
+    let item_type = match get_str(v, "target_type").as_deref() {
+        Some("MergeRequest") => NotificationItemType::PullRequest,
+        Some("Issue") => NotificationItemType::WorkItem,
+        _ => NotificationItemType::Other,
+    };
+    let item_id = match item_type {
+        NotificationItemType::PullRequest | NotificationItemType::WorkItem => {
+            target.and_then(|t| get_i64(t, "iid")).map(|i| i.to_string())
+        }
+        _ => None,
+    };
+    Notification {
+        id: get_i64(v, "id").map(|i| i.to_string()).unwrap_or_default(),
+        kind: gitlab_action_kind(&get_str(v, "action_name").unwrap_or_default()),
+        item_type,
+        item_id,
+        title: target.and_then(|t| get_str(t, "title")).unwrap_or_default(),
+        context: get_obj(v, "project").and_then(|p| get_str(p, "path_with_namespace")).unwrap_or_default(),
+        url: get_str(v, "target_url").or_else(|| target.and_then(|t| get_str(t, "web_url"))),
+        unread: get_str(v, "state").as_deref() == Some("pending"),
+        updated_at: get_date(v, "updated_at").or_else(|| get_date(v, "created_at")),
+    }
+}
+
 pub struct GitLabClient {
     http: reqwest::Client,
     base: String,
     project: String,
     self_username: tokio::sync::Mutex<Option<String>>,
+    project_id: tokio::sync::Mutex<Option<i64>>,
 }
 
 impl GitLabClient {
@@ -308,6 +348,16 @@ impl GitLabClient {
         }
         Ok(guard.clone())
     }
+
+    /// The project's numeric id (cached) — needed to scope the user's todos to this project.
+    async fn project_numeric_id(&self) -> Result<Option<i64>> {
+        let mut guard = self.project_id.lock().await;
+        if guard.is_none() {
+            let v = self.get_json(&self.project_path("")).await?;
+            *guard = get_i64(&v, "id");
+        }
+        Ok(*guard)
+    }
 }
 
 macro_rules! source {
@@ -318,6 +368,26 @@ macro_rules! source {
 source!(GitLabPr);
 source!(GitLabWi);
 source!(GitLabPipe);
+source!(GitLabNotif);
+
+#[async_trait]
+impl NotificationSource for GitLabNotif {
+    async fn list(&self) -> Result<Vec<Notification>> {
+        // Scope to this project so a todo's iid is safe to open in-app.
+        let mut url = format!("{}/todos?state=pending&per_page=50", self.0.base);
+        if let Some(pid) = self.0.project_numeric_id().await? {
+            url.push_str(&format!("&project_id={pid}"));
+        }
+        let v = self.0.get_json(&url).await?;
+        Ok(v.as_array().unwrap_or(&vec![]).iter().map(map_todo).collect())
+    }
+    async fn mark_read(&self, id: &str) -> Result<()> {
+        self.0.post_json(&format!("{}/todos/{id}/mark_as_done", self.0.base), json!({})).await
+    }
+    async fn mark_all_read(&self) -> Result<()> {
+        self.0.post_json(&format!("{}/todos/mark_as_done", self.0.base), json!({})).await
+    }
+}
 
 #[async_trait]
 impl PullRequestSource for GitLabPr {
@@ -543,6 +613,9 @@ impl ProviderConnection for GitLabConnection {
     fn work_items(&self) -> Option<Arc<dyn WorkItemSource>> {
         Some(Arc::new(GitLabWi(self.client.clone())))
     }
+    fn notifications(&self) -> Option<Arc<dyn NotificationSource>> {
+        Some(Arc::new(GitLabNotif(self.client.clone())))
+    }
     fn pipelines(&self) -> Option<Arc<dyn PipelineSource>> {
         Some(Arc::new(GitLabPipe(self.client.clone())))
     }
@@ -561,6 +634,7 @@ pub fn gitlab_capabilities() -> Capabilities {
         supports_inline_comments: true,
         supports_pipeline_trigger: true,
         supports_pipeline_discovery: true,
+        supports_notifications: true,
         terminology: Terminology {
             pull_requests: "Merge Requests".into(),
             work_items: "Issues".into(),
@@ -595,6 +669,7 @@ impl ProviderFactory for GitLabFactory {
             base: connection.base_url.clone().unwrap_or_else(|| "https://gitlab.com/api/v4".into()),
             project: encode_project(&project),
             self_username: tokio::sync::Mutex::new(None),
+            project_id: tokio::sync::Mutex::new(None),
         });
         Ok(Arc::new(GitLabConnection {
             id: connection.id.clone(),
@@ -608,6 +683,31 @@ impl ProviderFactory for GitLabFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn maps_todo_action_and_target() {
+        let v: Value = serde_json::from_str(
+            r#"{ "id": 130, "action_name": "review_requested", "state": "pending", "created_at": "2026-07-10T08:00:00Z",
+                 "target_type": "MergeRequest", "target": { "iid": 42, "title": "Rotate keys" },
+                 "project": { "path_with_namespace": "platform/infra" },
+                 "target_url": "https://gitlab.com/platform/infra/-/merge_requests/42" }"#,
+        )
+        .unwrap();
+        let n = map_todo(&v);
+        assert_eq!(n.id, "130");
+        assert_eq!(n.kind, NotificationKind::ReviewRequested);
+        assert_eq!(n.item_type, NotificationItemType::PullRequest);
+        assert_eq!(n.item_id.as_deref(), Some("42"), "MR iid for in-app drill-in");
+        assert_eq!(n.context, "platform/infra");
+        assert!(n.unread);
+
+        let build: Value = serde_json::from_str(
+            r#"{ "id": 5, "action_name": "build_failed", "state": "pending", "target_type": "Issue",
+                 "target": { "iid": 7, "title": "Flaky test" }, "project": { "path_with_namespace": "p/x" } }"#,
+        )
+        .unwrap();
+        assert_eq!(map_todo(&build).kind, NotificationKind::CiFailed);
+    }
 
     #[test]
     fn manual_status_surfaces_as_pending_not_canceled() {

@@ -21,6 +21,7 @@ This is the full reference. For install and a 60-second start, see the
 - [Pipelines](#pipelines)
 - [Filtering and sorting](#filtering-and-sorting)
 - [Command palette](#command-palette)
+- [Notification inbox](#notification-inbox)
 - [Saved views](#saved-views)
 - [Notifications](#notifications)
 - [Keybindings](#keybindings)
@@ -57,6 +58,9 @@ This is the full reference. For install and a 60-second start, see the
   state visibility, and pipeline subscriptions — all remembered per view.
 - **Command palette (`Ctrl-P`)** — fuzzy-jump to any PR, work item, or pipeline across
   every provider from one search box, without scrolling or switching tabs.
+- **Notification inbox (`i`)** — your cross-provider notification stream (reviews, mentions,
+  CI failures, assignments) in one list, with a top-left unread indicator; `Enter` drills
+  straight into the item. GitHub, GitLab, and Linear.
 - **Saved views** — bundle a filter + sort + state into a named view and flip
   between them from an always-visible view bar (`[` / `]`).
 - **Desktop notifications** — get pinged when a pipeline fails, a review is
@@ -343,6 +347,41 @@ item's full view, `Esc` to dismiss. Each row carries a status dot in the usual
 green/blue/red/grey colours, so you can scan state as you jump. It searches only what's
 loaded — no network round-trip — so it's instant.
 
+## Notification inbox
+
+Press **`i`** (from the Launchpad or any list) to open the **Inbox** — your notification
+*stream* aggregated across providers: review requests, @mentions, assignments, CI failures,
+comments, and state changes, newest first. It answers *what just happened*, where the
+Launchpad answers *what needs me now*.
+
+A **`Notifications (N) [i]`** nav item sits at the **far right** of the tab bar on every
+screen — dim grey when you're at zero, **bold yellow** with the count when there's something
+waiting, and highlighted (accent) while the Inbox is open. It's a nav item, not part of the
+`Tab` cycle (which stays on Launchpad → Pull Requests → Work Items → Pipelines).
+
+- `↑`/`↓` move · **`Enter`** opens the item **in-app** (drills straight into that PR / work
+  item) · `o` opens it in the browser · `x` marks the row read · `A` marks everything read ·
+  `r` refreshes · `Esc` back. Opening or marking updates the count immediately.
+- Each row shows a kind glyph in the status colours (CI failures red, reviews/assignments
+  accent, mentions magenta), an unread dot, the title, the repo/project, the connection, and
+  age. It refreshes on the 30s poll like everything else.
+
+**Provider support.** The inbox is fed by the providers that expose a personal notification
+feed:
+
+| Provider | Notification inbox |
+| --- | :---: |
+| **GitHub** | ✅ (notifications) |
+| **GitLab** | ✅ (todos) |
+| **Linear** | ✅ (notifications) |
+| **Azure DevOps** | — no personal feed |
+| **Bitbucket** | — no personal feed |
+| **Jira** | — no personal feed |
+
+Azure DevOps, Bitbucket, and Jira don't offer a personal notification feed in their APIs, so
+connections for those providers simply don't contribute to the inbox. (This is separate from
+[desktop notifications](#notifications), which is about which events fire an OS ping.)
+
 ## Saved views
 
 A **saved view** is a named bundle of a section's shaping — its base filter, the
@@ -393,6 +432,7 @@ the keys valid for where you are. Press `?` for the full panel. The complete set
 | `←` / `→`, `h` / `l`, `Tab`, `1`–`4` | Switch tab (`1` = Launchpad) |
 | `↑` / `↓`, `k` / `j` | Move selection |
 | `Ctrl-P` | Command palette — fuzzy-jump to any PR, work item, or pipeline |
+| `i` | Notification inbox (review requests, mentions, CI failures, assignments) |
 | `/` | Quick-filter the current list |
 | `S` | Sort by a column (re-pick flips direction) |
 | `o` | Open selected item in browser |

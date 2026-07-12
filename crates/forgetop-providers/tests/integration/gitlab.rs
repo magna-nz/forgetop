@@ -141,3 +141,15 @@ async fn gitlab_manual_job_approval_lifecycle() {
     raw.delete_pipeline(run_id.parse().unwrap()).await;
     raw.delete_branch(&branch).await;
 }
+
+#[tokio::test]
+async fn gitlab_lists_notifications() {
+    let gl = skip_if_none!(harness::gitlab(), "gitlab");
+    let notifs = gl.conn.notifications().expect("gitlab advertises notifications");
+    // Decoding the todos envelope is the assertion; no pending todos returns [].
+    let list = notifs.list().await.expect("list todos");
+    eprintln!("gitlab: {} todo(s)", list.len());
+    if let Some(n) = list.first() {
+        assert!(!n.id.is_empty(), "a todo carries an id for mark-as-done");
+    }
+}
