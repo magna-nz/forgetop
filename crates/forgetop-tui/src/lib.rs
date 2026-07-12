@@ -33,6 +33,7 @@ type Term = Terminal<CrosstermBackend<Stdout>>;
 
 /// Set up the terminal, run the loop against `deps`, and always restore the terminal.
 pub async fn run(deps: AppDeps, theme_name: &str) -> Result<()> {
+    install_panic_hook();
     let mut terminal = setup_terminal().map_err(forgetop_core::Error::from)?;
 
     let mut app = App::new(theme_name);
@@ -145,6 +146,20 @@ fn map_key(code: KeyCode, mods: KeyModifiers) -> Key {
         KeyCode::Char(c) => Key::Char(c),
         _ => Key::None,
     }
+}
+
+/// On panic, leave the alternate screen + raw mode so the message is readable (not a
+/// garbled terminal), record it to the log file, and point the user at it — then defer to
+/// the default hook so the backtrace still prints.
+fn install_panic_hook() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        forgetop_core::diag::log("panic", &info.to_string());
+        eprintln!("\nforgetop crashed — details logged to {}", forgetop_core::diag::log_path().display());
+        default(info);
+    }));
 }
 
 fn setup_terminal() -> io::Result<Term> {
