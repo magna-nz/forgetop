@@ -430,18 +430,34 @@ impl PullRequestSource for DemoPr {
         prs_for(&self.conn).into_iter().find(|p| p.id == id).ok_or_else(|| forgetop_core::Error::NotFound(id.into()))
     }
     async fn threads(&self, _id: &str) -> Result<Vec<CommentThread>> {
-        Ok(vec![CommentThread {
-            id: "t1".into(),
-            comments: vec![Comment {
-                id: "c1".into(),
-                author: bob(),
-                body: "Looks good — one nit on the jitter.".into(),
-                created_at: Some(base() - chrono::Duration::hours(2)),
-            }],
-            file_path: None,
-            line: None,
-            is_resolved: false,
-        }])
+        Ok(vec![
+            // Anchored to a diff line so the diff shows a gutter dot and `]`/`[` can jump to it.
+            CommentThread {
+                id: "t1".into(),
+                comments: vec![Comment {
+                    id: "c1".into(),
+                    author: bob(),
+                    body: "One nit on the jitter — cap the backoff so it can't grow unbounded.".into(),
+                    created_at: Some(base() - chrono::Duration::hours(2)),
+                }],
+                file_path: Some("src/http/retry.rs".into()),
+                line: Some(15),
+                is_resolved: false,
+            },
+            // A resolved thread on the other file (○ in the gutter).
+            CommentThread {
+                id: "t2".into(),
+                comments: vec![Comment {
+                    id: "c2".into(),
+                    author: carol(),
+                    body: "Good call reusing the policy here.".into(),
+                    created_at: Some(base() - chrono::Duration::hours(3)),
+                }],
+                file_path: Some("src/http/client.rs".into()),
+                line: Some(13),
+                is_resolved: true,
+            },
+        ])
     }
     async fn changes(&self, _id: &str) -> Result<Vec<FileChange>> {
         Ok(vec![
