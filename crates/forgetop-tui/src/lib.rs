@@ -3,6 +3,7 @@
 
 pub mod app;
 pub mod diff;
+pub mod highlight;
 pub mod launchpad;
 pub mod overlay;
 pub mod palette;
