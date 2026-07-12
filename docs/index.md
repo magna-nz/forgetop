@@ -233,9 +233,10 @@ strategy), `c` comment, `o` open in browser.
   file-list title tracks your progress as **`N/M reviewed`**. Session-only.
 - **Directory grouping** — files are grouped under directory headers so a large PR
   is easier to scan.
-- **Jump between threads** — **`[`** / **`]`** move the cursor to the previous / next
-  existing comment thread in the file; thread lines show a gutter dot (● open,
-  ○ resolved).
+- **Inline comment threads** — existing review comments render **inline in the diff,
+  beneath the line they're on** (a left bar: accent = open, dim = resolved), so you read
+  them in context instead of a side list. **`[`** / **`]`** jump the cursor between them.
+  (Unanchored / PR-level comments stay on the Conversation tab.)
 
 ### Reviewing code with line comments
 

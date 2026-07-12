@@ -1139,19 +1139,14 @@ fn kind_badge(theme: &Theme, kind: FileChangeKind) -> Span<'static> {
 }
 
 fn render_diff(frame: &mut Frame, area: Rect, theme: &Theme, diff: &DiffView, pending: &[LineComment]) {
+    // File list on the left; the patch on the right renders comment threads inline,
+    // beneath the lines they anchor to (unanchored threads live on the Conversation tab).
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(44), Constraint::Min(20)])
         .split(area);
 
-    let thread_h = if diff.threads.is_empty() { 3 } else { 12 };
-    let left = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(4), Constraint::Length(thread_h)])
-        .split(cols[0]);
-
-    render_diff_files(frame, left[0], theme, diff);
-    render_diff_threads(frame, left[1], theme, diff);
+    render_diff_files(frame, cols[0], theme, diff);
     render_diff_patch(frame, cols[1], theme, diff, pending);
 }
 
@@ -1219,35 +1214,6 @@ fn render_diff_files(frame: &mut Frame, area: Rect, theme: &Theme, diff: &DiffVi
     frame.render_stateful_widget(table, area, &mut state);
 }
 
-fn render_diff_threads(frame: &mut Frame, area: Rect, theme: &Theme, diff: &DiffView) {
-    let title = format!("Comments ({})", diff.threads.len());
-    let block = section_block(theme, &title);
-    if diff.threads.is_empty() {
-        empty(frame, area, theme, "No review comments.", block);
-        return;
-    }
-    let mut lines: Vec<Line> = Vec::new();
-    for t in &diff.threads {
-        let loc = match (&t.file_path, t.line) {
-            (Some(p), Some(l)) => format!("{p}:{l}"),
-            (Some(p), None) => p.clone(),
-            _ => "general".into(),
-        };
-        let mark = if t.is_resolved { "✓ resolved" } else { "○ open" };
-        lines.push(Line::from(vec![
-            Span::styled(format!("{loc} "), Style::default().fg(theme.accent)),
-            Span::styled(mark.to_string(), Style::default().fg(if t.is_resolved { theme.green } else { theme.dim })),
-        ]));
-        for c in &t.comments {
-            lines.push(Line::from(vec![
-                Span::styled(format!("  {}: ", c.author.display_name), Style::default().fg(theme.blue)),
-                Span::styled(c.body.clone(), Style::default().fg(theme.fg)),
-            ]));
-        }
-    }
-    frame.render_widget(Paragraph::new(lines).block(block).wrap(Wrap { trim: true }), area);
-}
-
 fn render_diff_patch(frame: &mut Frame, area: Rect, theme: &Theme, diff: &DiffView, pending: &[LineComment]) {
     let Some(file) = diff.current() else {
         frame.render_widget(section_block(theme, "Patch"), area);
@@ -1271,16 +1237,51 @@ fn render_diff_patch(frame: &mut Frame, area: Rect, theme: &Theme, diff: &DiffVi
 
     let inner_w = area.width.saturating_sub(2) as usize;
     let inner_h = area.height.saturating_sub(2) as usize;
-    let total = patch.lines().count();
-    // Patch lines (in this file) that carry a pending comment get a gutter bar.
+    // Pending (unsaved) comments get a gutter bar.
     let marks = pending_marks(patch, &file.path, pending);
-    // Patch lines that carry an existing thread → gutter dot (resolved if all are resolved).
-    let mut thread_marks: std::collections::HashMap<usize, bool> = std::collections::HashMap::new();
+    // Existing threads grouped by the patch line they anchor to — rendered inline below it.
+    let mut threads_at: std::collections::HashMap<usize, Vec<&CommentThread>> = std::collections::HashMap::new();
     for t in &diff.threads {
         if t.file_path.as_deref() == Some(file.path.as_str()) {
             if let Some(idx) = t.line.and_then(|l| crate::diff::patch_line_for_source_line(patch, l)) {
-                let e = thread_marks.entry(idx).or_insert(true);
-                *e = *e && t.is_resolved;
+                threads_at.entry(idx).or_default().push(t);
+            }
+        }
+    }
+
+    // One highlighter per file (regexes compile once); None for unhighlighted languages.
+    let mut hl = lang_for(&file.path).and_then(LineHighlighter::new);
+
+    // Build the display lines, splicing each thread in beneath the line it anchors to.
+    // `cursor_row` tracks where the cursor's patch line landed (comment lines shift it).
+    let mut lines: Vec<Line> = Vec::new();
+    let mut cursor_row = 0usize;
+    for (i, l) in patch.lines().enumerate() {
+        let gutter = if marks.contains(&i) {
+            Span::styled("▎", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD))
+        } else {
+            Span::raw(" ")
+        };
+        if patch_focus && i == diff.cursor {
+            cursor_row = lines.len();
+            // Pad to full width (minus the gutter) so the highlight spans the row.
+            let mut text = l.to_string();
+            let w = text.chars().count();
+            if w + 1 < inner_w {
+                text.push_str(&" ".repeat(inner_w - 1 - w));
+            }
+            lines.push(Line::from(vec![
+                gutter,
+                Span::styled(text, Style::default().fg(patch_fg(theme, l)).bg(theme.sel_bg).add_modifier(Modifier::BOLD)),
+            ]));
+        } else {
+            let mut line = patch_line_hl(theme, l, hl.as_mut());
+            line.spans.insert(0, gutter);
+            lines.push(line);
+        }
+        if let Some(ts) = threads_at.get(&i) {
+            for &t in ts {
+                lines.extend(inline_thread_lines(theme, t, inner_w));
             }
         }
     }
@@ -1289,48 +1290,64 @@ fn render_diff_patch(frame: &mut Frame, area: Rect, theme: &Theme, diff: &DiffVi
     // stored scroll is only used for the free-scroll (file-list) mode.
     let scroll = if patch_focus {
         let half = inner_h / 2;
-        diff.cursor.saturating_sub(half).min(total.saturating_sub(inner_h.max(1))) as u16
+        cursor_row.saturating_sub(half).min(lines.len().saturating_sub(inner_h.max(1))) as u16
     } else {
         diff.scroll
     };
 
-    // One highlighter per file (regexes compile once); None for unhighlighted languages.
-    let mut hl = lang_for(&file.path).and_then(LineHighlighter::new);
-
-    let lines: Vec<Line> = patch
-        .lines()
-        .enumerate()
-        .map(|(i, l)| {
-            // A 1-col gutter: pending comment (bar, priority), else an existing-thread dot
-            // (● open / ○ resolved).
-            let gutter = if marks.contains(&i) {
-                Span::styled("▎", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD))
-            } else if let Some(&resolved) = thread_marks.get(&i) {
-                let (glyph, color) = if resolved { ("○", theme.dim) } else { ("●", theme.accent) };
-                Span::styled(glyph, Style::default().fg(color))
-            } else {
-                Span::raw(" ")
-            };
-            if patch_focus && i == diff.cursor {
-                // Pad to full width (minus the gutter) so the highlight spans the row.
-                let mut text = l.to_string();
-                let w = text.chars().count();
-                if w + 1 < inner_w {
-                    text.push_str(&" ".repeat(inner_w - 1 - w));
-                }
-                Line::from(vec![
-                    gutter,
-                    Span::styled(text, Style::default().fg(patch_fg(theme, l)).bg(theme.sel_bg).add_modifier(Modifier::BOLD)),
-                ])
-            } else {
-                let mut line = patch_line_hl(theme, l, hl.as_mut());
-                line.spans.insert(0, gutter);
-                line
-            }
-        })
-        .collect();
-
     frame.render_widget(Paragraph::new(lines).block(block).scroll((scroll, 0)), area);
+}
+
+/// Wrap `s` to `width` display columns on word boundaries.
+fn wrap_words(s: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![s.to_string()];
+    }
+    let mut lines = Vec::new();
+    let mut cur = String::new();
+    for word in s.split_whitespace() {
+        if cur.is_empty() {
+            cur = word.to_string();
+        } else if cur.chars().count() + 1 + word.chars().count() <= width {
+            cur.push(' ');
+            cur.push_str(word);
+        } else {
+            lines.push(std::mem::take(&mut cur));
+            cur = word.to_string();
+        }
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+/// An existing review thread, rendered as indented lines shown inline beneath its diff
+/// line — a left bar (accent = open, dim = resolved), a state header, then each comment.
+fn inline_thread_lines(theme: &Theme, thread: &CommentThread, width: usize) -> Vec<Line<'static>> {
+    let bar_color = if thread.is_resolved { theme.dim } else { theme.accent };
+    let bar = || Span::styled("   ▌ ".to_string(), Style::default().fg(bar_color));
+    let text_w = width.saturating_sub(6).max(8);
+    let (glyph, state) = if thread.is_resolved { ("○", "resolved") } else { ("●", "open") };
+
+    let mut out = vec![Line::from(vec![
+        bar(),
+        Span::styled(format!("{glyph} {state}"), Style::default().fg(bar_color)),
+    ])];
+    for c in &thread.comments {
+        for (n, chunk) in wrap_words(&c.body, text_w).into_iter().enumerate() {
+            let mut spans = vec![bar()];
+            if n == 0 {
+                spans.push(Span::styled(format!("{}: ", c.author.display_name), Style::default().fg(theme.blue)));
+            }
+            spans.push(Span::styled(chunk, Style::default().fg(theme.fg)));
+            out.push(Line::from(spans));
+        }
+    }
+    out
 }
 
 fn patch_fg(theme: &Theme, line: &str) -> ratatui::style::Color {
@@ -2128,6 +2145,47 @@ mod tests {
         assert!(out.contains("Checks (2)"), "checks count");
         assert!(out.contains("Diff (3)"), "changed-file count");
         assert!(!out.contains("Conversation (0)"), "no zero-count noise on empty tabs");
+    }
+
+    #[test]
+    fn wrap_words_breaks_on_word_boundaries() {
+        assert_eq!(wrap_words("hello world foo", 11), vec!["hello world", "foo"]);
+        assert_eq!(wrap_words("", 10), vec![String::new()]);
+        assert_eq!(wrap_words("onelongword", 4), vec!["onelongword"]); // never splits a word
+    }
+
+    #[test]
+    fn diff_patch_renders_comment_threads_inline() {
+        use crate::app::Screen;
+        use forgetop_core::domain::{Comment, CommentThread};
+        let file = FileChange {
+            path: "a.rs".into(),
+            kind: FileChangeKind::Added,
+            additions: 2,
+            deletions: 0,
+            patch: Some("@@ -0,0 +1,2 @@\n+let n = 5;\n+// done".into()),
+        };
+        let mut view = pr_view(3, vec![], vec![file]);
+        view.diff.threads = vec![CommentThread {
+            id: "t1".into(),
+            comments: vec![Comment {
+                id: "c1".into(),
+                author: User { id: "u".into(), display_name: "Priya".into(), handle: None, avatar_url: None },
+                body: "cap the backoff here".into(),
+                created_at: None,
+            }],
+            file_path: Some("a.rs".into()),
+            line: Some(1),
+            is_resolved: false,
+        }];
+        let mut app = App::new("slate");
+        app.screen = Screen::PrView(Box::new(view));
+
+        let out = render_to_string(&mut app, 150, 24);
+        assert!(out.contains("let n = 5"), "the code line still renders");
+        assert!(out.contains("Priya"), "the comment author renders inline in the patch");
+        assert!(out.contains("cap the backoff"), "the comment body renders inline in the patch");
+        assert!(out.contains("open"), "the thread state marker renders");
     }
 
     #[test]
