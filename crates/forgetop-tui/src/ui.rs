@@ -13,6 +13,7 @@ use ratatui::Frame;
 use crate::app::{App, ConfigView, DiffFocus, DiffView, PipelineView, PrView, Screen, WiView, PR_TABS, TABS};
 use crate::diff::{cursor_line_label, pending_marks};
 use crate::overlay::Overlay;
+use crate::palette::{PaletteItem, PaletteKind};
 use crate::theme::{check_icon, pipeline_glyph, Theme};
 use crate::wizard::{Prompt, PromptKind};
 
@@ -1490,6 +1491,12 @@ fn render_overlay(frame: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
+    // The palette is a taller search panel (query line + windowed result list).
+    if let Overlay::Palette { query, candidates, results, selected } = overlay {
+        render_palette(frame, area, theme, query, candidates, results, *selected);
+        return;
+    }
+
     let (body, hint_color): (Vec<Line>, _) = match overlay {
         Overlay::Confirm { message, .. } => (
             vec![Line::from(""), Line::from(Span::styled(message.clone(), Style::default().fg(theme.fg)))],
@@ -1546,7 +1553,7 @@ fn render_overlay(frame: &mut Frame, area: Rect, app: &App) {
                 .collect(),
             theme.green,
         ),
-        Overlay::Help { .. } => return, // handled above
+        Overlay::Help { .. } | Overlay::Palette { .. } => return, // handled above
     };
 
     let hint = footer_keys(app)
@@ -1576,6 +1583,94 @@ fn render_overlay(frame: &mut Frame, area: Rect, app: &App) {
 
     frame.render_widget(Clear, rect);
     frame.render_widget(Paragraph::new(lines).block(block).wrap(Wrap { trim: false }), rect);
+}
+
+/// Short type tag shown at the head of each palette row.
+fn kind_tag(kind: PaletteKind) -> &'static str {
+    match kind {
+        PaletteKind::Pr => "PR",
+        PaletteKind::Wi => "WI",
+        PaletteKind::Pipe => "CI",
+    }
+}
+
+/// The command palette panel: a query line above a windowed, ranked result list.
+fn render_palette(
+    frame: &mut Frame,
+    area: Rect,
+    theme: &Theme,
+    query: &str,
+    candidates: &[PaletteItem],
+    results: &[usize],
+    selected: usize,
+) {
+    const MAX_ROWS: usize = 12;
+    // Scroll the window so the selected row stays visible.
+    let start = if selected >= MAX_ROWS { selected - MAX_ROWS + 1 } else { 0 };
+    let end = (start + MAX_ROWS).min(results.len());
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    let count = results.len();
+    lines.push(Line::from(vec![
+        Span::styled("> ", Style::default().fg(theme.accent)),
+        Span::styled(query.to_string(), Style::default().fg(theme.fg)),
+        Span::styled("█", Style::default().fg(theme.accent)),
+        Span::styled(
+            format!("    {count} match{}", if count == 1 { "" } else { "es" }),
+            Style::default().fg(theme.dim),
+        ),
+    ]));
+    lines.push(Line::from(""));
+
+    if results.is_empty() {
+        lines.push(Line::from(Span::styled("  No matches", Style::default().fg(theme.dim))));
+    } else {
+        for pos in start..end {
+            let item = &candidates[results[pos]];
+            let is_sel = pos == selected;
+            let (cursor, title_style) = if is_sel {
+                (" ▐ ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD))
+            } else {
+                ("   ", Style::default().fg(theme.fg))
+            };
+            let mut spans = vec![
+                Span::styled(cursor, Style::default().fg(theme.accent)),
+                Span::styled(format!("{} ", kind_tag(item.kind)), Style::default().fg(theme.dim)),
+                Span::styled(item.title.clone(), title_style),
+            ];
+            if !item.subtitle.is_empty() {
+                spans.push(Span::styled(format!("  {}", item.subtitle), Style::default().fg(theme.dim)));
+            }
+            lines.push(Line::from(spans));
+        }
+    }
+
+    let hint = [("↑↓", "move"), ("↵", "open"), ("Esc", "cancel")]
+        .into_iter()
+        .flat_map(|(k, l)| {
+            [
+                Span::styled(format!(" {k} "), Style::default().fg(theme.bg).bg(theme.accent).add_modifier(Modifier::BOLD)),
+                Span::styled(format!(" {l}   "), Style::default().fg(theme.dim)),
+            ]
+        })
+        .collect::<Vec<_>>();
+    lines.push(Line::from(""));
+    lines.push(Line::from(hint));
+
+    let height = lines.len() as u16 + 2;
+    let width = 76.min(area.width.saturating_sub(6));
+    let rect = centered_rect(width, height, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.accent))
+        .style(Style::default().bg(theme.panel))
+        .title(Span::styled(" Jump to ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)));
+
+    frame.render_widget(Clear, rect);
+    frame.render_widget(Paragraph::new(lines).block(block), rect);
 }
 
 /// Every keybinding, grouped by context — the content of the `?` help panel.
