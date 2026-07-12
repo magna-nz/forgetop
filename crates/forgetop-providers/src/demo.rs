@@ -50,6 +50,53 @@ fn rev(u: User, vote: ReviewVote) -> Reviewer {
     Reviewer { user: u, vote, is_required: true }
 }
 
+/// A believable body for each demo PR (keyed by number), so the Conversation tab reads
+/// like a real review. Unknown numbers fall back to a short synthesized note.
+fn pr_description(n: i64, title: &str, branch: &str) -> String {
+    let bespoke = match n {
+        1487 => "Adds client-supplied `Idempotency-Key` support to `POST /charge` and `POST /refund` so a retried request can't double-charge.\n\n- Keys are stored in Redis with a 24h TTL; a replay returns the original response.\n- A conflicting body on the same key returns 422.\n\nCloses PAY-1187.",
+        1492 => "Routine bump to pull in the security fixes in the Next.js 14.2.x line.\n\n- Regenerated the lockfile; no app code changes.\n- CI is red on the visual-regression suite — checking whether it's a real diff or just stale snapshots.",
+        1501 => "Reworks webhook delivery to use a jittered exponential backoff instead of a fixed 30s interval, and moves retries onto a dedicated queue so one slow endpoint can't starve first-delivery.\n\n- New `RetryPolicy` with a capped backoff.\n- Dead-letters after 12 attempts.\n\nReview focus: the backoff maths and the dead-letter cutoff.",
+        1495 => "Restricts the admin API CORS allow-list to the internal dashboard origins (it was effectively `*`).\n\n- Explicit origin allow-list read from config.\n- Credentialed cross-origin requests are rejected otherwise.\n\nCloses SEC-73.",
+        1476 => "**Draft — please don't review yet.** First cut of the new single-page checkout.\n\n- New card + wallet layout.\n- Address validation is still stubbed and tests are missing.\n\nOpening early for directional feedback on the component split.",
+        1450 => "Caches the computed customer risk score for 5 minutes to take it off the hot charge path.\n\n- Read-through cache keyed by customer id.\n- Invalidated on any KYC or limit change.\n\nCut charge-path p99 by ~40% in staging.",
+        312 => "Adds a managed Postgres read replica in `us-east-1` and routes read-heavy reporting queries to it.\n\n- New replica instance + parameter group.\n- Read endpoint wired into the analytics config.\n\nTerraform plan output is on the ticket.",
+        318 => "Scheduled rotation of the JWT signing keys in KMS.\n\n- Adds the new key version and keeps the previous one active for verification during the overlap window.\n- Retire the old key after 7 days (runbook step included).",
+        305 => "Bumps the service base image to Alpine 3.20 for the latest CVE patches.\n\n- No application changes; rebuilt and smoke-tested.\n- Image is ~6MB smaller.",
+        64 => "Adds a dbt model for ASC 606 revenue recognition off the invoices + subscriptions sources.\n\n- New `rev_rec_monthly` model with tests.\n- Blocked: waiting on finance to confirm the deferral schedule (see the review thread).",
+        61 => "Fixes the nightly ingestion DAG silently swallowing a failed task, which left downstream tables stale.\n\n- Retries with backoff, then fails loudly and pages on exhaustion.\n- Backfills the two missed partitions.",
+        _ => "",
+    };
+    if bespoke.is_empty() {
+        format!("{title}.\n\nReworks the `{branch}` path and adds test coverage. Please review the error handling and edge-case paths; background is on the linked ticket.")
+    } else {
+        bespoke.to_string()
+    }
+}
+
+/// A believable body for each demo work item (keyed by identifier).
+fn wi_description(id: &str, title: &str) -> String {
+    let bespoke = match id {
+        "#842" => "p99 on `POST /charge` has crept from ~180ms to ~600ms over the last week.\n\n- Prime suspect is the new risk-score lookup on the hot path.\n- Next: trace a slow request end-to-end and confirm whether the cache is actually being hit.",
+        "#851" => "We have no visibility into how much of its retry budget the sync worker burns before giving up.\n\n- Emit `retries_used` / `retry_budget` counters.\n- Add a panel and alert when a worker consistently exhausts its budget.",
+        "#860" => "`webhook_delivery_spec` fails roughly 1 in 10 CI runs, almost always on the ordering assertion.\n\n- Looks like a timing assumption on async delivery.\n- Fix the ordering expectation or quarantine the test until it's stable.",
+        "#77" => "Staging is running prod-sized node pools and costing more than it should.\n\n- Move to smaller instances and enable scale-to-zero overnight.\n- Confirm nothing relies on the current headroom first.",
+        "ENG-231" => "Design a daily job that reconciles the payments ledger against the processor settlement report and flags mismatches.\n\n- Define the matching keys and an acceptable tolerance.\n- Decide where discrepancies surface (dashboard vs alert).\n\nDeliverable: a short design doc before we implement.",
+        "ENG-245" => "Timeboxed 3-day spike to evaluate event sourcing for the payments ledger.\n\n- Prototype append-only events plus a projection.\n- Assess replay cost and operational complexity.\n\nOutcome is a recommendation, not production code.",
+        "ENG-250" => "Stand up SLO dashboards for the charge API.\n\n- Availability and latency SLOs with error budgets.\n- Wire up burn-rate alerts.\n\nUse the existing Grafana / Prometheus stack.",
+        "ENG-198" => "Migrate our bespoke feature-flag client to the OpenFeature SDK.\n\n- Wrap the current provider behind the OpenFeature API.\n- Migrate call sites incrementally.\n\nBlocked on the platform team publishing the shared provider.",
+        "OPS-1423" => "Collect Q3 access-review evidence for the SOC2 audit.\n\n- Export access lists for the production systems.\n- Get sign-off from each system owner.\n\nDue before the auditor's window closes.",
+        "SEC-88" => "Track the action items from the INC-4821 postmortem (the webhook outage).\n\n- Add alerting on delivery lag.\n- Cap the retry backoff.\n- Document the manual drain runbook.",
+        "OPS-1440" => "Upgrade the Vault cluster from 1.14 to 1.16.\n\n- Review the breaking changes and the storage migration.\n- Roll nodes one at a time, verifying unseal + auth after each.\n\nSchedule inside a maintenance window.",
+        _ => "",
+    };
+    if bespoke.is_empty() {
+        format!("{title}.\n\nSee the linked ticket for background and acceptance criteria.")
+    } else {
+        bespoke.to_string()
+    }
+}
+
 /// Compact PR/MR builder for the demo data.
 #[allow(clippy::too_many_arguments)]
 fn pr(
@@ -71,11 +118,7 @@ fn pr(
         id: n.to_string(),
         number: Some(n),
         title: title.into(),
-        description: Some(format!(
-            "{title}.\n\nReworks the `{branch}` path and adds test coverage. Main things to \
-             review: error handling and the retry / edge-case paths. Background and \
-             acceptance criteria are on the linked ticket."
-        )),
+        description: Some(pr_description(n, title, branch)),
         author,
         is_draft: matches!(status, PullRequestStatus::Draft),
         status,
@@ -102,7 +145,7 @@ fn wi(id: &str, title: &str, state: &str, cat: WorkItemStateCategory, ty: &str, 
         id: id.into(),
         identifier: Some(id.into()),
         title: title.into(),
-        description: None,
+        description: Some(wi_description(id, title)),
         state: state.into(),
         state_category: cat,
         work_item_type: Some(ty.into()),
