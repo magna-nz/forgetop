@@ -12,6 +12,7 @@ use ratatui::Frame;
 
 use crate::app::{App, ConfigView, DiffFocus, DiffView, PipelineView, PrView, Screen, WiView, PR_TABS, TABS};
 use crate::diff::{cursor_line_label, pending_marks};
+use crate::highlight::{lang_for, HlKind, LineHighlighter};
 use crate::overlay::Overlay;
 use crate::palette::{PaletteItem, PaletteKind, Tone};
 use crate::theme::{check_icon, pipeline_glyph, Theme};
@@ -1253,6 +1254,9 @@ fn render_diff_patch(frame: &mut Frame, area: Rect, theme: &Theme, diff: &DiffVi
         diff.scroll
     };
 
+    // One highlighter per file (regexes compile once); None for unhighlighted languages.
+    let mut hl = lang_for(&file.path).and_then(LineHighlighter::new);
+
     let lines: Vec<Line> = patch
         .lines()
         .enumerate()
@@ -1275,7 +1279,7 @@ fn render_diff_patch(frame: &mut Frame, area: Rect, theme: &Theme, diff: &DiffVi
                     Span::styled(text, Style::default().fg(patch_fg(theme, l)).bg(theme.sel_bg).add_modifier(Modifier::BOLD)),
                 ])
             } else {
-                let mut line = patch_line(theme, l);
+                let mut line = patch_line_hl(theme, l, hl.as_mut());
                 line.spans.insert(0, gutter);
                 line
             }
@@ -1301,6 +1305,41 @@ fn patch_fg(theme: &Theme, line: &str) -> ratatui::style::Color {
 
 fn patch_line(theme: &Theme, line: &str) -> Line<'static> {
     Line::from(Span::styled(line.to_string(), Style::default().fg(patch_fg(theme, line))))
+}
+
+/// Semantic token kind → an indexed theme colour (never truecolor RGB).
+fn hl_color(theme: &Theme, kind: HlKind) -> ratatui::style::Color {
+    match kind {
+        HlKind::Keyword => theme.magenta,
+        HlKind::Type => theme.cyan,
+        HlKind::Str => theme.green,
+        HlKind::Comment => theme.dim,
+        HlKind::Number => theme.yellow,
+        HlKind::Func => theme.blue,
+        HlKind::Punct | HlKind::Plain => theme.fg,
+    }
+}
+
+/// Like [`patch_line`], but syntax-highlights the source after the diff marker when a
+/// language highlighter is available. The `+`/`-`/context marker keeps its add/del colour;
+/// headers and unknown languages fall back to the flat [`patch_line`].
+fn patch_line_hl(theme: &Theme, line: &str, hl: Option<&mut LineHighlighter>) -> Line<'static> {
+    let Some(hl) = hl else { return patch_line(theme, line) };
+    if line.starts_with("@@") || line.starts_with("+++") || line.starts_with("---") {
+        return patch_line(theme, line);
+    }
+    // Split the 1-char diff marker (ASCII) from the source it decorates.
+    let (marker, source, marker_color) = match line.chars().next() {
+        Some('+') => ("+", &line[1..], theme.green),
+        Some('-') => ("-", &line[1..], theme.red),
+        Some(' ') => (" ", &line[1..], theme.fg),
+        _ => return patch_line(theme, line), // e.g. "\ No newline at end of file"
+    };
+    let mut spans = vec![Span::styled(marker.to_string(), Style::default().fg(marker_color))];
+    for (text, kind) in hl.line(source) {
+        spans.push(Span::styled(text, Style::default().fg(hl_color(theme, kind))));
+    }
+    Line::from(spans)
 }
 
 // ---- config / connections ----
@@ -2500,6 +2539,39 @@ mod tests {
         assert!(out.contains("Refreshing"), "a refresh shows 'Refreshing…' in the footer");
         // The header keeps just the theme + clock — no refresh glyph up there.
         assert!(!out.contains("⟳"), "no spinner in the top-right");
+    }
+
+    #[test]
+    fn patch_line_highlights_code_after_the_diff_marker() {
+        use crate::highlight::{Lang, LineHighlighter};
+        let theme = Theme::by_name("slate");
+        let mut hl = LineHighlighter::new(Lang::Rust).unwrap();
+        let line = patch_line_hl(&theme, "+let n = 5;", Some(&mut hl));
+
+        // The add marker keeps its green, separate from the code.
+        assert_eq!(line.spans[0].content, "+");
+        assert_eq!(line.spans[0].style.fg, Some(theme.green));
+        // `let` is a keyword (magenta); `5` is a number (yellow).
+        let kw = line.spans.iter().find(|s| s.content.contains("let")).expect("a `let` span");
+        assert_eq!(kw.style.fg, Some(theme.magenta), "keyword is magenta");
+        assert!(
+            line.spans.iter().any(|s| s.content.contains('5') && s.style.fg == Some(theme.yellow)),
+            "number is yellow"
+        );
+    }
+
+    #[test]
+    fn patch_line_headers_and_unknown_langs_stay_flat() {
+        use crate::highlight::{Lang, LineHighlighter};
+        let theme = Theme::by_name("slate");
+        let mut hl = LineHighlighter::new(Lang::Rust).unwrap();
+        // A hunk header stays accent even with a highlighter available.
+        let hdr = patch_line_hl(&theme, "@@ -1 +1 @@", Some(&mut hl));
+        assert_eq!(hdr.spans[0].style.fg, Some(theme.accent));
+        // No highlighter (unknown language) → one flat context span.
+        let plain = patch_line_hl(&theme, " untouched", None);
+        assert_eq!(plain.spans.len(), 1);
+        assert_eq!(plain.spans[0].style.fg, Some(theme.fg));
     }
 
     #[test]
