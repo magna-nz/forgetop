@@ -1511,6 +1511,9 @@ impl App {
         self.status = if r.errors.is_empty() {
             format!("{} PRs · {} work items · {} runs", self.prs.len(), self.wis.len(), self.pipes.len())
         } else {
+            for e in &r.errors {
+                forgetop_core::diag::log("fetch", e);
+            }
             r.errors.join("  |  ")
         };
     }

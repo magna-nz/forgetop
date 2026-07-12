@@ -2,6 +2,7 @@
 //! config + bindings, secret store, and the runtime services.
 
 pub mod config;
+pub mod diag;
 pub mod domain;
 pub mod error;
 pub mod filter;

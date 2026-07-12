@@ -72,7 +72,7 @@ fn render_tabs(frame: &mut Frame, area: Rect, app: &App) {
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(theme.accent))
         .style(Style::default().bg(theme.bg))
-        .title(Span::styled(" ▟ forgetop ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)))
+        .title(Span::styled(concat!(" ▟ forgetop v", env!("CARGO_PKG_VERSION"), " "), Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)))
         .title_top(Line::from(Span::styled(right, Style::default().fg(theme.dim))).right_aligned());
 
     let vis = app.visible_indices();

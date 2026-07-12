@@ -84,6 +84,7 @@ async fn doctor(config: &ConfigService, secrets: &Arc<dyn SecretStore>, resolver
     println!("forgetop doctor\n");
     println!("Config:   {}", default_config_path().display());
     println!("          {} connection(s) configured", cfg.connections.len());
+    println!("Log:      {}", forgetop_core::diag::log_path().display());
     match secrets.get("__forgetop_doctor_probe__") {
         Ok(_) => println!("Keychain: accessible\n"),
         Err(e) => println!("Keychain: NOT accessible — {e}\n"),
