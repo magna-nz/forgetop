@@ -6,6 +6,7 @@ use forgetop_core::domain::ReviewVote;
 use forgetop_core::provider::MergeStrategy;
 
 use crate::app::Key;
+use crate::palette::{rank, PaletteItem, PaletteKind};
 
 /// A write action to run against the selected item once an overlay is submitted.
 #[derive(Debug, Clone)]
@@ -34,6 +35,9 @@ pub enum Action {
     PickApproval { index: usize },
     /// Confirmed: respond to the chosen pipeline-approval gate.
     RespondApproval { index: usize },
+    /// Jump to an item chosen in the command palette. The app re-resolves the full
+    /// PR / work item / pipeline from its lists by `(kind, id)` and opens its view.
+    OpenItem { kind: PaletteKind, id: String, connection_id: String },
 }
 
 /// What a [`Overlay::Toggle`] checklist is choosing.
@@ -90,6 +94,10 @@ pub enum Overlay {
     Toggle { title: String, kind: ToggleKind, min_one: bool, items: Vec<ToggleItem>, selected: usize },
     /// A scrollable, context-agnostic reference of every keybinding.
     Help { scroll: u16 },
+    /// The command palette: fuzzy-jump across every already-fetched item. `results` are
+    /// indices into `candidates`, ranked for the current `query`; `selected` indexes into
+    /// `results`.
+    Palette { query: String, candidates: Vec<PaletteItem>, results: Vec<usize>, selected: usize },
 }
 
 /// What the app should do after feeding a key to the overlay.
@@ -110,6 +118,7 @@ impl Overlay {
             | Overlay::Input { title, .. }
             | Overlay::Toggle { title, .. } => title,
             Overlay::Help { .. } => "Keybindings",
+            Overlay::Palette { .. } => "Jump to",
         }
     }
 
@@ -121,6 +130,7 @@ impl Overlay {
             Overlay::Input { .. } => vec![("Esc", "cancel"), ("↵", "submit")],
             Overlay::Toggle { .. } => vec![("↑↓", "move"), ("↵/space", "toggle"), ("Esc", "apply")],
             Overlay::Help { .. } => vec![("↑↓", "scroll"), ("Esc", "close")],
+            Overlay::Palette { .. } => vec![("↑↓", "move"), ("↵", "open"), ("Esc", "cancel")],
         }
     }
 
@@ -214,6 +224,43 @@ impl Overlay {
                 Key::Escape | Key::Char('?') | Key::Char('q') => Outcome::Cancel,
                 _ => Outcome::Keep,
             },
+            Overlay::Palette { query, candidates, results, selected } => match key {
+                // Typing edits the query and re-ranks; selection resets to the top match.
+                Key::Char(c) => {
+                    query.push(c);
+                    *results = rank(query, candidates);
+                    *selected = 0;
+                    Outcome::Keep
+                }
+                Key::Backspace => {
+                    query.pop();
+                    *results = rank(query, candidates);
+                    *selected = 0;
+                    Outcome::Keep
+                }
+                Key::Down | Key::Ctrl('n') => {
+                    if !results.is_empty() {
+                        *selected = (*selected + 1) % results.len();
+                    }
+                    Outcome::Keep
+                }
+                Key::Up | Key::Ctrl('p') => {
+                    if !results.is_empty() {
+                        *selected = (*selected + results.len() - 1) % results.len();
+                    }
+                    Outcome::Keep
+                }
+                Key::Enter => match results.get(*selected).map(|&i| &candidates[i]) {
+                    Some(item) => Outcome::Submit(Action::OpenItem {
+                        kind: item.kind,
+                        id: item.id.clone(),
+                        connection_id: item.connection_id.clone(),
+                    }),
+                    None => Outcome::Keep, // no matches — swallow Enter
+                },
+                Key::Escape => Outcome::Cancel,
+                _ => Outcome::Keep,
+            },
         }
     }
 }
@@ -254,6 +301,69 @@ fn resolve_input(kind: InputKind, text: String) -> Action {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pitem(kind: PaletteKind, id: &str, title: &str) -> PaletteItem {
+        PaletteItem {
+            kind,
+            id: id.into(),
+            connection_id: "c".into(),
+            title: title.into(),
+            subtitle: String::new(),
+            tone: crate::palette::Tone::Neutral,
+            sort_ts: None,
+        }
+    }
+
+    fn palette(items: Vec<PaletteItem>) -> Overlay {
+        let results = rank("", &items);
+        Overlay::Palette { query: String::new(), candidates: items, results, selected: 0 }
+    }
+
+    #[test]
+    fn palette_typing_filters_and_resets_selection() {
+        let mut o = palette(vec![pitem(PaletteKind::Pr, "1", "Migrate billing"), pitem(PaletteKind::Wi, "2", "Fix login")]);
+        assert!(matches!(o.handle(Key::Down), Outcome::Keep)); // move off row 0
+        assert!(matches!(o.handle(Key::Char('m')), Outcome::Keep)); // "m" → only "Migrate billing"
+        let Overlay::Palette { results, selected, .. } = &o else { panic!() };
+        assert_eq!(results.len(), 1);
+        assert_eq!(*selected, 0, "selection resets to the top match after typing");
+    }
+
+    #[test]
+    fn palette_enter_submits_open_for_selected() {
+        let mut o = palette(vec![pitem(PaletteKind::Pr, "pr1", "alpha")]);
+        match o.handle(Key::Enter) {
+            Outcome::Submit(Action::OpenItem { kind, id, .. }) => {
+                assert_eq!(kind, PaletteKind::Pr);
+                assert_eq!(id, "pr1");
+            }
+            _ => panic!("expected an OpenItem submit"),
+        }
+    }
+
+    #[test]
+    fn palette_enter_with_no_matches_is_swallowed() {
+        let mut o = palette(vec![pitem(PaletteKind::Pr, "1", "alpha")]);
+        for c in "zzzz".chars() {
+            o.handle(Key::Char(c));
+        }
+        assert!(matches!(o.handle(Key::Enter), Outcome::Keep));
+    }
+
+    #[test]
+    fn palette_down_wraps_selection() {
+        let mut o = palette(vec![pitem(PaletteKind::Pr, "1", "a"), pitem(PaletteKind::Pr, "2", "b")]);
+        o.handle(Key::Down);
+        o.handle(Key::Down);
+        let Overlay::Palette { selected, .. } = &o else { panic!() };
+        assert_eq!(*selected, 0, "past the last result wraps to the first");
+    }
+
+    #[test]
+    fn palette_esc_cancels() {
+        let mut o = palette(vec![pitem(PaletteKind::Pr, "1", "a")]);
+        assert!(matches!(o.handle(Key::Escape), Outcome::Cancel));
+    }
 
     #[test]
     fn input_accumulates_text_and_submits_comment() {

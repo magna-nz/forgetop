@@ -5,6 +5,7 @@ pub mod app;
 pub mod diff;
 pub mod launchpad;
 pub mod overlay;
+pub mod palette;
 pub mod theme;
 pub mod ui;
 pub mod wizard;
@@ -121,8 +122,11 @@ fn input_reader(tx: mpsc::UnboundedSender<Key>) {
 }
 
 fn map_key(code: KeyCode, mods: KeyModifiers) -> Key {
-    if mods.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('c')) {
-        return Key::Quit;
+    if mods.contains(KeyModifiers::CONTROL) {
+        if let KeyCode::Char(c) = code {
+            let c = c.to_ascii_lowercase();
+            return if c == 'c' { Key::Quit } else { Key::Ctrl(c) };
+        }
     }
     // Keep keys semantic but preserve raw characters, so the app can interpret them
     // as navigation in normal mode or as literal text while an input overlay is open.

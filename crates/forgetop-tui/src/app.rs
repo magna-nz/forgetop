@@ -14,6 +14,7 @@ use tokio::sync::mpsc;
 
 use crate::launchpad;
 use crate::overlay::{Action, InputKind, Outcome, Overlay, PickerKind, ToggleItem, ToggleKind};
+use crate::palette::{self, PaletteKind};
 use crate::theme::Theme;
 use crate::wizard::{provider_sections, section_label, Wizard, WizardOutcome};
 
@@ -1187,6 +1188,50 @@ impl App {
         }
     }
 
+    // ---- command palette ----
+
+    /// Open the command palette over the current screen, seeded with every already-fetched
+    /// PR / work item / pipeline. Empty query → all, most-recent first.
+    fn open_palette(&mut self) {
+        let candidates = palette::build_candidates(&self.prs, &self.wis, &self.pipes);
+        let results = palette::rank("", &candidates);
+        self.overlay = Some(Overlay::Palette { query: String::new(), candidates, results, selected: 0 });
+    }
+
+    /// Open the item chosen in the palette, re-resolving the full struct from the section
+    /// lists by `(kind, id)` and reusing the same open path as selecting it on its screen.
+    async fn open_palette_item(&mut self, kind: PaletteKind, id: String, conn: String, deps: &AppDeps) {
+        // Esc from the opened view should return to wherever the palette was invoked from.
+        self.lp_origin = matches!(self.screen, Screen::Launchpad);
+        match kind {
+            PaletteKind::Pr => {
+                let found = self
+                    .prs
+                    .iter()
+                    .find(|r| r.connection_id == conn && r.pr.id == id)
+                    .map(|r| (pr_label(&r.pr), r.pr.url.clone(), r.pr.clone()));
+                if let Some((label, url, pr)) = found {
+                    self.open_pr_view_for(deps, 0, id, label, url, conn, pr).await;
+                }
+            }
+            PaletteKind::Wi => {
+                if let Some(wi) = self.wis.iter().find(|r| r.connection_id == conn && r.wi.id == id).map(|r| r.wi.clone()) {
+                    self.open_wi_view_for(deps, id, conn, wi).await;
+                }
+            }
+            PaletteKind::Pipe => {
+                let found = self
+                    .pipes
+                    .iter()
+                    .find(|r| r.connection_id == conn && r.run.id == id)
+                    .map(|r| (r.provider, r.run.definition_id.clone(), r.run.branch.clone(), pipe_label(r), r.run.clone()));
+                if let Some((provider, def, branch, title, fallback)) = found {
+                    self.open_pipeline_for(deps, conn, provider, id, def, branch, title, fallback).await;
+                }
+            }
+        }
+    }
+
     // ---- data loading ----
 
     /// A full refresh, run inline (blocking). Used for the initial load and after write
@@ -1470,6 +1515,11 @@ impl App {
             self.open_notifications_toggle();
             return;
         }
+        // Ctrl-P opens the command palette from the list screens and the Launchpad.
+        if key == Key::Ctrl('p') && matches!(self.screen, Screen::List | Screen::Launchpad) {
+            self.open_palette();
+            return;
+        }
 
         // Full-screen sub-views handle their own keys.
         match self.screen {
@@ -1551,7 +1601,7 @@ impl App {
                 }
             }
             Key::Char(c) => self.on_char(c, deps).await,
-            Key::Backspace | Key::Quit | Key::Redraw | Key::None => {}
+            Key::Backspace | Key::Ctrl(_) | Key::Quit | Key::Redraw | Key::None => {}
         }
     }
 
@@ -2238,9 +2288,15 @@ impl App {
 
     async fn on_overlay_key(&mut self, key: Key, deps: &AppDeps) {
         let Some(mut overlay) = self.overlay.take() else { return };
+        // Dismissing the palette is a quiet no-op, not a cancelled action.
+        let quiet_cancel = matches!(overlay, Overlay::Palette { .. });
         match overlay.handle(key) {
             Outcome::Keep => self.overlay = Some(overlay),
-            Outcome::Cancel => self.toast = Some("Cancelled".into()),
+            Outcome::Cancel => {
+                if !quiet_cancel {
+                    self.toast = Some("Cancelled".into());
+                }
+            }
             Outcome::Submit(action) => self.execute_action(action, deps).await,
         }
     }
@@ -2758,6 +2814,7 @@ impl App {
             Action::DeleteView => self.delete_view(deps).await,
             Action::PickApproval { index } => self.confirm_approval(index),
             Action::RespondApproval { index } => self.respond_approval(index, deps).await,
+            Action::OpenItem { kind, id, connection_id } => self.open_palette_item(kind, id, connection_id, deps).await,
         }
     }
 
@@ -3234,6 +3291,8 @@ pub enum Key {
     PageUp,
     PageDown,
     Char(char),
+    /// A Ctrl-modified letter (lowercased), e.g. Ctrl-P. Ctrl-C is mapped to [`Key::Quit`].
+    Ctrl(char),
     /// Hard quit (Ctrl-C), honoured in every mode.
     Quit,
     /// Terminal was resized — no-op, but wakes the loop so it redraws at the new size.
@@ -3524,6 +3583,32 @@ mod tests {
 
     fn wi_row(wi: WorkItem) -> WiRow {
         WiRow { connection_id: "c".into(), connection: "GH".into(), provider: ProviderType::GitHub, wi }
+    }
+
+    #[test]
+    fn palette_candidates_map_rows_to_searchable_items() {
+        let mut p = pr(None);
+        p.id = "pr1".into();
+        p.title = "Migrate billing".into();
+        p.source_ref = Some("feat/pay-412".into());
+        p.author = User { id: "u".into(), display_name: "Priya".into(), handle: Some("priya".into()), avatar_url: None };
+        let mut w = wi(None);
+        w.id = "wi1".into();
+        w.identifier = Some("PAY-412".into());
+        w.title = "Billing migration".into();
+
+        let cands = palette::build_candidates(&[pr_row(p)], &[wi_row(w)], &[]);
+        assert_eq!(cands.len(), 2);
+        // PR: routes by (kind,id), title is the PR title, subtitle carries author + branch.
+        assert_eq!(cands[0].kind, PaletteKind::Pr);
+        assert_eq!(cands[0].id, "pr1");
+        assert_eq!(cands[0].title, "Migrate billing");
+        assert!(cands[0].subtitle.contains("priya"), "subtitle has author: {}", cands[0].subtitle);
+        assert!(cands[0].subtitle.contains("feat/pay-412"), "subtitle has branch: {}", cands[0].subtitle);
+        // WI: identifier is searchable via the subtitle.
+        assert_eq!(cands[1].kind, PaletteKind::Wi);
+        assert_eq!(cands[1].id, "wi1");
+        assert!(cands[1].subtitle.contains("PAY-412"), "subtitle has identifier: {}", cands[1].subtitle);
     }
 
     #[test]
