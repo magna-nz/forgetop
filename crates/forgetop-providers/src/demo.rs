@@ -1,10 +1,10 @@
 //! Demo provider — canned, deterministic data so `--demo` works with no credentials.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use async_trait::async_trait;
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, Utc};
 use forgetop_core::domain::*;
 use forgetop_core::filter::apply_pull_request_filter;
 use forgetop_core::provider::*;
@@ -19,8 +19,11 @@ async fn demo_latency() {
     }
 }
 
+/// "Now" for the demo, so all the canned timestamps read as fresh relative to today
+/// (ages in hours/days, and the "recently merged" window actually catches recent merges)
+/// instead of drifting stale against a hard-coded date.
 fn base() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 6, 30, 9, 0, 0).unwrap()
+    Utc::now()
 }
 
 fn user(id: &str, name: &str, handle: &str) -> User {
@@ -469,6 +472,24 @@ fn submitted_threads() -> &'static Mutex<HashMap<String, Vec<CommentThread>>> {
     STORE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// PR ids merged during this `--demo` run. `merge()` records them and `list()`/`get()`
+/// then report those PRs as freshly merged — so a PR you merge drops out of "open" and
+/// shows up under "Recently merged", exactly like a real provider.
+fn merged_prs() -> &'static Mutex<HashSet<String>> {
+    static STORE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Apply any session merges to a PR: freshly merged, no longer a draft, updated just now.
+fn apply_session_merge(mut pr: PullRequest) -> PullRequest {
+    if merged_prs().lock().unwrap().contains(&pr.id) {
+        pr.status = PullRequestStatus::Merged;
+        pr.is_draft = false;
+        pr.updated_at = Some(base());
+    }
+    pr
+}
+
 struct DemoPr {
     conn: String,
 }
@@ -478,12 +499,17 @@ impl PullRequestSource for DemoPr {
         demo_latency().await;
         let prs: Vec<_> = prs_for(&self.conn)
             .into_iter()
+            .map(apply_session_merge)
             .filter(|p| query.include_completed || matches!(p.status, PullRequestStatus::Open | PullRequestStatus::Draft))
             .collect();
         Ok(apply_pull_request_filter(prs, query.filter, Some("you")))
     }
     async fn get(&self, id: &str) -> Result<PullRequest> {
-        prs_for(&self.conn).into_iter().find(|p| p.id == id).ok_or_else(|| forgetop_core::Error::NotFound(id.into()))
+        prs_for(&self.conn)
+            .into_iter()
+            .find(|p| p.id == id)
+            .map(apply_session_merge)
+            .ok_or_else(|| forgetop_core::Error::NotFound(id.into()))
     }
     async fn threads(&self, id: &str) -> Result<Vec<CommentThread>> {
         let mut threads = vec![
@@ -650,7 +676,9 @@ impl PullRequestSource for DemoPr {
     async fn vote(&self, _id: &str, _vote: ReviewVote) -> Result<()> {
         Ok(())
     }
-    async fn merge(&self, _id: &str, _options: &MergeOptions) -> Result<()> {
+    async fn merge(&self, id: &str, _options: &MergeOptions) -> Result<()> {
+        // Record the merge so list()/get() report this PR as freshly merged (→ Recently merged).
+        merged_prs().lock().unwrap().insert(id.to_string());
         Ok(())
     }
     async fn submit_review(&self, id: &str, _event: ReviewVote, comments: &[LineComment]) -> Result<()> {
@@ -871,6 +899,22 @@ mod tests {
         );
         // A different PR is unaffected by what was submitted to this one.
         assert_eq!(src.threads(other).await.unwrap().len(), before);
+    }
+
+    #[tokio::test]
+    async fn merging_marks_the_pr_as_freshly_merged() {
+        let src = conn().pull_requests().unwrap();
+        // A fabricated id (not a real demo PR) so the session-global store can't pollute
+        // other tests' open-PR counts.
+        let id = "demo-merge-test-42";
+        src.merge(id, &MergeOptions { strategy: MergeStrategy::Merge, delete_source_ref: false }).await.unwrap();
+
+        // A PR with that id now reports as merged and no longer open/draft.
+        let mut p = pr(0, "x", me(), PullRequestStatus::Open, CheckStatus::Passed, MergeableState::Mergeable, vec![], 1, 1, 1, "b", &[]);
+        p.id = id.to_string();
+        let merged = apply_session_merge(p);
+        assert_eq!(merged.status, PullRequestStatus::Merged);
+        assert!(!merged.is_draft);
     }
 
     #[tokio::test]
