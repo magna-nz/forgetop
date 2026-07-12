@@ -1301,7 +1301,7 @@ fn render_diff_patch(frame: &mut Frame, area: Rect, theme: &Theme, diff: &DiffVi
         }
         if let Some(ps) = pending_at.get(&i) {
             let bodies: Vec<String> = ps.iter().map(|c| format!("you: {}", c.body)).collect();
-            lines.extend(inline_box(theme, theme.yellow, "✎ draft — press s to submit", &bodies, inner_w));
+            lines.extend(inline_box(theme, theme.blue, "● pending", &bodies, inner_w));
         }
     }
 
@@ -2240,7 +2240,7 @@ mod tests {
         app.screen = Screen::PrView(Box::new(view));
 
         let out = render_to_string(&mut app, 150, 24);
-        assert!(out.contains("draft"), "an unsubmitted comment shows a draft box");
+        assert!(out.contains("pending"), "an unsubmitted comment shows a pending box");
         assert!(out.contains("hold off on this"), "the draft body renders inline");
         assert!(out.contains("╭"), "the draft is boxed like a real comment");
     }
