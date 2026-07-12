@@ -1248,6 +1248,18 @@ fn render_diff_patch(frame: &mut Frame, area: Rect, theme: &Theme, diff: &DiffVi
             }
         }
     }
+    // Pending (unsubmitted) comments, grouped by patch line via the same (line, side) map
+    // that drives the gutter marks — so a draft shows inline before you submit it.
+    let mut pending_at: std::collections::HashMap<usize, Vec<&LineComment>> = std::collections::HashMap::new();
+    if !pending.is_empty() {
+        for i in 0..patch.lines().count() {
+            if let Some(t) = crate::diff::comment_target(patch, i) {
+                for c in pending.iter().filter(|c| c.path == file.path && (c.line, c.side) == t) {
+                    pending_at.entry(i).or_default().push(c);
+                }
+            }
+        }
+    }
 
     // One highlighter per file (regexes compile once); None for unhighlighted languages.
     let mut hl = lang_for(&file.path).and_then(LineHighlighter::new);
@@ -1281,8 +1293,15 @@ fn render_diff_patch(frame: &mut Frame, area: Rect, theme: &Theme, diff: &DiffVi
         }
         if let Some(ts) = threads_at.get(&i) {
             for &t in ts {
-                lines.extend(inline_thread_lines(theme, t, inner_w));
+                let (glyph, state) = if t.is_resolved { ("○", "resolved") } else { ("●", "open") };
+                let border = if t.is_resolved { theme.dim } else { theme.accent };
+                let bodies: Vec<String> = t.comments.iter().map(|c| format!("{}: {}", c.author.display_name, c.body)).collect();
+                lines.extend(inline_box(theme, border, &format!("{glyph} {state}"), &bodies, inner_w));
             }
+        }
+        if let Some(ps) = pending_at.get(&i) {
+            let bodies: Vec<String> = ps.iter().map(|c| format!("you: {}", c.body)).collect();
+            lines.extend(inline_box(theme, theme.yellow, "✎ draft — press s to submit", &bodies, inner_w));
         }
     }
 
@@ -1325,26 +1344,20 @@ fn wrap_words(s: &str, width: usize) -> Vec<String> {
     lines
 }
 
-/// An existing review thread, rendered inline beneath its diff line as a **bordered,
-/// background-filled box** so it's clearly distinct from the code — a rounded frame
-/// (accent = open, dim = resolved), a state header, then each comment (author: body).
-fn inline_thread_lines(theme: &Theme, thread: &CommentThread, width: usize) -> Vec<Line<'static>> {
-    let border = if thread.is_resolved { theme.dim } else { theme.accent };
+/// Render a comment — an existing thread or an unsent draft — as a bordered,
+/// background-filled box shown inline beneath its diff line, so it's clearly distinct from
+/// the code. `header` is the state line; `bodies` are the comment texts (`author: body`).
+fn inline_box(theme: &Theme, border: ratatui::style::Color, header: &str, bodies: &[String], width: usize) -> Vec<Line<'static>> {
     let bg = theme.panel;
     let indent = "  ";
     let box_w = width.saturating_sub(3).max(20); // leaves a small right margin
     let content_w = box_w.saturating_sub(4); // inside "│ " … " │"
-    let (glyph, state) = if thread.is_resolved { ("○", "resolved") } else { ("●", "open") };
     let frame = |style: Style| style.fg(border).bg(bg);
 
     // Inner content rows (each a single styled string): a header, then wrapped comments.
-    let mut rows: Vec<Span<'static>> = vec![Span::styled(
-        format!("{glyph} {state}"),
-        frame(Style::default()).add_modifier(Modifier::BOLD),
-    )];
-    for c in &thread.comments {
-        let text = format!("{}: {}", c.author.display_name, c.body);
-        for chunk in wrap_words(&text, content_w) {
+    let mut rows: Vec<Span<'static>> = vec![Span::styled(header.to_string(), frame(Style::default()).add_modifier(Modifier::BOLD))];
+    for b in bodies {
+        for chunk in wrap_words(b, content_w) {
             rows.push(Span::styled(chunk, Style::default().fg(theme.fg).bg(bg)));
         }
     }
@@ -2207,6 +2220,29 @@ mod tests {
         assert!(out.contains("cap the backoff"), "the comment body renders inline in the patch");
         assert!(out.contains("open"), "the thread state marker renders");
         assert!(out.contains("╭") && out.contains("╰"), "the comment is drawn in its own box");
+    }
+
+    #[test]
+    fn diff_patch_renders_pending_draft_inline() {
+        use crate::app::{DiffFocus, Screen};
+        use forgetop_core::domain::{DiffSide, LineComment};
+        let file = FileChange {
+            path: "a.rs".into(),
+            kind: FileChangeKind::Added,
+            additions: 2,
+            deletions: 0,
+            patch: Some("@@ -0,0 +1,2 @@\n+let n = 5;\n+// done".into()),
+        };
+        let mut view = pr_view(3, vec![], vec![file]);
+        view.diff.focus = DiffFocus::Patch;
+        view.pending = vec![LineComment { path: "a.rs".into(), line: 1, side: DiffSide::New, body: "hold off on this".into() }];
+        let mut app = App::new("slate");
+        app.screen = Screen::PrView(Box::new(view));
+
+        let out = render_to_string(&mut app, 150, 24);
+        assert!(out.contains("draft"), "an unsubmitted comment shows a draft box");
+        assert!(out.contains("hold off on this"), "the draft body renders inline");
+        assert!(out.contains("╭"), "the draft is boxed like a real comment");
     }
 
     #[test]
