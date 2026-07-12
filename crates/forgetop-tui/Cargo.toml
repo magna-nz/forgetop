@@ -13,3 +13,4 @@ chrono.workspace = true
 open.workspace = true
 notify-rust.workspace = true
 fuzzy-matcher.workspace = true
+synoptic.workspace = true

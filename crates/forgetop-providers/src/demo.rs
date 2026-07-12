@@ -1,9 +1,10 @@
 //! Demo provider — canned, deterministic data so `--demo` works with no credentials.
 
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use async_trait::async_trait;
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::{DateTime, Utc};
 use forgetop_core::domain::*;
 use forgetop_core::filter::apply_pull_request_filter;
 use forgetop_core::provider::*;
@@ -18,8 +19,11 @@ async fn demo_latency() {
     }
 }
 
+/// "Now" for the demo, so all the canned timestamps read as fresh relative to today
+/// (ages in hours/days, and the "recently merged" window actually catches recent merges)
+/// instead of drifting stale against a hard-coded date.
 fn base() -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(2026, 6, 30, 9, 0, 0).unwrap()
+    Utc::now()
 }
 
 fn user(id: &str, name: &str, handle: &str) -> User {
@@ -49,6 +53,53 @@ fn rev(u: User, vote: ReviewVote) -> Reviewer {
     Reviewer { user: u, vote, is_required: true }
 }
 
+/// A believable body for each demo PR (keyed by number), so the Conversation tab reads
+/// like a real review. Unknown numbers fall back to a short synthesized note.
+fn pr_description(n: i64, title: &str, branch: &str) -> String {
+    let bespoke = match n {
+        1487 => "Adds client-supplied `Idempotency-Key` support to `POST /charge` and `POST /refund` so a retried request can't double-charge.\n\n- Keys are stored in Redis with a 24h TTL; a replay returns the original response.\n- A conflicting body on the same key returns 422.\n\nCloses PAY-1187.",
+        1492 => "Routine bump to pull in the security fixes in the Next.js 14.2.x line.\n\n- Regenerated the lockfile; no app code changes.\n- CI is red on the visual-regression suite — checking whether it's a real diff or just stale snapshots.",
+        1501 => "Reworks webhook delivery to use a jittered exponential backoff instead of a fixed 30s interval, and moves retries onto a dedicated queue so one slow endpoint can't starve first-delivery.\n\n- New `RetryPolicy` with a capped backoff.\n- Dead-letters after 12 attempts.\n\nReview focus: the backoff maths and the dead-letter cutoff.",
+        1495 => "Restricts the admin API CORS allow-list to the internal dashboard origins (it was effectively `*`).\n\n- Explicit origin allow-list read from config.\n- Credentialed cross-origin requests are rejected otherwise.\n\nCloses SEC-73.",
+        1476 => "**Draft — please don't review yet.** First cut of the new single-page checkout.\n\n- New card + wallet layout.\n- Address validation is still stubbed and tests are missing.\n\nOpening early for directional feedback on the component split.",
+        1450 => "Caches the computed customer risk score for 5 minutes to take it off the hot charge path.\n\n- Read-through cache keyed by customer id.\n- Invalidated on any KYC or limit change.\n\nCut charge-path p99 by ~40% in staging.",
+        312 => "Adds a managed Postgres read replica in `us-east-1` and routes read-heavy reporting queries to it.\n\n- New replica instance + parameter group.\n- Read endpoint wired into the analytics config.\n\nTerraform plan output is on the ticket.",
+        318 => "Scheduled rotation of the JWT signing keys in KMS.\n\n- Adds the new key version and keeps the previous one active for verification during the overlap window.\n- Retire the old key after 7 days (runbook step included).",
+        305 => "Bumps the service base image to Alpine 3.20 for the latest CVE patches.\n\n- No application changes; rebuilt and smoke-tested.\n- Image is ~6MB smaller.",
+        64 => "Adds a dbt model for ASC 606 revenue recognition off the invoices + subscriptions sources.\n\n- New `rev_rec_monthly` model with tests.\n- Blocked: waiting on finance to confirm the deferral schedule (see the review thread).",
+        61 => "Fixes the nightly ingestion DAG silently swallowing a failed task, which left downstream tables stale.\n\n- Retries with backoff, then fails loudly and pages on exhaustion.\n- Backfills the two missed partitions.",
+        _ => "",
+    };
+    if bespoke.is_empty() {
+        format!("{title}.\n\nReworks the `{branch}` path and adds test coverage. Please review the error handling and edge-case paths; background is on the linked ticket.")
+    } else {
+        bespoke.to_string()
+    }
+}
+
+/// A believable body for each demo work item (keyed by identifier).
+fn wi_description(id: &str, title: &str) -> String {
+    let bespoke = match id {
+        "#842" => "p99 on `POST /charge` has crept from ~180ms to ~600ms over the last week.\n\n- Prime suspect is the new risk-score lookup on the hot path.\n- Next: trace a slow request end-to-end and confirm whether the cache is actually being hit.",
+        "#851" => "We have no visibility into how much of its retry budget the sync worker burns before giving up.\n\n- Emit `retries_used` / `retry_budget` counters.\n- Add a panel and alert when a worker consistently exhausts its budget.",
+        "#860" => "`webhook_delivery_spec` fails roughly 1 in 10 CI runs, almost always on the ordering assertion.\n\n- Looks like a timing assumption on async delivery.\n- Fix the ordering expectation or quarantine the test until it's stable.",
+        "#77" => "Staging is running prod-sized node pools and costing more than it should.\n\n- Move to smaller instances and enable scale-to-zero overnight.\n- Confirm nothing relies on the current headroom first.",
+        "ENG-231" => "Design a daily job that reconciles the payments ledger against the processor settlement report and flags mismatches.\n\n- Define the matching keys and an acceptable tolerance.\n- Decide where discrepancies surface (dashboard vs alert).\n\nDeliverable: a short design doc before we implement.",
+        "ENG-245" => "Timeboxed 3-day spike to evaluate event sourcing for the payments ledger.\n\n- Prototype append-only events plus a projection.\n- Assess replay cost and operational complexity.\n\nOutcome is a recommendation, not production code.",
+        "ENG-250" => "Stand up SLO dashboards for the charge API.\n\n- Availability and latency SLOs with error budgets.\n- Wire up burn-rate alerts.\n\nUse the existing Grafana / Prometheus stack.",
+        "ENG-198" => "Migrate our bespoke feature-flag client to the OpenFeature SDK.\n\n- Wrap the current provider behind the OpenFeature API.\n- Migrate call sites incrementally.\n\nBlocked on the platform team publishing the shared provider.",
+        "OPS-1423" => "Collect Q3 access-review evidence for the SOC2 audit.\n\n- Export access lists for the production systems.\n- Get sign-off from each system owner.\n\nDue before the auditor's window closes.",
+        "SEC-88" => "Track the action items from the INC-4821 postmortem (the webhook outage).\n\n- Add alerting on delivery lag.\n- Cap the retry backoff.\n- Document the manual drain runbook.",
+        "OPS-1440" => "Upgrade the Vault cluster from 1.14 to 1.16.\n\n- Review the breaking changes and the storage migration.\n- Roll nodes one at a time, verifying unseal + auth after each.\n\nSchedule inside a maintenance window.",
+        _ => "",
+    };
+    if bespoke.is_empty() {
+        format!("{title}.\n\nSee the linked ticket for background and acceptance criteria.")
+    } else {
+        bespoke.to_string()
+    }
+}
+
 /// Compact PR/MR builder for the demo data.
 #[allow(clippy::too_many_arguments)]
 fn pr(
@@ -70,7 +121,7 @@ fn pr(
         id: n.to_string(),
         number: Some(n),
         title: title.into(),
-        description: None,
+        description: Some(pr_description(n, title, branch)),
         author,
         is_draft: matches!(status, PullRequestStatus::Draft),
         status,
@@ -97,7 +148,7 @@ fn wi(id: &str, title: &str, state: &str, cat: WorkItemStateCategory, ty: &str, 
         id: id.into(),
         identifier: Some(id.into()),
         title: title.into(),
-        description: None,
+        description: Some(wi_description(id, title)),
         state: state.into(),
         state_category: cat,
         work_item_type: Some(ty.into()),
@@ -413,6 +464,32 @@ fn pipeline_runs() -> Vec<PipelineRun> {
     ]
 }
 
+/// Session-global store of review comments submitted during this `--demo` run, keyed by PR
+/// id. It lets the demo emulate a real provider: a comment you submit persists and comes
+/// back from `threads()` (even after reopening the PR), instead of vanishing.
+fn submitted_threads() -> &'static Mutex<HashMap<String, Vec<CommentThread>>> {
+    static STORE: OnceLock<Mutex<HashMap<String, Vec<CommentThread>>>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// PR ids merged during this `--demo` run. `merge()` records them and `list()`/`get()`
+/// then report those PRs as freshly merged — so a PR you merge drops out of "open" and
+/// shows up under "Recently merged", exactly like a real provider.
+fn merged_prs() -> &'static Mutex<HashSet<String>> {
+    static STORE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Apply any session merges to a PR: freshly merged, no longer a draft, updated just now.
+fn apply_session_merge(mut pr: PullRequest) -> PullRequest {
+    if merged_prs().lock().unwrap().contains(&pr.id) {
+        pr.status = PullRequestStatus::Merged;
+        pr.is_draft = false;
+        pr.updated_at = Some(base());
+    }
+    pr
+}
+
 struct DemoPr {
     conn: String,
 }
@@ -422,26 +499,52 @@ impl PullRequestSource for DemoPr {
         demo_latency().await;
         let prs: Vec<_> = prs_for(&self.conn)
             .into_iter()
+            .map(apply_session_merge)
             .filter(|p| query.include_completed || matches!(p.status, PullRequestStatus::Open | PullRequestStatus::Draft))
             .collect();
         Ok(apply_pull_request_filter(prs, query.filter, Some("you")))
     }
     async fn get(&self, id: &str) -> Result<PullRequest> {
-        prs_for(&self.conn).into_iter().find(|p| p.id == id).ok_or_else(|| forgetop_core::Error::NotFound(id.into()))
+        prs_for(&self.conn)
+            .into_iter()
+            .find(|p| p.id == id)
+            .map(apply_session_merge)
+            .ok_or_else(|| forgetop_core::Error::NotFound(id.into()))
     }
-    async fn threads(&self, _id: &str) -> Result<Vec<CommentThread>> {
-        Ok(vec![CommentThread {
-            id: "t1".into(),
-            comments: vec![Comment {
-                id: "c1".into(),
-                author: bob(),
-                body: "Looks good — one nit on the jitter.".into(),
-                created_at: Some(base() - chrono::Duration::hours(2)),
-            }],
-            file_path: None,
-            line: None,
-            is_resolved: false,
-        }])
+    async fn threads(&self, id: &str) -> Result<Vec<CommentThread>> {
+        let mut threads = vec![
+            // Anchored to a diff line so it renders inline and `]`/`[` can jump to it.
+            CommentThread {
+                id: "t1".into(),
+                comments: vec![Comment {
+                    id: "c1".into(),
+                    author: bob(),
+                    body: "One nit on the jitter — cap the backoff so it can't grow unbounded.".into(),
+                    created_at: Some(base() - chrono::Duration::hours(2)),
+                }],
+                file_path: Some("src/http/retry.rs".into()),
+                line: Some(15),
+                is_resolved: false,
+            },
+            // A resolved thread on the other file.
+            CommentThread {
+                id: "t2".into(),
+                comments: vec![Comment {
+                    id: "c2".into(),
+                    author: carol(),
+                    body: "Good call reusing the policy here.".into(),
+                    created_at: Some(base() - chrono::Duration::hours(3)),
+                }],
+                file_path: Some("src/http/client.rs".into()),
+                line: Some(13),
+                is_resolved: true,
+            },
+        ];
+        // Include anything submitted this session so it persists like a real provider.
+        if let Some(extra) = submitted_threads().lock().unwrap().get(id) {
+            threads.extend(extra.iter().cloned());
+        }
+        Ok(threads)
     }
     async fn changes(&self, _id: &str) -> Result<Vec<FileChange>> {
         Ok(vec![
@@ -567,16 +670,44 @@ impl PullRequestSource for DemoPr {
         };
         Ok(vec![file])
     }
-    async fn add_comment(&self, _id: &str, _body: &str) -> Result<()> {
+    async fn add_comment(&self, id: &str, body: &str) -> Result<()> {
+        // Persist as a general (non-line) thread so it comes back from threads() and shows
+        // on the Conversation tab after the view refreshes.
+        let mut store = submitted_threads().lock().unwrap();
+        let entry = store.entry(id.to_string()).or_default();
+        let n = entry.len();
+        entry.push(CommentThread {
+            id: format!("submitted-{n}"),
+            comments: vec![Comment { id: format!("mine-{n}"), author: me(), body: body.into(), created_at: Some(base()) }],
+            file_path: None,
+            line: None,
+            is_resolved: false,
+        });
         Ok(())
     }
     async fn vote(&self, _id: &str, _vote: ReviewVote) -> Result<()> {
         Ok(())
     }
-    async fn merge(&self, _id: &str, _options: &MergeOptions) -> Result<()> {
+    async fn merge(&self, id: &str, _options: &MergeOptions) -> Result<()> {
+        // Record the merge so list()/get() report this PR as freshly merged (→ Recently merged).
+        merged_prs().lock().unwrap().insert(id.to_string());
         Ok(())
     }
-    async fn submit_review(&self, _id: &str, _event: ReviewVote, _comments: &[LineComment]) -> Result<()> {
+    async fn submit_review(&self, id: &str, _event: ReviewVote, comments: &[LineComment]) -> Result<()> {
+        // Persist each line comment as an open thread by "you", so it comes back from
+        // threads() and the diff shows it exactly as a real provider would.
+        let mut store = submitted_threads().lock().unwrap();
+        let entry = store.entry(id.to_string()).or_default();
+        for c in comments {
+            let n = entry.len();
+            entry.push(CommentThread {
+                id: format!("submitted-{n}"),
+                comments: vec![Comment { id: format!("mine-{n}"), author: me(), body: c.body.clone(), created_at: Some(base()) }],
+                file_path: Some(c.path.clone()),
+                line: Some(c.line),
+                is_resolved: false,
+            });
+        }
         Ok(())
     }
 }
@@ -601,13 +732,24 @@ impl WorkItemSource for DemoWi {
     async fn get(&self, id: &str) -> Result<WorkItem> {
         wis_for(&self.conn).into_iter().find(|w| w.id == id).ok_or_else(|| forgetop_core::Error::NotFound(id.into()))
     }
-    async fn threads(&self, _id: &str) -> Result<Vec<CommentThread>> {
-        Ok(vec![])
+    async fn threads(&self, id: &str) -> Result<Vec<CommentThread>> {
+        // Comments submitted this session persist and come back, like a real provider.
+        Ok(submitted_threads().lock().unwrap().get(id).cloned().unwrap_or_default())
     }
     async fn set_state(&self, _id: &str, _state: &str) -> Result<()> {
         Ok(())
     }
-    async fn add_comment(&self, _id: &str, _body: &str) -> Result<()> {
+    async fn add_comment(&self, id: &str, body: &str) -> Result<()> {
+        let mut store = submitted_threads().lock().unwrap();
+        let entry = store.entry(id.to_string()).or_default();
+        let n = entry.len();
+        entry.push(CommentThread {
+            id: format!("submitted-{n}"),
+            comments: vec![Comment { id: format!("mine-{n}"), author: me(), body: body.into(), created_at: Some(base()) }],
+            file_path: None,
+            line: None,
+            is_resolved: false,
+        });
         Ok(())
     }
     async fn available_states(&self, _id: &str) -> Result<Vec<String>> {
@@ -755,6 +897,70 @@ mod tests {
             provider: ProviderType::GitHub,
             caps: demo_capabilities(ProviderType::GitHub),
         }
+    }
+
+    #[tokio::test]
+    async fn submitted_review_comments_persist_in_threads() {
+        let src = DemoPr { conn: "github".into() };
+        // Unique ids so the session-global store can't collide with other tests.
+        let (pr, other) = ("persist-pr-a", "persist-pr-b");
+        let before = src.threads(pr).await.unwrap().len();
+
+        src.submit_review(
+            pr,
+            ReviewVote::NoVote,
+            &[LineComment { path: "src/http/retry.rs".into(), line: 7, side: DiffSide::New, body: "please add a test".into() }],
+        )
+        .await
+        .unwrap();
+
+        let after = src.threads(pr).await.unwrap();
+        assert_eq!(after.len(), before + 1, "the submitted comment persists as a new thread");
+        assert!(
+            after.iter().any(|t| t.comments.iter().any(|c| c.body == "please add a test")),
+            "the submitted body comes back from threads()"
+        );
+        // A different PR is unaffected by what was submitted to this one.
+        assert_eq!(src.threads(other).await.unwrap().len(), before);
+    }
+
+    #[tokio::test]
+    async fn pr_comment_persists_as_a_conversation_thread() {
+        let src = DemoPr { conn: "github".into() };
+        let id = "persist-prcomment-a"; // unique id → no cross-test pollution
+        src.add_comment(id, "ship it").await.unwrap();
+        let threads = src.threads(id).await.unwrap();
+        assert!(
+            threads.iter().any(|t| t.file_path.is_none() && t.comments.iter().any(|c| c.body == "ship it")),
+            "a PR comment comes back as a general (non-line) thread"
+        );
+    }
+
+    #[tokio::test]
+    async fn wi_comment_persists_in_threads() {
+        let src = DemoWi { conn: "github".into() };
+        let id = "persist-wicomment-a";
+        let before = src.threads(id).await.unwrap().len();
+        src.add_comment(id, "on it").await.unwrap();
+        let after = src.threads(id).await.unwrap();
+        assert_eq!(after.len(), before + 1);
+        assert!(after.iter().any(|t| t.comments.iter().any(|c| c.body == "on it")));
+    }
+
+    #[tokio::test]
+    async fn merging_marks_the_pr_as_freshly_merged() {
+        let src = conn().pull_requests().unwrap();
+        // A fabricated id (not a real demo PR) so the session-global store can't pollute
+        // other tests' open-PR counts.
+        let id = "demo-merge-test-42";
+        src.merge(id, &MergeOptions { strategy: MergeStrategy::Merge, delete_source_ref: false }).await.unwrap();
+
+        // A PR with that id now reports as merged and no longer open/draft.
+        let mut p = pr(0, "x", me(), PullRequestStatus::Open, CheckStatus::Passed, MergeableState::Mergeable, vec![], 1, 1, 1, "b", &[]);
+        p.id = id.to_string();
+        let merged = apply_session_merge(p);
+        assert_eq!(merged.status, PullRequestStatus::Merged);
+        assert!(!merged.is_draft);
     }
 
     #[tokio::test]

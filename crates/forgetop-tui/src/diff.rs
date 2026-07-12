@@ -65,6 +65,31 @@ pub fn comment_target(patch: &str, cursor: usize) -> Option<(i64, DiffSide)> {
     None
 }
 
+/// The patch display-line index whose **new-side** line number equals `target`, or `None`
+/// if it isn't in this patch. Used to jump the cursor to a thread anchored at a file line.
+pub fn patch_line_for_source_line(patch: &str, target: i64) -> Option<usize> {
+    let mut new_ln = 0i64;
+    for (i, line) in patch.lines().enumerate() {
+        if let Some((_, n)) = parse_hunk_header(line) {
+            new_ln = n;
+            continue;
+        }
+        if new_ln == 0 || line.starts_with("+++") || line.starts_with("---") {
+            continue;
+        }
+        match line.chars().next() {
+            Some('-') => {} // removed line: doesn't exist on the new side
+            _ => {
+                if new_ln == target {
+                    return Some(i);
+                }
+                new_ln += 1;
+            }
+        }
+    }
+    None
+}
+
 /// Human label for the file position of patch line `cursor` (e.g. `line 42`).
 pub fn cursor_line_label(patch: &str, cursor: usize) -> Option<String> {
     // Hunk headers get a distinct label; commentable lines report their number.
@@ -106,6 +131,15 @@ mod tests {
         assert_eq!(cursor_line_label(patch, 1).as_deref(), Some("line 20")); // context → new line 20
         assert_eq!(cursor_line_label(patch, 2).as_deref(), Some("line 21")); // added → new line 21
         assert_eq!(cursor_line_label(patch, 3).as_deref(), Some("line 11 (old)")); // removed → old line 11
+    }
+
+    #[test]
+    fn source_line_maps_back_to_the_patch_index() {
+        let patch = "@@ -10,3 +20,4 @@\n ctx\n+new\n-old";
+        assert_eq!(patch_line_for_source_line(patch, 20), Some(1)); // context row
+        assert_eq!(patch_line_for_source_line(patch, 21), Some(2)); // added row
+        assert_eq!(patch_line_for_source_line(patch, 22), None); // beyond the hunk
+        assert_eq!(patch_line_for_source_line(patch, 11), None); // an old-side line isn't on the new side
     }
 
     #[test]

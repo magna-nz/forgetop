@@ -31,6 +31,8 @@ pub enum Tone {
     Warn,
     /// Failed / blocked / worth a look — red.
     Bad,
+    /// Shipped — a merged PR — magenta.
+    Merged,
     /// Waiting / neutral — grey.
     Neutral,
 }
@@ -78,7 +80,8 @@ fn pr_tone(row: &PrRow) -> Tone {
         return Tone::Neutral;
     }
     match row.pr.status {
-        PullRequestStatus::Open | PullRequestStatus::Merged => Tone::Good,
+        PullRequestStatus::Open => Tone::Good,
+        PullRequestStatus::Merged => Tone::Merged,
         PullRequestStatus::Closed => Tone::Bad,
         PullRequestStatus::Draft => Tone::Neutral,
     }

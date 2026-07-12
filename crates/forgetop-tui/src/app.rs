@@ -519,6 +519,8 @@ pub struct DiffView {
     /// When set, the diff shows a single commit's changes (label shown in the
     /// file-list title); `None` means the whole-PR diff.
     pub commit_label: Option<String>,
+    /// Paths the reviewer has marked "viewed" this session (per open PR, not persisted).
+    pub viewed: HashSet<String>,
 }
 
 impl DiffView {
@@ -565,6 +567,51 @@ impl DiffView {
 
     fn scroll_by(&mut self, delta: i32) {
         self.scroll = (self.scroll as i32 + delta).max(0) as u16;
+    }
+
+    /// Toggle the "viewed" mark on the current file.
+    fn toggle_viewed(&mut self) {
+        if let Some(path) = self.current().map(|f| f.path.clone()) {
+            if !self.viewed.remove(&path) {
+                self.viewed.insert(path);
+            }
+        }
+    }
+
+    pub fn is_viewed(&self, path: &str) -> bool {
+        self.viewed.contains(path)
+    }
+
+    /// How many of the currently-listed files are marked viewed (for "N/M reviewed").
+    pub fn viewed_count(&self) -> usize {
+        self.files.iter().filter(|f| self.viewed.contains(&f.path)).count()
+    }
+
+    /// Move the patch cursor to the next (`dir > 0`) or previous thread in the current
+    /// file, entering the patch cursor. Wraps. No-op if the file has no located threads.
+    fn jump_thread(&mut self, dir: isize) {
+        let mut targets: Vec<usize> = {
+            let Some(file) = self.current() else { return };
+            let Some(patch) = file.patch.as_deref() else { return };
+            let path = file.path.as_str();
+            self.threads
+                .iter()
+                .filter(|t| t.file_path.as_deref() == Some(path))
+                .filter_map(|t| t.line.and_then(|l| crate::diff::patch_line_for_source_line(patch, l)))
+                .collect()
+        };
+        targets.sort_unstable();
+        targets.dedup();
+        if targets.is_empty() {
+            return;
+        }
+        self.focus = DiffFocus::Patch;
+        let cur = self.cursor;
+        self.cursor = if dir > 0 {
+            targets.iter().find(|&&t| t > cur).copied().unwrap_or(targets[0])
+        } else {
+            targets.iter().rev().find(|&&t| t < cur).copied().unwrap_or(*targets.last().unwrap())
+        };
     }
 }
 
@@ -1642,7 +1689,8 @@ impl App {
             }
         };
         let threads = source.threads(&id).await.unwrap_or_default();
-        let files = source.changes(&id).await.unwrap_or_default();
+        let mut files = source.changes(&id).await.unwrap_or_default();
+        files.sort_by(|a, b| a.path.cmp(&b.path)); // cluster by directory for grouping
         let checks = source.checks(&id).await.unwrap_or_default();
         let commits = source.commits(&id).await.unwrap_or_default();
         let diff = DiffView {
@@ -1655,6 +1703,7 @@ impl App {
             focus: DiffFocus::FileList,
             cursor: 0,
             commit_label: None,
+            viewed: HashSet::new(),
         };
         self.screen = Screen::PrView(Box::new(PrView {
             label,
@@ -1696,6 +1745,21 @@ impl App {
             }
             None => self.toast = Some("Move to a code line to comment (not a hunk header)".into()),
         }
+    }
+
+    /// On Esc with unsubmitted line comments, ask whether to submit or leave.
+    fn open_pending_exit_prompt(&mut self) {
+        let n = match &self.screen {
+            Screen::PrView(v) => v.pending.len(),
+            _ => return,
+        };
+        let noun = if n == 1 { "comment" } else { "comments" };
+        self.overlay = Some(Overlay::Picker {
+            title: format!("{n} unsubmitted {noun}"),
+            items: vec!["Submit review…".into(), "Leave without submitting".into()],
+            selected: 0,
+            kind: PickerKind::PendingExit,
+        });
     }
 
     /// Opens the submit-review verdict picker if there are pending comments.
@@ -1778,11 +1842,12 @@ impl App {
                 return;
             }
         };
-        let files = source.commit_changes(&pr_id, &sha).await.unwrap_or_default();
+        let mut files = source.commit_changes(&pr_id, &sha).await.unwrap_or_default();
         if files.is_empty() {
             self.toast = Some("No per-commit diff for this provider".into());
             return;
         }
+        files.sort_by(|a, b| a.path.cmp(&b.path));
 
         let short: String = sha.chars().take(7).collect();
         let title: String = msg.chars().take(50).collect();
@@ -1832,6 +1897,11 @@ impl App {
                         v.diff.exit_patch();
                         return;
                     }
+                }
+                // Leaving the view with buffered-but-unsubmitted comments: ask first.
+                if matches!(&self.screen, Screen::PrView(v) if !v.pending.is_empty()) {
+                    self.open_pending_exit_prompt();
+                    return;
                 }
                 self.screen = self.view_origin();
                 return;
@@ -1886,6 +1956,10 @@ impl App {
             }
             // Enter on a file drops into a line cursor within its patch.
             Key::Enter if v.tab == 3 => v.diff.enter_patch(),
+            // Diff-tab review ergonomics: mark viewed, jump between threads.
+            Key::Char('v') if v.tab == 3 => v.diff.toggle_viewed(),
+            Key::Char(']') if v.tab == 3 => v.diff.jump_thread(1),
+            Key::Char('[') if v.tab == 3 => v.diff.jump_thread(-1),
             Key::Up | Key::Char('k') => {
                 if v.tab == 3 {
                     if v.diff.focus == DiffFocus::Patch {
@@ -2815,6 +2889,8 @@ impl App {
             Action::PickApproval { index } => self.confirm_approval(index),
             Action::RespondApproval { index } => self.respond_approval(index, deps).await,
             Action::OpenItem { kind, id, connection_id } => self.open_palette_item(kind, id, connection_id, deps).await,
+            Action::OpenReviewMenu => self.open_review_submit(),
+            Action::LeavePrView => self.screen = self.view_origin(),
         }
     }
 
@@ -2858,6 +2934,18 @@ impl App {
                 // Voting on (reviewing) or merging a PR clears it from the Launchpad now.
                 if matches!(action, Action::PrVote(_) | Action::PrMerge(_)) {
                     self.dismiss_from_launchpad(&conn_id, &id);
+                }
+                // Reflect the change in the open PR view: re-fetch the PR (status / reviewers
+                // / mergeable) and its threads (a new comment), like the work-item handler.
+                if matches!(&self.screen, Screen::PrView(v) if v.pr.id == id) {
+                    let fresh = source.get(&id).await.ok();
+                    let threads = source.threads(&id).await.unwrap_or_default();
+                    if let Screen::PrView(v) = &mut self.screen {
+                        if let Some(pr) = fresh {
+                            v.pr = pr;
+                        }
+                        v.diff.threads = threads;
+                    }
                 }
                 let mut errors = Vec::new();
                 self.reload_pull_requests(deps, &mut errors).await;
@@ -4269,6 +4357,7 @@ mod tests {
             focus: DiffFocus::FileList,
             cursor: 0,
             commit_label: None,
+            viewed: HashSet::new(),
         }
     }
 
@@ -4312,6 +4401,43 @@ mod tests {
         let mut d = diff(vec![changed("bin", None)]);
         d.enter_patch();
         assert_eq!(d.focus, DiffFocus::FileList, "no patch → stay in the file list");
+    }
+
+    #[test]
+    fn diff_toggle_viewed_tracks_progress() {
+        let mut d = diff(vec![changed("a.rs", None), changed("b.rs", None)]);
+        assert_eq!(d.viewed_count(), 0);
+        d.toggle_viewed(); // marks a.rs (selected == 0)
+        assert!(d.is_viewed("a.rs"));
+        assert_eq!(d.viewed_count(), 1);
+        d.select_file(1);
+        d.toggle_viewed(); // marks b.rs
+        assert_eq!(d.viewed_count(), 2);
+        d.toggle_viewed(); // unmarks b.rs
+        assert!(!d.is_viewed("b.rs"));
+        assert_eq!(d.viewed_count(), 1);
+    }
+
+    #[test]
+    fn diff_jump_thread_moves_cursor_to_thread_lines() {
+        // new-side lines: 20 (ctx, idx 1), 21 (added, idx 2).
+        let mut d = diff(vec![changed("a.rs", Some("@@ -10,3 +20,4 @@\n ctx\n+added\n-removed"))]);
+        d.threads = vec![
+            CommentThread { id: "t1".into(), comments: vec![], file_path: Some("a.rs".into()), line: Some(21), is_resolved: false },
+        ];
+        d.jump_thread(1); // next thread from cursor 0 → the one at patch line 2
+        assert_eq!(d.focus, DiffFocus::Patch);
+        assert_eq!(d.cursor, 2);
+        d.jump_thread(1); // only one thread → wraps back to it
+        assert_eq!(d.cursor, 2);
+    }
+
+    #[test]
+    fn diff_jump_thread_is_noop_without_located_threads() {
+        let mut d = diff(vec![changed("a.rs", Some("@@ -1,1 +1,1 @@\n ctx"))]);
+        d.jump_thread(1); // no threads
+        assert_eq!(d.focus, DiffFocus::FileList);
+        assert_eq!(d.cursor, 0);
     }
 
     #[test]
@@ -4413,6 +4539,54 @@ mod tests {
         }
     }
 
+    fn pr_view_with_pending(pending: Vec<LineComment>) -> Screen {
+        Screen::PrView(Box::new(PrView {
+            label: "PR".into(),
+            connection_id: "c".into(),
+            url: None,
+            pr: pr(None),
+            tab: 0,
+            checks: vec![],
+            commits: vec![],
+            commit_sel: 0,
+            pr_files: vec![],
+            scroll: 0,
+            diff: diff(vec![]),
+            pending,
+            review_draft: None,
+        }))
+    }
+
+    #[test]
+    fn esc_with_pending_comments_prompts_before_leaving() {
+        let mut app = App::new("slate");
+        app.screen = pr_view_with_pending(vec![LineComment {
+            path: "a.rs".into(),
+            line: 1,
+            side: DiffSide::New,
+            body: "nit".into(),
+        }]);
+
+        app.on_pr_view_key(Key::Escape);
+
+        assert!(matches!(app.screen, Screen::PrView(_)), "does not leave while comments are unsubmitted");
+        match &app.overlay {
+            Some(Overlay::Picker { kind, .. }) => assert!(matches!(kind, PickerKind::PendingExit)),
+            _ => panic!("expected the unsubmitted-comments prompt"),
+        }
+    }
+
+    #[test]
+    fn esc_without_pending_leaves_the_pr_view() {
+        let mut app = App::new("slate");
+        app.screen = pr_view_with_pending(vec![]);
+
+        app.on_pr_view_key(Key::Escape);
+
+        assert!(!matches!(app.screen, Screen::PrView(_)), "leaves the PR view when nothing is buffered");
+        assert!(app.overlay.is_none());
+    }
+
     #[test]
     fn selected_url_reads_active_tab_and_subview() {
         let mut app = App::new("slate");
@@ -4448,6 +4622,7 @@ mod tests {
                 focus: DiffFocus::FileList,
                 cursor: 0,
                 commit_label: None,
+                viewed: HashSet::new(),
             },
             pending: vec![],
             review_draft: None,

@@ -12,6 +12,7 @@ use ratatui::Frame;
 
 use crate::app::{App, ConfigView, DiffFocus, DiffView, PipelineView, PrView, Screen, WiView, PR_TABS, TABS};
 use crate::diff::{cursor_line_label, pending_marks};
+use crate::highlight::{lang_for, HlKind, LineHighlighter};
 use crate::overlay::Overlay;
 use crate::palette::{PaletteItem, PaletteKind, Tone};
 use crate::theme::{check_icon, pipeline_glyph, Theme};
@@ -591,9 +592,9 @@ fn pr_status(theme: &Theme, pr: &PullRequest) -> (&'static str, ratatui::style::
         return ("◌ draft", theme.dim);
     }
     match pr.status {
-        // Green = healthy/done (open, merged); red = closed unmerged (worth a look).
+        // Green = open (healthy), magenta = merged (shipped/done), red = closed unmerged.
         PullRequestStatus::Open => ("● open", theme.green),
-        PullRequestStatus::Merged => ("✦ merged", theme.green),
+        PullRequestStatus::Merged => ("✦ merged", theme.magenta),
         PullRequestStatus::Closed => ("✗ closed", theme.red),
         PullRequestStatus::Draft => ("◌ draft", theme.dim),
     }
@@ -826,6 +827,17 @@ fn pr_tabs_line(theme: &Theme, view: &PrView) -> Line<'static> {
     Line::from(spans)
 }
 
+/// A reviewer's vote as a coloured glyph: green ✓ approved, red ✗ changes requested,
+/// yellow … waiting, dim · not yet voted.
+fn review_glyph(theme: &Theme, vote: ReviewVote) -> (&'static str, ratatui::style::Color) {
+    match vote {
+        ReviewVote::Approved | ReviewVote::ApprovedWithSuggestions => ("✓", theme.green),
+        ReviewVote::Rejected => ("✗", theme.red),
+        ReviewVote::WaitingForAuthor => ("…", theme.yellow),
+        ReviewVote::NoVote => ("·", theme.dim),
+    }
+}
+
 fn pr_conversation_lines(theme: &Theme, pr: &PullRequest, threads: &[CommentThread]) -> Vec<Line<'static>> {
     let mut lines = vec![
         field(theme, "Author", pr.author.display_name.clone()),
@@ -834,8 +846,16 @@ fn pr_conversation_lines(theme: &Theme, pr: &PullRequest, threads: &[CommentThre
         field(theme, "Changes", format!("{} files  +{} -{}", pr.changed_files, pr.additions, pr.deletions)),
     ];
     if !pr.reviewers.is_empty() {
-        let who = pr.reviewers.iter().map(|r| format!("{} ({:?})", r.user.display_name, r.vote)).collect::<Vec<_>>().join(", ");
-        lines.push(field(theme, "Reviewers", who));
+        let mut spans = vec![Span::styled(format!("{:<12}", "Reviewers"), Style::default().fg(theme.dim))];
+        for (i, r) in pr.reviewers.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::styled(", ", Style::default().fg(theme.dim)));
+            }
+            let (glyph, color) = review_glyph(theme, r.vote);
+            spans.push(Span::styled(format!("{} ({:?}) ", r.user.display_name, r.vote), Style::default().fg(theme.fg)));
+            spans.push(Span::styled(glyph, Style::default().fg(color)));
+        }
+        lines.push(Line::from(spans));
     }
     if !pr.labels.is_empty() {
         lines.push(field(theme, "Labels", pr.labels.join(", ")));
@@ -843,10 +863,11 @@ fn pr_conversation_lines(theme: &Theme, pr: &PullRequest, threads: &[CommentThre
     if let Some(url) = &pr.url {
         lines.push(field(theme, "URL", url.clone()));
     }
-    if let Some(desc) = pr.description.as_ref().filter(|d| !d.is_empty()) {
+    if let Some(desc) = pr.description.as_ref().filter(|d| !d.trim().is_empty()) {
         lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("Description", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD))));
         for l in desc.lines() {
-            lines.push(Line::from(Span::styled(l.to_string(), Style::default().fg(theme.dim))));
+            lines.push(Line::from(Span::styled(l.to_string(), Style::default().fg(theme.fg))));
         }
     }
     lines.extend(comment_lines(theme, threads));
@@ -1138,83 +1159,79 @@ fn kind_badge(theme: &Theme, kind: FileChangeKind) -> Span<'static> {
 }
 
 fn render_diff(frame: &mut Frame, area: Rect, theme: &Theme, diff: &DiffView, pending: &[LineComment]) {
+    // File list on the left; the patch on the right renders comment threads inline,
+    // beneath the lines they anchor to (unanchored threads live on the Conversation tab).
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Length(44), Constraint::Min(20)])
         .split(area);
 
-    let thread_h = if diff.threads.is_empty() { 3 } else { 12 };
-    let left = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(4), Constraint::Length(thread_h)])
-        .split(cols[0]);
-
-    render_diff_files(frame, left[0], theme, diff);
-    render_diff_threads(frame, left[1], theme, diff);
+    render_diff_files(frame, cols[0], theme, diff);
     render_diff_patch(frame, cols[1], theme, diff, pending);
 }
 
+/// The directory portion of a path (`""` for a root-level file).
+fn dir_of(path: &str) -> &str {
+    path.rfind('/').map(|i| &path[..i]).unwrap_or("")
+}
+
+/// The filename portion of a path.
+fn base_of(path: &str) -> &str {
+    path.rfind('/').map(|i| &path[i + 1..]).unwrap_or(path)
+}
+
 fn render_diff_files(frame: &mut Frame, area: Rect, theme: &Theme, diff: &DiffView) {
-    let title = match &diff.commit_label {
-        Some(l) => format!("commit {l} · files"),
-        None => format!("{} · files", diff.pr_label),
+    let scope = match &diff.commit_label {
+        Some(l) => format!("commit {l}"),
+        None => diff.pr_label.clone(),
     };
+    let title = format!("{scope} · files · {}/{} reviewed", diff.viewed_count(), diff.files.len());
     let block = section_block(theme, &title);
     if diff.files.is_empty() {
         empty(frame, area, theme, "No changed files.", block);
         return;
     }
 
-    let rows: Vec<Row> = diff
-        .files
-        .iter()
-        .map(|f| {
-            Row::new(vec![
-                Cell::from(kind_badge(theme, f.kind)),
-                Cell::from(Span::styled(f.path.clone(), Style::default().fg(theme.fg))),
-                Cell::from(Span::styled(format!("+{} -{}", f.additions, f.deletions), Style::default().fg(theme.dim))),
-            ])
-        })
-        .collect();
+    // Files are pre-sorted by path, so same-directory files are contiguous. Emit a dim
+    // directory header whenever the directory changes; track the selected file's row so
+    // the (file-indexed) selection lands on the right display row past the headers.
+    let mut rows: Vec<Row> = Vec::new();
+    let mut sel_row = 0usize;
+    let mut last_dir: Option<&str> = None;
+    for (i, f) in diff.files.iter().enumerate() {
+        let dir = dir_of(&f.path);
+        if last_dir != Some(dir) {
+            let label = if dir.is_empty() { "(root)".into() } else { format!("{dir}/") };
+            rows.push(Row::new(vec![
+                Cell::from(""),
+                Cell::from(""),
+                Cell::from(Span::styled(label, Style::default().fg(theme.dim).add_modifier(Modifier::BOLD))),
+                Cell::from(""),
+            ]));
+            last_dir = Some(dir);
+        }
+        if i == diff.selected {
+            sel_row = rows.len();
+        }
+        let viewed = diff.is_viewed(&f.path);
+        let name_style = if viewed { Style::default().fg(theme.dim) } else { Style::default().fg(theme.fg) };
+        rows.push(Row::new(vec![
+            Cell::from(Span::styled(if viewed { "[x]" } else { "[ ]" }, Style::default().fg(theme.dim))),
+            Cell::from(kind_badge(theme, f.kind)),
+            Cell::from(Span::styled(format!("  {}", base_of(&f.path)), name_style)),
+            Cell::from(Span::styled(format!("+{} -{}", f.additions, f.deletions), Style::default().fg(theme.dim))),
+        ]));
+    }
 
-    let widths = [Constraint::Length(1), Constraint::Min(10), Constraint::Length(10)];
+    let widths = [Constraint::Length(3), Constraint::Length(1), Constraint::Min(10), Constraint::Length(10)];
     let table = Table::new(rows, widths)
         .block(block)
         .column_spacing(1)
         .row_highlight_style(highlight(theme))
         .highlight_symbol("▐ ");
     let mut state = TableState::default();
-    state.select(Some(diff.selected));
+    state.select(Some(sel_row));
     frame.render_stateful_widget(table, area, &mut state);
-}
-
-fn render_diff_threads(frame: &mut Frame, area: Rect, theme: &Theme, diff: &DiffView) {
-    let title = format!("Comments ({})", diff.threads.len());
-    let block = section_block(theme, &title);
-    if diff.threads.is_empty() {
-        empty(frame, area, theme, "No review comments.", block);
-        return;
-    }
-    let mut lines: Vec<Line> = Vec::new();
-    for t in &diff.threads {
-        let loc = match (&t.file_path, t.line) {
-            (Some(p), Some(l)) => format!("{p}:{l}"),
-            (Some(p), None) => p.clone(),
-            _ => "general".into(),
-        };
-        let mark = if t.is_resolved { "✓ resolved" } else { "○ open" };
-        lines.push(Line::from(vec![
-            Span::styled(format!("{loc} "), Style::default().fg(theme.accent)),
-            Span::styled(mark.to_string(), Style::default().fg(if t.is_resolved { theme.green } else { theme.dim })),
-        ]));
-        for c in &t.comments {
-            lines.push(Line::from(vec![
-                Span::styled(format!("  {}: ", c.author.display_name), Style::default().fg(theme.blue)),
-                Span::styled(c.body.clone(), Style::default().fg(theme.fg)),
-            ]));
-        }
-    }
-    frame.render_widget(Paragraph::new(lines).block(block).wrap(Wrap { trim: true }), area);
 }
 
 fn render_diff_patch(frame: &mut Frame, area: Rect, theme: &Theme, diff: &DiffView, pending: &[LineComment]) {
@@ -1240,49 +1257,150 @@ fn render_diff_patch(frame: &mut Frame, area: Rect, theme: &Theme, diff: &DiffVi
 
     let inner_w = area.width.saturating_sub(2) as usize;
     let inner_h = area.height.saturating_sub(2) as usize;
-    let total = patch.lines().count();
-    // Patch lines (in this file) that carry a pending comment get a gutter bar.
+    // Pending (unsaved) comments get a gutter bar.
     let marks = pending_marks(patch, &file.path, pending);
+    // Existing threads grouped by the patch line they anchor to — rendered inline below it.
+    let mut threads_at: std::collections::HashMap<usize, Vec<&CommentThread>> = std::collections::HashMap::new();
+    for t in &diff.threads {
+        if t.file_path.as_deref() == Some(file.path.as_str()) {
+            if let Some(idx) = t.line.and_then(|l| crate::diff::patch_line_for_source_line(patch, l)) {
+                threads_at.entry(idx).or_default().push(t);
+            }
+        }
+    }
+    // Pending (unsubmitted) comments, grouped by patch line via the same (line, side) map
+    // that drives the gutter marks — so a draft shows inline before you submit it.
+    let mut pending_at: std::collections::HashMap<usize, Vec<&LineComment>> = std::collections::HashMap::new();
+    if !pending.is_empty() {
+        for i in 0..patch.lines().count() {
+            if let Some(t) = crate::diff::comment_target(patch, i) {
+                for c in pending.iter().filter(|c| c.path == file.path && (c.line, c.side) == t) {
+                    pending_at.entry(i).or_default().push(c);
+                }
+            }
+        }
+    }
+
+    // One highlighter per file (regexes compile once); None for unhighlighted languages.
+    let mut hl = lang_for(&file.path).and_then(LineHighlighter::new);
+
+    // Build the display lines, splicing each thread in beneath the line it anchors to.
+    // `cursor_row` tracks where the cursor's patch line landed (comment lines shift it).
+    let mut lines: Vec<Line> = Vec::new();
+    let mut cursor_row = 0usize;
+    for (i, l) in patch.lines().enumerate() {
+        let gutter = if marks.contains(&i) {
+            Span::styled("▎", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD))
+        } else {
+            Span::raw(" ")
+        };
+        if patch_focus && i == diff.cursor {
+            cursor_row = lines.len();
+            // Pad to full width (minus the gutter) so the highlight spans the row.
+            let mut text = l.to_string();
+            let w = text.chars().count();
+            if w + 1 < inner_w {
+                text.push_str(&" ".repeat(inner_w - 1 - w));
+            }
+            lines.push(Line::from(vec![
+                gutter,
+                Span::styled(text, Style::default().fg(patch_fg(theme, l)).bg(theme.sel_bg).add_modifier(Modifier::BOLD)),
+            ]));
+        } else {
+            let mut line = patch_line_hl(theme, l, hl.as_mut());
+            line.spans.insert(0, gutter);
+            lines.push(line);
+        }
+        if let Some(ts) = threads_at.get(&i) {
+            for &t in ts {
+                let (glyph, state) = if t.is_resolved { ("○", "resolved") } else { ("●", "open") };
+                let border = if t.is_resolved { theme.dim } else { theme.accent };
+                let bodies: Vec<String> = t.comments.iter().map(|c| format!("{}: {}", c.author.display_name, c.body)).collect();
+                lines.extend(inline_box(theme, border, &format!("{glyph} {state}"), &bodies, inner_w));
+            }
+        }
+        if let Some(ps) = pending_at.get(&i) {
+            let bodies: Vec<String> = ps.iter().map(|c| format!("you: {}", c.body)).collect();
+            lines.extend(inline_box(theme, theme.blue, "● pending", &bodies, inner_w));
+        }
+    }
 
     // In the cursor, derive scroll so the cursor line stays roughly centred; the
     // stored scroll is only used for the free-scroll (file-list) mode.
     let scroll = if patch_focus {
         let half = inner_h / 2;
-        diff.cursor.saturating_sub(half).min(total.saturating_sub(inner_h.max(1))) as u16
+        cursor_row.saturating_sub(half).min(lines.len().saturating_sub(inner_h.max(1))) as u16
     } else {
         diff.scroll
     };
 
-    let lines: Vec<Line> = patch
-        .lines()
-        .enumerate()
-        .map(|(i, l)| {
-            // A 1-col gutter: a bar when the line has a pending comment.
-            let gutter = if marks.contains(&i) {
-                Span::styled("▎", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD))
-            } else {
-                Span::raw(" ")
-            };
-            if patch_focus && i == diff.cursor {
-                // Pad to full width (minus the gutter) so the highlight spans the row.
-                let mut text = l.to_string();
-                let w = text.chars().count();
-                if w + 1 < inner_w {
-                    text.push_str(&" ".repeat(inner_w - 1 - w));
-                }
-                Line::from(vec![
-                    gutter,
-                    Span::styled(text, Style::default().fg(patch_fg(theme, l)).bg(theme.sel_bg).add_modifier(Modifier::BOLD)),
-                ])
-            } else {
-                let mut line = patch_line(theme, l);
-                line.spans.insert(0, gutter);
-                line
-            }
-        })
-        .collect();
-
     frame.render_widget(Paragraph::new(lines).block(block).scroll((scroll, 0)), area);
+}
+
+/// Wrap `s` to `width` display columns on word boundaries.
+fn wrap_words(s: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![s.to_string()];
+    }
+    let mut lines = Vec::new();
+    let mut cur = String::new();
+    for word in s.split_whitespace() {
+        if cur.is_empty() {
+            cur = word.to_string();
+        } else if cur.chars().count() + 1 + word.chars().count() <= width {
+            cur.push(' ');
+            cur.push_str(word);
+        } else {
+            lines.push(std::mem::take(&mut cur));
+            cur = word.to_string();
+        }
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+/// Render a comment — an existing thread or an unsent draft — as a bordered,
+/// background-filled box shown inline beneath its diff line, so it's clearly distinct from
+/// the code. `header` is the state line; `bodies` are the comment texts (`author: body`).
+fn inline_box(theme: &Theme, border: ratatui::style::Color, header: &str, bodies: &[String], width: usize) -> Vec<Line<'static>> {
+    let bg = theme.panel;
+    let indent = "  ";
+    let box_w = width.saturating_sub(3).max(20); // leaves a small right margin
+    let content_w = box_w.saturating_sub(4); // inside "│ " … " │"
+    let frame = |style: Style| style.fg(border).bg(bg);
+
+    // Inner content rows (each a single styled string): a header, then wrapped comments.
+    let mut rows: Vec<Span<'static>> = vec![Span::styled(header.to_string(), frame(Style::default()).add_modifier(Modifier::BOLD))];
+    for b in bodies {
+        for chunk in wrap_words(b, content_w) {
+            rows.push(Span::styled(chunk, Style::default().fg(theme.fg).bg(bg)));
+        }
+    }
+
+    let dashes = "─".repeat(box_w.saturating_sub(2));
+    let mut out = vec![Line::from(vec![
+        Span::raw(indent),
+        Span::styled(format!("╭{dashes}╮"), frame(Style::default())),
+    ])];
+    for inner in rows {
+        let fill = content_w.saturating_sub(inner.content.chars().count());
+        out.push(Line::from(vec![
+            Span::raw(indent),
+            Span::styled("│ ", frame(Style::default())),
+            inner,
+            Span::styled(format!("{} │", " ".repeat(fill)), frame(Style::default())),
+        ]));
+    }
+    out.push(Line::from(vec![
+        Span::raw(indent),
+        Span::styled(format!("╰{dashes}╯"), frame(Style::default())),
+    ]));
+    out
 }
 
 fn patch_fg(theme: &Theme, line: &str) -> ratatui::style::Color {
@@ -1301,6 +1419,41 @@ fn patch_fg(theme: &Theme, line: &str) -> ratatui::style::Color {
 
 fn patch_line(theme: &Theme, line: &str) -> Line<'static> {
     Line::from(Span::styled(line.to_string(), Style::default().fg(patch_fg(theme, line))))
+}
+
+/// Semantic token kind → an indexed theme colour (never truecolor RGB).
+fn hl_color(theme: &Theme, kind: HlKind) -> ratatui::style::Color {
+    match kind {
+        HlKind::Keyword => theme.magenta,
+        HlKind::Type => theme.cyan,
+        HlKind::Str => theme.green,
+        HlKind::Comment => theme.dim,
+        HlKind::Number => theme.yellow,
+        HlKind::Func => theme.blue,
+        HlKind::Punct | HlKind::Plain => theme.fg,
+    }
+}
+
+/// Like [`patch_line`], but syntax-highlights the source after the diff marker when a
+/// language highlighter is available. The `+`/`-`/context marker keeps its add/del colour;
+/// headers and unknown languages fall back to the flat [`patch_line`].
+fn patch_line_hl(theme: &Theme, line: &str, hl: Option<&mut LineHighlighter>) -> Line<'static> {
+    let Some(hl) = hl else { return patch_line(theme, line) };
+    if line.starts_with("@@") || line.starts_with("+++") || line.starts_with("---") {
+        return patch_line(theme, line);
+    }
+    // Split the 1-char diff marker (ASCII) from the source it decorates.
+    let (marker, source, marker_color) = match line.chars().next() {
+        Some('+') => ("+", &line[1..], theme.green),
+        Some('-') => ("-", &line[1..], theme.red),
+        Some(' ') => (" ", &line[1..], theme.fg),
+        _ => return patch_line(theme, line), // e.g. "\ No newline at end of file"
+    };
+    let mut spans = vec![Span::styled(marker.to_string(), Style::default().fg(marker_color))];
+    for (text, kind) in hl.line(source) {
+        spans.push(Span::styled(text, Style::default().fg(hl_color(theme, kind))));
+    }
+    Line::from(spans)
 }
 
 // ---- config / connections ----
@@ -1601,6 +1754,7 @@ fn tone_color(theme: &Theme, tone: Tone) -> ratatui::style::Color {
         Tone::Active => theme.blue,
         Tone::Warn => theme.yellow,
         Tone::Bad => theme.red,
+        Tone::Merged => theme.magenta,
         Tone::Neutral => theme.dim,
     }
 }
@@ -1740,9 +1894,11 @@ fn help_sections() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
                 ("Enter (Commits)", "Drill into that commit's diff"),
                 ("Enter (Diff file)", "Line cursor in the patch"),
                 ("↑/↓ (line cursor)", "Move line-by-line"),
+                ("v (Diff)", "Mark file viewed (updates N/M reviewed)"),
+                ("[  ] (Diff)", "Jump to previous / next comment thread"),
                 ("s", "Submit buffered line comments as a review"),
                 ("o", "Open in browser"),
-                ("Esc", "Step back (line → files → close)"),
+                ("Esc", "Step back (line → files → close; prompts if comments are unsubmitted)"),
             ],
         ),
         (
@@ -1992,6 +2148,7 @@ mod tests {
                 focus: crate::app::DiffFocus::FileList,
                 cursor: 0,
                 commit_label: None,
+                viewed: std::collections::HashSet::new(),
             },
             pending: vec![],
             review_draft: None,
@@ -2042,6 +2199,128 @@ mod tests {
         assert!(out.contains("Checks (2)"), "checks count");
         assert!(out.contains("Diff (3)"), "changed-file count");
         assert!(!out.contains("Conversation (0)"), "no zero-count noise on empty tabs");
+    }
+
+    #[test]
+    fn wrap_words_breaks_on_word_boundaries() {
+        assert_eq!(wrap_words("hello world foo", 11), vec!["hello world", "foo"]);
+        assert_eq!(wrap_words("", 10), vec![String::new()]);
+        assert_eq!(wrap_words("onelongword", 4), vec!["onelongword"]); // never splits a word
+    }
+
+    #[test]
+    fn diff_patch_renders_comment_threads_inline() {
+        use crate::app::Screen;
+        use forgetop_core::domain::{Comment, CommentThread};
+        let file = FileChange {
+            path: "a.rs".into(),
+            kind: FileChangeKind::Added,
+            additions: 2,
+            deletions: 0,
+            patch: Some("@@ -0,0 +1,2 @@\n+let n = 5;\n+// done".into()),
+        };
+        let mut view = pr_view(3, vec![], vec![file]);
+        view.diff.threads = vec![CommentThread {
+            id: "t1".into(),
+            comments: vec![Comment {
+                id: "c1".into(),
+                author: User { id: "u".into(), display_name: "Priya".into(), handle: None, avatar_url: None },
+                body: "cap the backoff here".into(),
+                created_at: None,
+            }],
+            file_path: Some("a.rs".into()),
+            line: Some(1),
+            is_resolved: false,
+        }];
+        let mut app = App::new("slate");
+        app.screen = Screen::PrView(Box::new(view));
+
+        let out = render_to_string(&mut app, 150, 24);
+        assert!(out.contains("let n = 5"), "the code line still renders");
+        assert!(out.contains("Priya"), "the comment author renders inline in the patch");
+        assert!(out.contains("cap the backoff"), "the comment body renders inline in the patch");
+        assert!(out.contains("open"), "the thread state marker renders");
+        assert!(out.contains("╭") && out.contains("╰"), "the comment is drawn in its own box");
+    }
+
+    #[test]
+    fn diff_patch_renders_pending_draft_inline() {
+        use crate::app::{DiffFocus, Screen};
+        use forgetop_core::domain::{DiffSide, LineComment};
+        let file = FileChange {
+            path: "a.rs".into(),
+            kind: FileChangeKind::Added,
+            additions: 2,
+            deletions: 0,
+            patch: Some("@@ -0,0 +1,2 @@\n+let n = 5;\n+// done".into()),
+        };
+        let mut view = pr_view(3, vec![], vec![file]);
+        view.diff.focus = DiffFocus::Patch;
+        view.pending = vec![LineComment { path: "a.rs".into(), line: 1, side: DiffSide::New, body: "hold off on this".into() }];
+        let mut app = App::new("slate");
+        app.screen = Screen::PrView(Box::new(view));
+
+        let out = render_to_string(&mut app, 150, 24);
+        assert!(out.contains("pending"), "an unsubmitted comment shows a pending box");
+        assert!(out.contains("hold off on this"), "the draft body renders inline");
+        assert!(out.contains("╭"), "the draft is boxed like a real comment");
+    }
+
+    #[test]
+    fn diff_file_list_groups_by_dir_and_shows_viewed_progress() {
+        use crate::app::Screen;
+        let file = |p: &str| FileChange { path: p.into(), kind: FileChangeKind::Modified, additions: 1, deletions: 0, patch: None };
+        // Pre-sorted (as the app does at open); two under src/, one at root.
+        let files = vec![file("README.md"), file("src/a.rs"), file("src/b.rs")];
+        let mut view = pr_view(3, vec![], files);
+        view.diff.viewed.insert("src/a.rs".into());
+        let mut app = App::new("slate");
+        app.screen = Screen::PrView(Box::new(view));
+
+        let out = render_to_string(&mut app, 150, 24);
+        assert!(out.contains("1/3 reviewed"), "progress in the title");
+        assert!(out.contains("src/"), "directory header");
+        assert!(out.contains("[x]"), "a viewed file's checkbox is ticked");
+        assert!(out.contains("[ ]"), "an unviewed file's checkbox is empty");
+    }
+
+    #[test]
+    fn merged_pr_is_magenta_distinct_from_open_green() {
+        let theme = Theme::by_name("slate");
+        let mut pr = sample_pr();
+        pr.is_draft = false;
+        pr.status = PullRequestStatus::Merged;
+        assert_eq!(pr_status(&theme, &pr).1, theme.magenta, "merged is magenta");
+        pr.status = PullRequestStatus::Open;
+        assert_eq!(pr_status(&theme, &pr).1, theme.green, "open stays green");
+    }
+
+    #[test]
+    fn reviewers_show_a_green_tick_or_red_cross_by_vote() {
+        use forgetop_core::domain::{Reviewer, ReviewVote};
+        let theme = Theme::by_name("slate");
+        let who = |name: &str| User { id: name.into(), display_name: name.into(), handle: None, avatar_url: None };
+        let mut pr = sample_pr();
+        pr.reviewers = vec![
+            Reviewer { user: who("Priya Nair"), vote: ReviewVote::Approved, is_required: true },
+            Reviewer { user: who("Marcus Lee"), vote: ReviewVote::Rejected, is_required: false },
+        ];
+        let lines = pr_conversation_lines(&theme, &pr, &[]);
+
+        let green_tick = lines.iter().any(|l| l.spans.iter().any(|s| s.content.as_ref() == "✓" && s.style.fg == Some(theme.green)));
+        let red_cross = lines.iter().any(|l| l.spans.iter().any(|s| s.content.as_ref() == "✗" && s.style.fg == Some(theme.red)));
+        assert!(green_tick, "an approved reviewer gets a green tick");
+        assert!(red_cross, "a changes-requested reviewer gets a red cross");
+    }
+
+    #[test]
+    fn conversation_shows_the_pr_description() {
+        use crate::app::Screen;
+        let mut app = App::new("slate");
+        app.screen = Screen::PrView(Box::new(pr_view(0, vec![], vec![]))); // sample_pr has a description
+        let out = render_to_string(&mut app, 120, 24);
+        assert!(out.contains("Description"), "the description has a heading");
+        assert!(out.contains("does the thing"), "the description body renders");
     }
 
     #[test]
@@ -2500,6 +2779,39 @@ mod tests {
         assert!(out.contains("Refreshing"), "a refresh shows 'Refreshing…' in the footer");
         // The header keeps just the theme + clock — no refresh glyph up there.
         assert!(!out.contains("⟳"), "no spinner in the top-right");
+    }
+
+    #[test]
+    fn patch_line_highlights_code_after_the_diff_marker() {
+        use crate::highlight::{Lang, LineHighlighter};
+        let theme = Theme::by_name("slate");
+        let mut hl = LineHighlighter::new(Lang::Rust).unwrap();
+        let line = patch_line_hl(&theme, "+let n = 5;", Some(&mut hl));
+
+        // The add marker keeps its green, separate from the code.
+        assert_eq!(line.spans[0].content, "+");
+        assert_eq!(line.spans[0].style.fg, Some(theme.green));
+        // `let` is a keyword (magenta); `5` is a number (yellow).
+        let kw = line.spans.iter().find(|s| s.content.contains("let")).expect("a `let` span");
+        assert_eq!(kw.style.fg, Some(theme.magenta), "keyword is magenta");
+        assert!(
+            line.spans.iter().any(|s| s.content.contains('5') && s.style.fg == Some(theme.yellow)),
+            "number is yellow"
+        );
+    }
+
+    #[test]
+    fn patch_line_headers_and_unknown_langs_stay_flat() {
+        use crate::highlight::{Lang, LineHighlighter};
+        let theme = Theme::by_name("slate");
+        let mut hl = LineHighlighter::new(Lang::Rust).unwrap();
+        // A hunk header stays accent even with a highlighter available.
+        let hdr = patch_line_hl(&theme, "@@ -1 +1 @@", Some(&mut hl));
+        assert_eq!(hdr.spans[0].style.fg, Some(theme.accent));
+        // No highlighter (unknown language) → one flat context span.
+        let plain = patch_line_hl(&theme, " untouched", None);
+        assert_eq!(plain.spans.len(), 1);
+        assert_eq!(plain.spans[0].style.fg, Some(theme.fg));
     }
 
     #[test]

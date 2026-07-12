@@ -38,6 +38,10 @@ pub enum Action {
     /// Jump to an item chosen in the command palette. The app re-resolves the full
     /// PR / work item / pipeline from its lists by `(kind, id)` and opens its view.
     OpenItem { kind: PaletteKind, id: String, connection_id: String },
+    /// From the unsubmitted-comments prompt: open the submit-review verdict picker.
+    OpenReviewMenu,
+    /// From the unsubmitted-comments prompt: leave the PR view, discarding pending comments.
+    LeavePrView,
 }
 
 /// What a [`Overlay::Toggle`] checklist is choosing.
@@ -75,6 +79,8 @@ pub enum PickerKind {
     SortColumn { section: usize },
     /// Choose a pipeline-approval gate + decision; resolves to the picked index.
     ApprovalGate,
+    /// Shown on Esc when line comments are buffered but unsubmitted: submit or leave.
+    PendingExit,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -286,6 +292,10 @@ fn resolve_picker(kind: PickerKind, selected: usize, items: &[String]) -> Action
         }
         PickerKind::SortColumn { section } => Action::SetSort { section, index: selected },
         PickerKind::ApprovalGate => Action::PickApproval { index: selected },
+        PickerKind::PendingExit => match selected {
+            0 => Action::OpenReviewMenu,
+            _ => Action::LeavePrView,
+        },
     }
 }
 
@@ -363,6 +373,12 @@ mod tests {
     fn palette_esc_cancels() {
         let mut o = palette(vec![pitem(PaletteKind::Pr, "1", "a")]);
         assert!(matches!(o.handle(Key::Escape), Outcome::Cancel));
+    }
+
+    #[test]
+    fn pending_exit_picker_maps_submit_and_leave() {
+        assert!(matches!(resolve_picker(PickerKind::PendingExit, 0, &[]), Action::OpenReviewMenu));
+        assert!(matches!(resolve_picker(PickerKind::PendingExit, 1, &[]), Action::LeavePrView));
     }
 
     #[test]

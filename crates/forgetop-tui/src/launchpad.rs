@@ -31,8 +31,8 @@ impl Bucket {
         Bucket::NeedsFixing,
         Bucket::YourWork,
         Bucket::YourOpenPrs,
-        Bucket::RecentPipelines,
         Bucket::RecentlyMerged,
+        Bucket::RecentPipelines,
     ];
 
     pub fn title(&self) -> &'static str {
@@ -44,7 +44,7 @@ impl Bucket {
             Bucket::YourWork => "Assigned to you",
             Bucket::YourOpenPrs => "Your open pull requests",
             Bucket::RecentPipelines => "Recent pipelines",
-            Bucket::RecentlyMerged => "Recently merged",
+            Bucket::RecentlyMerged => "Your recently merged pull requests",
         }
     }
 
