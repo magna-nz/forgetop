@@ -1,6 +1,7 @@
 //! Demo provider — canned, deterministic data so `--demo` works with no credentials.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use async_trait::async_trait;
 use chrono::{DateTime, TimeZone, Utc};
@@ -413,6 +414,14 @@ fn pipeline_runs() -> Vec<PipelineRun> {
     ]
 }
 
+/// Session-global store of review comments submitted during this `--demo` run, keyed by PR
+/// id. It lets the demo emulate a real provider: a comment you submit persists and comes
+/// back from `threads()` (even after reopening the PR), instead of vanishing.
+fn submitted_threads() -> &'static Mutex<HashMap<String, Vec<CommentThread>>> {
+    static STORE: OnceLock<Mutex<HashMap<String, Vec<CommentThread>>>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 struct DemoPr {
     conn: String,
 }
@@ -429,9 +438,9 @@ impl PullRequestSource for DemoPr {
     async fn get(&self, id: &str) -> Result<PullRequest> {
         prs_for(&self.conn).into_iter().find(|p| p.id == id).ok_or_else(|| forgetop_core::Error::NotFound(id.into()))
     }
-    async fn threads(&self, _id: &str) -> Result<Vec<CommentThread>> {
-        Ok(vec![
-            // Anchored to a diff line so the diff shows a gutter dot and `]`/`[` can jump to it.
+    async fn threads(&self, id: &str) -> Result<Vec<CommentThread>> {
+        let mut threads = vec![
+            // Anchored to a diff line so it renders inline and `]`/`[` can jump to it.
             CommentThread {
                 id: "t1".into(),
                 comments: vec![Comment {
@@ -444,7 +453,7 @@ impl PullRequestSource for DemoPr {
                 line: Some(15),
                 is_resolved: false,
             },
-            // A resolved thread on the other file (○ in the gutter).
+            // A resolved thread on the other file.
             CommentThread {
                 id: "t2".into(),
                 comments: vec![Comment {
@@ -457,7 +466,12 @@ impl PullRequestSource for DemoPr {
                 line: Some(13),
                 is_resolved: true,
             },
-        ])
+        ];
+        // Include anything submitted this session so it persists like a real provider.
+        if let Some(extra) = submitted_threads().lock().unwrap().get(id) {
+            threads.extend(extra.iter().cloned());
+        }
+        Ok(threads)
     }
     async fn changes(&self, _id: &str) -> Result<Vec<FileChange>> {
         Ok(vec![
@@ -592,7 +606,21 @@ impl PullRequestSource for DemoPr {
     async fn merge(&self, _id: &str, _options: &MergeOptions) -> Result<()> {
         Ok(())
     }
-    async fn submit_review(&self, _id: &str, _event: ReviewVote, _comments: &[LineComment]) -> Result<()> {
+    async fn submit_review(&self, id: &str, _event: ReviewVote, comments: &[LineComment]) -> Result<()> {
+        // Persist each line comment as an open thread by "you", so it comes back from
+        // threads() and the diff shows it exactly as a real provider would.
+        let mut store = submitted_threads().lock().unwrap();
+        let entry = store.entry(id.to_string()).or_default();
+        for c in comments {
+            let n = entry.len();
+            entry.push(CommentThread {
+                id: format!("submitted-{n}"),
+                comments: vec![Comment { id: format!("mine-{n}"), author: me(), body: c.body.clone(), created_at: Some(base()) }],
+                file_path: Some(c.path.clone()),
+                line: Some(c.line),
+                is_resolved: false,
+            });
+        }
         Ok(())
     }
 }
@@ -771,6 +799,31 @@ mod tests {
             provider: ProviderType::GitHub,
             caps: demo_capabilities(ProviderType::GitHub),
         }
+    }
+
+    #[tokio::test]
+    async fn submitted_review_comments_persist_in_threads() {
+        let src = DemoPr { conn: "github".into() };
+        // Unique ids so the session-global store can't collide with other tests.
+        let (pr, other) = ("persist-pr-a", "persist-pr-b");
+        let before = src.threads(pr).await.unwrap().len();
+
+        src.submit_review(
+            pr,
+            ReviewVote::NoVote,
+            &[LineComment { path: "src/http/retry.rs".into(), line: 7, side: DiffSide::New, body: "please add a test".into() }],
+        )
+        .await
+        .unwrap();
+
+        let after = src.threads(pr).await.unwrap();
+        assert_eq!(after.len(), before + 1, "the submitted comment persists as a new thread");
+        assert!(
+            after.iter().any(|t| t.comments.iter().any(|c| c.body == "please add a test")),
+            "the submitted body comes back from threads()"
+        );
+        // A different PR is unaffected by what was submitted to this one.
+        assert_eq!(src.threads(other).await.unwrap().len(), before);
     }
 
     #[tokio::test]
