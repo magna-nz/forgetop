@@ -1325,28 +1325,48 @@ fn wrap_words(s: &str, width: usize) -> Vec<String> {
     lines
 }
 
-/// An existing review thread, rendered as indented lines shown inline beneath its diff
-/// line — a left bar (accent = open, dim = resolved), a state header, then each comment.
+/// An existing review thread, rendered inline beneath its diff line as a **bordered,
+/// background-filled box** so it's clearly distinct from the code — a rounded frame
+/// (accent = open, dim = resolved), a state header, then each comment (author: body).
 fn inline_thread_lines(theme: &Theme, thread: &CommentThread, width: usize) -> Vec<Line<'static>> {
-    let bar_color = if thread.is_resolved { theme.dim } else { theme.accent };
-    let bar = || Span::styled("   ▌ ".to_string(), Style::default().fg(bar_color));
-    let text_w = width.saturating_sub(6).max(8);
+    let border = if thread.is_resolved { theme.dim } else { theme.accent };
+    let bg = theme.panel;
+    let indent = "  ";
+    let box_w = width.saturating_sub(3).max(20); // leaves a small right margin
+    let content_w = box_w.saturating_sub(4); // inside "│ " … " │"
     let (glyph, state) = if thread.is_resolved { ("○", "resolved") } else { ("●", "open") };
+    let frame = |style: Style| style.fg(border).bg(bg);
 
-    let mut out = vec![Line::from(vec![
-        bar(),
-        Span::styled(format!("{glyph} {state}"), Style::default().fg(bar_color)),
-    ])];
+    // Inner content rows (each a single styled string): a header, then wrapped comments.
+    let mut rows: Vec<Span<'static>> = vec![Span::styled(
+        format!("{glyph} {state}"),
+        frame(Style::default()).add_modifier(Modifier::BOLD),
+    )];
     for c in &thread.comments {
-        for (n, chunk) in wrap_words(&c.body, text_w).into_iter().enumerate() {
-            let mut spans = vec![bar()];
-            if n == 0 {
-                spans.push(Span::styled(format!("{}: ", c.author.display_name), Style::default().fg(theme.blue)));
-            }
-            spans.push(Span::styled(chunk, Style::default().fg(theme.fg)));
-            out.push(Line::from(spans));
+        let text = format!("{}: {}", c.author.display_name, c.body);
+        for chunk in wrap_words(&text, content_w) {
+            rows.push(Span::styled(chunk, Style::default().fg(theme.fg).bg(bg)));
         }
     }
+
+    let dashes = "─".repeat(box_w.saturating_sub(2));
+    let mut out = vec![Line::from(vec![
+        Span::raw(indent),
+        Span::styled(format!("╭{dashes}╮"), frame(Style::default())),
+    ])];
+    for inner in rows {
+        let fill = content_w.saturating_sub(inner.content.chars().count());
+        out.push(Line::from(vec![
+            Span::raw(indent),
+            Span::styled("│ ", frame(Style::default())),
+            inner,
+            Span::styled(format!("{} │", " ".repeat(fill)), frame(Style::default())),
+        ]));
+    }
+    out.push(Line::from(vec![
+        Span::raw(indent),
+        Span::styled(format!("╰{dashes}╯"), frame(Style::default())),
+    ]));
     out
 }
 
@@ -2186,6 +2206,7 @@ mod tests {
         assert!(out.contains("Priya"), "the comment author renders inline in the patch");
         assert!(out.contains("cap the backoff"), "the comment body renders inline in the patch");
         assert!(out.contains("open"), "the thread state marker renders");
+        assert!(out.contains("╭") && out.contains("╰"), "the comment is drawn in its own box");
     }
 
     #[test]
