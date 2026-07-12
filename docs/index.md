@@ -20,6 +20,7 @@ This is the full reference. For install and a 60-second start, see the
 - [Work Items](#work-items)
 - [Pipelines](#pipelines)
 - [Filtering and sorting](#filtering-and-sorting)
+- [Command palette](#command-palette)
 - [Saved views](#saved-views)
 - [Notifications](#notifications)
 - [Keybindings](#keybindings)
@@ -52,6 +53,8 @@ This is the full reference. For install and a 60-second start, see the
   (GitHub, Azure DevOps, GitLab).
 - **Filter, sort, and shape** — a live quick-filter, per-column sorting, work-item
   state visibility, and pipeline subscriptions — all remembered per view.
+- **Command palette (`Ctrl-P`)** — fuzzy-jump to any PR, work item, or pipeline across
+  every provider from one search box, without scrolling or switching tabs.
 - **Saved views** — bundle a filter + sort + state into a named view and flip
   between them from an always-visible view bar (`[` / `]`).
 - **Desktop notifications** — get pinged when a pipeline fails, a review is
@@ -311,6 +314,16 @@ Four complementary ways to cut a busy view down:
 
 All of these compose, and all work across the aggregated (multi-provider) list.
 
+## Command palette
+
+Press **`Ctrl-P`** (from the Launchpad or any list) to open the **command palette** — a
+fuzzy jump across *everything already loaded*: every PR, work item, and pipeline, from
+every connected provider, in one list. Type to filter (matching the title, author, branch,
+identifier, or connection), `↑`/`↓` (or `Ctrl-n`/`Ctrl-p`) to move, `Enter` to open the
+item's full view, `Esc` to dismiss. Each row carries a status dot in the usual
+green/blue/red/grey colours, so you can scan state as you jump. It searches only what's
+loaded — no network round-trip — so it's instant.
+
 ## Saved views
 
 A **saved view** is a named bundle of a section's shaping — its base filter, the
@@ -360,6 +373,7 @@ the keys valid for where you are. Press `?` for the full panel. The complete set
 | --- | --- |
 | `←` / `→`, `h` / `l`, `Tab`, `1`–`4` | Switch tab (`1` = Launchpad) |
 | `↑` / `↓`, `k` / `j` | Move selection |
+| `Ctrl-P` | Command palette — fuzzy-jump to any PR, work item, or pipeline |
 | `/` | Quick-filter the current list |
 | `S` | Sort by a column (re-pick flips direction) |
 | `o` | Open selected item in browser |

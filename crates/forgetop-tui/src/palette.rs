@@ -5,7 +5,7 @@
 //! query. No UI, no I/O, no provider calls — everything operates on data already in memory.
 
 use chrono::{DateTime, Utc};
-use forgetop_core::domain::User;
+use forgetop_core::domain::{PipelineRunStatus, PullRequestStatus, User, WorkItemStateCategory};
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
 
@@ -17,6 +17,22 @@ pub enum PaletteKind {
     Pr,
     Wi,
     Pipe,
+}
+
+/// A row's status in the shared green/blue/red/grey model (the UI maps this to a colour).
+/// Mirrors `pr_status` / `wi_state_color` / `Theme::pipeline_color` — keep in step with them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tone {
+    /// Done / healthy — green.
+    Good,
+    /// Actively in flight — blue.
+    Active,
+    /// Partial — yellow.
+    Warn,
+    /// Failed / blocked / worth a look — red.
+    Bad,
+    /// Waiting / neutral — grey.
+    Neutral,
 }
 
 /// One searchable row in the palette. Holds only what's needed to display a result and to
@@ -34,6 +50,8 @@ pub struct PaletteItem {
     /// Secondary match text: author / repo / identifier / branch / connection, so results
     /// are disambiguable and searchable by more than the title.
     pub subtitle: String,
+    /// Status in the shared colour model, for the leading dot on each row.
+    pub tone: Tone,
     /// Recency key (updated/finished time) — the tiebreak when scores are equal and the
     /// sole order for an empty query.
     pub sort_ts: Option<DateTime<Utc>>,
@@ -54,6 +72,18 @@ fn subtitle(parts: &[&str]) -> String {
         .join(" · ")
 }
 
+/// PR tone — mirrors `pr_status`: draft grey, open/merged green, closed red.
+fn pr_tone(row: &PrRow) -> Tone {
+    if row.pr.is_draft {
+        return Tone::Neutral;
+    }
+    match row.pr.status {
+        PullRequestStatus::Open | PullRequestStatus::Merged => Tone::Good,
+        PullRequestStatus::Closed => Tone::Bad,
+        PullRequestStatus::Draft => Tone::Neutral,
+    }
+}
+
 pub fn pr_candidate(row: &PrRow) -> PaletteItem {
     let branch = row.pr.source_ref.as_deref().unwrap_or("");
     PaletteItem {
@@ -62,7 +92,20 @@ pub fn pr_candidate(row: &PrRow) -> PaletteItem {
         connection_id: row.connection_id.clone(),
         title: row.pr.title.clone(),
         subtitle: subtitle(&[who(&row.pr.author), branch, &row.connection]),
+        tone: pr_tone(row),
         sort_ts: row.pr.updated_at,
+    }
+}
+
+/// WI tone — mirrors `wi_state_color`: blocked red, completed green, started blue, else grey.
+fn wi_tone(row: &WiRow) -> Tone {
+    if row.wi.state.eq_ignore_ascii_case("blocked") {
+        return Tone::Bad;
+    }
+    match row.wi.state_category {
+        WorkItemStateCategory::Completed => Tone::Good,
+        WorkItemStateCategory::Started => Tone::Active,
+        _ => Tone::Neutral,
     }
 }
 
@@ -75,6 +118,7 @@ pub fn wi_candidate(row: &WiRow) -> PaletteItem {
         connection_id: row.connection_id.clone(),
         title: row.wi.title.clone(),
         subtitle: subtitle(&[ident, ty, &row.connection]),
+        tone: wi_tone(row),
         sort_ts: row.wi.updated_at,
     }
 }
@@ -89,12 +133,22 @@ pub fn pipe_candidate(row: &PipeRow) -> PaletteItem {
         .unwrap_or_else(|| "pipeline".to_string());
     let run_name = row.run.name.as_deref().unwrap_or("");
     let branch = row.run.branch.as_deref().unwrap_or("");
+    // Mirrors Theme::pipeline_color: succeeded green, running blue, failed red,
+    // partial yellow, queued/canceled grey.
+    let tone = match row.run.status {
+        PipelineRunStatus::Succeeded => Tone::Good,
+        PipelineRunStatus::Running => Tone::Active,
+        PipelineRunStatus::Failed => Tone::Bad,
+        PipelineRunStatus::PartiallySucceeded => Tone::Warn,
+        PipelineRunStatus::Queued | PipelineRunStatus::Canceled => Tone::Neutral,
+    };
     PaletteItem {
         kind: PaletteKind::Pipe,
         id: row.run.id.clone(),
         connection_id: row.connection_id.clone(),
         title,
         subtitle: subtitle(&[run_name, branch, &row.connection]),
+        tone,
         sort_ts: row.run.finished_at.or(row.run.started_at),
     }
 }
@@ -163,6 +217,7 @@ mod tests {
             connection_id: "conn".into(),
             title: title.into(),
             subtitle: subtitle.into(),
+            tone: Tone::Neutral,
             sort_ts: ts(ts_secs),
         }
     }

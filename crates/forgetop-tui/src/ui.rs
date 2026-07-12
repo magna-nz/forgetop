@@ -13,7 +13,7 @@ use ratatui::Frame;
 use crate::app::{App, ConfigView, DiffFocus, DiffView, PipelineView, PrView, Screen, WiView, PR_TABS, TABS};
 use crate::diff::{cursor_line_label, pending_marks};
 use crate::overlay::Overlay;
-use crate::palette::{PaletteItem, PaletteKind};
+use crate::palette::{PaletteItem, PaletteKind, Tone};
 use crate::theme::{check_icon, pipeline_glyph, Theme};
 use crate::wizard::{Prompt, PromptKind};
 
@@ -1594,6 +1594,26 @@ fn kind_tag(kind: PaletteKind) -> &'static str {
     }
 }
 
+/// The status dot's colour, following the shared green/blue/yellow/red/grey model.
+fn tone_color(theme: &Theme, tone: Tone) -> ratatui::style::Color {
+    match tone {
+        Tone::Good => theme.green,
+        Tone::Active => theme.blue,
+        Tone::Warn => theme.yellow,
+        Tone::Bad => theme.red,
+        Tone::Neutral => theme.dim,
+    }
+}
+
+/// Truncate to `max` display chars, adding an ellipsis when clipped.
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(max.saturating_sub(1)).collect();
+    format!("{head}…")
+}
+
 /// The command palette panel: a query line above a windowed, ranked result list.
 fn render_palette(
     frame: &mut Frame,
@@ -1636,11 +1656,12 @@ fn render_palette(
             };
             let mut spans = vec![
                 Span::styled(cursor, Style::default().fg(theme.accent)),
+                Span::styled("● ", Style::default().fg(tone_color(theme, item.tone))),
                 Span::styled(format!("{} ", kind_tag(item.kind)), Style::default().fg(theme.dim)),
-                Span::styled(item.title.clone(), title_style),
+                Span::styled(truncate(&item.title, 40), title_style),
             ];
             if !item.subtitle.is_empty() {
-                spans.push(Span::styled(format!("  {}", item.subtitle), Style::default().fg(theme.dim)));
+                spans.push(Span::styled(format!("  {}", truncate(&item.subtitle, 24)), Style::default().fg(theme.dim)));
             }
             lines.push(Line::from(spans));
         }
@@ -1681,6 +1702,7 @@ fn help_sections() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
             vec![
                 ("←/→  h/l  Tab  1–3", "Switch tab"),
                 ("↑/↓  k/j", "Move selection"),
+                ("Ctrl-P", "Jump to any item (command palette)"),
                 ("/", "Quick-filter the list"),
                 ("S", "Sort by column (re-pick flips direction)"),
                 ("o", "Open selected in browser"),
@@ -2478,6 +2500,51 @@ mod tests {
         assert!(out.contains("Refreshing"), "a refresh shows 'Refreshing…' in the footer");
         // The header keeps just the theme + clock — no refresh glyph up there.
         assert!(!out.contains("⟳"), "no spinner in the top-right");
+    }
+
+    #[test]
+    fn truncate_clips_long_text_with_an_ellipsis() {
+        assert_eq!(truncate("short", 10), "short");
+        assert_eq!(truncate("exactly-ten", 11), "exactly-ten");
+        assert_eq!(truncate("this is far too long", 8), "this is…");
+    }
+
+    #[test]
+    fn palette_renders_query_results_and_status_dots() {
+        use crate::overlay::Overlay;
+        use crate::palette::{self, PaletteItem, PaletteKind, Tone};
+
+        let items = vec![
+            PaletteItem {
+                kind: PaletteKind::Pr,
+                id: "1".into(),
+                connection_id: "c".into(),
+                title: "Add the widget".into(),
+                subtitle: "alice · GitHub".into(),
+                tone: Tone::Good,
+                sort_ts: None,
+            },
+            PaletteItem {
+                kind: PaletteKind::Pipe,
+                id: "2".into(),
+                connection_id: "c".into(),
+                title: "CI Build".into(),
+                subtitle: "main".into(),
+                tone: Tone::Bad,
+                sort_ts: None,
+            },
+        ];
+        let results = palette::rank("", &items);
+        let mut app = App::new("slate");
+        app.overlay = Some(Overlay::Palette { query: "a".into(), candidates: items, results, selected: 0 });
+
+        let out = render_to_string(&mut app, 100, 30);
+        assert!(out.contains("Jump to"), "panel title");
+        assert!(out.contains("Add the widget"), "a result title is shown");
+        assert!(out.contains("CI Build"), "results from every type are shown");
+        assert!(out.contains("match"), "the match count is shown");
+        assert!(out.contains("● "), "status dots are rendered");
+        assert!(out.contains("PR") && out.contains("CI"), "type badges are shown");
     }
 
     #[test]

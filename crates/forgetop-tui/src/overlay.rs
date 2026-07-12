@@ -303,7 +303,15 @@ mod tests {
     use super::*;
 
     fn pitem(kind: PaletteKind, id: &str, title: &str) -> PaletteItem {
-        PaletteItem { kind, id: id.into(), connection_id: "c".into(), title: title.into(), subtitle: String::new(), sort_ts: None }
+        PaletteItem {
+            kind,
+            id: id.into(),
+            connection_id: "c".into(),
+            title: title.into(),
+            subtitle: String::new(),
+            tone: crate::palette::Tone::Neutral,
+            sort_ts: None,
+        }
     }
 
     fn palette(items: Vec<PaletteItem>) -> Overlay {
