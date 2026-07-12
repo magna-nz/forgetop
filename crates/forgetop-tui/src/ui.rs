@@ -1844,7 +1844,7 @@ fn help_sections() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
                 ("[  ] (Diff)", "Jump to previous / next comment thread"),
                 ("s", "Submit buffered line comments as a review"),
                 ("o", "Open in browser"),
-                ("Esc", "Step back (line → files → close)"),
+                ("Esc", "Step back (line → files → close; prompts if comments are unsubmitted)"),
             ],
         ),
         (

@@ -1747,6 +1747,21 @@ impl App {
         }
     }
 
+    /// On Esc with unsubmitted line comments, ask whether to submit or leave.
+    fn open_pending_exit_prompt(&mut self) {
+        let n = match &self.screen {
+            Screen::PrView(v) => v.pending.len(),
+            _ => return,
+        };
+        let noun = if n == 1 { "comment" } else { "comments" };
+        self.overlay = Some(Overlay::Picker {
+            title: format!("{n} unsubmitted {noun}"),
+            items: vec!["Submit review…".into(), "Leave without submitting".into()],
+            selected: 0,
+            kind: PickerKind::PendingExit,
+        });
+    }
+
     /// Opens the submit-review verdict picker if there are pending comments.
     fn open_review_submit(&mut self) {
         let has_pending = matches!(&self.screen, Screen::PrView(v) if !v.pending.is_empty());
@@ -1882,6 +1897,11 @@ impl App {
                         v.diff.exit_patch();
                         return;
                     }
+                }
+                // Leaving the view with buffered-but-unsubmitted comments: ask first.
+                if matches!(&self.screen, Screen::PrView(v) if !v.pending.is_empty()) {
+                    self.open_pending_exit_prompt();
+                    return;
                 }
                 self.screen = self.view_origin();
                 return;
@@ -2869,6 +2889,8 @@ impl App {
             Action::PickApproval { index } => self.confirm_approval(index),
             Action::RespondApproval { index } => self.respond_approval(index, deps).await,
             Action::OpenItem { kind, id, connection_id } => self.open_palette_item(kind, id, connection_id, deps).await,
+            Action::OpenReviewMenu => self.open_review_submit(),
+            Action::LeavePrView => self.screen = self.view_origin(),
         }
     }
 
@@ -4503,6 +4525,54 @@ mod tests {
             }
             _ => panic!("expected the approve confirm dialog to open"),
         }
+    }
+
+    fn pr_view_with_pending(pending: Vec<LineComment>) -> Screen {
+        Screen::PrView(Box::new(PrView {
+            label: "PR".into(),
+            connection_id: "c".into(),
+            url: None,
+            pr: pr(None),
+            tab: 0,
+            checks: vec![],
+            commits: vec![],
+            commit_sel: 0,
+            pr_files: vec![],
+            scroll: 0,
+            diff: diff(vec![]),
+            pending,
+            review_draft: None,
+        }))
+    }
+
+    #[test]
+    fn esc_with_pending_comments_prompts_before_leaving() {
+        let mut app = App::new("slate");
+        app.screen = pr_view_with_pending(vec![LineComment {
+            path: "a.rs".into(),
+            line: 1,
+            side: DiffSide::New,
+            body: "nit".into(),
+        }]);
+
+        app.on_pr_view_key(Key::Escape);
+
+        assert!(matches!(app.screen, Screen::PrView(_)), "does not leave while comments are unsubmitted");
+        match &app.overlay {
+            Some(Overlay::Picker { kind, .. }) => assert!(matches!(kind, PickerKind::PendingExit)),
+            _ => panic!("expected the unsubmitted-comments prompt"),
+        }
+    }
+
+    #[test]
+    fn esc_without_pending_leaves_the_pr_view() {
+        let mut app = App::new("slate");
+        app.screen = pr_view_with_pending(vec![]);
+
+        app.on_pr_view_key(Key::Escape);
+
+        assert!(!matches!(app.screen, Screen::PrView(_)), "leaves the PR view when nothing is buffered");
+        assert!(app.overlay.is_none());
     }
 
     #[test]

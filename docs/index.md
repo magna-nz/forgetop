@@ -244,6 +244,8 @@ In the Diff tab's line cursor, press `c` on a code line to write an inline
 comment. Comments are **buffered locally** — the line gets a `▎` marker — so you
 can comment on several lines first. Press **`s`** to submit them all as one
 review, choosing the verdict: **Comment**, **Approve**, or **Request changes**.
+If you press `Esc` to leave with comments still buffered, forgetop asks whether to
+**submit** or **leave without submitting** first, so you don't lose them by accident.
 
 - **GitHub** posts it as a single native review.
 - **GitLab** posts positioned discussions (and approves if you chose Approve).
