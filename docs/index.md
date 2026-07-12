@@ -354,8 +354,10 @@ Press **`i`** (from the Launchpad or any list) to open the **Inbox** — your no
 comments, and state changes, newest first. It answers *what just happened*, where the
 Launchpad answers *what needs me now*.
 
-A **`notification (N) [i]`** indicator sits in the top-left header on every screen — dim grey
-when you're at zero, **bold yellow** with the count when there's something waiting.
+A **`Notifications (N) [i]`** nav item sits at the **far right** of the tab bar on every
+screen — dim grey when you're at zero, **bold yellow** with the count when there's something
+waiting, and highlighted (accent) while the Inbox is open. It's a nav item, not part of the
+`Tab` cycle (which stays on Launchpad → Pull Requests → Work Items → Pipelines).
 
 - `↑`/`↓` move · **`Enter`** opens the item **in-app** (drills straight into that PR / work
   item) · `o` opens it in the browser · `x` marks the row read · `A` marks everything read ·

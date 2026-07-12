@@ -67,24 +67,12 @@ fn render_tabs(frame: &mut Frame, area: Rect, app: &App) {
     let clock = app.last_refresh.format("%H:%M:%S");
     let right = format!("{} · {} ", theme.name, clock);
 
-    // Top-left notification indicator: dim grey at (0), bold yellow when there's something.
-    let unread = app.unread_count();
-    let notif_style = if unread == 0 {
-        Style::default().fg(theme.dim)
-    } else {
-        Style::default().fg(theme.yellow).add_modifier(Modifier::BOLD)
-    };
-    let title = Line::from(vec![
-        Span::styled(" ▟ forgetop ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
-        Span::styled(format!(" notification ({unread}) [i] "), notif_style),
-    ]);
-
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(theme.accent))
         .style(Style::default().bg(theme.bg))
-        .title(title)
+        .title(Span::styled(" ▟ forgetop ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)))
         .title_top(Line::from(Span::styled(right, Style::default().fg(theme.dim))).right_aligned());
 
     let vis = app.visible_indices();
@@ -99,7 +87,9 @@ fn render_tabs(frame: &mut Frame, area: Rect, app: &App) {
         };
         Line::from(format!(" {} ({count}) ", TABS[i]))
     }));
-    let selected = if matches!(app.screen, Screen::Launchpad) {
+    let selected = if matches!(app.screen, Screen::Inbox) {
+        titles.len() // Inbox isn't a section tab — highlight none of them
+    } else if matches!(app.screen, Screen::Launchpad) {
         0
     } else {
         1 + vis.iter().position(|&i| i == app.active).unwrap_or(0)
@@ -114,6 +104,25 @@ fn render_tabs(frame: &mut Frame, area: Rect, app: &App) {
         .block(block);
 
     frame.render_widget(tabs, area);
+
+    // Notifications is a nav item pinned to the far right of the tab row — highlighted when
+    // its screen is open, but *not* part of the Tab cycle. Dim grey at (0), bold yellow
+    // when there's something, accent when active.
+    let unread = app.unread_count();
+    let label = format!(" Notifications ({unread}) [i] ");
+    let style = if matches!(app.screen, Screen::Inbox) {
+        Style::default().fg(theme.bg).bg(theme.accent).add_modifier(Modifier::BOLD)
+    } else if unread == 0 {
+        Style::default().fg(theme.dim).bg(theme.bg)
+    } else {
+        Style::default().fg(theme.yellow).bg(theme.bg).add_modifier(Modifier::BOLD)
+    };
+    let w = label.chars().count() as u16;
+    let inner_w = area.width.saturating_sub(2);
+    if inner_w > w + 1 {
+        let rect = Rect { x: area.x + 1 + inner_w - w, y: area.y + 1, width: w, height: 1 };
+        frame.render_widget(Paragraph::new(Line::from(Span::styled(label, style))), rect);
+    }
 }
 
 /// A horizontal strip of the active section's saved views, the current one lit.
@@ -2978,14 +2987,14 @@ mod tests {
         assert!(out.contains("Refactor the retry queue"), "notification title renders");
         assert!(out.contains("review"), "kind label renders");
         assert!(out.contains("Inbox"), "inbox panel title");
-        assert!(out.contains("notification (1)"), "header indicator shows the unread count");
+        assert!(out.contains("Notifications (1)"), "far-right nav item shows the unread count");
     }
 
     #[test]
     fn header_indicator_reads_zero_when_inbox_empty() {
         let mut app = App::new("slate");
         let out = render_to_string(&mut app, 120, 24);
-        assert!(out.contains("notification (0)"), "grey (0) indicator when there's nothing");
+        assert!(out.contains("Notifications (0)"), "grey (0) nav item when there's nothing");
     }
 
     #[test]
