@@ -3604,7 +3604,7 @@ async fn fetch_notifications(deps: &AppDeps, errors: &mut Vec<String>) -> Vec<No
         }
         Err(e) => errors.push(format!("Notifications: {e}")),
     }
-    out.sort_by(|a, b| b.notification.updated_at.cmp(&a.notification.updated_at)); // newest first
+    out.sort_by_key(|r| std::cmp::Reverse(r.notification.updated_at)); // newest first
     out
 }
 

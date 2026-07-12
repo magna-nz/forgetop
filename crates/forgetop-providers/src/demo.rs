@@ -877,7 +877,7 @@ impl NotificationSource for DemoNotifications {
                 n.unread = false;
             }
         }
-        ns.sort_by(|a, b| b.updated_at.cmp(&a.updated_at)); // newest first
+        ns.sort_by_key(|n| std::cmp::Reverse(n.updated_at)); // newest first
         Ok(ns)
     }
     async fn mark_read(&self, id: &str) -> Result<()> {
