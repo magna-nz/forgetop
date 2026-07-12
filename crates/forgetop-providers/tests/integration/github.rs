@@ -205,3 +205,15 @@ async fn github_pipeline_approval_gate_lifecycle() {
     raw.delete_environment(&env_name).await;
     raw.delete_file(&wf_path, &default, &format!("{prefix}: remove workflow")).await;
 }
+
+#[tokio::test]
+async fn github_lists_notifications() {
+    let gh = skip_if_none!(harness::github(), "github");
+    let notifs = gh.conn.notifications().expect("github advertises notifications");
+    // Decoding the list envelope is the assertion; a repo with nothing unread returns [].
+    let list = notifs.list().await.expect("list notifications");
+    eprintln!("github: {} notification(s)", list.len());
+    if let Some(n) = list.first() {
+        assert!(!n.id.is_empty(), "a notification carries an id for mark-read");
+    }
+}

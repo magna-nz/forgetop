@@ -250,6 +250,59 @@ fn unknown_user() -> User {
 
 // ---- client ----
 
+/// GitHub notification `reason` → our unified kind.
+fn github_reason_kind(reason: &str) -> NotificationKind {
+    match reason {
+        "review_requested" => NotificationKind::ReviewRequested,
+        "mention" | "team_mention" => NotificationKind::Mention,
+        "assign" => NotificationKind::Assigned,
+        "ci_activity" => NotificationKind::CiFailed,
+        "comment" => NotificationKind::Comment,
+        "state_change" => NotificationKind::StateChange,
+        _ => NotificationKind::Other,
+    }
+}
+
+/// Map a GitHub notification thread (`GET /notifications`) to a [`Notification`].
+pub fn map_notification(v: &Value) -> Notification {
+    let subject = get_obj(v, "subject");
+    let repo = get_obj(v, "repository");
+    let subj_type = subject.and_then(|s| get_str(s, "type")).unwrap_or_default();
+    let item_type = match subj_type.as_str() {
+        "PullRequest" => NotificationItemType::PullRequest,
+        "Issue" => NotificationItemType::WorkItem,
+        "CheckSuite" => NotificationItemType::Pipeline,
+        _ => NotificationItemType::Other,
+    };
+    // The PR/issue number is the last path segment of the subject's API URL. Only PRs and
+    // issues drill in — a check-suite's trailing id isn't something a source can open.
+    let item_id = match item_type {
+        NotificationItemType::PullRequest | NotificationItemType::WorkItem => subject
+            .and_then(|s| get_str(s, "url"))
+            .and_then(|u| u.rsplit('/').next().map(str::to_string))
+            .filter(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit())),
+        _ => None,
+    };
+    let html = repo.and_then(|r| get_str(r, "html_url"));
+    let url = match (&html, &item_id, item_type) {
+        (Some(h), Some(n), NotificationItemType::PullRequest) => Some(format!("{h}/pull/{n}")),
+        (Some(h), Some(n), NotificationItemType::WorkItem) => Some(format!("{h}/issues/{n}")),
+        (Some(h), _, _) => Some(h.clone()),
+        _ => None,
+    };
+    Notification {
+        id: get_str(v, "id").unwrap_or_default(),
+        kind: github_reason_kind(&get_str(v, "reason").unwrap_or_default()),
+        item_type,
+        item_id,
+        title: subject.and_then(|s| get_str(s, "title")).unwrap_or_default(),
+        context: repo.and_then(|r| get_str(r, "full_name")).unwrap_or_default(),
+        url,
+        unread: get_bool(v, "unread"),
+        updated_at: get_date(v, "updated_at"),
+    }
+}
+
 pub struct GitHubClient {
     http: reqwest::Client,
     base: String,
@@ -275,6 +328,22 @@ impl GitHubClient {
         let resp = self.http.post(url).json(&body).send().await.map_err(prov)?;
         if !resp.status().is_success() {
             return Err(Error::Provider(format!("POST {url} -> {}", resp.status())));
+        }
+        Ok(())
+    }
+
+    async fn patch_empty(&self, url: &str) -> Result<()> {
+        let resp = self.http.patch(url).send().await.map_err(prov)?;
+        if !resp.status().is_success() {
+            return Err(Error::Provider(format!("PATCH {url} -> {}", resp.status())));
+        }
+        Ok(())
+    }
+
+    async fn put_json(&self, url: &str, body: Value) -> Result<()> {
+        let resp = self.http.put(url).json(&body).send().await.map_err(prov)?;
+        if !resp.status().is_success() {
+            return Err(Error::Provider(format!("PUT {url} -> {}", resp.status())));
         }
         Ok(())
     }
@@ -315,6 +384,23 @@ macro_rules! source {
 source!(GitHubPr);
 source!(GitHubWi);
 source!(GitHubPipe);
+source!(GitHubNotif);
+
+#[async_trait]
+impl NotificationSource for GitHubNotif {
+    async fn list(&self) -> Result<Vec<Notification>> {
+        // Repo-scoped, unread only (the inbox surfaces what still needs you).
+        let v = self.0.get_json(&self.0.repo_path("/notifications?per_page=50")).await?;
+        Ok(v.as_array().unwrap_or(&vec![]).iter().map(map_notification).collect())
+    }
+    async fn mark_read(&self, id: &str) -> Result<()> {
+        // Marking a thread read is the account-level endpoint.
+        self.0.patch_empty(&format!("{}/notifications/threads/{id}", self.0.base)).await
+    }
+    async fn mark_all_read(&self) -> Result<()> {
+        self.0.put_json(&self.0.repo_path("/notifications"), json!({ "read": true })).await
+    }
+}
 
 #[async_trait]
 impl PullRequestSource for GitHubPr {
@@ -557,6 +643,9 @@ impl ProviderConnection for GitHubConnection {
     fn pipelines(&self) -> Option<Arc<dyn PipelineSource>> {
         Some(Arc::new(GitHubPipe(self.client.clone())))
     }
+    fn notifications(&self) -> Option<Arc<dyn NotificationSource>> {
+        Some(Arc::new(GitHubNotif(self.client.clone())))
+    }
     async fn check(&self) -> bool {
         self.client.get_json(&format!("{}/user", self.client.base)).await.is_ok()
     }
@@ -572,7 +661,7 @@ pub fn github_capabilities() -> Capabilities {
         supports_inline_comments: true,
         supports_pipeline_trigger: true,
         supports_pipeline_discovery: true,
-        supports_notifications: false, // enabled in the notifications wave
+        supports_notifications: true,
         terminology: Terminology { work_items: "Issues".into(), ..Default::default() },
     }
 }
@@ -617,6 +706,36 @@ impl ProviderFactory for GitHubFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn maps_notification_reason_and_item() {
+        let v: Value = serde_json::from_str(
+            r#"{ "id": "42", "unread": true, "reason": "review_requested", "updated_at": "2026-07-10T09:00:00Z",
+                 "subject": { "title": "Add retries", "type": "PullRequest", "url": "https://api.github.com/repos/acme/pay/pulls/1501" },
+                 "repository": { "full_name": "acme/pay", "html_url": "https://github.com/acme/pay" } }"#,
+        )
+        .unwrap();
+        let n = map_notification(&v);
+        assert_eq!(n.id, "42");
+        assert_eq!(n.kind, NotificationKind::ReviewRequested);
+        assert_eq!(n.item_type, NotificationItemType::PullRequest);
+        assert_eq!(n.item_id.as_deref(), Some("1501"), "PR number extracted for in-app drill-in");
+        assert_eq!(n.url.as_deref(), Some("https://github.com/acme/pay/pull/1501"));
+        assert_eq!(n.context, "acme/pay");
+        assert!(n.unread);
+
+        // A CI notification on a check-suite maps to a pipeline with no in-app id (browser only).
+        let ci: Value = serde_json::from_str(
+            r#"{ "id": "9", "unread": true, "reason": "ci_activity",
+                 "subject": { "title": "CI failed", "type": "CheckSuite", "url": "https://api.github.com/repos/acme/pay/check-suites/77" },
+                 "repository": { "full_name": "acme/pay", "html_url": "https://github.com/acme/pay" } }"#,
+        )
+        .unwrap();
+        let c = map_notification(&ci);
+        assert_eq!(c.kind, NotificationKind::CiFailed);
+        assert_eq!(c.item_type, NotificationItemType::Pipeline);
+        assert_eq!(c.item_id, None);
+    }
 
     #[test]
     fn maps_pending_deployment_to_approval() {
