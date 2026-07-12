@@ -5,6 +5,7 @@ pub mod app;
 pub mod diff;
 pub mod launchpad;
 pub mod overlay;
+pub mod palette;
 pub mod theme;
 pub mod ui;
 pub mod wizard;
