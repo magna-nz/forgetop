@@ -592,9 +592,9 @@ fn pr_status(theme: &Theme, pr: &PullRequest) -> (&'static str, ratatui::style::
         return ("◌ draft", theme.dim);
     }
     match pr.status {
-        // Green = healthy/done (open, merged); red = closed unmerged (worth a look).
+        // Green = open (healthy), magenta = merged (shipped/done), red = closed unmerged.
         PullRequestStatus::Open => ("● open", theme.green),
-        PullRequestStatus::Merged => ("✦ merged", theme.green),
+        PullRequestStatus::Merged => ("✦ merged", theme.magenta),
         PullRequestStatus::Closed => ("✗ closed", theme.red),
         PullRequestStatus::Draft => ("◌ draft", theme.dim),
     }
@@ -1754,6 +1754,7 @@ fn tone_color(theme: &Theme, tone: Tone) -> ratatui::style::Color {
         Tone::Active => theme.blue,
         Tone::Warn => theme.yellow,
         Tone::Bad => theme.red,
+        Tone::Merged => theme.magenta,
         Tone::Neutral => theme.dim,
     }
 }
@@ -2281,6 +2282,17 @@ mod tests {
         assert!(out.contains("src/"), "directory header");
         assert!(out.contains("[x]"), "a viewed file's checkbox is ticked");
         assert!(out.contains("[ ]"), "an unviewed file's checkbox is empty");
+    }
+
+    #[test]
+    fn merged_pr_is_magenta_distinct_from_open_green() {
+        let theme = Theme::by_name("slate");
+        let mut pr = sample_pr();
+        pr.is_draft = false;
+        pr.status = PullRequestStatus::Merged;
+        assert_eq!(pr_status(&theme, &pr).1, theme.magenta, "merged is magenta");
+        pr.status = PullRequestStatus::Open;
+        assert_eq!(pr_status(&theme, &pr).1, theme.green, "open stays green");
     }
 
     #[test]
