@@ -572,6 +572,7 @@ pub fn github_capabilities() -> Capabilities {
         supports_inline_comments: true,
         supports_pipeline_trigger: true,
         supports_pipeline_discovery: true,
+        supports_notifications: false, // enabled in the notifications wave
         terminology: Terminology { work_items: "Issues".into(), ..Default::default() },
     }
 }

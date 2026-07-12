@@ -315,3 +315,51 @@ pub enum ApprovalDecision {
     Approve,
     Reject,
 }
+
+/// Why a notification fired — each provider's native reason/action maps onto one of these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NotificationKind {
+    /// You were asked to review a PR/MR.
+    ReviewRequested,
+    /// You were @-mentioned (comment, description, team mention).
+    Mention,
+    /// Something was assigned to you.
+    Assigned,
+    /// CI failed on something of yours.
+    CiFailed,
+    /// A new comment/reply on something you follow.
+    Comment,
+    /// The state of something you follow changed (merged, closed, status).
+    StateChange,
+    /// Anything else the provider notified about.
+    Other,
+}
+
+/// What kind of item a notification points at — drives its icon and which source opens it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NotificationItemType {
+    PullRequest,
+    WorkItem,
+    Pipeline,
+    Other,
+}
+
+/// One item in the cross-provider notification inbox.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Notification {
+    /// Provider-native notification id — used to mark it read.
+    pub id: String,
+    pub kind: NotificationKind,
+    pub item_type: NotificationItemType,
+    /// The underlying PR / work-item / pipeline id, for opening it in-app. `None` when the
+    /// notification has no resolvable item (then we fall back to the web URL).
+    pub item_id: Option<String>,
+    /// Subject line — the PR/issue title.
+    pub title: String,
+    /// Where it lives: `org/repo`, or the project / team name.
+    pub context: String,
+    /// Web URL, for the browser fallback.
+    pub url: Option<String>,
+    pub unread: bool,
+    pub updated_at: Option<DateTime<Utc>>,
+}

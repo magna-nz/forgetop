@@ -75,6 +75,8 @@ pub struct Capabilities {
     pub supports_inline_comments: bool,
     pub supports_pipeline_trigger: bool,
     pub supports_pipeline_discovery: bool,
+    /// Whether this provider exposes a personal notification feed (GitHub / GitLab / Linear).
+    pub supports_notifications: bool,
     pub terminology: Terminology,
 }
 
@@ -89,6 +91,7 @@ impl Default for Capabilities {
             supports_inline_comments: false,
             supports_pipeline_trigger: false,
             supports_pipeline_discovery: false,
+            supports_notifications: false,
             terminology: Terminology::default(),
         }
     }
@@ -229,6 +232,24 @@ pub trait PipelineSource: Send + Sync {
     }
 }
 
+/// The provider's personal notification feed (GitHub notifications, GitLab todos, Linear
+/// notifications). Only some providers have one — see [`Capabilities::supports_notifications`].
+#[async_trait]
+pub trait NotificationSource: Send + Sync {
+    /// The current user's notifications, newest first.
+    async fn list(&self) -> Result<Vec<Notification>>;
+    /// Mark a single notification read by its id.
+    async fn mark_read(&self, id: &str) -> Result<()>;
+    /// Mark every notification read. Default: mark each one; providers with a bulk endpoint
+    /// (GitHub `PUT /notifications`, GitLab `/todos/mark_as_done`) should override.
+    async fn mark_all_read(&self) -> Result<()> {
+        for n in self.list().await? {
+            let _ = self.mark_read(&n.id).await;
+        }
+        Ok(())
+    }
+}
+
 /// A live, authenticated connection exposing only the sources it supports.
 #[async_trait]
 pub trait ProviderConnection: Send + Sync {
@@ -239,6 +260,10 @@ pub trait ProviderConnection: Send + Sync {
     fn pull_requests(&self) -> Option<Arc<dyn PullRequestSource>>;
     fn work_items(&self) -> Option<Arc<dyn WorkItemSource>>;
     fn pipelines(&self) -> Option<Arc<dyn PipelineSource>>;
+    /// The notification feed, when the provider has one. Defaults to `None` (unsupported).
+    fn notifications(&self) -> Option<Arc<dyn NotificationSource>> {
+        None
+    }
     /// Cheap reachability/auth check for the connections health bar.
     async fn check(&self) -> bool;
 }

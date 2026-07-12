@@ -561,6 +561,7 @@ pub fn gitlab_capabilities() -> Capabilities {
         supports_inline_comments: true,
         supports_pipeline_trigger: true,
         supports_pipeline_discovery: true,
+        supports_notifications: false, // enabled in the notifications wave
         terminology: Terminology {
             pull_requests: "Merge Requests".into(),
             work_items: "Issues".into(),
