@@ -67,12 +67,24 @@ fn render_tabs(frame: &mut Frame, area: Rect, app: &App) {
     let clock = app.last_refresh.format("%H:%M:%S");
     let right = format!("{} · {} ", theme.name, clock);
 
+    // Top-left notification indicator: dim grey at (0), bold yellow when there's something.
+    let unread = app.unread_count();
+    let notif_style = if unread == 0 {
+        Style::default().fg(theme.dim)
+    } else {
+        Style::default().fg(theme.yellow).add_modifier(Modifier::BOLD)
+    };
+    let title = Line::from(vec![
+        Span::styled(" ▟ forgetop ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+        Span::styled(format!(" notification ({unread}) [i] "), notif_style),
+    ]);
+
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(theme.accent))
         .style(Style::default().bg(theme.bg))
-        .title(Span::styled(" ▟ forgetop ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)))
+        .title(title)
         .title_top(Line::from(Span::styled(right, Style::default().fg(theme.dim))).right_aligned());
 
     let vis = app.visible_indices();
@@ -137,6 +149,10 @@ fn render_content(frame: &mut Frame, area: Rect, app: &mut App) {
         }
         Screen::Config(view) => {
             render_config(frame, area, &app.theme, view);
+            return;
+        }
+        Screen::Inbox => {
+            render_inbox(frame, area, app);
             return;
         }
         Screen::PrView(_) | Screen::WiView(_) | Screen::List => {}
@@ -1059,6 +1075,9 @@ fn footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
     if matches!(app.screen, Screen::WiView(_)) {
         return vec![("PgUp/Dn", "scroll"), ("u", "update state"), ("c", "comment"), ("o", "open"), ("Esc", "back"), ("q", "quit")];
     }
+    if matches!(app.screen, Screen::Inbox) {
+        return vec![("↑↓", "move"), ("↵", "open item"), ("o", "browser"), ("x", "mark read"), ("A", "all read"), ("r", "refresh"), ("Esc", "back")];
+    }
     if let Screen::Pipeline(v) = &app.screen {
         if v.logs.is_some() {
             return vec![("↑↓", "scroll"), ("PgUp/Dn", "jump"), ("Esc", "close logs")];
@@ -1096,6 +1115,73 @@ fn footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
     keys.push(("/", "find"));
     keys.extend([("v", "tabs"), ("C", "config"), ("r", "refresh"), ("t", "theme"), ("?", "help"), ("q", "quit")]);
     keys
+}
+
+/// A short glyph + label + colour for each notification kind.
+fn notif_kind(theme: &Theme, kind: NotificationKind) -> (&'static str, &'static str, ratatui::style::Color) {
+    match kind {
+        NotificationKind::ReviewRequested => ("◆", "review", theme.accent),
+        NotificationKind::Assigned => ("◎", "assigned", theme.accent),
+        NotificationKind::Mention => ("@", "mention", theme.magenta),
+        NotificationKind::CiFailed => ("✗", "ci failed", theme.red),
+        NotificationKind::Comment => ("▪", "comment", theme.dim),
+        NotificationKind::StateChange => ("↻", "update", theme.dim),
+        NotificationKind::Other => ("•", "activity", theme.dim),
+    }
+}
+
+fn render_inbox(frame: &mut Frame, area: Rect, app: &App) {
+    let theme = &app.theme;
+    let title = format!("Inbox — {} unread of {}", app.unread_count(), app.inbox.len());
+    let block = section_block(theme, &title);
+    if app.inbox.is_empty() {
+        empty(frame, area, theme, "No notifications. The inbox aggregates GitHub, GitLab, and Linear.", block);
+        return;
+    }
+
+    let rows: Vec<Row> = app
+        .inbox
+        .iter()
+        .map(|r| {
+            let n = &r.notification;
+            let (glyph, label, color) = notif_kind(theme, n.kind);
+            let dot = if n.unread {
+                Span::styled("●", Style::default().fg(theme.yellow))
+            } else {
+                Span::raw(" ")
+            };
+            let title_style = if n.unread {
+                Style::default().fg(theme.fg).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.dim)
+            };
+            Row::new(vec![
+                Cell::from(dot),
+                Cell::from(Span::styled(format!("{glyph} {label}"), Style::default().fg(color))),
+                Cell::from(Span::styled(n.title.clone(), title_style)),
+                Cell::from(Span::styled(n.context.clone(), Style::default().fg(theme.dim))),
+                Cell::from(Span::styled(r.connection.clone(), Style::default().fg(theme.dim))),
+                Cell::from(Span::styled(rel_age(n.updated_at), Style::default().fg(theme.dim))),
+            ])
+        })
+        .collect();
+
+    let widths = [
+        Constraint::Length(1),
+        Constraint::Length(12),
+        Constraint::Min(20),
+        Constraint::Length(22),
+        Constraint::Length(12),
+        Constraint::Length(5),
+    ];
+    let table = Table::new(rows, widths)
+        .block(block)
+        .column_spacing(1)
+        .row_highlight_style(highlight(theme))
+        .highlight_symbol("▐ ");
+    let mut state = TableState::default();
+    state.select(Some(app.inbox_sel.min(app.inbox.len().saturating_sub(1))));
+    frame.render_stateful_widget(table, area, &mut state);
 }
 
 fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
@@ -1857,6 +1943,7 @@ fn help_sections() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
                 ("←/→  h/l  Tab  1–3", "Switch tab"),
                 ("↑/↓  k/j", "Move selection"),
                 ("Ctrl-P", "Jump to any item (command palette)"),
+                ("i", "Notification inbox (mentions, reviews, CI, assignments)"),
                 ("/", "Quick-filter the list"),
                 ("S", "Sort by column (re-pick flips direction)"),
                 ("o", "Open selected in browser"),
@@ -2857,6 +2944,48 @@ mod tests {
         assert!(out.contains("match"), "the match count is shown");
         assert!(out.contains("● "), "status dots are rendered");
         assert!(out.contains("PR") && out.contains("CI"), "type badges are shown");
+    }
+
+    fn notif_row(id: &str, kind: NotificationKind, title: &str, unread: bool) -> crate::app::NotifRow {
+        crate::app::NotifRow {
+            connection_id: "github".into(),
+            connection: "GitHub".into(),
+            provider: ProviderType::GitHub,
+            notification: Notification {
+                id: id.into(),
+                kind,
+                item_type: NotificationItemType::PullRequest,
+                item_id: Some("1".into()),
+                title: title.into(),
+                context: "northwind/payments".into(),
+                url: Some("http://x".into()),
+                unread,
+                updated_at: None,
+            },
+        }
+    }
+
+    #[test]
+    fn inbox_lists_notifications_and_header_shows_unread_count() {
+        use crate::app::Screen;
+        let mut app = App::new("slate");
+        app.inbox = vec![
+            notif_row("n1", NotificationKind::ReviewRequested, "Refactor the retry queue", true),
+            notif_row("n2", NotificationKind::CiFailed, "Bump the deps", false),
+        ];
+        app.screen = Screen::Inbox;
+        let out = render_to_string(&mut app, 130, 24);
+        assert!(out.contains("Refactor the retry queue"), "notification title renders");
+        assert!(out.contains("review"), "kind label renders");
+        assert!(out.contains("Inbox"), "inbox panel title");
+        assert!(out.contains("notification (1)"), "header indicator shows the unread count");
+    }
+
+    #[test]
+    fn header_indicator_reads_zero_when_inbox_empty() {
+        let mut app = App::new("slate");
+        let out = render_to_string(&mut app, 120, 24);
+        assert!(out.contains("notification (0)"), "grey (0) indicator when there's nothing");
     }
 
     #[test]
