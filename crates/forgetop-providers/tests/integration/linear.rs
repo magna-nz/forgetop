@@ -49,3 +49,15 @@ async fn linear_work_item_lifecycle() {
 
     raw.archive_issue(&id).await;
 }
+
+#[tokio::test]
+async fn linear_lists_notifications() {
+    let ln = skip_if_none!(harness::linear(), "linear");
+    let notifs = ln.conn.notifications().expect("linear advertises notifications");
+    // Decoding the notifications envelope is the assertion; an empty inbox returns [].
+    let list = notifs.list().await.expect("list notifications");
+    eprintln!("linear: {} notification(s)", list.len());
+    if let Some(n) = list.first() {
+        assert!(!n.id.is_empty(), "a notification carries an id for mark-read");
+    }
+}
