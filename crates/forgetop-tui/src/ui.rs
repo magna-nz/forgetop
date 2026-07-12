@@ -1155,37 +1155,67 @@ fn render_diff(frame: &mut Frame, area: Rect, theme: &Theme, diff: &DiffView, pe
     render_diff_patch(frame, cols[1], theme, diff, pending);
 }
 
+/// The directory portion of a path (`""` for a root-level file).
+fn dir_of(path: &str) -> &str {
+    path.rfind('/').map(|i| &path[..i]).unwrap_or("")
+}
+
+/// The filename portion of a path.
+fn base_of(path: &str) -> &str {
+    path.rfind('/').map(|i| &path[i + 1..]).unwrap_or(path)
+}
+
 fn render_diff_files(frame: &mut Frame, area: Rect, theme: &Theme, diff: &DiffView) {
-    let title = match &diff.commit_label {
-        Some(l) => format!("commit {l} · files"),
-        None => format!("{} · files", diff.pr_label),
+    let scope = match &diff.commit_label {
+        Some(l) => format!("commit {l}"),
+        None => diff.pr_label.clone(),
     };
+    let title = format!("{scope} · files · {}/{} reviewed", diff.viewed_count(), diff.files.len());
     let block = section_block(theme, &title);
     if diff.files.is_empty() {
         empty(frame, area, theme, "No changed files.", block);
         return;
     }
 
-    let rows: Vec<Row> = diff
-        .files
-        .iter()
-        .map(|f| {
-            Row::new(vec![
-                Cell::from(kind_badge(theme, f.kind)),
-                Cell::from(Span::styled(f.path.clone(), Style::default().fg(theme.fg))),
-                Cell::from(Span::styled(format!("+{} -{}", f.additions, f.deletions), Style::default().fg(theme.dim))),
-            ])
-        })
-        .collect();
+    // Files are pre-sorted by path, so same-directory files are contiguous. Emit a dim
+    // directory header whenever the directory changes; track the selected file's row so
+    // the (file-indexed) selection lands on the right display row past the headers.
+    let mut rows: Vec<Row> = Vec::new();
+    let mut sel_row = 0usize;
+    let mut last_dir: Option<&str> = None;
+    for (i, f) in diff.files.iter().enumerate() {
+        let dir = dir_of(&f.path);
+        if last_dir != Some(dir) {
+            let label = if dir.is_empty() { "(root)".into() } else { format!("{dir}/") };
+            rows.push(Row::new(vec![
+                Cell::from(""),
+                Cell::from(""),
+                Cell::from(Span::styled(label, Style::default().fg(theme.dim).add_modifier(Modifier::BOLD))),
+                Cell::from(""),
+            ]));
+            last_dir = Some(dir);
+        }
+        if i == diff.selected {
+            sel_row = rows.len();
+        }
+        let viewed = diff.is_viewed(&f.path);
+        let name_style = if viewed { Style::default().fg(theme.dim) } else { Style::default().fg(theme.fg) };
+        rows.push(Row::new(vec![
+            Cell::from(Span::styled(if viewed { "[x]" } else { "[ ]" }, Style::default().fg(theme.dim))),
+            Cell::from(kind_badge(theme, f.kind)),
+            Cell::from(Span::styled(format!("  {}", base_of(&f.path)), name_style)),
+            Cell::from(Span::styled(format!("+{} -{}", f.additions, f.deletions), Style::default().fg(theme.dim))),
+        ]));
+    }
 
-    let widths = [Constraint::Length(1), Constraint::Min(10), Constraint::Length(10)];
+    let widths = [Constraint::Length(3), Constraint::Length(1), Constraint::Min(10), Constraint::Length(10)];
     let table = Table::new(rows, widths)
         .block(block)
         .column_spacing(1)
         .row_highlight_style(highlight(theme))
         .highlight_symbol("▐ ");
     let mut state = TableState::default();
-    state.select(Some(diff.selected));
+    state.select(Some(sel_row));
     frame.render_stateful_widget(table, area, &mut state);
 }
 
@@ -1244,6 +1274,16 @@ fn render_diff_patch(frame: &mut Frame, area: Rect, theme: &Theme, diff: &DiffVi
     let total = patch.lines().count();
     // Patch lines (in this file) that carry a pending comment get a gutter bar.
     let marks = pending_marks(patch, &file.path, pending);
+    // Patch lines that carry an existing thread → gutter dot (resolved if all are resolved).
+    let mut thread_marks: std::collections::HashMap<usize, bool> = std::collections::HashMap::new();
+    for t in &diff.threads {
+        if t.file_path.as_deref() == Some(file.path.as_str()) {
+            if let Some(idx) = t.line.and_then(|l| crate::diff::patch_line_for_source_line(patch, l)) {
+                let e = thread_marks.entry(idx).or_insert(true);
+                *e = *e && t.is_resolved;
+            }
+        }
+    }
 
     // In the cursor, derive scroll so the cursor line stays roughly centred; the
     // stored scroll is only used for the free-scroll (file-list) mode.
@@ -1261,9 +1301,13 @@ fn render_diff_patch(frame: &mut Frame, area: Rect, theme: &Theme, diff: &DiffVi
         .lines()
         .enumerate()
         .map(|(i, l)| {
-            // A 1-col gutter: a bar when the line has a pending comment.
+            // A 1-col gutter: pending comment (bar, priority), else an existing-thread dot
+            // (● open / ○ resolved).
             let gutter = if marks.contains(&i) {
                 Span::styled("▎", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD))
+            } else if let Some(&resolved) = thread_marks.get(&i) {
+                let (glyph, color) = if resolved { ("○", theme.dim) } else { ("●", theme.accent) };
+                Span::styled(glyph, Style::default().fg(color))
             } else {
                 Span::raw(" ")
             };
@@ -1779,6 +1823,8 @@ fn help_sections() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
                 ("Enter (Commits)", "Drill into that commit's diff"),
                 ("Enter (Diff file)", "Line cursor in the patch"),
                 ("↑/↓ (line cursor)", "Move line-by-line"),
+                ("v (Diff)", "Mark file viewed (updates N/M reviewed)"),
+                ("[  ] (Diff)", "Jump to previous / next comment thread"),
                 ("s", "Submit buffered line comments as a review"),
                 ("o", "Open in browser"),
                 ("Esc", "Step back (line → files → close)"),
@@ -2031,6 +2077,7 @@ mod tests {
                 focus: crate::app::DiffFocus::FileList,
                 cursor: 0,
                 commit_label: None,
+                viewed: std::collections::HashSet::new(),
             },
             pending: vec![],
             review_draft: None,
@@ -2081,6 +2128,24 @@ mod tests {
         assert!(out.contains("Checks (2)"), "checks count");
         assert!(out.contains("Diff (3)"), "changed-file count");
         assert!(!out.contains("Conversation (0)"), "no zero-count noise on empty tabs");
+    }
+
+    #[test]
+    fn diff_file_list_groups_by_dir_and_shows_viewed_progress() {
+        use crate::app::Screen;
+        let file = |p: &str| FileChange { path: p.into(), kind: FileChangeKind::Modified, additions: 1, deletions: 0, patch: None };
+        // Pre-sorted (as the app does at open); two under src/, one at root.
+        let files = vec![file("README.md"), file("src/a.rs"), file("src/b.rs")];
+        let mut view = pr_view(3, vec![], files);
+        view.diff.viewed.insert("src/a.rs".into());
+        let mut app = App::new("slate");
+        app.screen = Screen::PrView(Box::new(view));
+
+        let out = render_to_string(&mut app, 150, 24);
+        assert!(out.contains("1/3 reviewed"), "progress in the title");
+        assert!(out.contains("src/"), "directory header");
+        assert!(out.contains("[x]"), "a viewed file's checkbox is ticked");
+        assert!(out.contains("[ ]"), "an unviewed file's checkbox is empty");
     }
 
     #[test]

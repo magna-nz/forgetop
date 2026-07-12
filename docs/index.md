@@ -44,8 +44,10 @@ This is the full reference. For install and a 60-second start, see the
 - **Do work, not just watch it** — approve / request changes / merge / comment on
   PRs, change work-item states, trigger pipeline runs — all from the keyboard.
 - **Real code review** — a full-screen PR view with Conversation, Commits, Checks,
-  and Diff tabs; a line cursor in the patch; and **inline line comments buffered
-  locally then submitted as one review** (Comment / Approve / Request changes).
+  and Diff tabs; **syntax-highlighted** diffs grouped by directory, per-file
+  **viewed** checkboxes, thread jump-navigation, a line cursor in the patch; and
+  **inline line comments buffered locally then submitted as one review**
+  (Comment / Approve / Request changes).
 - **Pipeline drill-in** — expand stages → jobs → steps with per-node **durations**,
   **failure reasons**, a scrollable **logs** pane, and open-in-browser.
 - **Pipeline approvals** — see which runs are blocked on a gate you can action
@@ -215,11 +217,25 @@ write action lives inside the PR view.
 - **Conversation** — description, reviewers, labels, and comment threads.
 - **Commits** — one row per commit; `Enter` drills into *that commit's* diff.
 - **Checks** — each named CI check with its status.
-- **Diff** — the changed files; `Enter` on a file drops into a **line cursor** in
-  the patch (`↑`/`↓` move line-by-line; the title shows the real file line).
+- **Diff** — the changed files, **grouped by directory** and **syntax-highlighted**;
+  `Enter` on a file drops into a **line cursor** in the patch (`↑`/`↓` move
+  line-by-line; the title shows the real file line).
 
 Write actions from the view: `a` approve, `x` request changes, `m` merge (pick a
 strategy), `c` comment, `o` open in browser.
+
+### Reading the diff
+
+- **Syntax highlighting** — patches are highlighted for common languages
+  (Rust, TS/JS, Python, Go, Java, JSON, YAML), using the theme's colours; other
+  languages render plain. The `+`/`-` add/remove colour is always kept.
+- **Viewed checkboxes** — press **`v`** on a file to mark it reviewed (`[x]`); the
+  file-list title tracks your progress as **`N/M reviewed`**. Session-only.
+- **Directory grouping** — files are grouped under directory headers so a large PR
+  is easier to scan.
+- **Jump between threads** — **`[`** / **`]`** move the cursor to the previous / next
+  existing comment thread in the file; thread lines show a gutter dot (● open,
+  ○ resolved).
 
 ### Reviewing code with line comments
 
