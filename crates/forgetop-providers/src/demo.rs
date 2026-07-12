@@ -71,7 +71,11 @@ fn pr(
         id: n.to_string(),
         number: Some(n),
         title: title.into(),
-        description: None,
+        description: Some(format!(
+            "{title}.\n\nReworks the `{branch}` path and adds test coverage. Main things to \
+             review: error handling and the retry / edge-case paths. Background and \
+             acceptance criteria are on the linked ticket."
+        )),
         author,
         is_draft: matches!(status, PullRequestStatus::Draft),
         status,

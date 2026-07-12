@@ -844,10 +844,11 @@ fn pr_conversation_lines(theme: &Theme, pr: &PullRequest, threads: &[CommentThre
     if let Some(url) = &pr.url {
         lines.push(field(theme, "URL", url.clone()));
     }
-    if let Some(desc) = pr.description.as_ref().filter(|d| !d.is_empty()) {
+    if let Some(desc) = pr.description.as_ref().filter(|d| !d.trim().is_empty()) {
         lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled("Description", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD))));
         for l in desc.lines() {
-            lines.push(Line::from(Span::styled(l.to_string(), Style::default().fg(theme.dim))));
+            lines.push(Line::from(Span::styled(l.to_string(), Style::default().fg(theme.fg))));
         }
     }
     lines.extend(comment_lines(theme, threads));
@@ -2261,6 +2262,16 @@ mod tests {
         assert!(out.contains("src/"), "directory header");
         assert!(out.contains("[x]"), "a viewed file's checkbox is ticked");
         assert!(out.contains("[ ]"), "an unviewed file's checkbox is empty");
+    }
+
+    #[test]
+    fn conversation_shows_the_pr_description() {
+        use crate::app::Screen;
+        let mut app = App::new("slate");
+        app.screen = Screen::PrView(Box::new(pr_view(0, vec![], vec![]))); // sample_pr has a description
+        let out = render_to_string(&mut app, 120, 24);
+        assert!(out.contains("Description"), "the description has a heading");
+        assert!(out.contains("does the thing"), "the description body renders");
     }
 
     #[test]
