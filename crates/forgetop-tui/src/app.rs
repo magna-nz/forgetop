@@ -2935,6 +2935,18 @@ impl App {
                 if matches!(action, Action::PrVote(_) | Action::PrMerge(_)) {
                     self.dismiss_from_launchpad(&conn_id, &id);
                 }
+                // Reflect the change in the open PR view: re-fetch the PR (status / reviewers
+                // / mergeable) and its threads (a new comment), like the work-item handler.
+                if matches!(&self.screen, Screen::PrView(v) if v.pr.id == id) {
+                    let fresh = source.get(&id).await.ok();
+                    let threads = source.threads(&id).await.unwrap_or_default();
+                    if let Screen::PrView(v) = &mut self.screen {
+                        if let Some(pr) = fresh {
+                            v.pr = pr;
+                        }
+                        v.diff.threads = threads;
+                    }
+                }
                 let mut errors = Vec::new();
                 self.reload_pull_requests(deps, &mut errors).await;
                 self.fix_selection();

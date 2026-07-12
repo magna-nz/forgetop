@@ -670,7 +670,19 @@ impl PullRequestSource for DemoPr {
         };
         Ok(vec![file])
     }
-    async fn add_comment(&self, _id: &str, _body: &str) -> Result<()> {
+    async fn add_comment(&self, id: &str, body: &str) -> Result<()> {
+        // Persist as a general (non-line) thread so it comes back from threads() and shows
+        // on the Conversation tab after the view refreshes.
+        let mut store = submitted_threads().lock().unwrap();
+        let entry = store.entry(id.to_string()).or_default();
+        let n = entry.len();
+        entry.push(CommentThread {
+            id: format!("submitted-{n}"),
+            comments: vec![Comment { id: format!("mine-{n}"), author: me(), body: body.into(), created_at: Some(base()) }],
+            file_path: None,
+            line: None,
+            is_resolved: false,
+        });
         Ok(())
     }
     async fn vote(&self, _id: &str, _vote: ReviewVote) -> Result<()> {
@@ -720,13 +732,24 @@ impl WorkItemSource for DemoWi {
     async fn get(&self, id: &str) -> Result<WorkItem> {
         wis_for(&self.conn).into_iter().find(|w| w.id == id).ok_or_else(|| forgetop_core::Error::NotFound(id.into()))
     }
-    async fn threads(&self, _id: &str) -> Result<Vec<CommentThread>> {
-        Ok(vec![])
+    async fn threads(&self, id: &str) -> Result<Vec<CommentThread>> {
+        // Comments submitted this session persist and come back, like a real provider.
+        Ok(submitted_threads().lock().unwrap().get(id).cloned().unwrap_or_default())
     }
     async fn set_state(&self, _id: &str, _state: &str) -> Result<()> {
         Ok(())
     }
-    async fn add_comment(&self, _id: &str, _body: &str) -> Result<()> {
+    async fn add_comment(&self, id: &str, body: &str) -> Result<()> {
+        let mut store = submitted_threads().lock().unwrap();
+        let entry = store.entry(id.to_string()).or_default();
+        let n = entry.len();
+        entry.push(CommentThread {
+            id: format!("submitted-{n}"),
+            comments: vec![Comment { id: format!("mine-{n}"), author: me(), body: body.into(), created_at: Some(base()) }],
+            file_path: None,
+            line: None,
+            is_resolved: false,
+        });
         Ok(())
     }
     async fn available_states(&self, _id: &str) -> Result<Vec<String>> {
@@ -899,6 +922,29 @@ mod tests {
         );
         // A different PR is unaffected by what was submitted to this one.
         assert_eq!(src.threads(other).await.unwrap().len(), before);
+    }
+
+    #[tokio::test]
+    async fn pr_comment_persists_as_a_conversation_thread() {
+        let src = DemoPr { conn: "github".into() };
+        let id = "persist-prcomment-a"; // unique id → no cross-test pollution
+        src.add_comment(id, "ship it").await.unwrap();
+        let threads = src.threads(id).await.unwrap();
+        assert!(
+            threads.iter().any(|t| t.file_path.is_none() && t.comments.iter().any(|c| c.body == "ship it")),
+            "a PR comment comes back as a general (non-line) thread"
+        );
+    }
+
+    #[tokio::test]
+    async fn wi_comment_persists_in_threads() {
+        let src = DemoWi { conn: "github".into() };
+        let id = "persist-wicomment-a";
+        let before = src.threads(id).await.unwrap().len();
+        src.add_comment(id, "on it").await.unwrap();
+        let after = src.threads(id).await.unwrap();
+        assert_eq!(after.len(), before + 1);
+        assert!(after.iter().any(|t| t.comments.iter().any(|c| c.body == "on it")));
     }
 
     #[tokio::test]
