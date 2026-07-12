@@ -827,6 +827,17 @@ fn pr_tabs_line(theme: &Theme, view: &PrView) -> Line<'static> {
     Line::from(spans)
 }
 
+/// A reviewer's vote as a coloured glyph: green ✓ approved, red ✗ changes requested,
+/// yellow … waiting, dim · not yet voted.
+fn review_glyph(theme: &Theme, vote: ReviewVote) -> (&'static str, ratatui::style::Color) {
+    match vote {
+        ReviewVote::Approved | ReviewVote::ApprovedWithSuggestions => ("✓", theme.green),
+        ReviewVote::Rejected => ("✗", theme.red),
+        ReviewVote::WaitingForAuthor => ("…", theme.yellow),
+        ReviewVote::NoVote => ("·", theme.dim),
+    }
+}
+
 fn pr_conversation_lines(theme: &Theme, pr: &PullRequest, threads: &[CommentThread]) -> Vec<Line<'static>> {
     let mut lines = vec![
         field(theme, "Author", pr.author.display_name.clone()),
@@ -835,8 +846,16 @@ fn pr_conversation_lines(theme: &Theme, pr: &PullRequest, threads: &[CommentThre
         field(theme, "Changes", format!("{} files  +{} -{}", pr.changed_files, pr.additions, pr.deletions)),
     ];
     if !pr.reviewers.is_empty() {
-        let who = pr.reviewers.iter().map(|r| format!("{} ({:?})", r.user.display_name, r.vote)).collect::<Vec<_>>().join(", ");
-        lines.push(field(theme, "Reviewers", who));
+        let mut spans = vec![Span::styled(format!("{:<12}", "Reviewers"), Style::default().fg(theme.dim))];
+        for (i, r) in pr.reviewers.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::styled(", ", Style::default().fg(theme.dim)));
+            }
+            let (glyph, color) = review_glyph(theme, r.vote);
+            spans.push(Span::styled(format!("{} ({:?}) ", r.user.display_name, r.vote), Style::default().fg(theme.fg)));
+            spans.push(Span::styled(glyph, Style::default().fg(color)));
+        }
+        lines.push(Line::from(spans));
     }
     if !pr.labels.is_empty() {
         lines.push(field(theme, "Labels", pr.labels.join(", ")));
@@ -2262,6 +2281,24 @@ mod tests {
         assert!(out.contains("src/"), "directory header");
         assert!(out.contains("[x]"), "a viewed file's checkbox is ticked");
         assert!(out.contains("[ ]"), "an unviewed file's checkbox is empty");
+    }
+
+    #[test]
+    fn reviewers_show_a_green_tick_or_red_cross_by_vote() {
+        use forgetop_core::domain::{Reviewer, ReviewVote};
+        let theme = Theme::by_name("slate");
+        let who = |name: &str| User { id: name.into(), display_name: name.into(), handle: None, avatar_url: None };
+        let mut pr = sample_pr();
+        pr.reviewers = vec![
+            Reviewer { user: who("Priya Nair"), vote: ReviewVote::Approved, is_required: true },
+            Reviewer { user: who("Marcus Lee"), vote: ReviewVote::Rejected, is_required: false },
+        ];
+        let lines = pr_conversation_lines(&theme, &pr, &[]);
+
+        let green_tick = lines.iter().any(|l| l.spans.iter().any(|s| s.content.as_ref() == "✓" && s.style.fg == Some(theme.green)));
+        let red_cross = lines.iter().any(|l| l.spans.iter().any(|s| s.content.as_ref() == "✗" && s.style.fg == Some(theme.red)));
+        assert!(green_tick, "an approved reviewer gets a green tick");
+        assert!(red_cross, "a changes-requested reviewer gets a red cross");
     }
 
     #[test]
