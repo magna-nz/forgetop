@@ -13,7 +13,7 @@ and **Bitbucket** - in one place.
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 <div align="center">
-  <img src="docs/demo.gif" alt="forgetop demo" width="820">
+  <img src="docs/everything1.gif" alt="forgetop demo" width="820">
   <br/>
   <sub>Live dashboard - Pull Requests, Work Items, Pipelines.</sub>
 </div>
@@ -39,6 +39,12 @@ So instead of checking GitHub for reviews, Azure for failing builds, and Jira fo
 tickets, you start your day on one triaged list - every item in the same shape, so
 they're comparable at a glance - and act on any of them inline. No tab-hopping, nothing
 slipping through the cracks.
+
+<div align="center">
+  <img src="docs/launchpad1.gif" alt="The Launchpad - a cross-provider action queue" width="820">
+  <br/>
+  <sub>The Launchpad: everything that needs you, across every forge, on one page.</sub>
+</div>
 
 See the [Launchpad docs](https://magna-nz.github.io/forgetop/#launchpad) for the full
 bucket rules and keys.
