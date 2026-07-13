@@ -539,8 +539,9 @@ directory (e.g. `~/.config/forgetop/forgetop.log`). It records:
 
 - **Crashes** — if forgetop ever panics it restores your terminal (no garbled screen),
   writes the panic to the log, and prints the path so you can send it on.
-- **Fetch errors** — provider / auth / network failures that otherwise only flash in the
-  status line, timestamped, so intermittent issues are reviewable after the fact.
+- **Errors** — a failed action (approve / merge / comment / trigger / …) and background
+  provider / auth / network fetch failures, which otherwise only flash on screen — each
+  timestamped, so intermittent issues are reviewable after the fact.
 
 `forgetop doctor` prints the log's path. Logging is best-effort and contains no secrets.
 The running version is shown in the header (`▟ forgetop v…`) and via `forgetop --version`,
