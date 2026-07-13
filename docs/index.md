@@ -248,8 +248,8 @@ In the Diff tab's line cursor, press `c` on a code line to write an inline
 comment. Comments are **buffered locally** — the line gets a `▎` marker — so you
 can comment on several lines first. Press **`s`** to submit them all as one
 review, choosing the verdict: **Comment**, **Approve**, or **Request changes**.
-If you press `Esc` to leave with comments still buffered, forgetop asks whether to
-**submit** or **leave without submitting** first, so you don't lose them by accident.
+If you press `Esc` **or `q`** to leave with comments still buffered, forgetop asks whether
+to **submit** or **leave without submitting** first, so you don't lose them by accident.
 
 - **GitHub** posts it as a single native review.
 - **GitLab** posts positioned discussions (and approves if you chose Approve).
@@ -531,6 +531,20 @@ Tokens are stored in your OS keychain under the service name `forgetop`. In
 headless environments (CI, containers) you can instead supply a token via an
 environment variable named `FORGETOP_PAT_<CONNECTION_ID>` (uppercased;
 non-alphanumeric characters become `_`).
+
+### Logs & diagnostics
+
+forgetop keeps a small log file next to your config — **`forgetop.log`** in the same
+directory (e.g. `~/.config/forgetop/forgetop.log`). It records:
+
+- **Crashes** — if forgetop ever panics it restores your terminal (no garbled screen),
+  writes the panic to the log, and prints the path so you can send it on.
+- **Fetch errors** — provider / auth / network failures that otherwise only flash in the
+  status line, timestamped, so intermittent issues are reviewable after the fact.
+
+`forgetop doctor` prints the log's path. Logging is best-effort and contains no secrets.
+The running version is shown in the header (`▟ forgetop v…`) and via `forgetop --version`,
+so it's easy to include when reporting an issue.
 
 ### Token scopes
 

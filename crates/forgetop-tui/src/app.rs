@@ -2064,7 +2064,12 @@ impl App {
                 return;
             }
             Key::Char('q') => {
-                self.should_quit = true;
+                // Don't quit out from under unsubmitted line comments — same prompt as Esc.
+                if matches!(&self.screen, Screen::PrView(v) if !v.pending.is_empty()) {
+                    self.open_pending_exit_prompt();
+                } else {
+                    self.should_quit = true;
+                }
                 return;
             }
             Key::Char('o') => {
@@ -4786,6 +4791,26 @@ mod tests {
             Some(Overlay::Picker { kind, .. }) => assert!(matches!(kind, PickerKind::PendingExit)),
             _ => panic!("expected the unsubmitted-comments prompt"),
         }
+    }
+
+    #[test]
+    fn quit_with_pending_comments_prompts_instead_of_quitting() {
+        let mut app = App::new("slate");
+        app.screen = pr_view_with_pending(vec![LineComment { path: "a.rs".into(), line: 1, side: DiffSide::New, body: "nit".into() }]);
+
+        app.on_pr_view_key(Key::Char('q'));
+
+        assert!(!app.should_quit, "q doesn't quit out from under unsubmitted comments");
+        assert!(matches!(app.screen, Screen::PrView(_)));
+        assert!(matches!(&app.overlay, Some(Overlay::Picker { kind, .. }) if matches!(kind, PickerKind::PendingExit)));
+    }
+
+    #[test]
+    fn quit_without_pending_comments_quits() {
+        let mut app = App::new("slate");
+        app.screen = pr_view_with_pending(vec![]);
+        app.on_pr_view_key(Key::Char('q'));
+        assert!(app.should_quit);
     }
 
     #[test]
