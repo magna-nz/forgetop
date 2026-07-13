@@ -41,7 +41,7 @@ they're comparable at a glance - and act on any of them inline. No tab-hopping, 
 slipping through the cracks.
 
 <div align="center">
-  <img src="docs/launchpad1.gif" alt="The Launchpad - a cross-provider action queue" width="820">
+  <img src="docs/launchpad2.gif" alt="The Launchpad - a cross-provider action queue" width="820">
   <br/>
   <sub>The Launchpad: everything that needs you, across every forge, on one page.</sub>
 </div>
