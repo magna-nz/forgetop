@@ -2036,22 +2036,34 @@ fn help_sections() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
 }
 
 fn render_help(frame: &mut Frame, area: Rect, theme: &Theme, scroll: u16) {
-    let mut lines: Vec<Line> = Vec::new();
-    for (section, keys) in help_sections() {
-        lines.push(Line::from(Span::styled(section, Style::default().fg(theme.accent).add_modifier(Modifier::BOLD))));
+    // Build each section as a group of lines, then balance the groups across two columns so
+    // the whole reference fits on one screen without scrolling.
+    let group = |name: &'static str, keys: Vec<(&'static str, &'static str)>| -> Vec<Line<'static>> {
+        let mut g = vec![Line::from(Span::styled(name, Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)))];
         for (k, d) in keys {
-            lines.push(Line::from(vec![
-                Span::styled(format!("  {k:<18}"), Style::default().fg(theme.yellow)),
+            g.push(Line::from(vec![
+                Span::styled(format!("  {k:<15}"), Style::default().fg(theme.yellow)),
                 Span::styled(d, Style::default().fg(theme.fg)),
             ]));
         }
-        lines.push(Line::from(""));
+        g.push(Line::from(""));
+        g
+    };
+    let (mut left, mut right): (Vec<Line>, Vec<Line>) = (Vec::new(), Vec::new());
+    let (mut lh, mut rh) = (0usize, 0usize);
+    for (name, keys) in help_sections() {
+        let g = group(name, keys);
+        if lh <= rh {
+            lh += g.len();
+            left.extend(g);
+        } else {
+            rh += g.len();
+            right.extend(g);
+        }
     }
-    lines.push(Line::from(Span::styled("↑↓ scroll · Esc close", Style::default().fg(theme.dim))));
 
-    let total = lines.len() as u16;
-    let width = 68.min(area.width.saturating_sub(4));
-    let height = area.height.saturating_sub(4).clamp(10, total + 2);
+    let width = 104.min(area.width.saturating_sub(4));
+    let height = area.height.saturating_sub(2).max(12);
     let rect = centered_rect(width, height, area);
 
     let block = Block::default()
@@ -2059,14 +2071,21 @@ fn render_help(frame: &mut Frame, area: Rect, theme: &Theme, scroll: u16) {
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(theme.accent))
         .style(Style::default().bg(theme.panel))
-        .title(Span::styled(" Keybindings ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)));
-
-    // Clamp scroll so you can't page past the end.
-    let inner_h = height.saturating_sub(2);
-    let max_scroll = total.saturating_sub(inner_h);
+        .title(Span::styled(" Keybindings ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)))
+        .title_bottom(Line::from(Span::styled(" ↑↓ scroll · Esc close ", Style::default().fg(theme.dim))).right_aligned());
+    let inner = block.inner(rect);
 
     frame.render_widget(Clear, rect);
-    frame.render_widget(Paragraph::new(lines).block(block).scroll((scroll.min(max_scroll), 0)), rect);
+    frame.render_widget(block, rect);
+
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .spacing(2)
+        .split(inner);
+    let scroll = (scroll, 0);
+    frame.render_widget(Paragraph::new(left).scroll(scroll).wrap(Wrap { trim: false }), cols[0]);
+    frame.render_widget(Paragraph::new(right).scroll(scroll).wrap(Wrap { trim: false }), cols[1]);
 }
 
 fn render_wizard(frame: &mut Frame, area: Rect, app: &App) {
@@ -2995,6 +3014,18 @@ mod tests {
         let mut app = App::new("slate");
         let out = render_to_string(&mut app, 120, 24);
         assert!(out.contains("Notifications (0)"), "grey (0) nav item when there's nothing");
+    }
+
+    #[test]
+    fn help_shows_sections_from_both_columns_at_once() {
+        use crate::overlay::Overlay;
+        let mut app = App::new("slate");
+        app.overlay = Some(Overlay::Help { scroll: 0 });
+        let out = render_to_string(&mut app, 120, 44);
+        assert!(out.contains("Keybindings"), "help panel title");
+        // Early and late sections both visible on one screen → the two-column layout works.
+        assert!(out.contains("Global"), "first section");
+        assert!(out.contains("Pipelines"), "a later section without scrolling");
     }
 
     #[test]
