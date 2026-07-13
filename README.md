@@ -60,30 +60,25 @@ and [azdo](https://github.com/Elpulgo/azdo) (Azure DevOps only). forgetop's angl
 | :--- | :---: | :---: | :---: |
 | Forges supported | **6** | GitHub | Azure |
 | Cross-provider action inbox (Launchpad) | ✅ | ❌ | ❌ |
+| Cross-provider notification inbox | ✅ | ❌ | ❌ |
 | PRs + Work items + Pipelines | ✅ | PRs only | ✅ Azure |
 | Act (approve / merge / comment) | ✅ | ✅ PRs | partial |
 | Inline line-comment review | ✅ | preview | ❌ |
 | Pipeline drill-in + logs | ✅ | ❌ | ✅ |
 | Approve pipeline gates in-terminal | ✅ | ❌ | ❌ |
 | Filter · sort · saved prefs | ✅ | ✅ | limited |
+| Fuzzy command palette (jump to anything) | ✅ | ❌ | ❌ |
 | Cross-provider aggregation | ✅ | ❌ | ❌ |
 | Desktop notifications | ✅ | ❌ | ❌ |
 | Tokens in OS keychain | ✅ | via `gh` | PAT |
 
 ## Providers
 
-Each section binds to a provider that supports it; the Pipelines section can
-aggregate several at once.
-
-| Provider | Pull Requests | Work Items | Pipelines |
-| --- | :---: | :---: | :---: |
-| **GitHub** | ✅ | ✅ (Issues) | ✅ (Actions) |
-| **GitLab** | ✅ (MRs) | ✅ (Issues) | ✅ (CI) |
-| **Azure DevOps** | ✅ | ✅ | ✅ (Builds) |
-| **Bitbucket** | ✅ | - | ✅ (Pipelines) |
-| **Linear** | - | ✅ | - |
-| **Jira** | - | ✅ | - |
-| **Demo** | ✅ | ✅ | ✅ |
+**GitHub · GitLab · Azure DevOps · Bitbucket · Linear · Jira** (plus a built-in `--demo`).
+Each section — Pull Requests, Work Items, Pipelines — binds to the forges that serve it, and
+Pipelines can aggregate several at once. For exactly what each provider serves (and the
+notification-feed support), see the
+[capability matrix](https://magna-nz.github.io/forgetop/#providers-and-capabilities).
 
 ## Install
 
