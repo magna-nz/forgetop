@@ -1978,7 +1978,7 @@ impl App {
                 self.dismiss_from_launchpad(&conn_id, &pr_id);
                 self.toast = Some(format!("Review submitted ({} comment(s))", comments.len()));
             }
-            Err(e) => self.toast = Some(format!("Submit failed: {e}")),
+            Err(e) => self.toast_error(format!("Submit failed: {e}")),
         }
     }
 
@@ -2034,6 +2034,13 @@ impl App {
 
     /// Where Esc lands when closing an item view: back to the Launchpad if it was
     /// opened from there (row still selected), otherwise the section list.
+    /// Show an error to the user *and* record it to the log file, so a failed action is
+    /// reviewable after the toast fades (write actions, triggers, config changes).
+    fn toast_error(&mut self, msg: String) {
+        forgetop_core::diag::log("action", &msg);
+        self.toast = Some(msg);
+    }
+
     fn view_origin(&self) -> Screen {
         if self.from_inbox {
             Screen::Inbox
@@ -2402,7 +2409,7 @@ impl App {
                 self.toast = Some(format!("{verb} {label}"));
                 self.refresh_open_pipeline(deps).await;
             }
-            Err(e) => self.toast = Some(format!("Approval failed: {e}")),
+            Err(e) => self.toast_error(format!("Approval failed: {e}")),
         }
     }
 
@@ -2500,7 +2507,7 @@ impl App {
         let feeds = match deps.sections.pipeline_feeds().await {
             Ok(f) => f,
             Err(e) => {
-                self.toast = Some(format!("Trigger failed: {e}"));
+                self.toast_error(format!("Trigger failed: {e}"));
                 return;
             }
         };
@@ -2518,7 +2525,7 @@ impl App {
                     self.toast = Some(e.clone());
                 }
             }
-            Err(e) => self.toast = Some(format!("Trigger failed: {e}")),
+            Err(e) => self.toast_error(format!("Trigger failed: {e}")),
         }
     }
 
@@ -2622,7 +2629,7 @@ impl App {
         };
 
         if let Err(e) = deps.config.add_or_update_connection(connection, draft.pat).await {
-            self.toast = Some(format!("Add failed: {e}"));
+            self.toast_error(format!("Add failed: {e}"));
             return;
         }
 
@@ -2633,7 +2640,7 @@ impl App {
                 Section::Pipelines => deps.config.set_pipeline_auto_discover(&id, true).await,
             };
             if let Err(e) = result {
-                self.toast = Some(format!("Added, but binding failed: {e}"));
+                self.toast_error(format!("Added, but binding failed: {e}"));
                 self.reload_all(deps).await;
                 return;
             }
@@ -2763,7 +2770,7 @@ impl App {
         let defs = match source.discover().await {
             Ok(d) => d,
             Err(e) => {
-                self.toast = Some(format!("Discover failed: {e}"));
+                self.toast_error(format!("Discover failed: {e}"));
                 return;
             }
         };
@@ -2972,7 +2979,7 @@ impl App {
                 self.reload_all(deps).await;
                 self.rebuild_config_view(deps).await;
             }
-            Err(e) => self.toast = Some(format!("Remove failed: {e}")),
+            Err(e) => self.toast_error(format!("Remove failed: {e}")),
         }
     }
 
@@ -3118,7 +3125,7 @@ impl App {
                     self.toast = Some(e.clone());
                 }
             }
-            Err(e) => self.toast = Some(format!("Failed: {e}")),
+            Err(e) => self.toast_error(format!("Failed: {e}")),
         }
     }
 
@@ -3230,7 +3237,7 @@ impl App {
                     self.toast = Some(e.clone());
                 }
             }
-            Err(e) => self.toast = Some(format!("Failed: {e}")),
+            Err(e) => self.toast_error(format!("Failed: {e}")),
         }
     }
 }
