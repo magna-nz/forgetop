@@ -29,15 +29,15 @@ keychain, never in plaintext.
 ## The Launchpad
 
 forgetop opens on the **Launchpad** — one cross-provider queue answering *what needs me
-right now?* Every PR, work item, and pipeline that needs you, across every connected
-forge, lands on a single page ordered by urgency, in two columns:
+right now?* Every PR, work item, and pipeline that needs you — across every connected
+forge — lands on a single page, ordered by urgency, in two columns:
 
 - **Needs you** — reviews requested of you, pipeline gates to approve, PRs ready to
   merge, and anything of yours that's broken.
 - **Your work** — your assigned tickets, open PRs, and recent merges.
 
-Every item lands in the same shape, so they're comparable at a glance — and you act on any
-of them inline (approve a review, merge, clear a pipeline gate) without switching tabs.
+Every item is shown in the same shape, so they're comparable at a glance — and you act on
+any of them inline (approve a review, merge, clear a pipeline gate) without switching tabs.
 Nothing slips through the cracks.
 
 <div align="center">
