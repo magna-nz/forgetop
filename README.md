@@ -1,8 +1,8 @@
 # forgetop
 
 A fast, keyboard-driven terminal UI for your pull requests, work items, and CI
-pipelines - across **GitHub**, **GitLab**, **Azure DevOps**, **Linear**, **Jira**,
-and **Bitbucket** - in one place.
+pipelines — across **GitHub**, **GitLab**, **Azure DevOps**, **Bitbucket**,
+**Linear**, and **Jira** — in one place.
 
 📖 **Docs: [magna-nz.github.io/forgetop](https://magna-nz.github.io/forgetop/)**
 
@@ -15,39 +15,43 @@ and **Bitbucket** - in one place.
 <div align="center">
   <img src="docs/everything1.gif" alt="forgetop demo" width="820">
   <br/>
-  <sub>Live dashboard - Pull Requests, Work Items, Pipelines.</sub>
+  <sub>Your pull requests, work items, and pipelines from every forge — triaged and actionable in one terminal.</sub>
 </div>
 
 ---
 
-Modern teams spread work across several forges. forgetop pulls your pull requests,
-work items, and pipelines into one terminal dashboard - and lets you *act* on them
-(approve, merge, comment, change state, drill into pipeline stages, trigger runs)
-without leaving the keyboard. Tokens live in your OS keychain, never in plaintext.
+Checking GitHub for reviews, Azure for failing builds, and Jira for tickets is a lot of
+tabs. forgetop pulls your pull requests, work items, and pipelines into one terminal
+dashboard — and lets you *act* on them (approve, merge, comment, change state, drill into
+pipeline stages, trigger runs) without leaving the keyboard. Tokens live in your OS
+keychain, never in plaintext.
 
 ## The Launchpad
 
-forgetop opens on the **Launchpad** - one cross-provider queue answering *what needs me
-right now?* Every PR, work item, and pipeline that needs you - across every connected
-forge - lands on a single page, ordered by urgency, in two columns:
+forgetop opens on the **Launchpad** — one cross-provider queue answering *what needs me
+right now?* Every PR, work item, and pipeline that needs you, across every connected
+forge, lands on a single page ordered by urgency, in two columns:
 
-- **Needs you** - reviews requested of you, pipeline gates to approve, PRs ready to
+- **Needs you** — reviews requested of you, pipeline gates to approve, PRs ready to
   merge, and anything of yours that's broken.
-- **Your work** - your assigned tickets, open PRs, and recent merges.
+- **Your work** — your assigned tickets, open PRs, and recent merges.
 
-So instead of checking GitHub for reviews, Azure for failing builds, and Jira for
-tickets, you start your day on one triaged list - every item in the same shape, so
-they're comparable at a glance - and act on any of them inline. No tab-hopping, nothing
-slipping through the cracks.
+Every item lands in the same shape, so they're comparable at a glance — and you act on any
+of them inline (approve a review, merge, clear a pipeline gate) without switching tabs.
+Nothing slips through the cracks.
 
 <div align="center">
-  <img src="docs/launchpad2.gif" alt="The Launchpad - a cross-provider action queue" width="820">
+  <img src="docs/launchpad2.gif" alt="The Launchpad — a cross-provider action queue" width="820">
   <br/>
   <sub>The Launchpad: everything that needs you, across every forge, on one page.</sub>
 </div>
 
 See the [Launchpad docs](https://magna-nz.github.io/forgetop/#launchpad) for the full
 bucket rules and keys.
+
+Two more ways to stay on top of things: **`i`** opens a cross-provider **notification
+inbox** (mentions, review requests, CI failures, assignments), and **`Ctrl-P`** is a
+**fuzzy command palette** that jumps to any PR, work item, or pipeline across every forge.
 
 ## Why forgetop
 
@@ -106,18 +110,8 @@ Apple Silicon + Intel, Linux x86_64 + arm64, Windows x86_64).
 
 ## Quick start
 
-Try it with no setup - everything is in-memory, nothing is written:
-
-```sh
-forgetop --demo
-```
-
-It opens on the **[Launchpad](https://magna-nz.github.io/forgetop/#launchpad)** — your
-triaged queue across both demo connections; press `Tab` (or `2`–`4`) for the per-type
-lists.
-
-Then run it for real. On first launch forgetop drops straight into the
-**add-connection wizard**:
+On first launch forgetop drops straight into the **add-connection wizard** — pick a
+provider, paste a token, and bind it to a section:
 
 ```sh
 forgetop
@@ -129,22 +123,25 @@ forgetop
   <sub>The first-run wizard: pick a provider, enter details, paste a token, bind a section.</sub>
 </div>
 
-The wizard stores your token in the OS keychain and binds the connection to a
-section. Press **`C`** any time to manage connections and bindings.
+The wizard stores your token in the OS keychain and binds the connection to a section.
+Press **`C`** any time to manage connections and bindings.
 
-If something isn't connecting, run `forgetop doctor` — it checks your config,
-keychain access, and each connection's token + connectivity.
+Want to look before setting anything up? `forgetop --demo` runs the whole dashboard on
+canned data — nothing is written.
+
+If something isn't connecting, run `forgetop doctor` — it checks your config, keychain
+access, and each connection's token + connectivity.
 
 ## Documentation
 
 forgetop shows a **context-aware key glossary** along the bottom, so you rarely
 need a reference. The full docs live at **[magna-nz.github.io/forgetop](https://magna-nz.github.io/forgetop/)**:
 
-- [Launchpad](https://magna-nz.github.io/forgetop/#launchpad) - the cross-provider action inbox
-- [Keybindings](https://magna-nz.github.io/forgetop/#keybindings) - every key, per screen
-- [Configuration &amp; tokens](https://magna-nz.github.io/forgetop/#configuration) - config paths, keychain, token scopes per provider
+- [Launchpad](https://magna-nz.github.io/forgetop/#launchpad) — the cross-provider action inbox
+- [Keybindings](https://magna-nz.github.io/forgetop/#keybindings) — every key, per screen
+- [Configuration &amp; tokens](https://magna-nz.github.io/forgetop/#configuration) — config paths, keychain, token scopes per provider
 - [Themes](https://magna-nz.github.io/forgetop/#themes)
-- [How it works](https://magna-nz.github.io/forgetop/#how-it-works) - architecture
+- [How it works](https://magna-nz.github.io/forgetop/#how-it-works) — architecture
 
 ## Contributing
 
