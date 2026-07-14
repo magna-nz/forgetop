@@ -32,11 +32,12 @@ const ANIM_MS: u64 = 150;
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
 /// Set up the terminal, run the loop against `deps`, and always restore the terminal.
-pub async fn run(deps: AppDeps, theme_name: &str) -> Result<()> {
+pub async fn run(deps: AppDeps, theme_name: &str, dashboard_url: Option<String>) -> Result<()> {
     install_panic_hook();
     let mut terminal = setup_terminal().map_err(forgetop_core::Error::from)?;
 
     let mut app = App::new(theme_name);
+    app.dashboard_url = dashboard_url;
     app.apply_hidden_sections(&deps.config.snapshot().ui.hidden_sections);
     app.apply_hidden_work_item_states(&deps.config.snapshot().ui.hidden_work_item_states);
     {
