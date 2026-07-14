@@ -81,10 +81,13 @@ async fn serves_json_and_enforces_the_session_token() {
         assert!(r.json::<serde_json::Value>().await.unwrap().is_array(), "{path} returns an array");
     }
 
-    // The placeholder page loads with the token.
-    let r = client.get(format!("{base}/?t={}", server.token)).send().await.unwrap();
+    // The SPA shell is served openly (only the API is token-gated) — an unknown route
+    // falls back to index.html so client-side routing survives a refresh.
+    let r = client.get(format!("{base}/pipelines")).send().await.unwrap();
     assert_eq!(r.status(), 200);
-    assert!(r.text().await.unwrap().contains("forgetop dashboard"));
+    let ct = r.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+    assert!(ct.contains("text/html"), "index served as html, got {ct}");
+    assert!(r.text().await.unwrap().contains("forgetop"), "shell mentions forgetop");
 }
 
 #[tokio::test]
