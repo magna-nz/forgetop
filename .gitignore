@@ -23,3 +23,7 @@ Thumbs.db
 # Internal working notes (kept local, not published)
 /SPEC.md
 /STATUS.md
+
+# Dashboard SPA build artifacts (rebuilt by forgetop-server/build.rs)
+crates/forgetop-server/web/node_modules/
+crates/forgetop-server/web/dist/

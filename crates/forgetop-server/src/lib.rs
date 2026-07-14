@@ -8,14 +8,20 @@ use std::net::Ipv4Addr;
 use std::sync::Arc;
 
 use axum::extract::{Request, State};
-use axum::http::StatusCode;
+use axum::http::{header, StatusCode, Uri};
 use axum::middleware::{self, Next};
-use axum::response::{Html, IntoResponse, Json, Response};
+use axum::response::{IntoResponse, Json, Response};
 use axum::routing::get;
 use axum::Router;
 use forgetop_core::service::{ConnectionHealthService, SectionService};
+use rust_embed::RustEmbed;
 
 mod dto;
+
+/// The built dashboard SPA, baked into the binary at compile time (see `build.rs`).
+#[derive(RustEmbed)]
+#[folder = "web/dist"]
+struct Assets;
 
 /// Default dashboard port. `0` lets the OS pick a free one.
 pub const DEFAULT_PORT: u16 = 8177;
@@ -69,15 +75,35 @@ pub async fn serve_blocking(deps: Deps, port: u16, on_ready: impl FnOnce(&str)) 
 }
 
 fn router(state: AppState) -> Router {
-    Router::new()
-        .route("/", get(index))
+    // The API carries your data and can act on your behalf, so it's token-gated. The static
+    // SPA (HTML/JS/CSS) is just code — not secret — so it's served openly; the browser gets
+    // the token from the `/?t=` URL and replays it on every API call.
+    let api = Router::new()
         .route("/api/health", get(health))
         .route("/api/pull-requests", get(pull_requests))
         .route("/api/work-items", get(work_items))
         .route("/api/pipelines", get(pipelines))
         .route("/api/notifications", get(notifications))
         .layer(middleware::from_fn_with_state(state.clone(), auth))
-        .with_state(state)
+        .with_state(state);
+
+    Router::new().merge(api).fallback(static_asset)
+}
+
+/// Serves an embedded SPA asset by path, falling back to `index.html` for unknown routes so
+/// client-side routing works on refresh/deep-link.
+async fn static_asset(uri: Uri) -> Response {
+    let path = uri.path().trim_start_matches('/');
+    let path = if path.is_empty() { "index.html" } else { path };
+    serve(path)
+        .or_else(|| serve("index.html"))
+        .unwrap_or_else(|| (StatusCode::NOT_FOUND, "not found").into_response())
+}
+
+fn serve(path: &str) -> Option<Response> {
+    let file = Assets::get(path)?;
+    let mime = mime_guess::from_path(path).first_or_octet_stream();
+    Some(([(header::CONTENT_TYPE, mime.as_ref().to_string())], file.data).into_response())
 }
 
 /// Session-token gate. The browser opens `/?t=<token>`; other calls may send it as the
@@ -100,9 +126,6 @@ fn token_from(req: &Request) -> Option<String> {
         .and_then(|q| q.split('&').find_map(|pair| pair.strip_prefix("t=").map(str::to_string)))
 }
 
-async fn index() -> Html<&'static str> {
-    Html(PLACEHOLDER)
-}
 async fn health(State(s): State<AppState>) -> Json<Vec<dto::HealthRow>> {
     Json(dto::health(&s.deps.health).await)
 }
@@ -118,31 +141,3 @@ async fn pipelines(State(s): State<AppState>) -> Json<Vec<dto::PipeRow>> {
 async fn notifications(State(s): State<AppState>) -> Json<Vec<dto::NotifRow>> {
     Json(dto::notifications(&s.deps.sections).await)
 }
-
-const PLACEHOLDER: &str = r#"<!doctype html>
-<html><head><meta charset="utf-8"><title>forgetop dashboard</title>
-<style>
-  body{font-family:ui-monospace,"SF Mono",Menlo,monospace;background:#12151b;color:#e6e9ef;max-width:760px;margin:48px auto;padding:0 20px;line-height:1.6}
-  h1{color:#6fb0ff;font-weight:600} code{background:#1b2027;padding:2px 6px;border-radius:5px;color:#e6e9ef}
-  a{color:#6bd39a;text-decoration:none} a:hover{text-decoration:underline}
-  .dim{color:#8b95a5} .ok{color:#6bd39a} ul{padding-left:20px}
-</style></head><body>
-  <h1>&#9727; forgetop dashboard</h1>
-  <p class="dim">Wave 1 &mdash; the server is up. The React app arrives in wave 2.</p>
-  <p>Read-only API (send <code>?t=&lt;token&gt;</code> or the <code>x-forgetop-token</code> header):</p>
-  <ul>
-    <li><a>/api/health</a></li>
-    <li><a>/api/pull-requests</a></li>
-    <li><a>/api/work-items</a></li>
-    <li><a>/api/pipelines</a></li>
-    <li><a>/api/notifications</a></li>
-  </ul>
-  <p>Live check: <span id="probe" class="dim">probing&hellip;</span></p>
-  <script>
-    const t = new URLSearchParams(location.search).get('t') || '';
-    for (const a of document.querySelectorAll('ul a')) a.href = a.textContent + '?t=' + t;
-    fetch('/api/health?t=' + t).then(r => r.json()).then(h => {
-      document.getElementById('probe').innerHTML = '<span class="ok">/api/health OK</span> — ' + h.length + ' connection(s)';
-    }).catch(e => { document.getElementById('probe').textContent = 'probe failed: ' + e; });
-  </script>
-</body></html>"#;
