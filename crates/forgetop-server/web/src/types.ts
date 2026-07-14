@@ -143,4 +143,21 @@ export interface HealthRow {
   healthy: boolean;
 }
 
-export type SectionId = "prs" | "work-items" | "pipelines" | "notifications";
+interface LaunchpadBase {
+  bucket: string;
+  bucket_title: string;
+  column: number;
+  muted: boolean;
+  connection_id: string;
+  connection: string;
+  provider: ProviderType;
+}
+
+export type LaunchpadRow = LaunchpadBase &
+  (
+    | { kind: "pr"; pull_request: PullRequest }
+    | { kind: "wi"; work_item: WorkItem }
+    | { kind: "pipe"; run: PipelineRun; definition_name?: string | null }
+  );
+
+export type SectionId = "launchpad" | "prs" | "work-items" | "pipelines" | "notifications";

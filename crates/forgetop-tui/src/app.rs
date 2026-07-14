@@ -3328,11 +3328,7 @@ impl Notifier for SystemNotifier {
 }
 
 /// (approved, changes-requested) rollup from a PR's reviewer votes.
-pub(crate) fn pr_vote_flags(pr: &PullRequest) -> (bool, bool) {
-    let approved = pr.reviewers.iter().any(|r| matches!(r.vote, ReviewVote::Approved | ReviewVote::ApprovedWithSuggestions));
-    let changes = pr.reviewers.iter().any(|r| matches!(r.vote, ReviewVote::Rejected));
-    (approved, changes)
-}
+pub(crate) use forgetop_core::launchpad::pr_vote_flags;
 
 /// Which vote states newly flipped on since last scan: (newly approved, newly changes).
 fn pr_review_transitions(prev: Option<(bool, bool)>, pr: &PullRequest) -> (bool, bool) {

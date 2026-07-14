@@ -3,13 +3,14 @@ import { AnimatePresence, motion } from "framer-motion";
 import type { SectionId } from "../types";
 
 const META: Record<SectionId, { title: string; subtitle: string }> = {
+  launchpad: { title: "Launchpad", subtitle: "Everything triaged by what needs you first — review, ship, fix, then your work." },
   prs: { title: "Pull Requests", subtitle: "Open PRs you author or are asked to review, across every connection." },
   "work-items": { title: "Work Items", subtitle: "Issues and tickets currently assigned to you." },
   pipelines: { title: "Pipelines", subtitle: "Recent CI runs across your repositories." },
   notifications: { title: "Notifications", subtitle: "Review requests, mentions, and CI failures." },
 };
 
-export function TopBar({ section }: { section: SectionId }) {
+export function TopBar({ section, onOpenPalette }: { section: SectionId; onOpenPalette: () => void }) {
   const meta = META[section];
   const fetching = useIsFetching() > 0;
   const qc = useQueryClient();
@@ -43,6 +44,19 @@ export function TopBar({ section }: { section: SectionId }) {
             </motion.span>
           )}
         </AnimatePresence>
+        <button
+          onClick={onOpenPalette}
+          title="Command palette (⌘K)"
+          className="flex items-center gap-2 rounded-md px-2.5 py-1 text-xs transition-colors"
+          style={{ color: "var(--dim)", border: "1px solid var(--border)", background: "var(--panel2)" }}
+          onMouseEnter={(e) => (e.currentTarget.style.color = "var(--fg)")}
+          onMouseLeave={(e) => (e.currentTarget.style.color = "var(--dim)")}
+        >
+          <span>Search</span>
+          <kbd className="mono rounded px-1" style={{ background: "var(--bg)", border: "1px solid var(--border)" }}>
+            ⌘K
+          </kbd>
+        </button>
         <button
           onClick={() => qc.invalidateQueries()}
           title="Refresh now"

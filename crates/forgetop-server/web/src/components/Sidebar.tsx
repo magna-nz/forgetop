@@ -1,8 +1,9 @@
 import { motion } from "framer-motion";
-import { useHealth, useNotifications, usePipelines, usePullRequests, useWorkItems } from "../api";
+import { useHealth, useLaunchpad, useNotifications, usePipelines, usePullRequests, useWorkItems } from "../api";
 import type { SectionId } from "../types";
 
 const NAV: { id: SectionId; label: string; icon: string }[] = [
+  { id: "launchpad", label: "Launchpad", icon: "✦" },
   { id: "prs", label: "Pull Requests", icon: "⇄" },
   { id: "work-items", label: "Work Items", icon: "◧" },
   { id: "pipelines", label: "Pipelines", icon: "⛓" },
@@ -10,6 +11,7 @@ const NAV: { id: SectionId; label: string; icon: string }[] = [
 ];
 
 export function Sidebar({ section, onSelect }: { section: SectionId; onSelect: (s: SectionId) => void }) {
+  const lp = useLaunchpad();
   const prs = usePullRequests();
   const wis = useWorkItems();
   const pipes = usePipelines();
@@ -17,6 +19,8 @@ export function Sidebar({ section, onSelect }: { section: SectionId; onSelect: (
   const health = useHealth();
 
   const counts: Record<SectionId, number | undefined> = {
+    // Launchpad badge counts only actionable (non-muted) items — things truly waiting on you.
+    launchpad: lp.data?.filter((r) => !r.muted).length,
     prs: prs.data?.length,
     "work-items": wis.data?.length,
     pipelines: pipes.data?.length,
@@ -68,8 +72,8 @@ export function Sidebar({ section, onSelect }: { section: SectionId; onSelect: (
                 <span
                   className="relative z-10 mono rounded-full px-1.5 text-xs"
                   style={{
-                    background: item.id === "notifications" ? "var(--accent)" : "var(--panel2)",
-                    color: item.id === "notifications" ? "#10233b" : "var(--dim)",
+                    background: item.id === "notifications" || item.id === "launchpad" ? "var(--accent)" : "var(--panel2)",
+                    color: item.id === "notifications" || item.id === "launchpad" ? "#10233b" : "var(--dim)",
                   }}
                 >
                   {count}
