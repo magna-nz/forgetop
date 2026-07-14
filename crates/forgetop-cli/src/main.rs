@@ -59,22 +59,43 @@ async fn run() -> Result<()> {
         return doctor(&config, &secrets, &resolver).await;
     }
 
-    if !std::io::stdout().is_terminal() {
-        eprintln!("forgetop needs an interactive terminal (TTY) to run the dashboard.");
-        eprintln!("Tip: run `forgetop doctor` to check your connections.");
-        return Ok(());
-    }
-
     if demo {
         seed_demo(&config).await?;
     }
 
     let sections = Arc::new(SectionService::new(config.clone(), resolver.clone()));
     let health = Arc::new(ConnectionHealthService::new(config.clone(), resolver));
+    let server_deps = forgetop_server::Deps { sections: sections.clone(), health: health.clone() };
+
+    // `forgetop --dashboard`: run the web UI only (headless) — no TUI, so no TTY needed.
+    if args.iter().any(|a| a == "--dashboard") {
+        return forgetop_server::serve_blocking(server_deps, forgetop_server::DEFAULT_PORT, |url| {
+            println!("forgetop dashboard: {url}\n(Ctrl-C to stop)");
+            let _ = open::that(url);
+        })
+        .await
+        .map_err(forgetop_core::Error::from);
+    }
+
+    if !std::io::stdout().is_terminal() {
+        eprintln!("forgetop needs an interactive terminal (TTY) to run the dashboard.");
+        eprintln!("Tip: run `forgetop --dashboard` for the browser UI, or `forgetop doctor` to check connections.");
+        return Ok(());
+    }
+
+    // Start the dashboard server in the background — best-effort, so a bind failure never
+    // takes down the TUI. `B` in the TUI opens the URL.
+    let dashboard_url = match forgetop_server::spawn(server_deps, forgetop_server::DEFAULT_PORT).await {
+        Ok(server) => Some(server.url),
+        Err(e) => {
+            forgetop_core::diag::log("dashboard", &format!("server failed to start: {e}"));
+            None
+        }
+    };
 
     let theme = config.snapshot().ui.theme.clone().unwrap_or_else(|| "slate".into());
     let deps = AppDeps { sections, health, config };
-    forgetop_tui::run(deps, &theme).await
+    forgetop_tui::run(deps, &theme, dashboard_url).await
 }
 
 /// Diagnostic (`forgetop doctor`): config location, keychain access, and per-connection
@@ -136,16 +157,18 @@ fn print_help() {
 Keyboard-driven terminal UI for pull requests, work items, and CI across six forges.
 
 Usage:
-  forgetop            Launch the dashboard
+  forgetop            Launch the TUI (also serves the web dashboard in the background)
+  forgetop --dashboard  Serve the web dashboard and open it in the browser (no TUI)
   forgetop --demo     Launch with built-in demo data (no setup)
   forgetop doctor     Diagnose config, keychain access, and connection health
 
 Options:
+  --dashboard         Run the browser dashboard only (headless)
   -d, --demo          Run against built-in demo data
   -V, --version       Print version and exit
   -h, --help          Show this help and exit
 
-Inside the app, press `?` for every keybinding.
+Inside the app, press `?` for every keybinding, or `B` to open the web dashboard.
 Docs: https://magna-nz.github.io/forgetop/"#,
         version = env!("CARGO_PKG_VERSION")
     );

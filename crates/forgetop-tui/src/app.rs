@@ -136,6 +136,8 @@ pub struct App {
     /// The cross-provider notification inbox (distinct from `notifications`, the desktop-ping prefs).
     pub inbox: Vec<NotifRow>,
     pub inbox_sel: usize,
+    /// URL of the embedded web dashboard, if its server started. `B` opens it.
+    pub dashboard_url: Option<String>,
     pub pr_state: TableState,
     pub wi_state: TableState,
     pub pipe_state: TableState,
@@ -642,6 +644,7 @@ impl App {
             pipes: Vec::new(),
             inbox: Vec::new(),
             inbox_sel: 0,
+            dashboard_url: None,
             pr_state: TableState::default(),
             wi_state: TableState::default(),
             pipe_state: TableState::default(),
@@ -1303,6 +1306,17 @@ impl App {
 
     // ---- notification inbox ----
 
+    /// Open the web dashboard in the browser, if its server is running.
+    fn open_dashboard(&mut self) {
+        self.toast = Some(match &self.dashboard_url {
+            Some(url) => match open::that(url) {
+                Ok(_) => "Opening dashboard in your browser…".into(),
+                Err(e) => format!("Couldn't open dashboard: {e}"),
+            },
+            None => "Dashboard server isn't running".into(),
+        });
+    }
+
     /// Number of unread notifications — drives the header indicator.
     pub fn unread_count(&self) -> usize {
         self.inbox.iter().filter(|r| r.notification.unread).count()
@@ -1715,6 +1729,11 @@ impl App {
         if key == Key::Char('i') && matches!(self.screen, Screen::List | Screen::Launchpad) {
             self.inbox_sel = self.inbox_sel.min(self.inbox.len().saturating_sub(1));
             self.screen = Screen::Inbox;
+            return;
+        }
+        // `B` opens the web dashboard in the browser (available from anywhere).
+        if key == Key::Char('B') {
+            self.open_dashboard();
             return;
         }
 
