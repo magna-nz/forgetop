@@ -113,4 +113,11 @@ async fn seeded_demo_data_reaches_the_api() {
     // Health reflects the two seeded connections.
     let health = get("/api/health").await;
     assert_eq!(health.as_array().unwrap().len(), 2);
+
+    // The launchpad aggregates across sections and tags each row with a triage bucket.
+    let lp = get("/api/launchpad").await;
+    let rows = lp.as_array().expect("launchpad is an array");
+    assert!(!rows.is_empty(), "launchpad returns triaged rows");
+    assert!(rows[0]["bucket"].is_string(), "row carries a bucket key");
+    assert!(rows[0]["kind"].is_string(), "row carries an item kind (flattened)");
 }

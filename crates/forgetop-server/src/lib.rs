@@ -84,6 +84,7 @@ fn router(state: AppState) -> Router {
         .route("/api/work-items", get(work_items))
         .route("/api/pipelines", get(pipelines))
         .route("/api/notifications", get(notifications))
+        .route("/api/launchpad", get(launchpad))
         .layer(middleware::from_fn_with_state(state.clone(), auth))
         .with_state(state);
 
@@ -140,4 +141,7 @@ async fn pipelines(State(s): State<AppState>) -> Json<Vec<dto::PipeRow>> {
 }
 async fn notifications(State(s): State<AppState>) -> Json<Vec<dto::NotifRow>> {
     Json(dto::notifications(&s.deps.sections).await)
+}
+async fn launchpad(State(s): State<AppState>) -> Json<Vec<dto::LaunchpadRow>> {
+    Json(dto::launchpad(&s.deps.sections).await)
 }
