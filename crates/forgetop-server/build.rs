@@ -3,8 +3,11 @@
 //! `rust-embed` bakes `web/dist` into the binary, so that folder must exist and — for a real
 //! release — hold the built app. This script runs `npm` to produce it when Node is available,
 //! and otherwise drops a placeholder so `cargo build` still succeeds for Rust-only contributors.
-//! A frontend build failure is a *warning*, never a hard error, so the backend never gets
-//! blocked by a broken `node_modules`. CI builds the SPA in its own step where failures are fatal.
+//!
+//! Locally a frontend build failure is a *warning* (the backend never gets blocked by a broken
+//! `node_modules`). **Under CI** (`CI` env set), it's a hard error instead — a release must never
+//! silently ship the placeholder. Set `FORGETOP_SKIP_WEB_BUILD=1` to skip npm entirely and embed
+//! whatever is already in `web/dist` (used by CI after a dedicated SPA build step).
 
 use std::path::Path;
 use std::process::Command;
@@ -22,25 +25,35 @@ fn main() {
 
     let has_web = web.join("package.json").exists();
     let skip = std::env::var_os("FORGETOP_SKIP_WEB_BUILD").is_some();
+    let ci = std::env::var_os("CI").is_some();
 
-    if has_web && !skip && which_npm() {
-        if !web.join("node_modules").exists() {
-            run(Command::new("npm").arg("ci").current_dir(web), "npm ci");
+    if has_web && !skip {
+        if which_npm() {
+            if !web.join("node_modules").exists() {
+                run(Command::new("npm").arg("ci").current_dir(web), "npm ci", ci);
+            }
+            run(
+                Command::new("npm")
+                    .args(["run", "build"])
+                    .env("FORGETOP_VERSION", env!("CARGO_PKG_VERSION"))
+                    .current_dir(web),
+                "npm run build",
+                ci,
+            );
+        } else if ci {
+            panic!("Node/npm is required to build the dashboard SPA under CI, but `npm` was not found on PATH");
+        } else {
+            println!("cargo:warning=npm not found — embedding a placeholder dashboard. Install Node to build the real SPA.");
         }
-        run(
-            Command::new("npm")
-                .args(["run", "build"])
-                .env("FORGETOP_VERSION", env!("CARGO_PKG_VERSION"))
-                .current_dir(web),
-            "npm run build",
-        );
-    } else if has_web && !skip {
-        println!("cargo:warning=npm not found — embedding a placeholder dashboard. Install Node to build the real SPA.");
     }
 
     // rust-embed needs the folder to exist at macro-expansion time; guarantee it, and give the
-    // server *something* to serve if the SPA wasn't built.
+    // server *something* to serve if the SPA wasn't built. Under CI a missing real build is a
+    // failure, not a placeholder — we'd rather fail the release than ship a broken dashboard.
     if !dist.join("index.html").exists() {
+        if ci && !skip {
+            panic!("web/dist/index.html is missing after the SPA build — refusing to embed a placeholder in CI");
+        }
         std::fs::create_dir_all(&dist).expect("create web/dist");
         std::fs::write(dist.join("index.html"), PLACEHOLDER).expect("write placeholder index.html");
     }
@@ -50,12 +63,16 @@ fn which_npm() -> bool {
     Command::new("npm").arg("--version").output().map(|o| o.status.success()).unwrap_or(false)
 }
 
-fn run(cmd: &mut Command, label: &str) {
-    match cmd.status() {
-        Ok(s) if s.success() => {}
-        Ok(s) => println!("cargo:warning=`{label}` exited with {s}; embedding whatever is in web/dist."),
-        Err(e) => println!("cargo:warning=failed to run `{label}`: {e}"),
+fn run(cmd: &mut Command, label: &str, fatal: bool) {
+    let outcome = match cmd.status() {
+        Ok(s) if s.success() => return,
+        Ok(s) => format!("`{label}` exited with {s}"),
+        Err(e) => format!("failed to run `{label}`: {e}"),
+    };
+    if fatal {
+        panic!("{outcome}");
     }
+    println!("cargo:warning={outcome}; embedding whatever is in web/dist.");
 }
 
 const PLACEHOLDER: &str = r#"<!doctype html><html><head><meta charset="utf-8"><title>forgetop dashboard</title>

@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import { useNotifications, usePipelines, usePullRequests, useWorkItems } from "../api";
+import { usePrOpener } from "./PrDetail";
 import type { SectionId } from "../types";
 
 interface Command {
@@ -58,6 +59,7 @@ export function CommandPalette({
   const wis = useWorkItems();
   const pipes = usePipelines();
   const notifs = useNotifications();
+  const openPr = usePrOpener();
 
   const commands = useMemo<Command[]>(() => {
     const go = (s: SectionId) => () => {
@@ -81,7 +83,11 @@ export function CommandPalette({
       label: r.pull_request.title,
       sublabel: `PR${r.pull_request.number != null ? " #" + r.pull_request.number : ""} · ${r.connection}`,
       icon: "⇄",
-      run: openUrl(r.pull_request.url, "prs"),
+      // PRs open the in-app detail (with the diff + review), like clicking a PR row.
+      run: () => {
+        openPr({ conn: r.connection_id, id: r.pull_request.id });
+        onClose();
+      },
     }));
     const wiItems: Command[] = (wis.data ?? []).map((r) => ({
       id: `wi:${r.connection_id}:${r.work_item.id}`,
@@ -105,7 +111,7 @@ export function CommandPalette({
       run: openUrl(r.notification.url, "notifications"),
     }));
     return [...nav, ...prItems, ...wiItems, ...pipeItems, ...notifItems];
-  }, [prs.data, wis.data, pipes.data, notifs.data, onNavigate, onClose]);
+  }, [prs.data, wis.data, pipes.data, notifs.data, onNavigate, onClose, openPr]);
 
   const results = useMemo(() => {
     if (!query.trim()) return commands.slice(0, 8);

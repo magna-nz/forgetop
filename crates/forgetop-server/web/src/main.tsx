@@ -2,7 +2,10 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import App from "./App";
+import { initTheme } from "./theme";
 import "./index.css";
+
+initTheme();
 
 // Live-ish data: poll on an interval and on focus, matching the TUI's 30s refresh but
 // snappier for a foreground browser tab.

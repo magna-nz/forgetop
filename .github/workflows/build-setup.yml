@@ -1,0 +1,9 @@
+# Extra steps injected into cargo-dist's build job (via `github-build-setup` in
+# dist-workspace.toml). Makes Node available so forgetop-server's build.rs can build the
+# embedded dashboard SPA on every release runner. Re-run `dist generate` after editing.
+- name: Set up Node for the dashboard SPA
+  uses: actions/setup-node@v4
+  with:
+    node-version: 20
+    cache: npm
+    cache-dependency-path: crates/forgetop-server/web/package-lock.json
