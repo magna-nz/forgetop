@@ -1073,7 +1073,7 @@ fn base_footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
         return overlay.hint();
     }
     if matches!(app.screen, Screen::Launchpad) {
-        return vec![("↑↓", "move"), ("←→", "columns"), ("↵", "open"), ("Tab", "sections"), ("r", "refresh"), ("?", "help"), ("q", "quit")];
+        return vec![("↑↓", "move"), ("←→", "columns"), ("↵", "open"), ("Tab", "sections"), ("r", "refresh"), (",", "settings"), ("?", "help"), ("q", "quit")];
     }
     if let Screen::PrView(v) = &app.screen {
         return if v.tab == 3 {
@@ -1134,7 +1134,7 @@ fn base_footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
     }
     keys.push(("V", "save view"));
     keys.push(("/", "find"));
-    keys.extend([("v", "tabs"), ("C", "connections"), ("r", "refresh"), ("t", "theme"), ("?", "help"), ("q", "quit")]);
+    keys.extend([(",", "settings"), ("v", "tabs"), ("C", "connections"), ("r", "refresh"), ("t", "theme"), ("?", "help"), ("q", "quit")]);
     keys
 }
 
@@ -1969,9 +1969,9 @@ fn help_sections() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
                 ("/", "Quick-filter the list"),
                 ("S", "Sort by column (re-pick flips direction)"),
                 ("o", "Open selected in browser"),
-                ("n", "Add a connection (wizard)"),
+                (",", "Settings — what forgetop opens on launch"),
                 ("v", "Choose which tabs are visible"),
-                ("C", "Config / connections"),
+                ("C", "Connections (opens the dashboard)"),
                 ("r", "Refresh    t  cycle theme"),
                 ("N", "Notifications — choose which events ping you"),
                 ("?", "This help"),

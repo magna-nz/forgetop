@@ -5,7 +5,7 @@ use std::io::IsTerminal;
 use std::sync::Arc;
 
 use forgetop_core::config::{
-    default_config_path, ConfigStore, ForgetopConfig, InMemoryConfigStore, JsonConfigStore,
+    default_config_path, ConfigStore, ForgetopConfig, InMemoryConfigStore, JsonConfigStore, StartupMode,
 };
 use forgetop_core::domain::ProviderType;
 use forgetop_core::provider::{Connection, ProviderRegistry};
@@ -72,8 +72,11 @@ async fn run() -> Result<()> {
         secrets: secrets.clone(),
     };
 
-    // `forgetop --dashboard`: run the web UI only (headless) — no TUI, so no TTY needed.
-    if args.iter().any(|a| a == "--dashboard") {
+    // Dashboard-only: `forgetop --dashboard`, or the saved startup preference. Runs the web UI
+    // headless (no TUI, so no TTY needed).
+    let startup_mode = StartupMode::effective(config.snapshot().ui.startup_mode);
+    let dashboard_only = args.iter().any(|a| a == "--dashboard") || startup_mode == StartupMode::DashboardOnly;
+    if dashboard_only {
         return forgetop_server::serve_blocking(server_deps, forgetop_server::DEFAULT_PORT, |url| {
             println!("forgetop dashboard: {url}\n(Ctrl-C to stop)");
             let _ = open::that(url);
@@ -179,6 +182,10 @@ Options:
   -d, --demo          Run against built-in demo data
   -V, --version       Print version and exit
   -h, --help          Show this help and exit
+
+Environment:
+  FORGETOP_STARTUP    Override what opens on launch for this run — one of
+                      `both`, `terminal_only`, `dashboard_only` (handy with --demo).
 
 Inside the app, press `?` for every keybinding, or `B` to open the web dashboard.
 Docs: https://magna-nz.github.io/forgetop/"#,

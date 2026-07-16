@@ -67,10 +67,43 @@ pub struct PipelineBinding {
     pub subscriptions: Vec<PipelineSubscription>,
 }
 
+/// What `forgetop` launches when run with no flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StartupMode {
+    /// The terminal UI only. The dashboard server still runs in the background, so `B` opens it.
+    TerminalOnly,
+    /// The web dashboard only (no terminal UI) — like `forgetop --dashboard`.
+    DashboardOnly,
+    /// Both: the terminal UI, plus the dashboard opened in the browser.
+    #[default]
+    Both,
+}
+
+impl StartupMode {
+    /// The mode to actually launch with: the `FORGETOP_STARTUP` env var wins when set (a one-off
+    /// override, handy for `--demo` where nothing persists), otherwise the stored preference.
+    pub fn effective(stored: StartupMode) -> StartupMode {
+        Self::effective_from(stored, std::env::var("FORGETOP_STARTUP").ok().as_deref())
+    }
+
+    fn effective_from(stored: StartupMode, env: Option<&str>) -> StartupMode {
+        match env.map(str::trim) {
+            Some("terminal_only" | "terminal") => StartupMode::TerminalOnly,
+            Some("dashboard_only" | "dashboard") => StartupMode::DashboardOnly,
+            Some("both") => StartupMode::Both,
+            _ => stored,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UiState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub theme: Option<String>,
+    /// What `forgetop` opens on launch. Defaults to both the terminal UI and the dashboard.
+    #[serde(default)]
+    pub startup_mode: StartupMode,
     #[serde(default)]
     pub active_section: Section,
     /// Sections the user has hidden from the tab bar.
@@ -275,6 +308,16 @@ impl ConfigStore for InMemoryConfigStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_mode_env_overrides_the_stored_preference() {
+        // No/unknown env → stored preference wins.
+        assert_eq!(StartupMode::effective_from(StartupMode::TerminalOnly, None), StartupMode::TerminalOnly);
+        assert_eq!(StartupMode::effective_from(StartupMode::Both, Some("nonsense")), StartupMode::Both);
+        // A valid env var wins over the stored value (both spellings).
+        assert_eq!(StartupMode::effective_from(StartupMode::Both, Some("terminal_only")), StartupMode::TerminalOnly);
+        assert_eq!(StartupMode::effective_from(StartupMode::Both, Some(" dashboard ")), StartupMode::DashboardOnly);
+    }
 
     #[test]
     fn binding_ids_merge_legacy_and_dedup() {

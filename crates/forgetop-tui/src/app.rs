@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::{DateTime, Local, Utc};
-use forgetop_core::config::{NotificationPrefs, SavedView, SortPref};
+use forgetop_core::config::{NotificationPrefs, SavedView, SortPref, StartupMode};
 use forgetop_core::domain::*;
 use forgetop_core::provider::*;
 use forgetop_core::service::{ConfigService, ConnectionHealth, ConnectionHealthService, SectionService};
@@ -1080,6 +1080,21 @@ impl App {
         });
     }
 
+    /// Settings: choose what `forgetop` opens on launch (shared with the dashboard).
+    fn open_startup_picker(&mut self, deps: &AppDeps) {
+        let selected = match deps.config.snapshot().ui.startup_mode {
+            StartupMode::Both => 0,
+            StartupMode::TerminalOnly => 1,
+            StartupMode::DashboardOnly => 2,
+        };
+        self.overlay = Some(Overlay::Picker {
+            title: "When forgetop starts".into(),
+            items: vec!["Dashboard + terminal (default)".into(), "Terminal only".into(), "Dashboard only".into()],
+            selected,
+            kind: PickerKind::StartupMode,
+        });
+    }
+
     /// Applies a chosen sort column: same column toggles direction, a new column
     /// starts at its sensible default direction. Persists the choice.
     async fn apply_sort(&mut self, section: usize, index: usize, deps: &AppDeps) {
@@ -1213,6 +1228,7 @@ impl App {
             Key::Enter => self.open_launchpad_selected(deps).await,
             Key::Char('r') => self.request_reload(deps),
             Key::Char('C') => self.open_connections(deps).await,
+            Key::Char(',') => self.open_startup_picker(deps),
             Key::Char('t') => {
                 let next = Theme::next(self.theme.name);
                 self.theme = Theme::by_name(next);
@@ -1306,7 +1322,7 @@ impl App {
     // ---- notification inbox ----
 
     /// Open the web dashboard in the browser, if its server is running.
-    fn open_dashboard(&mut self) {
+    pub fn open_dashboard(&mut self) {
         self.open_dashboard_at("");
     }
 
@@ -2267,6 +2283,7 @@ impl App {
             'o' => self.open_selected(),
             'v' => self.open_sections_toggle(),
             'C' => self.open_connections(deps).await,
+            ',' => self.open_startup_picker(deps),
             // Saved views: previous / next on the active section; save / delete.
             '[' => self.switch_view(-1, deps).await,
             ']' => self.switch_view(1, deps).await,
@@ -3103,6 +3120,13 @@ impl App {
             Action::OpenItem { kind, id, connection_id } => self.open_palette_item(kind, id, connection_id, deps).await,
             Action::OpenReviewMenu => self.open_review_submit(),
             Action::LeavePrView => self.screen = self.view_origin(),
+            Action::SetStartupMode(mode) => {
+                if let Err(e) = deps.config.set_startup_mode(mode).await {
+                    self.toast_error(format!("Couldn't save: {e}"));
+                } else {
+                    self.toast = Some(format!("Startup set to {}", startup_mode_label(mode)));
+                }
+            }
         }
     }
 
@@ -3351,6 +3375,14 @@ impl Notifier for SystemNotifier {
 
 /// (approved, changes-requested) rollup from a PR's reviewer votes.
 pub(crate) use forgetop_core::launchpad::pr_vote_flags;
+
+fn startup_mode_label(mode: StartupMode) -> &'static str {
+    match mode {
+        StartupMode::Both => "dashboard + terminal",
+        StartupMode::TerminalOnly => "terminal only",
+        StartupMode::DashboardOnly => "dashboard only",
+    }
+}
 
 /// Which vote states newly flipped on since last scan: (newly approved, newly changes).
 fn pr_review_transitions(prev: Option<(bool, bool)>, pr: &PullRequest) -> (bool, bool) {

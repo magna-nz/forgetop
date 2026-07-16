@@ -49,10 +49,15 @@ pub async fn run(deps: AppDeps, theme_name: &str, dashboard_url: Option<String>)
     app.reload_all(&deps).await;
 
     // First run — nothing configured, or no connection has a token yet: open the web dashboard
-    // for setup (connections are managed there now), rather than a terminal wizard.
+    // for setup (connections are managed there now), rather than a terminal wizard. Otherwise, on
+    // the "Both" startup preference (the default) open the dashboard alongside the TUI.
     let cfg = deps.config.snapshot();
     if cfg.connections.is_empty() || cfg.connections.iter().all(|c| c.credential_ref.is_none()) {
         app.start_setup();
+    } else if forgetop_core::config::StartupMode::effective(cfg.ui.startup_mode)
+        == forgetop_core::config::StartupMode::Both
+    {
+        app.open_dashboard();
     }
 
     let result = event_loop(&mut terminal, &mut app, &deps).await;

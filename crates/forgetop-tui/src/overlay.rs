@@ -2,6 +2,7 @@
 //! When an overlay is open, the app routes every key to it via [`Overlay::handle`]
 //! instead of the table, so there's no ambiguity between typing and navigation.
 
+use forgetop_core::config::StartupMode;
 use forgetop_core::domain::ReviewVote;
 use forgetop_core::provider::MergeStrategy;
 
@@ -42,6 +43,8 @@ pub enum Action {
     OpenReviewMenu,
     /// From the unsubmitted-comments prompt: leave the PR view, discarding pending comments.
     LeavePrView,
+    /// Set the startup preference (what `forgetop` opens on launch).
+    SetStartupMode(StartupMode),
 }
 
 /// What a [`Overlay::Toggle`] checklist is choosing.
@@ -81,6 +84,8 @@ pub enum PickerKind {
     ApprovalGate,
     /// Shown on Esc when line comments are buffered but unsubmitted: submit or leave.
     PendingExit,
+    /// Choose what `forgetop` opens on launch (a shared preference).
+    StartupMode,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -296,6 +301,14 @@ fn resolve_picker(kind: PickerKind, selected: usize, items: &[String]) -> Action
             0 => Action::OpenReviewMenu,
             _ => Action::LeavePrView,
         },
+        PickerKind::StartupMode => {
+            let mode = match selected {
+                1 => StartupMode::TerminalOnly,
+                2 => StartupMode::DashboardOnly,
+                _ => StartupMode::Both,
+            };
+            Action::SetStartupMode(mode)
+        }
     }
 }
 
@@ -379,6 +392,14 @@ mod tests {
     fn pending_exit_picker_maps_submit_and_leave() {
         assert!(matches!(resolve_picker(PickerKind::PendingExit, 0, &[]), Action::OpenReviewMenu));
         assert!(matches!(resolve_picker(PickerKind::PendingExit, 1, &[]), Action::LeavePrView));
+    }
+
+    #[test]
+    fn startup_picker_maps_each_mode() {
+        use forgetop_core::config::StartupMode::*;
+        assert!(matches!(resolve_picker(PickerKind::StartupMode, 0, &[]), Action::SetStartupMode(Both)));
+        assert!(matches!(resolve_picker(PickerKind::StartupMode, 1, &[]), Action::SetStartupMode(TerminalOnly)));
+        assert!(matches!(resolve_picker(PickerKind::StartupMode, 2, &[]), Action::SetStartupMode(DashboardOnly)));
     }
 
     #[test]
