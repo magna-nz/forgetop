@@ -1,10 +1,17 @@
 //! JSON shapes for the dashboard API, and the fetch functions that build them from the
 //! same `SectionService` the TUI uses. Read-only in wave 1.
 
+use std::sync::Arc;
+
 use forgetop_core::config::PipelineSubscription;
-use forgetop_core::domain::{Notification, PipelineRun, PipelineRunStatus, ProviderType, PullRequest, WorkItem};
+use forgetop_core::domain::{
+    CheckRun, CommentThread, Commit, FileChange, Notification, PipelineRun, PipelineRunStatus, ProviderType,
+    PullRequest, WorkItem,
+};
 use forgetop_core::launchpad::{self, EntryItem, PipeInput, PrInput, WiInput};
-use forgetop_core::provider::{PipelineRunQuery, PullRequestFilter, PullRequestQuery, WorkItemQuery};
+use forgetop_core::provider::{
+    PipelineRunQuery, PullRequestFilter, PullRequestQuery, PullRequestSource, WorkItemQuery,
+};
 use forgetop_core::service::{ConnectionHealthService, SectionService};
 use serde::Serialize;
 
@@ -262,6 +269,42 @@ pub async fn launchpad(sections: &SectionService) -> Vec<LaunchpadRow> {
             },
         })
         .collect()
+}
+
+// ---- pull request detail ----
+
+/// Everything the PR detail view needs, fetched in one shot.
+#[derive(Serialize)]
+pub struct PrDetail {
+    pub pull_request: PullRequest,
+    pub threads: Vec<CommentThread>,
+    pub changes: Vec<FileChange>,
+    pub checks: Vec<CheckRun>,
+    pub commits: Vec<Commit>,
+}
+
+/// Resolves the PR source for a connection id (the one the action/detail is scoped to).
+pub async fn pr_source(sections: &SectionService, conn: &str) -> Option<Arc<dyn PullRequestSource>> {
+    sections
+        .pull_request_feeds()
+        .await
+        .ok()?
+        .into_iter()
+        .find(|f| f.connection.connection_id() == conn)
+        .map(|f| f.source)
+}
+
+pub async fn pr_detail(sections: &SectionService, conn: &str, id: &str) -> Option<PrDetail> {
+    let source = pr_source(sections, conn).await?;
+    let pull_request = source.get(id).await.ok()?;
+    // The detail extras are best-effort: a provider that doesn't expose one just yields empties.
+    Some(PrDetail {
+        pull_request,
+        threads: source.threads(id).await.unwrap_or_default(),
+        changes: source.changes(id).await.unwrap_or_default(),
+        checks: source.checks(id).await.unwrap_or_default(),
+        commits: source.commits(id).await.unwrap_or_default(),
+    })
 }
 
 pub async fn health(svc: &ConnectionHealthService) -> Vec<HealthRow> {

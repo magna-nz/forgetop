@@ -7,15 +7,19 @@
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 
-use axum::extract::{Request, State};
+use axum::extract::{Query, Request, State};
 use axum::http::{header, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Json, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::Router;
 use forgetop_core::service::{ConnectionHealthService, SectionService};
 use rust_embed::RustEmbed;
+use serde::Deserialize;
 
+use crate::actions::ActionError;
+
+mod actions;
 mod dto;
 
 /// The built dashboard SPA, baked into the binary at compile time (see `build.rs`).
@@ -85,6 +89,16 @@ fn router(state: AppState) -> Router {
         .route("/api/pipelines", get(pipelines))
         .route("/api/notifications", get(notifications))
         .route("/api/launchpad", get(launchpad))
+        .route("/api/pr/detail", get(pr_detail))
+        .route("/api/pr/vote", post(pr_vote))
+        .route("/api/pr/merge", post(pr_merge))
+        .route("/api/pr/comment", post(pr_comment))
+        .route("/api/pr/review", post(pr_review))
+        .route("/api/wi/states", get(wi_states))
+        .route("/api/wi/state", post(wi_state))
+        .route("/api/pipeline/approval", post(pipeline_approval))
+        .route("/api/pipeline/trigger", post(pipeline_trigger))
+        .route("/api/notification/read", post(notification_read))
         .layer(middleware::from_fn_with_state(state.clone(), auth))
         .with_state(state);
 
@@ -144,4 +158,62 @@ async fn notifications(State(s): State<AppState>) -> Json<Vec<dto::NotifRow>> {
 }
 async fn launchpad(State(s): State<AppState>) -> Json<Vec<dto::LaunchpadRow>> {
     Json(dto::launchpad(&s.deps.sections).await)
+}
+
+/// Query params identifying an item within a connection (`?conn=…&id=…`).
+#[derive(Deserialize)]
+struct ItemQuery {
+    conn: String,
+    id: String,
+}
+
+/// Turns an action outcome into a response: `{ok:true}`, 404 (no such connection/capability),
+/// or 502 (the provider call failed).
+fn action_response(result: Result<(), ActionError>) -> Response {
+    match result {
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Err(ActionError::NotFound) => (StatusCode::NOT_FOUND, "connection or capability not found").into_response(),
+        Err(ActionError::Failed(msg)) => (StatusCode::BAD_GATEWAY, msg).into_response(),
+    }
+}
+
+async fn pr_detail(State(s): State<AppState>, Query(q): Query<ItemQuery>) -> Response {
+    match dto::pr_detail(&s.deps.sections, &q.conn, &q.id).await {
+        Some(detail) => Json(detail).into_response(),
+        None => (StatusCode::NOT_FOUND, "pull request not found").into_response(),
+    }
+}
+
+async fn pr_vote(State(s): State<AppState>, Json(req): Json<actions::PrVoteReq>) -> Response {
+    action_response(actions::pr_vote(&s.deps.sections, req).await)
+}
+async fn pr_merge(State(s): State<AppState>, Json(req): Json<actions::PrMergeReq>) -> Response {
+    action_response(actions::pr_merge(&s.deps.sections, req).await)
+}
+async fn pr_comment(State(s): State<AppState>, Json(req): Json<actions::PrCommentReq>) -> Response {
+    action_response(actions::pr_comment(&s.deps.sections, req).await)
+}
+async fn pr_review(State(s): State<AppState>, Json(req): Json<actions::PrReviewReq>) -> Response {
+    action_response(actions::pr_review(&s.deps.sections, req).await)
+}
+
+async fn wi_states(State(s): State<AppState>, Query(q): Query<ItemQuery>) -> Response {
+    match actions::wi_states(&s.deps.sections, &q.conn, &q.id).await {
+        Some(states) => Json(states).into_response(),
+        None => (StatusCode::NOT_FOUND, "work item connection not found").into_response(),
+    }
+}
+async fn wi_state(State(s): State<AppState>, Json(req): Json<actions::WiStateReq>) -> Response {
+    action_response(actions::wi_set_state(&s.deps.sections, req).await)
+}
+
+async fn pipeline_approval(State(s): State<AppState>, Json(req): Json<actions::PipelineApprovalReq>) -> Response {
+    action_response(actions::pipeline_approval(&s.deps.sections, req).await)
+}
+async fn pipeline_trigger(State(s): State<AppState>, Json(req): Json<actions::PipelineTriggerReq>) -> Response {
+    action_response(actions::pipeline_trigger(&s.deps.sections, req).await)
+}
+
+async fn notification_read(State(s): State<AppState>, Json(req): Json<actions::NotifReadReq>) -> Response {
+    action_response(actions::notif_read(&s.deps.sections, req).await)
 }
