@@ -1,4 +1,5 @@
-import { useQuery } from "@tanstack/react-query";
+import { useState } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import type { HealthRow, LaunchpadRow, NotifRow, PipeRow, PrDetail, PrRef, PrRow, WiRow } from "./types";
 
 // The session token arrives once in the URL (`/?t=…`). We stash it in sessionStorage (so a
@@ -30,6 +31,11 @@ async function api<T>(path: string): Promise<T> {
   return (await res.json()) as T;
 }
 
+/** GET a token-authenticated JSON endpoint (for lazy fetches outside the query cache). */
+export function apiGet<T>(path: string): Promise<T> {
+  return api<T>(path);
+}
+
 /** POST a JSON body to a write endpoint. Throws ApiError with the server's message on failure. */
 export async function apiPost<T = unknown>(path: string, body: unknown): Promise<T> {
   const res = await fetch(path, {
@@ -43,6 +49,28 @@ export async function apiPost<T = unknown>(path: string, body: unknown): Promise
   }
   const ct = res.headers.get("content-type") ?? "";
   return (ct.includes("application/json") ? await res.json() : undefined) as T;
+}
+
+/** A tiny mutation helper: POST a write, then invalidate the given query keys. */
+export function useWriteAction() {
+  const qc = useQueryClient();
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const run = async (path: string, body: unknown, invalidate: string[] = []): Promise<boolean> => {
+    setBusy(true);
+    setError(null);
+    try {
+      await apiPost(path, body);
+      invalidate.forEach((k) => qc.invalidateQueries({ queryKey: [k] }));
+      return true;
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      return false;
+    } finally {
+      setBusy(false);
+    }
+  };
+  return { busy, error, run };
 }
 
 export const usePrDetail = (ref: PrRef | null) =>

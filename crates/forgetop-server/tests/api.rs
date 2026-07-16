@@ -227,6 +227,20 @@ async fn work_item_pipeline_and_notification_writes() {
         .unwrap();
     assert_eq!(trig.status(), 200);
 
+    // The pipelines list surfaces the approval gate on the in-flight run, and we can respond to it.
+    let gate = pipes
+        .as_array()
+        .unwrap()
+        .iter()
+        .find_map(|p| p["approvals"].as_array().and_then(|a| a.first()).map(|g| (p["connection_id"].clone(), p["run"]["id"].clone(), g["id"].clone())))
+        .expect("a run is waiting on an approval gate");
+    let approve = hdr(client.post(format!("{base}/api/pipeline/approval")))
+        .json(&serde_json::json!({ "conn": gate.0, "run_id": gate.1, "approval_id": gate.2, "decision": "Approve" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(approve.status(), 200);
+
     // Notification: mark one read.
     let notifs: serde_json::Value =
         hdr(client.get(format!("{base}/api/notifications"))).send().await.unwrap().json().await.unwrap();
