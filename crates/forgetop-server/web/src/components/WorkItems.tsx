@@ -1,24 +1,46 @@
 import { useEffect, useRef, useState } from "react";
 import { motion } from "framer-motion";
 import { apiGet, useWorkItems, useWriteAction } from "../api";
-import { relativeTime, wiStateColor } from "../format";
+import { relativeTime, toTime, wiStateColor } from "../format";
 import type { WiRow } from "../types";
 import { Avatar, Chip, List, ProviderBadge, Skeleton, StateCard } from "./ui";
 import { ErrorState } from "./ErrorState";
+import { useListView } from "./ControlBar";
 
 export function WorkItems() {
   const { data, isLoading, error } = useWorkItems();
+  const { rows, bar } = useListView<WiRow>({
+    storageKey: "work-items",
+    rows: data,
+    connId: (r) => r.connection_id,
+    connLabel: (r) => r.connection,
+    sorts: [
+      { label: "Recently updated", cmp: (a, b) => toTime(b.work_item.updated_at) - toTime(a.work_item.updated_at) },
+      { label: "Oldest", cmp: (a, b) => toTime(a.work_item.updated_at) - toTime(b.work_item.updated_at) },
+      { label: "Title A–Z", cmp: (a, b) => a.work_item.title.localeCompare(b.work_item.title) },
+    ],
+    statuses: [
+      { label: "In progress", match: (r) => r.work_item.state_category === "Started" },
+      { label: "Blocked", match: (r) => r.work_item.state.toLowerCase() === "blocked" },
+      { label: "Not started", match: (r) => ["Unstarted", "Backlog", "Triage"].includes(r.work_item.state_category) },
+    ],
+    statusLabel: "Show",
+  });
+
   if (isLoading) return <Skeleton />;
   if (error) return <ErrorState error={error} />;
   if (!data || data.length === 0)
     return <StateCard icon="◇" title="No work items assigned" sub="Issues and tickets assigned to you appear here." />;
 
   return (
-    <List>
-      {data.map((row, i) => (
-        <WiCard key={`${row.connection_id}:${row.work_item.id}`} row={row} index={i} />
-      ))}
-    </List>
+    <>
+      {bar}
+      <List>
+        {rows.map((row, i) => (
+          <WiCard key={`${row.connection_id}:${row.work_item.id}`} row={row} index={i} />
+        ))}
+      </List>
+    </>
   );
 }
 

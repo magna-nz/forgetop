@@ -8,6 +8,7 @@ const META: Record<SectionId, { title: string; subtitle: string }> = {
   "work-items": { title: "Work Items", subtitle: "Issues and tickets currently assigned to you." },
   pipelines: { title: "Pipelines", subtitle: "Recent CI runs across your repositories." },
   notifications: { title: "Notifications", subtitle: "Review requests, mentions, and CI failures." },
+  settings: { title: "Settings", subtitle: "Manage the connections shared with the terminal app." },
 };
 
 export function TopBar({ section, onOpenPalette }: { section: SectionId; onOpenPalette: () => void }) {

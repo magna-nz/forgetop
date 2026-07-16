@@ -1,23 +1,45 @@
 import { motion } from "framer-motion";
 import { usePipelines, useWriteAction } from "../api";
-import { pipeMeta, relativeTime } from "../format";
+import { pipeMeta, relativeTime, toTime } from "../format";
 import type { PipeRow } from "../types";
 import { Avatar, Chip, List, Pill, ProviderBadge, Skeleton, StateCard } from "./ui";
 import { ErrorState } from "./ErrorState";
+import { useListView } from "./ControlBar";
 
 export function Pipelines() {
   const { data, isLoading, error } = usePipelines();
+  const { rows, bar } = useListView<PipeRow>({
+    storageKey: "pipelines",
+    rows: data,
+    connId: (r) => r.connection_id,
+    connLabel: (r) => r.connection,
+    sorts: [
+      { label: "Most recent", cmp: (a, b) => toTime(b.run.finished_at ?? b.run.started_at) - toTime(a.run.finished_at ?? a.run.started_at) },
+      { label: "Oldest", cmp: (a, b) => toTime(a.run.finished_at ?? a.run.started_at) - toTime(b.run.finished_at ?? b.run.started_at) },
+    ],
+    statuses: [
+      { label: "Running", match: (r) => r.run.status === "Running" },
+      { label: "Failed", match: (r) => r.run.status === "Failed" },
+      { label: "Succeeded", match: (r) => r.run.status === "Succeeded" },
+      { label: "Awaiting approval", match: (r) => r.approvals.some((a) => a.can_respond) },
+    ],
+    statusLabel: "Show",
+  });
+
   if (isLoading) return <Skeleton />;
   if (error) return <ErrorState error={error} />;
   if (!data || data.length === 0)
     return <StateCard icon="◇" title="No pipeline runs" sub="Recent CI runs for your repositories appear here." />;
 
   return (
-    <List>
-      {data.map((row, i) => (
-        <PipeCard key={`${row.connection_id}:${row.run.id}`} row={row} index={i} />
-      ))}
-    </List>
+    <>
+      {bar}
+      <List>
+        {rows.map((row, i) => (
+          <PipeCard key={`${row.connection_id}:${row.run.id}`} row={row} index={i} />
+        ))}
+      </List>
+    </>
   );
 }
 

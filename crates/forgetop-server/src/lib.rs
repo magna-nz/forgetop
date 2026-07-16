@@ -13,13 +13,15 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
 use axum::Router;
-use forgetop_core::service::{ConnectionHealthService, SectionService};
+use forgetop_core::secret::SecretStore;
+use forgetop_core::service::{ConfigService, ConnectionHealthService, SectionService};
 use rust_embed::RustEmbed;
 use serde::Deserialize;
 
 use crate::actions::ActionError;
 
 mod actions;
+mod connections;
 mod dto;
 
 /// The built dashboard SPA, baked into the binary at compile time (see `build.rs`).
@@ -30,11 +32,14 @@ struct Assets;
 /// Default dashboard port. `0` lets the OS pick a free one.
 pub const DEFAULT_PORT: u16 = 8177;
 
-/// The services the dashboard reads from — the same ones the TUI is given.
+/// The services the dashboard reads from and writes through — the same ones the TUI is given,
+/// so connections added here show up in the TUI (and vice versa).
 #[derive(Clone)]
 pub struct Deps {
     pub sections: Arc<SectionService>,
     pub health: Arc<ConnectionHealthService>,
+    pub config: Arc<ConfigService>,
+    pub secrets: Arc<dyn SecretStore>,
 }
 
 /// A bound, running server: where it lives and the token needed to reach it.
@@ -99,6 +104,10 @@ fn router(state: AppState) -> Router {
         .route("/api/pipeline/approval", post(pipeline_approval))
         .route("/api/pipeline/trigger", post(pipeline_trigger))
         .route("/api/notification/read", post(notification_read))
+        .route("/api/providers", get(providers))
+        .route("/api/connections", get(list_connections).post(save_connection))
+        .route("/api/connections/delete", post(delete_connection))
+        .route("/api/connections/test", post(test_connection))
         .layer(middleware::from_fn_with_state(state.clone(), auth))
         .with_state(state);
 
@@ -216,4 +225,36 @@ async fn pipeline_trigger(State(s): State<AppState>, Json(req): Json<actions::Pi
 
 async fn notification_read(State(s): State<AppState>, Json(req): Json<actions::NotifReadReq>) -> Response {
     action_response(actions::notif_read(&s.deps.sections, req).await)
+}
+
+// ---- connection management ----
+
+#[derive(Deserialize)]
+struct IdReq {
+    id: String,
+}
+
+async fn providers() -> Json<Vec<connections::ProviderInfo>> {
+    Json(connections::providers())
+}
+async fn list_connections(State(s): State<AppState>) -> Json<Vec<connections::ConnectionRow>> {
+    Json(connections::list(&s.deps.config, s.deps.secrets.as_ref()))
+}
+async fn save_connection(State(s): State<AppState>, Json(req): Json<connections::SaveConnectionReq>) -> Response {
+    match connections::save(&s.deps.config, req).await {
+        Ok(id) => Json(serde_json::json!({ "ok": true, "id": id })).into_response(),
+        Err(msg) => (StatusCode::BAD_GATEWAY, msg).into_response(),
+    }
+}
+async fn delete_connection(State(s): State<AppState>, Json(req): Json<IdReq>) -> Response {
+    match connections::remove(&s.deps.config, &req.id).await {
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Err(msg) => (StatusCode::BAD_GATEWAY, msg).into_response(),
+    }
+}
+async fn test_connection(State(s): State<AppState>, Json(req): Json<IdReq>) -> Response {
+    match connections::test(&s.deps.health, &req.id).await {
+        Some(healthy) => Json(serde_json::json!({ "healthy": healthy })).into_response(),
+        None => (StatusCode::NOT_FOUND, "connection not found").into_response(),
+    }
 }
