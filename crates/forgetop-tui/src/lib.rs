@@ -54,7 +54,9 @@ pub async fn run(deps: AppDeps, theme_name: &str, dashboard_url: Option<String>)
     let cfg = deps.config.snapshot();
     if cfg.connections.is_empty() || cfg.connections.iter().all(|c| c.credential_ref.is_none()) {
         app.start_setup();
-    } else if cfg.ui.startup_mode == forgetop_core::config::StartupMode::Both {
+    } else if forgetop_core::config::StartupMode::effective(cfg.ui.startup_mode)
+        == forgetop_core::config::StartupMode::Both
+    {
         app.open_dashboard();
     }
 

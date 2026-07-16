@@ -80,6 +80,23 @@ pub enum StartupMode {
     Both,
 }
 
+impl StartupMode {
+    /// The mode to actually launch with: the `FORGETOP_STARTUP` env var wins when set (a one-off
+    /// override, handy for `--demo` where nothing persists), otherwise the stored preference.
+    pub fn effective(stored: StartupMode) -> StartupMode {
+        Self::effective_from(stored, std::env::var("FORGETOP_STARTUP").ok().as_deref())
+    }
+
+    fn effective_from(stored: StartupMode, env: Option<&str>) -> StartupMode {
+        match env.map(str::trim) {
+            Some("terminal_only" | "terminal") => StartupMode::TerminalOnly,
+            Some("dashboard_only" | "dashboard") => StartupMode::DashboardOnly,
+            Some("both") => StartupMode::Both,
+            _ => stored,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UiState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -291,6 +308,16 @@ impl ConfigStore for InMemoryConfigStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_mode_env_overrides_the_stored_preference() {
+        // No/unknown env → stored preference wins.
+        assert_eq!(StartupMode::effective_from(StartupMode::TerminalOnly, None), StartupMode::TerminalOnly);
+        assert_eq!(StartupMode::effective_from(StartupMode::Both, Some("nonsense")), StartupMode::Both);
+        // A valid env var wins over the stored value (both spellings).
+        assert_eq!(StartupMode::effective_from(StartupMode::Both, Some("terminal_only")), StartupMode::TerminalOnly);
+        assert_eq!(StartupMode::effective_from(StartupMode::Both, Some(" dashboard ")), StartupMode::DashboardOnly);
+    }
 
     #[test]
     fn binding_ids_merge_legacy_and_dedup() {
