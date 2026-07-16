@@ -122,11 +122,18 @@ export interface WiRow {
   work_item: WorkItem;
 }
 
+export interface PipelineApproval {
+  id: string;
+  name: string;
+  can_respond: boolean;
+}
+
 export interface PipeRow {
   connection_id: string;
   connection: string;
   provider: ProviderType;
   run: PipelineRun;
+  approvals: PipelineApproval[];
 }
 
 export interface NotifRow {

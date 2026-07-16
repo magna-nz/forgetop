@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use forgetop_core::config::PipelineSubscription;
 use forgetop_core::domain::{
-    CheckRun, CommentThread, Commit, FileChange, Notification, PipelineRun, PipelineRunStatus, ProviderType,
-    PullRequest, WorkItem,
+    CheckRun, CommentThread, Commit, FileChange, Notification, PipelineApproval, PipelineRun, PipelineRunStatus,
+    ProviderType, PullRequest, WorkItem,
 };
 use forgetop_core::launchpad::{self, EntryItem, PipeInput, PrInput, WiInput};
 use forgetop_core::provider::{
@@ -38,6 +38,9 @@ pub struct PipeRow {
     pub connection: String,
     pub provider: ProviderType,
     pub run: PipelineRun,
+    /// Pending approval gates on this run (empty unless it's in-flight and the provider
+    /// supports approvals) — drives the approve/reject buttons.
+    pub approvals: Vec<PipelineApproval>,
 }
 
 #[derive(Serialize)]
@@ -109,14 +112,24 @@ pub async fn pipelines(sections: &SectionService) -> Vec<PipeRow> {
     let mut out = Vec::new();
     if let Ok(feeds) = sections.pipeline_feeds().await {
         for feed in feeds {
+            let supports = feed.source.supports_approvals();
             for query in pipe_queries(&feed.subscription) {
                 if let Ok(runs) = feed.source.list_runs(&query).await {
-                    out.extend(runs.into_iter().map(|run| PipeRow {
-                        connection_id: feed.connection.connection_id().to_string(),
-                        connection: feed.connection.display_name().to_string(),
-                        provider: feed.connection.provider_type(),
-                        run,
-                    }));
+                    for run in runs {
+                        // Only in-flight runs can be waiting on a gate — bound the extra calls.
+                        let approvals = if supports && is_active(run.status) {
+                            feed.source.pending_approvals(&run.id).await.unwrap_or_default()
+                        } else {
+                            Vec::new()
+                        };
+                        out.push(PipeRow {
+                            connection_id: feed.connection.connection_id().to_string(),
+                            connection: feed.connection.display_name().to_string(),
+                            provider: feed.connection.provider_type(),
+                            approvals,
+                            run,
+                        });
+                    }
                 }
             }
         }
