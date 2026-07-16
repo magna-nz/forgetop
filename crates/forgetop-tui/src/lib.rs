@@ -48,10 +48,11 @@ pub async fn run(deps: AppDeps, theme_name: &str, dashboard_url: Option<String>)
     }
     app.reload_all(&deps).await;
 
-    // First run: nothing configured yet — drop straight into the add-connection wizard.
-    if deps.config.snapshot().connections.is_empty() {
-        app.start_add_connection();
-        app.toast = Some("Welcome to forgetop — add your first connection".into());
+    // First run — nothing configured, or no connection has a token yet: open the web dashboard
+    // for setup (connections are managed there now), rather than a terminal wizard.
+    let cfg = deps.config.snapshot();
+    if cfg.connections.is_empty() || cfg.connections.iter().all(|c| c.credential_ref.is_none()) {
+        app.start_setup();
     }
 
     let result = event_loop(&mut terminal, &mut app, &deps).await;

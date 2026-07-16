@@ -1134,7 +1134,7 @@ fn base_footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
     }
     keys.push(("V", "save view"));
     keys.push(("/", "find"));
-    keys.extend([("v", "tabs"), ("C", "config"), ("r", "refresh"), ("t", "theme"), ("?", "help"), ("q", "quit")]);
+    keys.extend([("v", "tabs"), ("C", "connections"), ("r", "refresh"), ("t", "theme"), ("?", "help"), ("q", "quit")]);
     keys
 }
 
