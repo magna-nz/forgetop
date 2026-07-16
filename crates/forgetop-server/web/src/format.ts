@@ -146,6 +146,13 @@ export function initials(name: string): string {
   return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase();
 }
 
+/** Epoch millis for sorting; missing/invalid dates sort last (as 0). */
+export function toTime(iso?: string | null): number {
+  if (!iso) return 0;
+  const t = new Date(iso).getTime();
+  return Number.isNaN(t) ? 0 : t;
+}
+
 export function relativeTime(iso?: string | null): string {
   if (!iso) return "";
   const then = new Date(iso).getTime();

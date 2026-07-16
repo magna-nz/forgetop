@@ -1047,9 +1047,21 @@ fn render_health(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-/// Context-aware key glossary for the active tab (azdo-style bar along the bottom).
-/// While an overlay is open it shows that overlay's own keys instead.
+/// Context-aware key glossary for the active tab (azdo-style bar along the bottom). Appends the
+/// web-dashboard hint on every screen where `B` actually opens it — i.e. everywhere except while
+/// the wizard, an overlay, or the quick-filter is capturing input — so people discover it exists.
 fn footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
+    let mut keys = base_footer_keys(app);
+    // Prepend (not append) so it survives the footer being clipped on narrow terminals — the
+    // whole point is that people always see the dashboard exists.
+    if app.dashboard_url.is_some() && app.wizard.is_none() && app.overlay.is_none() && !app.filtering {
+        keys.insert(0, ("B", "browser dashboard"));
+    }
+    keys
+}
+
+/// The per-screen key glossary before the global dashboard hint is appended.
+fn base_footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
     if let Some(wizard) = &app.wizard {
         return match wizard.current() {
             Some(Prompt { kind: PromptKind::Pick { .. }, .. }) => vec![("↑↓", "choose"), ("↵", "next"), ("Esc", "cancel")],
@@ -2696,6 +2708,18 @@ mod tests {
         app.active = 2;
         let out = render_to_string(&mut app, 120, 24);
         assert!(out.contains("drill-in") && out.contains("trigger"), "pipelines footer");
+    }
+
+    #[test]
+    fn footer_advertises_the_browser_dashboard_when_available() {
+        let mut app = App::new("slate");
+        app.screen = Screen::List;
+        // No dashboard running → no hint.
+        assert!(!render_to_string(&mut app, 120, 24).contains("browser dashboard"));
+        // Dashboard running → the hint shows so TUI users discover it.
+        app.dashboard_url = Some("http://127.0.0.1:8177/?t=x".into());
+        let out = render_to_string(&mut app, 120, 24);
+        assert!(out.contains("browser dashboard") && out.contains("B"), "footer advertises the dashboard");
     }
 
     #[test]

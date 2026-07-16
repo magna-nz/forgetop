@@ -2,24 +2,46 @@ import { useState } from "react";
 import { motion } from "framer-motion";
 import { useQueryClient } from "@tanstack/react-query";
 import { apiPost, useNotifications } from "../api";
-import { notificationMeta, relativeTime } from "../format";
+import { notificationMeta, relativeTime, toTime } from "../format";
 import type { NotifRow } from "../types";
 import { List, ProviderBadge, Skeleton, StateCard } from "./ui";
 import { ErrorState } from "./ErrorState";
+import { useListView } from "./ControlBar";
 
 export function Notifications() {
   const { data, isLoading, error } = useNotifications();
+  const { rows, bar } = useListView<NotifRow>({
+    storageKey: "notifications",
+    rows: data,
+    connId: (r) => r.connection_id,
+    connLabel: (r) => r.connection,
+    sorts: [
+      { label: "Newest", cmp: (a, b) => toTime(b.notification.updated_at) - toTime(a.notification.updated_at) },
+      { label: "Oldest", cmp: (a, b) => toTime(a.notification.updated_at) - toTime(b.notification.updated_at) },
+    ],
+    statuses: [
+      { label: "Unread", match: (r) => r.notification.unread },
+      { label: "Review requests", match: (r) => r.notification.kind === "ReviewRequested" },
+      { label: "Mentions", match: (r) => r.notification.kind === "Mention" },
+      { label: "CI failures", match: (r) => r.notification.kind === "CiFailed" },
+    ],
+    statusLabel: "Show",
+  });
+
   if (isLoading) return <Skeleton />;
   if (error) return <ErrorState error={error} />;
   if (!data || data.length === 0)
     return <StateCard icon="✓" title="Inbox zero" sub="Review requests, mentions, and CI failures land here." />;
 
   return (
-    <List>
-      {data.map((row, i) => (
-        <NotifCard key={`${row.connection_id}:${row.notification.id}`} row={row} index={i} />
-      ))}
-    </List>
+    <>
+      {bar}
+      <List>
+        {rows.map((row, i) => (
+          <NotifCard key={`${row.connection_id}:${row.notification.id}`} row={row} index={i} />
+        ))}
+      </List>
+    </>
   );
 }
 

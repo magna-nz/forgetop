@@ -228,4 +228,35 @@ export type LaunchpadRow = LaunchpadBase &
     | { kind: "pipe"; run: PipelineRun; definition_name?: string | null }
   );
 
-export type SectionId = "launchpad" | "prs" | "work-items" | "pipelines" | "notifications";
+export type FieldKey = "display_name" | "base_url" | "organization" | "project" | "repository" | "username" | "pat";
+
+export interface FieldSpec {
+  key: FieldKey;
+  label: string;
+  help: string;
+  required: boolean;
+  secret: boolean;
+  default?: string | null;
+}
+
+export interface ProviderInfo {
+  provider: ProviderType;
+  label: string;
+  fields: FieldSpec[];
+  sections: string[];
+}
+
+export interface ConnectionRow {
+  id: string;
+  provider: ProviderType;
+  display_name: string;
+  base_url?: string | null;
+  organization?: string | null;
+  project?: string | null;
+  repository?: string | null;
+  username?: string | null;
+  has_token: boolean;
+  sections: string[];
+}
+
+export type SectionId = "launchpad" | "prs" | "work-items" | "pipelines" | "notifications" | "settings";

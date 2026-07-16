@@ -9,6 +9,7 @@ const NAV: { id: SectionId; label: string; icon: string }[] = [
   { id: "work-items", label: "Work Items", icon: "◧" },
   { id: "pipelines", label: "Pipelines", icon: "⛓" },
   { id: "notifications", label: "Notifications", icon: "◔" },
+  { id: "settings", label: "Settings", icon: "⚙" },
 ];
 
 export function Sidebar({ section, onSelect }: { section: SectionId; onSelect: (s: SectionId) => void }) {
@@ -26,6 +27,7 @@ export function Sidebar({ section, onSelect }: { section: SectionId; onSelect: (
     "work-items": wis.data?.length,
     pipelines: pipes.data?.length,
     notifications: notifs.data?.filter((n) => n.notification.unread).length,
+    settings: undefined,
   };
 
   const healthy = health.data?.filter((h) => h.healthy).length ?? 0;

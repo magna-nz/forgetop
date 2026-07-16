@@ -1,23 +1,45 @@
 import { usePullRequests } from "../api";
-import { checkMeta, prStatusMeta, relativeTime, voteMeta } from "../format";
+import { checkMeta, prStatusMeta, relativeTime, toTime, voteMeta } from "../format";
 import type { PrRow } from "../types";
 import { Avatar, Chip, List, Pill, ProviderBadge, Row, Skeleton, StateCard } from "./ui";
 import { ErrorState } from "./ErrorState";
 import { usePrOpener } from "./PrDetail";
+import { useListView } from "./ControlBar";
 
 export function PullRequests() {
   const { data, isLoading, error } = usePullRequests();
+  const { rows, bar } = useListView<PrRow>({
+    storageKey: "prs",
+    rows: data,
+    connId: (r) => r.connection_id,
+    connLabel: (r) => r.connection,
+    sorts: [
+      { label: "Recently updated", cmp: (a, b) => toTime(b.pull_request.updated_at) - toTime(a.pull_request.updated_at) },
+      { label: "Oldest", cmp: (a, b) => toTime(a.pull_request.updated_at) - toTime(b.pull_request.updated_at) },
+      { label: "Title A–Z", cmp: (a, b) => a.pull_request.title.localeCompare(b.pull_request.title) },
+    ],
+    statuses: [
+      { label: "Open", match: (r) => r.pull_request.status === "Open" && !r.pull_request.is_draft },
+      { label: "Draft", match: (r) => r.pull_request.is_draft },
+      { label: "Checks failing", match: (r) => r.pull_request.checks === "Failed" },
+    ],
+    statusLabel: "Show",
+  });
+
   if (isLoading) return <Skeleton />;
   if (error) return <ErrorState error={error} />;
   if (!data || data.length === 0)
     return <StateCard icon="◇" title="No open pull requests" sub="PRs you author or are asked to review show up here." />;
 
   return (
-    <List>
-      {data.map((row, i) => (
-        <PrCard key={`${row.connection_id}:${row.pull_request.id}`} row={row} index={i} />
-      ))}
-    </List>
+    <>
+      {bar}
+      <List>
+        {rows.map((row, i) => (
+          <PrCard key={`${row.connection_id}:${row.pull_request.id}`} row={row} index={i} />
+        ))}
+      </List>
+    </>
   );
 }
 
