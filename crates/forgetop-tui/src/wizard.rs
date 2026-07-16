@@ -188,58 +188,15 @@ impl Wizard {
     }
 
     fn enqueue_provider_steps(&mut self) {
+        // Fields come from the shared schema in forgetop-core, so the wizard and the web
+        // dashboard's settings form always ask for the same things.
         let provider = self.draft.provider.unwrap_or(ProviderType::Demo);
-        self.queue.push_back(Prompt::text(Field::DisplayName, "Display name", "A label shown in the tab bar and connections list", true, provider.as_str()));
-        match provider {
-            ProviderType::Demo => {}
-            ProviderType::GitHub => {
-                self.queue.push_back(Prompt::text(Field::Repository, "Repository (owner/repo)", "e.g. octocat/hello-world — the owner and repo from the URL", false, ""));
-                self.queue.push_back(Prompt::secret(
-                    Field::Pat,
-                    "Personal access token",
-                    "github.com → Settings → Developer settings → Personal access tokens · scope: repo",
-                ));
-            }
-            ProviderType::AzureDevOps => {
-                self.queue.push_back(Prompt::text(Field::Organization, "Organization", "The {org} in dev.azure.com/{org}", true, ""));
-                self.queue.push_back(Prompt::text(Field::Project, "Project", "The team project name (leave blank to use the org default)", false, ""));
-                self.queue.push_back(Prompt::text(Field::Repository, "Repository", "The Git repo name (defaults to the project name)", false, ""));
-                self.queue.push_back(Prompt::secret(
-                    Field::Pat,
-                    "Personal access token",
-                    "dev.azure.com → User settings → Personal access tokens · Code, Work Items, Build",
-                ));
-            }
-            ProviderType::Linear => {
-                self.queue.push_back(Prompt::secret(Field::Pat, "API key", "linear.app → Settings → Security & access → API → Personal API keys"));
-            }
-            ProviderType::GitLab => {
-                self.queue.push_back(Prompt::text(Field::Repository, "Project (group/project)", "e.g. mygroup/myapp — the full path from the URL", true, ""));
-                self.queue.push_back(Prompt::secret(
-                    Field::Pat,
-                    "Personal access token",
-                    "gitlab.com → Preferences → Access Tokens · scope: api",
-                ));
-            }
-            ProviderType::Jira => {
-                self.queue.push_back(Prompt::text(Field::BaseUrl, "Site URL", "Your Atlassian site, e.g. https://your-company.atlassian.net", true, ""));
-                self.queue.push_back(Prompt::text(Field::Project, "Project key", "The prefix on issue keys, e.g. ENG in ENG-123", true, ""));
-                self.queue.push_back(Prompt::text(Field::Username, "Email", "The email of your Atlassian account", true, ""));
-                self.queue.push_back(Prompt::secret(
-                    Field::Pat,
-                    "API token",
-                    "id.atlassian.com → Security → Create and manage API tokens",
-                ));
-            }
-            ProviderType::Bitbucket => {
-                self.queue.push_back(Prompt::text(Field::Organization, "Workspace", "The {workspace} in bitbucket.org/{workspace}", true, ""));
-                self.queue.push_back(Prompt::text(Field::Repository, "Repository (slug)", "The repo slug from the URL, e.g. my-app", true, ""));
-                self.queue.push_back(Prompt::text(Field::Username, "Username", "Your Bitbucket username (not your email)", true, ""));
-                self.queue.push_back(Prompt::secret(
-                    Field::Pat,
-                    "App password",
-                    "Personal settings → App passwords · Pull requests + Pipelines (read & write)",
-                ));
+        for spec in forgetop_core::setup::connection_fields(provider) {
+            let field = field_from_key(spec.key);
+            if spec.secret {
+                self.queue.push_back(Prompt::secret(field, &spec.label, &spec.help));
+            } else {
+                self.queue.push_back(Prompt::text(field, &spec.label, &spec.help, spec.required, spec.default.as_deref().unwrap_or("")));
             }
         }
         let mut items: Vec<String> = provider_sections(provider).into_iter().map(|s| section_label(s).to_string()).collect();
@@ -248,18 +205,25 @@ impl Wizard {
     }
 }
 
+fn field_from_key(key: forgetop_core::setup::FieldKey) -> Field {
+    use forgetop_core::setup::FieldKey as K;
+    match key {
+        K::DisplayName => Field::DisplayName,
+        K::BaseUrl => Field::BaseUrl,
+        K::Organization => Field::Organization,
+        K::Project => Field::Project,
+        K::Repository => Field::Repository,
+        K::Username => Field::Username,
+        K::Pat => Field::Pat,
+    }
+}
+
 fn non_empty(s: &str) -> Option<String> {
     let t = s.trim();
     (!t.is_empty()).then(|| t.to_string())
 }
 
-pub fn provider_sections(provider: ProviderType) -> Vec<Section> {
-    match provider {
-        ProviderType::Linear | ProviderType::Jira => vec![Section::WorkItems],
-        ProviderType::Bitbucket => vec![Section::PullRequests, Section::Pipelines],
-        _ => vec![Section::PullRequests, Section::WorkItems, Section::Pipelines],
-    }
-}
+pub use forgetop_core::setup::provider_sections;
 
 pub fn section_label(section: Section) -> &'static str {
     match section {

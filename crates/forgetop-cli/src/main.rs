@@ -65,7 +65,12 @@ async fn run() -> Result<()> {
 
     let sections = Arc::new(SectionService::new(config.clone(), resolver.clone()));
     let health = Arc::new(ConnectionHealthService::new(config.clone(), resolver));
-    let server_deps = forgetop_server::Deps { sections: sections.clone(), health: health.clone() };
+    let server_deps = forgetop_server::Deps {
+        sections: sections.clone(),
+        health: health.clone(),
+        config: config.clone(),
+        secrets: secrets.clone(),
+    };
 
     // `forgetop --dashboard`: run the web UI only (headless) — no TUI, so no TTY needed.
     if args.iter().any(|a| a == "--dashboard") {

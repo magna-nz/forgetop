@@ -40,10 +40,10 @@ async fn demo_deps(seed: bool) -> Deps {
         config.set_pipeline_auto_discover("github", true).await.unwrap();
     }
 
-    let resolver = Arc::new(ConnectionResolver::new(config.clone(), registry, secrets));
+    let resolver = Arc::new(ConnectionResolver::new(config.clone(), registry, secrets.clone()));
     let sections = Arc::new(SectionService::new(config.clone(), resolver.clone()));
-    let health = Arc::new(ConnectionHealthService::new(config, resolver));
-    Deps { sections, health }
+    let health = Arc::new(ConnectionHealthService::new(config.clone(), resolver));
+    Deps { sections, health, config, secrets }
 }
 
 async fn empty_deps() -> Deps {
@@ -190,6 +190,65 @@ async fn pr_detail_and_write_actions_reach_the_provider() {
         .await
         .unwrap();
     assert_eq!(missing.status(), 404);
+}
+
+#[tokio::test]
+async fn connection_management_round_trip_and_never_leaks_the_token() {
+    // Start empty (no connections) and set one up entirely through the API.
+    let server = spawn(demo_deps(false).await, 0).await.expect("server binds");
+    let base = format!("http://127.0.0.1:{}", server.port);
+    let client = reqwest::Client::new();
+    let tok = server.token.clone();
+    let hdr = |r: reqwest::RequestBuilder| r.header("x-forgetop-token", &tok);
+
+    // Provider schema is available and includes a secret field for GitHub.
+    let provs: serde_json::Value = hdr(client.get(format!("{base}/api/providers"))).send().await.unwrap().json().await.unwrap();
+    let github = provs.as_array().unwrap().iter().find(|p| p["provider"] == "GitHub").expect("GitHub offered");
+    assert!(github["fields"].as_array().unwrap().iter().any(|f| f["secret"] == true));
+
+    // Unauthenticated writes are refused.
+    let unauth = client
+        .post(format!("{base}/api/connections"))
+        .json(&serde_json::json!({ "provider": "GitHub", "display_name": "x" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauth.status(), 401);
+
+    // Create a GitHub connection with a token, bound to Pull Requests.
+    const SECRET: &str = "ghp_thisisasupersecrettoken";
+    let saved: serde_json::Value = hdr(client.post(format!("{base}/api/connections")))
+        .json(&serde_json::json!({
+            "provider": "GitHub", "display_name": "Work GitHub", "repository": "acme/app",
+            "token": SECRET, "bind_pull_requests": true
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let id = saved["id"].as_str().expect("returns the new id").to_string();
+
+    // It shows up, reports a token is set + the binding — and the raw response NEVER contains the token.
+    let raw = hdr(client.get(format!("{base}/api/connections"))).send().await.unwrap().text().await.unwrap();
+    assert!(!raw.contains(SECRET), "the token must never be returned by the API");
+    let conns: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    let row = conns.as_array().unwrap().iter().find(|c| c["id"] == id.as_str()).expect("connection listed");
+    assert_eq!(row["has_token"], true);
+    assert_eq!(row["display_name"], "Work GitHub");
+    assert!(row["sections"].as_array().unwrap().iter().any(|s| s == "pull_requests"));
+
+    // Test-connection round-trips (demo GitHub authenticates).
+    let health: serde_json::Value =
+        hdr(client.post(format!("{base}/api/connections/test"))).json(&serde_json::json!({ "id": id })).send().await.unwrap().json().await.unwrap();
+    assert!(health["healthy"].is_boolean());
+
+    // Delete removes it.
+    let del = hdr(client.post(format!("{base}/api/connections/delete"))).json(&serde_json::json!({ "id": id })).send().await.unwrap();
+    assert_eq!(del.status(), 200);
+    let after: serde_json::Value = hdr(client.get(format!("{base}/api/connections"))).send().await.unwrap().json().await.unwrap();
+    assert!(after.as_array().unwrap().iter().all(|c| c["id"] != id.as_str()), "connection is gone");
 }
 
 #[tokio::test]
