@@ -1,7 +1,9 @@
 @import "tailwindcss";
 
-/* Palette mirrors the TUI's default "slate" theme (xterm-256 → hex). */
-:root {
+/* Palettes mirror the TUI themes (crates/forgetop-tui/src/theme.rs, xterm-256 → hex).
+   `data-theme` on <html> selects one; default (unset) is slate. */
+:root,
+:root[data-theme="slate"] {
   --bg: #1c1c1c;
   --panel: #212121;
   --panel2: #262626;
@@ -18,6 +20,63 @@
   --accent: #5fafff;
   --magenta: #d787d7;
   --cyan: #5fd7d7;
+}
+
+:root[data-theme="dark"] {
+  --bg: #080808;
+  --panel: #141414;
+  --panel2: #1c1c1c;
+  --card: #161616;
+  --card-hover: #1f1f1f;
+  --fg: #dadada;
+  --dim: #808080;
+  --border: #2a2a2a;
+  --sel: #333333;
+  --green: #5fff87;
+  --red: #ff5f5f;
+  --yellow: #ffd75f;
+  --blue: #00afff;
+  --accent: #00afff;
+  --magenta: #d787ff;
+  --cyan: #5fd7d7;
+}
+
+:root[data-theme="light"] {
+  --bg: #f4f4f4;
+  --panel: #eaeaea;
+  --panel2: #e2e2e2;
+  --card: #ffffff;
+  --card-hover: #f0f0f0;
+  --fg: #2a2a2a;
+  --dim: #6b6b6b;
+  --border: #d4d4d4;
+  --sel: #dcdcdc;
+  --green: #1a8a1a;
+  --red: #cc2222;
+  --yellow: #9a7500;
+  --blue: #005fd7;
+  --accent: #005fd7;
+  --magenta: #870087;
+  --cyan: #007a7a;
+}
+
+:root[data-theme="matrix"] {
+  --bg: #000000;
+  --panel: #0a0a0a;
+  --panel2: #101010;
+  --card: #0c0c0c;
+  --card-hover: #141414;
+  --fg: #00ff5f;
+  --dim: #009a3a;
+  --border: #005f00;
+  --sel: #003b00;
+  --green: #00ff5f;
+  --red: #ff5f5f;
+  --yellow: #d7ff00;
+  --blue: #00ff87;
+  --accent: #00ff87;
+  --magenta: #5fffd7;
+  --cyan: #00ffff;
 }
 
 html,

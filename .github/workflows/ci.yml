@@ -8,6 +8,8 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # The dashboard SPA is built in its own step below; the cargo build then just embeds it.
+  FORGETOP_SKIP_WEB_BUILD: "1"
 
 jobs:
   test:
@@ -19,6 +21,14 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: crates/forgetop-server/web/package-lock.json
+      - name: Build dashboard SPA
+        working-directory: crates/forgetop-server/web
+        run: npm ci && npm run build
       - name: Build
         run: cargo build --workspace --locked
       - name: Test

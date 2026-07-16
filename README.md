@@ -135,6 +135,23 @@ section. Press **`C`** any time to manage connections and bindings.
 If something isn't connecting, run `forgetop doctor` — it checks your config,
 keychain access, and each connection's token + connectivity.
 
+## Web dashboard
+
+Prefer a browser? forgetop ships the **same UI as a local web dashboard** — the
+Launchpad, all three lists, PR review with an inline-comment diff viewer, a
+command palette (`⌘K`), and every write action (approve, merge, comment,
+transition, approve a deploy gate, mark read).
+
+- **From the TUI:** press **`B`** to open it — running `forgetop` already serves
+  it in the background.
+- **Headless:** `forgetop --dashboard` serves it and opens your browser (no TTY
+  needed — handy over SSH with a forwarded port).
+
+It binds to **`127.0.0.1` only** and is gated by a **per-session token** baked
+into the URL, so nothing else on your machine (or a web page you visit) can reach
+your data or act on your behalf. The dashboard is built into the binary — no
+separate install, no external network.
+
 ## Documentation
 
 forgetop shows a **context-aware key glossary** along the bottom, so you rarely

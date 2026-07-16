@@ -1,5 +1,6 @@
 import { motion } from "framer-motion";
 import { useHealth, useLaunchpad, useNotifications, usePipelines, usePullRequests, useWorkItems } from "../api";
+import { useTheme } from "../theme";
 import type { SectionId } from "../types";
 
 const NAV: { id: SectionId; label: string; icon: string }[] = [
@@ -29,6 +30,7 @@ export function Sidebar({ section, onSelect }: { section: SectionId; onSelect: (
 
   const healthy = health.data?.filter((h) => h.healthy).length ?? 0;
   const total = health.data?.length ?? 0;
+  const [theme, cycleTheme] = useTheme();
 
   return (
     <aside
@@ -92,7 +94,17 @@ export function Sidebar({ section, onSelect }: { section: SectionId; onSelect: (
           />
           {total === 0 ? "No connections" : `${healthy}/${total} connections healthy`}
         </div>
-        <div className="mt-1 opacity-70">Live · refreshes every 15s</div>
+        <div className="mt-1.5 flex items-center justify-between">
+          <span className="opacity-70">Live · every 15s</span>
+          <button
+            onClick={cycleTheme}
+            title="Switch theme"
+            className="rounded px-1.5 py-0.5 capitalize"
+            style={{ border: "1px solid var(--border)", background: "var(--panel2)", color: "var(--dim)" }}
+          >
+            ◐ {theme}
+          </button>
+        </div>
       </div>
     </aside>
   );
