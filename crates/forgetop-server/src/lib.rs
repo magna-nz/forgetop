@@ -108,6 +108,8 @@ fn router(state: AppState) -> Router {
         .route("/api/connections", get(list_connections).post(save_connection))
         .route("/api/connections/delete", post(delete_connection))
         .route("/api/connections/test", post(test_connection))
+        .route("/api/preferences", get(get_preferences))
+        .route("/api/preferences/startup", post(set_startup_mode))
         .layer(middleware::from_fn_with_state(state.clone(), auth))
         .with_state(state);
 
@@ -256,5 +258,21 @@ async fn test_connection(State(s): State<AppState>, Json(req): Json<IdReq>) -> R
     match connections::test(&s.deps.health, &req.id).await {
         Some(healthy) => Json(serde_json::json!({ "healthy": healthy })).into_response(),
         None => (StatusCode::NOT_FOUND, "connection not found").into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct StartupModeReq {
+    mode: forgetop_core::config::StartupMode,
+}
+
+/// User preferences shared with the TUI (currently just the startup mode).
+async fn get_preferences(State(s): State<AppState>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "startup_mode": s.deps.config.snapshot().ui.startup_mode }))
+}
+async fn set_startup_mode(State(s): State<AppState>, Json(req): Json<StartupModeReq>) -> Response {
+    match s.deps.config.set_startup_mode(req.mode).await {
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
     }
 }

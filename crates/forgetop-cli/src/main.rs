@@ -5,7 +5,7 @@ use std::io::IsTerminal;
 use std::sync::Arc;
 
 use forgetop_core::config::{
-    default_config_path, ConfigStore, ForgetopConfig, InMemoryConfigStore, JsonConfigStore,
+    default_config_path, ConfigStore, ForgetopConfig, InMemoryConfigStore, JsonConfigStore, StartupMode,
 };
 use forgetop_core::domain::ProviderType;
 use forgetop_core::provider::{Connection, ProviderRegistry};
@@ -72,8 +72,11 @@ async fn run() -> Result<()> {
         secrets: secrets.clone(),
     };
 
-    // `forgetop --dashboard`: run the web UI only (headless) — no TUI, so no TTY needed.
-    if args.iter().any(|a| a == "--dashboard") {
+    // Dashboard-only: `forgetop --dashboard`, or the saved startup preference. Runs the web UI
+    // headless (no TUI, so no TTY needed).
+    let startup_mode = config.snapshot().ui.startup_mode;
+    let dashboard_only = args.iter().any(|a| a == "--dashboard") || startup_mode == StartupMode::DashboardOnly;
+    if dashboard_only {
         return forgetop_server::serve_blocking(server_deps, forgetop_server::DEFAULT_PORT, |url| {
             println!("forgetop dashboard: {url}\n(Ctrl-C to stop)");
             let _ = open::that(url);

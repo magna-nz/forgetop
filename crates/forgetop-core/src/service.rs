@@ -234,6 +234,12 @@ impl ConfigService {
         self.persist(cfg).await
     }
 
+    pub async fn set_startup_mode(&self, mode: crate::config::StartupMode) -> Result<()> {
+        let mut cfg = self.snapshot();
+        cfg.ui.startup_mode = mode;
+        self.persist(cfg).await
+    }
+
     pub async fn set_hidden_sections(&self, hidden: Vec<Section>) -> Result<()> {
         let mut cfg = self.snapshot();
         cfg.ui.hidden_sections = hidden;

@@ -1,9 +1,9 @@
 import { useState } from "react";
 import { motion } from "framer-motion";
 import { useQueryClient } from "@tanstack/react-query";
-import { apiPost, useConnections, useHealth, useWriteAction } from "../api";
+import { apiPost, useConnections, useHealth, usePreferences, useWriteAction } from "../api";
 import { providerMeta } from "../format";
-import type { ConnectionRow } from "../types";
+import type { ConnectionRow, StartupMode } from "../types";
 import { ProviderBadge, Skeleton, StateCard } from "./ui";
 import { ErrorState } from "./ErrorState";
 import { ConnectionForm } from "./ConnectionForm";
@@ -33,6 +33,8 @@ export function Settings() {
 
   return (
     <div className="p-5 max-w-4xl mx-auto">
+      <StartupSetting />
+
       <div className="flex items-center justify-between mb-4">
         <div>
           <h2 className="text-sm font-semibold" style={{ color: "var(--fg)" }}>Connections</h2>
@@ -78,6 +80,61 @@ export function Settings() {
         </Modal>
       )}
     </div>
+  );
+}
+
+const STARTUP_OPTIONS: { value: StartupMode; label: string; hint: string }[] = [
+  { value: "both", label: "Dashboard + terminal", hint: "Default — opens both when you run forgetop" },
+  { value: "terminal_only", label: "Terminal only", hint: "Just the TUI (press B for the dashboard)" },
+  { value: "dashboard_only", label: "Dashboard only", hint: "Just this browser dashboard, no TUI" },
+];
+
+function StartupSetting() {
+  const { data } = usePreferences();
+  const qc = useQueryClient();
+  const [busy, setBusy] = useState(false);
+  const current: StartupMode = data?.startup_mode ?? "both";
+
+  const choose = async (mode: StartupMode) => {
+    if (mode === current || busy) return;
+    setBusy(true);
+    try {
+      await apiPost("/api/preferences/startup", { mode });
+      qc.invalidateQueries({ queryKey: ["preferences"] });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <section className="mb-6">
+      <h2 className="text-sm font-semibold" style={{ color: "var(--fg)" }}>When forgetop starts</h2>
+      <p className="text-xs mb-3" style={{ color: "var(--dim)" }}>Shared with the terminal app.</p>
+      <div className="grid gap-2 sm:grid-cols-3">
+        {STARTUP_OPTIONS.map((o) => {
+          const active = o.value === current;
+          return (
+            <button
+              key={o.value}
+              disabled={busy}
+              onClick={() => choose(o.value)}
+              className="text-left rounded-lg p-3 transition-colors"
+              style={{
+                background: active ? "color-mix(in srgb, var(--accent) 14%, transparent)" : "var(--card)",
+                border: `1px solid ${active ? "var(--accent)" : "var(--border)"}`,
+                cursor: busy ? "default" : "pointer",
+              }}
+            >
+              <div className="flex items-center gap-2 text-sm font-medium" style={{ color: "var(--fg)" }}>
+                <span style={{ color: active ? "var(--accent)" : "var(--dim)" }}>{active ? "●" : "○"}</span>
+                {o.label}
+              </div>
+              <div className="text-xs mt-1" style={{ color: "var(--dim)" }}>{o.hint}</div>
+            </button>
+          );
+        })}
+      </div>
+    </section>
   );
 }
 

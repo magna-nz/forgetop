@@ -252,6 +252,33 @@ async fn connection_management_round_trip_and_never_leaks_the_token() {
 }
 
 #[tokio::test]
+async fn startup_preference_round_trips() {
+    let server = spawn(demo_deps(false).await, 0).await.expect("server binds");
+    let base = format!("http://127.0.0.1:{}", server.port);
+    let client = reqwest::Client::new();
+    let tok = server.token.clone();
+    let hdr = |r: reqwest::RequestBuilder| r.header("x-forgetop-token", &tok);
+
+    // Defaults to "both".
+    let prefs: serde_json::Value = hdr(client.get(format!("{base}/api/preferences"))).send().await.unwrap().json().await.unwrap();
+    assert_eq!(prefs["startup_mode"], "both");
+
+    // Change it, and it sticks.
+    let set = hdr(client.post(format!("{base}/api/preferences/startup")))
+        .json(&serde_json::json!({ "mode": "terminal_only" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(set.status(), 200);
+    let after: serde_json::Value = hdr(client.get(format!("{base}/api/preferences"))).send().await.unwrap().json().await.unwrap();
+    assert_eq!(after["startup_mode"], "terminal_only");
+
+    // Reading preferences still needs the token.
+    let unauth = client.get(format!("{base}/api/preferences")).send().await.unwrap();
+    assert_eq!(unauth.status(), 401);
+}
+
+#[tokio::test]
 async fn work_item_pipeline_and_notification_writes() {
     let server = spawn(demo_deps(true).await, 0).await.expect("server binds");
     let base = format!("http://127.0.0.1:{}", server.port);

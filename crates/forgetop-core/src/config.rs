@@ -67,10 +67,26 @@ pub struct PipelineBinding {
     pub subscriptions: Vec<PipelineSubscription>,
 }
 
+/// What `forgetop` launches when run with no flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StartupMode {
+    /// The terminal UI only. The dashboard server still runs in the background, so `B` opens it.
+    TerminalOnly,
+    /// The web dashboard only (no terminal UI) — like `forgetop --dashboard`.
+    DashboardOnly,
+    /// Both: the terminal UI, plus the dashboard opened in the browser.
+    #[default]
+    Both,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UiState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub theme: Option<String>,
+    /// What `forgetop` opens on launch. Defaults to both the terminal UI and the dashboard.
+    #[serde(default)]
+    pub startup_mode: StartupMode,
     #[serde(default)]
     pub active_section: Section,
     /// Sections the user has hidden from the tab bar.

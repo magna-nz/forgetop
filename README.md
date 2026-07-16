@@ -149,6 +149,11 @@ transition, approve a deploy gate, mark read).
 - **Headless:** `forgetop --dashboard` serves it and opens your browser (no TTY
   needed — handy over SSH with a forwarded port).
 
+By default `forgetop` opens **both** the terminal UI and the dashboard together.
+Change that under **Settings → When forgetop starts** (or press **`,`** in the
+TUI): *dashboard + terminal* (default), *terminal only*, or *dashboard only*. The
+choice is stored in your config and shared between the two.
+
 It binds to **`127.0.0.1` only** and is gated by a **per-session token** baked
 into the URL, so nothing else on your machine (or a web page you visit) can reach
 your data or act on your behalf. The dashboard is built into the binary — no
