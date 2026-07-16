@@ -22,8 +22,15 @@ const VIEWS: Record<SectionId, ComponentType> = {
   settings: Settings,
 };
 
+const SECTIONS: SectionId[] = ["launchpad", "prs", "work-items", "pipelines", "notifications", "settings"];
+const sectionFromHash = (): SectionId | undefined => {
+  const h = window.location.hash.replace(/^#/, "");
+  return SECTIONS.find((s) => s === h);
+};
+
 export default function App() {
-  const [section, setSection] = useState<SectionId>("launchpad");
+  // The TUI deep-links here (e.g. `#settings` when you press C), so honour the hash on load.
+  const [section, setSection] = useState<SectionId>(() => sectionFromHash() ?? "launchpad");
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [skippedFirstRun, setSkippedFirstRun] = useState(false);
   const connections = useConnections();
@@ -42,6 +49,16 @@ export default function App() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
+  // Re-opening the dashboard at a new hash (e.g. pressing C again) navigates there.
+  useEffect(() => {
+    const onHash = () => {
+      const s = sectionFromHash();
+      if (s) setSection(s);
+    };
+    window.addEventListener("hashchange", onHash);
+    return () => window.removeEventListener("hashchange", onHash);
   }, []);
 
   if (firstRun) {

@@ -116,21 +116,23 @@ It opens on the **[Launchpad](https://magna-nz.github.io/forgetop/#launchpad)** 
 triaged queue across both demo connections; press `Tab` (or `2`–`4`) for the per-type
 lists.
 
-Then run it for real. On first launch forgetop drops straight into the
-**add-connection wizard**:
+Then run it for real:
 
 ```sh
 forgetop
 ```
 
-<div align="center">
-  <img src="docs/wizard.gif" alt="Adding a connection with the wizard" width="720">
-  <br/>
-  <sub>The first-run wizard: pick a provider, enter details, paste a token, bind a section.</sub>
-</div>
+On first launch — before any connection has a token — forgetop **opens the web
+dashboard in your browser** to set them up (or skip). Pick a provider, paste a
+token, choose which sections it feeds; it's stored in your OS keychain and shared
+straight back to the terminal. Press **`C`** in the TUI any time to reopen the
+connections page.
 
-The wizard stores your token in the OS keychain and binds the connection to a
-section. Press **`C`** any time to manage connections and bindings.
+<div align="center">
+  <img src="docs/wizard.gif" alt="Setting up a connection" width="720">
+  <br/>
+  <sub>Setting up a connection: pick a provider, paste a token, choose sections.</sub>
+</div>
 
 If something isn't connecting, run `forgetop doctor` — it checks your config,
 keychain access, and each connection's token + connectivity.

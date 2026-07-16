@@ -88,19 +88,26 @@ async fn run() -> Result<()> {
         return Ok(());
     }
 
-    // Start the dashboard server in the background — best-effort, so a bind failure never
-    // takes down the TUI. `B` in the TUI opens the URL.
-    let dashboard_url = match forgetop_server::spawn(server_deps, forgetop_server::DEFAULT_PORT).await {
-        Ok(server) => Some(server.url),
-        Err(e) => {
-            forgetop_core::diag::log("dashboard", &format!("server failed to start: {e}"));
-            None
-        }
-    };
+    // Start the dashboard server in the background — best-effort, so a bind failure never takes
+    // down the TUI. `B` opens the URL and connection setup happens here. Fall back to an ephemeral
+    // port if the default is taken (e.g. a second forgetop) so the dashboard is virtually always up.
+    let dashboard_url = spawn_dashboard(server_deps).await;
 
     let theme = config.snapshot().ui.theme.clone().unwrap_or_else(|| "slate".into());
     let deps = AppDeps { sections, health, config };
     forgetop_tui::run(deps, &theme, dashboard_url).await
+}
+
+/// Spawns the background dashboard server, trying the default port first then an ephemeral one.
+/// Returns the URL (with session token) to open, or `None` if it couldn't bind at all.
+async fn spawn_dashboard(deps: forgetop_server::Deps) -> Option<String> {
+    for port in [forgetop_server::DEFAULT_PORT, 0] {
+        match forgetop_server::spawn(deps.clone(), port).await {
+            Ok(server) => return Some(server.url),
+            Err(e) => forgetop_core::diag::log("dashboard", &format!("bind on port {port} failed: {e}")),
+        }
+    }
+    None
 }
 
 /// Diagnostic (`forgetop doctor`): config location, keychain access, and per-connection

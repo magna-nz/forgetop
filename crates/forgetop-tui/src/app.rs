@@ -1212,8 +1212,7 @@ impl App {
             Key::Char(c @ '1'..='4') => self.set_tab(c as usize - '1' as usize),
             Key::Enter => self.open_launchpad_selected(deps).await,
             Key::Char('r') => self.request_reload(deps),
-            Key::Char('n') => self.start_add_connection(),
-            Key::Char('C') => self.open_config(deps).await,
+            Key::Char('C') => self.open_connections(deps).await,
             Key::Char('t') => {
                 let next = Theme::next(self.theme.name);
                 self.theme = Theme::by_name(next);
@@ -1308,12 +1307,20 @@ impl App {
 
     /// Open the web dashboard in the browser, if its server is running.
     fn open_dashboard(&mut self) {
+        self.open_dashboard_at("");
+    }
+
+    /// Open the dashboard at a specific view (e.g. `#settings` for connection management).
+    fn open_dashboard_at(&mut self, hash: &str) {
         self.toast = Some(match &self.dashboard_url {
-            Some(url) => match open::that(url) {
-                Ok(_) => "Opening dashboard in your browser…".into(),
-                Err(e) => format!("Couldn't open dashboard: {e}"),
-            },
-            None => "Dashboard server isn't running".into(),
+            Some(url) => {
+                let target = format!("{url}{hash}");
+                match open::that(&target) {
+                    Ok(_) => "Opening dashboard in your browser…".into(),
+                    Err(e) => format!("Couldn't open dashboard: {e}"),
+                }
+            }
+            None => "Web dashboard isn't running — start it with `forgetop --dashboard`".into(),
         });
     }
 
@@ -2258,9 +2265,8 @@ impl App {
             '/' => self.start_filter(),
             'S' => self.open_sort_picker(),
             'o' => self.open_selected(),
-            'n' => self.start_add_connection(),
             'v' => self.open_sections_toggle(),
-            'C' => self.open_config(deps).await,
+            'C' => self.open_connections(deps).await,
             // Saved views: previous / next on the active section; save / delete.
             '[' => self.switch_view(-1, deps).await,
             ']' => self.switch_view(1, deps).await,
@@ -2849,6 +2855,22 @@ impl App {
     }
 
     // ---- config / connections screen ----
+
+    /// First launch (or nothing set up): connection setup lives in the web dashboard now, so open
+    /// it instead of a terminal wizard.
+    pub fn start_setup(&mut self) {
+        self.open_dashboard_at("#settings");
+        if self.dashboard_url.is_some() {
+            self.toast = Some("Welcome to forgetop — set up your connections in the browser".into());
+        }
+    }
+
+    /// `C`: connection management happens in the web dashboard. Open it, and also show the
+    /// terminal connections list as a quick read-only glance / fallback.
+    async fn open_connections(&mut self, deps: &AppDeps) {
+        self.open_dashboard_at("#settings");
+        self.open_config(deps).await;
+    }
 
     async fn open_config(&mut self, deps: &AppDeps) {
         let view = self.build_config_view(deps);
