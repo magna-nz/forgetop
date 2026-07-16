@@ -143,6 +143,67 @@ export interface HealthRow {
   healthy: boolean;
 }
 
+export type FileChangeKind = "Added" | "Modified" | "Deleted" | "Renamed";
+
+export interface Comment {
+  id: string;
+  author: User;
+  body: string;
+  created_at?: string | null;
+}
+
+export interface CommentThread {
+  id: string;
+  comments: Comment[];
+  file_path?: string | null;
+  line?: number | null;
+  is_resolved: boolean;
+}
+
+export interface FileChange {
+  path: string;
+  kind: FileChangeKind;
+  additions: number;
+  deletions: number;
+  patch?: string | null;
+}
+
+export interface CheckRun {
+  name: string;
+  status: CheckStatus;
+  url?: string | null;
+}
+
+export interface Commit {
+  sha: string;
+  message: string;
+  author: string;
+  date?: string | null;
+  url?: string | null;
+}
+
+export interface PrDetail {
+  pull_request: PullRequest;
+  threads: CommentThread[];
+  changes: FileChange[];
+  checks: CheckRun[];
+  commits: Commit[];
+}
+
+/** A pending line comment (matches the Rust LineComment shape). */
+export interface LineComment {
+  path: string;
+  line: number;
+  side: "Old" | "New";
+  body: string;
+}
+
+/** Identifies a PR for the detail view. */
+export interface PrRef {
+  conn: string;
+  id: string;
+}
+
 interface LaunchpadBase {
   bucket: string;
   bucket_title: string;

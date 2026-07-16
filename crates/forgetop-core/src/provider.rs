@@ -138,7 +138,7 @@ pub struct PipelineRunQuery {
     pub limit: Option<u32>,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MergeStrategy {
     #[default]
     Merge,

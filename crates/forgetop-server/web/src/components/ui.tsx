@@ -58,20 +58,36 @@ export function Chip({ children, title }: { children: ReactNode; title?: string 
   );
 }
 
-export function Row({ children, index = 0, href }: { children: ReactNode; index?: number; href?: string | null }) {
+export function Row({
+  children,
+  index = 0,
+  href,
+  onClick,
+}: {
+  children: ReactNode;
+  index?: number;
+  href?: string | null;
+  onClick?: () => void;
+}) {
+  const common = {
+    initial: { opacity: 0, y: 6 },
+    animate: { opacity: 1, y: 0 },
+    transition: { duration: 0.22, delay: Math.min(index * 0.02, 0.3), ease: "easeOut" as const },
+    className: "group block rounded-lg px-4 py-3 transition-colors w-full text-left",
+    style: { background: "var(--card)", border: "1px solid var(--border)", cursor: href || onClick ? "pointer" : "default" },
+    onMouseEnter: (e: React.MouseEvent<HTMLElement>) => (e.currentTarget.style.background = "var(--card-hover)"),
+    onMouseLeave: (e: React.MouseEvent<HTMLElement>) => (e.currentTarget.style.background = "var(--card)"),
+  };
+  // A click handler wins (opens the in-app detail); otherwise it's a link to the provider.
+  if (onClick) {
+    return (
+      <motion.button {...common} onClick={onClick}>
+        {children}
+      </motion.button>
+    );
+  }
   return (
-    <motion.a
-      href={href ?? undefined}
-      target={href ? "_blank" : undefined}
-      rel="noreferrer"
-      initial={{ opacity: 0, y: 6 }}
-      animate={{ opacity: 1, y: 0 }}
-      transition={{ duration: 0.22, delay: Math.min(index * 0.02, 0.3), ease: "easeOut" }}
-      className="group block rounded-lg px-4 py-3 transition-colors"
-      style={{ background: "var(--card)", border: "1px solid var(--border)", cursor: href ? "pointer" : "default" }}
-      onMouseEnter={(e) => (e.currentTarget.style.background = "var(--card-hover)")}
-      onMouseLeave={(e) => (e.currentTarget.style.background = "var(--card)")}
-    >
+    <motion.a {...common} href={href ?? undefined} target={href ? "_blank" : undefined} rel="noreferrer">
       {children}
     </motion.a>
   );

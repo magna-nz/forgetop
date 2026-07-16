@@ -3,6 +3,7 @@ import { checkMeta, prStatusMeta, relativeTime, voteMeta } from "../format";
 import type { PrRow } from "../types";
 import { Avatar, Chip, List, Pill, ProviderBadge, Row, Skeleton, StateCard } from "./ui";
 import { ErrorState } from "./ErrorState";
+import { usePrOpener } from "./PrDetail";
 
 export function PullRequests() {
   const { data, isLoading, error } = usePullRequests();
@@ -24,8 +25,9 @@ function PrCard({ row, index }: { row: PrRow; index: number }) {
   const pr = row.pull_request;
   const status = prStatusMeta(pr);
   const checks = checkMeta(pr.checks);
+  const open = usePrOpener();
   return (
-    <Row index={index} href={pr.url}>
+    <Row index={index} onClick={() => open({ conn: row.connection_id, id: pr.id })}>
       <div className="flex items-start gap-3">
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2">

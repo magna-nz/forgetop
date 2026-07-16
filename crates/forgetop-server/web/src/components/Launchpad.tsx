@@ -4,6 +4,7 @@ import { checkMeta, pipeMeta, prStatusMeta, relativeTime, wiStateColor } from ".
 import type { LaunchpadRow } from "../types";
 import { ProviderBadge, Skeleton, StateCard } from "./ui";
 import { ErrorState } from "./ErrorState";
+import { usePrOpener } from "./PrDetail";
 
 export function Launchpad() {
   const { data, isLoading, error } = useLaunchpad();
@@ -82,19 +83,20 @@ function BucketGroup({ group }: { group: Group }) {
 
 function ItemRow({ row, index, muted }: { row: LaunchpadRow; index: number; muted: boolean }) {
   const { dot, spin, title, meta, href } = describe(row);
-  return (
-    <motion.a
-      href={href ?? undefined}
-      target={href ? "_blank" : undefined}
-      rel="noreferrer"
-      initial={{ opacity: 0, y: 4 }}
-      animate={{ opacity: 1, y: 0 }}
-      transition={{ duration: 0.2, delay: Math.min(index * 0.015, 0.25) }}
-      className="group flex items-center gap-2.5 rounded-lg px-3 py-2 transition-colors"
-      style={{ background: "var(--card)", border: "1px solid var(--border)", opacity: muted ? 0.85 : 1 }}
-      onMouseEnter={(e) => (e.currentTarget.style.background = "var(--card-hover)")}
-      onMouseLeave={(e) => (e.currentTarget.style.background = "var(--card)")}
-    >
+  const openPr = usePrOpener();
+  // PRs open the in-app detail; work items and pipelines link out to the provider.
+  const onClick = row.kind === "pr" ? () => openPr({ conn: row.connection_id, id: row.pull_request.id }) : undefined;
+  const common = {
+    initial: { opacity: 0, y: 4 },
+    animate: { opacity: 1, y: 0 },
+    transition: { duration: 0.2, delay: Math.min(index * 0.015, 0.25) },
+    className: "group flex items-center gap-2.5 rounded-lg px-3 py-2 transition-colors w-full text-left",
+    style: { background: "var(--card)", border: "1px solid var(--border)", opacity: muted ? 0.85 : 1, cursor: "pointer" },
+    onMouseEnter: (e: React.MouseEvent<HTMLElement>) => (e.currentTarget.style.background = "var(--card-hover)"),
+    onMouseLeave: (e: React.MouseEvent<HTMLElement>) => (e.currentTarget.style.background = "var(--card)"),
+  };
+  const inner = (
+    <>
       <span className={"shrink-0 " + (spin ? "spin" : "")} style={{ color: dot.color }}>
         {dot.icon}
       </span>
@@ -114,6 +116,15 @@ function ItemRow({ row, index, muted }: { row: LaunchpadRow; index: number; mute
           )}
         </div>
       </div>
+    </>
+  );
+  return onClick ? (
+    <motion.button {...common} onClick={onClick}>
+      {inner}
+    </motion.button>
+  ) : (
+    <motion.a {...common} href={href ?? undefined} target={href ? "_blank" : undefined} rel="noreferrer">
+      {inner}
     </motion.a>
   );
 }

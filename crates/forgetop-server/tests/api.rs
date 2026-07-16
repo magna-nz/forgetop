@@ -121,3 +121,120 @@ async fn seeded_demo_data_reaches_the_api() {
     assert!(rows[0]["bucket"].is_string(), "row carries a bucket key");
     assert!(rows[0]["kind"].is_string(), "row carries an item kind (flattened)");
 }
+
+#[tokio::test]
+async fn pr_detail_and_write_actions_reach_the_provider() {
+    let server = spawn(demo_deps(true).await, 0).await.expect("server binds");
+    let base = format!("http://127.0.0.1:{}", server.port);
+    let client = reqwest::Client::new();
+    let tok = server.token.clone();
+
+    // Pick a real PR from the list.
+    let prs: serde_json::Value = client
+        .get(format!("{base}/api/pull-requests"))
+        .header("x-forgetop-token", &tok)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let pr = &prs[0];
+    let conn = pr["connection_id"].as_str().unwrap();
+    let id = pr["pull_request"]["id"].as_str().unwrap();
+
+    let detail_url = format!("{base}/api/pr/detail?conn={conn}&id={id}");
+    let detail = client.get(&detail_url).header("x-forgetop-token", &tok).send().await.unwrap();
+    assert_eq!(detail.status(), 200);
+    let detail: serde_json::Value = detail.json().await.unwrap();
+    assert_eq!(detail["pull_request"]["id"], id);
+    assert!(detail["changes"].is_array() && detail["commits"].is_array());
+
+    // Submitting a review with a line comment (the demo persists it as a thread).
+    let review = client
+        .post(format!("{base}/api/pr/review"))
+        .header("x-forgetop-token", &tok)
+        .json(&serde_json::json!({
+            "conn": conn, "id": id, "event": "Approved",
+            "comments": [{ "path": "src/lib.rs", "line": 3, "side": "New", "body": "nice" }]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(review.status(), 200);
+
+    // It now comes back in the detail threads.
+    let after: serde_json::Value = client.get(&detail_url).header("x-forgetop-token", &tok).send().await.unwrap().json().await.unwrap();
+    let has_comment = after["threads"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|t| t["comments"].as_array().map(|c| c.iter().any(|x| x["body"] == "nice")).unwrap_or(false));
+    assert!(has_comment, "the submitted line comment is persisted and returned");
+
+    // Writes are gated by the token like everything under /api.
+    let unauth = client
+        .post(format!("{base}/api/pr/merge"))
+        .json(&serde_json::json!({ "conn": conn, "id": id }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauth.status(), 401, "an unauthenticated merge is rejected");
+
+    // A bad connection id is a 404, not a 500.
+    let missing = client
+        .post(format!("{base}/api/pr/vote"))
+        .header("x-forgetop-token", &tok)
+        .json(&serde_json::json!({ "conn": "nope", "id": id, "vote": "Approved" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), 404);
+}
+
+#[tokio::test]
+async fn work_item_pipeline_and_notification_writes() {
+    let server = spawn(demo_deps(true).await, 0).await.expect("server binds");
+    let base = format!("http://127.0.0.1:{}", server.port);
+    let client = reqwest::Client::new();
+    let tok = server.token.clone();
+    let hdr = |r: reqwest::RequestBuilder| r.header("x-forgetop-token", &tok);
+
+    // Work item: read available states, then transition.
+    let wis: serde_json::Value =
+        hdr(client.get(format!("{base}/api/work-items"))).send().await.unwrap().json().await.unwrap();
+    let wi = &wis[0];
+    let (wconn, wid) = (wi["connection_id"].as_str().unwrap(), wi["work_item"]["id"].as_str().unwrap());
+    let states: serde_json::Value =
+        hdr(client.get(format!("{base}/api/wi/states?conn={wconn}&id={wid}"))).send().await.unwrap().json().await.unwrap();
+    assert!(states.is_array(), "available states is an array");
+    let set = hdr(client.post(format!("{base}/api/wi/state")))
+        .json(&serde_json::json!({ "conn": wconn, "id": wid, "state": "In Progress" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(set.status(), 200);
+
+    // Pipeline: trigger a run for a discovered definition.
+    let pipes: serde_json::Value =
+        hdr(client.get(format!("{base}/api/pipelines"))).send().await.unwrap().json().await.unwrap();
+    let pipe = &pipes[0];
+    let (pconn, def) = (pipe["connection_id"].as_str().unwrap(), pipe["run"]["definition_id"].as_str().unwrap());
+    let trig = hdr(client.post(format!("{base}/api/pipeline/trigger")))
+        .json(&serde_json::json!({ "conn": pconn, "definition_id": def }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(trig.status(), 200);
+
+    // Notification: mark one read.
+    let notifs: serde_json::Value =
+        hdr(client.get(format!("{base}/api/notifications"))).send().await.unwrap().json().await.unwrap();
+    let n = &notifs[0];
+    let read = hdr(client.post(format!("{base}/api/notification/read")))
+        .json(&serde_json::json!({ "conn": n["connection_id"], "id": n["notification"]["id"] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(read.status(), 200);
+}
