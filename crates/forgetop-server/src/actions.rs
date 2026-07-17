@@ -52,6 +52,12 @@ pub struct PrMergeReq {
 }
 
 #[derive(Deserialize)]
+pub struct PrRevertReq {
+    pub conn: String,
+    pub id: String,
+}
+
+#[derive(Deserialize)]
 pub struct PrCommentReq {
     pub conn: String,
     pub id: String,
@@ -116,6 +122,11 @@ pub async fn pr_merge(sections: &SectionService, req: PrMergeReq) -> Result<(), 
     let source = dto::pr_source(sections, &req.conn).await.ok_or(ActionError::NotFound)?;
     let options = MergeOptions { strategy: req.strategy, delete_source_ref: req.delete_source_ref };
     source.merge(&req.id, &options).await.map_err(failed)
+}
+
+pub async fn pr_revert(sections: &SectionService, req: PrRevertReq) -> Result<(), ActionError> {
+    let source = dto::pr_source(sections, &req.conn).await.ok_or(ActionError::NotFound)?;
+    source.revert(&req.id).await.map_err(failed)
 }
 
 pub async fn pr_comment(sections: &SectionService, req: PrCommentReq) -> Result<(), ActionError> {
