@@ -114,12 +114,14 @@ async fn seeded_demo_data_reaches_the_api() {
     let health = get("/api/health").await;
     assert_eq!(health.as_array().unwrap().len(), 2);
 
-    // The launchpad aggregates across sections and tags each row with a triage bucket.
+    // The launchpad aggregates across sections and tags each row with a triage bucket, plus
+    // per-bucket overflow flags for the "more…" links.
     let lp = get("/api/launchpad").await;
-    let rows = lp.as_array().expect("launchpad is an array");
+    let rows = lp["rows"].as_array().expect("launchpad has a rows array");
     assert!(!rows.is_empty(), "launchpad returns triaged rows");
     assert!(rows[0]["bucket"].is_string(), "row carries a bucket key");
     assert!(rows[0]["kind"].is_string(), "row carries an item kind (flattened)");
+    assert!(lp["more"]["your_work"].is_boolean(), "carries overflow flags");
 }
 
 #[tokio::test]
@@ -141,6 +143,12 @@ async fn pr_views_map_to_provider_queries() {
     let all = rows(&get("all").await);
     assert!(!all.is_empty(), "all view returns rows");
     assert!(all.iter().all(|r| r["pull_request"]["status"] != "Merged"), "all view excludes merged");
+
+    // Your PRs: your own open PRs — authored by you, none merged.
+    let yours = rows(&get("yours").await);
+    assert!(!yours.is_empty(), "your-PRs view returns rows");
+    assert!(yours.iter().all(|r| r["pull_request"]["author"]["handle"] == "you"), "your-PRs view is authored by you");
+    assert!(yours.iter().all(|r| r["pull_request"]["status"] != "Merged"), "your-PRs view excludes merged");
 
     // Recently merged by you: every row is merged and authored by you.
     let merged = rows(&get("merged").await);

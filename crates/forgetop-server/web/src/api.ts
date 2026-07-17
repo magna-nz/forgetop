@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import type { ConnectionRow, HealthRow, LaunchpadRow, NotifRow, PipeRef, PipelineDetail, PipeRow, Preferences, PrDetail, PrRef, ProviderInfo, PrRow, WiDetail, WiRef, WiRow } from "./types";
+import type { ConnectionRow, HealthRow, LaunchpadResponse, NotifRow, PipeRef, PipelineDetail, PipeRow, Preferences, PrDetail, PrRef, ProviderInfo, PrRow, WiDetail, WiRef, WiRow } from "./types";
 
 // The session token arrives once in the URL (`/?t=…`). We stash it in sessionStorage (so a
 // refresh keeps working) and strip it from the visible URL, then replay it on every API call.
@@ -104,14 +104,14 @@ export const usePipelineDetail = (ref: PipeRef | null) =>
     enabled: !!ref,
   });
 
-export const useLaunchpad = () => useQuery({ queryKey: ["launchpad"], queryFn: () => api<LaunchpadRow[]>("/api/launchpad") });
+export const useLaunchpad = () => useQuery({ queryKey: ["launchpad"], queryFn: () => api<LaunchpadResponse>("/api/launchpad") });
 export const useHealth = () => useQuery({ queryKey: ["health"], queryFn: () => api<HealthRow[]>("/api/health") });
 export const useProviders = () =>
   useQuery({ queryKey: ["providers"], queryFn: () => api<ProviderInfo[]>("/api/providers"), staleTime: Infinity });
 export const useConnections = () => useQuery({ queryKey: ["connections"], queryFn: () => api<ConnectionRow[]>("/api/connections") });
 export const usePreferences = () => useQuery({ queryKey: ["preferences"], queryFn: () => api<Preferences>("/api/preferences") });
 /** Which slice of pull requests the PR page shows; maps to the backend `?view=` param. */
-export type PrView = "all" | "merged" | "review_requested";
+export type PrView = "all" | "yours" | "merged" | "review_requested";
 export const usePullRequests = (view: PrView = "all") =>
   useQuery({ queryKey: ["prs", view], queryFn: () => api<PrRow[]>(`/api/pull-requests?view=${view}`) });
 export const useWorkItems = () => useQuery({ queryKey: ["work-items"], queryFn: () => api<WiRow[]>("/api/work-items") });

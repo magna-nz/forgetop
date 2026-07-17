@@ -274,6 +274,19 @@ export type LaunchpadRow = LaunchpadBase &
     | { kind: "pipe"; run: PipelineRun; definition_name?: string | null }
   );
 
+/** Per-bucket overflow flags: true when the reference list had more than it shows. */
+export interface LaunchpadMore {
+  your_work: boolean;
+  your_open_prs: boolean;
+  recently_merged: boolean;
+  recent_pipelines: boolean;
+}
+
+export interface LaunchpadResponse {
+  rows: LaunchpadRow[];
+  more: LaunchpadMore;
+}
+
 export type FieldKey = "display_name" | "base_url" | "organization" | "project" | "repository" | "username" | "pat";
 
 export interface FieldSpec {

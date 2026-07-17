@@ -22,7 +22,7 @@ export function Sidebar({ section, onSelect }: { section: SectionId; onSelect: (
 
   const counts: Record<SectionId, number | undefined> = {
     // Launchpad badge counts only actionable (non-muted) items — things truly waiting on you.
-    launchpad: lp.data?.filter((r) => !r.muted).length,
+    launchpad: lp.data?.rows.filter((r) => !r.muted).length,
     prs: prs.data?.length,
     "work-items": wis.data?.length,
     pipelines: pipes.data?.length,
