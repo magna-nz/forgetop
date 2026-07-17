@@ -1,8 +1,8 @@
 # forgetop
 
-A fast, keyboard-driven terminal UI for your pull requests, work items, and CI
-pipelines - across **GitHub**, **GitLab**, **Azure DevOps**, **Linear**, **Jira**,
-and **Bitbucket** - in one place.
+A fast, keyboard-driven command center for your pull requests, work items, and CI
+pipelines - across **GitHub**, **GitLab**, **Azure DevOps**, **Linear**, **Jira**, and
+**Bitbucket** - in your **terminal**, your **browser**, or both.
 
 📖 **Docs: [magna-nz.github.io/forgetop](https://magna-nz.github.io/forgetop/)**
 
@@ -13,17 +13,27 @@ and **Bitbucket** - in one place.
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 <div align="center">
-  <img src="docs/everything1.gif" alt="forgetop demo" width="820">
+  <table>
+    <tr>
+      <td align="center" width="50%"><img src="docs/everything1.gif" alt="forgetop in the terminal" width="400"></td>
+      <td align="center" width="50%"><img src="docs/dashboard.gif" alt="forgetop web dashboard" width="400"></td>
+    </tr>
+    <tr>
+      <td align="center"><sub><b>In your terminal</b></sub></td>
+      <td align="center"><sub><b>…or your browser</b></sub></td>
+    </tr>
+  </table>
   <br/>
-  <sub>Live dashboard - Pull Requests, Work Items, Pipelines.</sub>
+  <sub>Same data, same actions - a keyboard-driven TUI <b>and</b> a web dashboard. Your call.</sub>
 </div>
 
 ---
 
-Modern teams spread work across several forges. forgetop pulls your pull requests,
-work items, and pipelines into one terminal dashboard - and lets you *act* on them
-(approve, merge, comment, change state, drill into pipeline stages, trigger runs)
-without leaving the keyboard. Tokens live in your OS keychain, never in plaintext.
+Modern teams spread work across several forges. forgetop pulls your pull requests, work
+items, and pipelines into one command center - and lets you *act* on them (approve, merge,
+comment, change state, drill into pipeline stages, trigger runs). Run it as a fast terminal
+UI, a browser dashboard, or **both at once** (the default). Tokens live in your OS keychain,
+never in plaintext.
 
 ## The Launchpad
 
@@ -71,6 +81,9 @@ and [azdo](https://github.com/Elpulgo/azdo) (Azure DevOps only). forgetop's angl
 | Cross-provider aggregation | ✅ | ❌ | ❌ |
 | Desktop notifications | ✅ | ❌ | ❌ |
 | Tokens in OS keychain | ✅ | via `gh` | PAT |
+
+…and all of it works the same in the **terminal UI** and the **web dashboard** - they're two
+frontends over one core.
 
 ## Providers
 
@@ -122,42 +135,27 @@ Then run it for real:
 forgetop
 ```
 
-On first launch — before any connection has a token — forgetop **opens the web
-dashboard in your browser** to set them up (or skip). Pick a provider, paste a
-token, choose which sections it feeds; it's stored in your OS keychain and shared
-straight back to the terminal. Press **`C`** in the TUI any time to reopen the
-connections page.
+This opens the **terminal UI and the dashboard together** (the default). On first launch —
+before any connection has a token — the dashboard drops into a quick setup: pick a provider,
+paste a token, choose which sections it feeds. Tokens go to your OS keychain and are shared
+straight back to the terminal. Press **`C`** in the TUI (or open **Settings**) to manage
+connections any time.
 
-<div align="center">
-  <img src="docs/wizard.gif" alt="Setting up a connection" width="720">
-  <br/>
-  <sub>Setting up a connection: pick a provider, paste a token, choose sections.</sub>
-</div>
+If something isn't connecting, run `forgetop doctor` — it checks your config, keychain
+access, and each connection's token + connectivity.
 
-If something isn't connecting, run `forgetop doctor` — it checks your config,
-keychain access, and each connection's token + connectivity.
+## Terminal or browser
 
-## Web dashboard
+The dashboard is the **same app** as the TUI — Launchpad, all three lists, PR review with an
+inline-comment diff viewer, the command palette, sort/filter, themes, and every write action
+— served by forgetop itself, built into the binary, on **`127.0.0.1` only** with a
+per-session token. No separate install, no external network.
 
-Prefer a browser? forgetop ships the **same UI as a local web dashboard** — the
-Launchpad, all three lists, PR review with an inline-comment diff viewer, a
-command palette (`⌘K`), and every write action (approve, merge, comment,
-transition, approve a deploy gate, mark read).
-
-- **From the TUI:** press **`B`** to open it — running `forgetop` already serves
-  it in the background.
-- **Headless:** `forgetop --dashboard` serves it and opens your browser (no TTY
-  needed — handy over SSH with a forwarded port).
-
-By default `forgetop` opens **both** the terminal UI and the dashboard together.
-Change that under **Settings → When forgetop starts** (or press **`,`** in the
-TUI): *dashboard + terminal* (default), *terminal only*, or *dashboard only*. The
-choice is stored in your config and shared between the two.
-
-It binds to **`127.0.0.1` only** and is gated by a **per-session token** baked
-into the URL, so nothing else on your machine (or a web page you visit) can reach
-your data or act on your behalf. The dashboard is built into the binary — no
-separate install, no external network.
+- `forgetop` opens **both** (the default). Press **`B`** in the TUI to open the browser, or
+  run **`forgetop --dashboard`** for browser-only (handy over SSH with a forwarded port).
+- Choose what launches under **Settings → When forgetop starts** (or **`,`** in the TUI):
+  *dashboard + terminal*, *terminal only*, or *dashboard only* — stored in your config,
+  shared between the two.
 
 ## Documentation
 
