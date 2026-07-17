@@ -4,10 +4,10 @@ title: Documentation
 
 # forgetop
 
-A fast, keyboard-driven terminal UI for your **pull requests, work items, and CI
-pipelines** — across GitHub, GitLab, Azure DevOps, Bitbucket, Linear, and Jira —
-in one place. Triage and *act* on everything without leaving the terminal, and
-without tab-hopping between forges.
+A fast, keyboard-driven command center for your **pull requests, work items, and CI
+pipelines** — across GitHub, GitLab, Azure DevOps, Bitbucket, Linear, and Jira — in
+one place. Triage and *act* on everything without tab-hopping between forges, as a
+terminal UI **and** a web dashboard.
 
 This is the full reference. For install and a 60-second start, see the
 [README](https://github.com/magna-nz/forgetop#readme).
@@ -15,6 +15,7 @@ This is the full reference. For install and a 60-second start, see the
 - [What forgetop does](#what-forgetop-does)
 - [Core concepts](#core-concepts)
 - [Getting started](#getting-started)
+- [Web dashboard](#web-dashboard)
 - [Launchpad](#launchpad)
 - [Pull Requests](#pull-requests)
 - [Work Items](#work-items)
@@ -35,6 +36,8 @@ This is the full reference. For install and a 60-second start, see the
 - **The Launchpad** — the default landing screen: one cross-provider **action inbox**
   that triages every PR, work item, and pipeline into "what needs you", so you start
   on your queue instead of scrolling three separate lists.
+- **Terminal *or* browser** — the same app as a keyboard-driven TUI *and* a local
+  **web dashboard**, opened together by default. Everything below works in both.
 - **Three sections in one dashboard** — Pull Requests, Work Items, and Pipelines,
   each a tab you can act on.
 - **Six forges** — GitHub, GitLab, Azure DevOps, Bitbucket, Linear, and Jira, plus
@@ -75,8 +78,8 @@ This is the full reference. For install and a 60-second start, see the
 
 forgetop has three **sections**: Pull Requests, Work Items, and Pipelines. Each is
 bound to one or more **connections** (a configured account on a forge). A section
-only shows data from the connections bound to it. You manage bindings on the
-config screen (`C`).
+only shows data from the connections bound to it. You manage connections and
+bindings in the [web dashboard](#web-dashboard) — press `C` in the TUI to open it.
 
 ### Providers and capabilities
 
@@ -111,6 +114,12 @@ Linux Secret Service). The JSON config only stores a *reference* to each token �
 never the secret itself. For headless use you can supply a token via an
 environment variable instead (see [Configuration](#configuration)).
 
+The [web dashboard](#web-dashboard) is served on **`127.0.0.1` only**, gated by a
+**per-session token** carried in its URL. Because its API can act on your behalf
+(merge a PR, change a state), it never listens off-loopback and never accepts
+cross-origin requests; the token is never returned by the API, written to config,
+or logged.
+
 ## Getting started
 
 Try it with no setup — everything is in memory, nothing is written:
@@ -119,17 +128,18 @@ Try it with no setup — everything is in memory, nothing is written:
 forgetop --demo
 ```
 
-Then run it for real. On first launch (no connections) forgetop drops straight
-into the **add-connection wizard**, which walks you through picking a provider,
-entering details, pasting a token, and binding it to a section. It then offers a
-notifications chooser.
+Then run it for real:
 
 ```sh
 forgetop
 ```
 
-Press **`C`** any time to open the config screen and manage connections and
-bindings; **`n`** starts the wizard again; **`?`** shows every keybinding.
+This opens the **terminal UI and the web dashboard together** (the default). On
+first launch — before any connection has a token — the dashboard drops into a quick
+setup: pick a provider, paste a token, choose which sections it feeds. Tokens go to
+your OS keychain and are shared straight back to the terminal. Press **`C`** in the
+TUI (or open the dashboard's **Settings**) to manage connections any time, and
+**`?`** shows every keybinding. See [Web dashboard](#web-dashboard) for the run modes.
 
 ### Diagnosing setup
 
@@ -148,11 +158,61 @@ or an expired credential.
 
 | Command | What it does |
 | --- | --- |
-| `forgetop` | Launch the dashboard |
+| `forgetop` | Launch — the terminal UI and the web dashboard together (default) |
+| `forgetop --dashboard` | Serve **only** the web dashboard (headless — no TUI) |
 | `forgetop --demo` (`-d`) | Launch with built-in demo data (no setup) |
 | `forgetop doctor` | Diagnose config, keychain access, and connection health |
 | `forgetop --version` (`-V`) | Print the version and exit |
 | `forgetop --help` (`-h`) | Show usage and exit |
+
+Set **`FORGETOP_STARTUP`** = `both` / `terminal_only` / `dashboard_only` to override
+what launches for a single run (handy with `--demo`, whose config is in-memory).
+
+## Web dashboard
+
+forgetop ships the **same app as a local web dashboard** — the Launchpad, all three
+lists, PR review with an inline-comment diff viewer, the command palette, sort/filter,
+themes, and every write action (approve, merge, comment, submit a review, change a
+work-item state, approve a pipeline gate, retry a run, mark a notification read). It's
+a React app **built into the binary** and served by forgetop itself — no separate
+install, no external network.
+
+The terminal UI and the dashboard are two frontends over one core, so they show the
+**same data**, act through the **same providers**, and share the **same config +
+keychain** — a connection or a setting changed in one shows up in the other.
+
+### Opening it
+
+- **From the TUI:** press **`B`** (shown in the footer and `?` help on every screen).
+- **Headless:** `forgetop --dashboard` serves it and opens your browser — no TTY, so
+  it's handy over SSH with a forwarded port.
+- By default, running `forgetop` opens **both** at once.
+
+### When forgetop starts
+
+A shared preference decides what launches — set it in the dashboard under **Settings →
+When forgetop starts**, or press **`,`** in the TUI:
+
+| Option | Behaviour |
+| --- | --- |
+| **Dashboard + terminal** (default) | Opens both together |
+| **Terminal only** | Just the TUI (the server still runs in the background, so `B` works) |
+| **Dashboard only** | Just the browser dashboard — same as `forgetop --dashboard` |
+
+The choice is stored in your config and shared between the two. For a one-off override
+(without changing the saved setting) use the `FORGETOP_STARTUP` env var above.
+
+### Connections & settings
+
+Connection setup lives in the dashboard's **Settings** page: add a provider from a
+form tailored to it, paste a token (stored in the OS keychain), tick which sections it
+feeds, and **Test** / **Edit** / **Delete** it. First launch with nothing set up opens
+this automatically. Pressing **`C`** in the TUI jumps straight here.
+
+### Security
+
+The server binds **`127.0.0.1` only** and gates its API with a **per-session token** in
+the URL — see [Security](#security).
 
 ## Launchpad
 
@@ -414,9 +474,8 @@ forgetop raises native desktop notifications on the events you choose:
   authored.
 
 Press **`N`** anywhere to open a checklist and opt in/out of each event; the
-choice is persisted, and the first-run wizard asks after your first connection.
-Detection is seeded on load (no startup spam), de-duped, and re-seeded when you
-change settings — and enabling fires one confirmation notification so you can
+choice is persisted. Detection is seeded on load (no startup spam), de-duped, and
+re-seeded when you change settings — and enabling fires one confirmation notification so you can
 verify it works on your machine. Every event spans **all bound providers**, not
 just the first.
 
@@ -436,9 +495,10 @@ the keys valid for where you are. Press `?` for the full panel. The complete set
 | `/` | Quick-filter the current list |
 | `S` | Sort by a column (re-pick flips direction) |
 | `o` | Open selected item in browser |
-| `n` | Add a connection (wizard) |
+| `B` | Open the web dashboard in your browser |
+| `,` | Settings — what forgetop opens on launch |
 | `v` | Choose which tabs are visible |
-| `C` | Config / connections screen |
+| `C` | Open the connections page (in the web dashboard) |
 | `r` | Refresh · `t` cycle theme |
 | `N` | Notifications — choose which events ping you |
 | `?` | Show all keybindings (anywhere) |
@@ -502,7 +562,11 @@ the keys valid for where you are. Press `?` for the full panel. The complete set
 | `o` | Open the selected job in the browser |
 | `T` | Trigger a run |
 
-### Config / connections
+### Connections (terminal fallback)
+
+Connection management lives in the [web dashboard](#web-dashboard) — `C` opens it and
+also shows a connections list in the terminal. That list still supports the original
+keys as a fallback:
 
 | Key | Action |
 | --- | --- |
@@ -527,10 +591,11 @@ notification choices).
 
 ### Tokens
 
-Tokens are stored in your OS keychain under the service name `forgetop`. In
-headless environments (CI, containers) you can instead supply a token via an
-environment variable named `FORGETOP_PAT_<CONNECTION_ID>` (uppercased;
-non-alphanumeric characters become `_`).
+You add connections and paste tokens in the dashboard's **Settings** page (see
+[Web dashboard](#web-dashboard)); each token is stored in your OS keychain under the
+service name `forgetop`. In headless environments (CI, containers) you can instead
+supply a token via an environment variable named `FORGETOP_PAT_<CONNECTION_ID>`
+(uppercased; non-alphanumeric characters become `_`).
 
 ### Logs & diagnostics
 
@@ -560,9 +625,11 @@ so it's easy to include when reporting an issue.
 
 ## Themes
 
-Cycle with `t`. Four built-in themes — `slate` (default), `dark`, `light`, and
-`matrix` — using 256-colour palettes so they render correctly on every terminal
-(including ones without truecolor). Your choice is remembered.
+Four built-in themes — `slate` (default), `dark`, `light`, and `matrix`. In the
+terminal, cycle with `t` (256-colour palettes, so they render correctly on every
+terminal, including ones without truecolor); in the [web dashboard](#web-dashboard),
+use the theme toggle in the sidebar footer. Each side remembers your choice (the
+dashboard's per browser).
 
 ## How it works (architecture)
 
@@ -573,6 +640,7 @@ forgetop is a Rust [Cargo workspace](https://doc.rust-lang.org/cargo/reference/w
 | `forgetop-core` | Domain model, capability-scoped provider traits, config, secrets, services |
 | `forgetop-providers` | GitHub, GitLab, Azure DevOps, Linear, Jira, Bitbucket, and Demo implementations |
 | `forgetop-tui` | The [ratatui](https://ratatui.rs) terminal UI |
+| `forgetop-server` | The web dashboard — an [axum](https://github.com/tokio-rs/axum) server + an embedded React SPA, over the same services |
 | `forgetop-cli` | The `forgetop` binary |
 
 A few design ideas hold it together:

@@ -1,3 +1,3 @@
 title: forgetop
-description: A keyboard-driven terminal UI for pull requests, work items, and CI pipelines across GitHub, GitLab, Azure DevOps, Linear, Jira, and Bitbucket.
+description: Pull requests, work items, and CI pipelines across GitHub, GitLab, Azure DevOps, Bitbucket, Linear, and Jira — a keyboard-driven terminal UI and a web dashboard.
 theme: jekyll-theme-cayman

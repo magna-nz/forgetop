@@ -15,8 +15,8 @@ and **Jira** — in your **terminal**, your **browser**, or both.
 <div align="center">
   <table>
     <tr>
-      <td align="center" width="50%"><img src="docs/everything1.gif" alt="forgetop in the terminal" width="400"></td>
-      <td align="center" width="50%"><img src="docs/dashboard.gif" alt="forgetop web dashboard" width="400"></td>
+      <td align="center" width="50%"><img src="docs/launchpad2.gif" alt="The Launchpad in the terminal" width="400"></td>
+      <td align="center" width="50%"><img src="docs/dashboard.gif" alt="The Launchpad in the web dashboard" width="400"></td>
     </tr>
     <tr>
       <td align="center"><sub><b>In your terminal</b></sub></td>
@@ -24,7 +24,7 @@ and **Jira** — in your **terminal**, your **browser**, or both.
     </tr>
   </table>
   <br/>
-  <sub>Same data, same actions — a keyboard-driven TUI <b>and</b> a web dashboard. Your call.</sub>
+  <sub>The <b>Launchpad</b> — the same triaged, actionable queue in your terminal and your browser. Same data, same actions. Your call.</sub>
 </div>
 
 ---
@@ -48,12 +48,6 @@ forge — lands on a single page, ordered by urgency, in two columns:
 Every item is shown in the same shape, so they're comparable at a glance — and you act on
 any of them inline (approve a review, merge, clear a pipeline gate) without switching tabs.
 Nothing slips through the cracks.
-
-<div align="center">
-  <img src="docs/launchpad2.gif" alt="The Launchpad — a cross-provider action queue" width="820">
-  <br/>
-  <sub>The Launchpad: everything that needs you, across every forge, on one page.</sub>
-</div>
 
 See the [Launchpad docs](https://magna-nz.github.io/forgetop/#launchpad) for the full
 bucket rules and keys.
