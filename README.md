@@ -1,8 +1,8 @@
 # forgetop
 
 A fast, keyboard-driven command center for your pull requests, work items, and CI
-pipelines - across **GitHub**, **GitLab**, **Azure DevOps**, **Linear**, **Jira**, and
-**Bitbucket** - in your **terminal**, your **browser**, or both.
+pipelines — across **GitHub**, **GitLab**, **Azure DevOps**, **Bitbucket**, **Linear**,
+and **Jira** — in your **terminal**, your **browser**, or both.
 
 📖 **Docs: [magna-nz.github.io/forgetop](https://magna-nz.github.io/forgetop/)**
 
@@ -24,40 +24,43 @@ pipelines - across **GitHub**, **GitLab**, **Azure DevOps**, **Linear**, **Jira*
     </tr>
   </table>
   <br/>
-  <sub>Same data, same actions - a keyboard-driven TUI <b>and</b> a web dashboard. Your call.</sub>
+  <sub>Same data, same actions — a keyboard-driven TUI <b>and</b> a web dashboard. Your call.</sub>
 </div>
 
 ---
 
-Modern teams spread work across several forges. forgetop pulls your pull requests, work
-items, and pipelines into one command center - and lets you *act* on them (approve, merge,
-comment, change state, drill into pipeline stages, trigger runs). Run it as a fast terminal
-UI, a browser dashboard, or **both at once** (the default). Tokens live in your OS keychain,
-never in plaintext.
+Checking GitHub for reviews, Azure for failing builds, and Jira for tickets is a lot of
+tabs. forgetop pulls your pull requests, work items, and pipelines into one command center
+— and lets you *act* on them (approve, merge, comment, change state, drill into pipeline
+stages, trigger runs). Run it as a fast terminal UI, a browser dashboard, or **both at
+once** (the default). Tokens live in your OS keychain, never in plaintext.
 
 ## The Launchpad
 
-forgetop opens on the **Launchpad** - one cross-provider queue answering *what needs me
-right now?* Every PR, work item, and pipeline that needs you - across every connected
-forge - lands on a single page, ordered by urgency, in two columns:
+forgetop opens on the **Launchpad** — one cross-provider queue answering *what needs me
+right now?* Every PR, work item, and pipeline that needs you — across every connected
+forge — lands on a single page, ordered by urgency, in two columns:
 
-- **Needs you** - reviews requested of you, pipeline gates to approve, PRs ready to
+- **Needs you** — reviews requested of you, pipeline gates to approve, PRs ready to
   merge, and anything of yours that's broken.
-- **Your work** - your assigned tickets, open PRs, and recent merges.
+- **Your work** — your assigned tickets, open PRs, and recent merges.
 
-So instead of checking GitHub for reviews, Azure for failing builds, and Jira for
-tickets, you start your day on one triaged list - every item in the same shape, so
-they're comparable at a glance - and act on any of them inline. No tab-hopping, nothing
-slipping through the cracks.
+Every item is shown in the same shape, so they're comparable at a glance — and you act on
+any of them inline (approve a review, merge, clear a pipeline gate) without switching tabs.
+Nothing slips through the cracks.
 
 <div align="center">
-  <img src="docs/launchpad2.gif" alt="The Launchpad - a cross-provider action queue" width="820">
+  <img src="docs/launchpad2.gif" alt="The Launchpad — a cross-provider action queue" width="820">
   <br/>
   <sub>The Launchpad: everything that needs you, across every forge, on one page.</sub>
 </div>
 
 See the [Launchpad docs](https://magna-nz.github.io/forgetop/#launchpad) for the full
 bucket rules and keys.
+
+Two more ways to stay on top of things: **`i`** opens a cross-provider **notification
+inbox** (mentions, review requests, CI failures, assignments), and **`Ctrl-P`** is a
+**fuzzy command palette** that jumps to any PR, work item, or pipeline across every forge.
 
 ## Why forgetop
 
@@ -119,7 +122,7 @@ Apple Silicon + Intel, Linux x86_64 + arm64, Windows x86_64).
 
 ## Quick start
 
-Try it with no setup - everything is in-memory, nothing is written:
+Try it with no setup — everything is in-memory, nothing is written:
 
 ```sh
 forgetop --demo
@@ -162,11 +165,11 @@ per-session token. No separate install, no external network.
 forgetop shows a **context-aware key glossary** along the bottom, so you rarely
 need a reference. The full docs live at **[magna-nz.github.io/forgetop](https://magna-nz.github.io/forgetop/)**:
 
-- [Launchpad](https://magna-nz.github.io/forgetop/#launchpad) - the cross-provider action inbox
-- [Keybindings](https://magna-nz.github.io/forgetop/#keybindings) - every key, per screen
-- [Configuration &amp; tokens](https://magna-nz.github.io/forgetop/#configuration) - config paths, keychain, token scopes per provider
+- [Launchpad](https://magna-nz.github.io/forgetop/#launchpad) — the cross-provider action inbox
+- [Keybindings](https://magna-nz.github.io/forgetop/#keybindings) — every key, per screen
+- [Configuration &amp; tokens](https://magna-nz.github.io/forgetop/#configuration) — config paths, keychain, token scopes per provider
 - [Themes](https://magna-nz.github.io/forgetop/#themes)
-- [How it works](https://magna-nz.github.io/forgetop/#how-it-works) - architecture
+- [How it works](https://magna-nz.github.io/forgetop/#how-it-works) — architecture
 
 ## Contributing
 
