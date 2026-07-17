@@ -7,16 +7,16 @@ export interface ListControls {
   status: string; // "" = all statuses
 }
 
-function usePref(key: string): [ListControls, (patch: Partial<ListControls>) => void] {
+function usePref(key: string, defaultStatus = ""): [ListControls, (patch: Partial<ListControls>) => void] {
   const storageKey = `forgetop_ctl_${key}`;
   const [state, setState] = useState<ListControls>(() => {
     try {
       const s = localStorage.getItem(storageKey);
-      if (s) return { sort: 0, conn: "", status: "", ...JSON.parse(s) };
+      if (s) return { sort: 0, conn: "", status: defaultStatus, ...JSON.parse(s) };
     } catch {
       /* ignore */
     }
-    return { sort: 0, conn: "", status: "" };
+    return { sort: 0, conn: "", status: defaultStatus };
   });
   const patch = (p: Partial<ListControls>) =>
     setState((prev) => {
@@ -47,8 +47,10 @@ export function useListView<T>(opts: {
   sorts: SortOption<T>[];
   statuses?: StatusOption<T>[];
   statusLabel?: string;
+  /** Index into `statuses` to select on first visit (before the user picks). Defaults to "All". */
+  defaultStatus?: number;
 }): { rows: T[]; bar: React.ReactNode; total: number } {
-  const [ctl, patch] = usePref(opts.storageKey);
+  const [ctl, patch] = usePref(opts.storageKey, opts.defaultStatus != null ? String(opts.defaultStatus) : "");
   const all = opts.rows ?? [];
 
   const connections = useMemo(() => {
