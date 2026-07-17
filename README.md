@@ -34,24 +34,22 @@ once** (the default). Tokens live in your OS keychain, never in plaintext.
 
 ## The Launchpad
 
-forgetop opens on the **Launchpad** — one cross-provider queue answering *what needs me
-right now?* Every PR, work item, and pipeline that needs you — across every connected
-forge — lands on a single page, ordered by urgency, in two columns:
+forgetop opens on the **Launchpad** — one queue answering *what needs me right now?*
+Everything that needs you, from every connected forge, on a single page ordered by
+urgency, in two columns:
 
 - **Needs you** — reviews requested of you, pipeline gates to approve, PRs ready to
   merge, and anything of yours that's broken.
 - **Your work** — your assigned tickets, open PRs, and recent merges.
 
-Every item is shown in the same shape, so they're comparable at a glance — and you act on
-any of them inline (approve a review, merge, clear a pipeline gate) without switching tabs.
-Nothing slips through the cracks.
+Every item reads in the same shape, so they're comparable at a glance — and you act on
+any of them inline, without switching tabs. See the
+[Launchpad docs](https://magna-nz.github.io/forgetop/#launchpad) for the full bucket
+rules and keys.
 
-See the [Launchpad docs](https://magna-nz.github.io/forgetop/#launchpad) for the full
-bucket rules and keys.
-
-Two more ways to stay on top of things: **`i`** opens a cross-provider **notification
-inbox** (mentions, review requests, CI failures, assignments), and **`Ctrl-P`** is a
-**fuzzy command palette** that jumps to any PR, work item, or pipeline across every forge.
+Two more cross-provider views: **`i`** opens a **notification inbox** (mentions, review
+requests, CI failures, assignments), and a **fuzzy command palette** jumps to any item —
+**`Ctrl-P`** in the terminal, **`⌘K`** in the dashboard.
 
 ## Why forgetop
 
@@ -76,16 +74,12 @@ and [azdo](https://github.com/Elpulgo/azdo) (Azure DevOps only). forgetop's angl
 | Desktop notifications | ✅ | ❌ | ❌ |
 | Tokens in OS keychain | ✅ | via `gh` | PAT |
 
-…and all of it works the same in the **terminal UI** and the **web dashboard** - they're two
+…and all of it works the same in the **terminal UI** and the **web dashboard** — they're two
 frontends over one core.
 
-## Providers
-
-**GitHub · GitLab · Azure DevOps · Bitbucket · Linear · Jira** (plus a built-in `--demo`).
-Each section — Pull Requests, Work Items, Pipelines — binds to the forges that serve it, and
-Pipelines can aggregate several at once. For exactly what each provider serves (and the
-notification-feed support), see the
-[capability matrix](https://magna-nz.github.io/forgetop/#providers-and-capabilities).
+Each section binds to the forges that serve it (Pipelines can aggregate several at once); see
+the [capability matrix](https://magna-nz.github.io/forgetop/#providers-and-capabilities) for
+exactly what each provider serves, including notification-feed support.
 
 ## Install
 
