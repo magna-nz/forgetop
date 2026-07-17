@@ -96,6 +96,14 @@ async fn run() -> Result<()> {
     // port if the default is taken (e.g. a second forgetop) so the dashboard is virtually always up.
     let dashboard_url = spawn_dashboard(server_deps).await;
 
+    // `both` (the default): open the dashboard in the browser alongside the TUI. `terminal_only`
+    // keeps it in the background until `B`.
+    if startup_mode == StartupMode::Both {
+        if let Some(url) = &dashboard_url {
+            let _ = open::that(url);
+        }
+    }
+
     let theme = config.snapshot().ui.theme.clone().unwrap_or_else(|| "slate".into());
     let deps = AppDeps { sections, health, config };
     forgetop_tui::run(deps, &theme, dashboard_url).await

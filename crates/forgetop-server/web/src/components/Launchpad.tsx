@@ -5,6 +5,8 @@ import type { LaunchpadRow } from "../types";
 import { ProviderBadge, Skeleton, StateCard } from "./ui";
 import { ErrorState } from "./ErrorState";
 import { usePrOpener } from "./PrDetail";
+import { useWiOpener } from "./WiDetail";
+import { usePipelineOpener } from "./PipelineDetail";
 
 export function Launchpad() {
   const { data, isLoading, error } = useLaunchpad();
@@ -82,10 +84,17 @@ function BucketGroup({ group }: { group: Group }) {
 }
 
 function ItemRow({ row, index, muted }: { row: LaunchpadRow; index: number; muted: boolean }) {
-  const { dot, spin, title, meta, href } = describe(row);
+  const { dot, spin, title, meta } = describe(row);
   const openPr = usePrOpener();
-  // PRs open the in-app detail; work items and pipelines link out to the provider.
-  const onClick = row.kind === "pr" ? () => openPr({ conn: row.connection_id, id: row.pull_request.id }) : undefined;
+  const openWi = useWiOpener();
+  const openPipe = usePipelineOpener();
+  // Every card kind opens its in-app detail panel, matching the list views.
+  const onClick =
+    row.kind === "pr"
+      ? () => openPr({ conn: row.connection_id, id: row.pull_request.id })
+      : row.kind === "wi"
+        ? () => openWi({ conn: row.connection_id, id: row.work_item.id })
+        : () => openPipe({ conn: row.connection_id, runId: row.run.id });
   const common = {
     initial: { opacity: 0, y: 4 },
     animate: { opacity: 1, y: 0 },
@@ -118,14 +127,10 @@ function ItemRow({ row, index, muted }: { row: LaunchpadRow; index: number; mute
       </div>
     </>
   );
-  return onClick ? (
+  return (
     <motion.button {...common} onClick={onClick}>
       {inner}
     </motion.button>
-  ) : (
-    <motion.a {...common} href={href ?? undefined} target={href ? "_blank" : undefined} rel="noreferrer">
-      {inner}
-    </motion.a>
   );
 }
 
@@ -134,7 +139,6 @@ function describe(row: LaunchpadRow): {
   spin: boolean;
   title: string;
   meta: string;
-  href?: string | null;
 } {
   if (row.kind === "pr") {
     const pr = row.pull_request;
@@ -145,7 +149,6 @@ function describe(row: LaunchpadRow): {
       spin: pr.checks === "Pending",
       title: pr.title,
       meta: `${pr.number != null ? "#" + pr.number : ""}${relativeTime(pr.updated_at) ? " · " + relativeTime(pr.updated_at) : ""}${c}`,
-      href: pr.url,
     };
   }
   if (row.kind === "wi") {
@@ -155,7 +158,6 @@ function describe(row: LaunchpadRow): {
       spin: false,
       title: wi.title,
       meta: `${wi.identifier ?? ""}${relativeTime(wi.updated_at) ? " · " + relativeTime(wi.updated_at) : ""}`,
-      href: wi.url,
     };
   }
   const run = row.run;
@@ -166,7 +168,6 @@ function describe(row: LaunchpadRow): {
     spin: m.running,
     title: row.definition_name ? `${row.definition_name} · ${label}` : label,
     meta: `${run.branch ?? ""}${relativeTime(run.finished_at ?? run.started_at) ? " · " + relativeTime(run.finished_at ?? run.started_at) : ""}`,
-    href: run.url,
   };
 }
 
