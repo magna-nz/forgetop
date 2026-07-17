@@ -128,6 +128,38 @@ impl ConfigService {
         self.persist(cfg).await
     }
 
+    /// Removes a single connection from the PR section (leaves others bound).
+    pub async fn unbind_pull_requests(&self, connection_id: &str) -> Result<()> {
+        let mut cfg = self.snapshot();
+        if let Some(b) = &mut cfg.pull_requests {
+            let ids: Vec<String> = b.ids().into_iter().filter(|c| c != connection_id).collect();
+            cfg.pull_requests = (!ids.is_empty()).then_some(PullRequestBinding { connection_ids: ids, connection_id: None });
+        }
+        self.persist(cfg).await
+    }
+
+    /// Removes a single connection from the work-item section (leaves others bound).
+    pub async fn unbind_work_items(&self, connection_id: &str) -> Result<()> {
+        let mut cfg = self.snapshot();
+        if let Some(b) = &mut cfg.work_items {
+            let ids: Vec<String> = b.ids().into_iter().filter(|c| c != connection_id).collect();
+            cfg.work_items = (!ids.is_empty()).then_some(WorkItemBinding { connection_ids: ids, connection_id: None });
+        }
+        self.persist(cfg).await
+    }
+
+    /// Drops a connection's pipeline subscription entirely (unbinds it from the section).
+    pub async fn unbind_pipelines(&self, connection_id: &str) -> Result<()> {
+        let mut cfg = self.snapshot();
+        if let Some(p) = &mut cfg.pipelines {
+            p.subscriptions.retain(|s| s.connection_id != connection_id);
+            if p.subscriptions.is_empty() {
+                cfg.pipelines = None;
+            }
+        }
+        self.persist(cfg).await
+    }
+
     /// Replaces the PR section's connections with an explicit set (multi-bind).
     pub async fn set_pull_request_connections(&self, connection_ids: Vec<String>) -> Result<()> {
         let mut cfg = self.snapshot();
@@ -199,6 +231,12 @@ impl ConfigService {
     pub async fn set_theme(&self, theme: Option<String>) -> Result<()> {
         let mut cfg = self.snapshot();
         cfg.ui.theme = theme;
+        self.persist(cfg).await
+    }
+
+    pub async fn set_startup_mode(&self, mode: crate::config::StartupMode) -> Result<()> {
+        let mut cfg = self.snapshot();
+        cfg.ui.startup_mode = mode;
         self.persist(cfg).await
     }
 

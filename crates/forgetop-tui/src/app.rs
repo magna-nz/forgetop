@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::{DateTime, Local, Utc};
-use forgetop_core::config::{NotificationPrefs, SavedView, SortPref};
+use forgetop_core::config::{NotificationPrefs, SavedView, SortPref, StartupMode};
 use forgetop_core::domain::*;
 use forgetop_core::provider::*;
 use forgetop_core::service::{ConfigService, ConnectionHealth, ConnectionHealthService, SectionService};
@@ -136,6 +136,8 @@ pub struct App {
     /// The cross-provider notification inbox (distinct from `notifications`, the desktop-ping prefs).
     pub inbox: Vec<NotifRow>,
     pub inbox_sel: usize,
+    /// URL of the embedded web dashboard, if its server started. `B` opens it.
+    pub dashboard_url: Option<String>,
     pub pr_state: TableState,
     pub wi_state: TableState,
     pub pipe_state: TableState,
@@ -642,6 +644,7 @@ impl App {
             pipes: Vec::new(),
             inbox: Vec::new(),
             inbox_sel: 0,
+            dashboard_url: None,
             pr_state: TableState::default(),
             wi_state: TableState::default(),
             pipe_state: TableState::default(),
@@ -1077,6 +1080,21 @@ impl App {
         });
     }
 
+    /// Settings: choose what `forgetop` opens on launch (shared with the dashboard).
+    fn open_startup_picker(&mut self, deps: &AppDeps) {
+        let selected = match deps.config.snapshot().ui.startup_mode {
+            StartupMode::Both => 0,
+            StartupMode::TerminalOnly => 1,
+            StartupMode::DashboardOnly => 2,
+        };
+        self.overlay = Some(Overlay::Picker {
+            title: "When forgetop starts".into(),
+            items: vec!["Dashboard + terminal (default)".into(), "Terminal only".into(), "Dashboard only".into()],
+            selected,
+            kind: PickerKind::StartupMode,
+        });
+    }
+
     /// Applies a chosen sort column: same column toggles direction, a new column
     /// starts at its sensible default direction. Persists the choice.
     async fn apply_sort(&mut self, section: usize, index: usize, deps: &AppDeps) {
@@ -1209,8 +1227,8 @@ impl App {
             Key::Char(c @ '1'..='4') => self.set_tab(c as usize - '1' as usize),
             Key::Enter => self.open_launchpad_selected(deps).await,
             Key::Char('r') => self.request_reload(deps),
-            Key::Char('n') => self.start_add_connection(),
-            Key::Char('C') => self.open_config(deps).await,
+            Key::Char('C') => self.open_connections(deps).await,
+            Key::Char(',') => self.open_startup_picker(deps),
             Key::Char('t') => {
                 let next = Theme::next(self.theme.name);
                 self.theme = Theme::by_name(next);
@@ -1302,6 +1320,25 @@ impl App {
     }
 
     // ---- notification inbox ----
+
+    /// Open the web dashboard in the browser, if its server is running.
+    pub fn open_dashboard(&mut self) {
+        self.open_dashboard_at("");
+    }
+
+    /// Open the dashboard at a specific view (e.g. `#settings` for connection management).
+    fn open_dashboard_at(&mut self, hash: &str) {
+        self.toast = Some(match &self.dashboard_url {
+            Some(url) => {
+                let target = format!("{url}{hash}");
+                match open::that(&target) {
+                    Ok(_) => "Opening dashboard in your browser…".into(),
+                    Err(e) => format!("Couldn't open dashboard: {e}"),
+                }
+            }
+            None => "Web dashboard isn't running — start it with `forgetop --dashboard`".into(),
+        });
+    }
 
     /// Number of unread notifications — drives the header indicator.
     pub fn unread_count(&self) -> usize {
@@ -1715,6 +1752,11 @@ impl App {
         if key == Key::Char('i') && matches!(self.screen, Screen::List | Screen::Launchpad) {
             self.inbox_sel = self.inbox_sel.min(self.inbox.len().saturating_sub(1));
             self.screen = Screen::Inbox;
+            return;
+        }
+        // `B` opens the web dashboard in the browser (available from anywhere).
+        if key == Key::Char('B') {
+            self.open_dashboard();
             return;
         }
 
@@ -2239,9 +2281,9 @@ impl App {
             '/' => self.start_filter(),
             'S' => self.open_sort_picker(),
             'o' => self.open_selected(),
-            'n' => self.start_add_connection(),
             'v' => self.open_sections_toggle(),
-            'C' => self.open_config(deps).await,
+            'C' => self.open_connections(deps).await,
+            ',' => self.open_startup_picker(deps),
             // Saved views: previous / next on the active section; save / delete.
             '[' => self.switch_view(-1, deps).await,
             ']' => self.switch_view(1, deps).await,
@@ -2831,6 +2873,22 @@ impl App {
 
     // ---- config / connections screen ----
 
+    /// First launch (or nothing set up): connection setup lives in the web dashboard now, so open
+    /// it instead of a terminal wizard.
+    pub fn start_setup(&mut self) {
+        self.open_dashboard_at("#settings");
+        if self.dashboard_url.is_some() {
+            self.toast = Some("Welcome to forgetop — set up your connections in the browser".into());
+        }
+    }
+
+    /// `C`: connection management happens in the web dashboard. Open it, and also show the
+    /// terminal connections list as a quick read-only glance / fallback.
+    async fn open_connections(&mut self, deps: &AppDeps) {
+        self.open_dashboard_at("#settings");
+        self.open_config(deps).await;
+    }
+
     async fn open_config(&mut self, deps: &AppDeps) {
         let view = self.build_config_view(deps);
         self.screen = Screen::Config(Box::new(view));
@@ -3062,6 +3120,13 @@ impl App {
             Action::OpenItem { kind, id, connection_id } => self.open_palette_item(kind, id, connection_id, deps).await,
             Action::OpenReviewMenu => self.open_review_submit(),
             Action::LeavePrView => self.screen = self.view_origin(),
+            Action::SetStartupMode(mode) => {
+                if let Err(e) = deps.config.set_startup_mode(mode).await {
+                    self.toast_error(format!("Couldn't save: {e}"));
+                } else {
+                    self.toast = Some(format!("Startup set to {}", startup_mode_label(mode)));
+                }
+            }
         }
     }
 
@@ -3309,10 +3374,14 @@ impl Notifier for SystemNotifier {
 }
 
 /// (approved, changes-requested) rollup from a PR's reviewer votes.
-pub(crate) fn pr_vote_flags(pr: &PullRequest) -> (bool, bool) {
-    let approved = pr.reviewers.iter().any(|r| matches!(r.vote, ReviewVote::Approved | ReviewVote::ApprovedWithSuggestions));
-    let changes = pr.reviewers.iter().any(|r| matches!(r.vote, ReviewVote::Rejected));
-    (approved, changes)
+pub(crate) use forgetop_core::launchpad::pr_vote_flags;
+
+fn startup_mode_label(mode: StartupMode) -> &'static str {
+    match mode {
+        StartupMode::Both => "dashboard + terminal",
+        StartupMode::TerminalOnly => "terminal only",
+        StartupMode::DashboardOnly => "dashboard only",
+    }
 }
 
 /// Which vote states newly flipped on since last scan: (newly approved, newly changes).

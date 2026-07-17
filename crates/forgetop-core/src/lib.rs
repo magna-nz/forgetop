@@ -6,8 +6,10 @@ pub mod diag;
 pub mod domain;
 pub mod error;
 pub mod filter;
+pub mod launchpad;
 pub mod provider;
 pub mod secret;
 pub mod service;
+pub mod setup;
 
 pub use error::{Error, Result};

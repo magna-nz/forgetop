@@ -32,11 +32,12 @@ const ANIM_MS: u64 = 150;
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
 /// Set up the terminal, run the loop against `deps`, and always restore the terminal.
-pub async fn run(deps: AppDeps, theme_name: &str) -> Result<()> {
+pub async fn run(deps: AppDeps, theme_name: &str, dashboard_url: Option<String>) -> Result<()> {
     install_panic_hook();
     let mut terminal = setup_terminal().map_err(forgetop_core::Error::from)?;
 
     let mut app = App::new(theme_name);
+    app.dashboard_url = dashboard_url;
     app.apply_hidden_sections(&deps.config.snapshot().ui.hidden_sections);
     app.apply_hidden_work_item_states(&deps.config.snapshot().ui.hidden_work_item_states);
     {
@@ -47,10 +48,16 @@ pub async fn run(deps: AppDeps, theme_name: &str) -> Result<()> {
     }
     app.reload_all(&deps).await;
 
-    // First run: nothing configured yet — drop straight into the add-connection wizard.
-    if deps.config.snapshot().connections.is_empty() {
-        app.start_add_connection();
-        app.toast = Some("Welcome to forgetop — add your first connection".into());
+    // First run — nothing configured, or no connection has a token yet: open the web dashboard
+    // for setup (connections are managed there now), rather than a terminal wizard. Otherwise, on
+    // the "Both" startup preference (the default) open the dashboard alongside the TUI.
+    let cfg = deps.config.snapshot();
+    if cfg.connections.is_empty() || cfg.connections.iter().all(|c| c.credential_ref.is_none()) {
+        app.start_setup();
+    } else if forgetop_core::config::StartupMode::effective(cfg.ui.startup_mode)
+        == forgetop_core::config::StartupMode::Both
+    {
+        app.open_dashboard();
     }
 
     let result = event_loop(&mut terminal, &mut app, &deps).await;

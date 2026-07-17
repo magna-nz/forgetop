@@ -5,7 +5,7 @@ use std::io::IsTerminal;
 use std::sync::Arc;
 
 use forgetop_core::config::{
-    default_config_path, ConfigStore, ForgetopConfig, InMemoryConfigStore, JsonConfigStore,
+    default_config_path, ConfigStore, ForgetopConfig, InMemoryConfigStore, JsonConfigStore, StartupMode,
 };
 use forgetop_core::domain::ProviderType;
 use forgetop_core::provider::{Connection, ProviderRegistry};
@@ -59,22 +59,58 @@ async fn run() -> Result<()> {
         return doctor(&config, &secrets, &resolver).await;
     }
 
-    if !std::io::stdout().is_terminal() {
-        eprintln!("forgetop needs an interactive terminal (TTY) to run the dashboard.");
-        eprintln!("Tip: run `forgetop doctor` to check your connections.");
-        return Ok(());
-    }
-
     if demo {
         seed_demo(&config).await?;
     }
 
     let sections = Arc::new(SectionService::new(config.clone(), resolver.clone()));
     let health = Arc::new(ConnectionHealthService::new(config.clone(), resolver));
+    let server_deps = forgetop_server::Deps {
+        sections: sections.clone(),
+        health: health.clone(),
+        config: config.clone(),
+        secrets: secrets.clone(),
+    };
+
+    // Dashboard-only: `forgetop --dashboard`, or the saved startup preference. Runs the web UI
+    // headless (no TUI, so no TTY needed).
+    let startup_mode = StartupMode::effective(config.snapshot().ui.startup_mode);
+    let dashboard_only = args.iter().any(|a| a == "--dashboard") || startup_mode == StartupMode::DashboardOnly;
+    if dashboard_only {
+        return forgetop_server::serve_blocking(server_deps, forgetop_server::DEFAULT_PORT, |url| {
+            println!("forgetop dashboard: {url}\n(Ctrl-C to stop)");
+            let _ = open::that(url);
+        })
+        .await
+        .map_err(forgetop_core::Error::from);
+    }
+
+    if !std::io::stdout().is_terminal() {
+        eprintln!("forgetop needs an interactive terminal (TTY) to run the dashboard.");
+        eprintln!("Tip: run `forgetop --dashboard` for the browser UI, or `forgetop doctor` to check connections.");
+        return Ok(());
+    }
+
+    // Start the dashboard server in the background — best-effort, so a bind failure never takes
+    // down the TUI. `B` opens the URL and connection setup happens here. Fall back to an ephemeral
+    // port if the default is taken (e.g. a second forgetop) so the dashboard is virtually always up.
+    let dashboard_url = spawn_dashboard(server_deps).await;
 
     let theme = config.snapshot().ui.theme.clone().unwrap_or_else(|| "slate".into());
     let deps = AppDeps { sections, health, config };
-    forgetop_tui::run(deps, &theme).await
+    forgetop_tui::run(deps, &theme, dashboard_url).await
+}
+
+/// Spawns the background dashboard server, trying the default port first then an ephemeral one.
+/// Returns the URL (with session token) to open, or `None` if it couldn't bind at all.
+async fn spawn_dashboard(deps: forgetop_server::Deps) -> Option<String> {
+    for port in [forgetop_server::DEFAULT_PORT, 0] {
+        match forgetop_server::spawn(deps.clone(), port).await {
+            Ok(server) => return Some(server.url),
+            Err(e) => forgetop_core::diag::log("dashboard", &format!("bind on port {port} failed: {e}")),
+        }
+    }
+    None
 }
 
 /// Diagnostic (`forgetop doctor`): config location, keychain access, and per-connection
@@ -136,16 +172,22 @@ fn print_help() {
 Keyboard-driven terminal UI for pull requests, work items, and CI across six forges.
 
 Usage:
-  forgetop            Launch the dashboard
+  forgetop            Launch the TUI (also serves the web dashboard in the background)
+  forgetop --dashboard  Serve the web dashboard and open it in the browser (no TUI)
   forgetop --demo     Launch with built-in demo data (no setup)
   forgetop doctor     Diagnose config, keychain access, and connection health
 
 Options:
+  --dashboard         Run the browser dashboard only (headless)
   -d, --demo          Run against built-in demo data
   -V, --version       Print version and exit
   -h, --help          Show this help and exit
 
-Inside the app, press `?` for every keybinding.
+Environment:
+  FORGETOP_STARTUP    Override what opens on launch for this run — one of
+                      `both`, `terminal_only`, `dashboard_only` (handy with --demo).
+
+Inside the app, press `?` for every keybinding, or `B` to open the web dashboard.
 Docs: https://magna-nz.github.io/forgetop/"#,
         version = env!("CARGO_PKG_VERSION")
     );

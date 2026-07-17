@@ -4,6 +4,7 @@ members = [
     "crates/forgetop-core",
     "crates/forgetop-providers",
     "crates/forgetop-tui",
+    "crates/forgetop-server",
     "crates/forgetop-cli",
 ]
 
@@ -19,6 +20,7 @@ homepage = "https://github.com/magna-nz/forgetop"
 forgetop-core = { path = "crates/forgetop-core" }
 forgetop-providers = { path = "crates/forgetop-providers" }
 forgetop-tui = { path = "crates/forgetop-tui" }
+forgetop-server = { path = "crates/forgetop-server" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -39,6 +41,10 @@ synoptic = "2"
 open = "5"
 dotenvy = "0.15"
 notify-rust = "4"
+axum = { version = "0.7", features = ["ws"] }
+tower-http = { version = "0.5", features = ["cors"] }
+rust-embed = { version = "8", features = ["debug-embed"] }
+mime_guess = "2"
 
 # The profile that 'dist' will build with
 [profile.dist]
