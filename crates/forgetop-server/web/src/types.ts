@@ -276,6 +276,7 @@ export type LaunchpadRow = LaunchpadBase &
 
 /** Per-bucket overflow flags: true when the reference list had more than it shows. */
 export interface LaunchpadMore {
+  needs_review: boolean;
   your_work: boolean;
   your_open_prs: boolean;
   recently_merged: boolean;
