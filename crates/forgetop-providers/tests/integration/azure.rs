@@ -54,6 +54,12 @@ async fn azure_pull_request_lifecycle() {
     })
     .await;
 
+    // A merged Azure PR reverts via the Reverts API (creates a revert branch off the target).
+    if merged.is_some() {
+        prs.revert(&id).await.expect("start a revert of the merged PR");
+        raw.delete_branch(&format!("revert-pr-{id}")).await; // best-effort; no-ops if not yet created
+    }
+
     // Teardown regardless of whether the merge landed.
     if merged.is_none() {
         raw.abandon_pr(id.parse().unwrap()).await;
