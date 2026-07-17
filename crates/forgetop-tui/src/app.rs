@@ -2214,16 +2214,29 @@ impl App {
                 self.open_selected();
                 return;
             }
+            // A merged PR offers Revert; an open one offers approve / request-changes / merge.
             Key::Char('a') => {
-                self.open_pr_vote(ReviewVote::Approved);
+                if !self.active_pr_is_merged() {
+                    self.open_pr_vote(ReviewVote::Approved);
+                }
                 return;
             }
             Key::Char('x') => {
-                self.open_pr_vote(ReviewVote::Rejected);
+                if !self.active_pr_is_merged() {
+                    self.open_pr_vote(ReviewVote::Rejected);
+                }
                 return;
             }
             Key::Char('m') => {
-                self.open_pr_merge();
+                if !self.active_pr_is_merged() {
+                    self.open_pr_merge();
+                }
+                return;
+            }
+            Key::Char('R') => {
+                if self.active_pr_is_merged() {
+                    self.open_pr_revert();
+                }
                 return;
             }
             Key::Char('c') => {
@@ -3186,6 +3199,17 @@ impl App {
         });
     }
 
+    fn open_pr_revert(&mut self) {
+        let Some(pr) = self.active_pr() else { return };
+        let message = format!("Revert {}? This asks the provider to undo its merge commit.", pr_label(pr));
+        self.overlay = Some(Overlay::Confirm { title: "Revert".into(), message, action: Action::PrRevert });
+    }
+
+    /// True when the PR in focus is merged (so it offers Revert instead of approve/merge).
+    fn active_pr_is_merged(&self) -> bool {
+        self.active_pr().map(|pr| pr.status == PullRequestStatus::Merged).unwrap_or(false)
+    }
+
     fn open_pr_comment(&mut self) {
         let Some(pr) = self.active_pr() else { return };
         let title = format!("Comment on {}", pr_label(pr));
@@ -3194,7 +3218,7 @@ impl App {
 
     async fn execute_action(&mut self, action: Action, deps: &AppDeps) {
         match action {
-            Action::PrVote(_) | Action::PrMerge(_) | Action::PrComment(_) => self.execute_pr_action(action, deps).await,
+            Action::PrVote(_) | Action::PrMerge(_) | Action::PrRevert | Action::PrComment(_) => self.execute_pr_action(action, deps).await,
             Action::WiSetState(_) | Action::WiComment(_) => self.execute_wi_action(action, deps).await,
             Action::PipelineTrigger { .. } => self.execute_pipeline_action(action, deps).await,
             Action::RemoveConnection { .. } => self.execute_config_action(action, deps).await,
@@ -3243,6 +3267,7 @@ impl App {
                 .merge(&id, &MergeOptions { strategy: *strategy, delete_source_ref: false })
                 .await
                 .map(|_| format!("Merged ({strategy:?})")),
+            Action::PrRevert => source.revert(&id).await.map(|_| "Revert requested".to_string()),
             Action::PrComment(text) => {
                 if text.trim().is_empty() {
                     self.toast = Some("Empty comment — nothing sent".into());

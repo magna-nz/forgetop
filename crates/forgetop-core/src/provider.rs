@@ -176,6 +176,11 @@ pub trait PullRequestSource: Send + Sync {
     async fn add_comment(&self, pull_request_id: &str, body: &str) -> Result<()>;
     async fn vote(&self, pull_request_id: &str, vote: ReviewVote) -> Result<()>;
     async fn merge(&self, pull_request_id: &str, options: &MergeOptions) -> Result<()>;
+    /// Reverts a merged pull request (undoes its merge commit on the target branch). Defaults to
+    /// unsupported — only providers with a revert API (GitLab, Azure DevOps) override this.
+    async fn revert(&self, _pull_request_id: &str) -> Result<()> {
+        Err(Error::Provider("this provider has no revert API — revert it from the provider's web UI".into()))
+    }
     /// Submits a review with inline line comments. `event` maps to approve /
     /// request-changes / plain comment. Defaults to unsupported.
     async fn submit_review(&self, _pull_request_id: &str, _event: ReviewVote, _comments: &[LineComment]) -> Result<()> {

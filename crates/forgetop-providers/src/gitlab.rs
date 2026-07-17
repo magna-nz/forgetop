@@ -454,6 +454,16 @@ impl PullRequestSource for GitLabPr {
         let url = self.0.project_path(&format!("/merge_requests/{id}/merge"));
         self.0.send(self.0.http.put(&url).json(&body), &format!("PUT {url}")).await
     }
+    async fn revert(&self, id: &str) -> Result<()> {
+        // Revert the MR's merge commit onto its target branch (GitLab commits the revert directly).
+        let mr = self.0.get_json(&self.0.project_path(&format!("/merge_requests/{id}"))).await?;
+        let sha = get_str(&mr, "merge_commit_sha")
+            .ok_or_else(|| Error::Provider(format!("merge request '{id}' has no merge commit to revert")))?;
+        let branch = get_str(&mr, "target_branch")
+            .ok_or_else(|| Error::Provider(format!("merge request '{id}' has no target branch")))?;
+        let url = self.0.project_path(&format!("/repository/commits/{sha}/revert"));
+        self.0.send(self.0.http.post(&url).json(&json!({ "branch": branch })), &format!("POST {url}")).await
+    }
     async fn submit_review(&self, id: &str, event: ReviewVote, comments: &[LineComment]) -> Result<()> {
         // GitLab positions a diff note against the MR's base/head/start commits.
         let mr = self.0.get_json(&self.0.project_path(&format!("/merge_requests/{id}"))).await?;

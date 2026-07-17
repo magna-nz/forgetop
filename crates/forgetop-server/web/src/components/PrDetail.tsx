@@ -85,6 +85,7 @@ function PrDetailPanel({ prRef, onClose }: { prRef: PrRef; onClose: () => void }
       await apiPost("/api/pr/merge", { conn: prRef.conn, id: prRef.id, strategy: "Merge" });
       setTimeout(onClose, 500);
     });
+  const revert = () => act("Revert requested", () => apiPost("/api/pr/revert", { conn: prRef.conn, id: prRef.id }));
   const submitReview = (event: "Approved" | "Rejected" | "NoVote") =>
     act("Review submitted", async () => {
       await apiPost("/api/pr/review", { conn: prRef.conn, id: prRef.id, event, comments: pending });
@@ -189,7 +190,11 @@ function PrDetailPanel({ prRef, onClose }: { prRef: PrRef; onClose: () => void }
 
             {/* action bar */}
             <div className="flex items-center gap-2 px-4 py-3 shrink-0 flex-wrap" style={{ borderTop: "1px solid var(--border)" }}>
-              {pending.length > 0 ? (
+              {pr.status === "Merged" ? (
+                <div className="ml-auto flex gap-2">
+                  <ActionButton disabled={busy} onClick={revert} label="Revert" color="var(--red)" primary />
+                </div>
+              ) : pending.length > 0 ? (
                 <>
                   <span className="text-sm" style={{ color: "var(--accent)" }}>
                     {pending.length} pending comment{pending.length > 1 ? "s" : ""}

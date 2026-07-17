@@ -97,6 +97,7 @@ fn router(state: AppState) -> Router {
         .route("/api/pr/detail", get(pr_detail))
         .route("/api/pr/vote", post(pr_vote))
         .route("/api/pr/merge", post(pr_merge))
+        .route("/api/pr/revert", post(pr_revert))
         .route("/api/pr/comment", post(pr_comment))
         .route("/api/pr/review", post(pr_review))
         .route("/api/wi/detail", get(wi_detail))
@@ -227,6 +228,9 @@ async fn pr_vote(State(s): State<AppState>, Json(req): Json<actions::PrVoteReq>)
 }
 async fn pr_merge(State(s): State<AppState>, Json(req): Json<actions::PrMergeReq>) -> Response {
     action_response(actions::pr_merge(&s.deps.sections, req).await)
+}
+async fn pr_revert(State(s): State<AppState>, Json(req): Json<actions::PrRevertReq>) -> Response {
+    action_response(actions::pr_revert(&s.deps.sections, req).await)
 }
 async fn pr_comment(State(s): State<AppState>, Json(req): Json<actions::PrCommentReq>) -> Response {
     action_response(actions::pr_comment(&s.deps.sections, req).await)

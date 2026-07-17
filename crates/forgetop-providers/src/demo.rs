@@ -693,6 +693,10 @@ impl PullRequestSource for DemoPr {
         merged_prs().lock().unwrap().insert(id.to_string());
         Ok(())
     }
+    async fn revert(&self, _id: &str) -> Result<()> {
+        // Demo revert is a no-op success so the button is present and clickable without a live forge.
+        Ok(())
+    }
     async fn submit_review(&self, id: &str, _event: ReviewVote, comments: &[LineComment]) -> Result<()> {
         // Persist each line comment as an open thread by "you", so it comes back from
         // threads() and the diff shows it exactly as a real provider would.

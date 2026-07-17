@@ -1100,6 +1100,11 @@ fn base_footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
         return vec![("↑↓", "move"), ("←→", "columns"), ("↵", "open"), ("Tab", "sections"), ("r", "refresh"), (",", "settings"), ("?", "help"), ("q", "quit")];
     }
     if let Screen::PrView(v) = &app.screen {
+        // A merged PR only offers Revert; an open one offers approve / (reject) / merge.
+        let merged = v.pr.status == PullRequestStatus::Merged;
+        let acts: Vec<(&'static str, &'static str)> = if merged { vec![("R", "revert")] } else { vec![("a", "approve"), ("m", "merge")] };
+        let acts_full: Vec<(&'static str, &'static str)> =
+            if merged { vec![("R", "revert")] } else { vec![("a", "approve"), ("x", "reject"), ("m", "merge")] };
         return if v.tab == 3 {
             if v.diff.focus == DiffFocus::Patch {
                 let mut keys = vec![("↑↓", "line"), ("c", "comment")];
@@ -1109,12 +1114,21 @@ fn base_footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
                 keys.extend([("PgUp/Dn", "jump"), ("Esc", "files"), ("o", "open")]);
                 keys
             } else {
-                vec![("←→", "tabs"), ("↑↓", "file"), ("↵", "open file"), ("PgUp/Dn", "scroll"), ("a", "approve"), ("m", "merge"), ("o", "open"), ("Esc", "back")]
+                let mut keys = vec![("←→", "tabs"), ("↑↓", "file"), ("↵", "open file"), ("PgUp/Dn", "scroll")];
+                keys.extend(acts);
+                keys.extend([("o", "open"), ("Esc", "back")]);
+                keys
             }
         } else if v.tab == 1 {
-            vec![("←→", "tabs"), ("↑↓", "commit"), ("↵", "commit diff"), ("a", "approve"), ("m", "merge"), ("o", "open"), ("Esc", "back")]
+            let mut keys = vec![("←→", "tabs"), ("↑↓", "commit"), ("↵", "commit diff")];
+            keys.extend(acts);
+            keys.extend([("o", "open"), ("Esc", "back")]);
+            keys
         } else {
-            vec![("←→", "tabs"), ("PgUp/Dn", "scroll"), ("a", "approve"), ("x", "reject"), ("m", "merge"), ("c", "comment"), ("o", "open"), ("Esc", "back")]
+            let mut keys = vec![("←→", "tabs"), ("PgUp/Dn", "scroll")];
+            keys.extend(acts_full);
+            keys.extend([("c", "comment"), ("o", "open"), ("Esc", "back")]);
+            keys
         };
     }
     if matches!(app.screen, Screen::WiView(_)) {

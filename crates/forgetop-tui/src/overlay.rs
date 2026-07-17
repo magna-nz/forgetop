@@ -14,6 +14,7 @@ use crate::palette::{rank, PaletteItem, PaletteKind};
 pub enum Action {
     PrVote(ReviewVote),
     PrMerge(MergeStrategy),
+    PrRevert,
     PrComment(String),
     WiSetState(String),
     WiComment(String),

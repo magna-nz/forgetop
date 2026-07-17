@@ -524,6 +524,24 @@ impl PullRequestSource for AzurePr {
         }
         Ok(())
     }
+    async fn revert(&self, id: &str) -> Result<()> {
+        // Azure creates the revert on a new branch off the PR's target; the user opens a PR from it.
+        let pr = self.0.get_json(&format!("{}?{API}", self.0.pr_base(id))).await?;
+        let onto = get_str(&pr, "targetRefName")
+            .ok_or_else(|| Error::Provider(format!("pull request '{id}' has no target branch")))?;
+        let pr_id: i64 = id.parse().map_err(|_| Error::Provider(format!("pull request id '{id}' is not numeric")))?;
+        let url = format!("{}/{}/_apis/git/repositories/{}/reverts?{API}", self.0.base, self.0.project, self.0.repository);
+        let body = json!({
+            "generatedRefName": format!("refs/heads/revert-pr-{id}"),
+            "ontoRefName": onto,
+            "source": { "pullRequestId": pr_id },
+        });
+        let resp = self.0.http.post(&url).json(&body).send().await.map_err(prov)?;
+        if !resp.status().is_success() {
+            return Err(Error::Provider(format!("POST {url} -> {}", resp.status())));
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
