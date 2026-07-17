@@ -12,6 +12,12 @@ and **Jira** — in your **terminal**, your **browser**, or both.
 [![Rust](https://img.shields.io/badge/built%20with-Rust-DEA584?logo=rust&logoColor=white)](https://www.rust-lang.org)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
+Checking GitHub for reviews, Azure for failing builds, and Jira for tickets is a lot of
+tabs. forgetop pulls your pull requests, work items, and pipelines into one command center
+— and lets you *act* on them (approve, merge, comment, change state, drill into pipeline
+stages, trigger runs). Run it as a fast terminal UI, a browser dashboard, or **both at
+once** (the default). Tokens live in your OS keychain, never in plaintext.
+
 <div align="center">
   <img src="docs/launchpad2.gif" alt="The Launchpad in the terminal" width="820">
   <br/>
@@ -25,12 +31,6 @@ and **Jira** — in your **terminal**, your **browser**, or both.
 </div>
 
 ---
-
-Checking GitHub for reviews, Azure for failing builds, and Jira for tickets is a lot of
-tabs. forgetop pulls your pull requests, work items, and pipelines into one command center
-— and lets you *act* on them (approve, merge, comment, change state, drill into pipeline
-stages, trigger runs). Run it as a fast terminal UI, a browser dashboard, or **both at
-once** (the default). Tokens live in your OS keychain, never in plaintext.
 
 ## The Launchpad
 

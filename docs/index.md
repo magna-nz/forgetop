@@ -12,6 +12,35 @@ terminal UI **and** a web dashboard.
 This is the full reference. For install and a 60-second start, see the
 [README](https://github.com/magna-nz/forgetop#readme).
 
+Many sections below have a **Terminal / Dashboard** switch — pick the surface you're using
+and the whole page follows, so you only read the instructions that apply to you. Your
+choice is remembered.
+
+<style>
+.surface-toggle{display:inline-flex;margin:.1rem 0 1.1rem;border:1px solid #d0d7de;border-radius:7px;overflow:hidden;background:#f6f8fa;font-size:0}
+.surface-toggle .st-btn{appearance:none;-webkit-appearance:none;border:0;background:transparent;color:#57606a;font-family:inherit;font-size:.82rem;font-weight:600;padding:.34rem .85rem;cursor:pointer;line-height:1.3}
+.surface-toggle .st-btn+.st-btn{border-left:1px solid #d0d7de}
+.surface-toggle .st-btn:hover{color:#1a1a1a}
+html[data-surface="dash"] .surface-toggle .st-dash,
+html[data-surface="tui"]  .surface-toggle .st-tui{background:#159957;color:#fff}
+.surface-tui{display:none}
+html[data-surface="tui"] .surface-tui{display:block}
+html[data-surface="tui"] .surface-dash{display:none}
+</style>
+<script>
+(function(){
+  var KEY='forgetop-docs-surface',root=document.documentElement,pref;
+  try{pref=localStorage.getItem(KEY);}catch(e){}
+  root.setAttribute('data-surface',pref==='tui'?'tui':'dash');
+  document.addEventListener('click',function(e){
+    var b=e.target.closest?e.target.closest('.st-btn'):null;if(!b)return;
+    var s=b.getAttribute('data-surface-set');if(s!=='tui'&&s!=='dash')return;
+    root.setAttribute('data-surface',s);
+    try{localStorage.setItem(KEY,s);}catch(err){}
+  });
+})();
+</script>
+
 - [What forgetop does](#what-forgetop-does)
 - [Core concepts](#core-concepts)
 - [Getting started](#getting-started)
@@ -216,11 +245,12 @@ the URL — see [Security](#security).
 
 ## Launchpad
 
-The **Launchpad** is the screen forgetop opens on (tab `1`). Instead of browsing by
+<div class="surface-toggle" role="group" aria-label="Show Launchpad instructions for"><button type="button" class="st-btn st-tui" data-surface-set="tui">Terminal</button><button type="button" class="st-btn st-dash" data-surface-set="dash">Dashboard</button></div>
+
+The **Launchpad** is the screen forgetop opens on. Instead of browsing by
 type, it answers one question — *what needs me right now?* — by pulling every PR,
 work item, and pipeline across every connected provider into a single, prioritised
-page. The Pull Requests / Work Items / Pipelines tabs are still there as drill-downs
-to their right.
+page. The Pull Requests / Work Items / Pipelines views are still there as drill-downs.
 
 It's split into **two columns**:
 
@@ -244,6 +274,19 @@ status; a work item its state), a short **#ref**, the **title**, one type-specif
 **age** (which reddens once it's stale). For pipelines the title is the **pipeline
 name** (e.g. `CI Build`) and the ref is the **run/release** (e.g. `10.1.100`).
 
+<div class="surface surface-dash" markdown="1">
+
+**Getting around:** the two columns scroll independently. **Click a card** to open it —
+a pull request opens its in-app **review panel** right here; work items and pipelines open
+in their provider (open them from the Work Items / Pipelines tabs for the in-app panel).
+When you **act** on an item — submit a review, approve, or merge — it drops off the
+Launchpad straight away rather than waiting for the next poll. The sidebar **Launchpad**
+badge counts only the items that actually need you.
+
+</div>
+
+<div class="surface surface-tui" markdown="1">
+
 **Getting around:**
 
 - `↑` / `↓` (or `k` / `j`) — move within the focused column.
@@ -260,7 +303,52 @@ next poll; and the **selected row's title scrolls** horizontally when it's too l
 fit, so you can always read it in full. The `Launchpad (N)` tab badge counts the items
 that actually need you (the reference sections don't inflate it).
 
+</div>
+
 ## Pull Requests
+
+<div class="surface-toggle" role="group" aria-label="Show Pull Requests instructions for"><button type="button" class="st-btn st-tui" data-surface-set="tui">Terminal</button><button type="button" class="st-btn st-dash" data-surface-set="dash">Dashboard</button></div>
+
+<div class="surface surface-dash" markdown="1">
+
+The Pull Requests view is **browse-and-open**: the list is for finding a PR; every write
+action lives inside the PR panel.
+
+**On the list:**
+
+- **Click a card** to open the PR review panel (a slide-over from the right).
+- The **control bar** across the top filters and sorts: **Show** (Open / Draft / Checks
+  failing), **Connection** (one provider or all), and **Sort** (Recently updated / Oldest /
+  Title). Your choice per list is remembered.
+- Each card shows the review state, `#number`, the `+/-`, checks, reviewers, and labels.
+
+**Inside the PR panel** (three tabs):
+
+- **Files** — the changed files with a syntax-coloured diff; existing review comments render
+  **inline beneath the line they're on**. Hover a line and click the **`+`** to write an
+  inline comment.
+- **Conversation** — the description plus comment threads, and a box to add a comment.
+- **Commits** — one row per commit.
+
+The header has an **↗ open-in-provider** link; the action bar has **Approve**, **Request
+changes**, and **Merge**. Press **Esc** or click the backdrop to close.
+
+### Reviewing code with line comments
+
+On the **Files** tab, click the **`+`** on a code line to write an inline comment. Comments
+are **buffered as pending** (shown in a blue *pending* box) so you can comment on several
+lines first, then submit them together as one review — **Submit comments**, **Request
+changes**, or **Approve**. If you try to close the panel with comments still pending,
+forgetop asks before discarding them.
+
+- **GitHub** posts it as a single native review.
+- **GitLab** posts positioned discussions (and approves if you chose Approve).
+- **Azure DevOps / Bitbucket** don't expose inline patches, so line comments aren't
+  available there — use the Conversation tab.
+
+</div>
+
+<div class="surface surface-tui" markdown="1">
 
 The Pull Requests tab is **browse-and-open**: the list is for finding a PR; every
 write action lives inside the PR view.
@@ -288,7 +376,7 @@ write action lives inside the PR view.
 Write actions from the view: `a` approve, `x` request changes, `m` merge (pick a
 strategy), `c` comment, `o` open in browser.
 
-### Reading the diff
+#### Reading the diff
 
 - **Syntax highlighting** — patches are highlighted for common languages
   (Rust, TS/JS, Python, Go, Java, JSON, YAML), using the theme's colours; other
@@ -302,7 +390,7 @@ strategy), `c` comment, `o` open in browser.
   them in context instead of a side list. **`[`** / **`]`** jump the cursor between them.
   (Unanchored / PR-level comments stay on the Conversation tab.)
 
-### Reviewing code with line comments
+#### Reviewing code with line comments
 
 In the Diff tab's line cursor, press `c` on a code line to write an inline
 comment. Comments are **buffered locally** — the line gets a `▎` marker — so you
@@ -316,11 +404,32 @@ to **submit** or **leave without submitting** first, so you don't lose them by a
 - **Azure DevOps / Bitbucket** don't expose inline patches, so the line cursor —
   and line comments — aren't available there.
 
+</div>
+
 ## Work Items
 
-The Work Items tab shows only items **assigned to you** — each provider resolves
+<div class="surface-toggle" role="group" aria-label="Show Work Items instructions for"><button type="button" class="st-btn st-tui" data-surface-set="tui">Terminal</button><button type="button" class="st-btn st-dash" data-surface-set="dash">Dashboard</button></div>
+
+The Work Items view shows only items **assigned to you** — each provider resolves
 the current user from your token (`@me`, `currentUser()`, `isMe`, …), so there's
 nothing to configure.
+
+<div class="surface surface-dash" markdown="1">
+
+Browse-and-open; the write actions live in the item panel.
+
+- **Click a work item** to open its panel: the **description**, **comment threads** with a
+  box to add a comment, and a **Move ▾** control to change state.
+- **Move ▾** pulls its choices from the provider itself: Jira's workflow transitions,
+  Linear's team states, Azure's work-item-type states, or open/closed for GitHub/GitLab
+  issues.
+- The header's **↗** opens the item in its provider.
+- The **control bar** filters and sorts: **Show** (In progress / Blocked / Not started),
+  **Connection**, and **Sort**.
+
+</div>
+
+<div class="surface surface-tui" markdown="1">
 
 The list is browse-and-open; the write actions live in the item view:
 
@@ -338,12 +447,32 @@ Inside the item view (after `Enter`):
 - `c` — comment (works on every work-item provider).
 - `o` — open in browser.
 
+</div>
+
 ## Pipelines
 
-The list shows a **Pipeline** column — the pipeline (definition) name, e.g. `CI Build`
-or `CD (Release)` — separate from the **Run** column, which is the run's own name or
-release (e.g. `10.1.100`, or its number when it has none). Sort by `Pipeline` to group
-runs by their definition.
+<div class="surface-toggle" role="group" aria-label="Show Pipelines instructions for"><button type="button" class="st-btn st-tui" data-surface-set="tui">Terminal</button><button type="button" class="st-btn st-dash" data-surface-set="dash">Dashboard</button></div>
+
+Each entry is a **run**, tagged with its **pipeline** (definition) name — e.g. `CI Build`
+or `CD (Release)` — and its own run name or release (e.g. `10.1.100`, or its number when
+it has none).
+
+<div class="surface surface-dash" markdown="1">
+
+- **Click a run** to open its drill-in panel: a **stages → jobs → steps** tree. Each node
+  carries its status; **expand a job** to load its scrollable **logs**, and failed jobs
+  show a short **failure reason** (GitLab's reason, Azure's error/warning counts).
+- A **failed** run gets a **Re-run** button; a run waiting on a gate shows **Approve** /
+  **Reject** (see below). The header's **↗** opens the run in its provider.
+- Filter with the control bar's **Show** (Running / Failed / Succeeded / Awaiting
+  approval), plus **Connection** and **Sort**.
+
+</div>
+
+<div class="surface surface-tui" markdown="1">
+
+The list shows a **Pipeline** column separate from the **Run** column; sort by `Pipeline`
+to group runs by their definition.
 
 - `Enter` — drill into a run: a collapsible **stages → jobs → steps** tree.
 - `T` — trigger a run.
@@ -359,17 +488,31 @@ Inside the drill-in each node shows its **duration**, and failed jobs show a sho
 For a connection that discovers many pipelines, open the config screen and press
 `s` on it to **subscribe** to just the definitions you care about.
 
+</div>
+
 ### Approvals
 
 When a run is blocked on a manual gate — a **GitHub** environment required-reviewer,
-an **Azure DevOps** approval check, or a **GitLab** manual job — forgetop surfaces it:
+an **Azure DevOps** approval check, or a **GitLab** manual job — forgetop surfaces it,
+refreshed on the normal poll (and you can opt into a desktop
+[notification](#notifications) when a gate first appears):
 
-- The Pipelines list shows a red **Approval needed** column on that run, refreshed
-  on the normal 30-second poll (and you can opt into a desktop
-  [notification](#notifications) when a gate first appears).
-- Inside the run, a banner reads **⏸ Approval needed: {environment}**. On providers
-  where forgetop can act (**GitHub**, **GitLab**) press `A` to open a picker of
-  Approve / Reject options per gate, then confirm.
+<div class="surface surface-dash" markdown="1">
+
+- The run shows the waiting gate inline; on providers where forgetop can act
+  (**GitHub**, **GitLab**) it renders **Approve** / **Reject** buttons — both on the
+  card and inside the run's panel.
+
+</div>
+
+<div class="surface surface-tui" markdown="1">
+
+- The Pipelines list shows a red **Approval needed** column on that run. Inside the run,
+  a banner reads **⏸ Approval needed: {environment}**; on providers where forgetop can act
+  (**GitHub**, **GitLab**) press `A` to open a picker of Approve / Reject options per gate,
+  then confirm.
+
+</div>
 
 Acting is **capability-scoped**:
 - **GitHub / GitLab** — approve or reject in-app (on GitLab a reject cancels the
@@ -381,6 +524,25 @@ Acting is **capability-scoped**:
   manual step); the run shows an explicit *"not supported"* note.
 
 ## Filtering and sorting
+
+<div class="surface-toggle" role="group" aria-label="Show Filtering and sorting instructions for"><button type="button" class="st-btn st-tui" data-surface-set="tui">Terminal</button><button type="button" class="st-btn st-dash" data-surface-set="dash">Dashboard</button></div>
+
+<div class="surface surface-dash" markdown="1">
+
+Each list has a **control bar** across the top with three dropdowns, remembered per list
+in your browser:
+
+- **Sort** — order the list (Recently updated / Oldest / Title, and so on per section).
+- **Connection** — narrow to one provider, or **All connections**.
+- **Show** — a status filter tuned to the section: PRs (Open / Draft / Checks failing),
+  Work Items (In progress / Blocked / Not started), Pipelines (Running / Failed /
+  Succeeded / Awaiting approval).
+
+All three compose, and all work across the aggregated (multi-provider) list.
+
+</div>
+
+<div class="surface surface-tui" markdown="1">
 
 Four complementary ways to cut a busy view down:
 
@@ -397,34 +559,66 @@ Four complementary ways to cut a busy view down:
 
 All of these compose, and all work across the aggregated (multi-provider) list.
 
+</div>
+
 ## Command palette
 
-Press **`Ctrl-P`** (from the Launchpad or any list) to open the **command palette** — a
-fuzzy jump across *everything already loaded*: every PR, work item, and pipeline, from
-every connected provider, in one list. Type to filter (matching the title, author, branch,
-identifier, or connection), `↑`/`↓` (or `Ctrl-n`/`Ctrl-p`) to move, `Enter` to open the
-item's full view, `Esc` to dismiss. Each row carries a status dot in the usual
-green/blue/red/grey colours, so you can scan state as you jump. It searches only what's
-loaded — no network round-trip — so it's instant.
+<div class="surface-toggle" role="group" aria-label="Show Command palette instructions for"><button type="button" class="st-btn st-tui" data-surface-set="tui">Terminal</button><button type="button" class="st-btn st-dash" data-surface-set="dash">Dashboard</button></div>
+
+The **command palette** is a fuzzy jump across *everything already loaded*: every PR, work
+item, and pipeline, from every connected provider, in one list. Type to filter (matching
+the title, author, branch, identifier, or connection); each row carries a status dot in the
+usual green/blue/red/grey colours. It searches only what's loaded — no network round-trip —
+so it's instant.
+
+<div class="surface surface-dash" markdown="1">
+
+Press **`⌘K`** (Ctrl-K on Windows/Linux) from anywhere to open it; type to filter, click a
+result (or `↑`/`↓` then `Enter`) to open it, `Esc` to dismiss.
+
+</div>
+
+<div class="surface surface-tui" markdown="1">
+
+Press **`Ctrl-P`** (from the Launchpad or any list) to open it; `↑`/`↓` (or
+`Ctrl-n`/`Ctrl-p`) to move, `Enter` to open the item's full view, `Esc` to dismiss.
+
+</div>
 
 ## Notification inbox
 
-Press **`i`** (from the Launchpad or any list) to open the **Inbox** — your notification
-*stream* aggregated across providers: review requests, @mentions, assignments, CI failures,
-comments, and state changes, newest first. It answers *what just happened*, where the
-Launchpad answers *what needs me now*.
+<div class="surface-toggle" role="group" aria-label="Show Notification inbox instructions for"><button type="button" class="st-btn st-tui" data-surface-set="tui">Terminal</button><button type="button" class="st-btn st-dash" data-surface-set="dash">Dashboard</button></div>
 
-A **`Notifications (N) [i]`** nav item sits at the **far right** of the tab bar on every
-screen — dim grey when you're at zero, **bold yellow** with the count when there's something
-waiting, and highlighted (accent) while the Inbox is open. It's a nav item, not part of the
-`Tab` cycle (which stays on Launchpad → Pull Requests → Work Items → Pipelines).
+The **notification inbox** is your notification *stream* aggregated across providers: review
+requests, @mentions, assignments, CI failures, comments, and state changes, newest first. It
+answers *what just happened*, where the Launchpad answers *what needs me now*. A
+**Notifications** nav item carries an **unread count** that stands out when something's
+waiting.
+
+<div class="surface surface-dash" markdown="1">
+
+- Open **Notifications** in the sidebar. Each row shows a kind glyph in the status colours,
+  an unread dot, the title, the repo/project, the connection, and age.
+- **Click a row** to open it in its provider; the **✓ read** button marks it read (and the
+  **Show** filter can narrow to unread). Marking updates the count immediately.
+
+</div>
+
+<div class="surface surface-tui" markdown="1">
+
+Press **`i`** (from the Launchpad or any list) to open the **Inbox**. The
+**`Notifications (N) [i]`** nav item sits at the **far right** of the tab bar — dim grey at
+zero, **bold yellow** with the count when something's waiting, accent while the Inbox is
+open. It's a nav item, not part of the `Tab` cycle.
 
 - `↑`/`↓` move · **`Enter`** opens the item **in-app** (drills straight into that PR / work
   item) · `o` opens it in the browser · `x` marks the row read · `A` marks everything read ·
   `r` refreshes · `Esc` back. Opening or marking updates the count immediately.
 - Each row shows a kind glyph in the status colours (CI failures red, reviews/assignments
   accent, mentions magenta), an unread dot, the title, the repo/project, the connection, and
-  age. It refreshes on the 30s poll like everything else.
+  age.
+
+</div>
 
 **Provider support.** The inbox is fed by the providers that expose a personal notification
 feed:
@@ -444,6 +638,19 @@ connections for those providers simply don't contribute to the inbox. (This is s
 
 ## Saved views
 
+<div class="surface-toggle" role="group" aria-label="Show Saved views instructions for"><button type="button" class="st-btn st-tui" data-surface-set="tui">Terminal</button><button type="button" class="st-btn st-dash" data-surface-set="dash">Dashboard</button></div>
+
+<div class="surface surface-dash" markdown="1">
+
+The dashboard doesn't have named saved views — instead, each list **remembers its own
+control-bar state** (Sort, Connection, Show) in your browser, so a list comes back shaped
+the way you left it. For the named-view workflow with a switchable view bar, use the
+terminal (toggle above).
+
+</div>
+
+<div class="surface surface-tui" markdown="1">
+
 A **saved view** is a named bundle of a section's shaping — its base filter, the
 quick-filter text, the sort, and (on Work Items) which states are hidden. Views
 live in a horizontal **view bar** above the list, gh-dash style, with the active
@@ -461,6 +668,8 @@ Switching a view re-applies the whole bundle at once, so a `Mine` view can pin a
 different sort and quick-filter than `Review`. Views are persisted per section, so
 they're waiting next time — except in `--demo`, where the in-memory config means
 saved views last only for that session.
+
+</div>
 
 ## Notifications
 
@@ -480,6 +689,9 @@ verify it works on your machine. Every event spans **all bound providers**, not
 just the first.
 
 ## Keybindings
+
+*Terminal only — the dashboard is mouse-driven, with **`⌘K`** for the
+[command palette](#command-palette).*
 
 forgetop shows a **context-aware key glossary** along the bottom — it only lists
 the keys valid for where you are. Press `?` for the full panel. The complete set:
