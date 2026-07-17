@@ -9,7 +9,6 @@ import { ErrorState } from "./ErrorState";
 import { useListView } from "./ControlBar";
 import { usePrOpener } from "./PrDetail";
 import { useWiOpener } from "./WiDetail";
-import { usePipelineOpener } from "./PipelineDetail";
 
 export function Notifications() {
   const { data, isLoading, error } = useNotifications();
@@ -56,33 +55,44 @@ function NotifCard({ row, index }: { row: NotifRow; index: number }) {
   const [busy, setBusy] = useState(false);
   const openPr = usePrOpener();
   const openWi = useWiOpener();
-  const openPipe = usePipelineOpener();
-
-  // Open the referenced item in-app when the notification carries a drillable target.
-  // Some notifications have no in-app target (item_id null, or item_type "Other" — e.g. a
-  // GitHub CheckSuite) — those keep the external link.
   const conn = row.connection_id;
-  const openInApp =
-    n.item_id == null
-      ? null
-      : n.item_type === "PullRequest"
-        ? () => openPr({ conn, id: n.item_id! })
-        : n.item_type === "WorkItem"
-          ? () => openWi({ conn, id: n.item_id! })
-          : n.item_type === "Pipeline"
-            ? () => openPipe({ conn, runId: n.item_id! })
-            : null;
 
+  const markReadNow = async () => {
+    await apiPost("/api/notification/read", { conn, id: n.id });
+    qc.invalidateQueries({ queryKey: ["notifications"] });
+    qc.invalidateQueries({ queryKey: ["launchpad"] });
+  };
+
+  // Explicit "✓ read" button — shows a busy state.
   const markRead = async () => {
     setBusy(true);
     try {
-      await apiPost("/api/notification/read", { conn: row.connection_id, id: n.id });
-      qc.invalidateQueries({ queryKey: ["notifications"] });
-      qc.invalidateQueries({ queryKey: ["launchpad"] });
+      await markReadNow();
     } finally {
       setBusy(false);
     }
   };
+
+  // Opening a notification marks it read, matching the TUI inbox. Like the TUI, only PRs and
+  // work items drill in-app; everything else (pipelines, untyped activity, or a null item_id)
+  // falls back to the provider link. Read is marked whichever path is taken.
+  const onOpen = () => {
+    if (n.unread) void markReadNow();
+  };
+  const openInApp =
+    n.item_id == null
+      ? null
+      : n.item_type === "PullRequest"
+        ? () => {
+            onOpen();
+            openPr({ conn, id: n.item_id! });
+          }
+        : n.item_type === "WorkItem"
+          ? () => {
+              onOpen();
+              openWi({ conn, id: n.item_id! });
+            }
+          : null;
 
   const body = (
     <>
@@ -123,7 +133,7 @@ function NotifCard({ row, index }: { row: NotifRow; index: number }) {
           {body}
         </button>
       ) : (
-        <a href={n.url ?? undefined} target="_blank" rel="noreferrer" className="flex-1 min-w-0" style={{ cursor: n.url ? "pointer" : "default" }}>
+        <a href={n.url ?? undefined} onClick={onOpen} target="_blank" rel="noreferrer" className="flex-1 min-w-0" style={{ cursor: n.url ? "pointer" : "default" }}>
           {body}
         </a>
       )}
