@@ -7,6 +7,8 @@ import type { NotifRow } from "../types";
 import { List, ProviderBadge, Skeleton, StateCard } from "./ui";
 import { ErrorState } from "./ErrorState";
 import { useListView } from "./ControlBar";
+import { usePrOpener } from "./PrDetail";
+import { useWiOpener } from "./WiDetail";
 
 export function Notifications() {
   const { data, isLoading, error } = useNotifications();
@@ -26,6 +28,7 @@ export function Notifications() {
       { label: "CI failures", match: (r) => r.notification.kind === "CiFailed" },
     ],
     statusLabel: "Show",
+    defaultStatus: 0, // Unread — the common inbox view
   });
 
   if (isLoading) return <Skeleton />;
@@ -50,17 +53,66 @@ function NotifCard({ row, index }: { row: NotifRow; index: number }) {
   const meta = notificationMeta(n.kind);
   const qc = useQueryClient();
   const [busy, setBusy] = useState(false);
+  const openPr = usePrOpener();
+  const openWi = useWiOpener();
+  const conn = row.connection_id;
 
+  const markReadNow = async () => {
+    await apiPost("/api/notification/read", { conn, id: n.id });
+    qc.invalidateQueries({ queryKey: ["notifications"] });
+    qc.invalidateQueries({ queryKey: ["launchpad"] });
+  };
+
+  // Explicit "✓ read" button — shows a busy state.
   const markRead = async () => {
     setBusy(true);
     try {
-      await apiPost("/api/notification/read", { conn: row.connection_id, id: n.id });
-      qc.invalidateQueries({ queryKey: ["notifications"] });
-      qc.invalidateQueries({ queryKey: ["launchpad"] });
+      await markReadNow();
     } finally {
       setBusy(false);
     }
   };
+
+  // Opening a notification marks it read, matching the TUI inbox. Like the TUI, only PRs and
+  // work items drill in-app; everything else (pipelines, untyped activity, or a null item_id)
+  // falls back to the provider link. Read is marked whichever path is taken.
+  const onOpen = () => {
+    if (n.unread) void markReadNow();
+  };
+  const openInApp =
+    n.item_id == null
+      ? null
+      : n.item_type === "PullRequest"
+        ? () => {
+            onOpen();
+            openPr({ conn, id: n.item_id! });
+          }
+        : n.item_type === "WorkItem"
+          ? () => {
+              onOpen();
+              openWi({ conn, id: n.item_id! });
+            }
+          : null;
+
+  const body = (
+    <>
+      <div className="flex items-center gap-2">
+        {n.unread && <span className="inline-block w-2 h-2 rounded-full shrink-0" style={{ background: "var(--accent)" }} title="unread" />}
+        <span className="truncate font-medium" style={{ color: n.unread ? "var(--fg)" : "var(--dim)" }}>
+          {n.title}
+        </span>
+      </div>
+      <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1">
+        <span className="text-xs font-medium" style={{ color: meta.color }}>
+          {meta.label}
+        </span>
+        <span className="text-xs" style={{ color: "var(--dim)" }}>
+          {n.context}
+        </span>
+        <ProviderBadge provider={row.provider} connection={row.connection} />
+      </div>
+    </>
+  );
 
   return (
     <motion.div
@@ -76,23 +128,15 @@ function NotifCard({ row, index }: { row: NotifRow; index: number }) {
       >
         {meta.icon}
       </span>
-      <a href={n.url ?? undefined} target="_blank" rel="noreferrer" className="flex-1 min-w-0" style={{ cursor: n.url ? "pointer" : "default" }}>
-        <div className="flex items-center gap-2">
-          {n.unread && <span className="inline-block w-2 h-2 rounded-full shrink-0" style={{ background: "var(--accent)" }} title="unread" />}
-          <span className="truncate font-medium" style={{ color: n.unread ? "var(--fg)" : "var(--dim)" }}>
-            {n.title}
-          </span>
-        </div>
-        <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1">
-          <span className="text-xs font-medium" style={{ color: meta.color }}>
-            {meta.label}
-          </span>
-          <span className="text-xs" style={{ color: "var(--dim)" }}>
-            {n.context}
-          </span>
-          <ProviderBadge provider={row.provider} connection={row.connection} />
-        </div>
-      </a>
+      {openInApp ? (
+        <button onClick={openInApp} className="flex-1 min-w-0 text-left" style={{ cursor: "pointer" }}>
+          {body}
+        </button>
+      ) : (
+        <a href={n.url ?? undefined} onClick={onOpen} target="_blank" rel="noreferrer" className="flex-1 min-w-0" style={{ cursor: n.url ? "pointer" : "default" }}>
+          {body}
+        </a>
+      )}
       <div className="flex items-center gap-3 shrink-0">
         {n.unread && (
           <button
