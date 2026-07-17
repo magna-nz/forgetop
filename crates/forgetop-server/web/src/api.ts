@@ -110,7 +110,10 @@ export const useProviders = () =>
   useQuery({ queryKey: ["providers"], queryFn: () => api<ProviderInfo[]>("/api/providers"), staleTime: Infinity });
 export const useConnections = () => useQuery({ queryKey: ["connections"], queryFn: () => api<ConnectionRow[]>("/api/connections") });
 export const usePreferences = () => useQuery({ queryKey: ["preferences"], queryFn: () => api<Preferences>("/api/preferences") });
-export const usePullRequests = () => useQuery({ queryKey: ["prs"], queryFn: () => api<PrRow[]>("/api/pull-requests") });
+/** Which slice of pull requests the PR page shows; maps to the backend `?view=` param. */
+export type PrView = "all" | "merged" | "review_requested";
+export const usePullRequests = (view: PrView = "all") =>
+  useQuery({ queryKey: ["prs", view], queryFn: () => api<PrRow[]>(`/api/pull-requests?view=${view}`) });
 export const useWorkItems = () => useQuery({ queryKey: ["work-items"], queryFn: () => api<WiRow[]>("/api/work-items") });
 export const usePipelines = () => useQuery({ queryKey: ["pipelines"], queryFn: () => api<PipeRow[]>("/api/pipelines") });
 export const useNotifications = () =>
