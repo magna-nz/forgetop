@@ -4902,6 +4902,63 @@ mod tests {
     }
 
     #[test]
+    fn merged_pr_offers_revert_not_merge() {
+        use crate::overlay::{Action, Overlay};
+        let view = |status: PullRequestStatus| {
+            let mut p = pr(None);
+            p.status = status;
+            Screen::PrView(Box::new(PrView {
+                label: "PR".into(),
+                connection_id: "c".into(),
+                url: None,
+                pr: p,
+                tab: 0,
+                checks: vec![],
+                commits: vec![],
+                commit_sel: 0,
+                pr_files: vec![],
+                scroll: 0,
+                diff: diff(vec![]),
+                pending: vec![],
+                review_draft: None,
+            }))
+        };
+
+        // Open PR: `m` opens the merge picker, `R` does nothing.
+        let mut app = App::new("slate");
+        app.screen = view(PullRequestStatus::Open);
+        assert!(!app.active_pr_is_merged());
+        app.on_pr_view_key(Key::Char('m'));
+        assert!(matches!(app.overlay, Some(Overlay::Picker { .. })), "an open PR can merge");
+        app.overlay = None;
+        app.on_pr_view_key(Key::Char('R'));
+        assert!(app.overlay.is_none(), "an open PR has no revert");
+
+        // Merged PR: `m` is inert, `R` opens the revert confirm.
+        let mut app = App::new("slate");
+        app.screen = view(PullRequestStatus::Merged);
+        assert!(app.active_pr_is_merged());
+        app.on_pr_view_key(Key::Char('m'));
+        assert!(app.overlay.is_none(), "a merged PR can't be merged again");
+        app.on_pr_view_key(Key::Char('R'));
+        assert!(
+            matches!(app.overlay, Some(Overlay::Confirm { action: Action::PrRevert, .. })),
+            "a merged PR reverts",
+        );
+    }
+
+    #[test]
+    fn goto_section_leaves_the_launchpad_for_a_section() {
+        // The primitive behind a Launchpad "more…" jump (YourWork → Work Items, RecentPipelines →
+        // Pipelines). The PR-view jumps additionally reload, so they're exercised in integration.
+        let mut app = App::new("slate");
+        app.screen = Screen::Launchpad;
+        app.goto_section(Section::Pipelines);
+        assert!(matches!(app.screen, Screen::List), "now on a section list");
+        assert_eq!(app.active, index_of(Section::Pipelines), "the Pipelines section is active");
+    }
+
+    #[test]
     fn add_line_comment_buffers_against_draft() {
         let mut app = App::new("slate");
         app.screen = Screen::PrView(Box::new(PrView {

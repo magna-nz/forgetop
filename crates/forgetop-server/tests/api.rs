@@ -453,3 +453,111 @@ async fn work_item_and_pipeline_detail_reach_the_provider() {
     let missing_pipe = hdr(client.get(format!("{base}/api/pipeline/detail?conn=nope&run_id={run_id}"))).send().await.unwrap();
     assert_eq!(missing_pipe.status(), 404);
 }
+
+#[tokio::test]
+async fn launchpad_shape_ordering_and_expand_buckets() {
+    // The exact cap→overflow arithmetic is unit-tested in `forgetop_core::launchpad`; here we verify
+    // the endpoint wires the flags through, keeps every capped list within its limit, orders
+    // "Assigned to you" in-progress-first, and leaves the expand buckets uncapped.
+    let server = spawn(demo_deps(true).await, 0).await.expect("server binds");
+    let base = format!("http://127.0.0.1:{}", server.port);
+    let client = reqwest::Client::new();
+    let lp: serde_json::Value =
+        client.get(format!("{base}/api/launchpad?t={}", server.token)).send().await.unwrap().json().await.unwrap();
+    let rows = lp["rows"].as_array().expect("rows array");
+    let more = &lp["more"];
+    assert!(!rows.is_empty(), "launchpad has rows");
+    let count = |b: &str| rows.iter().filter(|r| r["bucket"] == b).count();
+
+    // A boolean overflow flag exists for every capped bucket, and none exceeds its cap of 5.
+    for k in ["needs_review", "your_work", "your_open_prs", "recently_merged", "recent_pipelines"] {
+        assert!(more[k].is_boolean(), "{k} carries an overflow flag");
+        assert!(count(k) <= 5, "{k} is capped at 5 (was {})", count(k));
+    }
+
+    // Expand buckets are returned whole (the dashboard reveals them in place) — no overflow flag.
+    assert!(
+        more.get("ready_to_merge").is_none() && more.get("needs_fixing").is_none(),
+        "ready-to-merge / needs-fixing carry no overflow flag",
+    );
+
+    // "Assigned to you" favours in-progress: once a non-Started row appears, no Started follows.
+    let cats: Vec<String> = rows
+        .iter()
+        .filter(|r| r["bucket"] == "your_work")
+        .map(|r| r["work_item"]["state_category"].as_str().unwrap_or("").to_string())
+        .collect();
+    if let Some(i) = cats.iter().position(|c| c != "Started") {
+        assert!(cats[i..].iter().all(|c| c != "Started"), "in-progress work items sort first: {cats:?}");
+    }
+}
+
+#[tokio::test]
+async fn pr_revert_endpoint_reaches_the_provider() {
+    let server = spawn(demo_deps(true).await, 0).await.expect("server binds");
+    let base = format!("http://127.0.0.1:{}", server.port);
+    let client = reqwest::Client::new();
+    let tok = server.token.clone();
+
+    // A merged demo PR reverts (demo is a no-op success).
+    let ok = client
+        .post(format!("{base}/api/pr/revert"))
+        .header("x-forgetop-token", &tok)
+        .json(&serde_json::json!({ "conn": "github", "id": "1450" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), 200);
+    assert_eq!(ok.json::<serde_json::Value>().await.unwrap()["ok"], true);
+
+    // An unknown connection is a 404, not a 500.
+    let missing = client
+        .post(format!("{base}/api/pr/revert"))
+        .header("x-forgetop-token", &tok)
+        .json(&serde_json::json!({ "conn": "nope", "id": "1450" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), 404);
+}
+
+#[tokio::test]
+async fn notifications_carry_drill_in_targets_and_mark_read() {
+    let server = spawn(demo_deps(true).await, 0).await.expect("server binds");
+    let base = format!("http://127.0.0.1:{}", server.port);
+    let client = reqwest::Client::new();
+    let tok = server.token.clone();
+    let get = |c: &reqwest::Client| {
+        c.get(format!("{base}/api/notifications")).header("x-forgetop-token", &tok)
+    };
+
+    let notifs: serde_json::Value = get(&client).send().await.unwrap().json().await.unwrap();
+    let rows = notifs.as_array().unwrap();
+    assert!(!rows.is_empty(), "demo has notifications");
+    assert!(
+        rows.iter().any(|n| {
+            let t = &n["notification"]["item_type"];
+            (t == "PullRequest" || t == "WorkItem") && n["notification"]["item_id"].is_string()
+        }),
+        "a notification carries item_type + item_id for in-app drill-in",
+    );
+
+    // Marking one read flips its unread flag on the next fetch.
+    let n = &rows[0];
+    let read = client
+        .post(format!("{base}/api/notification/read"))
+        .header("x-forgetop-token", &tok)
+        .json(&serde_json::json!({ "conn": n["connection_id"], "id": n["notification"]["id"] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(read.status(), 200);
+    let after: serde_json::Value = get(&client).send().await.unwrap().json().await.unwrap();
+    let same = after
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["notification"]["id"] == n["notification"]["id"])
+        .expect("the notification is still listed");
+    assert_eq!(same["notification"]["unread"], false, "it now reads as read");
+}
