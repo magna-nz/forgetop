@@ -76,16 +76,12 @@ and [azdo](https://github.com/Elpulgo/azdo) (Azure DevOps only). forgetop's angl
 | Desktop notifications | ✅ | ❌ | ❌ |
 | Tokens in OS keychain | ✅ | via `gh` | PAT |
 
-…and all of it works the same in the **terminal UI** and the **web dashboard** - they're two
+…and all of it works the same in the **terminal UI** and the **web dashboard** — they're two
 frontends over one core.
 
-## Providers
-
-**GitHub · GitLab · Azure DevOps · Bitbucket · Linear · Jira** (plus a built-in `--demo`).
-Each section — Pull Requests, Work Items, Pipelines — binds to the forges that serve it, and
-Pipelines can aggregate several at once. For exactly what each provider serves (and the
-notification-feed support), see the
-[capability matrix](https://magna-nz.github.io/forgetop/#providers-and-capabilities).
+Each section binds to the forges that serve it (Pipelines can aggregate several at once); see
+the [capability matrix](https://magna-nz.github.io/forgetop/#providers-and-capabilities) for
+exactly what each provider serves, including notification-feed support.
 
 ## Install
 
