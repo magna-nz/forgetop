@@ -126,6 +126,7 @@ pub fn classify_pr(pr: &PullRequest, role: PrRole) -> Option<Bucket> {
 
 /// How many entries each right-column reference list shows before a "more…" affordance. When a
 /// bucket has more than this, [`Overflow`] flags it so the frontends can link to the full page.
+const NEEDS_REVIEW_MAX: usize = 5;
 const YOUR_WORK_MAX: usize = 5;
 const YOUR_OPEN_PRS_MAX: usize = 5;
 const RECENT_MERGE_MAX: usize = 5;
@@ -271,6 +272,7 @@ fn age_key(t: Option<DateTime<Utc>>) -> (u8, i64) {
 /// Whether a capped reference bucket had more entries than it shows — drives the "more…" affordance.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Overflow {
+    pub needs_review: bool,
     pub your_work: bool,
     pub your_open_prs: bool,
     pub recently_merged: bool,
@@ -374,16 +376,24 @@ pub fn build(prs_review: &[PrInput], prs_mine: &[PrInput], wis: &[WiInput], pipe
         })
     });
 
-    // Cap each reference list, flagging any that had more so a "more…" link can show.
+    // Cap the buckets that deep-link to a full page/view, flagging any that had more so a "more…"
+    // link can show. "Needs your review" caps here (it links to the PR Review-requested view); the
+    // other left-column buckets (ready-to-merge / needs-fixing) are left whole so the dashboard can
+    // expand them in place.
     let total = |bucket: Bucket| out.iter().filter(|e| e.bucket == bucket).count();
     let overflow = Overflow {
+        needs_review: total(Bucket::NeedsReview) > NEEDS_REVIEW_MAX,
         your_work: total(Bucket::YourWork) > YOUR_WORK_MAX,
         your_open_prs: total(Bucket::YourOpenPrs) > YOUR_OPEN_PRS_MAX,
         recently_merged: total(Bucket::RecentlyMerged) > RECENT_MERGE_MAX,
         recent_pipelines: total(Bucket::RecentPipelines) > RECENT_PIPELINE_MAX,
     };
-    let (mut work, mut open_prs, mut merged, mut pipelines) = (0, 0, 0, 0);
+    let (mut review, mut work, mut open_prs, mut merged, mut pipelines) = (0, 0, 0, 0, 0);
     out.retain(|e| match e.bucket {
+        Bucket::NeedsReview => {
+            review += 1;
+            review <= NEEDS_REVIEW_MAX
+        }
         Bucket::YourWork => {
             work += 1;
             work <= YOUR_WORK_MAX
@@ -580,6 +590,16 @@ mod tests {
         // In-progress first (newest activity first within the group), then the rest by recency.
         assert_eq!(&work[..4], &["prog1", "prog2", "prog3", "prog4"], "in-progress items lead");
         assert_eq!(work[4], "todo1", "then the most recently updated of the rest");
+    }
+
+    #[test]
+    fn needs_review_caps_at_five_and_flags_overflow() {
+        let review: Vec<PrInput> = (0..6)
+            .map(|i| pr_row(&format!("r{i}"), authored(false, &[], CheckStatus::Passed, MergeableState::Mergeable)))
+            .collect();
+        let lp = build(&review, &[], &[], &[]);
+        assert_eq!(lp.entries.iter().filter(|e| e.bucket == Bucket::NeedsReview).count(), 5, "capped at five");
+        assert!(lp.overflow.needs_review, "six review requests flags overflow");
     }
 
     #[test]

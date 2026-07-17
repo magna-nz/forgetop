@@ -1207,6 +1207,7 @@ impl App {
     fn bucket_overflowed(&self, b: launchpad::Bucket) -> bool {
         use launchpad::Bucket::*;
         match b {
+            NeedsReview => self.lp_overflow.needs_review,
             YourWork => self.lp_overflow.your_work,
             YourOpenPrs => self.lp_overflow.your_open_prs,
             RecentlyMerged => self.lp_overflow.recently_merged,
@@ -1283,6 +1284,7 @@ impl App {
     async fn open_lp_more(&mut self, bucket: launchpad::Bucket, deps: &AppDeps) {
         use launchpad::Bucket::*;
         match bucket {
+            NeedsReview => self.goto_pr_section(PullRequestFilter::ReviewRequested, false, deps).await,
             YourOpenPrs => self.goto_pr_section(PullRequestFilter::Mine, false, deps).await,
             RecentlyMerged => self.goto_pr_section(PullRequestFilter::Mine, true, deps).await,
             YourWork => self.goto_section(Section::WorkItems),

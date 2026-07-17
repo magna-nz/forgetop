@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { motion } from "framer-motion";
 import { useLaunchpad } from "../api";
 import { checkMeta, pipeMeta, prStatusMeta, relativeTime, wiStateColor } from "../format";
@@ -30,6 +31,15 @@ export function Launchpad() {
 /** Where a bucket's "more…" link goes; presets the PR page view where relevant. */
 function moreTarget(bucket: string, navigate: (s: SectionId) => void): (() => void) | null {
   switch (bucket) {
+    case "needs_review":
+      return () => {
+        try {
+          localStorage.setItem("forgetop_pr_view", "review_requested");
+        } catch {
+          /* ignore */
+        }
+        navigate("prs");
+      };
     case "your_work":
       return () => navigate("work-items");
     case "your_open_prs":
@@ -94,10 +104,22 @@ function Column({ heading, groups, emptyHint, more }: { heading: string; groups:
   );
 }
 
+/** Buckets with no clean deep-link target: capped in the UI and revealed in place, a page at a time. */
+const EXPAND_BUCKETS = new Set(["ready_to_merge", "needs_fixing"]);
+const EXPAND_STEP = 5;
+
 function BucketGroup({ group, more }: { group: Group; more: LaunchpadMore }) {
   const navigate = useNavigateSection();
-  const hasMore = (more as unknown as Record<string, boolean>)[group.bucket] === true;
-  const go = hasMore ? moreTarget(group.bucket, navigate) : null;
+  const isExpand = EXPAND_BUCKETS.has(group.bucket);
+  const [limit, setLimit] = useState(EXPAND_STEP);
+
+  // Expand buckets are returned whole and revealed in place; the rest are already capped by the
+  // backend and their "more…" deep-links to the full page/view.
+  const rows = isExpand ? group.rows.slice(0, limit) : group.rows;
+  const expandMore = isExpand && group.rows.length > limit;
+  const navMore = !isExpand && (more as unknown as Record<string, boolean>)[group.bucket] === true;
+  const go = navMore ? moreTarget(group.bucket, navigate) : null;
+
   return (
     <div>
       <div className="flex items-center gap-2 px-1 mb-2">
@@ -109,12 +131,12 @@ function BucketGroup({ group, more }: { group: Group; more: LaunchpadMore }) {
         </span>
       </div>
       <div className="flex flex-col gap-1.5">
-        {group.rows.map((row, i) => (
+        {rows.map((row, i) => (
           <ItemRow key={`${row.connection_id}:${rowId(row)}`} row={row} index={i} muted={group.muted} />
         ))}
-        {go && (
+        {(go || expandMore) && (
           <button
-            onClick={go}
+            onClick={go ?? (() => setLimit((l) => l + EXPAND_STEP))}
             className="text-xs font-medium rounded-lg px-3 py-2 text-left transition-colors hover:brightness-110"
             style={{ color: "var(--accent)", background: "var(--card)", border: "1px solid var(--border)" }}
           >

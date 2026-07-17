@@ -308,6 +308,7 @@ async fn pipe_inputs(sections: &SectionService) -> Vec<PipeInput> {
 /// Which capped reference lists had more entries than they show — drives the "more…" links.
 #[derive(Serialize)]
 pub struct LaunchpadMore {
+    pub needs_review: bool,
     pub your_work: bool,
     pub your_open_prs: bool,
     pub recently_merged: bool,
@@ -349,6 +350,7 @@ pub async fn launchpad(sections: &SectionService) -> LaunchpadResponse {
     LaunchpadResponse {
         rows,
         more: LaunchpadMore {
+            needs_review: built.overflow.needs_review,
             your_work: built.overflow.your_work,
             your_open_prs: built.overflow.your_open_prs,
             recently_merged: built.overflow.recently_merged,
