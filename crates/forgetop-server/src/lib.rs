@@ -159,8 +159,8 @@ fn token_from(req: &Request) -> Option<String> {
 async fn health(State(s): State<AppState>) -> Json<Vec<dto::HealthRow>> {
     Json(dto::health(&s.deps.health).await)
 }
-async fn pull_requests(State(s): State<AppState>) -> Json<Vec<dto::PrRow>> {
-    Json(dto::pull_requests(&s.deps.sections).await)
+async fn pull_requests(State(s): State<AppState>, Query(q): Query<PrListQuery>) -> Json<Vec<dto::PrRow>> {
+    Json(dto::pull_requests(&s.deps.sections, dto::PrView::parse(q.view.as_deref())).await)
 }
 async fn work_items(State(s): State<AppState>) -> Json<Vec<dto::WiRow>> {
     Json(dto::work_items(&s.deps.sections).await)
@@ -180,6 +180,13 @@ async fn launchpad(State(s): State<AppState>) -> Json<Vec<dto::LaunchpadRow>> {
 struct ItemQuery {
     conn: String,
     id: String,
+}
+
+/// Query params for the PR list: which view to show (`?view=all|merged|review_requested`).
+#[derive(Deserialize)]
+struct PrListQuery {
+    #[serde(default)]
+    view: Option<String>,
 }
 
 /// Query params identifying a pipeline run within a connection (`?conn=…&run_id=…`).

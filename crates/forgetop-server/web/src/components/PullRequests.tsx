@@ -1,4 +1,5 @@
-import { usePullRequests } from "../api";
+import { useState } from "react";
+import { usePullRequests, type PrView } from "../api";
 import { checkMeta, prStatusMeta, relativeTime, toTime, voteMeta } from "../format";
 import type { PrRow } from "../types";
 import { Avatar, Chip, List, Pill, ProviderBadge, Row, Skeleton, StateCard } from "./ui";
@@ -6,8 +7,42 @@ import { ErrorState } from "./ErrorState";
 import { usePrOpener } from "./PrDetail";
 import { useListView } from "./ControlBar";
 
+const PR_VIEWS: { key: PrView; label: string }[] = [
+  { key: "all", label: "All Pull Requests" },
+  { key: "merged", label: "Recently merged by you" },
+  { key: "review_requested", label: "Review requested" },
+];
+
+const EMPTY: Record<PrView, { icon: string; title: string; sub: string }> = {
+  all: { icon: "◇", title: "No open pull requests", sub: "PRs you author or are asked to review show up here." },
+  merged: { icon: "✓", title: "Nothing merged recently", sub: "Pull requests you authored that have merged show up here." },
+  review_requested: { icon: "◇", title: "No review requests", sub: "Pull requests waiting on your review show up here." },
+};
+
+function usePrView(): [PrView, (v: PrView) => void] {
+  const [view, setView] = useState<PrView>(() => {
+    try {
+      const s = localStorage.getItem("forgetop_pr_view");
+      if (s === "all" || s === "merged" || s === "review_requested") return s;
+    } catch {
+      /* ignore */
+    }
+    return "all";
+  });
+  const set = (v: PrView) => {
+    setView(v);
+    try {
+      localStorage.setItem("forgetop_pr_view", v);
+    } catch {
+      /* ignore */
+    }
+  };
+  return [view, set];
+}
+
 export function PullRequests() {
-  const { data, isLoading, error } = usePullRequests();
+  const [view, setView] = usePrView();
+  const { data, isLoading, error } = usePullRequests(view);
   const { rows, bar } = useListView<PrRow>({
     storageKey: "prs",
     rows: data,
@@ -18,28 +53,51 @@ export function PullRequests() {
       { label: "Oldest", cmp: (a, b) => toTime(a.pull_request.updated_at) - toTime(b.pull_request.updated_at) },
       { label: "Title A–Z", cmp: (a, b) => a.pull_request.title.localeCompare(b.pull_request.title) },
     ],
-    statuses: [
-      { label: "Open", match: (r) => r.pull_request.status === "Open" && !r.pull_request.is_draft },
-      { label: "Draft", match: (r) => r.pull_request.is_draft },
-      { label: "Checks failing", match: (r) => r.pull_request.checks === "Failed" },
-    ],
-    statusLabel: "Show",
   });
-
-  if (isLoading) return <Skeleton />;
-  if (error) return <ErrorState error={error} />;
-  if (!data || data.length === 0)
-    return <StateCard icon="◇" title="No open pull requests" sub="PRs you author or are asked to review show up here." />;
 
   return (
     <>
-      {bar}
-      <List>
-        {rows.map((row, i) => (
-          <PrCard key={`${row.connection_id}:${row.pull_request.id}`} row={row} index={i} />
-        ))}
-      </List>
+      <ViewTabs view={view} onChange={setView} />
+      {isLoading ? (
+        <Skeleton />
+      ) : error ? (
+        <ErrorState error={error} />
+      ) : !data || data.length === 0 ? (
+        <StateCard icon={EMPTY[view].icon} title={EMPTY[view].title} sub={EMPTY[view].sub} />
+      ) : (
+        <>
+          {bar}
+          <List>
+            {rows.map((row, i) => (
+              <PrCard key={`${row.connection_id}:${row.pull_request.id}`} row={row} index={i} />
+            ))}
+          </List>
+        </>
+      )}
     </>
+  );
+}
+
+function ViewTabs({ view, onChange }: { view: PrView; onChange: (v: PrView) => void }) {
+  return (
+    <div className="flex px-5 pt-4 max-w-5xl mx-auto">
+      <div className="inline-flex rounded-lg p-0.5" style={{ background: "var(--panel2)", border: "1px solid var(--border)" }}>
+        {PR_VIEWS.map((v) => {
+          const active = v.key === view;
+          return (
+            <button
+              key={v.key}
+              onClick={() => onChange(v.key)}
+              aria-pressed={active}
+              className="text-xs font-medium rounded-md px-3 py-1.5 transition-colors whitespace-nowrap"
+              style={{ background: active ? "var(--accent)" : "transparent", color: active ? "var(--bg)" : "var(--dim)" }}
+            >
+              {v.label}
+            </button>
+          );
+        })}
+      </div>
+    </div>
   );
 }
 

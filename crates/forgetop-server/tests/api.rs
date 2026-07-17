@@ -123,6 +123,43 @@ async fn seeded_demo_data_reaches_the_api() {
 }
 
 #[tokio::test]
+async fn pr_views_map_to_provider_queries() {
+    // The three PR-page views resolve through the provider's `list(query)` — the same path the
+    // TUI uses — so this exercises the real filtering, not a client-side slice.
+    let server = spawn(demo_deps(true).await, 0).await.expect("server binds");
+    let base = format!("http://127.0.0.1:{}", server.port);
+    let client = reqwest::Client::new();
+
+    let get = |view: &str| {
+        let url = format!("{base}/api/pull-requests?view={view}&t={}", server.token);
+        let client = client.clone();
+        async move { client.get(url).send().await.unwrap().json::<serde_json::Value>().await.unwrap() }
+    };
+    let rows = |v: &serde_json::Value| v.as_array().unwrap().clone();
+
+    // All: open PRs across connections — nothing merged.
+    let all = rows(&get("all").await);
+    assert!(!all.is_empty(), "all view returns rows");
+    assert!(all.iter().all(|r| r["pull_request"]["status"] != "Merged"), "all view excludes merged");
+
+    // Recently merged by you: every row is merged and authored by you.
+    let merged = rows(&get("merged").await);
+    assert!(!merged.is_empty(), "merged view returns your merged PRs");
+    assert!(merged.iter().all(|r| r["pull_request"]["status"] == "Merged"), "merged view is only merged");
+    assert!(merged.iter().all(|r| r["pull_request"]["author"]["handle"] == "you"), "merged view is authored by you");
+
+    // Review requested: every row lists you as a reviewer.
+    let review = rows(&get("review_requested").await);
+    assert!(!review.is_empty(), "review-requested view returns rows");
+    assert!(
+        review
+            .iter()
+            .all(|r| r["pull_request"]["reviewers"].as_array().unwrap().iter().any(|rv| rv["user"]["handle"] == "you")),
+        "review-requested rows list you as a reviewer",
+    );
+}
+
+#[tokio::test]
 async fn pr_detail_and_write_actions_reach_the_provider() {
     let server = spawn(demo_deps(true).await, 0).await.expect("server binds");
     let base = format!("http://127.0.0.1:{}", server.port);

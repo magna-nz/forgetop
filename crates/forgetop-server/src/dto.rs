@@ -6,7 +6,7 @@ use std::sync::Arc;
 use forgetop_core::config::PipelineSubscription;
 use forgetop_core::domain::{
     CheckRun, CommentThread, Commit, FileChange, Notification, PipelineApproval, PipelineRun, PipelineRunStatus,
-    ProviderType, PullRequest, WorkItem,
+    ProviderType, PullRequest, PullRequestStatus, WorkItem,
 };
 use forgetop_core::launchpad::{self, EntryItem, PipeInput, PrInput, WiInput};
 use forgetop_core::provider::{
@@ -60,13 +60,54 @@ pub struct HealthRow {
     pub healthy: bool,
 }
 
-pub async fn pull_requests(sections: &SectionService) -> Vec<PrRow> {
+/// Which slice of pull requests the PR page is showing. The provider `list(query)` does the
+/// filtering (the same path the TUI uses), so each view is correct for real providers, not just demo.
+#[derive(Clone, Copy)]
+pub enum PrView {
+    /// Open PRs across the bound connections.
+    All,
+    /// PRs you authored that have merged (newest first is applied client-side by the default sort).
+    MergedByYou,
+    /// PRs where you're a requested reviewer.
+    ReviewRequested,
+}
+
+impl PrView {
+    /// Parses the `?view=` query param; anything unrecognised (or absent) means `All`.
+    pub fn parse(s: Option<&str>) -> PrView {
+        match s {
+            Some("merged") => PrView::MergedByYou,
+            Some("review_requested") => PrView::ReviewRequested,
+            _ => PrView::All,
+        }
+    }
+
+    fn query(self) -> PullRequestQuery {
+        let (filter, include_completed) = match self {
+            // "Merged by you" needs completed PRs; we keep only the merged ones below.
+            PrView::MergedByYou => (PullRequestFilter::Mine, true),
+            PrView::ReviewRequested => (PullRequestFilter::ReviewRequested, false),
+            PrView::All => (PullRequestFilter::All, false),
+        };
+        PullRequestQuery { filter, include_completed, limit: Some(50) }
+    }
+
+    /// `Mine + include_completed` also returns your closed-but-not-merged PRs; drop those.
+    fn keep(self, pr: &PullRequest) -> bool {
+        match self {
+            PrView::MergedByYou => matches!(pr.status, PullRequestStatus::Merged),
+            _ => true,
+        }
+    }
+}
+
+pub async fn pull_requests(sections: &SectionService, view: PrView) -> Vec<PrRow> {
     let mut out = Vec::new();
     if let Ok(feeds) = sections.pull_request_feeds().await {
-        let query = PullRequestQuery { filter: PullRequestFilter::All, include_completed: false, limit: Some(50) };
+        let query = view.query();
         for feed in feeds {
             if let Ok(list) = feed.source.list(&query).await {
-                out.extend(list.into_iter().map(|pr| PrRow {
+                out.extend(list.into_iter().filter(|pr| view.keep(pr)).map(|pr| PrRow {
                     connection_id: feed.connection.connection_id().to_string(),
                     connection: feed.connection.display_name().to_string(),
                     provider: feed.connection.provider_type(),
