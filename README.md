@@ -13,17 +13,14 @@ and **Jira** — in your **terminal**, your **browser**, or both.
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 <div align="center">
-  <table>
-    <tr>
-      <td align="center" width="50%"><img src="docs/launchpad2.gif" alt="The Launchpad in the terminal" width="400"></td>
-      <td align="center" width="50%"><img src="docs/dashboard.gif" alt="The Launchpad in the web dashboard" width="400"></td>
-    </tr>
-    <tr>
-      <td align="center"><sub><b>In your terminal</b></sub></td>
-      <td align="center"><sub><b>…or your browser</b></sub></td>
-    </tr>
-  </table>
+  <img src="docs/launchpad2.gif" alt="The Launchpad in the terminal" width="820">
   <br/>
+  <sub><b>In your terminal</b></sub>
+  <br/><br/>
+  <img src="docs/dashboard.gif" alt="The Launchpad in the web dashboard" width="820">
+  <br/>
+  <sub><b>…or your browser</b></sub>
+  <br/><br/>
   <sub>The <b>Launchpad</b> — the same triaged, actionable queue in your terminal and your browser. Same data, same actions. Your call.</sub>
 </div>
 
