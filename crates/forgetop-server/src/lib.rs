@@ -171,7 +171,7 @@ async fn pipelines(State(s): State<AppState>) -> Json<Vec<dto::PipeRow>> {
 async fn notifications(State(s): State<AppState>) -> Json<Vec<dto::NotifRow>> {
     Json(dto::notifications(&s.deps.sections).await)
 }
-async fn launchpad(State(s): State<AppState>) -> Json<Vec<dto::LaunchpadRow>> {
+async fn launchpad(State(s): State<AppState>) -> Json<dto::LaunchpadResponse> {
     Json(dto::launchpad(&s.deps.sections).await)
 }
 

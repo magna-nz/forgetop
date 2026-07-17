@@ -203,6 +203,8 @@ pub struct App {
     pub screen: Screen,
     /// Launchpad rows (grouped + sorted), rebuilt each refresh.
     pub lp: Vec<launchpad::Entry>,
+    /// Which Launchpad reference lists had more than they show (drives the "more…" row).
+    pub lp_overflow: launchpad::Overflow,
     /// Focused column (0 = left, 1 = right) and the selected row within each — the
     /// Launchpad is a two-column layout.
     pub lp_side: usize,
@@ -234,6 +236,14 @@ pub struct App {
 
 /// Full-screen views layered above the list. The large views are boxed so the
 /// common `List` state doesn't bloat every `Screen` value.
+/// A selectable row in a Launchpad column: a real entry, or a "more…" link for an overflowing
+/// bucket that jumps to the full section.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LpSlot {
+    Entry(usize),
+    More(launchpad::Bucket),
+}
+
 pub enum Screen {
     /// The default landing: a unified, grouped action inbox across every provider.
     Launchpad,
@@ -680,6 +690,7 @@ impl App {
             wizard: None,
             screen: Screen::Launchpad,
             lp: Vec::new(),
+            lp_overflow: launchpad::Overflow::default(),
             lp_side: 0,
             lp_sel: [0, 0],
             lp_prs_mine: Vec::new(),
@@ -1167,11 +1178,13 @@ impl App {
 
     /// Rebuilds the Launchpad rows from the current feeds (no fetch) and clamps selection.
     fn rebuild_launchpad(&mut self) {
-        self.lp = launchpad::build(&self.lp_prs_review, &self.lp_prs_mine, &self.wis, &self.pipes);
+        let built = launchpad::build(&self.lp_prs_review, &self.lp_prs_mine, &self.wis, &self.pipes);
+        self.lp = built.entries;
+        self.lp_overflow = built.overflow;
         // Drop anything already acted on this session (e.g. a PR you've reviewed).
         self.lp.retain(|e| !self.lp_dismissed.contains(&launchpad::Entry::key(&e.connection_id, e.item_id())));
         for side in 0..2 {
-            let len = self.lp_column(side).len();
+            let len = self.lp_slots(side).len();
             if self.lp_sel[side] >= len {
                 self.lp_sel[side] = len.saturating_sub(1);
             }
@@ -1190,13 +1203,41 @@ impl App {
         self.lp.iter().enumerate().filter(|(_, e)| e.bucket.column() == side).map(|(i, _)| i).collect()
     }
 
-    /// The `self.lp` index of the currently-focused Launchpad row, if any.
-    fn lp_selected(&self) -> Option<usize> {
-        self.lp_column(self.lp_side).get(self.lp_sel[self.lp_side]).copied()
+    /// Whether a capped reference bucket had more than it shows (drives the "more…" slot).
+    fn bucket_overflowed(&self, b: launchpad::Bucket) -> bool {
+        use launchpad::Bucket::*;
+        match b {
+            YourWork => self.lp_overflow.your_work,
+            YourOpenPrs => self.lp_overflow.your_open_prs,
+            RecentlyMerged => self.lp_overflow.recently_merged,
+            RecentPipelines => self.lp_overflow.recent_pipelines,
+            _ => false,
+        }
+    }
+
+    /// The selectable slots for a column: each entry, plus a "more…" slot after the last entry
+    /// of any overflowing bucket.
+    pub fn lp_slots(&self, side: usize) -> Vec<LpSlot> {
+        let col = self.lp_column(side);
+        let mut slots = Vec::with_capacity(col.len());
+        for (pos, &i) in col.iter().enumerate() {
+            slots.push(LpSlot::Entry(i));
+            let bucket = self.lp[i].bucket;
+            let last_of_bucket = col.get(pos + 1).map(|&j| self.lp[j].bucket != bucket).unwrap_or(true);
+            if last_of_bucket && self.bucket_overflowed(bucket) {
+                slots.push(LpSlot::More(bucket));
+            }
+        }
+        slots
+    }
+
+    /// The slot the cursor is on, if any.
+    fn lp_selected_slot(&self) -> Option<LpSlot> {
+        self.lp_slots(self.lp_side).into_iter().nth(self.lp_sel[self.lp_side])
     }
 
     fn lp_move(&mut self, delta: isize) {
-        let len = self.lp_column(self.lp_side).len();
+        let len = self.lp_slots(self.lp_side).len();
         if len > 0 {
             let cur = self.lp_sel[self.lp_side] as isize;
             self.lp_sel[self.lp_side] = (cur + delta).clamp(0, len as isize - 1) as usize;
@@ -1238,9 +1279,55 @@ impl App {
         }
     }
 
-    /// Opens the selected Launchpad row in its full item view.
+    /// Follows a Launchpad "more…" link to the full section, applying the closest filter.
+    async fn open_lp_more(&mut self, bucket: launchpad::Bucket, deps: &AppDeps) {
+        use launchpad::Bucket::*;
+        match bucket {
+            YourOpenPrs => self.goto_pr_section(PullRequestFilter::Mine, false, deps).await,
+            RecentlyMerged => self.goto_pr_section(PullRequestFilter::Mine, true, deps).await,
+            YourWork => self.goto_section(Section::WorkItems),
+            RecentPipelines => self.goto_section(Section::Pipelines),
+            _ => {}
+        }
+    }
+
+    /// Leaves the Launchpad for a section's list.
+    fn goto_section(&mut self, section: Section) {
+        self.active = index_of(section);
+        self.screen = Screen::List;
+        self.list_scroll = 0;
+        self.clamp_selection();
+    }
+
+    /// Jumps to the PR section with a base filter; `show_merged` also ticks Merged so your
+    /// recently-merged PRs come back from the provider.
+    async fn goto_pr_section(&mut self, filter: PullRequestFilter, show_merged: bool, deps: &AppDeps) {
+        self.goto_section(Section::PullRequests);
+        self.pr_filter = filter;
+        if show_merged {
+            self.pr_shown_statuses.insert(PullRequestStatus::Merged);
+        }
+        let mut errors = Vec::new();
+        self.reload_pull_requests(deps, &mut errors).await;
+        if let Some(e) = errors.first() {
+            self.toast = Some(e.clone());
+        }
+    }
+
+    /// Opens the selected Launchpad row in its full item view, or follows a "more…" slot to the
+    /// full section.
     async fn open_launchpad_selected(&mut self, deps: &AppDeps) {
-        let Some(entry) = self.lp_selected().and_then(|i| self.lp.get(i)) else { return };
+        let entry = match self.lp_selected_slot() {
+            Some(LpSlot::Entry(i)) => match self.lp.get(i) {
+                Some(e) => e,
+                None => return,
+            },
+            Some(LpSlot::More(bucket)) => {
+                self.open_lp_more(bucket, deps).await;
+                return;
+            }
+            None => return,
+        };
         self.lp_origin = true; // opened from the Launchpad, so Esc returns there
         self.from_inbox = false;
         let (kind, conn, id) = (entry.kind(), entry.connection_id.clone(), entry.item_id().to_string());
@@ -3963,6 +4050,28 @@ mod tests {
         assert_eq!(app.inbox_sel, 0);
         app.inbox_move(-1);
         assert_eq!(app.inbox_sel, 2, "moving up past the top wraps to the end");
+    }
+
+    #[test]
+    fn launchpad_caps_assigned_work_and_adds_a_more_slot() {
+        let mut app = App::new("slate");
+        app.wis = (0..6)
+            .map(|i| {
+                let mut w = wi(None);
+                w.id = format!("w{i}");
+                w.state_category = WorkItemStateCategory::Started;
+                wi_row(w)
+            })
+            .collect();
+        app.rebuild_launchpad();
+        // Six assigned → five shown, with the overflow flag set.
+        let shown = app.lp.iter().filter(|e| e.bucket == launchpad::Bucket::YourWork).count();
+        assert_eq!(shown, 5, "capped at five");
+        assert!(app.lp_overflow.your_work, "overflow flagged");
+        // The right column ends with a selectable "more…" slot for the overflowing bucket.
+        let slots = app.lp_slots(1);
+        assert_eq!(slots.len(), shown + 1, "five entries + one more… slot");
+        assert!(matches!(slots.last(), Some(LpSlot::More(launchpad::Bucket::YourWork))));
     }
 
     #[test]

@@ -1,29 +1,60 @@
 import { motion } from "framer-motion";
 import { useLaunchpad } from "../api";
 import { checkMeta, pipeMeta, prStatusMeta, relativeTime, wiStateColor } from "../format";
-import type { LaunchpadRow } from "../types";
+import type { LaunchpadMore, LaunchpadRow, SectionId } from "../types";
 import { ProviderBadge, Skeleton, StateCard } from "./ui";
 import { ErrorState } from "./ErrorState";
 import { usePrOpener } from "./PrDetail";
 import { useWiOpener } from "./WiDetail";
 import { usePipelineOpener } from "./PipelineDetail";
+import { useNavigateSection } from "../nav";
 
 export function Launchpad() {
   const { data, isLoading, error } = useLaunchpad();
   if (isLoading) return <Skeleton />;
   if (error) return <ErrorState error={error} />;
-  if (!data || data.length === 0)
+  if (!data || data.rows.length === 0)
     return <StateCard icon="✦" title="All clear" sub="Nothing needs your attention right now." />;
 
-  const left = groupByBucket(data.filter((r) => r.column === 0));
-  const right = groupByBucket(data.filter((r) => r.column === 1));
+  const left = groupByBucket(data.rows.filter((r) => r.column === 0));
+  const right = groupByBucket(data.rows.filter((r) => r.column === 1));
 
   return (
     <div className="grid gap-5 p-5 max-w-6xl mx-auto lg:grid-cols-2">
-      <Column heading="Needs you" groups={left} emptyHint="Nothing waiting on you." />
-      <Column heading="Your work" groups={right} emptyHint="No open work." />
+      <Column heading="Needs you" groups={left} emptyHint="Nothing waiting on you." more={data.more} />
+      <Column heading="Your work" groups={right} emptyHint="No open work." more={data.more} />
     </div>
   );
+}
+
+/** Where a bucket's "more…" link goes; presets the PR page view where relevant. */
+function moreTarget(bucket: string, navigate: (s: SectionId) => void): (() => void) | null {
+  switch (bucket) {
+    case "your_work":
+      return () => navigate("work-items");
+    case "your_open_prs":
+      return () => {
+        try {
+          localStorage.setItem("forgetop_pr_view", "yours");
+        } catch {
+          /* ignore */
+        }
+        navigate("prs");
+      };
+    case "recently_merged":
+      return () => {
+        try {
+          localStorage.setItem("forgetop_pr_view", "merged");
+        } catch {
+          /* ignore */
+        }
+        navigate("prs");
+      };
+    case "recent_pipelines":
+      return () => navigate("pipelines");
+    default:
+      return null;
+  }
 }
 
 interface Group {
@@ -46,7 +77,7 @@ function groupByBucket(rows: LaunchpadRow[]): Group[] {
   return groups;
 }
 
-function Column({ heading, groups, emptyHint }: { heading: string; groups: Group[]; emptyHint: string }) {
+function Column({ heading, groups, emptyHint, more }: { heading: string; groups: Group[]; emptyHint: string; more: LaunchpadMore }) {
   return (
     <section className="flex flex-col gap-5">
       <h2 className="text-xs font-semibold uppercase tracking-wider px-1" style={{ color: "var(--dim)" }}>
@@ -57,13 +88,16 @@ function Column({ heading, groups, emptyHint }: { heading: string; groups: Group
           {emptyHint}
         </p>
       ) : (
-        groups.map((g) => <BucketGroup key={g.bucket} group={g} />)
+        groups.map((g) => <BucketGroup key={g.bucket} group={g} more={more} />)
       )}
     </section>
   );
 }
 
-function BucketGroup({ group }: { group: Group }) {
+function BucketGroup({ group, more }: { group: Group; more: LaunchpadMore }) {
+  const navigate = useNavigateSection();
+  const hasMore = (more as unknown as Record<string, boolean>)[group.bucket] === true;
+  const go = hasMore ? moreTarget(group.bucket, navigate) : null;
   return (
     <div>
       <div className="flex items-center gap-2 px-1 mb-2">
@@ -78,6 +112,15 @@ function BucketGroup({ group }: { group: Group }) {
         {group.rows.map((row, i) => (
           <ItemRow key={`${row.connection_id}:${rowId(row)}`} row={row} index={i} muted={group.muted} />
         ))}
+        {go && (
+          <button
+            onClick={go}
+            className="text-xs font-medium rounded-lg px-3 py-2 text-left transition-colors hover:brightness-110"
+            style={{ color: "var(--accent)", background: "var(--card)", border: "1px solid var(--border)" }}
+          >
+            more…
+          </button>
+        )}
       </div>
     </div>
   );

@@ -10,7 +10,7 @@ use ratatui::widgets::{
 };
 use ratatui::Frame;
 
-use crate::app::{App, ConfigView, DiffFocus, DiffView, PipelineView, PrView, Screen, WiView, PR_TABS, TABS};
+use crate::app::{App, ConfigView, DiffFocus, DiffView, LpSlot, PipelineView, PrView, Screen, WiView, PR_TABS, TABS};
 use crate::diff::{cursor_line_label, pending_marks};
 use crate::highlight::{lang_for, HlKind, LineHighlighter};
 use crate::overlay::Overlay;
@@ -219,51 +219,75 @@ fn render_lp_column(frame: &mut Frame, area: Rect, app: &App, side: usize, title
         .title(Span::styled(format!(" {title} "), Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)));
 
     let col = app.lp_column(side);
-    if col.is_empty() {
+    let slots = app.lp_slots(side);
+    if slots.is_empty() {
         empty(frame, area, theme, "— nothing here —", block);
         return;
     }
 
     let content_w = (area.width.saturating_sub(2) as usize).saturating_sub(2); // borders + highlight symbol
-    // One shared set of column widths for the whole side, so every row lines up.
-    let rows_cells: Vec<Vec<Vec<Span>>> = col.iter().map(|&i| lp_cells(theme, &app.lp[i], app.anim)).collect();
-    let widths = lp_widths(&rows_cells, 3, content_w);
+    // One shared set of column widths for the whole side (real entries only), so rows line up.
+    let entry_cells: Vec<Vec<Vec<Span>>> = slots
+        .iter()
+        .filter_map(|s| match s {
+            LpSlot::Entry(i) => Some(lp_cells(theme, &app.lp[*i], app.anim)),
+            LpSlot::More(_) => None,
+        })
+        .collect();
+    let widths = lp_widths(&entry_cells, 3, content_w);
 
     let mut items: Vec<ListItem> = Vec::new();
     let mut visual_sel = 0usize;
     let mut last: Option<Bucket> = None;
-    for (pos, (&i, cells)) in col.iter().zip(rows_cells.iter()).enumerate() {
-        let e = &app.lp[i];
-        if last != Some(e.bucket) {
-            let count = col.iter().filter(|&&j| app.lp[j].bucket == e.bucket).count();
-            let rank = Bucket::ORDER.iter().position(|b| *b == e.bucket).unwrap_or(0);
-            // All headings share one calm grey so they read uniformly as section labels.
-            let style = Style::default().fg(theme.dim).add_modifier(Modifier::BOLD);
-            if !items.is_empty() {
-                items.push(ListItem::new(Line::from("")));
-            }
-            items.push(ListItem::new(Line::from(Span::styled(format!("{}  {} ({count})", CIRCLED[rank.min(7)], e.bucket.title()), style))));
-            last = Some(e.bucket);
-        }
+    let mut cell_i = 0usize;
+    for (pos, slot) in slots.iter().enumerate() {
         let selected = pos == app.lp_sel[side];
-        if selected {
-            visual_sel = items.len();
-        }
-        // On the focused row, any overflowing column (title, person) scrolls so it's readable.
-        let line = if selected && focused {
-            let mut c = cells.clone();
-            for col in [LP_TITLE_COL, LP_PERSON_COL] {
-                if cell_width(&c[col]) > widths[col] {
-                    let text: String = c[col].iter().map(|s| s.content.as_ref()).collect();
-                    let style = c[col].first().map(|s| s.style).unwrap_or_default();
-                    c[col] = vec![Span::styled(marquee_window(&text, widths[col], app.anim / 2), style)];
+        match *slot {
+            LpSlot::Entry(i) => {
+                let e = &app.lp[i];
+                if last != Some(e.bucket) {
+                    let count = col.iter().filter(|&&j| app.lp[j].bucket == e.bucket).count();
+                    let rank = Bucket::ORDER.iter().position(|b| *b == e.bucket).unwrap_or(0);
+                    // All headings share one calm grey so they read uniformly as section labels.
+                    let style = Style::default().fg(theme.dim).add_modifier(Modifier::BOLD);
+                    if !items.is_empty() {
+                        items.push(ListItem::new(Line::from("")));
+                    }
+                    items.push(ListItem::new(Line::from(Span::styled(
+                        format!("{}  {} ({count})", CIRCLED[rank.min(7)], e.bucket.title()),
+                        style,
+                    ))));
+                    last = Some(e.bucket);
                 }
+                if selected {
+                    visual_sel = items.len();
+                }
+                let cells = &entry_cells[cell_i];
+                cell_i += 1;
+                // On the focused row, any overflowing column (title, person) scrolls so it's readable.
+                let line = if selected && focused {
+                    let mut c = cells.clone();
+                    for col in [LP_TITLE_COL, LP_PERSON_COL] {
+                        if cell_width(&c[col]) > widths[col] {
+                            let text: String = c[col].iter().map(|s| s.content.as_ref()).collect();
+                            let style = c[col].first().map(|s| s.style).unwrap_or_default();
+                            c[col] = vec![Span::styled(marquee_window(&text, widths[col], app.anim / 2), style)];
+                        }
+                    }
+                    lp_cells_line(&c, &widths, content_w)
+                } else {
+                    lp_cells_line(cells, &widths, content_w)
+                };
+                items.push(ListItem::new(line));
             }
-            lp_cells_line(&c, &widths, content_w)
-        } else {
-            lp_cells_line(cells, &widths, content_w)
-        };
-        items.push(ListItem::new(line));
+            LpSlot::More(_) => {
+                if selected {
+                    visual_sel = items.len();
+                }
+                let style = Style::default().fg(theme.accent).add_modifier(Modifier::BOLD);
+                items.push(ListItem::new(Line::from(Span::styled("more…".to_string(), style))));
+            }
+        }
     }
 
     let list = List::new(items)

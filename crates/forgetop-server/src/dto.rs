@@ -66,6 +66,8 @@ pub struct HealthRow {
 pub enum PrView {
     /// Open PRs across the bound connections.
     All,
+    /// Your own open PRs (authored by you, still open).
+    Yours,
     /// PRs you authored that have merged (newest first is applied client-side by the default sort).
     MergedByYou,
     /// PRs where you're a requested reviewer.
@@ -76,6 +78,7 @@ impl PrView {
     /// Parses the `?view=` query param; anything unrecognised (or absent) means `All`.
     pub fn parse(s: Option<&str>) -> PrView {
         match s {
+            Some("yours") => PrView::Yours,
             Some("merged") => PrView::MergedByYou,
             Some("review_requested") => PrView::ReviewRequested,
             _ => PrView::All,
@@ -86,6 +89,7 @@ impl PrView {
         let (filter, include_completed) = match self {
             // "Merged by you" needs completed PRs; we keep only the merged ones below.
             PrView::MergedByYou => (PullRequestFilter::Mine, true),
+            PrView::Yours => (PullRequestFilter::Mine, false),
             PrView::ReviewRequested => (PullRequestFilter::ReviewRequested, false),
             PrView::All => (PullRequestFilter::All, false),
         };
@@ -301,13 +305,31 @@ async fn pipe_inputs(sections: &SectionService) -> Vec<PipeInput> {
     out
 }
 
-pub async fn launchpad(sections: &SectionService) -> Vec<LaunchpadRow> {
+/// Which capped reference lists had more entries than they show — drives the "more…" links.
+#[derive(Serialize)]
+pub struct LaunchpadMore {
+    pub your_work: bool,
+    pub your_open_prs: bool,
+    pub recently_merged: bool,
+    pub recent_pipelines: bool,
+}
+
+/// The Launchpad payload: display-ordered rows plus per-bucket overflow flags.
+#[derive(Serialize)]
+pub struct LaunchpadResponse {
+    pub rows: Vec<LaunchpadRow>,
+    pub more: LaunchpadMore,
+}
+
+pub async fn launchpad(sections: &SectionService) -> LaunchpadResponse {
     let review = pr_inputs(sections, PullRequestFilter::ReviewRequested, false).await;
     let mine = pr_inputs(sections, PullRequestFilter::Mine, true).await;
     let wis = wi_inputs(sections).await;
     let pipes = pipe_inputs(sections).await;
 
-    launchpad::build(&review, &mine, &wis, &pipes)
+    let built = launchpad::build(&review, &mine, &wis, &pipes);
+    let rows = built
+        .entries
         .into_iter()
         .map(|e| LaunchpadRow {
             bucket: e.bucket.key(),
@@ -323,7 +345,16 @@ pub async fn launchpad(sections: &SectionService) -> Vec<LaunchpadRow> {
                 EntryItem::Pipe { run, definition_name } => LaunchpadItem::Pipe { run, definition_name },
             },
         })
-        .collect()
+        .collect();
+    LaunchpadResponse {
+        rows,
+        more: LaunchpadMore {
+            your_work: built.overflow.your_work,
+            your_open_prs: built.overflow.your_open_prs,
+            recently_merged: built.overflow.recently_merged,
+            recent_pipelines: built.overflow.recent_pipelines,
+        },
+    }
 }
 
 // ---- pull request detail ----

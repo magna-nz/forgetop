@@ -9,7 +9,7 @@ use chrono::{DateTime, Utc};
 
 use crate::domain::{
     CheckStatus, MergeableState, PipelineRun, PipelineRunStatus, ProviderType, PullRequest, PullRequestStatus,
-    ReviewVote, WorkItem,
+    ReviewVote, WorkItem, WorkItemStateCategory,
 };
 
 /// The action bucket an item lands in. [`Bucket::ORDER`] is the display/urgency order — the
@@ -124,11 +124,14 @@ pub fn classify_pr(pr: &PullRequest, role: PrRole) -> Option<Bucket> {
     }
 }
 
-/// Recency window for the "Recently merged" section, and how many to show.
-const RECENT_MERGE_DAYS: i64 = 7;
+/// How many entries each right-column reference list shows before a "more…" affordance. When a
+/// bucket has more than this, [`Overflow`] flags it so the frontends can link to the full page.
+const YOUR_WORK_MAX: usize = 5;
+const YOUR_OPEN_PRS_MAX: usize = 5;
 const RECENT_MERGE_MAX: usize = 5;
-/// How many recent pipeline runs to show in the right-column reference list.
-const RECENT_PIPELINE_MAX: usize = 6;
+const RECENT_PIPELINE_MAX: usize = 5;
+/// Recency window for the "Recently merged" section.
+const RECENT_MERGE_DAYS: i64 = 7;
 
 /// True for your PRs merged within the recency window (shown in "Recently merged").
 fn merged_recently(pr: &PullRequest, now: DateTime<Utc>) -> bool {
@@ -265,9 +268,35 @@ fn age_key(t: Option<DateTime<Utc>>) -> (u8, i64) {
     }
 }
 
+/// Whether a capped reference bucket had more entries than it shows — drives the "more…" affordance.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Overflow {
+    pub your_work: bool,
+    pub your_open_prs: bool,
+    pub recently_merged: bool,
+    pub recent_pipelines: bool,
+}
+
+/// The built Launchpad: display-ordered, capped rows plus per-bucket overflow flags.
+pub struct Launchpad {
+    pub entries: Vec<Entry>,
+    pub overflow: Overflow,
+}
+
+/// In-progress work items sort before the rest of "Assigned to you" — `Started` is the
+/// provider-neutral in-progress category, so this is correct for every provider.
+fn wi_in_progress_rank(e: &Entry) -> u8 {
+    match &e.item {
+        EntryItem::Wi(wi) if wi.state_category == WorkItemStateCategory::Started => 0,
+        _ => 1,
+    }
+}
+
 /// Builds the Launchpad rows from the aggregated feeds, already sorted into display order:
-/// bucket by urgency, then oldest-activity first within each bucket.
-pub fn build(prs_review: &[PrInput], prs_mine: &[PrInput], wis: &[WiInput], pipes: &[PipeInput]) -> Vec<Entry> {
+/// bucket by urgency, then oldest-activity first within each bucket (newest-first for the recent
+/// reference lists; in-progress-first for "Assigned to you"). Each reference list is capped, with
+/// [`Overflow`] flagging the ones that had more.
+pub fn build(prs_review: &[PrInput], prs_mine: &[PrInput], wis: &[WiInput], pipes: &[PipeInput]) -> Launchpad {
     let pr_entry = |row: &PrInput, bucket: Bucket| Entry {
         bucket,
         connection_id: row.connection_id.clone(),
@@ -328,20 +357,41 @@ pub fn build(prs_review: &[PrInput], prs_mine: &[PrInput], wis: &[WiInput], pipe
     }
 
     // Bucket by urgency; within a bucket oldest-first, except the recent reference lists
-    // (recently merged / recent pipelines), which read newest-first.
+    // (recently merged / recent pipelines), which read newest-first, and "Assigned to you", which
+    // puts in-progress items first then newest activity.
     let newest_first = |b: Bucket| matches!(b, Bucket::RecentlyMerged | Bucket::RecentPipelines);
     out.sort_by(|a, b| {
         bucket_rank(a.bucket).cmp(&bucket_rank(b.bucket)).then_with(|| {
-            if newest_first(a.bucket) {
+            if a.bucket == Bucket::YourWork {
+                wi_in_progress_rank(a)
+                    .cmp(&wi_in_progress_rank(b))
+                    .then_with(|| age_key(b.updated_at()).cmp(&age_key(a.updated_at())))
+            } else if newest_first(a.bucket) {
                 age_key(b.updated_at()).cmp(&age_key(a.updated_at()))
             } else {
                 age_key(a.updated_at()).cmp(&age_key(b.updated_at()))
             }
         })
     });
-    // Keep the reference footers short (already newest-first after the sort).
-    let (mut merged, mut pipelines) = (0, 0);
+
+    // Cap each reference list, flagging any that had more so a "more…" link can show.
+    let total = |bucket: Bucket| out.iter().filter(|e| e.bucket == bucket).count();
+    let overflow = Overflow {
+        your_work: total(Bucket::YourWork) > YOUR_WORK_MAX,
+        your_open_prs: total(Bucket::YourOpenPrs) > YOUR_OPEN_PRS_MAX,
+        recently_merged: total(Bucket::RecentlyMerged) > RECENT_MERGE_MAX,
+        recent_pipelines: total(Bucket::RecentPipelines) > RECENT_PIPELINE_MAX,
+    };
+    let (mut work, mut open_prs, mut merged, mut pipelines) = (0, 0, 0, 0);
     out.retain(|e| match e.bucket {
+        Bucket::YourWork => {
+            work += 1;
+            work <= YOUR_WORK_MAX
+        }
+        Bucket::YourOpenPrs => {
+            open_prs += 1;
+            open_prs <= YOUR_OPEN_PRS_MAX
+        }
         Bucket::RecentlyMerged => {
             merged += 1;
             merged <= RECENT_MERGE_MAX
@@ -352,7 +402,7 @@ pub fn build(prs_review: &[PrInput], prs_mine: &[PrInput], wis: &[WiInput], pipe
         }
         _ => true,
     });
-    out
+    Launchpad { entries: out, overflow }
 }
 
 #[cfg(test)]
@@ -419,6 +469,23 @@ mod tests {
         PrInput { connection_id: "c".into(), connection: "GH".into(), provider: ProviderType::GitHub, pr }
     }
 
+    fn wi_row(id: &str, cat: WorkItemStateCategory, updated_h: i64) -> WiInput {
+        let wi = WorkItem {
+            id: id.into(),
+            identifier: Some(id.into()),
+            title: "wi".into(),
+            description: None,
+            state: "s".into(),
+            state_category: cat,
+            work_item_type: None,
+            assignee: None,
+            created_at: None,
+            updated_at: Some(Utc::now() - chrono::Duration::hours(updated_h)),
+            url: None,
+        };
+        WiInput { connection_id: "c".into(), connection: "GH".into(), provider: ProviderType::GitHub, wi }
+    }
+
     #[test]
     fn reviewer_prs_always_need_review() {
         let pr = authored(false, &[ReviewVote::Approved], CheckStatus::Passed, MergeableState::Mergeable);
@@ -455,7 +522,7 @@ mod tests {
 
     #[test]
     fn build_lists_every_run_in_recent_pipelines() {
-        let out = build(&[], &[], &[], &[pipe(PipelineRunStatus::Failed, false), pipe(PipelineRunStatus::Succeeded, false)]);
+        let out = build(&[], &[], &[], &[pipe(PipelineRunStatus::Failed, false), pipe(PipelineRunStatus::Succeeded, false)]).entries;
         let buckets: Vec<Bucket> = out.iter().map(|e| e.bucket).collect();
         assert_eq!(buckets.iter().filter(|&&b| b == Bucket::RecentPipelines).count(), 2);
         assert!(buckets.contains(&Bucket::NeedsFixing));
@@ -484,13 +551,53 @@ mod tests {
             pr_row("merged", merged),
             pr_row("old", old),
         ];
-        let out = build(&[], &mine, &[], &[]);
+        let out = build(&[], &mine, &[], &[]).entries;
         let buckets = |id: &str| out.iter().filter(|e| e.item_id() == id).map(|e| e.bucket).collect::<Vec<_>>();
 
         assert!(buckets("ready").contains(&Bucket::ReadyToMerge) && buckets("ready").contains(&Bucket::YourOpenPrs));
         assert_eq!(buckets("draft"), vec![Bucket::YourOpenPrs]);
         assert_eq!(buckets("merged"), vec![Bucket::RecentlyMerged]);
         assert!(buckets("old").is_empty());
+    }
+
+    #[test]
+    fn your_work_caps_at_five_favours_in_progress_and_flags_overflow() {
+        use WorkItemStateCategory as C;
+        // Four in-progress + three not = seven assigned items (updated_h = hours ago).
+        let wis = vec![
+            wi_row("todo1", C::Unstarted, 1),
+            wi_row("prog1", C::Started, 2),
+            wi_row("prog2", C::Started, 3),
+            wi_row("todo2", C::Backlog, 4),
+            wi_row("prog3", C::Started, 5),
+            wi_row("todo3", C::Unstarted, 6),
+            wi_row("prog4", C::Started, 7),
+        ];
+        let lp = build(&[], &[], &wis, &[]);
+        let work: Vec<&str> = lp.entries.iter().filter(|e| e.bucket == Bucket::YourWork).map(|e| e.item_id()).collect();
+        assert_eq!(work.len(), 5, "capped at five");
+        assert!(lp.overflow.your_work, "seven assigned flags overflow");
+        // In-progress first (newest activity first within the group), then the rest by recency.
+        assert_eq!(&work[..4], &["prog1", "prog2", "prog3", "prog4"], "in-progress items lead");
+        assert_eq!(work[4], "todo1", "then the most recently updated of the rest");
+    }
+
+    #[test]
+    fn your_open_prs_caps_at_five_and_flags_overflow() {
+        let mine: Vec<PrInput> = (0..6)
+            .map(|i| pr_row(&format!("pr{i}"), authored(true, &[], CheckStatus::None, MergeableState::Mergeable)))
+            .collect();
+        let lp = build(&[], &mine, &[], &[]);
+        assert_eq!(lp.entries.iter().filter(|e| e.bucket == Bucket::YourOpenPrs).count(), 5, "capped at five");
+        assert!(lp.overflow.your_open_prs, "six open PRs flags overflow");
+    }
+
+    #[test]
+    fn recent_pipelines_cap_at_five_and_flag_overflow() {
+        let pipes: Vec<PipeInput> = (0..6).map(|_| pipe(PipelineRunStatus::Succeeded, false)).collect();
+        let lp = build(&[], &[], &[], &pipes);
+        assert_eq!(lp.entries.iter().filter(|e| e.bucket == Bucket::RecentPipelines).count(), 5, "capped at five");
+        assert!(lp.overflow.recent_pipelines, "six runs flags overflow");
     }
 
     #[test]

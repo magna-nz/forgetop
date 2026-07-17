@@ -13,6 +13,7 @@ import { WorkItems } from "./components/WorkItems";
 import { Pipelines } from "./components/Pipelines";
 import { Notifications } from "./components/Notifications";
 import { Settings } from "./components/Settings";
+import { NavContext } from "./nav";
 import type { SectionId } from "./types";
 
 const VIEWS: Record<SectionId, ComponentType> = {
@@ -76,6 +77,7 @@ export default function App() {
     <PrDetailProvider>
       <WiDetailProvider>
         <PipelineDetailProvider>
+          <NavContext.Provider value={setSection}>
           <div className="flex h-full">
             <Sidebar section={section} onSelect={setSection} />
             <main className="flex flex-col flex-1 min-w-0 h-full">
@@ -90,6 +92,7 @@ export default function App() {
             </main>
             <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} onNavigate={setSection} />
           </div>
+          </NavContext.Provider>
         </PipelineDetailProvider>
       </WiDetailProvider>
     </PrDetailProvider>

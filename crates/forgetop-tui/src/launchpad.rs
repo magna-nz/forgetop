@@ -4,12 +4,12 @@
 //! dashboard share one set of rules. This module just re-exports it and maps the TUI's row types
 //! onto the core inputs.
 
-pub use forgetop_core::launchpad::{Bucket, Entry, EntryItem, EntryKind, PrRole};
+pub use forgetop_core::launchpad::{Bucket, Entry, EntryItem, EntryKind, Launchpad, Overflow, PrRole};
 
 use crate::app::{PipeRow, PrRow, WiRow};
 
 /// Builds the Launchpad rows from the TUI's aggregated feeds (see [`forgetop_core::launchpad::build`]).
-pub fn build(prs_review: &[PrRow], prs_mine: &[PrRow], wis: &[WiRow], pipes: &[PipeRow]) -> Vec<Entry> {
+pub fn build(prs_review: &[PrRow], prs_mine: &[PrRow], wis: &[WiRow], pipes: &[PipeRow]) -> Launchpad {
     use forgetop_core::launchpad::{PipeInput, PrInput, WiInput};
 
     let pr_input = |r: &PrRow| PrInput {

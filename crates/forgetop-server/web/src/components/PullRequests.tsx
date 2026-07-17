@@ -9,12 +9,14 @@ import { useListView } from "./ControlBar";
 
 const PR_VIEWS: { key: PrView; label: string }[] = [
   { key: "all", label: "All Pull Requests" },
+  { key: "yours", label: "Your PRs" },
   { key: "merged", label: "Recently merged by you" },
   { key: "review_requested", label: "Review requested" },
 ];
 
 const EMPTY: Record<PrView, { icon: string; title: string; sub: string }> = {
   all: { icon: "◇", title: "No open pull requests", sub: "PRs you author or are asked to review show up here." },
+  yours: { icon: "◇", title: "No open PRs of yours", sub: "Pull requests you've opened that are still open show up here." },
   merged: { icon: "✓", title: "Nothing merged recently", sub: "Pull requests you authored that have merged show up here." },
   review_requested: { icon: "◇", title: "No review requests", sub: "Pull requests waiting on your review show up here." },
 };
@@ -23,7 +25,7 @@ function usePrView(): [PrView, (v: PrView) => void] {
   const [view, setView] = useState<PrView>(() => {
     try {
       const s = localStorage.getItem("forgetop_pr_view");
-      if (s === "all" || s === "merged" || s === "review_requested") return s;
+      if (s === "all" || s === "yours" || s === "merged" || s === "review_requested") return s;
     } catch {
       /* ignore */
     }
