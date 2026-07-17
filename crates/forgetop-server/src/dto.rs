@@ -10,7 +10,8 @@ use forgetop_core::domain::{
 };
 use forgetop_core::launchpad::{self, EntryItem, PipeInput, PrInput, WiInput};
 use forgetop_core::provider::{
-    PipelineRunQuery, PullRequestFilter, PullRequestQuery, PullRequestSource, WorkItemQuery,
+    PipelineRunQuery, PipelineSource, PullRequestFilter, PullRequestQuery, PullRequestSource, WorkItemQuery,
+    WorkItemSource,
 };
 use forgetop_core::service::{ConnectionHealthService, SectionService};
 use serde::Serialize;
@@ -318,6 +319,73 @@ pub async fn pr_detail(sections: &SectionService, conn: &str, id: &str) -> Optio
         checks: source.checks(id).await.unwrap_or_default(),
         commits: source.commits(id).await.unwrap_or_default(),
     })
+}
+
+// ---- work-item detail ----
+
+/// Everything the work-item detail view needs.
+#[derive(Serialize)]
+pub struct WiDetail {
+    pub work_item: WorkItem,
+    pub threads: Vec<CommentThread>,
+}
+
+/// Resolves the work-item source for a connection id.
+pub async fn wi_source(sections: &SectionService, conn: &str) -> Option<Arc<dyn WorkItemSource>> {
+    sections
+        .work_item_feeds()
+        .await
+        .ok()?
+        .into_iter()
+        .find(|f| f.connection.connection_id() == conn)
+        .map(|f| f.source)
+}
+
+pub async fn wi_detail(sections: &SectionService, conn: &str, id: &str) -> Option<WiDetail> {
+    let source = wi_source(sections, conn).await?;
+    let work_item = source.get(id).await.ok()?;
+    // Comments are best-effort: a provider that doesn't expose them just yields empties.
+    Some(WiDetail { work_item, threads: source.threads(id).await.unwrap_or_default() })
+}
+
+// ---- pipeline detail ----
+
+/// Everything the pipeline drill-in needs: the full run (stages → jobs → steps) plus any
+/// pending approval gates the current user can act on.
+#[derive(Serialize)]
+pub struct PipelineDetail {
+    pub run: PipelineRun,
+    pub approvals: Vec<PipelineApproval>,
+}
+
+/// Resolves the pipeline source for a connection id.
+pub async fn pipe_source(sections: &SectionService, conn: &str) -> Option<Arc<dyn PipelineSource>> {
+    sections
+        .pipeline_feeds()
+        .await
+        .ok()?
+        .into_iter()
+        .find(|f| f.connection.connection_id() == conn)
+        .map(|f| f.source)
+}
+
+pub async fn pipeline_detail(sections: &SectionService, conn: &str, run_id: &str) -> Option<PipelineDetail> {
+    let source = pipe_source(sections, conn).await?;
+    let run = source.get_run(run_id).await.ok()?;
+    // Only in-flight runs can be waiting on a gate — mirror the list endpoint's bound.
+    let approvals = if source.supports_approvals() && is_active(run.status) {
+        source.pending_approvals(run_id).await.unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    Some(PipelineDetail { run, approvals })
+}
+
+/// Logs for a run, optionally scoped to a single job. Best-effort: `None` when the connection
+/// isn't found or the provider can't supply logs.
+pub async fn pipeline_logs(sections: &SectionService, conn: &str, run_id: &str, job_id: Option<&str>) -> Option<String> {
+    let source = pipe_source(sections, conn).await?;
+    source.logs(run_id, job_id).await.ok()
 }
 
 pub async fn health(svc: &ConnectionHealthService) -> Vec<HealthRow> {

@@ -1,7 +1,57 @@
 import { motion } from "framer-motion";
-import type { ReactNode } from "react";
+import { useEffect, type ReactNode } from "react";
 import { initials, providerMeta } from "../format";
 import type { ProviderType } from "../types";
+
+/** Right-hand slide-over used by the work-item and pipeline detail views (mirrors PrDetail's
+ *  own panel). Backdrop click and Esc both close; `header` and `children` render inside. */
+export function SlideOver({
+  onClose,
+  header,
+  children,
+}: {
+  onClose: () => void;
+  header: ReactNode;
+  children: ReactNode;
+}) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  return (
+    <motion.div
+      className="fixed inset-0 z-40 flex justify-end"
+      style={{ background: "rgba(0,0,0,0.5)" }}
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      exit={{ opacity: 0 }}
+      transition={{ duration: 0.15 }}
+      onClick={onClose}
+    >
+      <motion.div
+        initial={{ x: 40, opacity: 0.6 }}
+        animate={{ x: 0, opacity: 1 }}
+        exit={{ x: 40, opacity: 0 }}
+        transition={{ duration: 0.22, ease: "easeOut" }}
+        onClick={(e) => e.stopPropagation()}
+        className="flex flex-col h-full w-full max-w-3xl"
+        style={{ background: "var(--bg)", borderLeft: "1px solid var(--border)" }}
+      >
+        <div className="flex items-start gap-3 px-5 py-3.5 shrink-0" style={{ borderBottom: "1px solid var(--border)" }}>
+          {header}
+          <button onClick={onClose} className="text-lg px-2 leading-none" style={{ color: "var(--dim)" }} title="Close (Esc)">
+            ✕
+          </button>
+        </div>
+        <div className="flex-1 overflow-auto">{children}</div>
+      </motion.div>
+    </motion.div>
+  );
+}
 
 export function Avatar({ name, size = 22 }: { name: string; size?: number }) {
   // Deterministic hue from the name so the same person keeps the same colour.

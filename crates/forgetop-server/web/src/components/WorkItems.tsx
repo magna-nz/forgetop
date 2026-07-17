@@ -6,6 +6,7 @@ import type { WiRow } from "../types";
 import { Avatar, Chip, List, ProviderBadge, Skeleton, StateCard } from "./ui";
 import { ErrorState } from "./ErrorState";
 import { useListView } from "./ControlBar";
+import { useWiOpener } from "./WiDetail";
 
 export function WorkItems() {
   const { data, isLoading, error } = useWorkItems();
@@ -47,6 +48,7 @@ export function WorkItems() {
 function WiCard({ row, index }: { row: WiRow; index: number }) {
   const wi = row.work_item;
   const color = wiStateColor(wi.state, wi.state_category);
+  const open = useWiOpener();
   return (
     <motion.div
       initial={{ opacity: 0, y: 6 }}
@@ -55,7 +57,11 @@ function WiCard({ row, index }: { row: WiRow; index: number }) {
       className="flex items-start gap-3 rounded-lg px-4 py-3"
       style={{ background: "var(--card)", border: "1px solid var(--border)" }}
     >
-      <a href={wi.url ?? undefined} target="_blank" rel="noreferrer" className="flex-1 min-w-0" style={{ cursor: wi.url ? "pointer" : "default" }}>
+      <button
+        onClick={() => open({ conn: row.connection_id, id: wi.id })}
+        className="flex-1 min-w-0 text-left"
+        style={{ cursor: "pointer" }}
+      >
         <div className="flex items-center gap-2">
           <span className="inline-flex items-center gap-1.5 text-xs font-medium whitespace-nowrap" style={{ color }}>
             <span>●</span>
@@ -70,7 +76,7 @@ function WiCard({ row, index }: { row: WiRow; index: number }) {
           {wi.identifier && <span className="mono text-xs" style={{ color: "var(--dim)" }}>{wi.identifier}</span>}
           {wi.work_item_type && <Chip>{wi.work_item_type}</Chip>}
         </div>
-      </a>
+      </button>
       <div className="flex flex-col items-end gap-2 shrink-0">
         <StateMenu row={row} />
         <div className="flex items-center gap-2">
