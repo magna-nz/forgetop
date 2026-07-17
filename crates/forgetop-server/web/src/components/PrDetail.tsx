@@ -377,7 +377,7 @@ function FileDiff({
                   {canComment ? (
                     <span className="w-6 shrink-0 flex items-center justify-center">
                       <button
-                        className="flex items-center justify-center rounded opacity-40 group-hover:opacity-100 transition-opacity hover:brightness-110"
+                        className="flex items-center justify-center rounded opacity-0 group-hover:opacity-100 transition-opacity hover:brightness-110"
                         style={{ width: 16, height: 16, background: "var(--accent)", color: "var(--bg)", fontWeight: 600, lineHeight: 1 }}
                         title="Comment on this line"
                         aria-label="Comment on this line"
