@@ -25,12 +25,12 @@ export function PrDetailProvider({ children }: { children: ReactNode }) {
 
 // ---- panel ----
 
-type Tab = "files" | "conversation" | "commits";
+type Tab = "conversation" | "commits" | "files";
 
 function PrDetailPanel({ prRef, onClose }: { prRef: PrRef; onClose: () => void }) {
   const { data, isLoading, error } = usePrDetail(prRef);
   const qc = useQueryClient();
-  const [tab, setTab] = useState<Tab>("files");
+  const [tab, setTab] = useState<Tab>("conversation");
   const [pending, setPending] = useState<LineComment[]>([]);
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState<string | null>(null);
@@ -41,7 +41,7 @@ function PrDetailPanel({ prRef, onClose }: { prRef: PrRef; onClose: () => void }
   };
 
   useEffect(() => {
-    setTab("files");
+    setTab("conversation");
     setPending([]);
     setNote(null);
   }, [prRef.conn, prRef.id]);
@@ -149,7 +149,7 @@ function PrDetailPanel({ prRef, onClose }: { prRef: PrRef; onClose: () => void }
 
             {/* tabs */}
             <div className="flex items-center gap-1 px-4 shrink-0" style={{ borderBottom: "1px solid var(--border)" }}>
-              {(["files", "conversation", "commits"] as Tab[]).map((t) => (
+              {(["conversation", "commits", "files"] as Tab[]).map((t) => (
                 <button
                   key={t}
                   onClick={() => setTab(t)}
