@@ -338,3 +338,73 @@ async fn work_item_pipeline_and_notification_writes() {
         .unwrap();
     assert_eq!(read.status(), 200);
 }
+
+#[tokio::test]
+async fn work_item_and_pipeline_detail_reach_the_provider() {
+    let server = spawn(demo_deps(true).await, 0).await.expect("server binds");
+    let base = format!("http://127.0.0.1:{}", server.port);
+    let client = reqwest::Client::new();
+    let tok = server.token.clone();
+    let hdr = |r: reqwest::RequestBuilder| r.header("x-forgetop-token", &tok);
+
+    // --- work item detail ---
+    let wis: serde_json::Value =
+        hdr(client.get(format!("{base}/api/work-items"))).send().await.unwrap().json().await.unwrap();
+    let wi = &wis[0];
+    let (wconn, wid) = (wi["connection_id"].as_str().unwrap(), wi["work_item"]["id"].as_str().unwrap());
+
+    let wi_detail_url = format!("{base}/api/wi/detail?conn={wconn}&id={wid}");
+    let detail = hdr(client.get(&wi_detail_url)).send().await.unwrap();
+    assert_eq!(detail.status(), 200);
+    let detail: serde_json::Value = detail.json().await.unwrap();
+    assert_eq!(detail["work_item"]["id"], wid);
+    assert!(detail["threads"].is_array(), "detail carries a threads array");
+
+    // A comment posted through the API comes back on the item's threads (the demo persists it).
+    let comment = hdr(client.post(format!("{base}/api/wi/comment")))
+        .json(&serde_json::json!({ "conn": wconn, "id": wid, "body": "looking into this" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(comment.status(), 200);
+    let after: serde_json::Value = hdr(client.get(&wi_detail_url)).send().await.unwrap().json().await.unwrap();
+    let has_comment = after["threads"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|t| t["comments"].as_array().map(|c| c.iter().any(|x| x["body"] == "looking into this")).unwrap_or(false));
+    assert!(has_comment, "the posted work-item comment is persisted and returned");
+
+    // --- pipeline detail + logs ---
+    let pipes: serde_json::Value =
+        hdr(client.get(format!("{base}/api/pipelines"))).send().await.unwrap().json().await.unwrap();
+    let pipe = &pipes[0];
+    let (pconn, run_id) = (pipe["connection_id"].as_str().unwrap(), pipe["run"]["id"].as_str().unwrap());
+
+    let detail = hdr(client.get(format!("{base}/api/pipeline/detail?conn={pconn}&run_id={run_id}"))).send().await.unwrap();
+    assert_eq!(detail.status(), 200);
+    let detail: serde_json::Value = detail.json().await.unwrap();
+    assert_eq!(detail["run"]["id"], run_id);
+    assert!(detail["run"]["stages"].is_array(), "run carries a stages array");
+    assert!(detail["approvals"].is_array(), "detail carries an approvals array");
+
+    // Logs for the first job on the run (fall back to the whole run if it has no jobs).
+    let job = detail["run"]["stages"]
+        .as_array()
+        .and_then(|s| s.iter().find_map(|st| st["jobs"].as_array().and_then(|j| j.first()).map(|j| j["id"].as_str().unwrap().to_string())));
+    let logs_url = match &job {
+        Some(j) => format!("{base}/api/pipeline/logs?conn={pconn}&run_id={run_id}&job={j}"),
+        None => format!("{base}/api/pipeline/logs?conn={pconn}&run_id={run_id}"),
+    };
+    let logs = hdr(client.get(&logs_url)).send().await.unwrap();
+    assert_eq!(logs.status(), 200);
+    assert!(logs.text().await.unwrap().contains("logs for run"), "logs come back as plain text");
+
+    // --- token gating + missing-connection handling ---
+    let unauth = client.get(&wi_detail_url).send().await.unwrap();
+    assert_eq!(unauth.status(), 401, "detail is token-gated");
+    let missing_wi = hdr(client.get(format!("{base}/api/wi/detail?conn=nope&id={wid}"))).send().await.unwrap();
+    assert_eq!(missing_wi.status(), 404, "a bad connection is a 404, not a 500");
+    let missing_pipe = hdr(client.get(format!("{base}/api/pipeline/detail?conn=nope&run_id={run_id}"))).send().await.unwrap();
+    assert_eq!(missing_pipe.status(), 404);
+}

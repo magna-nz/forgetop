@@ -99,8 +99,12 @@ fn router(state: AppState) -> Router {
         .route("/api/pr/merge", post(pr_merge))
         .route("/api/pr/comment", post(pr_comment))
         .route("/api/pr/review", post(pr_review))
+        .route("/api/wi/detail", get(wi_detail))
         .route("/api/wi/states", get(wi_states))
         .route("/api/wi/state", post(wi_state))
+        .route("/api/wi/comment", post(wi_comment))
+        .route("/api/pipeline/detail", get(pipeline_detail))
+        .route("/api/pipeline/logs", get(pipeline_logs))
         .route("/api/pipeline/approval", post(pipeline_approval))
         .route("/api/pipeline/trigger", post(pipeline_trigger))
         .route("/api/notification/read", post(notification_read))
@@ -178,6 +182,22 @@ struct ItemQuery {
     id: String,
 }
 
+/// Query params identifying a pipeline run within a connection (`?conn=…&run_id=…`).
+#[derive(Deserialize)]
+struct RunQuery {
+    conn: String,
+    run_id: String,
+}
+
+/// Query params for pipeline logs: a run, optionally scoped to a single job (`&job=…`).
+#[derive(Deserialize)]
+struct PipelineLogsQuery {
+    conn: String,
+    run_id: String,
+    #[serde(default)]
+    job: Option<String>,
+}
+
 /// Turns an action outcome into a response: `{ok:true}`, 404 (no such connection/capability),
 /// or 502 (the provider call failed).
 fn action_response(result: Result<(), ActionError>) -> Response {
@@ -208,6 +228,12 @@ async fn pr_review(State(s): State<AppState>, Json(req): Json<actions::PrReviewR
     action_response(actions::pr_review(&s.deps.sections, req).await)
 }
 
+async fn wi_detail(State(s): State<AppState>, Query(q): Query<ItemQuery>) -> Response {
+    match dto::wi_detail(&s.deps.sections, &q.conn, &q.id).await {
+        Some(detail) => Json(detail).into_response(),
+        None => (StatusCode::NOT_FOUND, "work item not found").into_response(),
+    }
+}
 async fn wi_states(State(s): State<AppState>, Query(q): Query<ItemQuery>) -> Response {
     match actions::wi_states(&s.deps.sections, &q.conn, &q.id).await {
         Some(states) => Json(states).into_response(),
@@ -216,6 +242,22 @@ async fn wi_states(State(s): State<AppState>, Query(q): Query<ItemQuery>) -> Res
 }
 async fn wi_state(State(s): State<AppState>, Json(req): Json<actions::WiStateReq>) -> Response {
     action_response(actions::wi_set_state(&s.deps.sections, req).await)
+}
+async fn wi_comment(State(s): State<AppState>, Json(req): Json<actions::WiCommentReq>) -> Response {
+    action_response(actions::wi_comment(&s.deps.sections, req).await)
+}
+
+async fn pipeline_detail(State(s): State<AppState>, Query(q): Query<RunQuery>) -> Response {
+    match dto::pipeline_detail(&s.deps.sections, &q.conn, &q.run_id).await {
+        Some(detail) => Json(detail).into_response(),
+        None => (StatusCode::NOT_FOUND, "pipeline run not found").into_response(),
+    }
+}
+async fn pipeline_logs(State(s): State<AppState>, Query(q): Query<PipelineLogsQuery>) -> Response {
+    match dto::pipeline_logs(&s.deps.sections, &q.conn, &q.run_id, q.job.as_deref()).await {
+        Some(text) => ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], text).into_response(),
+        None => (StatusCode::NOT_FOUND, "logs not available").into_response(),
+    }
 }
 
 async fn pipeline_approval(State(s): State<AppState>, Json(req): Json<actions::PipelineApprovalReq>) -> Response {

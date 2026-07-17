@@ -5,6 +5,7 @@ import type { PipeRow } from "../types";
 import { Avatar, Chip, List, Pill, ProviderBadge, Skeleton, StateCard } from "./ui";
 import { ErrorState } from "./ErrorState";
 import { useListView } from "./ControlBar";
+import { usePipelineOpener } from "./PipelineDetail";
 
 export function Pipelines() {
   const { data, isLoading, error } = usePipelines();
@@ -49,6 +50,7 @@ function PipeCard({ row, index }: { row: PipeRow; index: number }) {
   const label = run.name ?? (run.number != null ? `Run #${run.number}` : run.definition_id);
   const gates = row.approvals.filter((a) => a.can_respond);
   const { busy, error, run: act } = useWriteAction();
+  const open = usePipelineOpener();
 
   const respond = (approvalId: string, decision: "Approve" | "Reject") =>
     act("/api/pipeline/approval", { conn: row.connection_id, run_id: run.id, approval_id: approvalId, decision }, ["pipelines", "launchpad"]);
@@ -63,7 +65,11 @@ function PipeCard({ row, index }: { row: PipeRow; index: number }) {
       style={{ background: "var(--card)", border: "1px solid var(--border)" }}
     >
       <div className="flex items-start gap-3">
-        <a href={run.url ?? undefined} target="_blank" rel="noreferrer" className="flex-1 min-w-0" style={{ cursor: run.url ? "pointer" : "default" }}>
+        <button
+          onClick={() => open({ conn: row.connection_id, runId: run.id })}
+          className="flex-1 min-w-0 text-left"
+          style={{ cursor: "pointer" }}
+        >
           <div className="flex items-center gap-2">
             <Pill icon={meta.icon} label={meta.label} color={meta.color} spin={meta.running} />
             <span className="truncate font-medium" style={{ color: "var(--fg)" }}>
@@ -75,7 +81,7 @@ function PipeCard({ row, index }: { row: PipeRow; index: number }) {
             {run.branch && <Chip title="branch">⑂ {run.branch}</Chip>}
             {run.commit_sha && <span className="mono text-xs" style={{ color: "var(--dim)" }}>{run.commit_sha.slice(0, 7)}</span>}
           </div>
-        </a>
+        </button>
         <div className="flex flex-col items-end gap-2 shrink-0">
           <span className="text-xs whitespace-nowrap" style={{ color: "var(--dim)" }}>
             {relativeTime(run.finished_at ?? run.started_at)}

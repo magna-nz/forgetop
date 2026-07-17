@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import type { ConnectionRow, HealthRow, LaunchpadRow, NotifRow, PipeRow, Preferences, PrDetail, PrRef, ProviderInfo, PrRow, WiRow } from "./types";
+import type { ConnectionRow, HealthRow, LaunchpadRow, NotifRow, PipeRef, PipelineDetail, PipeRow, Preferences, PrDetail, PrRef, ProviderInfo, PrRow, WiDetail, WiRef, WiRow } from "./types";
 
 // The session token arrives once in the URL (`/?t=…`). We stash it in sessionStorage (so a
 // refresh keeps working) and strip it from the visible URL, then replay it on every API call.
@@ -34,6 +34,15 @@ async function api<T>(path: string): Promise<T> {
 /** GET a token-authenticated JSON endpoint (for lazy fetches outside the query cache). */
 export function apiGet<T>(path: string): Promise<T> {
   return api<T>(path);
+}
+
+/** GET a token-authenticated plain-text endpoint (e.g. pipeline logs). */
+export async function apiGetText(path: string): Promise<string> {
+  const res = await fetch(path, { headers: { "x-forgetop-token": TOKEN } });
+  if (!res.ok) {
+    throw new ApiError(res.status, res.status === 401 ? "Unauthorized — reopen the dashboard from forgetop." : `${res.status} ${res.statusText}`);
+  }
+  return res.text();
 }
 
 /** POST a JSON body to a write endpoint. Throws ApiError with the server's message on failure. */
@@ -77,6 +86,21 @@ export const usePrDetail = (ref: PrRef | null) =>
   useQuery({
     queryKey: ["pr-detail", ref?.conn, ref?.id],
     queryFn: () => api<PrDetail>(`/api/pr/detail?conn=${encodeURIComponent(ref!.conn)}&id=${encodeURIComponent(ref!.id)}`),
+    enabled: !!ref,
+  });
+
+export const useWiDetail = (ref: WiRef | null) =>
+  useQuery({
+    queryKey: ["wi-detail", ref?.conn, ref?.id],
+    queryFn: () => api<WiDetail>(`/api/wi/detail?conn=${encodeURIComponent(ref!.conn)}&id=${encodeURIComponent(ref!.id)}`),
+    enabled: !!ref,
+  });
+
+export const usePipelineDetail = (ref: PipeRef | null) =>
+  useQuery({
+    queryKey: ["pipeline-detail", ref?.conn, ref?.runId],
+    queryFn: () =>
+      api<PipelineDetail>(`/api/pipeline/detail?conn=${encodeURIComponent(ref!.conn)}&run_id=${encodeURIComponent(ref!.runId)}`),
     enabled: !!ref,
   });
 

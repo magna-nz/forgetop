@@ -81,6 +81,30 @@ export interface WorkItem {
   url?: string | null;
 }
 
+export interface PipelineStep {
+  name: string;
+  status: PipelineRunStatus;
+  started_at?: string | null;
+  finished_at?: string | null;
+}
+
+export interface PipelineJob {
+  id: string;
+  name: string;
+  status: PipelineRunStatus;
+  started_at?: string | null;
+  finished_at?: string | null;
+  steps: PipelineStep[];
+  url?: string | null;
+  problem?: string | null;
+}
+
+export interface PipelineStage {
+  name: string;
+  status: PipelineRunStatus;
+  jobs: PipelineJob[];
+}
+
 export interface PipelineRun {
   id: string;
   definition_id: string;
@@ -93,7 +117,7 @@ export interface PipelineRun {
   started_at?: string | null;
   finished_at?: string | null;
   url?: string | null;
-  stages: unknown[];
+  stages: PipelineStage[];
 }
 
 export interface Notification {
@@ -209,6 +233,28 @@ export interface LineComment {
 export interface PrRef {
   conn: string;
   id: string;
+}
+
+/** Identifies a work item for the detail view. */
+export interface WiRef {
+  conn: string;
+  id: string;
+}
+
+/** Identifies a pipeline run for the detail view. */
+export interface PipeRef {
+  conn: string;
+  runId: string;
+}
+
+export interface WiDetail {
+  work_item: WorkItem;
+  threads: CommentThread[];
+}
+
+export interface PipelineDetail {
+  run: PipelineRun;
+  approvals: PipelineApproval[];
 }
 
 interface LaunchpadBase {

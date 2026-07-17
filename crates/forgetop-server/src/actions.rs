@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use forgetop_core::domain::{ApprovalDecision, LineComment, ReviewVote};
-use forgetop_core::provider::{MergeOptions, MergeStrategy, NotificationSource, PipelineSource, WorkItemSource};
+use forgetop_core::provider::{MergeOptions, MergeStrategy, NotificationSource};
 use forgetop_core::service::SectionService;
 use serde::Deserialize;
 
@@ -24,14 +24,9 @@ fn failed(e: impl std::fmt::Display) -> ActionError {
 }
 
 // ---- source resolvers ----
-
-async fn wi_source(sections: &SectionService, conn: &str) -> Option<Arc<dyn WorkItemSource>> {
-    sections.work_item_feeds().await.ok()?.into_iter().find(|f| f.connection.connection_id() == conn).map(|f| f.source)
-}
-
-async fn pipe_source(sections: &SectionService, conn: &str) -> Option<Arc<dyn PipelineSource>> {
-    sections.pipeline_feeds().await.ok()?.into_iter().find(|f| f.connection.connection_id() == conn).map(|f| f.source)
-}
+//
+// Work-item and pipeline resolvers live in `dto` (shared with the read/detail endpoints);
+// only the notification resolver is action-only.
 
 async fn notif_source(sections: &SectionService, conn: &str) -> Option<Arc<dyn NotificationSource>> {
     sections.notification_feeds().await.ok()?.into_iter().find(|f| f.connection.connection_id() == conn).map(|f| f.source)
@@ -77,6 +72,13 @@ pub struct WiStateReq {
     pub conn: String,
     pub id: String,
     pub state: String,
+}
+
+#[derive(Deserialize)]
+pub struct WiCommentReq {
+    pub conn: String,
+    pub id: String,
+    pub body: String,
 }
 
 #[derive(Deserialize)]
@@ -128,22 +130,27 @@ pub async fn pr_review(sections: &SectionService, req: PrReviewReq) -> Result<()
 
 /// The states a work item can move to (for the transition menu).
 pub async fn wi_states(sections: &SectionService, conn: &str, id: &str) -> Option<Vec<String>> {
-    let source = wi_source(sections, conn).await?;
+    let source = dto::wi_source(sections, conn).await?;
     Some(source.available_states(id).await.unwrap_or_default())
 }
 
 pub async fn wi_set_state(sections: &SectionService, req: WiStateReq) -> Result<(), ActionError> {
-    let source = wi_source(sections, &req.conn).await.ok_or(ActionError::NotFound)?;
+    let source = dto::wi_source(sections, &req.conn).await.ok_or(ActionError::NotFound)?;
     source.set_state(&req.id, &req.state).await.map_err(failed)
 }
 
+pub async fn wi_comment(sections: &SectionService, req: WiCommentReq) -> Result<(), ActionError> {
+    let source = dto::wi_source(sections, &req.conn).await.ok_or(ActionError::NotFound)?;
+    source.add_comment(&req.id, &req.body).await.map_err(failed)
+}
+
 pub async fn pipeline_approval(sections: &SectionService, req: PipelineApprovalReq) -> Result<(), ActionError> {
-    let source = pipe_source(sections, &req.conn).await.ok_or(ActionError::NotFound)?;
+    let source = dto::pipe_source(sections, &req.conn).await.ok_or(ActionError::NotFound)?;
     source.respond_approval(&req.run_id, &req.approval_id, req.decision, req.comment.as_deref()).await.map_err(failed)
 }
 
 pub async fn pipeline_trigger(sections: &SectionService, req: PipelineTriggerReq) -> Result<(), ActionError> {
-    let source = pipe_source(sections, &req.conn).await.ok_or(ActionError::NotFound)?;
+    let source = dto::pipe_source(sections, &req.conn).await.ok_or(ActionError::NotFound)?;
     source.trigger(&req.definition_id, req.branch.as_deref()).await.map_err(failed)
 }
 
