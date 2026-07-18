@@ -705,7 +705,7 @@ function ConversationTab({
         </div>
       )}
       {timeline.length > 0 && <Timeline events={timeline} />}
-      {general.length === 0 && <Empty text="No comments yet." />}
+      {general.length === 0 && <div className="text-xs px-1" style={{ color: "var(--dim)" }}>No comments yet.</div>}
       {general.map((t) => (
         <ThreadBox key={t.id} thread={t} busy={busy} onReply={onReply} />
       ))}
