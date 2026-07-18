@@ -266,6 +266,31 @@ fn notes_to_thread(prefix: &str, id: &str, notes: &[Value]) -> Vec<CommentThread
     }
 }
 
+/// Map GitLab discussions (`GET .../discussions`) to real threads, keyed by discussion id so a
+/// reply can post back into the same discussion. Diff-anchored discussions keep their file/line.
+fn discussions_to_thread(discussions: &[Value]) -> Vec<CommentThread> {
+    discussions
+        .iter()
+        .filter_map(|d| {
+            let visible: Vec<&Value> = get_arr(d, "notes").iter().filter(|n| !get_bool(n, "system")).collect();
+            let comments: Vec<Comment> = visible.iter().map(|n| map_note(n)).collect();
+            if comments.is_empty() {
+                return None;
+            }
+            let pos = visible.first().and_then(|n| get_obj(n, "position"));
+            let file_path = pos.and_then(|p| get_str(p, "new_path").or_else(|| get_str(p, "old_path")));
+            let line = pos.and_then(|p| get_i64(p, "new_line").or_else(|| get_i64(p, "old_line")));
+            Some(CommentThread {
+                id: get_str(d, "id").unwrap_or_default(),
+                comments,
+                file_path,
+                line,
+                is_resolved: visible.iter().any(|n| get_bool(n, "resolved")),
+            })
+        })
+        .collect()
+}
+
 // ---- client ----
 
 /// GitLab todo `action_name` → our unified kind.
@@ -404,8 +429,9 @@ impl PullRequestSource for GitLabPr {
         Ok(map_merge_request(&v))
     }
     async fn threads(&self, id: &str) -> Result<Vec<CommentThread>> {
-        let v = self.0.get_json(&self.0.project_path(&format!("/merge_requests/{id}/notes?per_page=100"))).await?;
-        Ok(notes_to_thread("mr", id, v.as_array().unwrap_or(&vec![])))
+        // Discussions (not flat notes) so each thread carries its discussion id for replies.
+        let v = self.0.get_json(&self.0.project_path(&format!("/merge_requests/{id}/discussions?per_page=100"))).await?;
+        Ok(discussions_to_thread(v.as_array().unwrap_or(&vec![])))
     }
     async fn changes(&self, id: &str) -> Result<Vec<FileChange>> {
         let v = self.0.get_json(&self.0.project_path(&format!("/merge_requests/{id}/changes"))).await?;
@@ -427,6 +453,12 @@ impl PullRequestSource for GitLabPr {
     }
     async fn add_comment(&self, id: &str, body: &str) -> Result<()> {
         self.0.post_json(&self.0.project_path(&format!("/merge_requests/{id}/notes")), json!({ "body": body })).await
+    }
+    async fn reply_to_thread(&self, id: &str, thread_id: &str, body: &str) -> Result<()> {
+        // Post a note into the existing discussion so it threads under the original comment.
+        self.0
+            .post_json(&self.0.project_path(&format!("/merge_requests/{id}/discussions/{thread_id}/notes")), json!({ "body": body }))
+            .await
     }
     async fn vote(&self, id: &str, vote: ReviewVote) -> Result<()> {
         match vote {
@@ -816,5 +848,30 @@ mod tests {
         assert_eq!(c.kind, FileChangeKind::Added);
         assert_eq!(c.additions, 2);
         assert_eq!(c.deletions, 1);
+    }
+
+    #[test]
+    fn maps_discussions_to_threads() {
+        let discussions: Vec<Value> = serde_json::from_str(
+            r#"[
+                { "id": "abc123", "notes": [
+                    { "id": 1, "body": "on the diff", "author": { "name": "Bob" }, "created_at": "2026-06-01T10:00:00Z",
+                      "resolved": true, "position": { "new_path": "src/x.rs", "new_line": 15 } },
+                    { "id": 2, "body": "reply", "author": { "name": "You" }, "created_at": "2026-06-01T10:05:00Z" }
+                ] },
+                { "id": "sys", "notes": [ { "id": 3, "body": "changed the milestone", "system": true } ] },
+                { "id": "def456", "notes": [ { "id": 4, "body": "general note", "author": { "name": "Amy" }, "created_at": "2026-06-01T11:00:00Z" } ] }
+            ]"#,
+        )
+        .unwrap();
+        let threads = discussions_to_thread(&discussions);
+        assert_eq!(threads.len(), 2, "system-only discussion dropped");
+        assert_eq!(threads[0].id, "abc123");
+        assert_eq!(threads[0].comments.len(), 2);
+        assert_eq!(threads[0].file_path.as_deref(), Some("src/x.rs"));
+        assert_eq!(threads[0].line, Some(15));
+        assert!(threads[0].is_resolved);
+        assert_eq!(threads[1].id, "def456");
+        assert!(threads[1].file_path.is_none());
     }
 }

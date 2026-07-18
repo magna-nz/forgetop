@@ -149,6 +149,58 @@ fn map_pr_comment(v: &Value) -> Comment {
     }
 }
 
+/// Group flat Bitbucket PR comments into threads keyed by their root comment id: replies carry a
+/// `parent.id`, so we walk each comment up to its root and bucket them together. The root id is
+/// what a reply posts against. Inline comments keep their file/line from the root's `inline`.
+fn group_bb_threads(raw: &[Value]) -> Vec<CommentThread> {
+    use std::collections::HashMap;
+    let visible: Vec<&Value> = raw.iter().filter(|c| !get_bool(c, "deleted")).collect();
+    let parent: HashMap<String, String> = visible
+        .iter()
+        .filter_map(|c| {
+            let id = get_i64(c, "id")?.to_string();
+            let pid = get_obj(c, "parent").and_then(|p| get_i64(p, "id"))?.to_string();
+            Some((id, pid))
+        })
+        .collect();
+    let root_of = |mut id: String| -> String {
+        for _ in 0..100 {
+            match parent.get(&id) {
+                Some(p) => id = p.clone(),
+                None => break,
+            }
+        }
+        id
+    };
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: HashMap<String, Vec<&Value>> = HashMap::new();
+    for c in &visible {
+        let Some(id) = get_i64(c, "id").map(|n| n.to_string()) else { continue };
+        let root = root_of(id);
+        if !groups.contains_key(&root) {
+            order.push(root.clone());
+        }
+        groups.entry(root).or_default().push(c);
+    }
+    order
+        .into_iter()
+        .filter_map(|root| {
+            let mut items = groups.remove(&root)?;
+            items.sort_by_key(|c| get_date(c, "created_on"));
+            let inline = items.first().and_then(|c| get_obj(c, "inline"));
+            let file_path = inline.and_then(|i| get_str(i, "path"));
+            let line = inline.and_then(|i| get_i64(i, "to").or_else(|| get_i64(i, "from")));
+            Some(CommentThread {
+                id: root,
+                comments: items.iter().map(|c| map_pr_comment(c)).collect(),
+                file_path,
+                line,
+                is_resolved: false,
+            })
+        })
+        .collect()
+}
+
 /// Bitbucket state is `{ name, result: { name } }` on the pipeline/step.
 pub fn bb_status(state: Option<&Value>) -> PipelineRunStatus {
     let Some(state) = state else { return PipelineRunStatus::Queued };
@@ -259,12 +311,7 @@ impl PullRequestSource for BitbucketPr {
     }
     async fn threads(&self, id: &str) -> Result<Vec<CommentThread>> {
         let v = self.0.get_json(&self.0.repo_path(&format!("/pullrequests/{id}/comments?pagelen=100"))).await?;
-        let comments: Vec<Comment> = get_arr(&v, "values").iter().filter(|c| !get_bool(c, "deleted")).map(map_pr_comment).collect();
-        Ok(if comments.is_empty() {
-            vec![]
-        } else {
-            vec![CommentThread { id: format!("pr-{id}"), comments, file_path: None, line: None, is_resolved: false }]
-        })
+        Ok(group_bb_threads(get_arr(&v, "values")))
     }
     async fn changes(&self, id: &str) -> Result<Vec<FileChange>> {
         let v = self.0.get_json(&self.0.repo_path(&format!("/pullrequests/{id}/diffstat?pagelen=100"))).await?;
@@ -284,6 +331,18 @@ impl PullRequestSource for BitbucketPr {
     }
     async fn add_comment(&self, id: &str, body: &str) -> Result<()> {
         self.0.post_ok(&self.0.repo_path(&format!("/pullrequests/{id}/comments")), json!({ "content": { "raw": body } })).await
+    }
+    async fn reply_to_thread(&self, id: &str, thread_id: &str, body: &str) -> Result<()> {
+        // Reply nests under the thread's root comment via `parent.id` (Bitbucket wants an integer).
+        let parent_id: i64 = thread_id
+            .parse()
+            .map_err(|_| Error::Provider(format!("invalid Bitbucket comment id '{thread_id}'")))?;
+        self.0
+            .post_ok(
+                &self.0.repo_path(&format!("/pullrequests/{id}/comments")),
+                json!({ "content": { "raw": body }, "parent": { "id": parent_id } }),
+            )
+            .await
     }
     async fn vote(&self, id: &str, vote: ReviewVote) -> Result<()> {
         match vote {
@@ -509,5 +568,27 @@ mod tests {
         assert_eq!(c.kind, FileChangeKind::Added);
         assert_eq!(c.path, "src/x.rs");
         assert_eq!(c.additions, 12);
+    }
+
+    #[test]
+    fn groups_comments_into_threads_by_root() {
+        let raw: Vec<Value> = serde_json::from_str(
+            r#"[
+                { "id": 10, "content": { "raw": "root" }, "created_on": "2026-06-01T10:00:00Z", "inline": { "path": "src/x.rs", "to": 12 } },
+                { "id": 11, "content": { "raw": "reply" }, "created_on": "2026-06-01T10:05:00Z", "parent": { "id": 10 } },
+                { "id": 12, "content": { "raw": "gone" }, "deleted": true },
+                { "id": 20, "content": { "raw": "general" }, "created_on": "2026-06-01T11:00:00Z" }
+            ]"#,
+        )
+        .unwrap();
+        let threads = group_bb_threads(&raw);
+        assert_eq!(threads.len(), 2, "one inline root+reply thread, one general");
+        let inline = &threads[0];
+        assert_eq!(inline.id, "10");
+        assert_eq!(inline.comments.len(), 2, "root + its reply, deleted excluded");
+        assert_eq!(inline.file_path.as_deref(), Some("src/x.rs"));
+        assert_eq!(inline.line, Some(12));
+        assert_eq!(threads[1].id, "20");
+        assert!(threads[1].file_path.is_none());
     }
 }
