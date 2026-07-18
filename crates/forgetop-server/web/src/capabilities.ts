@@ -8,7 +8,7 @@ import { providerMeta } from "./format";
 // off for a provider, add it to UNSUPPORTED — the UI stays the same shape, just disabled.
 
 /** Features that may be unavailable on some providers. Extend as we gate more. */
-export type ProviderFeature = "check-links";
+export type ProviderFeature = "check-links" | "checks";
 
 /** The features each provider's API can't back. Default is supported — only list exceptions. */
 const UNSUPPORTED: Partial<Record<ProviderType, ProviderFeature[]>> = {

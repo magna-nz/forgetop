@@ -213,9 +213,31 @@ export interface Commit {
   url?: string | null;
 }
 
+export type TimelineEventKind =
+  | "Approved"
+  | "ChangesRequested"
+  | "Reviewed"
+  | "Commented"
+  | "Merged"
+  | "Closed"
+  | "Reopened"
+  | "StateChanged"
+  | "Assigned"
+  | "Labeled"
+  | "Committed"
+  | "Other";
+
+export interface TimelineEvent {
+  actor: User | null;
+  kind: TimelineEventKind;
+  summary: string;
+  at?: string | null;
+}
+
 export interface PrDetail {
   pull_request: PullRequest;
   threads: CommentThread[];
+  timeline: TimelineEvent[];
   changes: FileChange[];
   checks: CheckRun[];
   commits: Commit[];
@@ -250,6 +272,7 @@ export interface PipeRef {
 export interface WiDetail {
   work_item: WorkItem;
   threads: CommentThread[];
+  timeline: TimelineEvent[];
 }
 
 export interface PipelineDetail {

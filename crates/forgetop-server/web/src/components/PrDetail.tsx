@@ -2,10 +2,10 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useState, t
 import { AnimatePresence, motion } from "framer-motion";
 import { useQueryClient } from "@tanstack/react-query";
 import { apiPost, useConnections, usePrCommitChanges, usePrDetail } from "../api";
-import { checkMeta, prStatusMeta, relativeTime, voteMeta } from "../format";
+import { checkMeta, prStatusMeta, relativeTime, timelineMeta, voteMeta } from "../format";
 import { providerSupports, unsupportedMessage } from "../capabilities";
 import { parsePatch } from "../diff";
-import type { CheckRun, CommentThread, Commit, FileChange, FileChangeKind, LineComment, MergeableState, PrRef, ProviderType, Reviewer } from "../types";
+import type { CheckRun, CommentThread, Commit, FileChange, FileChangeKind, LineComment, PrRef, ProviderType, Reviewer, TimelineEvent } from "../types";
 import { Avatar, Chip, Pill } from "./ui";
 
 // ---- opener context ----
@@ -163,7 +163,7 @@ function PrDetailPanel({ prRef, onClose }: { prRef: PrRef; onClose: () => void }
 
         {pr && data && (
           <>
-            <MetaBar mergeable={pr.mergeable} reviewers={pr.reviewers} author={pr.author.display_name} checks={data.checks} />
+            <MetaBar author={pr.author.display_name} />
 
             {/* tabs */}
             <div className="flex items-center gap-1 px-4 shrink-0" style={{ borderBottom: "1px solid var(--border)" }}>
@@ -207,6 +207,8 @@ function PrDetailPanel({ prRef, onClose }: { prRef: PrRef; onClose: () => void }
                 <ConversationTab
                   threads={data.threads}
                   description={pr.description}
+                  reviewers={pr.reviewers}
+                  timeline={data.timeline}
                   busy={busy}
                   onReply={reply}
                   onComment={(body) => act("Comment posted", () => apiPost("/api/pr/comment", { conn: prRef.conn, id: prRef.id, body }))}
@@ -232,6 +234,11 @@ function PrDetailPanel({ prRef, onClose }: { prRef: PrRef; onClose: () => void }
 
             {/* action bar */}
             <div className="flex items-center gap-2 px-4 py-3 shrink-0 flex-wrap" style={{ borderTop: "1px solid var(--border)" }}>
+              <ChecksBadge
+                checks={data.checks}
+                provider={provider}
+                onUnsupported={() => provider && setNote(unsupportedMessage(provider))}
+              />
               {pr.status === "Merged" ? (
                 <div className="ml-auto flex gap-2">
                   <ActionButton disabled={busy} onClick={revert} label="Revert" color="var(--red)" primary />
@@ -298,54 +305,113 @@ function ActionButton({
   );
 }
 
-function MetaBar({
-  mergeable,
-  reviewers,
-  author,
-  checks,
-}: {
-  mergeable: MergeableState;
-  reviewers: Reviewer[];
-  author: string;
-  checks: CheckRun[];
-}) {
-  const passed = checks.filter((c) => c.status === "Passed").length;
-  const failed = checks.filter((c) => c.status === "Failed").length;
-  // A reviewer requesting changes isn't reflected in the provider's `mergeable` (which is about
-  // conflicts / branch-protection policy), so factor it in here rather than reading "mergeable".
-  const changesRequested = reviewers.some((r) => r.vote === "Rejected");
-  const [mergeLabel, mergeColor] =
-    mergeable === "Conflicting"
-      ? ["conflicts", "var(--red)"]
-      : changesRequested
-        ? ["changes requested", "var(--red)"]
-        : mergeable === "Mergeable"
-          ? ["mergeable", "var(--green)"]
-          : [mergeable.toLowerCase(), "var(--dim)"];
+function MetaBar({ author }: { author: string }) {
   return (
-    <div className="flex items-center gap-x-4 gap-y-2 px-5 py-2.5 flex-wrap text-xs shrink-0" style={{ borderBottom: "1px solid var(--border)", color: "var(--dim)" }}>
+    <div className="flex items-center gap-x-4 px-5 py-2.5 text-xs shrink-0" style={{ borderBottom: "1px solid var(--border)", color: "var(--dim)" }}>
       <span className="flex items-center gap-1.5">
-        <Avatar name={author} size={18} /> {author}
+        <Avatar name={author} size={18} /> opened by {author}
       </span>
-      {reviewers.length > 0 && (
-        <span className="flex items-center gap-2">
-          reviewers:
-          {reviewers.map((r, i) => {
-            const v = voteMeta(r.vote);
-            return (
-              <span key={i} title={`${r.user.display_name} — ${v.label}`} style={{ color: v.color }}>
-                {v.icon} {r.user.display_name}
-              </span>
-            );
-          })}
-        </span>
+    </div>
+  );
+}
+
+/** The reviewers list shown beside the description: a vote mark (✓ / ✗ / none) + name. */
+function ReviewersPanel({ reviewers }: { reviewers: Reviewer[] }) {
+  return (
+    <aside className="shrink-0 w-44 rounded-lg p-3 flex flex-col gap-2" style={{ background: "var(--card)", border: "1px solid var(--border)" }}>
+      <div className="text-[11px] font-semibold uppercase tracking-wider" style={{ color: "var(--dim)" }}>
+        Reviewers
+      </div>
+      {reviewers.map((r, i) => {
+        const v = voteMeta(r.vote);
+        return (
+          <div key={i} className="flex items-center gap-2 text-xs" title={`${r.user.display_name} — ${v.label}`}>
+            <span className="shrink-0 w-3 text-center" style={{ color: v.color }}>{r.vote === "NoVote" ? "" : v.icon}</span>
+            <Avatar name={r.user.display_name} size={16} />
+            <span className="truncate" style={{ color: "var(--fg)" }}>{r.user.display_name}</span>
+          </div>
+        );
+      })}
+    </aside>
+  );
+}
+
+/** The event timeline (approvals, merges, state changes, …), shown before the comments. */
+function Timeline({ events }: { events: TimelineEvent[] }) {
+  return (
+    <div className="rounded-lg p-3 flex flex-col gap-1.5" style={{ background: "var(--card)", border: "1px solid var(--border)" }}>
+      <div className="text-[11px] font-semibold uppercase tracking-wider mb-0.5" style={{ color: "var(--dim)" }}>
+        Timeline
+      </div>
+      {events.map((e, i) => {
+        const m = timelineMeta(e.kind);
+        return (
+          <div key={i} className="flex items-center gap-2 text-xs">
+            <span className="shrink-0 w-4 text-center" style={{ color: m.color }}>{m.icon}</span>
+            <span className="font-medium" style={{ color: "var(--fg)" }}>{e.actor?.display_name ?? "Someone"}</span>
+            <span className="truncate" style={{ color: "var(--dim)" }}>{e.summary}</span>
+            {e.at && <span className="ml-auto shrink-0" style={{ color: "var(--dim)" }}>{relativeTime(e.at)}</span>}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+/** Action-bar checks badge: green "all passed" / red "N failed"; click opens a popover of every
+ *  check. Greyed with the standard message when the provider can't report checks. */
+function ChecksBadge({ checks, provider, onUnsupported }: { checks: CheckRun[]; provider: ProviderType | undefined; onUnsupported: () => void }) {
+  const [open, setOpen] = useState(false);
+  const supported = provider ? providerSupports(provider, "checks") : true;
+  const base = "flex items-center gap-1.5 rounded-md px-2.5 py-1 text-xs font-medium whitespace-nowrap";
+  if (!supported) {
+    return (
+      <button onClick={onUnsupported} title={provider ? unsupportedMessage(provider) : undefined} className={base} style={{ opacity: 0.55, cursor: "not-allowed", color: "var(--dim)", border: "1px solid var(--border)", background: "var(--panel2)" }}>
+        Checks
+      </button>
+    );
+  }
+  if (checks.length === 0) {
+    return <span className={base} style={{ color: "var(--dim)", border: "1px solid var(--border)", background: "var(--panel2)" }}>No checks</span>;
+  }
+  const failed = checks.filter((c) => c.status === "Failed").length;
+  const color = failed > 0 ? "var(--red)" : "var(--green)";
+  const label = failed > 0 ? `${failed} check${failed > 1 ? "s" : ""} failed` : "All checks passed";
+  return (
+    <div className="relative">
+      <button
+        onClick={() => setOpen((o) => !o)}
+        className={base}
+        style={{ color, background: `color-mix(in srgb, ${color} 14%, transparent)`, border: `1px solid color-mix(in srgb, ${color} 30%, transparent)`, cursor: "pointer" }}
+      >
+        {failed > 0 ? "✗" : "✓"} {label}
+      </button>
+      {open && (
+        <>
+          <div className="fixed inset-0" style={{ zIndex: 20 }} onClick={() => setOpen(false)} />
+          <div className="absolute bottom-full left-0 mb-2 w-72 rounded-lg p-1 max-h-64 overflow-auto shadow-2xl" style={{ zIndex: 21, background: "var(--panel)", border: "1px solid var(--border)" }}>
+            {checks.map((c, i) => {
+              const m = checkMeta(c.status);
+              const inner = (
+                <>
+                  <span className="shrink-0" style={{ color: m.color }}>{m.icon}</span>
+                  <span className="flex-1 truncate" style={{ color: "var(--fg)" }}>{c.name}</span>
+                  <span className="capitalize shrink-0" style={{ color: m.color }}>{c.status.toLowerCase()}</span>
+                  {c.url && <span className="shrink-0" style={{ color: "var(--dim)" }}>↗</span>}
+                </>
+              );
+              const cls = "flex items-center gap-2 rounded px-2 py-1.5 text-xs";
+              return c.url ? (
+                <a key={i} href={c.url} target="_blank" rel="noreferrer" className={cls + " transition-colors"} onMouseEnter={(e) => (e.currentTarget.style.background = "var(--sel)")} onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}>
+                  {inner}
+                </a>
+              ) : (
+                <div key={i} className={cls}>{inner}</div>
+              );
+            })}
+          </div>
+        </>
       )}
-      {checks.length > 0 && (
-        <span>
-          checks: <span style={{ color: "var(--green)" }}>{passed}✓</span> {failed > 0 && <span style={{ color: "var(--red)" }}>{failed}✗</span>}
-        </span>
-      )}
-      <span style={{ color: mergeColor }}>{mergeLabel}</span>
     </div>
   );
 }
@@ -623,12 +689,16 @@ function PendingBox({ body, onRemove }: { body: string; onRemove: () => void }) 
 function ConversationTab({
   threads,
   description,
+  reviewers,
+  timeline,
   busy,
   onReply,
   onComment,
 }: {
   threads: CommentThread[];
   description?: string | null;
+  reviewers: Reviewer[];
+  timeline: TimelineEvent[];
   busy: boolean;
   onReply: (threadId: string, body: string) => void;
   onComment: (body: string) => void;
@@ -636,13 +706,22 @@ function ConversationTab({
   const [draft, setDraft] = useState("");
   const general = threads.filter((t) => !t.file_path);
   return (
-    <div className="p-4 flex flex-col gap-3 max-w-3xl">
-      {description && (
-        <div className="rounded-lg p-3 text-sm whitespace-pre-wrap" style={{ background: "var(--card)", border: "1px solid var(--border)", color: "var(--fg)" }}>
-          {description}
+    <div className="p-4 flex flex-col gap-3 max-w-4xl">
+      {/* description with the reviewers listed to its right */}
+      <div className="flex gap-4 items-start">
+        <div className="flex-1 min-w-0">
+          {description ? (
+            <div className="rounded-lg p-3 text-sm whitespace-pre-wrap" style={{ background: "var(--card)", border: "1px solid var(--border)", color: "var(--fg)" }}>
+              {description}
+            </div>
+          ) : (
+            <div className="text-sm" style={{ color: "var(--dim)" }}>No description.</div>
+          )}
         </div>
-      )}
-      {general.length === 0 && !description && <Empty text="No conversation yet." />}
+        {reviewers.length > 0 && <ReviewersPanel reviewers={reviewers} />}
+      </div>
+      {timeline.length > 0 && <Timeline events={timeline} />}
+      {general.length === 0 && <Empty text="No comments yet." />}
       {general.map((t) => (
         <ThreadBox key={t.id} thread={t} busy={busy} onReply={onReply} />
       ))}
