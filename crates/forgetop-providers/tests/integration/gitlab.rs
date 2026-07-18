@@ -188,3 +188,61 @@ async fn gitlab_lists_notifications() {
         assert!(!n.id.is_empty(), "a todo carries an id for mark-as-done");
     }
 }
+
+/// End-to-end: an event on your MR surfaces in the notification inbox, drills back to the MR,
+/// and clears on mark-read. GitLab's notification primitive is the to-do, so we create one with
+/// the manual `.../todo` endpoint — the single-user harness can't have a *second* person comment
+/// on or request review of your MR (and GitLab makes no to-do for your own actions). What this
+/// proves is the pipeline the TUI/Dashboard depend on: todo → `notifications().list()` → in-app
+/// drill-in id → mark-read.
+#[tokio::test]
+async fn gitlab_mr_event_surfaces_as_notification() {
+    let gl = skip_if_none!(harness::gitlab(), "gitlab");
+    let raw = GlRaw::from_env().expect("gitlab raw");
+    harness::maybe_sweep(raw.sweep()).await;
+    let prefix = harness::run_prefix();
+
+    // Fixture: an MR to hang the to-do on.
+    let default = raw.default_branch().await;
+    let branch = format!("{prefix}-notif");
+    raw.create_branch(&branch, &default).await;
+    raw.put_file(&format!("{prefix}.txt"), "forgetop notif fixture\n", &branch, &format!("{prefix}: fixture")).await;
+    let iid = raw.open_mr(&branch, &default, &format!("{prefix} MR")).await;
+
+    raw.create_mr_todo(iid).await;
+
+    // The to-do appears as a PR notification pointing back at the MR (todos can lag a moment).
+    let notifs = gl.conn.notifications().expect("gitlab notifications");
+    let id = iid.to_string();
+    let found = {
+        let notifs = &notifs;
+        let id = id.as_str();
+        harness::poll(harness::POLL_LIST, move || async move {
+            notifs
+                .list()
+                .await
+                .ok()
+                .and_then(|l| l.into_iter().find(|n| n.item_id.as_deref() == Some(id) && n.item_type == NotificationItemType::PullRequest))
+        })
+        .await
+    };
+    let n = found.expect("the MR to-do surfaces as a PR notification");
+    assert!(n.unread, "a pending to-do reads as unread");
+
+    // Mark it read through the adapter; it drops out of the inbox.
+    notifs.mark_read(&n.id).await.expect("mark the notification read");
+    let cleared = {
+        let notifs = &notifs;
+        let id = id.as_str();
+        harness::poll(harness::POLL_LIST, move || async move {
+            match notifs.list().await {
+                Ok(l) if !l.iter().any(|x| x.item_id.as_deref() == Some(id)) => Some(()),
+                _ => None,
+            }
+        })
+        .await
+    };
+    assert!(cleared.is_some(), "the notification clears after mark-read");
+
+    raw.delete_branch(&branch).await;
+}
