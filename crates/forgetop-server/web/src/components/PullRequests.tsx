@@ -135,7 +135,7 @@ function PrCard({ row, index }: { row: PrRow; index: number }) {
             {pr.labels.slice(0, 3).map((l) => (
               <Chip key={l}>{l}</Chip>
             ))}
-            {pr.mergeable === "Mergeable" && <Pill icon="✓" label="Mergeable" color="var(--green)" />}
+            {pr.mergeable === "Mergeable" && <Pill icon="✓" label="Mergeable" color="var(--magenta)" />}
           </div>
         </div>
         <div className="flex flex-col items-end gap-2 shrink-0">
