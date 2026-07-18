@@ -594,7 +594,7 @@ impl PullRequestSource for DemoPr {
             at: Some(base() - chrono::Duration::hours(hrs)),
         };
         let mut events = vec![
-            ev(bob(), K::Reviewed, "requested changes on the retry maths", 6),
+            ev(bob(), K::ChangesRequested, "requested changes on the retry maths", 6),
             ev(alice(), K::Commented, "left a comment", 4),
             ev(alice(), K::Approved, "approved these changes", 1),
         ];

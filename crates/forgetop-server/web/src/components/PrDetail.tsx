@@ -347,10 +347,10 @@ function Timeline({ events }: { events: TimelineEvent[] }) {
         const m = timelineMeta(e.kind);
         return (
           <div key={i} className="flex items-center gap-2 text-xs">
+            <span className="shrink-0 w-14 tabular-nums" style={{ color: "var(--dim)" }}>{e.at ? relativeTime(e.at) : ""}</span>
             <span className="shrink-0 w-4 text-center" style={{ color: m.color }}>{m.icon}</span>
-            <span className="font-medium" style={{ color: "var(--fg)" }}>{e.actor?.display_name ?? "Someone"}</span>
+            <span className="font-medium shrink-0" style={{ color: "var(--fg)" }}>{e.actor?.display_name ?? "Someone"}</span>
             <span className="truncate" style={{ color: "var(--dim)" }}>{e.summary}</span>
-            {e.at && <span className="ml-auto shrink-0" style={{ color: "var(--dim)" }}>{relativeTime(e.at)}</span>}
           </div>
         );
       })}
