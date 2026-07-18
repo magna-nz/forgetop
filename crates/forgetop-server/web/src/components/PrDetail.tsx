@@ -86,6 +86,8 @@ function PrDetailPanel({ prRef, onClose }: { prRef: PrRef; onClose: () => void }
       setTimeout(onClose, 500);
     });
   const revert = () => act("Revert requested", () => apiPost("/api/pr/revert", { conn: prRef.conn, id: prRef.id }));
+  const reply = (threadId: string, body: string) =>
+    act("Reply posted", () => apiPost("/api/pr/reply", { conn: prRef.conn, id: prRef.id, thread_id: threadId, body }));
   const submitReview = (event: "Approved" | "Rejected" | "NoVote") =>
     act("Review submitted", async () => {
       await apiPost("/api/pr/review", { conn: prRef.conn, id: prRef.id, event, comments: pending });
@@ -173,6 +175,8 @@ function PrDetailPanel({ prRef, onClose }: { prRef: PrRef; onClose: () => void }
                   changes={data.changes}
                   threads={data.threads}
                   pending={pending}
+                  busy={busy}
+                  onReply={reply}
                   onAddPending={(c) => setPending((p) => [...p, c])}
                   onRemovePending={(i) => setPending((p) => p.filter((_, k) => k !== i))}
                 />
@@ -182,6 +186,7 @@ function PrDetailPanel({ prRef, onClose }: { prRef: PrRef; onClose: () => void }
                   threads={data.threads}
                   description={pr.description}
                   busy={busy}
+                  onReply={reply}
                   onComment={(body) => act("Comment posted", () => apiPost("/api/pr/comment", { conn: prRef.conn, id: prRef.id, body }))}
                 />
               )}
@@ -305,12 +310,16 @@ function FilesTab({
   changes,
   threads,
   pending,
+  busy,
+  onReply,
   onAddPending,
   onRemovePending,
 }: {
   changes: FileChange[];
   threads: CommentThread[];
   pending: LineComment[];
+  busy: boolean;
+  onReply: (threadId: string, body: string) => void;
   onAddPending: (c: LineComment) => void;
   onRemovePending: (index: number) => void;
 }) {
@@ -318,7 +327,7 @@ function FilesTab({
   return (
     <div className="p-4 flex flex-col gap-4">
       {changes.map((f) => (
-        <FileDiff key={f.path} file={f} threads={threads} pending={pending} onAddPending={onAddPending} onRemovePending={onRemovePending} />
+        <FileDiff key={f.path} file={f} threads={threads} pending={pending} busy={busy} onReply={onReply} onAddPending={onAddPending} onRemovePending={onRemovePending} />
       ))}
     </div>
   );
@@ -328,12 +337,16 @@ function FileDiff({
   file,
   threads,
   pending,
+  busy,
+  onReply,
   onAddPending,
   onRemovePending,
 }: {
   file: FileChange;
   threads: CommentThread[];
   pending: LineComment[];
+  busy: boolean;
+  onReply: (threadId: string, body: string) => void;
   onAddPending: (c: LineComment) => void;
   onRemovePending: (index: number) => void;
 }) {
@@ -400,7 +413,7 @@ function FileDiff({
                   </span>
                 </div>
                 {lineThreads.map((t) => (
-                  <ThreadBox key={t.id} thread={t} />
+                  <ThreadBox key={t.id} thread={t} busy={busy} onReply={onReply} />
                 ))}
                 {linePending.map(({ p, idx }) => (
                   <PendingBox key={idx} body={p.body} onRemove={() => onRemovePending(idx)} />
@@ -431,7 +444,16 @@ function FileDiff({
   );
 }
 
-function ThreadBox({ thread }: { thread: CommentThread }) {
+function ThreadBox({ thread, busy, onReply }: { thread: CommentThread; busy: boolean; onReply: (threadId: string, body: string) => void }) {
+  const [replying, setReplying] = useState(false);
+  const [draft, setDraft] = useState("");
+  const submit = () => {
+    const body = draft.trim();
+    if (!body) return;
+    onReply(thread.id, body);
+    setDraft("");
+    setReplying(false);
+  };
   return (
     <div className="px-3 py-2 text-xs" style={{ background: "var(--panel)", borderTop: "1px solid var(--border)" }}>
       {thread.comments.map((c) => (
@@ -443,6 +465,29 @@ function ThreadBox({ thread }: { thread: CommentThread }) {
           </span>
         </div>
       ))}
+      {replying ? (
+        <div className="mt-1.5 flex flex-col gap-1.5">
+          <textarea
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            placeholder="Reply…"
+            rows={2}
+            autoFocus
+            className="w-full rounded p-2 text-xs outline-none"
+            style={{ background: "var(--card)", color: "var(--fg)", border: "1px solid var(--border)" }}
+          />
+          <div className="flex items-center gap-2">
+            <ActionButton label="Reply" disabled={busy || !draft.trim()} primary color="var(--accent)" onClick={submit} />
+            <button className="text-xs" style={{ color: "var(--dim)" }} onClick={() => { setReplying(false); setDraft(""); }}>
+              Cancel
+            </button>
+          </div>
+        </div>
+      ) : (
+        <button className="mt-1 text-xs" style={{ color: "var(--accent)" }} onClick={() => setReplying(true)}>
+          ↳ Reply
+        </button>
+      )}
     </div>
   );
 }
@@ -463,11 +508,13 @@ function ConversationTab({
   threads,
   description,
   busy,
+  onReply,
   onComment,
 }: {
   threads: CommentThread[];
   description?: string | null;
   busy: boolean;
+  onReply: (threadId: string, body: string) => void;
   onComment: (body: string) => void;
 }) {
   const [draft, setDraft] = useState("");
@@ -481,7 +528,7 @@ function ConversationTab({
       )}
       {general.length === 0 && !description && <Empty text="No conversation yet." />}
       {general.map((t) => (
-        <ThreadBox key={t.id} thread={t} />
+        <ThreadBox key={t.id} thread={t} busy={busy} onReply={onReply} />
       ))}
       <div className="mt-2">
         <textarea

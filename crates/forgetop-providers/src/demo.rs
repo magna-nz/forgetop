@@ -472,6 +472,13 @@ fn submitted_threads() -> &'static Mutex<HashMap<String, Vec<CommentThread>>> {
     STORE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Replies posted this run, keyed by `"{pr_id}:{thread_id}"`, so `reply_to_thread` persists
+/// like a real provider: the reply comes back appended to its thread on the next `threads()`.
+fn thread_replies() -> &'static Mutex<HashMap<String, Vec<Comment>>> {
+    static STORE: OnceLock<Mutex<HashMap<String, Vec<Comment>>>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 /// PR ids merged during this `--demo` run. `merge()` records them and `list()`/`get()`
 /// then report those PRs as freshly merged — so a PR you merge drops out of "open" and
 /// shows up under "Recently merged", exactly like a real provider.
@@ -543,6 +550,13 @@ impl PullRequestSource for DemoPr {
         // Include anything submitted this session so it persists like a real provider.
         if let Some(extra) = submitted_threads().lock().unwrap().get(id) {
             threads.extend(extra.iter().cloned());
+        }
+        // Append any replies posted this session into their target thread.
+        let replies = thread_replies().lock().unwrap();
+        for t in &mut threads {
+            if let Some(rs) = replies.get(&format!("{id}:{}", t.id)) {
+                t.comments.extend(rs.iter().cloned());
+            }
         }
         Ok(threads)
     }
@@ -683,6 +697,14 @@ impl PullRequestSource for DemoPr {
             line: None,
             is_resolved: false,
         });
+        Ok(())
+    }
+    async fn reply_to_thread(&self, id: &str, thread_id: &str, body: &str) -> Result<()> {
+        // Append the reply to its thread so it comes back inline on the next refresh.
+        let mut store = thread_replies().lock().unwrap();
+        let entry = store.entry(format!("{id}:{thread_id}")).or_default();
+        let n = entry.len();
+        entry.push(Comment { id: format!("reply-{thread_id}-{n}"), author: me(), body: body.into(), created_at: Some(base()) });
         Ok(())
     }
     async fn vote(&self, _id: &str, _vote: ReviewVote) -> Result<()> {

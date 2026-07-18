@@ -16,6 +16,8 @@ pub enum Action {
     PrMerge(MergeStrategy),
     PrRevert,
     PrComment(String),
+    /// Reply (body) to the thread stashed on the PR view's `reply_target`.
+    PrReply(String),
     WiSetState(String),
     WiComment(String),
     PipelineTrigger { connection_id: String, definition_id: String, branch: Option<String>, label: String },
@@ -95,6 +97,8 @@ pub enum InputKind {
     WorkItemComment,
     /// The body of a pending inline line comment.
     PrLineComment,
+    /// A reply to the thread stashed on the PR view (`reply_target`).
+    PrThreadReply,
     /// The name for a new saved view.
     SaveView,
 }
@@ -318,6 +322,7 @@ fn resolve_input(kind: InputKind, text: String) -> Action {
         InputKind::PrComment => Action::PrComment(text),
         InputKind::WorkItemComment => Action::WiComment(text),
         InputKind::PrLineComment => Action::AddLineComment(text),
+        InputKind::PrThreadReply => Action::PrReply(text),
         InputKind::SaveView => Action::SaveView(text),
     }
 }

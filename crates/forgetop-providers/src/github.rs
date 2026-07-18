@@ -248,6 +248,61 @@ fn unknown_user() -> User {
     User { id: "unknown".into(), display_name: "unknown".into(), handle: None, avatar_url: None }
 }
 
+/// Map a GitHub comment (issue or review) to our [`Comment`] — both share these fields.
+fn map_gh_comment(c: &Value) -> Comment {
+    Comment {
+        id: get_i64(c, "id").map(|n| n.to_string()).unwrap_or_else(|| "0".into()),
+        author: get_obj(c, "user").map(map_user).unwrap_or_else(unknown_user),
+        body: get_str(c, "body").unwrap_or_default(),
+        created_at: get_date(c, "created_at"),
+    }
+}
+
+/// Group GitHub review (diff-line) comments (`GET /pulls/{id}/comments`) into real threads, keyed
+/// by the root comment id (replies carry `in_reply_to_id`). The root id is what a reply posts to
+/// via `/pulls/{id}/comments/{id}/replies`. Each thread keeps the root's file/line.
+fn group_gh_review_threads(raw: &[Value]) -> Vec<CommentThread> {
+    use std::collections::HashMap;
+    let parent: HashMap<String, String> = raw
+        .iter()
+        .filter_map(|c| Some((get_i64(c, "id")?.to_string(), get_i64(c, "in_reply_to_id")?.to_string())))
+        .collect();
+    let root_of = |mut id: String| -> String {
+        for _ in 0..100 {
+            match parent.get(&id) {
+                Some(p) => id = p.clone(),
+                None => break,
+            }
+        }
+        id
+    };
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: HashMap<String, Vec<&Value>> = HashMap::new();
+    for c in raw {
+        let Some(id) = get_i64(c, "id").map(|n| n.to_string()) else { continue };
+        let root = root_of(id);
+        if !groups.contains_key(&root) {
+            order.push(root.clone());
+        }
+        groups.entry(root).or_default().push(c);
+    }
+    order
+        .into_iter()
+        .filter_map(|root| {
+            let mut items = groups.remove(&root)?;
+            items.sort_by_key(|c| get_date(c, "created_at"));
+            let head = items.first().copied();
+            Some(CommentThread {
+                id: root,
+                file_path: head.and_then(|c| get_str(c, "path")),
+                line: head.and_then(|c| get_i64(c, "line").or_else(|| get_i64(c, "original_line"))),
+                is_resolved: false,
+                comments: items.iter().map(|c| map_gh_comment(c)).collect(),
+            })
+        })
+        .collect()
+}
+
 // ---- client ----
 
 /// GitHub notification `reason` → our unified kind.
@@ -423,23 +478,17 @@ impl PullRequestSource for GitHubPr {
         Ok(map_pull_request(&v))
     }
     async fn threads(&self, id: &str) -> Result<Vec<CommentThread>> {
-        let v = self.0.get_json(&self.0.repo_path(&format!("/issues/{id}/comments?per_page=100"))).await?;
-        let comments: Vec<Comment> = v
-            .as_array()
-            .unwrap_or(&vec![])
-            .iter()
-            .map(|c| Comment {
-                id: get_i64(c, "id").map(|n| n.to_string()).unwrap_or_else(|| "0".into()),
-                author: get_obj(c, "user").map(map_user).unwrap_or_else(unknown_user),
-                body: get_str(c, "body").unwrap_or_default(),
-                created_at: get_date(c, "created_at"),
-            })
-            .collect();
-        Ok(if comments.is_empty() {
-            vec![]
-        } else {
-            vec![CommentThread { id: format!("pr-{id}"), comments, file_path: None, line: None, is_resolved: false }]
-        })
+        // The PR conversation is flat issue comments (one bundled thread; GitHub has no reply API
+        // for these), plus the real review (diff-line) threads which *do* support replies.
+        let issues = self.0.get_json(&self.0.repo_path(&format!("/issues/{id}/comments?per_page=100"))).await?;
+        let comments: Vec<Comment> = issues.as_array().unwrap_or(&vec![]).iter().map(map_gh_comment).collect();
+        let mut threads = Vec::new();
+        if !comments.is_empty() {
+            threads.push(CommentThread { id: format!("pr-{id}"), comments, file_path: None, line: None, is_resolved: false });
+        }
+        let reviews = self.0.get_json(&self.0.repo_path(&format!("/pulls/{id}/comments?per_page=100"))).await?;
+        threads.extend(group_gh_review_threads(reviews.as_array().unwrap_or(&vec![])));
+        Ok(threads)
     }
     async fn changes(&self, id: &str) -> Result<Vec<FileChange>> {
         let v = self.0.get_json(&self.0.repo_path(&format!("/pulls/{id}/files?per_page=100"))).await?;
@@ -461,6 +510,16 @@ impl PullRequestSource for GitHubPr {
     }
     async fn add_comment(&self, id: &str, body: &str) -> Result<()> {
         self.0.post_json(&self.0.repo_path(&format!("/issues/{id}/comments")), json!({ "body": body })).await
+    }
+    async fn reply_to_thread(&self, id: &str, thread_id: &str, body: &str) -> Result<()> {
+        // The bundled conversation thread ("pr-<id>") is flat issue comments with no reply API, so
+        // fall back to a top-level comment; a numeric id is a review thread that supports replies.
+        if thread_id.starts_with("pr-") {
+            return self.add_comment(id, body).await;
+        }
+        self.0
+            .post_json(&self.0.repo_path(&format!("/pulls/{id}/comments/{thread_id}/replies")), json!({ "body": body }))
+            .await
     }
     async fn vote(&self, id: &str, vote: ReviewVote) -> Result<()> {
         let event = match vote {
@@ -840,5 +899,25 @@ mod tests {
         let c = map_file_change(&v);
         assert_eq!(c.kind, FileChangeKind::Added);
         assert_eq!(c.patch.as_deref(), Some("@@"));
+    }
+
+    #[test]
+    fn groups_review_comments_into_threads() {
+        let raw: Vec<Value> = serde_json::from_str(
+            r#"[
+                { "id": 100, "body": "root", "path": "src/x.rs", "line": 12, "user": { "login": "bob" }, "created_at": "2026-06-01T10:00:00Z" },
+                { "id": 101, "body": "reply", "in_reply_to_id": 100, "user": { "login": "you" }, "created_at": "2026-06-01T10:05:00Z" },
+                { "id": 200, "body": "other file", "path": "src/y.rs", "original_line": 3, "user": { "login": "amy" }, "created_at": "2026-06-01T11:00:00Z" }
+            ]"#,
+        )
+        .unwrap();
+        let threads = group_gh_review_threads(&raw);
+        assert_eq!(threads.len(), 2);
+        assert_eq!(threads[0].id, "100");
+        assert_eq!(threads[0].comments.len(), 2, "root + reply grouped");
+        assert_eq!(threads[0].file_path.as_deref(), Some("src/x.rs"));
+        assert_eq!(threads[0].line, Some(12));
+        assert_eq!(threads[1].id, "200");
+        assert_eq!(threads[1].line, Some(3), "falls back to original_line");
     }
 }

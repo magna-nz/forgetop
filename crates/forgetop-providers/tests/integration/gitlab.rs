@@ -49,6 +49,15 @@ async fn gitlab_merge_request_lifecycle() {
     let threads = prs.threads(&id).await.expect("threads");
     assert!(threads.iter().any(|t| t.comments.iter().any(|c| c.body.contains(prefix))), "comment shows in threads");
 
+    // Reply into that discussion; the reply comes back nested in the same thread.
+    let thread_id = threads.iter().find(|t| t.comments.iter().any(|c| c.body.contains(prefix))).expect("our thread").id.clone();
+    prs.reply_to_thread(&id, &thread_id, &format!("{prefix} reply")).await.expect("reply to discussion");
+    let after = prs.threads(&id).await.expect("threads after reply");
+    assert!(
+        after.iter().any(|t| t.id == thread_id && t.comments.iter().any(|c| c.body.contains(&format!("{prefix} reply")))),
+        "the reply lands in the discussion it targeted"
+    );
+
     // Merge (retry: GitLab may briefly report the MR as still checking mergeability).
     let merged = harness::poll(harness::POLL_MERGE, || async {
         if prs.merge(&id, &MergeOptions { strategy: MergeStrategy::Merge, delete_source_ref: true }).await.is_ok() {

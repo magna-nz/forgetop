@@ -174,6 +174,14 @@ pub trait PullRequestSource: Send + Sync {
         Ok(Vec::new())
     }
     async fn add_comment(&self, pull_request_id: &str, body: &str) -> Result<()>;
+    /// Replies to an existing comment thread (returned by [`threads`](Self::threads)), so you can
+    /// answer someone else's comment in-thread rather than starting a new top-level one. Defaults
+    /// to posting a plain top-level comment — providers whose threads are really flat (e.g. a
+    /// GitHub PR *conversation*, which has no reply API) keep that behaviour; providers with real
+    /// threads (Azure, GitLab discussions, Bitbucket, GitHub *review* threads) override it.
+    async fn reply_to_thread(&self, pull_request_id: &str, _thread_id: &str, body: &str) -> Result<()> {
+        self.add_comment(pull_request_id, body).await
+    }
     async fn vote(&self, pull_request_id: &str, vote: ReviewVote) -> Result<()>;
     async fn merge(&self, pull_request_id: &str, options: &MergeOptions) -> Result<()>;
     /// Reverts a merged pull request (undoes its merge commit on the target branch). Defaults to

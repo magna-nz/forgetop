@@ -499,6 +499,16 @@ impl PullRequestSource for AzurePr {
             .await
             .map(|_| ())
     }
+    async fn reply_to_thread(&self, id: &str, thread_id: &str, body: &str) -> Result<()> {
+        // Append a reply comment to an existing thread; parentCommentId 1 is the thread's root.
+        self.0
+            .post_json_read(
+                &format!("{}/threads/{thread_id}/comments?{API}", self.0.pr_base(id)),
+                json!({ "content": body, "parentCommentId": 1, "commentType": 1 }),
+            )
+            .await
+            .map(|_| ())
+    }
     async fn vote(&self, id: &str, vote: ReviewVote) -> Result<()> {
         let self_id = self.0.self_id().await?.ok_or_else(|| Error::Provider("could not resolve authenticated user".into()))?;
         let url = format!("{}/reviewers/{self_id}?{API}", self.0.pr_base(id));
