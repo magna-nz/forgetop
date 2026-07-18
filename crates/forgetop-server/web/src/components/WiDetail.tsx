@@ -4,7 +4,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { apiGet, apiPost, useWiDetail } from "../api";
 import { relativeTime, wiStateColor } from "../format";
 import type { CommentThread, WiRef } from "../types";
-import { Avatar, Chip, Pill, SlideOver } from "./ui";
+import { Avatar, Chip, Pill, SlideOver, Timeline } from "./ui";
 
 // ---- opener context ----
 
@@ -100,6 +100,8 @@ function WiDetailPanel({ wiRef, onClose }: { wiRef: WiRef; onClose: () => void }
               {wi.description}
             </div>
           )}
+
+          {data.timeline.length > 0 && <Timeline events={data.timeline} />}
 
           <Comments
             threads={data.threads}

@@ -2,11 +2,11 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useState, t
 import { AnimatePresence, motion } from "framer-motion";
 import { useQueryClient } from "@tanstack/react-query";
 import { apiPost, useConnections, usePrCommitChanges, usePrDetail } from "../api";
-import { checkMeta, prStatusMeta, relativeTime, timelineMeta, voteMeta } from "../format";
+import { checkMeta, prStatusMeta, relativeTime, voteMeta } from "../format";
 import { providerSupports, unsupportedMessage } from "../capabilities";
 import { parsePatch } from "../diff";
 import type { CheckRun, CommentThread, Commit, FileChange, FileChangeKind, LineComment, PrRef, ProviderType, Reviewer, TimelineEvent } from "../types";
-import { Avatar, Chip, Pill } from "./ui";
+import { Avatar, Chip, Pill, Timeline } from "./ui";
 
 // ---- opener context ----
 
@@ -325,29 +325,6 @@ function MetaBar({ author, reviewers }: { author: string; reviewers: Reviewer[] 
           })}
         </span>
       )}
-    </div>
-  );
-}
-
-/** The event timeline (approvals, merges, comments, state changes, …), newest first. */
-function Timeline({ events }: { events: TimelineEvent[] }) {
-  const ordered = [...events].reverse(); // events arrive oldest→newest; show newest at the top
-  return (
-    <div className="rounded-lg p-3 flex flex-col gap-1.5" style={{ background: "var(--card)", border: "1px solid var(--border)" }}>
-      <div className="text-[11px] font-semibold uppercase tracking-wider mb-0.5" style={{ color: "var(--dim)" }}>
-        Timeline
-      </div>
-      {ordered.map((e, i) => {
-        const m = timelineMeta(e.kind);
-        return (
-          <div key={i} className="flex items-center gap-2 text-xs">
-            <span className="shrink-0 w-14 tabular-nums" style={{ color: "var(--dim)" }}>{e.at ? relativeTime(e.at) : ""}</span>
-            <span className="shrink-0 w-4 text-center" style={{ color: m.color }}>{m.icon}</span>
-            <span className="font-medium shrink-0" style={{ color: "var(--fg)" }}>{e.actor?.display_name ?? "Someone"}</span>
-            <span className="truncate" style={{ color: "var(--dim)" }}>{e.summary}</span>
-          </div>
-        );
-      })}
     </div>
   );
 }
