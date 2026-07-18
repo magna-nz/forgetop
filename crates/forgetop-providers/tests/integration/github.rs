@@ -100,6 +100,9 @@ async fn github_pull_request_lifecycle() {
     .await;
     assert!(after.is_some(), "the PR reads back as merged");
 
+    // GitHub has no one-call revert API, so the adapter reports it unsupported rather than faking it.
+    assert!(prs.revert(&id).await.is_err(), "github revert is unsupported");
+
     // Teardown (squash+delete usually removes the branch already).
     raw.delete_ref(&branch).await;
 }

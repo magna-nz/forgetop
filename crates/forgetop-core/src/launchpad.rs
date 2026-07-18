@@ -613,6 +613,21 @@ mod tests {
     }
 
     #[test]
+    fn expand_buckets_are_not_capped() {
+        // "Ready to merge" / "Needs fixing" are revealed in place by the dashboard, so build keeps
+        // them all rather than capping at 5. Seven of your PRs fail CI → seven needs-fixing rows.
+        let mine: Vec<PrInput> = (0..7)
+            .map(|i| pr_row(&format!("pr{i}"), authored(false, &[], CheckStatus::Failed, MergeableState::Mergeable)))
+            .collect();
+        let lp = build(&[], &mine, &[], &[]);
+        assert_eq!(
+            lp.entries.iter().filter(|e| e.bucket == Bucket::NeedsFixing).count(),
+            7,
+            "needs-fixing is returned whole, not capped",
+        );
+    }
+
+    #[test]
     fn recent_pipelines_cap_at_five_and_flag_overflow() {
         let pipes: Vec<PipeInput> = (0..6).map(|_| pipe(PipelineRunStatus::Succeeded, false)).collect();
         let lp = build(&[], &[], &[], &pipes);

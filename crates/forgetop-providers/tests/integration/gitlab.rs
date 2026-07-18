@@ -60,6 +60,9 @@ async fn gitlab_merge_request_lifecycle() {
     .await;
     assert!(merged.is_some(), "the MR reads back as merged");
 
+    // Revert the merge commit onto the target branch (GitLab commits the revert directly).
+    prs.revert(&id).await.expect("revert the merged MR");
+
     raw.delete_branch(&branch).await;
 }
 

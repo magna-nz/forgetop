@@ -26,9 +26,15 @@ jobs:
           node-version: 20
           cache: npm
           cache-dependency-path: crates/forgetop-server/web/package-lock.json
+      - name: Install dashboard deps
+        working-directory: crates/forgetop-server/web
+        run: npm ci
+      - name: Dashboard tests
+        working-directory: crates/forgetop-server/web
+        run: npm run test
       - name: Build dashboard SPA
         working-directory: crates/forgetop-server/web
-        run: npm ci && npm run build
+        run: npm run build
       - name: Build
         run: cargo build --workspace --locked
       - name: Test
