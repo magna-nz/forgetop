@@ -65,6 +65,18 @@ async fn azure_pull_request_lifecycle() {
         "the reply lands in the thread it targeted"
     );
 
+    // Mergeable flag: the clean fixture PR (off the default branch, no conflicts) settles to
+    // Mergeable. Azure computes `mergeStatus` asynchronously, so poll get() until it lands.
+    let mergeable = {
+        let prs = &prs;
+        let id = id.as_str();
+        harness::poll(harness::POLL_MERGE, move || async move {
+            prs.get(id).await.ok().filter(|p| p.mergeable == MergeableState::Mergeable).map(|_| ())
+        })
+        .await
+    };
+    assert!(mergeable.is_some(), "the clean PR computes as mergeable");
+
     // Merge via the adapter (retry: Azure needs a moment to compute mergeability).
     let merged = harness::poll(harness::POLL_MERGE, || async {
         if prs.merge(&id, &MergeOptions { strategy: MergeStrategy::Squash, delete_source_ref: true }).await.is_ok() {

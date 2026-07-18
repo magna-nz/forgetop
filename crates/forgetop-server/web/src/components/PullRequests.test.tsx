@@ -62,4 +62,16 @@ describe("PullRequests", () => {
     renderWithClient(<PullRequests />);
     expect(await screen.findByText("No open pull requests")).toBeInTheDocument();
   });
+
+  it("badges a mergeable PR and omits the badge otherwise", async () => {
+    const blocked = pr("2", "A blocked PR");
+    blocked.pull_request.mergeable = "Blocked";
+    mockFetch({ get: { "view=all": [pr("1", "A mergeable PR"), blocked] } });
+    renderWithClient(<PullRequests />);
+
+    // The mergeable PR carries exactly one "Mergeable" badge; the blocked one carries none.
+    expect(await screen.findByText("A mergeable PR")).toBeInTheDocument();
+    expect(await screen.findByText("A blocked PR")).toBeInTheDocument();
+    expect(screen.getAllByText("Mergeable")).toHaveLength(1);
+  });
 });

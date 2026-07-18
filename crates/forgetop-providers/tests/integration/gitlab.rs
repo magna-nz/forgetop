@@ -69,6 +69,18 @@ async fn gitlab_merge_request_lifecycle() {
         "the reply lands in the discussion it targeted"
     );
 
+    // Mergeable flag: the clean fixture MR (off the default branch, no conflicts) settles to
+    // Mergeable. GitLab computes `merge_status` asynchronously, so poll get() until it lands.
+    let mergeable = {
+        let prs = &prs;
+        let id = id.as_str();
+        harness::poll(harness::POLL_MERGE, move || async move {
+            prs.get(id).await.ok().filter(|p| p.mergeable == MergeableState::Mergeable).map(|_| ())
+        })
+        .await
+    };
+    assert!(mergeable.is_some(), "the clean MR computes as mergeable");
+
     // Merge (retry: GitLab may briefly report the MR as still checking mergeability).
     let merged = harness::poll(harness::POLL_MERGE, || async {
         if prs.merge(&id, &MergeOptions { strategy: MergeStrategy::Merge, delete_source_ref: true }).await.is_ok() {
