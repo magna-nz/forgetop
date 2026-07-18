@@ -171,10 +171,18 @@ function PrDetailPanel({ prRef, onClose }: { prRef: PrRef; onClose: () => void }
                 <button
                   key={t}
                   onClick={() => setTab(t)}
-                  className="px-3 py-2 text-sm capitalize"
+                  className="px-3 py-2 text-sm capitalize rounded-t-md transition-colors"
                   style={{
                     color: tab === t ? "var(--fg)" : "var(--dim)",
                     borderBottom: tab === t ? "2px solid var(--accent)" : "2px solid transparent",
+                  }}
+                  onMouseEnter={(e) => {
+                    e.currentTarget.style.background = "var(--card)";
+                    if (tab !== t) e.currentTarget.style.color = "var(--fg)";
+                  }}
+                  onMouseLeave={(e) => {
+                    e.currentTarget.style.background = "transparent";
+                    if (tab !== t) e.currentTarget.style.color = "var(--dim)";
                   }}
                 >
                   {t}
