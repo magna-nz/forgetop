@@ -844,6 +844,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn notification_reasons_cover_pr_activity() {
+        // When someone acts on a PR you're involved in, GitHub attaches one of these reasons.
+        // This locks in that each maps to the kind the inbox renders (comment/review/mention/…).
+        assert_eq!(github_reason_kind("comment"), NotificationKind::Comment);
+        assert_eq!(github_reason_kind("review_requested"), NotificationKind::ReviewRequested);
+        assert_eq!(github_reason_kind("mention"), NotificationKind::Mention);
+        assert_eq!(github_reason_kind("team_mention"), NotificationKind::Mention);
+        assert_eq!(github_reason_kind("assign"), NotificationKind::Assigned);
+        assert_eq!(github_reason_kind("state_change"), NotificationKind::StateChange);
+        assert_eq!(github_reason_kind("ci_activity"), NotificationKind::CiFailed);
+        // Anything new GitHub adds falls back to Other rather than being dropped.
+        assert_eq!(github_reason_kind("some_future_reason"), NotificationKind::Other);
+    }
+
+    #[test]
     fn maps_notification_reason_and_item() {
         let v: Value = serde_json::from_str(
             r#"{ "id": "42", "unread": true, "reason": "review_requested", "updated_at": "2026-07-10T09:00:00Z",

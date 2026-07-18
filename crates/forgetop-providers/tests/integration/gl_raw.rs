@@ -77,6 +77,18 @@ impl GlRaw {
         v["iid"].as_i64().expect("mr iid")
     }
 
+    /// Manually creates a to-do for the current user on an MR (GitLab's
+    /// `POST .../merge_requests/:iid/todo`). This is the one single-user way to generate a real
+    /// notification — GitLab won't make a to-do for your own comment/review. 201 = created,
+    /// 304 = one already exists; both mean a pending to-do is now present.
+    pub async fn create_mr_todo(&self, iid: i64) {
+        let (status, text) = self.raw(Method::POST, &self.url(&format!("/merge_requests/{iid}/todo")), None).await;
+        assert!(
+            status.is_success() || status == reqwest::StatusCode::NOT_MODIFIED,
+            "create MR todo -> {status}: {text}"
+        );
+    }
+
     /// Creates an issue assigned to `assignee_id`; returns its iid.
     pub async fn create_issue(&self, title: &str, assignee_id: i64) -> i64 {
         let v = self.send(Method::POST, &self.url("/issues"), Some(json!({ "title": title, "assignee_ids": [assignee_id] }))).await;
