@@ -79,16 +79,24 @@ function PrDetailPanel({ prRef, onClose }: { prRef: PrRef; onClose: () => void }
     }
   };
 
+  // A verdict/merge action from the action bar closes the pane once it lands (brief delay so the
+  // "✓" note flashes first), matching Merge — you've acted on this PR, so return to the list.
+  const closeSoon = () => setTimeout(onClose, 500);
   const vote = (v: "Approved" | "Rejected") =>
-    act(v === "Approved" ? "Approved" : "Requested changes", () =>
-      apiPost("/api/pr/vote", { conn: prRef.conn, id: prRef.id, vote: v }),
-    );
+    act(v === "Approved" ? "Approved" : "Requested changes", async () => {
+      await apiPost("/api/pr/vote", { conn: prRef.conn, id: prRef.id, vote: v });
+      closeSoon();
+    });
   const merge = () =>
     act("Merged", async () => {
       await apiPost("/api/pr/merge", { conn: prRef.conn, id: prRef.id, strategy: "Merge" });
-      setTimeout(onClose, 500);
+      closeSoon();
     });
-  const revert = () => act("Revert requested", () => apiPost("/api/pr/revert", { conn: prRef.conn, id: prRef.id }));
+  const revert = () =>
+    act("Revert requested", async () => {
+      await apiPost("/api/pr/revert", { conn: prRef.conn, id: prRef.id });
+      closeSoon();
+    });
   const reply = (threadId: string, body: string) =>
     act("Reply posted", () => apiPost("/api/pr/reply", { conn: prRef.conn, id: prRef.id, thread_id: threadId, body }));
   const submitReview = (event: "Approved" | "Rejected" | "NoVote") =>

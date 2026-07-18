@@ -1,6 +1,6 @@
 import { useEffect } from "react";
 import { describe, it, expect } from "vitest";
-import { screen, waitFor } from "@testing-library/react";
+import { screen, waitFor, waitForElementToBeRemoved } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { PrDetailProvider, usePrOpener } from "./PrDetail";
 import { renderWithClient, mockFetch } from "../test/util";
@@ -58,6 +58,18 @@ describe("PrDetail action bar", () => {
 
     await userEvent.click(screen.getByRole("button", { name: "Revert" }));
     await waitFor(() => expect(posts.some((p) => p.url.includes("/api/pr/revert"))).toBe(true));
+  });
+
+  it("selecting an action bar verdict closes the pane", async () => {
+    mockFetch({ get: { "/api/pr/detail": detail("Open") } });
+    renderWithClient(
+      <PrDetailProvider>
+        <Opener conn="c" id="1" />
+      </PrDetailProvider>,
+    );
+    await userEvent.click(await screen.findByRole("button", { name: "Approve" }));
+    // The panel unmounts once the action lands (after the brief post-action delay).
+    await waitForElementToBeRemoved(() => screen.queryByText("Cache the customer risk score"), { timeout: 2000 });
   });
 
   it("an open PR shows Request changes / Approve / Merge and no Revert", async () => {
