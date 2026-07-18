@@ -140,6 +140,27 @@ describe("PrDetail action bar", () => {
     expect(link).toHaveAttribute("href", "https://gh.test/checks/1");
   });
 
+  it("Files tab: a left-hand file list switches the shown diff", async () => {
+    const d = detail("Open");
+    d.changes = [
+      { path: "src/a.rs", kind: "Modified", additions: 1, deletions: 1, patch: "@@ -1 +1 @@\n-old\n+newA" },
+      { path: "src/b.rs", kind: "Added", additions: 2, deletions: 0, patch: "@@ -0,0 +1,2 @@\n+newB\n+two" },
+    ];
+    mockFetch({ get: { "/api/pr/detail": d } });
+    renderWithClient(
+      <PrDetailProvider>
+        <Opener conn="c" id="1" />
+      </PrDetailProvider>,
+    );
+    await userEvent.click(await screen.findByRole("button", { name: /files/i }));
+    // First file's diff is shown by default (its header carries the full path).
+    expect(await screen.findByText("src/a.rs")).toBeInTheDocument();
+    // Clicking the second file in the list switches the shown diff.
+    await userEvent.click(screen.getByRole("button", { name: /b\.rs/i }));
+    expect(await screen.findByText("src/b.rs")).toBeInTheDocument();
+    expect(screen.queryByText("src/a.rs")).not.toBeInTheDocument();
+  });
+
   it("Commits tab: selecting a commit shows that commit's diff in Files", async () => {
     const d = detail("Open");
     d.commits = [{ sha: "abc1234def", message: "Add retry policy", author: "alice", date: null, url: null }];
