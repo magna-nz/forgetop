@@ -3,7 +3,7 @@ import { motion } from "framer-motion";
 import { useLaunchpad } from "../api";
 import { checkMeta, pipeMeta, prStatusMeta, relativeTime, wiStateColor } from "../format";
 import type { LaunchpadMore, LaunchpadRow, SectionId } from "../types";
-import { ProviderBadge, Skeleton, StateCard } from "./ui";
+import { Skeleton, StateCard } from "./ui";
 import { ErrorState } from "./ErrorState";
 import { usePrOpener } from "./PrDetail";
 import { useWiOpener } from "./WiDetail";
@@ -165,7 +165,7 @@ function ItemRow({ row, index, muted }: { row: LaunchpadRow; index: number; mute
     initial: { opacity: 0, y: 4 },
     animate: { opacity: 1, y: 0 },
     transition: { duration: 0.2, delay: Math.min(index * 0.015, 0.25) },
-    className: "group flex items-center gap-2.5 rounded-lg px-3 py-2 transition-colors w-full text-left",
+    className: "group flex items-center gap-2.5 rounded-lg px-3 py-1.5 transition-colors w-full text-left",
     style: { background: "var(--card)", border: "1px solid var(--border)", opacity: muted ? 0.85 : 1, cursor: "pointer" },
     onMouseEnter: (e: React.MouseEvent<HTMLElement>) => (e.currentTarget.style.background = "var(--card-hover)"),
     onMouseLeave: (e: React.MouseEvent<HTMLElement>) => (e.currentTarget.style.background = "var(--card)"),
@@ -181,7 +181,6 @@ function ItemRow({ row, index, muted }: { row: LaunchpadRow; index: number; mute
           <span className="mono text-[11px] rounded px-1" style={{ background: "var(--panel2)", color: "var(--dim)" }}>
             {kindLabel(row.kind)}
           </span>
-          <ProviderBadge provider={row.provider} connection={row.connection} />
           {meta && (
             <span className="text-xs truncate" style={{ color: "var(--dim)" }}>
               {meta}
@@ -265,5 +264,5 @@ function rowId(row: LaunchpadRow): string {
 }
 
 function kindLabel(kind: LaunchpadRow["kind"]): string {
-  return kind === "pr" ? "PR" : kind === "wi" ? "Issue" : "Pipeline";
+  return kind === "pr" ? "Pull Request" : kind === "wi" ? "Work Item" : "Pipeline";
 }
