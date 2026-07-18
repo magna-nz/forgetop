@@ -8,13 +8,11 @@ import { providerMeta } from "./format";
 // off for a provider, add it to UNSUPPORTED — the UI stays the same shape, just disabled.
 
 /** Features that may be unavailable on some providers. Extend as we gate more. */
-export type ProviderFeature = "check-links" | "checks";
+export type ProviderFeature = "checks";
 
-/** The features each provider's API can't back. Default is supported — only list exceptions. */
-const UNSUPPORTED: Partial<Record<ProviderType, ProviderFeature[]>> = {
-  // The demo's checks are canned and carry no links to open.
-  Demo: ["check-links"],
-};
+/** The features each provider's API can't back. Default is supported — only list exceptions.
+ *  (Empty today — every provider reports checks; the mechanism stays for the next gated feature.) */
+const UNSUPPORTED: Partial<Record<ProviderType, ProviderFeature[]>> = {};
 
 export function providerSupports(provider: ProviderType, feature: ProviderFeature): boolean {
   return !(UNSUPPORTED[provider]?.includes(feature) ?? false);

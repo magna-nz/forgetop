@@ -26,7 +26,7 @@ export function PrDetailProvider({ children }: { children: ReactNode }) {
 
 // ---- panel ----
 
-type Tab = "conversation" | "commits" | "checks" | "files";
+type Tab = "conversation" | "commits" | "files";
 
 function PrDetailPanel({ prRef, onClose }: { prRef: PrRef; onClose: () => void }) {
   const { data, isLoading, error } = usePrDetail(prRef);
@@ -167,7 +167,7 @@ function PrDetailPanel({ prRef, onClose }: { prRef: PrRef; onClose: () => void }
 
             {/* tabs */}
             <div className="flex items-center gap-1 px-4 shrink-0" style={{ borderBottom: "1px solid var(--border)" }}>
-              {(["conversation", "commits", "checks", "files"] as Tab[]).map((t) => (
+              {(["conversation", "commits", "files"] as Tab[]).map((t) => (
                 <button
                   key={t}
                   onClick={() => setTab(t)}
@@ -188,7 +188,6 @@ function PrDetailPanel({ prRef, onClose }: { prRef: PrRef; onClose: () => void }
                   {t}
                   {t === "files" && ` (${data.changes.length})`}
                   {t === "commits" && ` (${data.commits.length})`}
-                  {t === "checks" && ` (${data.checks.length})`}
                 </button>
               ))}
             </div>
@@ -228,13 +227,6 @@ function PrDetailPanel({ prRef, onClose }: { prRef: PrRef; onClose: () => void }
                     setCommitScope({ sha, label });
                     setTab("files");
                   }}
-                />
-              )}
-              {tab === "checks" && (
-                <ChecksTab
-                  checks={data.checks}
-                  provider={provider}
-                  onUnsupported={() => provider && setNote(unsupportedMessage(provider))}
                 />
               )}
             </div>
@@ -741,73 +733,6 @@ function CommitsTab({ commits, onSelect }: { commits: Commit[]; onSelect: (sha: 
             <span className="text-xs shrink-0" style={{ color: "var(--dim)" }}>{c.author}</span>
             <span className="text-xs shrink-0 opacity-0 transition-opacity group-hover:opacity-100" style={{ color: "var(--accent)" }}>diff →</span>
           </button>
-        );
-      })}
-    </div>
-  );
-}
-
-function ChecksTab({
-  checks,
-  provider,
-  onUnsupported,
-}: {
-  checks: CheckRun[];
-  provider: ProviderType | undefined;
-  onUnsupported: () => void;
-}) {
-  if (checks.length === 0) return <Empty text="No checks reported." />;
-  // Whether this provider's API lets us open a check. When it can't, the rows stay visible but
-  // greyed, and a click shows the standard "not supported" popup (see capabilities.ts).
-  const supported = provider ? providerSupports(provider, "check-links") : true;
-  const base = "flex items-center gap-3 rounded-lg px-3 py-2 text-left w-full";
-  const cardStyle = { background: "var(--card)", border: "1px solid var(--border)" };
-  return (
-    <div className="p-4 flex flex-col gap-1.5 max-w-3xl">
-      {checks.map((c, i) => {
-        const m = checkMeta(c.status);
-        const inner = (
-          <>
-            <span className="shrink-0" style={{ color: m.color }}>{m.icon}</span>
-            <span className="flex-1 truncate text-sm" style={{ color: "var(--fg)" }}>{c.name}</span>
-            <span className="text-xs shrink-0 capitalize" style={{ color: m.color }}>{c.status.toLowerCase()}</span>
-          </>
-        );
-        if (supported && c.url) {
-          return (
-            <a
-              key={i}
-              href={c.url}
-              target="_blank"
-              rel="noreferrer"
-              className={base + " transition-colors"}
-              style={{ ...cardStyle, cursor: "pointer" }}
-              onMouseEnter={(e) => (e.currentTarget.style.background = "var(--card-hover)")}
-              onMouseLeave={(e) => (e.currentTarget.style.background = "var(--card)")}
-            >
-              {inner}
-              <span className="text-xs shrink-0" style={{ color: "var(--dim)" }}>↗</span>
-            </a>
-          );
-        }
-        if (!supported) {
-          return (
-            <button
-              key={i}
-              onClick={onUnsupported}
-              className={base}
-              style={{ ...cardStyle, opacity: 0.55, cursor: "not-allowed" }}
-              title={provider ? unsupportedMessage(provider) : undefined}
-            >
-              {inner}
-            </button>
-          );
-        }
-        // Supported provider, but this particular check exposes no link — plain, non-clickable row.
-        return (
-          <div key={i} className={base} style={cardStyle}>
-            {inner}
-          </div>
         );
       })}
     </div>
