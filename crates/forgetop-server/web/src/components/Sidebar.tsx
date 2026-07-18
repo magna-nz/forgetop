@@ -4,7 +4,8 @@ import { useTheme } from "../theme";
 import type { SectionId } from "../types";
 
 const NAV: { id: SectionId; label: string; icon: string }[] = [
-  { id: "launchpad", label: "Launchpad", icon: "✦" },
+  // "Command Center" is the user-facing name for the launchpad; code keeps the `launchpad` id.
+  { id: "launchpad", label: "Command Center", icon: "✦" },
   { id: "prs", label: "Pull Requests", icon: "⇄" },
   { id: "work-items", label: "Work Items", icon: "◧" },
   { id: "pipelines", label: "Pipelines", icon: "⛓" },

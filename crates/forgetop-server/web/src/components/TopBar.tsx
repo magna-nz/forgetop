@@ -3,7 +3,8 @@ import { AnimatePresence, motion } from "framer-motion";
 import type { SectionId } from "../types";
 
 const META: Record<SectionId, { title: string; subtitle: string }> = {
-  launchpad: { title: "Launchpad", subtitle: "Everything triaged by what needs you first — review, ship, fix, then your work." },
+  // "Command Center" is the user-facing name for the launchpad section (code keeps `launchpad`).
+  launchpad: { title: "Command Center", subtitle: "Everything triaged by what needs you first — review, ship, fix, then your work." },
   prs: { title: "Pull Requests", subtitle: "Open PRs you author or are asked to review, across every connection." },
   "work-items": { title: "Work Items", subtitle: "Issues and tickets currently assigned to you." },
   pipelines: { title: "Pipelines", subtitle: "Recent CI runs across your repositories." },

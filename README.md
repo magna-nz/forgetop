@@ -19,22 +19,22 @@ stages, trigger runs). Run it as a fast terminal UI, a browser dashboard, or **b
 once** (the default). Tokens live in your OS keychain, never in plaintext.
 
 <div align="center">
-  <img src="docs/launchpad2.gif" alt="The Launchpad in the terminal" width="820">
+  <img src="docs/launchpad2.gif" alt="The Command Center in the terminal" width="820">
   <br/>
   <sub><b>In your terminal</b></sub>
   <br/><br/>
-  <img src="docs/dashboard.gif" alt="The Launchpad in the web dashboard" width="820">
+  <img src="docs/dashboard.gif" alt="The Command Center in the web dashboard" width="820">
   <br/>
   <sub><b>…or your browser</b></sub>
   <br/><br/>
-  <sub>The <b>Launchpad</b> — the same triaged, actionable queue in your terminal and your browser. Same data, same actions. Your call.</sub>
+  <sub>The <b>Command Center</b> — the same triaged, actionable queue in your terminal and your browser. Same data, same actions. Your call.</sub>
 </div>
 
 ---
 
-## The Launchpad
+## The Command Center
 
-forgetop opens on the **Launchpad** — one queue answering *what needs me right now?*
+forgetop opens on the **Command Center** — one queue answering *what needs me right now?*
 Everything that needs you, from every connected forge, on a single page ordered by
 urgency, in two columns:
 
@@ -44,7 +44,7 @@ urgency, in two columns:
 
 Every item reads in the same shape, so they're comparable at a glance — and you act on
 any of them inline, without switching tabs. See the
-[Launchpad docs](https://magna-nz.github.io/forgetop/#launchpad) for the full bucket
+[Command Center docs](https://magna-nz.github.io/forgetop/#command-center) for the full bucket
 rules and keys.
 
 Two more cross-provider views: **`i`** opens a **notification inbox** (mentions, review
@@ -61,7 +61,7 @@ and [azdo](https://github.com/Elpulgo/azdo) (Azure DevOps only). forgetop's angl
 | Capability | forgetop | gh-dash | azdo |
 | :--- | :---: | :---: | :---: |
 | Forges supported | **6** | GitHub | Azure |
-| Cross-provider action inbox (Launchpad) | ✅ | ❌ | ❌ |
+| Cross-provider action inbox (Command Center) | ✅ | ❌ | ❌ |
 | Cross-provider notification inbox | ✅ | ❌ | ❌ |
 | PRs + Work items + Pipelines | ✅ | PRs only | ✅ Azure |
 | Act (approve / merge / comment) | ✅ | ✅ PRs | partial |
@@ -113,7 +113,7 @@ Try it with no setup — everything is in-memory, nothing is written:
 forgetop --demo
 ```
 
-It opens on the **[Launchpad](https://magna-nz.github.io/forgetop/#launchpad)** — your
+It opens on the **[Command Center](https://magna-nz.github.io/forgetop/#command-center)** — your
 triaged queue across both demo connections; press `Tab` (or `2`–`4`) for the per-type
 lists.
 
@@ -134,7 +134,7 @@ access, and each connection's token + connectivity.
 
 ## Terminal or browser
 
-The dashboard is the **same app** as the TUI — Launchpad, all three lists, PR review with an
+The dashboard is the **same app** as the TUI — Command Center, all three lists, PR review with an
 inline-comment diff viewer, the command palette, sort/filter, themes, and every write action
 — served by forgetop itself, built into the binary, on **`127.0.0.1` only** with a
 per-session token. No separate install, no external network.
@@ -150,7 +150,7 @@ per-session token. No separate install, no external network.
 forgetop shows a **context-aware key glossary** along the bottom, so you rarely
 need a reference. The full docs live at **[magna-nz.github.io/forgetop](https://magna-nz.github.io/forgetop/)**:
 
-- [Launchpad](https://magna-nz.github.io/forgetop/#launchpad) — the cross-provider action inbox
+- [Command Center](https://magna-nz.github.io/forgetop/#command-center) — the cross-provider action inbox
 - [Keybindings](https://magna-nz.github.io/forgetop/#keybindings) — every key, per screen
 - [Configuration &amp; tokens](https://magna-nz.github.io/forgetop/#configuration) — config paths, keychain, token scopes per provider
 - [Themes](https://magna-nz.github.io/forgetop/#themes)
