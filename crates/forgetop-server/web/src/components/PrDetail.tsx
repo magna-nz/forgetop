@@ -5,8 +5,8 @@ import { apiPost, useConnections, usePrCommitChanges, usePrDetail } from "../api
 import { checkMeta, prStatusMeta, relativeTime, voteMeta } from "../format";
 import { providerSupports, unsupportedMessage } from "../capabilities";
 import { parsePatch } from "../diff";
-import type { CheckRun, CommentThread, Commit, FileChange, FileChangeKind, LineComment, MergeableState, PrRef, ProviderType, Reviewer } from "../types";
-import { Avatar, Chip, Pill } from "./ui";
+import type { CheckRun, CommentThread, Commit, FileChange, FileChangeKind, LineComment, PrRef, ProviderType, Reviewer, TimelineEvent } from "../types";
+import { Avatar, Chip, Pill, Timeline } from "./ui";
 
 // ---- opener context ----
 
@@ -26,7 +26,7 @@ export function PrDetailProvider({ children }: { children: ReactNode }) {
 
 // ---- panel ----
 
-type Tab = "conversation" | "commits" | "checks" | "files";
+type Tab = "conversation" | "commits" | "files";
 
 function PrDetailPanel({ prRef, onClose }: { prRef: PrRef; onClose: () => void }) {
   const { data, isLoading, error } = usePrDetail(prRef);
@@ -163,24 +163,31 @@ function PrDetailPanel({ prRef, onClose }: { prRef: PrRef; onClose: () => void }
 
         {pr && data && (
           <>
-            <MetaBar mergeable={pr.mergeable} reviewers={pr.reviewers} author={pr.author.display_name} checks={data.checks} />
+            <MetaBar author={pr.author.display_name} reviewers={pr.reviewers} />
 
             {/* tabs */}
             <div className="flex items-center gap-1 px-4 shrink-0" style={{ borderBottom: "1px solid var(--border)" }}>
-              {(["conversation", "commits", "checks", "files"] as Tab[]).map((t) => (
+              {(["conversation", "commits", "files"] as Tab[]).map((t) => (
                 <button
                   key={t}
                   onClick={() => setTab(t)}
-                  className="px-3 py-2 text-sm capitalize"
+                  className="px-3 py-2 text-sm capitalize rounded-t-md transition-colors"
                   style={{
                     color: tab === t ? "var(--fg)" : "var(--dim)",
                     borderBottom: tab === t ? "2px solid var(--accent)" : "2px solid transparent",
+                  }}
+                  onMouseEnter={(e) => {
+                    e.currentTarget.style.background = "var(--card)";
+                    if (tab !== t) e.currentTarget.style.color = "var(--fg)";
+                  }}
+                  onMouseLeave={(e) => {
+                    e.currentTarget.style.background = "transparent";
+                    if (tab !== t) e.currentTarget.style.color = "var(--dim)";
                   }}
                 >
                   {t}
                   {t === "files" && ` (${data.changes.length})`}
                   {t === "commits" && ` (${data.commits.length})`}
-                  {t === "checks" && ` (${data.checks.length})`}
                 </button>
               ))}
             </div>
@@ -207,6 +214,7 @@ function PrDetailPanel({ prRef, onClose }: { prRef: PrRef; onClose: () => void }
                 <ConversationTab
                   threads={data.threads}
                   description={pr.description}
+                  timeline={data.timeline}
                   busy={busy}
                   onReply={reply}
                   onComment={(body) => act("Comment posted", () => apiPost("/api/pr/comment", { conn: prRef.conn, id: prRef.id, body }))}
@@ -221,17 +229,15 @@ function PrDetailPanel({ prRef, onClose }: { prRef: PrRef; onClose: () => void }
                   }}
                 />
               )}
-              {tab === "checks" && (
-                <ChecksTab
-                  checks={data.checks}
-                  provider={provider}
-                  onUnsupported={() => provider && setNote(unsupportedMessage(provider))}
-                />
-              )}
             </div>
 
             {/* action bar */}
             <div className="flex items-center gap-2 px-4 py-3 shrink-0 flex-wrap" style={{ borderTop: "1px solid var(--border)" }}>
+              <ChecksBadge
+                checks={data.checks}
+                provider={provider}
+                onUnsupported={() => provider && setNote(unsupportedMessage(provider))}
+              />
               {pr.status === "Merged" ? (
                 <div className="ml-auto flex gap-2">
                   <ActionButton disabled={busy} onClick={revert} label="Revert" color="var(--red)" primary />
@@ -298,54 +304,85 @@ function ActionButton({
   );
 }
 
-function MetaBar({
-  mergeable,
-  reviewers,
-  author,
-  checks,
-}: {
-  mergeable: MergeableState;
-  reviewers: Reviewer[];
-  author: string;
-  checks: CheckRun[];
-}) {
-  const passed = checks.filter((c) => c.status === "Passed").length;
-  const failed = checks.filter((c) => c.status === "Failed").length;
-  // A reviewer requesting changes isn't reflected in the provider's `mergeable` (which is about
-  // conflicts / branch-protection policy), so factor it in here rather than reading "mergeable".
-  const changesRequested = reviewers.some((r) => r.vote === "Rejected");
-  const [mergeLabel, mergeColor] =
-    mergeable === "Conflicting"
-      ? ["conflicts", "var(--red)"]
-      : changesRequested
-        ? ["changes requested", "var(--red)"]
-        : mergeable === "Mergeable"
-          ? ["mergeable", "var(--green)"]
-          : [mergeable.toLowerCase(), "var(--dim)"];
+/** The header meta bar: who opened the PR + the reviewers with their vote marks (✓ / ✗ / ·). */
+function MetaBar({ author, reviewers }: { author: string; reviewers: Reviewer[] }) {
   return (
-    <div className="flex items-center gap-x-4 gap-y-2 px-5 py-2.5 flex-wrap text-xs shrink-0" style={{ borderBottom: "1px solid var(--border)", color: "var(--dim)" }}>
+    <div className="flex items-center gap-x-5 gap-y-1 px-5 py-2.5 flex-wrap text-xs shrink-0" style={{ borderBottom: "1px solid var(--border)", color: "var(--dim)" }}>
       <span className="flex items-center gap-1.5">
-        <Avatar name={author} size={18} /> {author}
+        <Avatar name={author} size={18} /> opened by <span style={{ color: "var(--fg)" }}>{author}</span>
       </span>
       {reviewers.length > 0 && (
-        <span className="flex items-center gap-2">
-          reviewers:
+        <span className="flex items-center gap-x-3 gap-y-1 flex-wrap">
+          <span className="uppercase tracking-wider text-[10px]">Reviewers</span>
           {reviewers.map((r, i) => {
             const v = voteMeta(r.vote);
             return (
-              <span key={i} title={`${r.user.display_name} — ${v.label}`} style={{ color: v.color }}>
-                {v.icon} {r.user.display_name}
+              <span key={i} className="flex items-center gap-1" title={`${r.user.display_name} — ${v.label}`}>
+                <span className="w-3 text-center" style={{ color: r.vote === "NoVote" ? "var(--dim)" : v.color }}>{r.vote === "NoVote" ? "·" : v.icon}</span>
+                <span style={{ color: "var(--fg)" }}>{r.user.display_name}</span>
               </span>
             );
           })}
         </span>
       )}
-      {checks.length > 0 && (
-        <span>
-          checks: <span style={{ color: "var(--green)" }}>{passed}✓</span> {failed > 0 && <span style={{ color: "var(--red)" }}>{failed}✗</span>}
-        </span>
+    </div>
+  );
+}
+
+/** Action-bar checks badge: green "all passed" / red "N failed"; click opens a popover of every
+ *  check. Greyed with the standard message when the provider can't report checks. */
+function ChecksBadge({ checks, provider, onUnsupported }: { checks: CheckRun[]; provider: ProviderType | undefined; onUnsupported: () => void }) {
+  const [open, setOpen] = useState(false);
+  const supported = provider ? providerSupports(provider, "checks") : true;
+  const base = "flex items-center gap-1.5 rounded-md px-2.5 py-1 text-xs font-medium whitespace-nowrap";
+  if (!supported) {
+    return (
+      <button onClick={onUnsupported} title={provider ? unsupportedMessage(provider) : undefined} className={base} style={{ opacity: 0.55, cursor: "not-allowed", color: "var(--dim)", border: "1px solid var(--border)", background: "var(--panel2)" }}>
+        Checks
+      </button>
+    );
+  }
+  if (checks.length === 0) {
+    return <span className={base} style={{ color: "var(--dim)", border: "1px solid var(--border)", background: "var(--panel2)" }}>No checks</span>;
+  }
+  const failed = checks.filter((c) => c.status === "Failed").length;
+  const color = failed > 0 ? "var(--red)" : "var(--green)";
+  const label = failed > 0 ? `${failed} check${failed > 1 ? "s" : ""} failed` : "All checks passed";
+  return (
+    <div className="relative">
+      <button
+        onClick={() => setOpen((o) => !o)}
+        className={base}
+        style={{ color, background: `color-mix(in srgb, ${color} 14%, transparent)`, border: `1px solid color-mix(in srgb, ${color} 30%, transparent)`, cursor: "pointer" }}
+      >
+        {failed > 0 ? "✗" : "✓"} {label}
+      </button>
+      {open && (
+        <>
+          <div className="fixed inset-0" style={{ zIndex: 20 }} onClick={() => setOpen(false)} />
+          <div className="absolute bottom-full left-0 mb-2 w-72 rounded-lg p-1 max-h-64 overflow-auto shadow-2xl" style={{ zIndex: 21, background: "var(--panel)", border: "1px solid var(--border)" }}>
+            {checks.map((c, i) => {
+              const m = checkMeta(c.status);
+              const inner = (
+                <>
+                  <span className="shrink-0" style={{ color: m.color }}>{m.icon}</span>
+                  <span className="flex-1 truncate" style={{ color: "var(--fg)" }}>{c.name}</span>
+                  <span className="capitalize shrink-0" style={{ color: m.color }}>{c.status.toLowerCase()}</span>
+                  {c.url && <span className="shrink-0" style={{ color: "var(--dim)" }}>↗</span>}
+                </>
+              );
+              const cls = "flex items-center gap-2 rounded px-2 py-1.5 text-xs";
+              return c.url ? (
+                <a key={i} href={c.url} target="_blank" rel="noreferrer" className={cls + " transition-colors"} onMouseEnter={(e) => (e.currentTarget.style.background = "var(--sel)")} onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}>
+                  {inner}
+                </a>
+              ) : (
+                <div key={i} className={cls}>{inner}</div>
+              );
+            })}
+          </div>
+        </>
       )}
-      <span style={{ color: mergeColor }}>{mergeLabel}</span>
     </div>
   );
 }
@@ -623,12 +660,14 @@ function PendingBox({ body, onRemove }: { body: string; onRemove: () => void }) 
 function ConversationTab({
   threads,
   description,
+  timeline,
   busy,
   onReply,
   onComment,
 }: {
   threads: CommentThread[];
   description?: string | null;
+  timeline: TimelineEvent[];
   busy: boolean;
   onReply: (threadId: string, body: string) => void;
   onComment: (body: string) => void;
@@ -642,7 +681,8 @@ function ConversationTab({
           {description}
         </div>
       )}
-      {general.length === 0 && !description && <Empty text="No conversation yet." />}
+      {timeline.length > 0 && <Timeline events={timeline} />}
+      {general.length === 0 && <div className="text-xs px-1" style={{ color: "var(--dim)" }}>No comments yet.</div>}
       {general.map((t) => (
         <ThreadBox key={t.id} thread={t} busy={busy} onReply={onReply} />
       ))}
@@ -693,73 +733,6 @@ function CommitsTab({ commits, onSelect }: { commits: Commit[]; onSelect: (sha: 
             <span className="text-xs shrink-0" style={{ color: "var(--dim)" }}>{c.author}</span>
             <span className="text-xs shrink-0 opacity-0 transition-opacity group-hover:opacity-100" style={{ color: "var(--accent)" }}>diff →</span>
           </button>
-        );
-      })}
-    </div>
-  );
-}
-
-function ChecksTab({
-  checks,
-  provider,
-  onUnsupported,
-}: {
-  checks: CheckRun[];
-  provider: ProviderType | undefined;
-  onUnsupported: () => void;
-}) {
-  if (checks.length === 0) return <Empty text="No checks reported." />;
-  // Whether this provider's API lets us open a check. When it can't, the rows stay visible but
-  // greyed, and a click shows the standard "not supported" popup (see capabilities.ts).
-  const supported = provider ? providerSupports(provider, "check-links") : true;
-  const base = "flex items-center gap-3 rounded-lg px-3 py-2 text-left w-full";
-  const cardStyle = { background: "var(--card)", border: "1px solid var(--border)" };
-  return (
-    <div className="p-4 flex flex-col gap-1.5 max-w-3xl">
-      {checks.map((c, i) => {
-        const m = checkMeta(c.status);
-        const inner = (
-          <>
-            <span className="shrink-0" style={{ color: m.color }}>{m.icon}</span>
-            <span className="flex-1 truncate text-sm" style={{ color: "var(--fg)" }}>{c.name}</span>
-            <span className="text-xs shrink-0 capitalize" style={{ color: m.color }}>{c.status.toLowerCase()}</span>
-          </>
-        );
-        if (supported && c.url) {
-          return (
-            <a
-              key={i}
-              href={c.url}
-              target="_blank"
-              rel="noreferrer"
-              className={base + " transition-colors"}
-              style={{ ...cardStyle, cursor: "pointer" }}
-              onMouseEnter={(e) => (e.currentTarget.style.background = "var(--card-hover)")}
-              onMouseLeave={(e) => (e.currentTarget.style.background = "var(--card)")}
-            >
-              {inner}
-              <span className="text-xs shrink-0" style={{ color: "var(--dim)" }}>↗</span>
-            </a>
-          );
-        }
-        if (!supported) {
-          return (
-            <button
-              key={i}
-              onClick={onUnsupported}
-              className={base}
-              style={{ ...cardStyle, opacity: 0.55, cursor: "not-allowed" }}
-              title={provider ? unsupportedMessage(provider) : undefined}
-            >
-              {inner}
-            </button>
-          );
-        }
-        // Supported provider, but this particular check exposes no link — plain, non-clickable row.
-        return (
-          <div key={i} className={base} style={cardStyle}>
-            {inner}
-          </div>
         );
       })}
     </div>

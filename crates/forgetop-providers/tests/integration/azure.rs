@@ -53,6 +53,9 @@ async fn azure_pull_request_lifecycle() {
     let threads = prs.threads(&id).await.expect("threads");
     assert!(threads.iter().any(|t| t.comments.iter().any(|c| c.body.contains(prefix))), "comment shows in threads");
 
+    // The event timeline decodes (reviewer votes + completion status).
+    prs.timeline(&id).await.expect("timeline decodes");
+
     // Reply into that thread; the reply comes back nested in the same thread.
     let thread_id = threads.iter().find(|t| t.comments.iter().any(|c| c.body.contains(prefix))).expect("our thread").id.clone();
     prs.reply_to_thread(&id, &thread_id, &format!("{prefix} reply")).await.expect("reply to thread");
@@ -105,6 +108,7 @@ async fn azure_work_item_lifecycle() {
     let states = wi.available_states(&id).await.expect("available states");
     assert!(!states.is_empty(), "work item type reports states");
     wi.add_comment(&id, &format!("{prefix} note")).await.expect("comment");
+    wi.timeline(&id).await.expect("timeline decodes");
 
     // Move it to a different state and confirm it sticks.
     if let Some(next) = states.iter().find(|s| !s.eq_ignore_ascii_case(&got.state)) {

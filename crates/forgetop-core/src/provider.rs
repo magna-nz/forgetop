@@ -159,6 +159,11 @@ pub trait PullRequestSource: Send + Sync {
     async fn list(&self, query: &PullRequestQuery) -> Result<Vec<PullRequest>>;
     async fn get(&self, id: &str) -> Result<PullRequest>;
     async fn threads(&self, pull_request_id: &str) -> Result<Vec<CommentThread>>;
+    /// The event timeline (reviews/approvals, merges, state changes, …), oldest → newest.
+    /// Defaults to empty for providers without a timeline/activity API.
+    async fn timeline(&self, _pull_request_id: &str) -> Result<Vec<TimelineEvent>> {
+        Ok(Vec::new())
+    }
     async fn changes(&self, pull_request_id: &str) -> Result<Vec<FileChange>>;
     /// Individual named CI checks. Defaults to empty for providers that don't expose them.
     async fn checks(&self, _pull_request_id: &str) -> Result<Vec<CheckRun>> {
@@ -201,6 +206,10 @@ pub trait WorkItemSource: Send + Sync {
     async fn list(&self, query: &WorkItemQuery) -> Result<Vec<WorkItem>>;
     async fn get(&self, id: &str) -> Result<WorkItem>;
     async fn threads(&self, work_item_id: &str) -> Result<Vec<CommentThread>>;
+    /// The event history (status changes, assignments, …), oldest → newest. Defaults to empty.
+    async fn timeline(&self, _work_item_id: &str) -> Result<Vec<TimelineEvent>> {
+        Ok(Vec::new())
+    }
     async fn set_state(&self, work_item_id: &str, state: &str) -> Result<()>;
     async fn add_comment(&self, work_item_id: &str, body: &str) -> Result<()>;
     /// The states this item can move to (provider-accurate). Defaults to empty,

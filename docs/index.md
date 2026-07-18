@@ -80,8 +80,9 @@ html[data-surface="tui"] .surface-dash{display:none}
   and Diff tabs; **syntax-highlighted** diffs grouped by directory, per-file
   **viewed** checkboxes, thread jump-navigation, a line cursor in the patch;
   **inline line comments buffered locally then submitted as one review**
-  (Comment / Approve / Request changes); and **replying in-thread** to someone
-  else's comment.
+  (Comment / Approve / Request changes); **replying in-thread** to someone
+  else's comment; and an **event timeline** of who approved / requested changes /
+  merged / commented.
 - **Pipeline drill-in** — expand stages → jobs → steps with per-node **durations**,
   **failure reasons**, a scrollable **logs** pane, and open-in-browser.
 - **Pipeline approvals** — see which runs are blocked on a gate you can action
@@ -323,17 +324,33 @@ action lives inside the PR panel.
   Title). Your choice per list is remembered.
 - Each card shows the review state, `#number`, the `+/-`, checks, reviewers, and labels.
 
+The meta bar under the title shows who opened the PR and the **reviewers**, each with a vote
+mark: **✓** approved, **✗** changes requested, **·** no vote yet. (These come from the provider's
+review data — on GitHub/GitLab the votes are read from `/reviews` and `/approvals`, not just the
+requested-reviewer list, so an approver actually shows a tick.)
+
 **Inside the PR panel** (three tabs):
 
-- **Files** — the changed files with a syntax-coloured diff; existing review comments render
-  **inline beneath the line they're on**. Hover a line and click the **`+`** to write an
-  inline comment, or click **↳ Reply** under any existing comment to answer it in-thread.
-- **Conversation** — the description plus comment threads, a box to add a comment, and **↳ Reply**
-  on each thread to respond to someone else's comment.
-- **Commits** — one row per commit.
+- **Conversation** — the description, a **Timeline** of events (see below), the comment threads,
+  a box to add a comment, and **↳ Reply** on each thread.
+- **Commits** — one row per commit; click one to see its diff on the Files tab.
+- **Files** — the changed files with a **left-hand file list** you click between and a
+  syntax-coloured diff; existing review comments render **inline beneath the line they're on**.
+  Hover a line and click the **`+`** to write an inline comment, or click **↳ Reply** under any
+  existing comment to answer it in-thread. Selecting a commit on the Commits tab scopes this to
+  that commit's diff.
 
-The header has an **↗ open-in-provider** link; the action bar has **Approve**, **Request
-changes**, and **Merge**. Press **Esc** or click the backdrop to close.
+Checks live on the action-bar badge (below), not a tab.
+
+The **Timeline** (newest first) shows who did what: approvals, change-requests, merges, state
+changes and comments — assembled from each provider's timeline/activity/history API (GitHub
+reviews + issue events, Bitbucket activity, GitLab resource-events + approvals, Azure reviewer
+votes, plus comments). A provider without a timeline API just shows the comment activity.
+
+The header has an **↗ open-in-provider** link. The action bar shows a **checks badge** on the left
+— green **"All checks passed"** or red **"N checks failed"**; click it for a popover listing every
+check (each links to the provider) — and **Approve**, **Request changes**, **Merge** on the right.
+Choosing an action closes the panel. Press **Esc** or click the backdrop to close.
 
 ### Reviewing code with line comments
 
@@ -432,8 +449,10 @@ nothing to configure.
 
 Browse-and-open; the write actions live in the item panel.
 
-- **Click a work item** to open its panel: the **description**, **comment threads** with a
-  box to add a comment, and a **Move ▾** control to change state.
+- **Click a work item** to open its panel: the **description**, a **Timeline** of events
+  (status changes, assignments, comments — from the provider's history: Jira changelog,
+  Linear issue history, Azure work-item revisions, GitHub/GitLab issue events), **comment
+  threads** with a box to add a comment, and a **Move ▾** control to change state.
 - **Move ▾** pulls its choices from the provider itself: Jira's workflow transitions,
   Linear's team states, Azure's work-item-type states, or open/closed for GitHub/GitLab
   issues.

@@ -38,6 +38,7 @@ const detail = (status: string): any => ({
     url: null,
   },
   threads: [],
+  timeline: [],
   changes: [],
   checks: [],
   commits: [],
@@ -86,58 +87,40 @@ describe("PrDetail action bar", () => {
     expect(screen.queryByRole("button", { name: "Revert" })).not.toBeInTheDocument();
   });
 
-  it("a PR with changes requested reads as 'changes requested', not 'mergeable'", async () => {
-    const d = detail("Open"); // mergeable: "Mergeable" at the conflict level
+  it("Conversation shows the timeline and the reviewers with their vote marks", async () => {
+    const d = detail("Open");
+    const priya = { id: "u1", display_name: "Priya Nair", handle: "p", avatar_url: null };
+    d.timeline = [{ actor: priya, kind: "Approved", summary: "approved these changes", at: null }];
     d.pull_request.reviewers = [
-      { user: { id: "u2", display_name: "Marcus Lee", handle: "marcus", avatar_url: null }, vote: "Rejected", is_required: true },
+      { user: priya, vote: "Approved", is_required: true },
+      { user: { id: "u2", display_name: "Marcus Lee", handle: "m", avatar_url: null }, vote: "Rejected", is_required: true },
     ];
     mockFetch({ get: { "/api/pr/detail": d } });
     renderWithClient(
       <PrDetailProvider>
-        <Opener conn="c" id="1501" />
+        <Opener conn="c" id="1" />
       </PrDetailProvider>,
     );
-
-    expect(await screen.findByText("changes requested")).toBeInTheDocument();
-    expect(screen.queryByText("mergeable")).not.toBeInTheDocument();
+    expect(await screen.findByText("Timeline")).toBeInTheDocument();
+    expect(screen.getByText("approved these changes")).toBeInTheDocument();
+    expect(screen.getByText("Reviewers")).toBeInTheDocument();
+    expect(screen.getByText("Marcus Lee")).toBeInTheDocument();
   });
 
-  it("Checks tab: an unsupported provider greys the checks and pops the standard message", async () => {
+  it("action bar checks badge shows failures and opens a checks popover", async () => {
     const d = detail("Open");
-    d.checks = [{ name: "build", status: "Passed", url: null }];
-    mockFetch({
-      get: {
-        "/api/pr/detail": d,
-        "/api/connections": [{ id: "c", provider: "Demo", display_name: "Demo", has_token: true, sections: [] }],
-      },
-    });
+    d.checks = [
+      { name: "build", status: "Passed", url: null },
+      { name: "integration", status: "Failed", url: "https://ci.test/integration" },
+    ];
+    mockFetch({ get: { "/api/pr/detail": d, "/api/connections": [{ id: "c", provider: "GitHub", display_name: "gh", has_token: true, sections: [] }] } });
     renderWithClient(
       <PrDetailProvider>
         <Opener conn="c" id="1" />
       </PrDetailProvider>,
     );
-    await userEvent.click(await screen.findByRole("button", { name: /checks/i }));
-    await userEvent.click(await screen.findByRole("button", { name: /build/i }));
-    expect(await screen.findByText("Demo currently does not support this feature")).toBeInTheDocument();
-  });
-
-  it("Checks tab: a supporting provider links each check to the provider", async () => {
-    const d = detail("Open");
-    d.checks = [{ name: "build", status: "Passed", url: "https://gh.test/checks/1" }];
-    mockFetch({
-      get: {
-        "/api/pr/detail": d,
-        "/api/connections": [{ id: "c", provider: "GitHub", display_name: "gh", has_token: true, sections: [] }],
-      },
-    });
-    renderWithClient(
-      <PrDetailProvider>
-        <Opener conn="c" id="1" />
-      </PrDetailProvider>,
-    );
-    await userEvent.click(await screen.findByRole("button", { name: /checks/i }));
-    const link = await screen.findByRole("link", { name: /build/i });
-    expect(link).toHaveAttribute("href", "https://gh.test/checks/1");
+    await userEvent.click(await screen.findByRole("button", { name: /1 check failed/i }));
+    expect(await screen.findByRole("link", { name: /integration/i })).toHaveAttribute("href", "https://ci.test/integration");
   });
 
   it("Files tab: a left-hand file list switches the shown diff", async () => {

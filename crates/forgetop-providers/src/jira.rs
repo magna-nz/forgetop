@@ -155,6 +155,30 @@ impl WorkItemSource for JiraWi {
             vec![CommentThread { id: format!("issue-{id}"), comments, file_path: None, line: None, is_resolved: false }]
         })
     }
+    async fn timeline(&self, id: &str) -> Result<Vec<TimelineEvent>> {
+        // The issue changelog: surface status transitions and (re)assignments.
+        let v = self.0.get_json(&format!("{}/issue/{id}?expand=changelog", self.0.api)).await?;
+        let mut out = Vec::new();
+        for h in get_obj(&v, "changelog").map(|c| get_arr(c, "histories")).unwrap_or(&[]) {
+            let actor = get_obj(h, "author").map(map_user);
+            let at = get_date(h, "created");
+            for item in get_arr(h, "items") {
+                let to = get_str(item, "toString").unwrap_or_default();
+                let (kind, summary) = match get_str(item, "field").as_deref() {
+                    Some("status") => (TimelineEventKind::StateChanged, format!("changed status to {to}")),
+                    Some("assignee") => (
+                        TimelineEventKind::Assigned,
+                        if to.is_empty() { "unassigned this".into() } else { format!("assigned this to {to}") },
+                    ),
+                    Some("resolution") if !to.is_empty() => (TimelineEventKind::Other, format!("set resolution to {to}")),
+                    _ => continue,
+                };
+                out.push(TimelineEvent { actor: actor.clone(), kind, summary, at });
+            }
+        }
+        out.sort_by_key(|e| e.at);
+        Ok(out)
+    }
 
     async fn set_state(&self, id: &str, state: &str) -> Result<()> {
         // Jira changes state via a workflow transition; find the one that lands on `state`.

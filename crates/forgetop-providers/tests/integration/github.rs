@@ -101,6 +101,9 @@ async fn github_pull_request_lifecycle() {
         "the posted comment appears in the PR threads"
     );
 
+    // The event timeline decodes (reviews + issue events).
+    prs.timeline(&id).await.expect("timeline decodes");
+
     // Reply into that thread. A GitHub PR *conversation* is flat (no reply API), so this exercises
     // the reply_to_thread → add_comment fallback; the reply comes back in the conversation thread.
     let thread_id = threads.iter().find(|t| t.comments.iter().any(|c| c.body.contains(prefix))).expect("our thread").id.clone();

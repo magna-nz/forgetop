@@ -39,6 +39,7 @@ async fn linear_work_item_lifecycle() {
     let states = wi.available_states(&id).await.expect("available states");
     assert!(!states.is_empty(), "team reports workflow states");
     wi.add_comment(&id, &format!("{prefix} note")).await.expect("comment");
+    wi.timeline(&id).await.expect("timeline decodes");
 
     let current = wi.get(&id).await.expect("get").state;
     if let Some(next) = states.iter().find(|s| !s.eq_ignore_ascii_case(&current)) {

@@ -9,6 +9,7 @@ import type {
   ProviderType,
   PullRequest,
   ReviewVote,
+  TimelineEventKind,
   WorkItemStateCategory,
 } from "./types";
 
@@ -136,6 +137,35 @@ export function notificationMeta(kind: NotificationKind): { icon: string; label:
       return { icon: "↻", label: "State change", color: V("green") };
     case "Other":
       return { icon: "•", label: "Update", color: V("dim") };
+  }
+}
+
+export function timelineMeta(kind: TimelineEventKind): { icon: string; color: string } {
+  switch (kind) {
+    case "Approved":
+      return { icon: "✓", color: V("green") };
+    case "ChangesRequested":
+      return { icon: "✗", color: V("red") };
+    case "Reviewed":
+      return { icon: "◎", color: V("blue") };
+    case "Commented":
+      return { icon: "❝", color: V("yellow") };
+    case "Merged":
+      return { icon: "✦", color: V("magenta") };
+    case "Closed":
+      return { icon: "⊘", color: V("red") };
+    case "Reopened":
+      return { icon: "↻", color: V("green") };
+    case "StateChanged":
+      return { icon: "→", color: V("blue") };
+    case "Assigned":
+      return { icon: "◎", color: V("cyan") };
+    case "Labeled":
+      return { icon: "▪", color: V("dim") };
+    case "Committed":
+      return { icon: "●", color: V("dim") };
+    default:
+      return { icon: "•", color: V("dim") };
   }
 }
 

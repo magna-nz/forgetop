@@ -1,7 +1,32 @@
 import { motion } from "framer-motion";
 import { useEffect, type ReactNode } from "react";
-import { initials, providerMeta } from "../format";
-import type { ProviderType } from "../types";
+import { initials, providerMeta, relativeTime, timelineMeta } from "../format";
+import type { ProviderType, TimelineEvent } from "../types";
+
+/** The event timeline (approvals, merges, comments, state changes, …), newest first. Shared by
+ *  the PR and work-item panes; events arrive oldest→newest and are shown with the newest on top. */
+export function Timeline({ events }: { events: TimelineEvent[] }) {
+  const ordered = [...events].reverse();
+  return (
+    <div className="rounded-lg p-3 flex flex-col gap-1.5" style={{ background: "var(--card)", border: "1px solid var(--border)" }}>
+      <div className="text-[11px] font-semibold uppercase tracking-wider mb-0.5" style={{ color: "var(--dim)" }}>
+        Timeline
+      </div>
+      {ordered.map((e, i) => {
+        const m = timelineMeta(e.kind);
+        // The mark (✓ / ✗ / …) trails the summary; comments carry no mark.
+        return (
+          <div key={i} className="flex items-center gap-2 text-xs">
+            <span className="shrink-0 w-14 tabular-nums" style={{ color: "var(--dim)" }}>{e.at ? relativeTime(e.at) : ""}</span>
+            <span className="font-medium shrink-0" style={{ color: "var(--fg)" }}>{e.actor?.display_name ?? "Someone"}</span>
+            <span style={{ color: "var(--dim)" }}>{e.summary}</span>
+            {e.kind !== "Commented" && <span className="shrink-0" style={{ color: m.color }}>{m.icon}</span>}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
 
 /** Right-hand slide-over used by the work-item and pipeline detail views (mirrors PrDetail's
  *  own panel). Backdrop click and Esc both close; `header` and `children` render inside. */

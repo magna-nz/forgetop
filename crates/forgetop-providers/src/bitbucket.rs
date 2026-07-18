@@ -141,6 +141,27 @@ pub fn map_bb_status(v: &Value) -> CheckRun {
     }
 }
 
+/// A Bitbucket PR activity entry (`/pullrequests/{id}/activity`) → a timeline event. The feed
+/// mixes approvals, change-requests, merges/declines and comments; comments are dropped (they're
+/// in the threads), the rest become events.
+fn map_bb_activity(v: &Value) -> Option<TimelineEvent> {
+    if let Some(a) = get_obj(v, "approval") {
+        return Some(TimelineEvent { actor: get_obj(a, "user").map(map_user), kind: TimelineEventKind::Approved, summary: "approved this".into(), at: get_date(a, "date") });
+    }
+    if let Some(c) = get_obj(v, "changes_requested") {
+        return Some(TimelineEvent { actor: get_obj(c, "user").map(map_user), kind: TimelineEventKind::ChangesRequested, summary: "requested changes".into(), at: get_date(c, "date") });
+    }
+    if let Some(u) = get_obj(v, "update") {
+        let (kind, summary) = match get_str(u, "state").as_deref() {
+            Some("MERGED") => (TimelineEventKind::Merged, "merged this"),
+            Some("DECLINED") => (TimelineEventKind::Closed, "declined this"),
+            _ => return None,
+        };
+        return Some(TimelineEvent { actor: get_obj(u, "author").map(map_user), kind, summary: summary.into(), at: get_date(u, "date") });
+    }
+    None
+}
+
 fn map_pr_comment(v: &Value) -> Comment {
     Comment {
         id: get_i64(v, "id").map(|n| n.to_string()).unwrap_or_else(|| "0".into()),
@@ -313,6 +334,12 @@ impl PullRequestSource for BitbucketPr {
     async fn threads(&self, id: &str) -> Result<Vec<CommentThread>> {
         let v = self.0.get_json(&self.0.repo_path(&format!("/pullrequests/{id}/comments?pagelen=100"))).await?;
         Ok(group_bb_threads(get_arr(&v, "values")))
+    }
+    async fn timeline(&self, id: &str) -> Result<Vec<TimelineEvent>> {
+        let v = self.0.get_json(&self.0.repo_path(&format!("/pullrequests/{id}/activity?pagelen=50"))).await?;
+        let mut out: Vec<TimelineEvent> = get_arr(&v, "values").iter().filter_map(map_bb_activity).collect();
+        out.sort_by_key(|e| e.at);
+        Ok(out)
     }
     async fn changes(&self, id: &str) -> Result<Vec<FileChange>> {
         let v = self.0.get_json(&self.0.repo_path(&format!("/pullrequests/{id}/diffstat?pagelen=100"))).await?;
@@ -596,5 +623,22 @@ mod tests {
         assert_eq!(inline.line, Some(12));
         assert_eq!(threads[1].id, "20");
         assert!(threads[1].file_path.is_none());
+    }
+
+    #[test]
+    fn maps_activity_to_timeline() {
+        let approval: Value = serde_json::from_str(r#"{ "approval": { "user": { "display_name": "Priya" }, "date": "2026-06-01T10:00:00Z" } }"#).unwrap();
+        let e = map_bb_activity(&approval).unwrap();
+        assert_eq!(e.kind, TimelineEventKind::Approved);
+        assert_eq!(e.actor.unwrap().display_name, "Priya");
+
+        let merged: Value = serde_json::from_str(r#"{ "update": { "state": "MERGED", "author": { "display_name": "Sam" }, "date": "2026-06-01T11:00:00Z" } }"#).unwrap();
+        assert_eq!(map_bb_activity(&merged).unwrap().kind, TimelineEventKind::Merged);
+
+        // Comments and plain (OPEN) updates are dropped.
+        let comment: Value = serde_json::from_str(r#"{ "comment": { "content": { "raw": "hi" } } }"#).unwrap();
+        assert!(map_bb_activity(&comment).is_none());
+        let opened: Value = serde_json::from_str(r#"{ "update": { "state": "OPEN" } }"#).unwrap();
+        assert!(map_bb_activity(&opened).is_none());
     }
 }

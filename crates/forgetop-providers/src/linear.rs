@@ -147,6 +147,23 @@ impl WorkItemSource for LinearWi {
         let comments: Vec<Comment> = get_obj(issue, "comments").map(|c| get_arr(c, "nodes").iter().map(map_comment).collect()).unwrap_or_default();
         Ok(if comments.is_empty() { vec![] } else { vec![CommentThread { id: format!("issue-{id}"), comments, file_path: None, line: None, is_resolved: false }] })
     }
+    async fn timeline(&self, id: &str) -> Result<Vec<TimelineEvent>> {
+        let gql = "query($id:String!){ issue(id:$id){ history(first:50){ nodes { createdAt actor { id name displayName } toState { name } toAssignee { displayName } } } } }";
+        let data = self.0.query(gql, json!({ "id": id })).await?;
+        let Some(issue) = get_obj(&data, "issue") else { return Ok(vec![]) };
+        let mut out = Vec::new();
+        for n in get_obj(issue, "history").map(|h| get_arr(h, "nodes")).unwrap_or(&[]) {
+            let actor = get_obj(n, "actor").map(map_user);
+            let at = get_date(n, "createdAt");
+            if let Some(to) = get_obj(n, "toState").and_then(|s| get_str(s, "name")) {
+                out.push(TimelineEvent { actor, kind: TimelineEventKind::StateChanged, summary: format!("changed status to {to}"), at });
+            } else if let Some(assignee) = get_obj(n, "toAssignee").and_then(|a| get_str(a, "displayName")) {
+                out.push(TimelineEvent { actor, kind: TimelineEventKind::Assigned, summary: format!("assigned this to {assignee}"), at });
+            }
+        }
+        out.sort_by_key(|e| e.at);
+        Ok(out)
+    }
     async fn set_state(&self, id: &str, state: &str) -> Result<()> {
         let lookup = "query($id:String!){ issue(id:$id){ team { states { nodes { id name } } } } }";
         let data = self.0.query(lookup, json!({ "id": id })).await?;
