@@ -193,7 +193,8 @@ pub fn map_change_entry(v: &Value) -> FileChange {
 pub fn map_az_commit(v: &Value) -> Commit {
     let author = get_obj(v, "author");
     Commit {
-        sha: get_str(v, "commitId").map(|s| s.chars().take(8).collect()).unwrap_or_default(),
+        // Keep the full commitId — Azure's commits/{id} API needs it; the UI truncates for display.
+        sha: get_str(v, "commitId").unwrap_or_default(),
         message: get_str(v, "comment").unwrap_or_default().lines().next().unwrap_or_default().to_string(),
         author: author.and_then(|a| get_str(a, "name")).unwrap_or_else(|| "unknown".into()),
         date: author.and_then(|a| get_date(a, "date")),
@@ -488,6 +489,41 @@ impl PullRequestSource for AzurePr {
     async fn commits(&self, id: &str) -> Result<Vec<Commit>> {
         let v = self.0.get_json(&format!("{}/commits?{API}", self.0.pr_base(id))).await?;
         Ok(get_arr(&v, "value").iter().map(map_az_commit).collect())
+    }
+    async fn commit_changes(&self, _id: &str, sha: &str) -> Result<Vec<FileChange>> {
+        // Diff the commit against its first parent, computing each file's patch from item content
+        // (same approach as the whole-PR `changes`). A root commit diffs against an empty tree.
+        let repo = format!("{}/{}/_apis/git/repositories/{}", self.0.base, self.0.project, self.0.repository);
+        let commit = self.0.get_json(&format!("{repo}/commits/{sha}?{API}")).await?;
+        let parent = get_arr(&commit, "parents").first().and_then(|p| p.as_str().map(String::from));
+        let changes = self.0.get_json(&format!("{repo}/commits/{sha}/changes?{API}")).await?;
+        let mut out = Vec::new();
+        for raw in get_arr(&changes, "changes") {
+            if get_obj(raw, "item").map(|i| get_bool(i, "isFolder")).unwrap_or(false) {
+                continue;
+            }
+            let mut change = map_change_entry(raw);
+            let old = if matches!(change.kind, FileChangeKind::Added) {
+                Some(String::new())
+            } else if let Some(p) = &parent {
+                self.0.item_content(&change.path, p).await
+            } else {
+                Some(String::new())
+            };
+            let new = if matches!(change.kind, FileChangeKind::Deleted) {
+                Some(String::new())
+            } else {
+                self.0.item_content(&change.path, sha).await
+            };
+            if let (Some(o), Some(n)) = (old, new) {
+                let (patch, adds, dels) = unified_diff(&o, &n);
+                change.patch = Some(patch);
+                change.additions = adds;
+                change.deletions = dels;
+            }
+            out.push(change);
+        }
+        Ok(out)
     }
     async fn checks(&self, id: &str) -> Result<Vec<CheckRun>> {
         let v = self.0.get_json(&format!("{}/statuses?{API}", self.0.pr_base(id))).await?;
@@ -846,7 +882,7 @@ mod tests {
         )
         .unwrap();
         let c = map_az_commit(&commit);
-        assert_eq!(c.sha, "01234567"); // truncated to 8
+        assert_eq!(c.sha, "0123456789abcdef"); // full commitId (UI truncates for display)
         assert_eq!(c.message, "Add retry");
         assert_eq!(c.author, "Dana");
 

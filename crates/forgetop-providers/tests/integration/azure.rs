@@ -38,7 +38,16 @@ async fn azure_pull_request_lifecycle() {
     let list = prs.list(&PullRequestQuery::default()).await.expect("list");
     assert!(list.iter().any(|p| p.id == id), "created PR appears in the list");
     assert_eq!(prs.get(&id).await.expect("get").id, id);
-    assert!(!prs.commits(&id).await.expect("commits").is_empty());
+    let commits = prs.commits(&id).await.expect("commits");
+    assert!(!commits.is_empty());
+
+    // The head commit's per-commit diff decodes and reports the file the fixture added.
+    let sha = commits.first().expect("a commit").sha.clone();
+    let commit_files = prs.commit_changes(&id, &sha).await.expect("commit changes");
+    assert!(
+        commit_files.iter().any(|f| f.path.contains(&format!("{prefix}.txt"))),
+        "the commit reports the file it added"
+    );
 
     prs.add_comment(&id, &format!("{prefix} comment")).await.expect("comment");
     let threads = prs.threads(&id).await.expect("threads");
