@@ -81,8 +81,17 @@ async fn github_pull_request_lifecycle() {
     assert!(list.iter().any(|p| p.id == id), "the created PR appears in the list");
     let got = prs.get(&id).await.expect("get PR");
     assert_eq!(got.id, id);
-    assert!(!prs.commits(&id).await.expect("commits").is_empty(), "PR has commits");
+    let commits = prs.commits(&id).await.expect("commits");
+    assert!(!commits.is_empty(), "PR has commits");
     prs.checks(&id).await.expect("checks decode");
+
+    // The head commit's per-commit diff decodes and reports the pushed fixture file.
+    let sha = commits.first().expect("a commit").sha.clone();
+    let commit_files = prs.commit_changes(&id, &sha).await.expect("commit changes");
+    assert!(
+        commit_files.iter().any(|f| f.path.contains(&format!("{prefix}.txt"))),
+        "the commit reports the file it added"
+    );
 
     // Comment write → shows up in threads.
     prs.add_comment(&id, &format!("{prefix} comment")).await.expect("add comment");

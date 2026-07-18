@@ -45,6 +45,15 @@ async fn gitlab_merge_request_lifecycle() {
     };
     assert!(has_commits.is_some(), "the MR reports its commit");
 
+    // The head commit's per-commit diff decodes and reports the pushed fixture file.
+    let commits = prs.commits(&id).await.expect("commits");
+    let sha = commits.first().expect("a commit").sha.clone();
+    let commit_files = prs.commit_changes(&id, &sha).await.expect("commit changes");
+    assert!(
+        commit_files.iter().any(|f| f.path.contains(&format!("{prefix}.txt"))),
+        "the commit reports the file it added"
+    );
+
     prs.add_comment(&id, &format!("{prefix} comment")).await.expect("comment");
     let threads = prs.threads(&id).await.expect("threads");
     assert!(threads.iter().any(|t| t.comments.iter().any(|c| c.body.contains(prefix))), "comment shows in threads");
