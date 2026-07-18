@@ -424,6 +424,38 @@ impl PullRequestSource for AzurePr {
     async fn get(&self, id: &str) -> Result<PullRequest> {
         Ok(map_pull_request(&self.0.get_json(&format!("{}?{API}", self.0.pr_base(id))).await?))
     }
+    async fn timeline(&self, id: &str) -> Result<Vec<TimelineEvent>> {
+        // Azure has no single timeline endpoint; derive events from the reviewers' votes and the
+        // PR's completion status (vote timestamps aren't exposed, so those events carry no time).
+        let pr = self.0.get_json(&format!("{}?{API}", self.0.pr_base(id))).await?;
+        let mut out = Vec::new();
+        for r in get_arr(&pr, "reviewers") {
+            let (kind, summary) = match get_i64(r, "vote").unwrap_or(0) {
+                10 | 5 => (TimelineEventKind::Approved, "approved this"),
+                -10 => (TimelineEventKind::ChangesRequested, "requested changes"),
+                -5 => (TimelineEventKind::Reviewed, "is waiting for the author"),
+                _ => continue,
+            };
+            out.push(TimelineEvent { actor: Some(map_user(r)), kind, summary: summary.into(), at: None });
+        }
+        match get_str(&pr, "status").as_deref() {
+            Some("completed") => out.push(TimelineEvent {
+                actor: get_obj(&pr, "closedBy").map(map_user),
+                kind: TimelineEventKind::Merged,
+                summary: "completed this pull request".into(),
+                at: get_date(&pr, "closedDate"),
+            }),
+            Some("abandoned") => out.push(TimelineEvent {
+                actor: get_obj(&pr, "closedBy").map(map_user),
+                kind: TimelineEventKind::Closed,
+                summary: "abandoned this pull request".into(),
+                at: get_date(&pr, "closedDate"),
+            }),
+            _ => {}
+        }
+        out.sort_by_key(|e| e.at);
+        Ok(out)
+    }
     async fn threads(&self, id: &str) -> Result<Vec<CommentThread>> {
         let v = self.0.get_json(&format!("{}/threads?{API}", self.0.pr_base(id))).await?;
         Ok(get_arr(&v, "value")
@@ -615,6 +647,24 @@ impl WorkItemSource for AzureWi {
     }
     async fn threads(&self, _id: &str) -> Result<Vec<CommentThread>> {
         Ok(vec![])
+    }
+    async fn timeline(&self, id: &str) -> Result<Vec<TimelineEvent>> {
+        // Work-item revisions: surface each System.State change.
+        let v = self.0.get_json(&format!("{}/_apis/wit/workItems/{id}/updates?{API}", self.0.base)).await?;
+        let mut out = Vec::new();
+        for u in get_arr(&v, "value") {
+            let state = get_obj(u, "fields").and_then(|f| get_obj(f, "System.State")).and_then(|s| get_str(s, "newValue"));
+            if let Some(state) = state {
+                out.push(TimelineEvent {
+                    actor: get_obj(u, "revisedBy").map(map_user),
+                    kind: TimelineEventKind::StateChanged,
+                    summary: format!("changed status to {state}"),
+                    at: get_date(u, "revisedDate"),
+                });
+            }
+        }
+        out.sort_by_key(|e| e.at);
+        Ok(out)
     }
     async fn set_state(&self, id: &str, state: &str) -> Result<()> {
         let url = format!("{}/_apis/wit/workitems/{id}?{API}", self.0.base);

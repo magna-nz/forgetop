@@ -138,6 +138,35 @@ pub struct CommentThread {
     pub is_resolved: bool,
 }
 
+/// What happened in a timeline event — drives its icon/colour in the UI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TimelineEventKind {
+    Approved,
+    ChangesRequested,
+    Reviewed,
+    Commented,
+    Merged,
+    Closed,
+    Reopened,
+    StateChanged,
+    Assigned,
+    Labeled,
+    Committed,
+    Other,
+}
+
+/// A single event on a pull request or work item (a review, a merge, a state change, an
+/// assignment, …), assembled from whatever the provider's timeline / activity / history API
+/// exposes. Ordered oldest → newest.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimelineEvent {
+    pub actor: Option<User>,
+    pub kind: TimelineEventKind,
+    /// Human-readable one-liner, e.g. "approved", "changed status to In Progress", "merged".
+    pub summary: String,
+    pub at: Option<DateTime<Utc>>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Reviewer {
     pub user: User,

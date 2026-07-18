@@ -248,6 +248,17 @@ pub fn map_change(v: &Value) -> FileChange {
     }
 }
 
+/// A GitLab resource_state_event (`/…/resource_state_events`) → a timeline event.
+fn map_gl_state_event(v: &Value) -> Option<TimelineEvent> {
+    let (kind, summary) = match get_str(v, "state").as_deref() {
+        Some("merged") => (TimelineEventKind::Merged, "merged this"),
+        Some("closed") => (TimelineEventKind::Closed, "closed this"),
+        Some("reopened") => (TimelineEventKind::Reopened, "reopened this"),
+        _ => return None,
+    };
+    Some(TimelineEvent { actor: get_obj(v, "user").map(map_user), kind, summary: summary.into(), at: get_date(v, "created_at") })
+}
+
 fn map_note(v: &Value) -> Comment {
     Comment {
         id: get_i64(v, "id").map(|n| n.to_string()).unwrap_or_else(|| "0".into()),
@@ -433,6 +444,20 @@ impl PullRequestSource for GitLabPr {
         let v = self.0.get_json(&self.0.project_path(&format!("/merge_requests/{id}/discussions?per_page=100"))).await?;
         Ok(discussions_to_thread(v.as_array().unwrap_or(&vec![])))
     }
+    async fn timeline(&self, id: &str) -> Result<Vec<TimelineEvent>> {
+        // State changes (merge/close/reopen) + who approved (approvals API carries no timestamp).
+        let states = self.0.get_json(&self.0.project_path(&format!("/merge_requests/{id}/resource_state_events?per_page=100"))).await?;
+        let mut out: Vec<TimelineEvent> = states.as_array().unwrap_or(&vec![]).iter().filter_map(map_gl_state_event).collect();
+        if let Ok(approvals) = self.0.get_json(&self.0.project_path(&format!("/merge_requests/{id}/approvals"))).await {
+            for a in get_arr(&approvals, "approved_by") {
+                if let Some(user) = get_obj(a, "user").map(map_user) {
+                    out.push(TimelineEvent { actor: Some(user), kind: TimelineEventKind::Approved, summary: "approved this".into(), at: None });
+                }
+            }
+        }
+        out.sort_by_key(|e| e.at);
+        Ok(out)
+    }
     async fn changes(&self, id: &str) -> Result<Vec<FileChange>> {
         let v = self.0.get_json(&self.0.project_path(&format!("/merge_requests/{id}/changes"))).await?;
         Ok(get_arr(&v, "changes").iter().map(map_change).collect())
@@ -551,6 +576,12 @@ impl WorkItemSource for GitLabWi {
     async fn threads(&self, id: &str) -> Result<Vec<CommentThread>> {
         let v = self.0.get_json(&self.0.project_path(&format!("/issues/{id}/notes?per_page=100"))).await?;
         Ok(notes_to_thread("issue", id, v.as_array().unwrap_or(&vec![])))
+    }
+    async fn timeline(&self, id: &str) -> Result<Vec<TimelineEvent>> {
+        let states = self.0.get_json(&self.0.project_path(&format!("/issues/{id}/resource_state_events?per_page=100"))).await?;
+        let mut out: Vec<TimelineEvent> = states.as_array().unwrap_or(&vec![]).iter().filter_map(map_gl_state_event).collect();
+        out.sort_by_key(|e| e.at);
+        Ok(out)
     }
     async fn set_state(&self, id: &str, state: &str) -> Result<()> {
         let event = if state.eq_ignore_ascii_case("closed") || state.eq_ignore_ascii_case("close") { "close" } else { "reopen" };
@@ -873,5 +904,18 @@ mod tests {
         assert!(threads[0].is_resolved);
         assert_eq!(threads[1].id, "def456");
         assert!(threads[1].file_path.is_none());
+    }
+
+    #[test]
+    fn maps_state_events_to_timeline() {
+        let merged: Value = serde_json::from_str(r#"{ "state": "merged", "user": { "name": "Sam" }, "created_at": "2026-06-01T10:00:00Z" }"#).unwrap();
+        let e = map_gl_state_event(&merged).unwrap();
+        assert_eq!(e.kind, TimelineEventKind::Merged);
+        assert_eq!(e.actor.unwrap().display_name, "Sam");
+        let reopened: Value = serde_json::from_str(r#"{ "state": "reopened", "user": { "name": "Amy" } }"#).unwrap();
+        assert_eq!(map_gl_state_event(&reopened).unwrap().kind, TimelineEventKind::Reopened);
+        // "opened" isn't surfaced.
+        let opened: Value = serde_json::from_str(r#"{ "state": "opened", "user": { "name": "Amy" } }"#).unwrap();
+        assert!(map_gl_state_event(&opened).is_none());
     }
 }

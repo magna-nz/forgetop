@@ -194,6 +194,9 @@ async fn pr_detail_and_write_actions_reach_the_provider() {
     let detail: serde_json::Value = detail.json().await.unwrap();
     assert_eq!(detail["pull_request"]["id"], id);
     assert!(detail["changes"].is_array() && detail["commits"].is_array());
+    // The detail carries a timeline of events (the demo returns reviews/approvals).
+    let timeline = detail["timeline"].as_array().expect("timeline array");
+    assert!(!timeline.is_empty() && timeline[0]["kind"].is_string() && timeline[0]["summary"].is_string());
 
     // Submitting a review with a line comment (the demo persists it as a thread).
     let review = client

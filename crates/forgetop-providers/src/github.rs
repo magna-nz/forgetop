@@ -248,6 +248,39 @@ fn unknown_user() -> User {
     User { id: "unknown".into(), display_name: "unknown".into(), handle: None, avatar_url: None }
 }
 
+/// A PR review (`GET /pulls/{id}/reviews`) → a timeline event (approval / changes / review).
+fn map_gh_review(v: &Value) -> Option<TimelineEvent> {
+    let (kind, summary) = match get_str(v, "state").as_deref() {
+        Some("APPROVED") => (TimelineEventKind::Approved, "approved these changes"),
+        Some("CHANGES_REQUESTED") => (TimelineEventKind::ChangesRequested, "requested changes"),
+        Some("DISMISSED") => (TimelineEventKind::Other, "dismissed a review"),
+        Some("COMMENTED") => (TimelineEventKind::Reviewed, "reviewed"),
+        _ => return None,
+    };
+    Some(TimelineEvent { actor: get_obj(v, "user").map(map_user), kind, summary: summary.into(), at: get_date(v, "submitted_at") })
+}
+
+/// An issue/PR event (`GET /issues/{id}/events`) → a timeline event. Only the meaningful kinds
+/// (merge / close / reopen / assign / label / review-request) are surfaced; the rest are dropped.
+fn map_gh_issue_event(v: &Value) -> Option<TimelineEvent> {
+    let (kind, summary): (TimelineEventKind, String) = match get_str(v, "event").as_deref()? {
+        "merged" => (TimelineEventKind::Merged, "merged this".into()),
+        "closed" => (TimelineEventKind::Closed, "closed this".into()),
+        "reopened" => (TimelineEventKind::Reopened, "reopened this".into()),
+        "assigned" => {
+            let who = get_obj(v, "assignee").map(map_user).map(|u| u.display_name).unwrap_or_default();
+            (TimelineEventKind::Assigned, if who.is_empty() { "assigned this".into() } else { format!("assigned this to {who}") })
+        }
+        "labeled" => {
+            let l = get_obj(v, "label").and_then(|l| get_str(l, "name")).unwrap_or_default();
+            (TimelineEventKind::Labeled, format!("added the {l} label"))
+        }
+        "review_requested" => (TimelineEventKind::Other, "requested a review".into()),
+        _ => return None,
+    };
+    Some(TimelineEvent { actor: get_obj(v, "actor").map(map_user), kind, summary, at: get_date(v, "created_at") })
+}
+
 /// Map a GitHub comment (issue or review) to our [`Comment`] — both share these fields.
 fn map_gh_comment(c: &Value) -> Comment {
     Comment {
@@ -490,6 +523,15 @@ impl PullRequestSource for GitHubPr {
         threads.extend(group_gh_review_threads(reviews.as_array().unwrap_or(&vec![])));
         Ok(threads)
     }
+    async fn timeline(&self, id: &str) -> Result<Vec<TimelineEvent>> {
+        // Reviews (approvals / changes requested) + issue events (merge / close / assign / …).
+        let reviews = self.0.get_json(&self.0.repo_path(&format!("/pulls/{id}/reviews?per_page=100"))).await?;
+        let events = self.0.get_json(&self.0.repo_path(&format!("/issues/{id}/events?per_page=100"))).await?;
+        let mut out: Vec<TimelineEvent> = reviews.as_array().unwrap_or(&vec![]).iter().filter_map(map_gh_review).collect();
+        out.extend(events.as_array().unwrap_or(&vec![]).iter().filter_map(map_gh_issue_event));
+        out.sort_by_key(|e| e.at);
+        Ok(out)
+    }
     async fn changes(&self, id: &str) -> Result<Vec<FileChange>> {
         let v = self.0.get_json(&self.0.repo_path(&format!("/pulls/{id}/files?per_page=100"))).await?;
         Ok(v.as_array().unwrap_or(&vec![]).iter().map(map_file_change).collect())
@@ -585,6 +627,12 @@ impl WorkItemSource for GitHubWi {
     }
     async fn threads(&self, id: &str) -> Result<Vec<CommentThread>> {
         GitHubPr(self.0.clone()).threads(id).await
+    }
+    async fn timeline(&self, id: &str) -> Result<Vec<TimelineEvent>> {
+        let events = self.0.get_json(&self.0.repo_path(&format!("/issues/{id}/events?per_page=100"))).await?;
+        let mut out: Vec<TimelineEvent> = events.as_array().unwrap_or(&vec![]).iter().filter_map(map_gh_issue_event).collect();
+        out.sort_by_key(|e| e.at);
+        Ok(out)
     }
     async fn set_state(&self, id: &str, state: &str) -> Result<()> {
         let url = self.0.repo_path(&format!("/issues/{id}"));
@@ -919,5 +967,26 @@ mod tests {
         assert_eq!(threads[0].line, Some(12));
         assert_eq!(threads[1].id, "200");
         assert_eq!(threads[1].line, Some(3), "falls back to original_line");
+    }
+
+    #[test]
+    fn maps_timeline_reviews_and_events() {
+        let approved: Value = serde_json::from_str(r#"{ "state": "APPROVED", "user": { "login": "priya" }, "submitted_at": "2026-06-01T10:00:00Z" }"#).unwrap();
+        let e = map_gh_review(&approved).unwrap();
+        assert_eq!(e.kind, TimelineEventKind::Approved);
+        assert_eq!(e.actor.unwrap().display_name, "priya");
+
+        let changes: Value = serde_json::from_str(r#"{ "state": "CHANGES_REQUESTED", "user": { "login": "sam" } }"#).unwrap();
+        assert_eq!(map_gh_review(&changes).unwrap().kind, TimelineEventKind::ChangesRequested);
+
+        let merged: Value = serde_json::from_str(r#"{ "event": "merged", "actor": { "login": "sam" }, "created_at": "2026-06-01T11:00:00Z" }"#).unwrap();
+        assert_eq!(map_gh_issue_event(&merged).unwrap().kind, TimelineEventKind::Merged);
+        let assigned: Value = serde_json::from_str(r#"{ "event": "assigned", "actor": { "login": "sam" }, "assignee": { "login": "priya" } }"#).unwrap();
+        let a = map_gh_issue_event(&assigned).unwrap();
+        assert_eq!(a.kind, TimelineEventKind::Assigned);
+        assert!(a.summary.contains("priya"));
+        // Noise events are dropped.
+        let subscribed: Value = serde_json::from_str(r#"{ "event": "subscribed", "actor": { "login": "sam" } }"#).unwrap();
+        assert!(map_gh_issue_event(&subscribed).is_none());
     }
 }

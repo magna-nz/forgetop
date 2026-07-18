@@ -585,6 +585,28 @@ impl PullRequestSource for DemoPr {
         }
         Ok(threads)
     }
+    async fn timeline(&self, id: &str) -> Result<Vec<TimelineEvent>> {
+        use TimelineEventKind as K;
+        let ev = |actor: User, kind: K, summary: &str, hrs: i64| TimelineEvent {
+            actor: Some(actor),
+            kind,
+            summary: summary.into(),
+            at: Some(base() - chrono::Duration::hours(hrs)),
+        };
+        let mut events = vec![
+            ev(bob(), K::Reviewed, "requested changes on the retry maths", 6),
+            ev(alice(), K::Commented, "left a comment", 4),
+            ev(alice(), K::Approved, "approved these changes", 1),
+        ];
+        // Reflect actions taken this session, like re-fetching after acting.
+        if changes_requested_prs().lock().unwrap().contains(id) {
+            events.push(ev(me(), K::ChangesRequested, "requested changes", 0));
+        }
+        if merged_prs().lock().unwrap().contains(id) {
+            events.push(ev(me(), K::Merged, "merged this pull request", 0));
+        }
+        Ok(events)
+    }
     async fn changes(&self, _id: &str) -> Result<Vec<FileChange>> {
         Ok(vec![
             FileChange {
@@ -800,6 +822,20 @@ impl WorkItemSource for DemoWi {
     async fn threads(&self, id: &str) -> Result<Vec<CommentThread>> {
         // Comments submitted this session persist and come back, like a real provider.
         Ok(submitted_threads().lock().unwrap().get(id).cloned().unwrap_or_default())
+    }
+    async fn timeline(&self, _id: &str) -> Result<Vec<TimelineEvent>> {
+        use TimelineEventKind as K;
+        let ev = |actor: User, kind: K, summary: &str, hrs: i64| TimelineEvent {
+            actor: Some(actor),
+            kind,
+            summary: summary.into(),
+            at: Some(base() - chrono::Duration::hours(hrs)),
+        };
+        Ok(vec![
+            ev(bob(), K::Assigned, "assigned this to Priya Nair", 30),
+            ev(alice(), K::StateChanged, "moved this to In Progress", 26),
+            ev(alice(), K::Commented, "left a comment", 5),
+        ])
     }
     async fn set_state(&self, _id: &str, _state: &str) -> Result<()> {
         Ok(())

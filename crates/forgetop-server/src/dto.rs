@@ -6,7 +6,7 @@ use std::sync::Arc;
 use forgetop_core::config::PipelineSubscription;
 use forgetop_core::domain::{
     CheckRun, CommentThread, Commit, FileChange, Notification, PipelineApproval, PipelineRun, PipelineRunStatus,
-    ProviderType, PullRequest, PullRequestStatus, WorkItem,
+    ProviderType, PullRequest, PullRequestStatus, TimelineEvent, WorkItem,
 };
 use forgetop_core::launchpad::{self, EntryItem, PipeInput, PrInput, WiInput};
 use forgetop_core::provider::{
@@ -366,6 +366,7 @@ pub async fn launchpad(sections: &SectionService) -> LaunchpadResponse {
 pub struct PrDetail {
     pub pull_request: PullRequest,
     pub threads: Vec<CommentThread>,
+    pub timeline: Vec<TimelineEvent>,
     pub changes: Vec<FileChange>,
     pub checks: Vec<CheckRun>,
     pub commits: Vec<Commit>,
@@ -389,6 +390,7 @@ pub async fn pr_detail(sections: &SectionService, conn: &str, id: &str) -> Optio
     Some(PrDetail {
         pull_request,
         threads: source.threads(id).await.unwrap_or_default(),
+        timeline: source.timeline(id).await.unwrap_or_default(),
         changes: source.changes(id).await.unwrap_or_default(),
         checks: source.checks(id).await.unwrap_or_default(),
         commits: source.commits(id).await.unwrap_or_default(),
@@ -408,6 +410,7 @@ pub async fn pr_commit_changes(sections: &SectionService, conn: &str, id: &str, 
 pub struct WiDetail {
     pub work_item: WorkItem,
     pub threads: Vec<CommentThread>,
+    pub timeline: Vec<TimelineEvent>,
 }
 
 /// Resolves the work-item source for a connection id.
@@ -425,7 +428,11 @@ pub async fn wi_detail(sections: &SectionService, conn: &str, id: &str) -> Optio
     let source = wi_source(sections, conn).await?;
     let work_item = source.get(id).await.ok()?;
     // Comments are best-effort: a provider that doesn't expose them just yields empties.
-    Some(WiDetail { work_item, threads: source.threads(id).await.unwrap_or_default() })
+    Some(WiDetail {
+        work_item,
+        threads: source.threads(id).await.unwrap_or_default(),
+        timeline: source.timeline(id).await.unwrap_or_default(),
+    })
 }
 
 // ---- pipeline detail ----
