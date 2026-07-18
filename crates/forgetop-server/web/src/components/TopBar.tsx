@@ -11,7 +11,17 @@ const META: Record<SectionId, { title: string; subtitle: string }> = {
   settings: { title: "Settings", subtitle: "Manage the connections shared with the terminal app." },
 };
 
-export function TopBar({ section, onOpenPalette }: { section: SectionId; onOpenPalette: () => void }) {
+export function TopBar({
+  section,
+  onOpenPalette,
+  sidebarOpen,
+  onToggleSidebar,
+}: {
+  section: SectionId;
+  onOpenPalette: () => void;
+  sidebarOpen: boolean;
+  onToggleSidebar: () => void;
+}) {
   const meta = META[section];
   const fetching = useIsFetching() > 0;
   const qc = useQueryClient();
@@ -21,6 +31,18 @@ export function TopBar({ section, onOpenPalette }: { section: SectionId; onOpenP
       className="flex items-center gap-4 px-6 h-14 shrink-0"
       style={{ background: "var(--panel)", borderBottom: "1px solid var(--border)" }}
     >
+      <button
+        onClick={onToggleSidebar}
+        title={sidebarOpen ? "Collapse sidebar" : "Expand sidebar"}
+        aria-label={sidebarOpen ? "Collapse sidebar" : "Expand sidebar"}
+        aria-expanded={sidebarOpen}
+        className="-ml-2 flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-base transition-colors"
+        style={{ color: "var(--dim)", border: "1px solid var(--border)", background: "var(--panel2)" }}
+        onMouseEnter={(e) => (e.currentTarget.style.color = "var(--fg)")}
+        onMouseLeave={(e) => (e.currentTarget.style.color = "var(--dim)")}
+      >
+        ☰
+      </button>
       <div className="min-w-0">
         <h1 className="text-sm font-semibold leading-tight">{meta.title}</h1>
         <p className="text-xs truncate" style={{ color: "var(--dim)" }}>

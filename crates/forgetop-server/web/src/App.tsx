@@ -36,11 +36,17 @@ export default function App() {
   const [section, setSection] = useState<SectionId>(() => sectionFromHash() ?? "launchpad");
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [skippedFirstRun, setSkippedFirstRun] = useState(false);
+  // Collapse the sidebar to give a section the full page width; persisted like other UI prefs.
+  const [sidebarOpen, setSidebarOpen] = useState(() => localStorage.getItem("forgetop_sidebar_open") !== "false");
   const connections = useConnections();
   const View = VIEWS[section];
 
   // First launch with nothing configured → the setup wizard, like the TUI.
   const firstRun = connections.data?.length === 0 && !skippedFirstRun;
+
+  useEffect(() => {
+    localStorage.setItem("forgetop_sidebar_open", String(sidebarOpen));
+  }, [sidebarOpen]);
 
   // Cmd/Ctrl-K toggles the command palette from anywhere.
   useEffect(() => {
@@ -79,9 +85,14 @@ export default function App() {
         <PipelineDetailProvider>
           <NavContext.Provider value={setSection}>
           <div className="flex h-full">
-            <Sidebar section={section} onSelect={setSection} />
+            <Sidebar section={section} onSelect={setSection} collapsed={!sidebarOpen} />
             <main className="flex flex-col flex-1 min-w-0 h-full">
-              <TopBar section={section} onOpenPalette={() => setPaletteOpen(true)} />
+              <TopBar
+                section={section}
+                onOpenPalette={() => setPaletteOpen(true)}
+                sidebarOpen={sidebarOpen}
+                onToggleSidebar={() => setSidebarOpen((o) => !o)}
+              />
               <div className="flex-1 overflow-auto">
                 {/* key forces a remount per section so the CSS fade replays; row-level entrance
                     animations live in <Row>. */}
