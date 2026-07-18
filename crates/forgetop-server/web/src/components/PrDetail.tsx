@@ -67,6 +67,8 @@ function PrDetailPanel({ prRef, onClose }: { prRef: PrRef; onClose: () => void }
     qc.invalidateQueries({ queryKey: ["pr-detail", prRef.conn, prRef.id] });
     qc.invalidateQueries({ queryKey: ["prs"] });
     qc.invalidateQueries({ queryKey: ["launchpad"] });
+    // Acting on a PR (merge, approve, …) can clear its review-request / mention notification.
+    qc.invalidateQueries({ queryKey: ["notifications"] });
   };
 
   const act = async (label: string, fn: () => Promise<void>) => {
