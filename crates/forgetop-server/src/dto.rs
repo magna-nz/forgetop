@@ -397,7 +397,7 @@ fn with_comment_events(mut timeline: Vec<TimelineEvent>, threads: &[CommentThrea
             });
         }
     }
-    timeline.sort_by(|a, b| a.at.cmp(&b.at));
+    timeline.sort_by_key(|a| a.at);
     timeline
 }
 
