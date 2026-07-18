@@ -77,8 +77,9 @@ fn render_tabs(frame: &mut Frame, area: Rect, app: &App) {
 
     let vis = app.visible_indices();
     // Launchpad is tab 0; its badge is the count of items that actually need you.
+    // "Command Center" is the user-facing name for the launchpad (code keeps `launchpad`/`lp`).
     let lp_count = app.lp.iter().filter(|e| !e.bucket.muted()).count();
-    let mut titles: Vec<Line> = vec![Line::from(format!(" Launchpad ({lp_count}) "))];
+    let mut titles: Vec<Line> = vec![Line::from(format!(" Command Center ({lp_count}) "))];
     titles.extend(vis.iter().map(|&i| {
         let count = match i {
             0 => app.prs.len(),
@@ -194,7 +195,7 @@ fn render_launchpad(frame: &mut Frame, area: Rect, app: &mut App) {
     let theme = &app.theme;
     if app.lp.is_empty() {
         let msg = if app.health.is_empty() { FIRST_RUN_HINT } else { "✓ You're all caught up — nothing needs you." };
-        empty(frame, area, theme, msg, section_block(theme, "Launchpad · what needs you"));
+        empty(frame, area, theme, msg, section_block(theme, "Command Center · what needs you"));
         return;
     }
     let cols = Layout::default()

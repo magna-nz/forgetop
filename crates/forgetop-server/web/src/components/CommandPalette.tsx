@@ -72,7 +72,8 @@ export function CommandPalette({
       onClose();
     };
     const nav: Command[] = [
-      { id: "nav:launchpad", label: "Go to Launchpad", icon: "✦", run: go("launchpad") },
+      // "Command Center" = the launchpad section (code keeps the `launchpad` id).
+      { id: "nav:launchpad", label: "Go to Command Center", icon: "✦", run: go("launchpad") },
       { id: "nav:prs", label: "Go to Pull Requests", icon: "⇄", run: go("prs") },
       { id: "nav:wi", label: "Go to Work Items", icon: "◧", run: go("work-items") },
       { id: "nav:pipes", label: "Go to Pipelines", icon: "⛓", run: go("pipelines") },

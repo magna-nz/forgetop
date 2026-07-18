@@ -45,7 +45,7 @@ html[data-surface="tui"] .surface-dash{display:none}
 - [Core concepts](#core-concepts)
 - [Getting started](#getting-started)
 - [Web dashboard](#web-dashboard)
-- [Launchpad](#launchpad)
+- [Command Center](#command-center)
 - [Pull Requests](#pull-requests)
 - [Work Items](#work-items)
 - [Pipelines](#pipelines)
@@ -62,7 +62,7 @@ html[data-surface="tui"] .surface-dash{display:none}
 
 ## What forgetop does
 
-- **The Launchpad** — the default landing screen: one cross-provider **action inbox**
+- **The Command Center** — the default landing screen: one cross-provider **action inbox**
   that triages every PR, work item, and pipeline into "what needs you", so you start
   on your queue instead of scrolling three separate lists.
 - **Terminal *or* browser** — the same app as a keyboard-driven TUI *and* a local
@@ -199,7 +199,7 @@ what launches for a single run (handy with `--demo`, whose config is in-memory).
 
 ## Web dashboard
 
-forgetop ships the **same app as a local web dashboard** — the Launchpad, all three
+forgetop ships the **same app as a local web dashboard** — the Command Center, all three
 lists, PR review with an inline-comment diff viewer, the command palette, sort/filter,
 themes, and every write action (approve, merge, comment, submit a review, change a
 work-item state, approve a pipeline gate, retry a run, mark a notification read). It's
@@ -243,11 +243,11 @@ this automatically. Pressing **`C`** in the TUI jumps straight here.
 The server binds **`127.0.0.1` only** and gates its API with a **per-session token** in
 the URL — see [Security](#security).
 
-## Launchpad
+## Command Center
 
-<div class="surface-toggle" role="group" aria-label="Show Launchpad instructions for"><button type="button" class="st-btn st-tui" data-surface-set="tui">Terminal</button><button type="button" class="st-btn st-dash" data-surface-set="dash">Dashboard</button></div>
+<div class="surface-toggle" role="group" aria-label="Show Command Center instructions for"><button type="button" class="st-btn st-tui" data-surface-set="tui">Terminal</button><button type="button" class="st-btn st-dash" data-surface-set="dash">Dashboard</button></div>
 
-The **Launchpad** is the screen forgetop opens on. Instead of browsing by
+The **Command Center** is the screen forgetop opens on. Instead of browsing by
 type, it answers one question — *what needs me right now?* — by pulling every PR,
 work item, and pipeline across every connected provider into a single, prioritised
 page. The Pull Requests / Work Items / Pipelines views are still there as drill-downs.
@@ -280,7 +280,7 @@ name** (e.g. `CI Build`) and the ref is the **run/release** (e.g. `10.1.100`).
 a pull request opens its in-app **review panel** right here; work items and pipelines open
 in their provider (open them from the Work Items / Pipelines tabs for the in-app panel).
 When you **act** on an item — submit a review, approve, or merge — it drops off the
-Launchpad straight away rather than waiting for the next poll. The sidebar **Launchpad**
+Command Center straight away rather than waiting for the next poll. The sidebar **Command Center**
 badge counts only the items that actually need you.
 
 </div>
@@ -293,14 +293,14 @@ badge counts only the items that actually need you.
 - `←` / `→` (or `h` / `l`) — switch between the two columns.
 - `Enter` — open the selected item in its **full view** (the same PR / work-item /
   pipeline view as from the section tabs, with all its actions).
-- `Esc` — from an item opened here, return to the Launchpad with the **same row still
+- `Esc` — from an item opened here, return to the Command Center with the **same row still
   selected**.
 - `Tab`, `1`–`4` — switch top-level tabs. `r` — refresh.
 
 Two touches make it feel live: when you **act** on an item — submit a review, approve,
-or merge a PR — it drops off the Launchpad immediately rather than lingering until the
+or merge a PR — it drops off the Command Center immediately rather than lingering until the
 next poll; and the **selected row's title scrolls** horizontally when it's too long to
-fit, so you can always read it in full. The `Launchpad (N)` tab badge counts the items
+fit, so you can always read it in full. The `Command Center (N)` tab badge counts the items
 that actually need you (the reference sections don't inflate it).
 
 </div>
@@ -580,7 +580,7 @@ result (or `↑`/`↓` then `Enter`) to open it, `Esc` to dismiss.
 
 <div class="surface surface-tui" markdown="1">
 
-Press **`Ctrl-P`** (from the Launchpad or any list) to open it; `↑`/`↓` (or
+Press **`Ctrl-P`** (from the Command Center or any list) to open it; `↑`/`↓` (or
 `Ctrl-n`/`Ctrl-p`) to move, `Enter` to open the item's full view, `Esc` to dismiss.
 
 </div>
@@ -591,7 +591,7 @@ Press **`Ctrl-P`** (from the Launchpad or any list) to open it; `↑`/`↓` (or
 
 The **notification inbox** is your notification *stream* aggregated across providers: review
 requests, @mentions, assignments, CI failures, comments, and state changes, newest first. It
-answers *what just happened*, where the Launchpad answers *what needs me now*. A
+answers *what just happened*, where the Command Center answers *what needs me now*. A
 **Notifications** nav item carries an **unread count** that stands out when something's
 waiting.
 
@@ -606,7 +606,7 @@ waiting.
 
 <div class="surface surface-tui" markdown="1">
 
-Press **`i`** (from the Launchpad or any list) to open the **Inbox**. The
+Press **`i`** (from the Command Center or any list) to open the **Inbox**. The
 **`Notifications (N) [i]`** nav item sits at the **far right** of the tab bar — dim grey at
 zero, **bold yellow** with the count when something's waiting, accent while the Inbox is
 open. It's a nav item, not part of the `Tab` cycle.
@@ -700,7 +700,7 @@ the keys valid for where you are. Press `?` for the full panel. The complete set
 
 | Key | Action |
 | --- | --- |
-| `←` / `→`, `h` / `l`, `Tab`, `1`–`4` | Switch tab (`1` = Launchpad) |
+| `←` / `→`, `h` / `l`, `Tab`, `1`–`4` | Switch tab (`1` = Command Center) |
 | `↑` / `↓`, `k` / `j` | Move selection |
 | `Ctrl-P` | Command palette — fuzzy-jump to any PR, work item, or pipeline |
 | `i` | Notification inbox (review requests, mentions, CI failures, assignments) |
@@ -716,14 +716,14 @@ the keys valid for where you are. Press `?` for the full panel. The complete set
 | `?` | Show all keybindings (anywhere) |
 | `q` / `Ctrl-C` | Quit · `Esc` back / close |
 
-### Launchpad
+### Command Center
 
 | Key | Action |
 | --- | --- |
 | `↑` / `↓`, `k` / `j` | Move within the focused column |
 | `←` / `→`, `h` / `l` | Switch between the two columns |
 | `Enter` | Open the selected item in its full view |
-| `Esc` (in the opened item) | Return to the Launchpad, same row selected |
+| `Esc` (in the opened item) | Return to the Command Center, same row selected |
 
 ### Saved views
 

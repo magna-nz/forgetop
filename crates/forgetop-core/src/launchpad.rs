@@ -1,5 +1,11 @@
 //! Launchpad triage engine: classifies aggregated items into action buckets.
 //!
+//! NAMING (for humans and AI): the user-facing name for this feature is the **"Command Center"**
+//! — that is the label shown in the TUI tab, the dashboard sidebar, docs, etc. The code
+//! deliberately keeps the original `launchpad` / `lp` identifiers (types, fields, API routes,
+//! module names) unchanged. So "Command Center" and "launchpad" refer to the same thing; only the
+//! display strings say "Command Center". Do not rename the code identifiers to match.
+//!
 //! Pure logic — no UI, no fetching — so the triage rules are unit-tested in isolation and,
 //! more importantly, **shared** by the terminal UI and the web dashboard. Both frontends map
 //! their own row types onto the [`PrInput`] / [`WiInput`] / [`PipeInput`] structs here and call
