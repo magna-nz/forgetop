@@ -12,7 +12,15 @@ const NAV: { id: SectionId; label: string; icon: string }[] = [
   { id: "settings", label: "Settings", icon: "⚙" },
 ];
 
-export function Sidebar({ section, onSelect }: { section: SectionId; onSelect: (s: SectionId) => void }) {
+export function Sidebar({
+  section,
+  onSelect,
+  collapsed,
+}: {
+  section: SectionId;
+  onSelect: (s: SectionId) => void;
+  collapsed: boolean;
+}) {
   const lp = useLaunchpad();
   const prs = usePullRequests();
   const wis = useWorkItems();
@@ -36,9 +44,10 @@ export function Sidebar({ section, onSelect }: { section: SectionId; onSelect: (
 
   return (
     <aside
-      className="flex flex-col w-60 shrink-0 h-full"
-      style={{ background: "var(--panel)", borderRight: "1px solid var(--border)" }}
+      className={`shrink-0 min-w-0 h-full overflow-hidden transition-[width] duration-200 ease-out ${collapsed ? "w-0" : "w-60"}`}
+      style={{ borderRight: collapsed ? "none" : "1px solid var(--border)" }}
     >
+      <div className="flex flex-col w-60 h-full" style={{ background: "var(--panel)" }}>
       <div className="flex items-center gap-2 px-5 h-14 shrink-0" style={{ borderBottom: "1px solid var(--border)" }}>
         <span className="text-lg" style={{ color: "var(--accent)" }}>
           ◿
@@ -107,6 +116,7 @@ export function Sidebar({ section, onSelect }: { section: SectionId; onSelect: (
             ◐ {theme}
           </button>
         </div>
+      </div>
       </div>
     </aside>
   );
