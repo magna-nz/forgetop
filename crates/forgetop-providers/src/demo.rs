@@ -642,13 +642,15 @@ impl PullRequestSource for DemoPr {
             },
         ])
     }
-    async fn checks(&self, _id: &str) -> Result<Vec<CheckRun>> {
+    async fn checks(&self, id: &str) -> Result<Vec<CheckRun>> {
+        // Canned URLs so the dashboard Checks tab is clickable in --demo, like a real provider.
+        let url = |name: &str| Some(format!("https://example.test/pr/{id}/checks/{name}"));
         Ok(vec![
-            CheckRun { name: "build".into(), status: CheckStatus::Passed, url: None },
-            CheckRun { name: "unit-tests".into(), status: CheckStatus::Passed, url: None },
-            CheckRun { name: "clippy".into(), status: CheckStatus::Passed, url: None },
-            CheckRun { name: "integration".into(), status: CheckStatus::Failed, url: None },
-            CheckRun { name: "deploy-preview".into(), status: CheckStatus::Pending, url: None },
+            CheckRun { name: "build".into(), status: CheckStatus::Passed, url: url("build") },
+            CheckRun { name: "unit-tests".into(), status: CheckStatus::Passed, url: url("unit-tests") },
+            CheckRun { name: "clippy".into(), status: CheckStatus::Passed, url: url("clippy") },
+            CheckRun { name: "integration".into(), status: CheckStatus::Failed, url: url("integration") },
+            CheckRun { name: "deploy-preview".into(), status: CheckStatus::Pending, url: url("deploy-preview") },
         ])
     }
     async fn commits(&self, _id: &str) -> Result<Vec<Commit>> {

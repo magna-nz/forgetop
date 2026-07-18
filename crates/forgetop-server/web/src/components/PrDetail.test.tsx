@@ -90,6 +90,44 @@ describe("PrDetail action bar", () => {
     expect(screen.queryByText("mergeable")).not.toBeInTheDocument();
   });
 
+  it("Checks tab: an unsupported provider greys the checks and pops the standard message", async () => {
+    const d = detail("Open");
+    d.checks = [{ name: "build", status: "Passed", url: null }];
+    mockFetch({
+      get: {
+        "/api/pr/detail": d,
+        "/api/connections": [{ id: "c", provider: "Demo", display_name: "Demo", has_token: true, sections: [] }],
+      },
+    });
+    renderWithClient(
+      <PrDetailProvider>
+        <Opener conn="c" id="1" />
+      </PrDetailProvider>,
+    );
+    await userEvent.click(await screen.findByRole("button", { name: /checks/i }));
+    await userEvent.click(await screen.findByRole("button", { name: /build/i }));
+    expect(await screen.findByText("Demo currently does not support this feature")).toBeInTheDocument();
+  });
+
+  it("Checks tab: a supporting provider links each check to the provider", async () => {
+    const d = detail("Open");
+    d.checks = [{ name: "build", status: "Passed", url: "https://gh.test/checks/1" }];
+    mockFetch({
+      get: {
+        "/api/pr/detail": d,
+        "/api/connections": [{ id: "c", provider: "GitHub", display_name: "gh", has_token: true, sections: [] }],
+      },
+    });
+    renderWithClient(
+      <PrDetailProvider>
+        <Opener conn="c" id="1" />
+      </PrDetailProvider>,
+    );
+    await userEvent.click(await screen.findByRole("button", { name: /checks/i }));
+    const link = await screen.findByRole("link", { name: /build/i });
+    expect(link).toHaveAttribute("href", "https://gh.test/checks/1");
+  });
+
   it("replying to a conversation thread posts /api/pr/reply with the thread id", async () => {
     const withThread = detail("Open");
     withThread.threads = [
