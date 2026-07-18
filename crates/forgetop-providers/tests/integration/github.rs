@@ -114,6 +114,18 @@ async fn github_pull_request_lifecycle() {
         "the reply comes back on the PR threads"
     );
 
+    // Mergeable flag: the clean fixture PR (off the default branch, no conflicts) settles to
+    // Mergeable. GitHub computes `mergeable_state` asynchronously, so poll get() until it lands.
+    let mergeable = {
+        let prs = &prs;
+        let id = id.as_str();
+        harness::poll(harness::POLL_MERGE, move || async move {
+            prs.get(id).await.ok().filter(|p| p.mergeable == MergeableState::Mergeable).map(|_| ())
+        })
+        .await
+    };
+    assert!(mergeable.is_some(), "the clean PR computes as mergeable");
+
     // Merge write (the actual adapter action) → PR reads back as merged.
     prs.merge(&id, &MergeOptions { strategy: MergeStrategy::Squash, delete_source_ref: true }).await.expect("merge PR");
     let after = harness::poll(harness::POLL_MERGE, || async {

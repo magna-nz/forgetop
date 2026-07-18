@@ -87,6 +87,35 @@ describe("PrDetail action bar", () => {
     expect(screen.queryByRole("button", { name: "Revert" })).not.toBeInTheDocument();
   });
 
+  it("greys out Merge when the PR is not mergeable", async () => {
+    const d = detail("Open");
+    d.pull_request.mergeable = "Conflicting";
+    mockFetch({ get: { "/api/pr/detail": d } });
+    renderWithClient(
+      <PrDetailProvider>
+        <Opener conn="c" id="1" />
+      </PrDetailProvider>,
+    );
+    expect(await screen.findByRole("button", { name: "Merge" })).toBeDisabled();
+  });
+
+  it("shows a friendly toast when a merge is rejected by the provider", async () => {
+    mockFetch({
+      get: { "/api/pr/detail": detail("Open") },
+      onPost: (url) => {
+        if (url.includes("/api/pr/merge")) throw new Error("409 not mergeable");
+        return { ok: true };
+      },
+    });
+    renderWithClient(
+      <PrDetailProvider>
+        <Opener conn="c" id="1" />
+      </PrDetailProvider>,
+    );
+    await userEvent.click(await screen.findByRole("button", { name: "Merge" }));
+    expect(await screen.findByText(/Couldn't merge — the PR may not be mergeable\./)).toBeInTheDocument();
+  });
+
   it("Conversation shows the timeline and the reviewers with their vote marks", async () => {
     const d = detail("Open");
     const priya = { id: "u1", display_name: "Priya Nair", handle: "p", avatar_url: null };

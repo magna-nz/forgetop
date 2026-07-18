@@ -93,7 +93,12 @@ function PrDetailPanel({ prRef, onClose }: { prRef: PrRef; onClose: () => void }
     });
   const merge = () =>
     act("Merged", async () => {
-      await apiPost("/api/pr/merge", { conn: prRef.conn, id: prRef.id, strategy: "Merge" });
+      try {
+        await apiPost("/api/pr/merge", { conn: prRef.conn, id: prRef.id, strategy: "Merge" });
+      } catch {
+        // Providers without a mergeable flag (e.g. Bitbucket) let you try — the API decides.
+        throw new Error("Couldn't merge — the PR may not be mergeable.");
+      }
       closeSoon();
     });
   const revert = () =>
@@ -257,7 +262,20 @@ function PrDetailPanel({ prRef, onClose }: { prRef: PrRef; onClose: () => void }
                 <div className="ml-auto flex gap-2">
                   <ActionButton disabled={busy} onClick={() => vote("Rejected")} label="Request changes" color="var(--red)" />
                   <ActionButton disabled={busy} onClick={() => vote("Approved")} label="Approve" color="var(--green)" />
-                  <ActionButton disabled={busy || pr.mergeable === "Conflicting"} onClick={merge} label="Merge" color="var(--magenta)" primary />
+                  <ActionButton
+                    disabled={busy || pr.mergeable === "Conflicting" || pr.mergeable === "Blocked"}
+                    title={
+                      pr.mergeable === "Conflicting"
+                        ? "This PR has merge conflicts"
+                        : pr.mergeable === "Blocked"
+                          ? "This PR is blocked (branch policy or draft)"
+                          : undefined
+                    }
+                    onClick={merge}
+                    label="Merge"
+                    color="var(--magenta)"
+                    primary
+                  />
                 </div>
               )}
             </div>
@@ -279,17 +297,20 @@ function ActionButton({
   disabled,
   color = "var(--fg)",
   primary = false,
+  title,
 }: {
   label: string;
   onClick: () => void;
   disabled?: boolean;
   color?: string;
   primary?: boolean;
+  title?: string;
 }) {
   return (
     <button
       onClick={onClick}
       disabled={disabled}
+      title={title}
       className="rounded-md px-3 py-1.5 text-sm font-medium transition-opacity"
       style={{
         color: primary ? "#12151b" : color,
