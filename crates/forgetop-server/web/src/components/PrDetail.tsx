@@ -5,7 +5,7 @@ import { apiPost, useConnections, usePrCommitChanges, usePrDetail } from "../api
 import { checkMeta, prStatusMeta, relativeTime, voteMeta } from "../format";
 import { providerSupports, unsupportedMessage } from "../capabilities";
 import { parsePatch } from "../diff";
-import type { CheckRun, CommentThread, Commit, FileChange, LineComment, MergeableState, PrRef, ProviderType, Reviewer } from "../types";
+import type { CheckRun, CommentThread, Commit, FileChange, FileChangeKind, LineComment, MergeableState, PrRef, ProviderType, Reviewer } from "../types";
 import { Avatar, Chip, Pill } from "./ui";
 
 // ---- opener context ----
@@ -188,6 +188,7 @@ function PrDetailPanel({ prRef, onClose }: { prRef: PrRef; onClose: () => void }
             <div className="flex-1 overflow-auto">
               {tab === "files" && (
                 <FilesTab
+                  key={commitScope?.sha ?? "all"}
                   changes={commitScope ? (commitChanges.data ?? []) : data.changes}
                   threads={data.threads}
                   pending={pending}
@@ -370,6 +371,9 @@ function FilesTab({
   onRemovePending: (index: number) => void;
   scope?: { label: string; loading: boolean; onClear: () => void };
 }) {
+  // Which file the left-hand list has selected (clamped in case the file set shrank).
+  const [selected, setSelected] = useState(0);
+  const sel = Math.min(selected, Math.max(0, changes.length - 1));
   // Scoped to one commit: show a banner with a way back to the whole-PR diff.
   const banner = scope && (
     <div className="flex items-center gap-3 rounded-lg px-3 py-2 text-xs" style={{ background: "var(--panel2)", border: "1px solid var(--border)" }}>
@@ -380,21 +384,69 @@ function FilesTab({
       </button>
     </div>
   );
-  const body = scope?.loading ? (
-    <Empty text="Loading commit diff…" />
-  ) : changes.length === 0 ? (
-    <Empty text={scope ? "No per-commit diff available for this provider." : "No file changes to show."} />
-  ) : (
-    changes.map((f) => (
-      <FileDiff key={f.path} file={f} threads={threads} pending={pending} busy={busy} onReply={onReply} onAddPending={onAddPending} onRemovePending={onRemovePending} />
-    ))
-  );
+
+  if (scope?.loading || changes.length === 0) {
+    return (
+      <div className="p-4 flex flex-col gap-4">
+        {banner}
+        {scope?.loading ? <Empty text="Loading commit diff…" /> : <Empty text={scope ? "No per-commit diff available for this provider." : "No file changes to show."} />}
+      </div>
+    );
+  }
+
+  const file = changes[sel];
   return (
-    <div className="p-4 flex flex-col gap-4">
-      {banner}
-      {body}
+    <div className="flex flex-col h-full">
+      {banner && <div className="px-4 pt-4 shrink-0">{banner}</div>}
+      <div className="flex flex-1 min-h-0">
+        {/* file list */}
+        <nav className="w-56 shrink-0 overflow-auto p-2 flex flex-col gap-0.5" style={{ borderRight: "1px solid var(--border)" }}>
+          {changes.map((f, i) => {
+            const active = i === sel;
+            const k = kindTag(f.kind);
+            const parts = f.path.split("/");
+            const name = parts.pop() ?? f.path;
+            const dir = parts.join("/");
+            return (
+              <button
+                key={f.path}
+                onClick={() => setSelected(i)}
+                title={f.path}
+                className="flex items-center gap-2 rounded-md px-2 py-1.5 text-left w-full transition-colors"
+                style={{ background: active ? "var(--sel)" : "transparent" }}
+                onMouseEnter={(e) => !active && (e.currentTarget.style.background = "var(--card)")}
+                onMouseLeave={(e) => !active && (e.currentTarget.style.background = "transparent")}
+              >
+                <span className="mono text-xs shrink-0 w-3 text-center" style={{ color: k.color }} title={f.kind}>{k.letter}</span>
+                <span className="flex flex-col min-w-0 flex-1">
+                  <span className="truncate text-xs" style={{ color: "var(--fg)" }}>{name}</span>
+                  {dir && <span className="truncate text-[10px]" style={{ color: "var(--dim)" }}>{dir}</span>}
+                </span>
+              </button>
+            );
+          })}
+        </nav>
+        {/* selected file's diff */}
+        <div className="flex-1 overflow-auto p-4 min-w-0">
+          <FileDiff key={file.path} file={file} threads={threads} pending={pending} busy={busy} onReply={onReply} onAddPending={onAddPending} onRemovePending={onRemovePending} />
+        </div>
+      </div>
     </div>
   );
+}
+
+/** Single-letter change-kind tag for the file list, coloured like a diff. */
+function kindTag(kind: FileChangeKind): { letter: string; color: string } {
+  switch (kind) {
+    case "Added":
+      return { letter: "A", color: "var(--green)" };
+    case "Deleted":
+      return { letter: "D", color: "var(--red)" };
+    case "Renamed":
+      return { letter: "R", color: "var(--cyan)" };
+    default:
+      return { letter: "M", color: "var(--yellow)" };
+  }
 }
 
 function FileDiff({
