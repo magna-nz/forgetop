@@ -36,17 +36,14 @@ export default function App() {
   const [section, setSection] = useState<SectionId>(() => sectionFromHash() ?? "launchpad");
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [skippedFirstRun, setSkippedFirstRun] = useState(false);
-  // Collapse the sidebar to give a section the full page width; persisted like other UI prefs.
-  const [sidebarOpen, setSidebarOpen] = useState(() => localStorage.getItem("forgetop_sidebar_open") !== "false");
+  // The sidebar always starts open on each load; the toggle collapses it to give a section the
+  // full page width, but that choice is intentionally not persisted across sessions.
+  const [sidebarOpen, setSidebarOpen] = useState(true);
   const connections = useConnections();
   const View = VIEWS[section];
 
   // First launch with nothing configured → the setup wizard, like the TUI.
   const firstRun = connections.data?.length === 0 && !skippedFirstRun;
-
-  useEffect(() => {
-    localStorage.setItem("forgetop_sidebar_open", String(sidebarOpen));
-  }, [sidebarOpen]);
 
   // Cmd/Ctrl-K toggles the command palette from anywhere.
   useEffect(() => {
