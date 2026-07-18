@@ -395,6 +395,12 @@ pub async fn pr_detail(sections: &SectionService, conn: &str, id: &str) -> Optio
     })
 }
 
+/// Files changed by a single commit on the PR (empty for providers without a per-commit diff API).
+pub async fn pr_commit_changes(sections: &SectionService, conn: &str, id: &str, sha: &str) -> Option<Vec<FileChange>> {
+    let source = pr_source(sections, conn).await?;
+    Some(source.commit_changes(id, sha).await.unwrap_or_default())
+}
+
 // ---- work-item detail ----
 
 /// Everything the work-item detail view needs.

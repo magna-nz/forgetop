@@ -569,6 +569,47 @@ async fn pr_reply_posts_into_the_target_thread() {
 }
 
 #[tokio::test]
+async fn pr_commit_changes_endpoint_returns_a_commits_diff() {
+    let server = spawn(demo_deps(true).await, 0).await.expect("server binds");
+    let base = format!("http://127.0.0.1:{}", server.port);
+    let client = reqwest::Client::new();
+    let tok = server.token.clone();
+
+    // Pick a PR and one of its commits.
+    let prs: serde_json::Value =
+        client.get(format!("{base}/api/pull-requests")).header("x-forgetop-token", &tok).send().await.unwrap().json().await.unwrap();
+    let pr = &prs[0];
+    let conn = pr["connection_id"].as_str().unwrap();
+    let id = pr["pull_request"]["id"].as_str().unwrap();
+    let detail: serde_json::Value =
+        client.get(format!("{base}/api/pr/detail?conn={conn}&id={id}")).header("x-forgetop-token", &tok).send().await.unwrap().json().await.unwrap();
+    let sha = detail["commits"][0]["sha"].as_str().expect("a commit sha").to_string();
+
+    // That commit reports its own changed files.
+    let changes: serde_json::Value = client
+        .get(format!("{base}/api/pr/commit-changes?conn={conn}&id={id}&sha={sha}"))
+        .header("x-forgetop-token", &tok)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let files = changes.as_array().expect("array of file changes");
+    assert!(!files.is_empty(), "the commit reports its changed files");
+    assert!(files[0]["path"].is_string());
+
+    // An unknown connection is a 404, not a 500.
+    let missing = client
+        .get(format!("{base}/api/pr/commit-changes?conn=nope&id={id}&sha={sha}"))
+        .header("x-forgetop-token", &tok)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), 404);
+}
+
+#[tokio::test]
 async fn notifications_carry_drill_in_targets_and_mark_read() {
     let server = spawn(demo_deps(true).await, 0).await.expect("server binds");
     let base = format!("http://127.0.0.1:{}", server.port);

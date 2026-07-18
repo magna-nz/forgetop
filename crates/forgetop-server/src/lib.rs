@@ -95,6 +95,7 @@ fn router(state: AppState) -> Router {
         .route("/api/notifications", get(notifications))
         .route("/api/launchpad", get(launchpad))
         .route("/api/pr/detail", get(pr_detail))
+        .route("/api/pr/commit-changes", get(pr_commit_changes))
         .route("/api/pr/vote", post(pr_vote))
         .route("/api/pr/merge", post(pr_merge))
         .route("/api/pr/revert", post(pr_revert))
@@ -184,6 +185,14 @@ struct ItemQuery {
     id: String,
 }
 
+/// Query params identifying a single commit's diff within a PR (`?conn=…&id=…&sha=…`).
+#[derive(Deserialize)]
+struct CommitQuery {
+    conn: String,
+    id: String,
+    sha: String,
+}
+
 /// Query params for the PR list: which view to show (`?view=all|merged|review_requested`).
 #[derive(Deserialize)]
 struct PrListQuery {
@@ -214,6 +223,13 @@ fn action_response(result: Result<(), ActionError>) -> Response {
         Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
         Err(ActionError::NotFound) => (StatusCode::NOT_FOUND, "connection or capability not found").into_response(),
         Err(ActionError::Failed(msg)) => (StatusCode::BAD_GATEWAY, msg).into_response(),
+    }
+}
+
+async fn pr_commit_changes(State(s): State<AppState>, Query(q): Query<CommitQuery>) -> Response {
+    match dto::pr_commit_changes(&s.deps.sections, &q.conn, &q.id, &q.sha).await {
+        Some(changes) => Json(changes).into_response(),
+        None => (StatusCode::NOT_FOUND, "pull request not found").into_response(),
     }
 }
 

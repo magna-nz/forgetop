@@ -113,7 +113,8 @@ pub fn map_diffstat(v: &Value) -> FileChange {
 pub fn map_bb_commit(v: &Value) -> Commit {
     let author = get_obj(v, "author");
     Commit {
-        sha: get_str(v, "hash").map(|h| h.chars().take(8).collect()).unwrap_or_default(),
+        // Keep the full hash — the commit-diff API needs a resolvable sha; the UI truncates for display.
+        sha: get_str(v, "hash").unwrap_or_default(),
         message: get_str(v, "message").unwrap_or_default().lines().next().unwrap_or_default().to_string(),
         author: author
             .and_then(|a| get_obj(a, "user").and_then(|u| get_str(u, "display_name")).or_else(|| get_str(a, "raw")))
@@ -315,6 +316,11 @@ impl PullRequestSource for BitbucketPr {
     }
     async fn changes(&self, id: &str) -> Result<Vec<FileChange>> {
         let v = self.0.get_json(&self.0.repo_path(&format!("/pullrequests/{id}/diffstat?pagelen=100"))).await?;
+        Ok(get_arr(&v, "values").iter().map(map_diffstat).collect())
+    }
+    async fn commit_changes(&self, _id: &str, sha: &str) -> Result<Vec<FileChange>> {
+        // A commit's diffstat (vs its first parent), same shape as the whole-PR file list.
+        let v = self.0.get_json(&self.0.repo_path(&format!("/diffstat/{sha}?pagelen=100"))).await?;
         Ok(get_arr(&v, "values").iter().map(map_diffstat).collect())
     }
     async fn commits(&self, id: &str) -> Result<Vec<Commit>> {
@@ -548,7 +554,7 @@ mod tests {
         )
         .unwrap();
         let c = map_bb_commit(&commit);
-        assert_eq!(c.sha, "abcdef12"); // truncated to 8
+        assert_eq!(c.sha, "abcdef1234567"); // full hash (UI truncates for display)
         assert_eq!(c.message, "Add cache");
         assert_eq!(c.author, "Dana");
 
