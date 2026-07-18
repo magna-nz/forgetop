@@ -42,6 +42,7 @@ async fn jira_work_item_lifecycle() {
     let states = wi.available_states(&id).await.expect("available states (transitions)");
     assert!(!states.is_empty(), "issue reports transitions");
     wi.add_comment(&id, &format!("{prefix} note")).await.expect("comment");
+    wi.timeline(&id).await.expect("timeline decodes");
 
     // Transition to the first available target state.
     wi.set_state(&id, &states[0]).await.expect("transition");
