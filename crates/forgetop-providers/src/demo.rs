@@ -497,6 +497,31 @@ fn apply_session_merge(mut pr: PullRequest) -> PullRequest {
     pr
 }
 
+/// PR ids you've requested changes on this run. `vote(Rejected)` records them; approving clears
+/// them — so a re-fetch reflects your review exactly like a real provider would.
+fn changes_requested_prs() -> &'static Mutex<HashSet<String>> {
+    static STORE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Reflect a session "request changes": your reviewer entry reads as Rejected (added if you
+/// weren't already a reviewer) until you approve — exactly what re-fetching the PR would show.
+fn apply_session_review(mut pr: PullRequest) -> PullRequest {
+    if changes_requested_prs().lock().unwrap().contains(&pr.id) {
+        match pr.reviewers.iter_mut().find(|r| r.user.id == me().id) {
+            Some(r) => r.vote = ReviewVote::Rejected,
+            None => pr.reviewers.push(rev(me(), ReviewVote::Rejected)),
+        }
+        pr.updated_at = Some(base());
+    }
+    pr
+}
+
+/// All session mutations a real provider would surface on a re-fetch (merge + your review).
+fn apply_session_state(pr: PullRequest) -> PullRequest {
+    apply_session_review(apply_session_merge(pr))
+}
+
 struct DemoPr {
     conn: String,
 }
@@ -506,7 +531,7 @@ impl PullRequestSource for DemoPr {
         demo_latency().await;
         let prs: Vec<_> = prs_for(&self.conn)
             .into_iter()
-            .map(apply_session_merge)
+            .map(apply_session_state)
             .filter(|p| query.include_completed || matches!(p.status, PullRequestStatus::Open | PullRequestStatus::Draft))
             .collect();
         Ok(apply_pull_request_filter(prs, query.filter, Some("you")))
@@ -515,7 +540,7 @@ impl PullRequestSource for DemoPr {
         prs_for(&self.conn)
             .into_iter()
             .find(|p| p.id == id)
-            .map(apply_session_merge)
+            .map(apply_session_state)
             .ok_or_else(|| forgetop_core::Error::NotFound(id.into()))
     }
     async fn threads(&self, id: &str) -> Result<Vec<CommentThread>> {
@@ -707,7 +732,19 @@ impl PullRequestSource for DemoPr {
         entry.push(Comment { id: format!("reply-{thread_id}-{n}"), author: me(), body: body.into(), created_at: Some(base()) });
         Ok(())
     }
-    async fn vote(&self, _id: &str, _vote: ReviewVote) -> Result<()> {
+    async fn vote(&self, id: &str, vote: ReviewVote) -> Result<()> {
+        // Record your review so list()/get() reflect it on the next fetch, like a real provider:
+        // requesting changes marks the PR, approving clears it.
+        let mut cr = changes_requested_prs().lock().unwrap();
+        match vote {
+            ReviewVote::Rejected => {
+                cr.insert(id.to_string());
+            }
+            ReviewVote::Approved | ReviewVote::ApprovedWithSuggestions => {
+                cr.remove(id);
+            }
+            _ => {}
+        }
         Ok(())
     }
     async fn merge(&self, id: &str, _options: &MergeOptions) -> Result<()> {
@@ -1096,6 +1133,32 @@ mod tests {
         let merged = apply_session_merge(p);
         assert_eq!(merged.status, PullRequestStatus::Merged);
         assert!(!merged.is_draft);
+    }
+
+    #[tokio::test]
+    async fn requesting_changes_reflects_your_review_on_refetch() {
+        // Models the #1501 ("Refactor the webhook retry queue") scenario where you're a NoVote
+        // reviewer; uses a fabricated id so the session-global store can't pollute other tests.
+        let src = conn().pull_requests().unwrap();
+        let id = "demo-review-test-99";
+        let base_pr = || {
+            let mut p = pr(0, "x", me(), PullRequestStatus::Open, CheckStatus::Passed, MergeableState::Mergeable, vec![rev(me(), ReviewVote::NoVote)], 1, 1, 1, "b", &[]);
+            p.id = id.to_string();
+            p
+        };
+
+        // Request changes → a re-fetch (apply_session_state) shows your review as Rejected.
+        src.vote(id, ReviewVote::Rejected).await.unwrap();
+        let reviewed = apply_session_state(base_pr());
+        assert!(
+            reviewed.reviewers.iter().any(|r| r.user.id == "me" && r.vote == ReviewVote::Rejected),
+            "your review reads as changes-requested after voting"
+        );
+
+        // Approving clears it again.
+        src.vote(id, ReviewVote::Approved).await.unwrap();
+        let cleared = apply_session_state(base_pr());
+        assert!(cleared.reviewers.iter().all(|r| r.vote != ReviewVote::Rejected), "approving clears the changes-requested review");
     }
 
     #[tokio::test]

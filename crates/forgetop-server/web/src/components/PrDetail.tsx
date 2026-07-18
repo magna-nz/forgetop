@@ -274,6 +274,17 @@ function MetaBar({
 }) {
   const passed = checks.filter((c) => c.status === "Passed").length;
   const failed = checks.filter((c) => c.status === "Failed").length;
+  // A reviewer requesting changes isn't reflected in the provider's `mergeable` (which is about
+  // conflicts / branch-protection policy), so factor it in here rather than reading "mergeable".
+  const changesRequested = reviewers.some((r) => r.vote === "Rejected");
+  const [mergeLabel, mergeColor] =
+    mergeable === "Conflicting"
+      ? ["conflicts", "var(--red)"]
+      : changesRequested
+        ? ["changes requested", "var(--red)"]
+        : mergeable === "Mergeable"
+          ? ["mergeable", "var(--green)"]
+          : [mergeable.toLowerCase(), "var(--dim)"];
   return (
     <div className="flex items-center gap-x-4 gap-y-2 px-5 py-2.5 flex-wrap text-xs shrink-0" style={{ borderBottom: "1px solid var(--border)", color: "var(--dim)" }}>
       <span className="flex items-center gap-1.5">
@@ -297,9 +308,7 @@ function MetaBar({
           checks: <span style={{ color: "var(--green)" }}>{passed}✓</span> {failed > 0 && <span style={{ color: "var(--red)" }}>{failed}✗</span>}
         </span>
       )}
-      <span style={{ color: mergeable === "Conflicting" ? "var(--red)" : mergeable === "Mergeable" ? "var(--green)" : "var(--dim)" }}>
-        {mergeable === "Conflicting" ? "conflicts" : mergeable === "Mergeable" ? "mergeable" : mergeable.toLowerCase()}
-      </span>
+      <span style={{ color: mergeColor }}>{mergeLabel}</span>
     </div>
   );
 }

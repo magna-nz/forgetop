@@ -74,6 +74,22 @@ describe("PrDetail action bar", () => {
     expect(screen.queryByRole("button", { name: "Revert" })).not.toBeInTheDocument();
   });
 
+  it("a PR with changes requested reads as 'changes requested', not 'mergeable'", async () => {
+    const d = detail("Open"); // mergeable: "Mergeable" at the conflict level
+    d.pull_request.reviewers = [
+      { user: { id: "u2", display_name: "Marcus Lee", handle: "marcus", avatar_url: null }, vote: "Rejected", is_required: true },
+    ];
+    mockFetch({ get: { "/api/pr/detail": d } });
+    renderWithClient(
+      <PrDetailProvider>
+        <Opener conn="c" id="1501" />
+      </PrDetailProvider>,
+    );
+
+    expect(await screen.findByText("changes requested")).toBeInTheDocument();
+    expect(screen.queryByText("mergeable")).not.toBeInTheDocument();
+  });
+
   it("replying to a conversation thread posts /api/pr/reply with the thread id", async () => {
     const withThread = detail("Open");
     withThread.threads = [
