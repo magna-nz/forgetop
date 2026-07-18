@@ -140,6 +140,28 @@ describe("PrDetail action bar", () => {
     expect(link).toHaveAttribute("href", "https://gh.test/checks/1");
   });
 
+  it("Commits tab: selecting a commit shows that commit's diff in Files", async () => {
+    const d = detail("Open");
+    d.commits = [{ sha: "abc1234def", message: "Add retry policy", author: "alice", date: null, url: null }];
+    mockFetch({
+      get: {
+        "/api/pr/detail": d,
+        "/api/pr/commit-changes": [{ path: "src/retry.rs", kind: "Added", additions: 6, deletions: 0, patch: "@@ -0,0 +1,1 @@\n+x" }],
+      },
+    });
+    renderWithClient(
+      <PrDetailProvider>
+        <Opener conn="c" id="1" />
+      </PrDetailProvider>,
+    );
+    await userEvent.click(await screen.findByRole("button", { name: /commits/i }));
+    await userEvent.click(await screen.findByRole("button", { name: /Add retry policy/i }));
+    // Now on the Files tab, scoped to that commit's diff, with a way back.
+    expect(await screen.findByText("Showing commit")).toBeInTheDocument();
+    expect(await screen.findByText("src/retry.rs")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Show all files/i })).toBeInTheDocument();
+  });
+
   it("replying to a conversation thread posts /api/pr/reply with the thread id", async () => {
     const withThread = detail("Open");
     withThread.threads = [

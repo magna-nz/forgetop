@@ -1,7 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import { useQueryClient } from "@tanstack/react-query";
-import { apiPost, useConnections, usePrDetail } from "../api";
+import { apiPost, useConnections, usePrCommitChanges, usePrDetail } from "../api";
 import { checkMeta, prStatusMeta, relativeTime, voteMeta } from "../format";
 import { providerSupports, unsupportedMessage } from "../capabilities";
 import { parsePatch } from "../diff";
@@ -37,6 +37,9 @@ function PrDetailPanel({ prRef, onClose }: { prRef: PrRef; onClose: () => void }
   const [pending, setPending] = useState<LineComment[]>([]);
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState<string | null>(null);
+  // When set, the Files tab shows a single commit's diff instead of the whole-PR changes.
+  const [commitScope, setCommitScope] = useState<{ sha: string; label: string } | null>(null);
+  const commitChanges = usePrCommitChanges(prRef, commitScope?.sha ?? null);
 
   const requestClose = () => {
     if (pending.length > 0 && !window.confirm(`Discard ${pending.length} unsubmitted comment(s)?`)) return;
@@ -47,6 +50,7 @@ function PrDetailPanel({ prRef, onClose }: { prRef: PrRef; onClose: () => void }
     setTab("conversation");
     setPending([]);
     setNote(null);
+    setCommitScope(null);
   }, [prRef.conn, prRef.id]);
 
   // Esc closes (guarding unsubmitted comments via requestClose).
@@ -184,13 +188,18 @@ function PrDetailPanel({ prRef, onClose }: { prRef: PrRef; onClose: () => void }
             <div className="flex-1 overflow-auto">
               {tab === "files" && (
                 <FilesTab
-                  changes={data.changes}
+                  changes={commitScope ? (commitChanges.data ?? []) : data.changes}
                   threads={data.threads}
                   pending={pending}
                   busy={busy}
                   onReply={reply}
                   onAddPending={(c) => setPending((p) => [...p, c])}
                   onRemovePending={(i) => setPending((p) => p.filter((_, k) => k !== i))}
+                  scope={
+                    commitScope
+                      ? { label: commitScope.label, loading: commitChanges.isLoading, onClear: () => setCommitScope(null) }
+                      : undefined
+                  }
                 />
               )}
               {tab === "conversation" && (
@@ -202,7 +211,15 @@ function PrDetailPanel({ prRef, onClose }: { prRef: PrRef; onClose: () => void }
                   onComment={(body) => act("Comment posted", () => apiPost("/api/pr/comment", { conn: prRef.conn, id: prRef.id, body }))}
                 />
               )}
-              {tab === "commits" && <CommitsTab commits={data.commits} />}
+              {tab === "commits" && (
+                <CommitsTab
+                  commits={data.commits}
+                  onSelect={(sha, label) => {
+                    setCommitScope({ sha, label });
+                    setTab("files");
+                  }}
+                />
+              )}
               {tab === "checks" && (
                 <ChecksTab
                   checks={data.checks}
@@ -342,6 +359,7 @@ function FilesTab({
   onReply,
   onAddPending,
   onRemovePending,
+  scope,
 }: {
   changes: FileChange[];
   threads: CommentThread[];
@@ -350,13 +368,31 @@ function FilesTab({
   onReply: (threadId: string, body: string) => void;
   onAddPending: (c: LineComment) => void;
   onRemovePending: (index: number) => void;
+  scope?: { label: string; loading: boolean; onClear: () => void };
 }) {
-  if (changes.length === 0) return <Empty text="No file changes to show." />;
+  // Scoped to one commit: show a banner with a way back to the whole-PR diff.
+  const banner = scope && (
+    <div className="flex items-center gap-3 rounded-lg px-3 py-2 text-xs" style={{ background: "var(--panel2)", border: "1px solid var(--border)" }}>
+      <span style={{ color: "var(--dim)" }}>Showing commit</span>
+      <span className="mono truncate" style={{ color: "var(--fg)" }}>{scope.label}</span>
+      <button onClick={scope.onClear} className="ml-auto shrink-0" style={{ color: "var(--accent)" }}>
+        ← Show all files
+      </button>
+    </div>
+  );
+  const body = scope?.loading ? (
+    <Empty text="Loading commit diff…" />
+  ) : changes.length === 0 ? (
+    <Empty text={scope ? "No per-commit diff available for this provider." : "No file changes to show."} />
+  ) : (
+    changes.map((f) => (
+      <FileDiff key={f.path} file={f} threads={threads} pending={pending} busy={busy} onReply={onReply} onAddPending={onAddPending} onRemovePending={onRemovePending} />
+    ))
+  );
   return (
     <div className="p-4 flex flex-col gap-4">
-      {changes.map((f) => (
-        <FileDiff key={f.path} file={f} threads={threads} pending={pending} busy={busy} onReply={onReply} onAddPending={onAddPending} onRemovePending={onRemovePending} />
-      ))}
+      {banner}
+      {body}
     </div>
   );
 }
@@ -584,17 +620,29 @@ function ConversationTab({
   );
 }
 
-function CommitsTab({ commits }: { commits: Commit[] }) {
+function CommitsTab({ commits, onSelect }: { commits: Commit[]; onSelect: (sha: string, label: string) => void }) {
   if (commits.length === 0) return <Empty text="No commits to show." />;
   return (
     <div className="p-4 flex flex-col gap-1.5 max-w-3xl">
-      {commits.map((c) => (
-        <div key={c.sha} className="flex items-center gap-3 rounded-lg px-3 py-2" style={{ background: "var(--card)", border: "1px solid var(--border)" }}>
-          <span className="mono text-xs shrink-0" style={{ color: "var(--cyan)" }}>{c.sha.slice(0, 7)}</span>
-          <span className="flex-1 truncate text-sm" style={{ color: "var(--fg)" }}>{c.message.split("\n")[0]}</span>
-          <span className="text-xs shrink-0" style={{ color: "var(--dim)" }}>{c.author}</span>
-        </div>
-      ))}
+      {commits.map((c) => {
+        const first = c.message.split("\n")[0];
+        return (
+          <button
+            key={c.sha}
+            onClick={() => onSelect(c.sha, `${c.sha.slice(0, 7)} ${first}`)}
+            title="View this commit's diff"
+            className="group flex items-center gap-3 rounded-lg px-3 py-2 text-left w-full transition-colors"
+            style={{ background: "var(--card)", border: "1px solid var(--border)", cursor: "pointer" }}
+            onMouseEnter={(e) => (e.currentTarget.style.background = "var(--card-hover)")}
+            onMouseLeave={(e) => (e.currentTarget.style.background = "var(--card)")}
+          >
+            <span className="mono text-xs shrink-0" style={{ color: "var(--cyan)" }}>{c.sha.slice(0, 7)}</span>
+            <span className="flex-1 truncate text-sm" style={{ color: "var(--fg)" }}>{first}</span>
+            <span className="text-xs shrink-0" style={{ color: "var(--dim)" }}>{c.author}</span>
+            <span className="text-xs shrink-0 opacity-0 transition-opacity group-hover:opacity-100" style={{ color: "var(--accent)" }}>diff →</span>
+          </button>
+        );
+      })}
     </div>
   );
 }

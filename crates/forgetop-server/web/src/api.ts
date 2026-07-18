@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import type { ConnectionRow, HealthRow, LaunchpadResponse, NotifRow, PipeRef, PipelineDetail, PipeRow, Preferences, PrDetail, PrRef, ProviderInfo, PrRow, WiDetail, WiRef, WiRow } from "./types";
+import type { ConnectionRow, FileChange, HealthRow, LaunchpadResponse, NotifRow, PipeRef, PipelineDetail, PipeRow, Preferences, PrDetail, PrRef, ProviderInfo, PrRow, WiDetail, WiRef, WiRow } from "./types";
 
 // The session token arrives once in the URL (`/?t=…`). We stash it in sessionStorage (so a
 // refresh keeps working) and strip it from the visible URL, then replay it on every API call.
@@ -87,6 +87,17 @@ export const usePrDetail = (ref: PrRef | null) =>
     queryKey: ["pr-detail", ref?.conn, ref?.id],
     queryFn: () => api<PrDetail>(`/api/pr/detail?conn=${encodeURIComponent(ref!.conn)}&id=${encodeURIComponent(ref!.id)}`),
     enabled: !!ref,
+  });
+
+/** The files changed by a single commit on the PR (for the Commits → Files drill-in). */
+export const usePrCommitChanges = (ref: PrRef | null, sha: string | null) =>
+  useQuery({
+    queryKey: ["pr-commit-changes", ref?.conn, ref?.id, sha],
+    queryFn: () =>
+      api<FileChange[]>(
+        `/api/pr/commit-changes?conn=${encodeURIComponent(ref!.conn)}&id=${encodeURIComponent(ref!.id)}&sha=${encodeURIComponent(sha!)}`,
+      ),
+    enabled: !!ref && !!sha,
   });
 
 export const useWiDetail = (ref: WiRef | null) =>
