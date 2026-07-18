@@ -329,17 +329,18 @@ mark: **✓** approved, **✗** changes requested, **·** no vote yet. (These co
 review data — on GitHub/GitLab the votes are read from `/reviews` and `/approvals`, not just the
 requested-reviewer list, so an approver actually shows a tick.)
 
-**Inside the PR panel** (four tabs):
+**Inside the PR panel** (three tabs):
 
+- **Conversation** — the description, a **Timeline** of events (see below), the comment threads,
+  a box to add a comment, and **↳ Reply** on each thread.
+- **Commits** — one row per commit; click one to see its diff on the Files tab.
 - **Files** — the changed files with a **left-hand file list** you click between and a
   syntax-coloured diff; existing review comments render **inline beneath the line they're on**.
   Hover a line and click the **`+`** to write an inline comment, or click **↳ Reply** under any
   existing comment to answer it in-thread. Selecting a commit on the Commits tab scopes this to
   that commit's diff.
-- **Conversation** — the description, a **Timeline** of events (see below), the comment threads,
-  a box to add a comment, and **↳ Reply** on each thread.
-- **Commits** — one row per commit; click one to see its diff on the Files tab.
-- **Checks** — each named CI check with its status.
+
+Checks live on the action-bar badge (below), not a tab.
 
 The **Timeline** (newest first) shows who did what: approvals, change-requests, merges, state
 changes and comments — assembled from each provider's timeline/activity/history API (GitHub
