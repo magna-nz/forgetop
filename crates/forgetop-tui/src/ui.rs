@@ -1108,7 +1108,7 @@ fn base_footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
             if merged { vec![("R", "revert")] } else { vec![("a", "approve"), ("x", "reject"), ("m", "merge")] };
         return if v.tab == 3 {
             if v.diff.focus == DiffFocus::Patch {
-                let mut keys = vec![("↑↓", "line"), ("c", "comment")];
+                let mut keys = vec![("↑↓", "line"), ("]/[", "threads"), ("c", "comment"), ("r", "reply")];
                 if !v.pending.is_empty() {
                     keys.push(("s", "submit review"));
                 }
@@ -1128,7 +1128,7 @@ fn base_footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
         } else {
             let mut keys = vec![("←→", "tabs"), ("PgUp/Dn", "scroll")];
             keys.extend(acts_full);
-            keys.extend([("c", "comment"), ("o", "open"), ("Esc", "back")]);
+            keys.extend([("c", "comment"), ("r", "reply"), ("o", "open"), ("Esc", "back")]);
             keys
         };
     }
@@ -2319,6 +2319,7 @@ mod tests {
             },
             pending: vec![],
             review_draft: None,
+            reply_target: None,
         }
     }
 

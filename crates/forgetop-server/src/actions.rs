@@ -65,6 +65,14 @@ pub struct PrCommentReq {
 }
 
 #[derive(Deserialize)]
+pub struct PrReplyReq {
+    pub conn: String,
+    pub id: String,
+    pub thread_id: String,
+    pub body: String,
+}
+
+#[derive(Deserialize)]
 pub struct PrReviewReq {
     pub conn: String,
     pub id: String,
@@ -132,6 +140,11 @@ pub async fn pr_revert(sections: &SectionService, req: PrRevertReq) -> Result<()
 pub async fn pr_comment(sections: &SectionService, req: PrCommentReq) -> Result<(), ActionError> {
     let source = dto::pr_source(sections, &req.conn).await.ok_or(ActionError::NotFound)?;
     source.add_comment(&req.id, &req.body).await.map_err(failed)
+}
+
+pub async fn pr_reply(sections: &SectionService, req: PrReplyReq) -> Result<(), ActionError> {
+    let source = dto::pr_source(sections, &req.conn).await.ok_or(ActionError::NotFound)?;
+    source.reply_to_thread(&req.id, &req.thread_id, &req.body).await.map_err(failed)
 }
 
 pub async fn pr_review(sections: &SectionService, req: PrReviewReq) -> Result<(), ActionError> {

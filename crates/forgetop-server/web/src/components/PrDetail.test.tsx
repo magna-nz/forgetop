@@ -73,4 +73,34 @@ describe("PrDetail action bar", () => {
     expect(screen.getByRole("button", { name: "Request changes" })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Revert" })).not.toBeInTheDocument();
   });
+
+  it("replying to a conversation thread posts /api/pr/reply with the thread id", async () => {
+    const withThread = detail("Open");
+    withThread.threads = [
+      {
+        id: "t-42",
+        file_path: null,
+        line: null,
+        is_resolved: false,
+        comments: [{ id: "c1", author: { id: "bob", display_name: "Bob", handle: "bob", avatar_url: null }, body: "Nit here", created_at: null }],
+      },
+    ];
+    const { posts } = mockFetch({ get: { "/api/pr/detail": withThread } });
+    renderWithClient(
+      <PrDetailProvider>
+        <Opener conn="c" id="1450" />
+      </PrDetailProvider>,
+    );
+
+    // Open the reply box on the thread, type, and send.
+    await userEvent.click(await screen.findByRole("button", { name: "↳ Reply" }));
+    await userEvent.type(screen.getByPlaceholderText("Reply…"), "Good point");
+    await userEvent.click(screen.getByRole("button", { name: "Reply" }));
+
+    await waitFor(() => {
+      const reply = posts.find((p) => p.url.includes("/api/pr/reply"));
+      expect(reply).toBeTruthy();
+      expect(reply!.body).toMatchObject({ thread_id: "t-42", body: "Good point" });
+    });
+  });
 });

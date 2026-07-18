@@ -281,6 +281,8 @@ pub struct PrView {
     pub pending: Vec<LineComment>,
     /// Target line for a comment being typed (filled in with the body on submit).
     pub review_draft: Option<DraftComment>,
+    /// Thread id a reply is being typed against (`r`); the input body is posted to it on submit.
+    pub reply_target: Option<String>,
 }
 
 /// The file line a pending comment is being written against.
@@ -555,6 +557,17 @@ pub struct DiffView {
 impl DiffView {
     pub fn current(&self) -> Option<&FileChange> {
         self.files.get(self.selected)
+    }
+
+    /// The comment thread anchored at the current patch cursor line, if any — the target for `r`.
+    pub fn thread_at_cursor(&self) -> Option<&CommentThread> {
+        let file = self.current()?;
+        let patch = file.patch.as_deref()?;
+        let path = file.path.as_str();
+        self.threads.iter().find(|t| {
+            t.file_path.as_deref() == Some(path)
+                && t.line.and_then(|l| crate::diff::patch_line_for_source_line(patch, l)) == Some(self.cursor)
+        })
     }
 
     /// Number of lines in the current file's patch (0 if none).
@@ -2005,6 +2018,7 @@ impl App {
             diff,
             pending: Vec::new(),
             review_draft: None,
+            reply_target: None,
         }));
     }
 
@@ -2030,6 +2044,40 @@ impl App {
                 self.overlay = Some(Overlay::Input { title, buffer: String::new(), kind: InputKind::PrLineComment });
             }
             None => self.toast = Some("Move to a code line to comment (not a hunk header)".into()),
+        }
+    }
+
+    /// Opens a reply to an existing thread: the one under the diff cursor (Diff tab), or the sole
+    /// conversation thread (Conversation tab). Stashes its id on `reply_target` for the submit.
+    fn open_thread_reply(&mut self) {
+        // Resolve the target id (or an error message) under an immutable borrow, then mutate.
+        let target: Result<String, &'static str> = {
+            let Screen::PrView(v) = &self.screen else { return };
+            match v.tab {
+                3 => v
+                    .diff
+                    .thread_at_cursor()
+                    .map(|t| t.id.clone())
+                    .ok_or("Move onto a comment thread first (] / [ to jump), then r to reply"),
+                0 => {
+                    let general: Vec<&CommentThread> = v.diff.threads.iter().filter(|t| t.file_path.is_none()).collect();
+                    match general.as_slice() {
+                        [t] => Ok(t.id.clone()),
+                        [] => Err("No comment thread to reply to — press c to add a comment"),
+                        _ => Err("Multiple threads — reply from the Diff tab (] / [ to a thread, then r)"),
+                    }
+                }
+                _ => Err("Switch to the Conversation or Diff tab to reply to a comment"),
+            }
+        };
+        match target {
+            Ok(thread_id) => {
+                if let Screen::PrView(v) = &mut self.screen {
+                    v.reply_target = Some(thread_id);
+                }
+                self.overlay = Some(Overlay::Input { title: "Reply to thread".into(), buffer: String::new(), kind: InputKind::PrThreadReply });
+            }
+            Err(msg) => self.toast = Some(msg.into()),
         }
     }
 
@@ -2243,6 +2291,11 @@ impl App {
                 // On a diff patch line this buffers a line comment; elsewhere it's a
                 // plain PR comment.
                 self.open_line_comment();
+                return;
+            }
+            Key::Char('r') => {
+                // Reply to an existing thread (under the diff cursor, or the sole conversation thread).
+                self.open_thread_reply();
                 return;
             }
             Key::Char('s') => {
@@ -3218,7 +3271,9 @@ impl App {
 
     async fn execute_action(&mut self, action: Action, deps: &AppDeps) {
         match action {
-            Action::PrVote(_) | Action::PrMerge(_) | Action::PrRevert | Action::PrComment(_) => self.execute_pr_action(action, deps).await,
+            Action::PrVote(_) | Action::PrMerge(_) | Action::PrRevert | Action::PrComment(_) | Action::PrReply(_) => {
+                self.execute_pr_action(action, deps).await
+            }
             Action::WiSetState(_) | Action::WiComment(_) => self.execute_wi_action(action, deps).await,
             Action::PipelineTrigger { .. } => self.execute_pipeline_action(action, deps).await,
             Action::RemoveConnection { .. } => self.execute_config_action(action, deps).await,
@@ -3275,6 +3330,21 @@ impl App {
                 }
                 source.add_comment(&id, text).await.map(|_| "Comment added".to_string())
             }
+            Action::PrReply(text) => {
+                if text.trim().is_empty() {
+                    self.toast = Some("Empty reply — nothing sent".into());
+                    return;
+                }
+                let thread_id = match &self.screen {
+                    Screen::PrView(v) => v.reply_target.clone(),
+                    _ => None,
+                };
+                let Some(thread_id) = thread_id else {
+                    self.toast = Some("No thread selected to reply to".into());
+                    return;
+                };
+                source.reply_to_thread(&id, &thread_id, text).await.map(|_| "Reply posted".to_string())
+            }
             _ => return,
         };
 
@@ -3295,6 +3365,7 @@ impl App {
                             v.pr = pr;
                         }
                         v.diff.threads = threads;
+                        v.reply_target = None;
                     }
                 }
                 let mut errors = Vec::new();
@@ -4870,6 +4941,17 @@ mod tests {
     }
 
     #[test]
+    fn diff_thread_at_cursor_matches_only_on_the_anchored_line() {
+        // new-side line 21 (added) sits at patch index 2.
+        let mut d = diff(vec![changed("a.rs", Some("@@ -10,3 +20,4 @@\n ctx\n+added\n-removed"))]);
+        d.threads = vec![CommentThread { id: "t7".into(), comments: vec![], file_path: Some("a.rs".into()), line: Some(21), is_resolved: false }];
+        d.cursor = 0;
+        assert!(d.thread_at_cursor().is_none(), "cursor not on the thread's line");
+        d.cursor = 2;
+        assert_eq!(d.thread_at_cursor().map(|t| t.id.as_str()), Some("t7"), "cursor on the anchored line finds it");
+    }
+
+    #[test]
     fn commit_diff_scope_restores_whole_pr() {
         let mut d = diff(vec![changed("b.rs", Some("@@ -1 +1 @@\n-p\n+q"))]);
         d.selected = 0;
@@ -4891,6 +4973,7 @@ mod tests {
             diff: d,
             pending: vec![],
             review_draft: None,
+            reply_target: None,
         };
 
         v.reset_diff_scope();
@@ -4921,6 +5004,7 @@ mod tests {
                 diff: diff(vec![]),
                 pending: vec![],
                 review_draft: None,
+                reply_target: None,
             }))
         };
 
@@ -4975,6 +5059,7 @@ mod tests {
             diff: diff(vec![changed("a.rs", Some("@@ -1 +1 @@\n-x\n+y"))]),
             pending: vec![],
             review_draft: Some(DraftComment { path: "a.rs".into(), line: 5, side: DiffSide::New }),
+            reply_target: None,
         }));
 
         app.add_line_comment("looks off".into());
@@ -5013,6 +5098,7 @@ mod tests {
             diff: diff(vec![]),
             pending: vec![],
             review_draft: None,
+            reply_target: None,
         }));
 
         app.open_pr_vote(ReviewVote::Approved);
@@ -5040,6 +5126,7 @@ mod tests {
             diff: diff(vec![]),
             pending,
             review_draft: None,
+            reply_target: None,
         }))
     }
 
@@ -5132,6 +5219,7 @@ mod tests {
             },
             pending: vec![],
             review_draft: None,
+            reply_target: None,
         }));
         assert_eq!(app.selected_url().as_deref(), Some("http://prview"));
     }

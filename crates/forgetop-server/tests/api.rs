@@ -522,6 +522,53 @@ async fn pr_revert_endpoint_reaches_the_provider() {
 }
 
 #[tokio::test]
+async fn pr_reply_posts_into_the_target_thread() {
+    let server = spawn(demo_deps(true).await, 0).await.expect("server binds");
+    let base = format!("http://127.0.0.1:{}", server.port);
+    let client = reqwest::Client::new();
+    let tok = server.token.clone();
+
+    // Pick a PR and one of its existing threads.
+    let prs: serde_json::Value =
+        client.get(format!("{base}/api/pull-requests")).header("x-forgetop-token", &tok).send().await.unwrap().json().await.unwrap();
+    let pr = &prs[0];
+    let conn = pr["connection_id"].as_str().unwrap();
+    let id = pr["pull_request"]["id"].as_str().unwrap();
+    let detail_url = format!("{base}/api/pr/detail?conn={conn}&id={id}");
+    let detail: serde_json::Value = client.get(&detail_url).header("x-forgetop-token", &tok).send().await.unwrap().json().await.unwrap();
+    let thread_id = detail["threads"][0]["id"].as_str().expect("a thread to reply to").to_string();
+
+    // Reply into that thread.
+    let reply = client
+        .post(format!("{base}/api/pr/reply"))
+        .header("x-forgetop-token", &tok)
+        .json(&serde_json::json!({ "conn": conn, "id": id, "thread_id": thread_id, "body": "threaded reply" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reply.status(), 200);
+    assert_eq!(reply.json::<serde_json::Value>().await.unwrap()["ok"], true);
+
+    // The reply comes back appended to the *same* thread it targeted.
+    let after: serde_json::Value = client.get(&detail_url).header("x-forgetop-token", &tok).send().await.unwrap().json().await.unwrap();
+    let in_thread = after["threads"].as_array().unwrap().iter().any(|t| {
+        t["id"].as_str() == Some(thread_id.as_str())
+            && t["comments"].as_array().map(|c| c.iter().any(|x| x["body"] == "threaded reply")).unwrap_or(false)
+    });
+    assert!(in_thread, "the reply lands inside the thread it was posted to");
+
+    // An unknown connection is a 404, not a 500.
+    let missing = client
+        .post(format!("{base}/api/pr/reply"))
+        .header("x-forgetop-token", &tok)
+        .json(&serde_json::json!({ "conn": "nope", "id": id, "thread_id": thread_id, "body": "x" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), 404);
+}
+
+#[tokio::test]
 async fn notifications_carry_drill_in_targets_and_mark_read() {
     let server = spawn(demo_deps(true).await, 0).await.expect("server binds");
     let base = format!("http://127.0.0.1:{}", server.port);
