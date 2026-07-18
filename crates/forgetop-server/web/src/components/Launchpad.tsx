@@ -149,7 +149,8 @@ function BucketGroup({ group, more }: { group: Group; more: LaunchpadMore }) {
 }
 
 function ItemRow({ row, index, muted }: { row: LaunchpadRow; index: number; muted: boolean }) {
-  const { dot, spin, title, meta } = describe(row);
+  const { title, meta } = describe(row);
+  const badge = statusBadge(row);
   const openPr = usePrOpener();
   const openWi = useWiOpener();
   const openPipe = usePipelineOpener();
@@ -171,9 +172,7 @@ function ItemRow({ row, index, muted }: { row: LaunchpadRow; index: number; mute
   };
   const inner = (
     <>
-      <span className={"shrink-0 " + (spin ? "spin" : "")} style={{ color: dot.color }}>
-        {dot.icon}
-      </span>
+      <StatusBadge label={badge.label} color={badge.color} />
       <div className="flex-1 min-w-0">
         <div className="truncate text-sm" style={{ color: "var(--fg)" }}>
           {title}
@@ -199,19 +198,11 @@ function ItemRow({ row, index, muted }: { row: LaunchpadRow; index: number; mute
   );
 }
 
-function describe(row: LaunchpadRow): {
-  dot: { icon: string; color: string };
-  spin: boolean;
-  title: string;
-  meta: string;
-} {
+function describe(row: LaunchpadRow): { title: string; meta: string } {
   if (row.kind === "pr") {
     const pr = row.pull_request;
-    const s = prStatusMeta(pr);
     const c = pr.checks !== "None" ? ` · ${checkMeta(pr.checks).label}` : "";
     return {
-      dot: { icon: s.icon, color: s.color },
-      spin: pr.checks === "Pending",
       title: pr.title,
       meta: `${pr.number != null ? "#" + pr.number : ""}${relativeTime(pr.updated_at) ? " · " + relativeTime(pr.updated_at) : ""}${c}`,
     };
@@ -219,21 +210,52 @@ function describe(row: LaunchpadRow): {
   if (row.kind === "wi") {
     const wi = row.work_item;
     return {
-      dot: { icon: "●", color: wiStateColor(wi.state, wi.state_category) },
-      spin: false,
       title: wi.title,
       meta: `${wi.identifier ?? ""}${relativeTime(wi.updated_at) ? " · " + relativeTime(wi.updated_at) : ""}`,
     };
   }
   const run = row.run;
-  const m = pipeMeta(run.status);
   const label = run.name ?? (run.number != null ? `#${run.number}` : run.definition_id);
   return {
-    dot: { icon: m.icon, color: m.color },
-    spin: m.running,
     title: row.definition_name ? `${row.definition_name} · ${label}` : label,
     meta: `${run.branch ?? ""}${relativeTime(run.finished_at ?? run.started_at) ? " · " + relativeTime(run.finished_at ?? run.started_at) : ""}`,
   };
+}
+
+const capitalize = (s: string): string => (s.length ? s[0].toUpperCase() + s.slice(1) : s);
+
+/** The status word + colour shown on each Command Center row, replacing the old status dot.
+ *  PRs → Open/Merged/Closed/Draft, work items → their state, pipelines → Running/Queued/…
+ *  with a failed run reading as "Error". Colours reuse the shared status model. */
+function statusBadge(row: LaunchpadRow): { label: string; color: string } {
+  if (row.kind === "pr") {
+    const s = prStatusMeta(row.pull_request);
+    return { label: capitalize(s.label), color: s.color };
+  }
+  if (row.kind === "wi") {
+    const wi = row.work_item;
+    return { label: wi.state, color: wiStateColor(wi.state, wi.state_category) };
+  }
+  const m = pipeMeta(row.run.status);
+  return { label: row.run.status === "Failed" ? "Error" : capitalize(m.label), color: m.color };
+}
+
+/** Uniform status chip used across every Command Center row so they read as one set —
+ *  tinted by the status colour, shaped like the work-items "[Bug]" chip. Command Center only;
+ *  the list views (Pull Requests, Work Items, Pipelines) keep their status dots for now. */
+function StatusBadge({ label, color }: { label: string; color: string }) {
+  return (
+    <span
+      className="inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium whitespace-nowrap shrink-0"
+      style={{
+        color,
+        background: `color-mix(in srgb, ${color} 12%, transparent)`,
+        border: `1px solid color-mix(in srgb, ${color} 30%, transparent)`,
+      }}
+    >
+      {label}
+    </span>
+  );
 }
 
 function rowId(row: LaunchpadRow): string {
