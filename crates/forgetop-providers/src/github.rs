@@ -248,6 +248,29 @@ fn unknown_user() -> User {
     User { id: "unknown".into(), display_name: "unknown".into(), handle: None, avatar_url: None }
 }
 
+/// Fold each reviewer's latest APPROVED / CHANGES_REQUESTED review into the reviewers list,
+/// updating people already listed and adding those who reviewed without being requested.
+fn merge_review_votes(reviewers: &mut Vec<Reviewer>, reviews: &[Value]) {
+    use std::collections::HashMap;
+    let mut latest: HashMap<String, (User, ReviewVote)> = HashMap::new();
+    for r in reviews {
+        let Some(uobj) = get_obj(r, "user") else { continue };
+        let vote = match get_str(r, "state").as_deref() {
+            Some("APPROVED") => ReviewVote::Approved,
+            Some("CHANGES_REQUESTED") => ReviewVote::Rejected,
+            _ => continue, // COMMENTED / DISMISSED don't set a standing vote
+        };
+        let user = map_user(uobj);
+        latest.insert(user.id.clone(), (user, vote)); // reviews are chronological — last wins
+    }
+    for (uid, (user, vote)) in latest {
+        match reviewers.iter_mut().find(|r| r.user.id == uid) {
+            Some(r) => r.vote = vote,
+            None => reviewers.push(Reviewer { user, vote, is_required: false }),
+        }
+    }
+}
+
 /// A PR review (`GET /pulls/{id}/reviews`) → a timeline event (approval / changes / review).
 fn map_gh_review(v: &Value) -> Option<TimelineEvent> {
     let (kind, summary) = match get_str(v, "state").as_deref() {
@@ -508,7 +531,13 @@ impl PullRequestSource for GitHubPr {
     }
     async fn get(&self, id: &str) -> Result<PullRequest> {
         let v = self.0.get_json(&self.0.repo_path(&format!("/pulls/{id}"))).await?;
-        Ok(map_pull_request(&v))
+        let mut pr = map_pull_request(&v);
+        // `requested_reviewers` only lists people who *haven't* reviewed yet, so merge the actual
+        // review votes in — otherwise an approver shows no tick in the reviewers list.
+        if let Ok(reviews) = self.0.get_json(&self.0.repo_path(&format!("/pulls/{id}/reviews?per_page=100"))).await {
+            merge_review_votes(&mut pr.reviewers, reviews.as_array().unwrap_or(&vec![]));
+        }
+        Ok(pr)
     }
     async fn threads(&self, id: &str) -> Result<Vec<CommentThread>> {
         // The PR conversation is flat issue comments (one bundled thread; GitHub has no reply API

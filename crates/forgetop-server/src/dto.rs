@@ -6,7 +6,7 @@ use std::sync::Arc;
 use forgetop_core::config::PipelineSubscription;
 use forgetop_core::domain::{
     CheckRun, CommentThread, Commit, FileChange, Notification, PipelineApproval, PipelineRun, PipelineRunStatus,
-    ProviderType, PullRequest, PullRequestStatus, TimelineEvent, WorkItem,
+    ProviderType, PullRequest, PullRequestStatus, TimelineEvent, TimelineEventKind, WorkItem,
 };
 use forgetop_core::launchpad::{self, EntryItem, PipeInput, PrInput, WiInput};
 use forgetop_core::provider::{
@@ -383,14 +383,34 @@ pub async fn pr_source(sections: &SectionService, conn: &str) -> Option<Arc<dyn 
         .map(|f| f.source)
 }
 
+/// Fold each conversation comment into the timeline as a lightweight "commented" event, so the
+/// activity feed is complete (the provider timelines carry actions, not comments). Inline diff
+/// comments are skipped — those belong to code review, shown on the diff. Sorted oldest → newest.
+fn with_comment_events(mut timeline: Vec<TimelineEvent>, threads: &[CommentThread]) -> Vec<TimelineEvent> {
+    for t in threads.iter().filter(|t| t.file_path.is_none()) {
+        for c in &t.comments {
+            timeline.push(TimelineEvent {
+                actor: Some(c.author.clone()),
+                kind: TimelineEventKind::Commented,
+                summary: "commented".into(),
+                at: c.created_at,
+            });
+        }
+    }
+    timeline.sort_by(|a, b| a.at.cmp(&b.at));
+    timeline
+}
+
 pub async fn pr_detail(sections: &SectionService, conn: &str, id: &str) -> Option<PrDetail> {
     let source = pr_source(sections, conn).await?;
     let pull_request = source.get(id).await.ok()?;
     // The detail extras are best-effort: a provider that doesn't expose one just yields empties.
+    let threads = source.threads(id).await.unwrap_or_default();
+    let timeline = with_comment_events(source.timeline(id).await.unwrap_or_default(), &threads);
     Some(PrDetail {
         pull_request,
-        threads: source.threads(id).await.unwrap_or_default(),
-        timeline: source.timeline(id).await.unwrap_or_default(),
+        threads,
+        timeline,
         changes: source.changes(id).await.unwrap_or_default(),
         checks: source.checks(id).await.unwrap_or_default(),
         commits: source.commits(id).await.unwrap_or_default(),
@@ -428,11 +448,9 @@ pub async fn wi_detail(sections: &SectionService, conn: &str, id: &str) -> Optio
     let source = wi_source(sections, conn).await?;
     let work_item = source.get(id).await.ok()?;
     // Comments are best-effort: a provider that doesn't expose them just yields empties.
-    Some(WiDetail {
-        work_item,
-        threads: source.threads(id).await.unwrap_or_default(),
-        timeline: source.timeline(id).await.unwrap_or_default(),
-    })
+    let threads = source.threads(id).await.unwrap_or_default();
+    let timeline = with_comment_events(source.timeline(id).await.unwrap_or_default(), &threads);
+    Some(WiDetail { work_item, threads, timeline })
 }
 
 // ---- pipeline detail ----

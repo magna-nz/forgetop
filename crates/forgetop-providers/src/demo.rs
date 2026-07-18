@@ -172,7 +172,7 @@ fn github_prs() -> Vec<PullRequest> {
         // Needs fixing: yours, CI red.
         pr(1492, "Bump Next.js to 14.2.5", me(), PS::Open, CS::Failed, MS::Blocked, vec![rev(bob(), RV::NoVote)], 40, 12, 5, "chore/next-14-2-5", &["frontend", "dependencies"]),
         // Needs your review: a teammate's PR, you're a reviewer.
-        pr(1501, "Refactor the webhook retry queue", bob(), PS::Open, CS::Passed, MS::Mergeable, vec![rev(me(), RV::NoVote), rev(alice(), RV::Approved)], 210, 64, 4, "refactor/webhook-retry", &["reliability"]),
+        pr(1501, "Refactor the webhook retry queue", bob(), PS::Open, CS::Passed, MS::Mergeable, vec![rev(alice(), RV::Approved), rev(carol(), RV::Rejected), rev(me(), RV::NoVote)], 210, 64, 4, "refactor/webhook-retry", &["reliability"]),
         pr(1495, "Tighten CORS on the admin API", carol(), PS::Open, CS::Passed, MS::Mergeable, vec![rev(me(), RV::NoVote)], 18, 6, 9, "security/admin-cors", &["security"]),
         // Draft (yours).
         pr(1476, "Checkout redesign", me(), PS::Draft, CS::Pending, MS::Blocked, vec![], 88, 20, 26, "feat/checkout-redesign", &["frontend", "wip"]),
@@ -571,6 +571,19 @@ impl PullRequestSource for DemoPr {
                 line: Some(13),
                 is_resolved: true,
             },
+            // A general (conversation) comment — no file — so it also shows in the timeline.
+            CommentThread {
+                id: "t3".into(),
+                comments: vec![Comment {
+                    id: "c3".into(),
+                    author: dev(),
+                    body: "Thanks for the quick turnaround on this.".into(),
+                    created_at: Some(base() - chrono::Duration::hours(2)),
+                }],
+                file_path: None,
+                line: None,
+                is_resolved: false,
+            },
         ];
         // Include anything submitted this session so it persists like a real provider.
         if let Some(extra) = submitted_threads().lock().unwrap().get(id) {
@@ -587,23 +600,29 @@ impl PullRequestSource for DemoPr {
     }
     async fn timeline(&self, id: &str) -> Result<Vec<TimelineEvent>> {
         use TimelineEventKind as K;
-        let ev = |actor: User, kind: K, summary: &str, hrs: i64| TimelineEvent {
-            actor: Some(actor),
-            kind,
-            summary: summary.into(),
-            at: Some(base() - chrono::Duration::hours(hrs)),
-        };
-        let mut events = vec![
-            ev(bob(), K::ChangesRequested, "requested changes on the retry maths", 6),
-            ev(alice(), K::Commented, "left a comment", 4),
-            ev(alice(), K::Approved, "approved these changes", 1),
-        ];
-        // Reflect actions taken this session, like re-fetching after acting.
+        let mut events = Vec::new();
+        // Derive review events from the PR's actual reviewers, so the timeline matches the
+        // Reviewers panel exactly (comment events are added from the threads by the server).
+        if let Some(pr) = prs_for(&self.conn).into_iter().find(|p| p.id == id) {
+            for (i, r) in pr.reviewers.iter().enumerate() {
+                let at = Some(base() - chrono::Duration::hours(6 - i as i64));
+                match r.vote {
+                    ReviewVote::Approved | ReviewVote::ApprovedWithSuggestions => {
+                        events.push(TimelineEvent { actor: Some(r.user.clone()), kind: K::Approved, summary: "approved these changes".into(), at });
+                    }
+                    ReviewVote::Rejected => {
+                        events.push(TimelineEvent { actor: Some(r.user.clone()), kind: K::ChangesRequested, summary: "requested changes".into(), at });
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // Actions taken this session, like re-fetching after acting.
         if changes_requested_prs().lock().unwrap().contains(id) {
-            events.push(ev(me(), K::ChangesRequested, "requested changes", 0));
+            events.push(TimelineEvent { actor: Some(me()), kind: K::ChangesRequested, summary: "requested changes".into(), at: Some(base()) });
         }
         if merged_prs().lock().unwrap().contains(id) {
-            events.push(ev(me(), K::Merged, "merged this pull request", 0));
+            events.push(TimelineEvent { actor: Some(me()), kind: K::Merged, summary: "merged this pull request".into(), at: Some(base()) });
         }
         Ok(events)
     }
@@ -834,7 +853,6 @@ impl WorkItemSource for DemoWi {
         Ok(vec![
             ev(bob(), K::Assigned, "assigned this to Priya Nair", 30),
             ev(alice(), K::StateChanged, "moved this to In Progress", 26),
-            ev(alice(), K::Commented, "left a comment", 5),
         ])
     }
     async fn set_state(&self, _id: &str, _state: &str) -> Result<()> {

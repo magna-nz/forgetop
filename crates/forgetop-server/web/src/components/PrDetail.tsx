@@ -163,7 +163,7 @@ function PrDetailPanel({ prRef, onClose }: { prRef: PrRef; onClose: () => void }
 
         {pr && data && (
           <>
-            <MetaBar author={pr.author.display_name} />
+            <MetaBar author={pr.author.display_name} reviewers={pr.reviewers} />
 
             {/* tabs */}
             <div className="flex items-center gap-1 px-4 shrink-0" style={{ borderBottom: "1px solid var(--border)" }}>
@@ -207,7 +207,6 @@ function PrDetailPanel({ prRef, onClose }: { prRef: PrRef; onClose: () => void }
                 <ConversationTab
                   threads={data.threads}
                   description={pr.description}
-                  reviewers={pr.reviewers}
                   timeline={data.timeline}
                   busy={busy}
                   onReply={reply}
@@ -305,45 +304,40 @@ function ActionButton({
   );
 }
 
-function MetaBar({ author }: { author: string }) {
+/** The header meta bar: who opened the PR + the reviewers with their vote marks (✓ / ✗ / ·). */
+function MetaBar({ author, reviewers }: { author: string; reviewers: Reviewer[] }) {
   return (
-    <div className="flex items-center gap-x-4 px-5 py-2.5 text-xs shrink-0" style={{ borderBottom: "1px solid var(--border)", color: "var(--dim)" }}>
+    <div className="flex items-center gap-x-5 gap-y-1 px-5 py-2.5 flex-wrap text-xs shrink-0" style={{ borderBottom: "1px solid var(--border)", color: "var(--dim)" }}>
       <span className="flex items-center gap-1.5">
-        <Avatar name={author} size={18} /> opened by {author}
+        <Avatar name={author} size={18} /> opened by <span style={{ color: "var(--fg)" }}>{author}</span>
       </span>
+      {reviewers.length > 0 && (
+        <span className="flex items-center gap-x-3 gap-y-1 flex-wrap">
+          <span className="uppercase tracking-wider text-[10px]">Reviewers</span>
+          {reviewers.map((r, i) => {
+            const v = voteMeta(r.vote);
+            return (
+              <span key={i} className="flex items-center gap-1" title={`${r.user.display_name} — ${v.label}`}>
+                <span className="w-3 text-center" style={{ color: r.vote === "NoVote" ? "var(--dim)" : v.color }}>{r.vote === "NoVote" ? "·" : v.icon}</span>
+                <span style={{ color: "var(--fg)" }}>{r.user.display_name}</span>
+              </span>
+            );
+          })}
+        </span>
+      )}
     </div>
   );
 }
 
-/** The reviewers list shown beside the description: a vote mark (✓ / ✗ / none) + name. */
-function ReviewersPanel({ reviewers }: { reviewers: Reviewer[] }) {
-  return (
-    <aside className="shrink-0 w-44 rounded-lg p-3 flex flex-col gap-2" style={{ background: "var(--card)", border: "1px solid var(--border)" }}>
-      <div className="text-[11px] font-semibold uppercase tracking-wider" style={{ color: "var(--dim)" }}>
-        Reviewers
-      </div>
-      {reviewers.map((r, i) => {
-        const v = voteMeta(r.vote);
-        return (
-          <div key={i} className="flex items-center gap-2 text-xs" title={`${r.user.display_name} — ${v.label}`}>
-            <span className="shrink-0 w-3 text-center" style={{ color: v.color }}>{r.vote === "NoVote" ? "" : v.icon}</span>
-            <Avatar name={r.user.display_name} size={16} />
-            <span className="truncate" style={{ color: "var(--fg)" }}>{r.user.display_name}</span>
-          </div>
-        );
-      })}
-    </aside>
-  );
-}
-
-/** The event timeline (approvals, merges, state changes, …), shown before the comments. */
+/** The event timeline (approvals, merges, comments, state changes, …), newest first. */
 function Timeline({ events }: { events: TimelineEvent[] }) {
+  const ordered = [...events].reverse(); // events arrive oldest→newest; show newest at the top
   return (
     <div className="rounded-lg p-3 flex flex-col gap-1.5" style={{ background: "var(--card)", border: "1px solid var(--border)" }}>
       <div className="text-[11px] font-semibold uppercase tracking-wider mb-0.5" style={{ color: "var(--dim)" }}>
         Timeline
       </div>
-      {events.map((e, i) => {
+      {ordered.map((e, i) => {
         const m = timelineMeta(e.kind);
         return (
           <div key={i} className="flex items-center gap-2 text-xs">
@@ -689,7 +683,6 @@ function PendingBox({ body, onRemove }: { body: string; onRemove: () => void }) 
 function ConversationTab({
   threads,
   description,
-  reviewers,
   timeline,
   busy,
   onReply,
@@ -697,7 +690,6 @@ function ConversationTab({
 }: {
   threads: CommentThread[];
   description?: string | null;
-  reviewers: Reviewer[];
   timeline: TimelineEvent[];
   busy: boolean;
   onReply: (threadId: string, body: string) => void;
@@ -706,20 +698,12 @@ function ConversationTab({
   const [draft, setDraft] = useState("");
   const general = threads.filter((t) => !t.file_path);
   return (
-    <div className="p-4 flex flex-col gap-3 max-w-4xl">
-      {/* description with the reviewers listed to its right */}
-      <div className="flex gap-4 items-start">
-        <div className="flex-1 min-w-0">
-          {description ? (
-            <div className="rounded-lg p-3 text-sm whitespace-pre-wrap" style={{ background: "var(--card)", border: "1px solid var(--border)", color: "var(--fg)" }}>
-              {description}
-            </div>
-          ) : (
-            <div className="text-sm" style={{ color: "var(--dim)" }}>No description.</div>
-          )}
+    <div className="p-4 flex flex-col gap-3 max-w-3xl">
+      {description && (
+        <div className="rounded-lg p-3 text-sm whitespace-pre-wrap" style={{ background: "var(--card)", border: "1px solid var(--border)", color: "var(--fg)" }}>
+          {description}
         </div>
-        {reviewers.length > 0 && <ReviewersPanel reviewers={reviewers} />}
-      </div>
+      )}
       {timeline.length > 0 && <Timeline events={timeline} />}
       {general.length === 0 && <Empty text="No comments yet." />}
       {general.map((t) => (

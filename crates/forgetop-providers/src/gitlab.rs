@@ -437,7 +437,18 @@ impl PullRequestSource for GitLabPr {
     }
     async fn get(&self, id: &str) -> Result<PullRequest> {
         let v = self.0.get_json(&self.0.project_path(&format!("/merge_requests/{id}"))).await?;
-        Ok(map_merge_request(&v))
+        let mut pr = map_merge_request(&v);
+        // The `reviewers` field carries no vote; fold in `approved_by` so approvers show a tick.
+        if let Ok(approvals) = self.0.get_json(&self.0.project_path(&format!("/merge_requests/{id}/approvals"))).await {
+            for a in get_arr(&approvals, "approved_by") {
+                let Some(user) = get_obj(a, "user").map(map_user) else { continue };
+                match pr.reviewers.iter_mut().find(|r| r.user.id == user.id) {
+                    Some(r) => r.vote = ReviewVote::Approved,
+                    None => pr.reviewers.push(Reviewer { user, vote: ReviewVote::Approved, is_required: false }),
+                }
+            }
+        }
+        Ok(pr)
     }
     async fn threads(&self, id: &str) -> Result<Vec<CommentThread>> {
         // Discussions (not flat notes) so each thread carries its discussion id for replies.
