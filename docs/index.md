@@ -78,9 +78,10 @@ html[data-surface="tui"] .surface-dash{display:none}
   PRs, change work-item states, trigger pipeline runs — all from the keyboard.
 - **Real code review** — a full-screen PR view with Conversation, Commits, Checks,
   and Diff tabs; **syntax-highlighted** diffs grouped by directory, per-file
-  **viewed** checkboxes, thread jump-navigation, a line cursor in the patch; and
+  **viewed** checkboxes, thread jump-navigation, a line cursor in the patch;
   **inline line comments buffered locally then submitted as one review**
-  (Comment / Approve / Request changes).
+  (Comment / Approve / Request changes); and **replying in-thread** to someone
+  else's comment.
 - **Pipeline drill-in** — expand stages → jobs → steps with per-node **durations**,
   **failure reasons**, a scrollable **logs** pane, and open-in-browser.
 - **Pipeline approvals** — see which runs are blocked on a gate you can action
@@ -326,8 +327,9 @@ action lives inside the PR panel.
 
 - **Files** — the changed files with a syntax-coloured diff; existing review comments render
   **inline beneath the line they're on**. Hover a line and click the **`+`** to write an
-  inline comment.
-- **Conversation** — the description plus comment threads, and a box to add a comment.
+  inline comment, or click **↳ Reply** under any existing comment to answer it in-thread.
+- **Conversation** — the description plus comment threads, a box to add a comment, and **↳ Reply**
+  on each thread to respond to someone else's comment.
 - **Commits** — one row per commit.
 
 The header has an **↗ open-in-provider** link; the action bar has **Approve**, **Request
@@ -345,6 +347,17 @@ forgetop asks before discarding them.
 - **GitLab** posts positioned discussions (and approves if you chose Approve).
 - **Azure DevOps / Bitbucket** don't expose inline patches, so line comments aren't
   available there — use the Conversation tab.
+
+### Replying to a comment
+
+Click **↳ Reply** under any comment to answer it **in-thread** rather than starting a new
+top-level comment. forgetop uses each provider's real reply API:
+
+- **Azure DevOps** and **GitLab** (discussions) nest the reply under the original comment.
+- **Bitbucket** replies to the root comment of the thread.
+- **GitHub** review (diff-line) threads get a native threaded reply. A GitHub PR
+  **conversation** comment is flat — GitHub has no reply API for it — so a reply there posts
+  a new conversation comment.
 
 </div>
 
@@ -374,7 +387,7 @@ write action lives inside the PR view.
   line-by-line; the title shows the real file line).
 
 Write actions from the view: `a` approve, `x` request changes, `m` merge (pick a
-strategy), `c` comment, `o` open in browser.
+strategy), `c` comment, `r` reply to a thread, `o` open in browser.
 
 #### Reading the diff
 
@@ -387,8 +400,9 @@ strategy), `c` comment, `o` open in browser.
   is easier to scan.
 - **Inline comment threads** — existing review comments render **inline in the diff,
   beneath the line they're on** (a left bar: accent = open, dim = resolved), so you read
-  them in context instead of a side list. **`[`** / **`]`** jump the cursor between them.
-  (Unanchored / PR-level comments stay on the Conversation tab.)
+  them in context instead of a side list. **`[`** / **`]`** jump the cursor between them,
+  and **`r`** replies to the thread under the cursor **in-thread**. (Unanchored / PR-level
+  comments stay on the Conversation tab, where **`r`** replies to the thread there.)
 
 #### Reviewing code with line comments
 
@@ -749,6 +763,8 @@ the keys valid for where you are. Press `?` for the full panel. The complete set
 | `a` / `x` | Approve / request changes |
 | `m` | Merge (choose strategy) |
 | `c` | Comment (inline on a diff line, otherwise the PR) |
+| `[` / `]` (Diff line cursor) | Jump between existing comment threads |
+| `r` | Reply to a comment thread (under the diff cursor, or the Conversation thread) |
 | `Enter` (Commits) | Drill into that commit's diff |
 | `Enter` (Diff, on a file) | Line cursor within the patch |
 | `s` | Submit buffered line comments as one review |

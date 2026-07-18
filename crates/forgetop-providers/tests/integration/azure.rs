@@ -44,6 +44,15 @@ async fn azure_pull_request_lifecycle() {
     let threads = prs.threads(&id).await.expect("threads");
     assert!(threads.iter().any(|t| t.comments.iter().any(|c| c.body.contains(prefix))), "comment shows in threads");
 
+    // Reply into that thread; the reply comes back nested in the same thread.
+    let thread_id = threads.iter().find(|t| t.comments.iter().any(|c| c.body.contains(prefix))).expect("our thread").id.clone();
+    prs.reply_to_thread(&id, &thread_id, &format!("{prefix} reply")).await.expect("reply to thread");
+    let after = prs.threads(&id).await.expect("threads after reply");
+    assert!(
+        after.iter().any(|t| t.id == thread_id && t.comments.iter().any(|c| c.body.contains(&format!("{prefix} reply")))),
+        "the reply lands in the thread it targeted"
+    );
+
     // Merge via the adapter (retry: Azure needs a moment to compute mergeability).
     let merged = harness::poll(harness::POLL_MERGE, || async {
         if prs.merge(&id, &MergeOptions { strategy: MergeStrategy::Squash, delete_source_ref: true }).await.is_ok() {

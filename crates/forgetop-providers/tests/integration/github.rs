@@ -92,6 +92,16 @@ async fn github_pull_request_lifecycle() {
         "the posted comment appears in the PR threads"
     );
 
+    // Reply into that thread. A GitHub PR *conversation* is flat (no reply API), so this exercises
+    // the reply_to_thread → add_comment fallback; the reply comes back in the conversation thread.
+    let thread_id = threads.iter().find(|t| t.comments.iter().any(|c| c.body.contains(prefix))).expect("our thread").id.clone();
+    prs.reply_to_thread(&id, &thread_id, &format!("{prefix} reply")).await.expect("reply to thread");
+    let after = prs.threads(&id).await.expect("threads after reply");
+    assert!(
+        after.iter().any(|t| t.comments.iter().any(|c| c.body.contains(&format!("{prefix} reply")))),
+        "the reply comes back on the PR threads"
+    );
+
     // Merge write (the actual adapter action) → PR reads back as merged.
     prs.merge(&id, &MergeOptions { strategy: MergeStrategy::Squash, delete_source_ref: true }).await.expect("merge PR");
     let after = harness::poll(harness::POLL_MERGE, || async {
