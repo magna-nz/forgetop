@@ -67,11 +67,9 @@ function WiCard({ row, index }: { row: WiRow; index: number }) {
           {wi.title}
         </span>
         {wi.work_item_type && (
-          <span className="shrink-0">
-            <Chip>
-              {wi.work_item_type.toLowerCase() === "bug" && <BugIcon />}
-              {wi.work_item_type}
-            </Chip>
+          <span className="shrink-0 inline-flex items-center gap-1.5" style={{ color: "var(--dim)" }}>
+            <Chip>{wi.work_item_type}</Chip>
+            {wi.work_item_type.toLowerCase() === "bug" && <BugIcon />}
           </span>
         )}
       </button>
