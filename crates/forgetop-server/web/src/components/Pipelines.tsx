@@ -2,7 +2,7 @@ import { motion } from "framer-motion";
 import { usePipelines } from "../api";
 import { pipeMeta, relativeTime, toTime } from "../format";
 import type { PipeRow } from "../types";
-import { Avatar, Chip, List, Skeleton, StateCard, StatusBadge } from "./ui";
+import { Avatar, Chip, List, Pill, Skeleton, StateCard, StatusBadge } from "./ui";
 import { ErrorState } from "./ErrorState";
 import { useListView } from "./ControlBar";
 import { usePipelineOpener } from "./PipelineDetail";
@@ -75,7 +75,11 @@ function PipeCard({ row, index }: { row: PipeRow; index: number }) {
         )}
         {run.commit_sha && <span className="mono text-xs shrink-0" style={{ color: "var(--dim)" }}>{run.commit_sha.slice(0, 7)}</span>}
         {run.title && <span className="truncate text-sm min-w-0" style={{ color: "var(--dim)" }}>{run.title}</span>}
-        {needsApproval && <StatusBadge label="Approval needed" color="var(--red)" />}
+        {needsApproval && (
+          <span className="shrink-0">
+            <Pill icon="⏳" label="Approval needed" color="var(--red)" />
+          </span>
+        )}
       </button>
       <div className="flex items-center gap-2 shrink-0">
         <span className="text-xs whitespace-nowrap" style={{ color: "var(--dim)" }}>
