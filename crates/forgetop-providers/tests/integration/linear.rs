@@ -43,14 +43,12 @@ async fn linear_work_item_lifecycle() {
 
     let candidates = wi.assignable_users(&id).await.expect("assignable users");
     assert!(!candidates.is_empty(), "workspace reports users");
-    let cand = candidates.first().expect("candidate");
-    wi.set_assignee(&id, Some(&cand.id)).await.expect("assign");
-    let assigned = {
-        let wi = &wi;
-        let id = id.as_str();
-        harness::poll(harness::POLL_LIST, move || async move { wi.get(id).await.ok().filter(|w| w.assignee.is_some()).map(|_| ()) }).await
-    };
-    assert!(assigned.is_some(), "issue reports an assignee");
+    let viewer_id = candidates
+        .iter()
+        .find(|candidate| candidate.id == me)
+        .map(|candidate| candidate.id.clone())
+        .expect("authenticated viewer appears in assignable users");
+
     wi.set_assignee(&id, None).await.expect("unassign");
     let unassigned = {
         let wi = &wi;
@@ -58,6 +56,22 @@ async fn linear_work_item_lifecycle() {
         harness::poll(harness::POLL_LIST, move || async move { wi.get(id).await.ok().filter(|w| w.assignee.is_none()).map(|_| ()) }).await
     };
     assert!(unassigned.is_some(), "issue reports no assignee");
+
+    wi.set_assignee(&id, Some(&viewer_id)).await.expect("assign");
+    let assigned = {
+        let wi = &wi;
+        let id = id.as_str();
+        let viewer_id = viewer_id.as_str();
+        harness::poll(harness::POLL_LIST, move || async move {
+            wi.get(id)
+                .await
+                .ok()
+                .filter(|w| w.assignee.as_ref().is_some_and(|assignee| assignee.id == viewer_id))
+                .map(|_| ())
+        })
+        .await
+    };
+    assert!(assigned.is_some(), "issue reports the authenticated viewer as assignee");
 
     let new_title = format!("{prefix} edited");
     wi.update_fields(&id, Some(&new_title), Some("edited body")).await.expect("edit");
