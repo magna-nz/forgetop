@@ -1,6 +1,6 @@
 import { useEffect, useReducer, useRef, useState } from "react";
 import { DashboardShell, DemoNotice, DemoSidebar, DemoTopBar, type DemoSection } from "./components/DashboardShell";
-import { Chip, DetailDrawer, EmptyState, List, ListRow, PageHeader, SectionCard, StatCard, StatusBadge } from "./components/primitives";
+import { Chip, DetailDrawer, EmptyState, List, ListRow, PageHeader, SectionCard, StatusBadge } from "./components/primitives";
 import { createDemoState, pipelineById, pullRequestById, reduceDemo, unreadNotificationCount, workItemById } from "./demoStore";
 import type { DemoPipeline, DemoPullRequest, DemoState, DemoWorkItem, PipelineStatus, PullRequestStatus, WorkItemCategory } from "./demoTypes";
 
@@ -90,27 +90,37 @@ function Launchpad({ state, search, onSelect }: { state: DemoState; search: stri
   const prs = (ids: string[]) => state.pullRequests.filter((item) => ids.includes(item.id) && matches(search, item.title, item.provider));
   const work = state.workItems.filter((item) => state.launchpad.assignedWork.includes(item.id) && matches(search, item.title, item.identifier));
   const pipes = state.pipelines.filter((item) => state.launchpad.pipelineAlerts.includes(item.id) && matches(search, item.name));
+  const yourOpenPrs = state.pullRequests.filter((item) => item.author.id === state.currentUser.id && item.status === "open" && matches(search, item.title, item.repository));
+  const readyToMerge = yourOpenPrs.filter((item) => item.mergeable && item.checks === "passing");
+  const recentlyMerged = state.pullRequests.filter((item) => item.status === "merged" && matches(search, item.title, item.repository));
+  const recentPipelines = state.pipelines.filter((item) => matches(search, item.name, item.project));
+  const needsFixing = [...prs(state.launchpad.needsAttention), ...pipes];
   return <>
-    <PageHeader eyebrow="COMMAND CENTER" title="Things that need your attention." description="A simulated cross-provider action inbox." />
-    <div className="demo-stat-grid">
-      <StatCard label="Needs your review" value={prs(state.launchpad.reviewRequested).length} detail="Pull requests" tone="yellow" />
-      <StatCard label="Your work" value={work.length} detail="Assigned work items" tone="blue" />
-      <StatCard label="Needs fixing" value={prs(state.launchpad.needsAttention).length + pipes.length} detail="PRs and pipelines" tone="red" />
-    </div>
-    <div className="demo-launchpad-grid">
-      <LaunchpadBucket title="Needs your review" items={prs(state.launchpad.reviewRequested)} onSelect={(id) => onSelect("pr", id)} />
-      <LaunchpadBucket title="Your work" items={work} onSelect={(id) => onSelect("work-item", id)} />
-      <LaunchpadBucket title="Needs fixing" items={prs(state.launchpad.needsAttention)} onSelect={(id) => onSelect("pr", id)} />
-      <LaunchpadBucket title="Pipeline alerts" items={pipes} onSelect={(id) => onSelect("pipeline", id)} />
+    <div className="demo-command-center">
+      <section className="demo-command-column">
+        <h1>Needs you</h1>
+        <CommandBucket title="Needs your review" items={prs(state.launchpad.reviewRequested)} onSelect={onSelect} />
+        <CommandBucket title="Ready to merge" items={readyToMerge} onSelect={onSelect} />
+        <CommandBucket title="Needs fixing" items={needsFixing} onSelect={onSelect} />
+      </section>
+      <section className="demo-command-column">
+        <h1>Your work</h1>
+        <CommandBucket title="Assigned to you" items={work} onSelect={onSelect} />
+        <CommandBucket title="Your open pull requests" items={yourOpenPrs} onSelect={onSelect} muted />
+        <CommandBucket title="Your recently merged pull requests" items={recentlyMerged} onSelect={onSelect} muted />
+        <CommandBucket title="Recent pipelines" items={recentPipelines} onSelect={onSelect} muted />
+      </section>
     </div>
   </>;
 }
 
-function LaunchpadBucket({ title, items, onSelect }: { title: string; items: Array<DemoPullRequest | DemoWorkItem | DemoPipeline>; onSelect: (id: string) => void }) {
-  return <SectionCard title={title}>{items.length === 0 ? <EmptyState title="All clear" description="No matching simulated work." /> : <List>{items.map((item) => {
+function CommandBucket({ title, items, onSelect, muted = false }: { title: string; items: Array<DemoPullRequest | DemoWorkItem | DemoPipeline>; onSelect: (kind: NonNullable<Selection>["kind"], id: string) => void; muted?: boolean }) {
+  return <div className={`demo-command-bucket${muted ? " is-muted" : ""}`}><div className="demo-command-bucket-heading"><h2>{title}</h2><span>{items.length}</span></div>{items.length === 0 ? <p className="demo-command-empty">Nothing waiting on you.</p> : <div className="demo-command-rows">{items.map((item) => {
     const isPr = "number" in item; const isWork = "identifier" in item;
-    return <ListRow key={item.id} title={isPr ? item.title : isWork ? item.title : item.name} subtitle={isPr ? `${item.provider} · #${item.number} · ${item.repository}` : isWork ? `${item.provider} · ${item.identifier}` : `${item.provider} · run #${item.runNumber}`} badge={isPr ? <StatusBadge tone={prTone[item.status]}>{titleCase(item.status)}</StatusBadge> : isWork ? <StatusBadge tone={workTone[item.category]}>{item.state}</StatusBadge> : <StatusBadge tone={pipelineTone[item.status]}>{titleCase(item.status)}</StatusBadge>} onClick={() => onSelect(item.id)} />;
-  })}</List>}</SectionCard>;
+    const meta = isPr ? `#${item.number} · ${item.updatedAt}${item.checks !== "passing" ? ` · ${item.checks}` : ""}` : isWork ? `${item.identifier} · ${item.updatedAt}` : `${item.branch} · ${item.startedAt}`;
+    const kind = isPr ? "Pull Request" : isWork ? "Work Item" : "Pipeline";
+    return <button className="demo-command-row" type="button" key={item.id} onClick={() => onSelect(isPr ? "pr" : isWork ? "work-item" : "pipeline", item.id)}><StatusBadge tone={isPr ? prTone[item.status] : isWork ? workTone[item.category] : pipelineTone[item.status]}>{isPr ? titleCase(item.status) : isWork ? item.state : item.status === "failed" ? "Error" : titleCase(item.status)}</StatusBadge><div><strong>{isPr ? item.title : isWork ? item.title : `${item.name} · #${item.runNumber}`}</strong><p><span>{kind}</span>{meta}</p></div></button>;
+  })}</div>}</div>;
 }
 
 function PullRequests({ state, search, view, onView, onSelect }: { state: DemoState; search: string; view: PrView; onView: (view: PrView) => void; onSelect: (id: string) => void }) {

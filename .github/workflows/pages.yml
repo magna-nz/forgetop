@@ -28,7 +28,7 @@ jobs:
         uses: actions/jekyll-build-pages@v1
         with:
           source: ./docs
-          destination: ./_site
+          destination: ./docs-site
       - uses: actions/setup-node@v4
         with:
           node-version: 20
@@ -42,13 +42,14 @@ jobs:
         run: npm run build
       - name: Add public demo to the Pages artifact
         run: |
-          mkdir -p _site/demo
-          cp -R demo/dist/. _site/demo/
-          touch _site/.nojekyll
+          mkdir -p site-artifact/demo
+          cp -R docs-site/. site-artifact/
+          cp -R demo/dist/. site-artifact/demo/
+          touch site-artifact/.nojekyll
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v4
         with:
-          path: ./_site
+          path: ./site-artifact
 
   deploy:
     name: deploy
