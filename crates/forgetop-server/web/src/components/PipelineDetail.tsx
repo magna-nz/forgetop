@@ -3,7 +3,7 @@ import { AnimatePresence } from "framer-motion";
 import { useQueryClient } from "@tanstack/react-query";
 import { apiGetText, apiPost, usePipelineDetail } from "../api";
 import { pipeMeta, relativeTime } from "../format";
-import type { PipeRef, PipelineApproval, PipelineJob } from "../types";
+import type { PipeRef, PipelineApproval, PipelineJob, PipelineStage } from "../types";
 import { Avatar, Chip, SlideOver, StatusBadge } from "./ui";
 
 const cap = (s: string): string => (s.length ? s[0].toUpperCase() + s.slice(1) : s);
@@ -115,21 +115,41 @@ function PipelineDetailPanel({ pipeRef, onClose }: { pipeRef: PipeRef; onClose: 
             </div>
           )}
 
-          <div className="flex flex-col gap-3">
+          <div className="flex flex-col gap-4">
             {run.stages.length === 0 && <div className="text-sm" style={{ color: "var(--dim)" }}>No stages to show yet.</div>}
-            {run.stages.map((stage) => (
-              <div key={stage.name} className="rounded-lg overflow-hidden" style={{ border: "1px solid var(--border)" }}>
-                <div className="flex items-center gap-2 px-3 py-2 text-sm" style={{ background: "var(--panel)", borderBottom: "1px solid var(--border)" }}>
-                  <span style={{ color: pipeMeta(stage.status).color }}>{pipeMeta(stage.status).icon}</span>
-                  <span className="font-medium" style={{ color: "var(--fg)" }}>{stage.name}</span>
-                </div>
-                <div className="flex flex-col">
-                  {stage.jobs.map((job) => (
+
+            {/* Providers that expose real ordered stages (Azure timeline, GitLab stages) get the
+                connected "plan" flow. GitHub Actions / Bitbucket return one flat group of jobs/steps
+                (no runtime DAG without parsing the pipeline YAML), so they just show the job list. */}
+            {run.stages.length > 1 && <StageFlow stages={run.stages} />}
+
+            {run.stages.length === 1 ? (
+              <div>
+                <SectionLabel>{cap(run.stages[0].name)}</SectionLabel>
+                <div className="rounded-lg overflow-hidden" style={{ border: "1px solid var(--border)" }}>
+                  {run.stages[0].jobs.map((job) => (
                     <Job key={job.id} job={job} pipeRef={pipeRef} />
                   ))}
                 </div>
               </div>
-            ))}
+            ) : (
+              run.stages.map((stage) => {
+                const m = pipeMeta(stage.status);
+                return (
+                  <div key={stage.name} className="rounded-lg overflow-hidden" style={{ border: "1px solid var(--border)" }}>
+                    <div className="flex items-center gap-2 px-3 py-2 text-sm" style={{ background: "var(--panel)", borderBottom: "1px solid var(--border)" }}>
+                      <span className={m.running ? "spin" : undefined} style={{ color: m.color }}>{m.icon}</span>
+                      <span className="font-medium" style={{ color: "var(--fg)" }}>{stage.name}</span>
+                    </div>
+                    <div className="flex flex-col">
+                      {stage.jobs.map((job) => (
+                        <Job key={job.id} job={job} pipeRef={pipeRef} />
+                      ))}
+                    </div>
+                  </div>
+                );
+              })
+            )}
           </div>
 
           {note && (
@@ -140,6 +160,53 @@ function PipelineDetailPanel({ pipeRef, onClose }: { pipeRef: PipeRef; onClose: 
         </div>
       )}
     </SlideOver>
+  );
+}
+
+// ---- stage flow ("the plan") ----
+
+function SectionLabel({ children }: { children: ReactNode }) {
+  return (
+    <div className="text-[11px] font-semibold uppercase tracking-wider mb-2" style={{ color: "var(--dim)" }}>
+      {children}
+    </div>
+  );
+}
+
+/** The pipeline "plan": ordered stages as connected, status-tinted nodes. Shown for providers that
+ *  expose real stages (Azure / GitLab). Sequence + live state at a glance; scrolls if it overflows. */
+function StageFlow({ stages }: { stages: PipelineStage[] }) {
+  return (
+    <div className="rounded-lg p-3" style={{ background: "var(--card)", border: "1px solid var(--border)" }}>
+      <SectionLabel>Plan</SectionLabel>
+      <div className="flex items-center overflow-x-auto pb-1">
+        {stages.map((stage, i) => {
+          const m = pipeMeta(stage.status);
+          return (
+            <div key={stage.name} className="flex items-center shrink-0">
+              <div
+                className="flex items-center gap-1.5 rounded-md px-2.5 py-1.5 whitespace-nowrap"
+                style={{
+                  color: m.color,
+                  background: `color-mix(in srgb, ${m.color} 12%, transparent)`,
+                  border: `1px solid color-mix(in srgb, ${m.color} 30%, transparent)`,
+                }}
+                title={`${stage.name} — ${m.label}`}
+              >
+                <span className={m.running ? "spin" : undefined} aria-hidden="true">{m.icon}</span>
+                <span className="text-sm font-medium">{stage.name}</span>
+              </div>
+              {i < stages.length - 1 && (
+                <div
+                  className="shrink-0 h-0.5 w-6 mx-1 rounded-full"
+                  style={{ background: stage.status === "Succeeded" ? "var(--green)" : "var(--border)" }}
+                />
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
   );
 }
 
