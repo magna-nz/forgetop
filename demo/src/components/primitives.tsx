@@ -53,7 +53,7 @@ export function Chip({ children }: { children: ReactNode }) {
   return <span className="demo-chip">{children}</span>;
 }
 
-export function DetailDrawer({ open, title, subtitle, onClose, children, footer }: { open: boolean; title: string; subtitle?: string; onClose: () => void; children: ReactNode; footer?: ReactNode }) {
+export function DetailDrawer({ open, title, subtitle, onClose, children, footer, wide = false }: { open: boolean; title: string; subtitle?: string; onClose: () => void; children: ReactNode; footer?: ReactNode; wide?: boolean }) {
   const drawerRef = useRef<HTMLElement>(null);
   const previousFocus = useRef<HTMLElement | null>(null);
 
@@ -79,7 +79,7 @@ export function DetailDrawer({ open, title, subtitle, onClose, children, footer 
   if (!open) return null;
   return <div className="demo-drawer-layer" role="presentation">
     <button className="demo-drawer-backdrop" type="button" aria-label="Close detail" onClick={onClose} />
-    <aside ref={drawerRef} className="demo-detail-drawer" role="dialog" aria-modal="true" aria-label={title}>
+    <aside ref={drawerRef} className={`demo-detail-drawer${wide ? " is-wide" : ""}`} role="dialog" aria-modal="true" aria-label={title}>
       <header className="demo-drawer-heading">
         <div><h2>{title}</h2>{subtitle && <p>{subtitle}</p>}</div>
         <button className="demo-icon-button" type="button" onClick={onClose} aria-label="Close detail">×</button>
