@@ -39,6 +39,9 @@ pub struct PipeRow {
     pub connection: String,
     pub provider: ProviderType,
     pub run: PipelineRun,
+    /// The pipeline (definition) name this run belongs to, resolved from discovery — shown
+    /// before the run name in the list. `None` if discovery doesn't name it.
+    pub definition_name: Option<String>,
     /// Pending approval gates on this run (empty unless it's in-flight and the provider
     /// supports approvals) — drives the approve/reject buttons.
     pub approvals: Vec<PipelineApproval>,
@@ -158,6 +161,8 @@ pub async fn pipelines(sections: &SectionService) -> Vec<PipeRow> {
     let mut out = Vec::new();
     if let Ok(feeds) = sections.pipeline_feeds().await {
         for feed in feeds {
+            let def_names: std::collections::HashMap<String, String> =
+                feed.source.discover().await.unwrap_or_default().into_iter().map(|d| (d.id, d.name)).collect();
             let supports = feed.source.supports_approvals();
             for query in pipe_queries(&feed.subscription) {
                 if let Ok(runs) = feed.source.list_runs(&query).await {
@@ -172,6 +177,7 @@ pub async fn pipelines(sections: &SectionService) -> Vec<PipeRow> {
                             connection_id: feed.connection.connection_id().to_string(),
                             connection: feed.connection.display_name().to_string(),
                             provider: feed.connection.provider_type(),
+                            definition_name: def_names.get(&run.definition_id).cloned(),
                             approvals,
                             run,
                         });
