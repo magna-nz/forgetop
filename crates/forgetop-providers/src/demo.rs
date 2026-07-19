@@ -305,7 +305,7 @@ fn run(id: &str, def: &str, num: i64, name: &str, title: &str, status: PipelineR
         commit_sha: Some("abc1234".into()),
         started_at: Some(started),
         finished_at: matches!(status, PipelineRunStatus::Running | PipelineRunStatus::Queued).then(|| started + chrono::Duration::minutes(6)),
-        url: None,
+        url: Some("https://ci.example.com/runs/demo".into()),
         stages: vec![],
     }
 }
@@ -358,7 +358,7 @@ fn pipeline_runs() -> Vec<PipelineRun> {
             commit_sha: Some("a1b2c3d".into()),
             started_at: Some(now - chrono::Duration::minutes(4)),
             finished_at: None,
-            url: None,
+            url: Some("https://ci.example.com/runs/demo".into()),
             stages: vec![
                 PipelineStage {
                     name: "build".into(),
@@ -391,7 +391,7 @@ fn pipeline_runs() -> Vec<PipelineRun> {
             commit_sha: Some("9f8e7d6".into()),
             started_at: Some(now - chrono::Duration::hours(1)),
             finished_at: Some(now - chrono::Duration::minutes(52)),
-            url: None,
+            url: Some("https://ci.example.com/runs/demo".into()),
             stages: vec![
                 PipelineStage {
                     name: "build".into(),
@@ -437,7 +437,7 @@ fn pipeline_runs() -> Vec<PipelineRun> {
             commit_sha: Some("1234abc".into()),
             started_at: Some(now - chrono::Duration::days(2)),
             finished_at: Some(now - chrono::Duration::days(2) + chrono::Duration::minutes(8)),
-            url: None,
+            url: Some("https://ci.example.com/runs/demo".into()),
             stages: vec![PipelineStage {
                 name: "publish".into(),
                 status: PipelineRunStatus::Succeeded,
@@ -463,7 +463,7 @@ fn pipeline_runs() -> Vec<PipelineRun> {
             commit_sha: Some("cafe123".into()),
             started_at: None,
             finished_at: None,
-            url: None,
+            url: Some("https://ci.example.com/runs/demo".into()),
             stages: vec![],
         },
     ]
