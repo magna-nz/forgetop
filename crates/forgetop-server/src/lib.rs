@@ -106,6 +106,9 @@ fn router(state: AppState) -> Router {
         .route("/api/wi/states", get(wi_states))
         .route("/api/wi/state", post(wi_state))
         .route("/api/wi/comment", post(wi_comment))
+        .route("/api/wi/assignees", get(wi_assignees))
+        .route("/api/wi/assignee", post(wi_assignee))
+        .route("/api/wi/update", post(wi_update))
         .route("/api/pipeline/detail", get(pipeline_detail))
         .route("/api/pipeline/logs", get(pipeline_logs))
         .route("/api/pipeline/approval", post(pipeline_approval))
@@ -276,6 +279,18 @@ async fn wi_state(State(s): State<AppState>, Json(req): Json<actions::WiStateReq
 }
 async fn wi_comment(State(s): State<AppState>, Json(req): Json<actions::WiCommentReq>) -> Response {
     action_response(actions::wi_comment(&s.deps.sections, req).await)
+}
+async fn wi_assignees(State(s): State<AppState>, Query(q): Query<ItemQuery>) -> Response {
+    match actions::wi_assignees(&s.deps.sections, &q.conn, &q.id).await {
+        Some(users) => Json(users).into_response(),
+        None => (StatusCode::NOT_FOUND, "work item connection not found").into_response(),
+    }
+}
+async fn wi_assignee(State(s): State<AppState>, Json(req): Json<actions::WiAssigneeReq>) -> Response {
+    action_response(actions::wi_set_assignee(&s.deps.sections, req).await)
+}
+async fn wi_update(State(s): State<AppState>, Json(req): Json<actions::WiUpdateReq>) -> Response {
+    action_response(actions::wi_update(&s.deps.sections, req).await)
 }
 
 async fn pipeline_detail(State(s): State<AppState>, Query(q): Query<RunQuery>) -> Response {

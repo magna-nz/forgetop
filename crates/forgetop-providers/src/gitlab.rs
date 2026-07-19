@@ -602,6 +602,32 @@ impl WorkItemSource for GitLabWi {
     async fn available_states(&self, _id: &str) -> Result<Vec<String>> {
         Ok(vec!["opened".into(), "closed".into()])
     }
+    async fn assignable_users(&self, _id: &str) -> Result<Vec<User>> {
+        let v = self.0.get_json(&self.0.project_path("/members/all?per_page=100")).await?;
+        Ok(v.as_array().unwrap_or(&vec![]).iter().map(map_user).collect())
+    }
+    async fn set_assignee(&self, id: &str, assignee_id: Option<&str>) -> Result<()> {
+        let assignee_ids = match assignee_id {
+            Some(assignee_id) => vec![assignee_id.parse::<i64>().map_err(prov)?],
+            None => vec![],
+        };
+        let url = self.0.project_path(&format!("/issues/{id}"));
+        self.0.send(self.0.http.put(&url).json(&json!({ "assignee_ids": assignee_ids })), &format!("PUT {url}")).await
+    }
+    async fn update_fields(&self, id: &str, title: Option<&str>, description: Option<&str>) -> Result<()> {
+        let mut body = serde_json::Map::new();
+        if let Some(title) = title {
+            body.insert("title".into(), json!(title));
+        }
+        if let Some(description) = description {
+            body.insert("description".into(), json!(description));
+        }
+        if body.is_empty() {
+            return Ok(());
+        }
+        let url = self.0.project_path(&format!("/issues/{id}"));
+        self.0.send(self.0.http.put(&url).json(&Value::Object(body)), &format!("PUT {url}")).await
+    }
     async fn add_comment(&self, id: &str, body: &str) -> Result<()> {
         self.0.post_json(&self.0.project_path(&format!("/issues/{id}/notes")), json!({ "body": body })).await
     }

@@ -170,6 +170,42 @@ async fn github_work_item_lifecycle() {
     assert!(states.iter().any(|s| s.eq_ignore_ascii_case("closed")), "closed is an available state, got {states:?}");
 
     wi.add_comment(&id, &format!("{prefix} note")).await.expect("comment");
+
+    let candidates = wi.assignable_users(&id).await.expect("assignable users");
+    assert!(!candidates.is_empty(), "repo reports assignable users");
+
+    let cand = candidates.first().expect("an assignable user");
+    wi.set_assignee(&id, Some(&cand.id)).await.expect("assign");
+    let assigned = {
+        let wi = &wi;
+        let id = id.as_str();
+        harness::poll(harness::POLL_LIST, move || async move { wi.get(id).await.ok().filter(|w| w.assignee.is_some()) }).await
+    };
+    assert!(assigned.is_some(), "the issue reads back assigned");
+
+    wi.set_assignee(&id, None).await.expect("unassign");
+    let unassigned = {
+        let wi = &wi;
+        let id = id.as_str();
+        harness::poll(harness::POLL_LIST, move || async move { wi.get(id).await.ok().filter(|w| w.assignee.is_none()) }).await
+    };
+    assert!(unassigned.is_some(), "the issue reads back unassigned");
+
+    let new_title = format!("{prefix} edited");
+    wi.update_fields(&id, Some(&new_title), Some("edited body")).await.expect("edit");
+    let edited = {
+        let wi = &wi;
+        let id = id.as_str();
+        let new_title = new_title.as_str();
+        harness::poll(harness::POLL_LIST, move || async move {
+            wi.get(id).await.ok().filter(|w| {
+                w.title == new_title && w.description.as_deref().is_some_and(|d| d.contains("edited body"))
+            })
+        })
+        .await
+    };
+    assert!(edited.is_some(), "the issue reads back edited");
+
     wi.set_state(&id, "closed").await.expect("close issue");
     let after = wi.get(&id).await.expect("get after close");
     assert!(after.state.eq_ignore_ascii_case("closed"), "issue reads back closed, got {}", after.state);

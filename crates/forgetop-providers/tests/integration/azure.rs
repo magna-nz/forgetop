@@ -122,6 +122,24 @@ async fn azure_work_item_lifecycle() {
     wi.add_comment(&id, &format!("{prefix} note")).await.expect("comment");
     wi.timeline(&id).await.expect("timeline decodes");
 
+    let candidates = wi.assignable_users(&id).await.expect("assignable users");
+    assert!(!candidates.is_empty(), "project team reports members");
+
+    let cand = candidates.first().expect("assignable user");
+    wi.set_assignee(&id, Some(&cand.id)).await.expect("assign");
+    assert!(wi.get(&id).await.expect("get assigned").assignee.is_some(), "work item has an assignee");
+    wi.set_assignee(&id, None).await.expect("unassign");
+    assert!(wi.get(&id).await.expect("get unassigned").assignee.is_none(), "work item is unassigned");
+
+    let new_title = format!("{prefix} edited");
+    wi.update_fields(&id, Some(&new_title), Some("edited body")).await.expect("edit");
+    let edited = wi.get(&id).await.expect("get edited");
+    assert_eq!(edited.title, new_title);
+    assert!(
+        edited.description.as_deref().is_some_and(|description| description.contains("edited body")),
+        "description contains edited body"
+    );
+
     // Move it to a different state and confirm it sticks.
     if let Some(next) = states.iter().find(|s| !s.eq_ignore_ascii_case(&got.state)) {
         wi.set_state(&id, next).await.expect("set state");

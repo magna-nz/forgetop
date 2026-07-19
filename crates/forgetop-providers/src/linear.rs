@@ -182,6 +182,55 @@ impl WorkItemSource for LinearWi {
         let mutation = "mutation($id:String!,$body:String!){ commentCreate(input:{issueId:$id,body:$body}){ success } }";
         self.0.query(mutation, json!({ "id": id, "body": body })).await.map(|_| ())
     }
+    async fn assignable_users(&self, _work_item_id: &str) -> Result<Vec<User>> {
+        let data = self
+            .0
+            .query("query { users(first: 100) { nodes { id name displayName avatarUrl } } }", Value::Null)
+            .await?;
+        Ok(get_obj(&data, "users")
+            .map(|u| {
+                get_arr(u, "nodes")
+                    .iter()
+                    .map(|n| User {
+                        id: get_str(n, "id").unwrap_or_else(|| "unknown".into()),
+                        display_name: get_str(n, "displayName").or_else(|| get_str(n, "name")).unwrap_or_else(|| "unknown".into()),
+                        handle: None,
+                        avatar_url: get_str(n, "avatarUrl"),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+    async fn set_assignee(&self, work_item_id: &str, assignee_id: Option<&str>) -> Result<()> {
+        let mutation = "mutation($id:String!,$aid:String){ issueUpdate(id:$id,input:{assigneeId:$aid}){ success } }";
+        let data = self.0.query(mutation, json!({ "id": work_item_id, "aid": assignee_id })).await?;
+        if get_obj(&data, "issueUpdate").map(|u| get_bool(u, "success")).unwrap_or(false) {
+            Ok(())
+        } else {
+            Err(Error::Provider("Linear issueUpdate did not succeed".into()))
+        }
+    }
+    async fn update_fields(&self, work_item_id: &str, title: Option<&str>, description: Option<&str>) -> Result<()> {
+        if title.is_none() && description.is_none() {
+            return Ok(());
+        }
+
+        let mut input = serde_json::Map::new();
+        if let Some(title) = title {
+            input.insert("title".into(), json!(title));
+        }
+        if let Some(description) = description {
+            input.insert("description".into(), json!(description));
+        }
+
+        let mutation = "mutation($id:String!,$input:IssueUpdateInput!){ issueUpdate(id:$id,input:$input){ success } }";
+        let data = self.0.query(mutation, json!({ "id": work_item_id, "input": input })).await?;
+        if get_obj(&data, "issueUpdate").map(|u| get_bool(u, "success")).unwrap_or(false) {
+            Ok(())
+        } else {
+            Err(Error::Provider("Linear issueUpdate did not succeed".into()))
+        }
+    }
     async fn available_states(&self, id: &str) -> Result<Vec<String>> {
         let lookup = "query($id:String!){ issue(id:$id){ team { states { nodes { name } } } } }";
         let data = self.0.query(lookup, json!({ "id": id })).await?;

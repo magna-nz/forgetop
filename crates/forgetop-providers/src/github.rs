@@ -663,9 +663,47 @@ impl WorkItemSource for GitHubWi {
         out.sort_by_key(|e| e.at);
         Ok(out)
     }
+    async fn assignable_users(&self, _id: &str) -> Result<Vec<User>> {
+        let v = self.0.get_json(&self.0.repo_path("/assignees?per_page=100")).await?;
+        Ok(v.as_array()
+            .unwrap_or(&vec![])
+            .iter()
+            .map(|u| {
+                let login = get_str(u, "login").unwrap_or_else(|| "unknown".into());
+                User { id: login.clone(), display_name: login.clone(), handle: Some(login), avatar_url: get_str(u, "avatar_url") }
+            })
+            .collect())
+    }
     async fn set_state(&self, id: &str, state: &str) -> Result<()> {
         let url = self.0.repo_path(&format!("/issues/{id}"));
         let resp = self.0.http.patch(&url).json(&json!({ "state": state })).send().await.map_err(prov)?;
+        if !resp.status().is_success() {
+            return Err(Error::Provider(format!("PATCH {url} -> {}", resp.status())));
+        }
+        Ok(())
+    }
+    async fn set_assignee(&self, id: &str, assignee_id: Option<&str>) -> Result<()> {
+        let url = self.0.repo_path(&format!("/issues/{id}"));
+        let assignees: Vec<&str> = assignee_id.into_iter().collect();
+        let resp = self.0.http.patch(&url).json(&json!({ "assignees": assignees })).send().await.map_err(prov)?;
+        if !resp.status().is_success() {
+            return Err(Error::Provider(format!("PATCH {url} -> {}", resp.status())));
+        }
+        Ok(())
+    }
+    async fn update_fields(&self, id: &str, title: Option<&str>, description: Option<&str>) -> Result<()> {
+        if title.is_none() && description.is_none() {
+            return Ok(());
+        }
+        let mut body = serde_json::Map::new();
+        if let Some(title) = title {
+            body.insert("title".into(), json!(title));
+        }
+        if let Some(description) = description {
+            body.insert("body".into(), json!(description));
+        }
+        let url = self.0.repo_path(&format!("/issues/{id}"));
+        let resp = self.0.http.patch(&url).json(&Value::Object(body)).send().await.map_err(prov)?;
         if !resp.status().is_success() {
             return Err(Error::Provider(format!("PATCH {url} -> {}", resp.status())));
         }

@@ -116,6 +116,14 @@ impl JiraClient {
         }
         Ok(())
     }
+
+    async fn put_ok(&self, url: &str, body: Value) -> Result<()> {
+        let resp = self.http.put(url).json(&body).send().await.map_err(prov)?;
+        if !resp.status().is_success() {
+            return Err(Error::Provider(format!("PUT {url} -> {}", resp.status())));
+        }
+        Ok(())
+    }
 }
 
 pub struct JiraWi(pub Arc<JiraClient>);
@@ -200,6 +208,35 @@ impl WorkItemSource for JiraWi {
     async fn add_comment(&self, id: &str, body: &str) -> Result<()> {
         self.0.post_ok(&format!("{}/issue/{id}/comment", self.0.api), json!({ "body": body })).await
     }
+
+    async fn assignable_users(&self, id: &str) -> Result<Vec<User>> {
+        let v = self
+            .0
+            .get_json(&format!("{}/user/assignable/search?issueKey={id}&maxResults=100", self.0.api))
+            .await?;
+        Ok(v.as_array().map(|users| users.iter().map(map_user).collect()).unwrap_or_default())
+    }
+
+    async fn set_assignee(&self, id: &str, assignee_id: Option<&str>) -> Result<()> {
+        self.0.put_ok(&format!("{}/issue/{id}/assignee", self.0.api), json!({ "accountId": assignee_id })).await
+    }
+
+    async fn update_fields(&self, id: &str, title: Option<&str>, description: Option<&str>) -> Result<()> {
+        if title.is_none() && description.is_none() {
+            return Ok(());
+        }
+
+        let mut fields = serde_json::Map::new();
+        if let Some(title) = title {
+            fields.insert("summary".into(), json!(title));
+        }
+        if let Some(description) = description {
+            fields.insert("description".into(), json!(description));
+        }
+
+        self.0.put_ok(&format!("{}/issue/{id}", self.0.api), json!({ "fields": fields })).await
+    }
+
     async fn available_states(&self, id: &str) -> Result<Vec<String>> {
         // The states this issue can transition to, from its workflow.
         let v = self.0.get_json(&format!("{}/issue/{id}/transitions", self.0.api)).await?;

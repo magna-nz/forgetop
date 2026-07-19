@@ -408,6 +408,25 @@ pub struct AzurePr(pub Arc<AzureClient>);
 pub struct AzureWi(pub Arc<AzureClient>);
 pub struct AzurePipe(pub Arc<AzureClient>);
 
+impl AzureWi {
+    async fn patch_work_item(&self, id: &str, patch: Value) -> Result<()> {
+        let url = format!("{}/_apis/wit/workitems/{id}?{API}", self.0.base);
+        let resp = self
+            .0
+            .http
+            .patch(&url)
+            .header("Content-Type", "application/json-patch+json")
+            .body(patch.to_string())
+            .send()
+            .await
+            .map_err(prov)?;
+        if !resp.status().is_success() {
+            return Err(Error::Provider(format!("PATCH {url} -> {}", resp.status())));
+        }
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl PullRequestSource for AzurePr {
     async fn list(&self, query: &PullRequestQuery) -> Result<Vec<PullRequest>> {
@@ -667,21 +686,7 @@ impl WorkItemSource for AzureWi {
         Ok(out)
     }
     async fn set_state(&self, id: &str, state: &str) -> Result<()> {
-        let url = format!("{}/_apis/wit/workitems/{id}?{API}", self.0.base);
-        let patch = json!([ { "op": "add", "path": "/fields/System.State", "value": state } ]);
-        let resp = self
-            .0
-            .http
-            .patch(&url)
-            .header("Content-Type", "application/json-patch+json")
-            .body(patch.to_string())
-            .send()
-            .await
-            .map_err(prov)?;
-        if !resp.status().is_success() {
-            return Err(Error::Provider(format!("PATCH {url} -> {}", resp.status())));
-        }
-        Ok(())
+        self.patch_work_item(id, json!([ { "op": "add", "path": "/fields/System.State", "value": state } ])).await
     }
     async fn add_comment(&self, id: &str, body: &str) -> Result<()> {
         let url = format!("{}/{}/_apis/wit/workItems/{id}/comments?api-version=7.1-preview.3", self.0.base, self.0.project);
@@ -696,6 +701,49 @@ impl WorkItemSource for AzureWi {
         let url = format!("{}/{}/_apis/wit/workItemTypes/{}/states?{API}", self.0.base, self.0.project, urlencoding(&t));
         let v = self.0.get_json(&url).await?;
         Ok(get_arr(&v, "value").iter().filter_map(|s| get_str(s, "name")).collect())
+    }
+    async fn assignable_users(&self, _work_item_id: &str) -> Result<Vec<User>> {
+        let teams = self.0.get_json(&format!("{}/_apis/projects/{}/teams?{API}", self.0.base, self.0.project)).await?;
+        let Some(team_id) = get_arr(&teams, "value").first().and_then(|t| get_str(t, "id")) else {
+            return Ok(Vec::new());
+        };
+        let members = self
+            .0
+            .get_json(&format!("{}/_apis/projects/{}/teams/{team_id}/members?{API}", self.0.base, self.0.project))
+            .await?;
+        Ok(get_arr(&members, "value")
+            .iter()
+            .filter_map(|m| {
+                let identity = get_obj(m, "identity")?;
+                let unique_name = get_str(identity, "uniqueName")?;
+                Some(User {
+                    id: unique_name.clone(),
+                    display_name: get_str(identity, "displayName").unwrap_or_else(|| unique_name.clone()),
+                    handle: Some(unique_name),
+                    avatar_url: None,
+                })
+            })
+            .collect())
+    }
+    async fn set_assignee(&self, id: &str, assignee_id: Option<&str>) -> Result<()> {
+        let patch = match assignee_id {
+            Some(unique_name) => json!([ { "op": "add", "path": "/fields/System.AssignedTo", "value": unique_name } ]),
+            None => json!([ { "op": "remove", "path": "/fields/System.AssignedTo" } ]),
+        };
+        self.patch_work_item(id, patch).await
+    }
+    async fn update_fields(&self, id: &str, title: Option<&str>, description: Option<&str>) -> Result<()> {
+        let mut patch = Vec::new();
+        if let Some(title) = title {
+            patch.push(json!({ "op": "add", "path": "/fields/System.Title", "value": title }));
+        }
+        if let Some(description) = description {
+            patch.push(json!({ "op": "add", "path": "/fields/System.Description", "value": description }));
+        }
+        if patch.is_empty() {
+            return Ok(());
+        }
+        self.patch_work_item(id, json!(patch)).await
     }
 }
 
