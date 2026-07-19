@@ -4,7 +4,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { apiPost, useNotifications } from "../api";
 import { notificationMeta, relativeTime, toTime } from "../format";
 import type { NotifRow } from "../types";
-import { List, ProviderBadge, Skeleton, StateCard } from "./ui";
+import { List, Skeleton, StateCard } from "./ui";
 import { ErrorState } from "./ErrorState";
 import { useListView } from "./ControlBar";
 import { usePrOpener } from "./PrDetail";
@@ -97,19 +97,17 @@ function NotifCard({ row, index }: { row: NotifRow; index: number }) {
   const body = (
     <>
       <div className="flex items-center gap-2">
-        {n.unread && <span className="inline-block w-2 h-2 rounded-full shrink-0" style={{ background: "var(--accent)" }} title="unread" />}
         <span className="truncate font-medium" style={{ color: n.unread ? "var(--fg)" : "var(--dim)" }}>
           {n.title}
         </span>
       </div>
-      <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1">
+      <div className="mt-0.5 flex flex-wrap items-center gap-x-3 gap-y-1">
         <span className="text-xs font-medium" style={{ color: meta.color }}>
           {meta.label}
         </span>
         <span className="text-xs" style={{ color: "var(--dim)" }}>
           {n.context}
         </span>
-        <ProviderBadge provider={row.provider} connection={row.connection} />
       </div>
     </>
   );
@@ -119,15 +117,9 @@ function NotifCard({ row, index }: { row: NotifRow; index: number }) {
       initial={{ opacity: 0, y: 6 }}
       animate={{ opacity: 1, y: 0 }}
       transition={{ duration: 0.22, delay: Math.min(index * 0.02, 0.3), ease: "easeOut" }}
-      className="group flex items-start gap-3 rounded-lg px-4 py-3"
+      className="group flex items-center gap-3 rounded-lg px-3 py-2"
       style={{ background: "var(--card)", border: "1px solid var(--border)" }}
     >
-      <span
-        className="inline-flex items-center justify-center rounded-md shrink-0 mt-0.5"
-        style={{ width: 26, height: 26, background: "color-mix(in srgb, " + meta.color + " 16%, transparent)", color: meta.color }}
-      >
-        {meta.icon}
-      </span>
       {openInApp ? (
         <button onClick={openInApp} className="flex-1 min-w-0 text-left" style={{ cursor: "pointer" }}>
           {body}
