@@ -31,9 +31,11 @@ function PipelineDetailPanel({ pipeRef, onClose }: { pipeRef: PipeRef; onClose: 
   const qc = useQueryClient();
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState<string | null>(null);
+  const [selectedStage, setSelectedStage] = useState<string | null>(null);
 
   useEffect(() => {
     setNote(null);
+    setSelectedStage(null);
   }, [pipeRef.conn, pipeRef.runId]);
 
   const refresh = () => {
@@ -60,8 +62,6 @@ function PipelineDetailPanel({ pipeRef, onClose }: { pipeRef: PipeRef; onClose: 
   const meta = run ? pipeMeta(run.status) : null;
   const label = run ? run.name ?? (run.number != null ? `Run #${run.number}` : run.definition_id) : null;
 
-  const retry = () =>
-    act("Re-run triggered", () => apiPost("/api/pipeline/trigger", { conn: pipeRef.conn, definition_id: run!.definition_id }));
   const cancel = () =>
     act("Cancel requested", () => apiPost("/api/pipeline/cancel", { conn: pipeRef.conn, run_id: pipeRef.runId }));
 
@@ -78,18 +78,13 @@ function PipelineDetailPanel({ pipeRef, onClose }: { pipeRef: PipeRef; onClose: 
           {label ?? (isLoading ? "Loading…" : "Pipeline run")}
         </div>
         {run && (
-          <div className="flex items-center gap-2 mt-1 text-xs" style={{ color: "var(--dim)" }}>
+          <div className="flex items-center gap-2 mt-0.5 text-xs" style={{ color: "var(--dim)" }}>
             {run.branch && <Chip title="branch">⑂ {run.branch}</Chip>}
             {run.commit_sha && <span className="mono">{run.commit_sha.slice(0, 7)}</span>}
             <span className="whitespace-nowrap">{relativeTime(run.finished_at ?? run.started_at)}</span>
           </div>
         )}
       </div>
-      {run?.url && (
-        <a href={run.url} target="_blank" rel="noreferrer" title="Open in provider" className="text-sm px-2 py-1" style={{ color: "var(--dim)" }}>
-          ↗
-        </a>
-      )}
     </>
   );
 
@@ -99,18 +94,33 @@ function PipelineDetailPanel({ pipeRef, onClose }: { pipeRef: PipeRef; onClose: 
 
       {run && data && (
         <div className="p-5 flex flex-col gap-4 max-w-3xl">
-          {run.triggered_by && (
-            <div className="flex items-center gap-1.5 text-xs" style={{ color: "var(--dim)" }}>
-              <Avatar name={run.triggered_by.display_name} size={18} /> {run.triggered_by.display_name}
+          {(run.triggered_by || run.url) && (
+            <div className="flex items-center justify-between text-xs" style={{ color: "var(--dim)" }}>
+              {run.triggered_by ? (
+                <div className="flex items-center gap-1.5">
+                  <Avatar name={run.triggered_by.display_name} size={18} />
+                  <span>Started by {run.triggered_by.display_name}</span>
+                </div>
+              ) : <span />}
+              {run.url && (
+                <a
+                  href={run.url}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="rounded-md px-2 py-1 text-xs"
+                  style={{ color: "var(--dim)", border: "1px solid var(--border)", background: "var(--panel2)" }}
+                >
+                  Open ↗
+                </a>
+              )}
             </div>
           )}
 
-          {(data.approvals.length > 0 || run.status === "Failed" || run.status === "Running" || run.status === "Queued") && (
+          {(data.approvals.length > 0 || run.status === "Running" || run.status === "Queued") && (
             <div className="flex flex-wrap items-center gap-2 rounded-lg px-3 py-2.5" style={{ background: "var(--card)", border: "1px solid var(--border)" }}>
               {data.approvals.map((g) => (
                 <Gate key={g.id} gate={g} />
               ))}
-              {run.status === "Failed" && <ActBtn label="↻ Re-run" color="var(--blue)" disabled={busy} onClick={retry} />}
               {(run.status === "Running" || run.status === "Queued") && <ActBtn label="■ Cancel" color="var(--red)" disabled={busy} onClick={cancel} />}
             </div>
           )}
@@ -121,7 +131,16 @@ function PipelineDetailPanel({ pipeRef, onClose }: { pipeRef: PipeRef; onClose: 
             {/* Providers that expose real ordered stages (Azure timeline, GitLab stages) get the
                 connected "plan" flow. GitHub Actions / Bitbucket return one flat group of jobs/steps
                 (no runtime DAG without parsing the pipeline YAML), so they just show the job list. */}
-            {run.stages.length > 1 && <StageFlow stages={run.stages} />}
+            {run.stages.length > 1 && (
+              <>
+                <StageFlow stages={run.stages} selected={selectedStage ?? run.stages[0].name} onSelect={setSelectedStage} />
+                <div className="rounded-lg overflow-hidden" style={{ border: "1px solid var(--border)" }}>
+                  {(run.stages.find((stage) => stage.name === (selectedStage ?? run.stages[0].name)) ?? run.stages[0]).jobs.map((job) => (
+                    <Job key={job.id} job={job} pipeRef={pipeRef} />
+                  ))}
+                </div>
+              </>
+            )}
 
             {run.stages.length === 1 ? (
               <div>
@@ -132,24 +151,7 @@ function PipelineDetailPanel({ pipeRef, onClose }: { pipeRef: PipeRef; onClose: 
                   ))}
                 </div>
               </div>
-            ) : (
-              run.stages.map((stage) => {
-                const m = pipeMeta(stage.status);
-                return (
-                  <div key={stage.name} className="rounded-lg overflow-hidden" style={{ border: "1px solid var(--border)" }}>
-                    <div className="flex items-center gap-2 px-3 py-2 text-sm" style={{ background: "var(--panel)", borderBottom: "1px solid var(--border)" }}>
-                      <span className={m.running ? "spin" : undefined} style={{ color: m.color }}>{m.icon}</span>
-                      <span className="font-medium" style={{ color: "var(--fg)" }}>{stage.name}</span>
-                    </div>
-                    <div className="flex flex-col">
-                      {stage.jobs.map((job) => (
-                        <Job key={job.id} job={job} pipeRef={pipeRef} />
-                      ))}
-                    </div>
-                  </div>
-                );
-              })
-            )}
+            ) : null}
           </div>
 
           {note && (
@@ -175,7 +177,7 @@ function SectionLabel({ children }: { children: ReactNode }) {
 
 /** The pipeline "plan": ordered stages as connected, status-tinted nodes. Shown for providers that
  *  expose real stages (Azure / GitLab). Sequence + live state at a glance; scrolls if it overflows. */
-function StageFlow({ stages }: { stages: PipelineStage[] }) {
+function StageFlow({ stages, selected, onSelect }: { stages: PipelineStage[]; selected: string; onSelect: (stage: string) => void }) {
   return (
     <div className="rounded-lg p-3" style={{ background: "var(--card)", border: "1px solid var(--border)" }}>
       <SectionLabel>Plan</SectionLabel>
@@ -184,18 +186,21 @@ function StageFlow({ stages }: { stages: PipelineStage[] }) {
           const m = pipeMeta(stage.status);
           return (
             <div key={stage.name} className="flex items-center shrink-0">
-              <div
+              <button
+                type="button"
+                onClick={() => onSelect(stage.name)}
                 className="flex items-center gap-1.5 rounded-md px-2.5 py-1.5 whitespace-nowrap"
                 style={{
                   color: m.color,
                   background: `color-mix(in srgb, ${m.color} 12%, transparent)`,
-                  border: `1px solid color-mix(in srgb, ${m.color} 30%, transparent)`,
+                  border: `${selected === stage.name ? "2px" : "1px"} solid color-mix(in srgb, ${m.color} ${selected === stage.name ? "75%" : "30%"}, transparent)`,
+                  boxShadow: selected === stage.name ? `0 0 0 2px color-mix(in srgb, ${m.color} 20%, transparent)` : undefined,
                 }}
                 title={`${stage.name} — ${m.label}`}
               >
                 <span className={m.running ? "spin" : undefined} aria-hidden="true">{m.icon}</span>
                 <span className="text-sm font-medium">{stage.name}</span>
-              </div>
+              </button>
               {i < stages.length - 1 && (
                 <div
                   className="shrink-0 h-0.5 w-6 mx-1 rounded-full"
