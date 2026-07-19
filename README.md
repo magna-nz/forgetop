@@ -35,54 +35,61 @@ runs. It supports **GitHub**, **GitLab**, **Azure DevOps**, **Bitbucket**, **Lin
 
 ---
 
+## Why forgetop
+
+Your code review, delivery, and planning work is scattered across the tools that own it.
+That makes routine questions expensive: *What needs my attention? What is blocked? What can I
+ship now?*
+
+forgetop brings the answer into a single, keyboard-first workspace. It aggregates the work that
+matters from every connected forge, then lets you take the next action without bouncing among
+tabs.
+
 ## The Command Center
 
 forgetop opens on the **Command Center** — one queue answering *what needs me right now?*
-Everything that needs you, from every connected forge, on a single page ordered by
-urgency, in two columns:
+Everything is ranked by urgency and grouped into two useful views:
 
-- **Needs you** — reviews requested of you, pipeline gates to approve, PRs ready to
-  merge, and anything of yours that's broken.
-- **Your work** — your assigned tickets, open PRs, and recent merges.
+- **Needs you** — review requests, pipeline gates, PRs ready to merge, and work that needs fixing.
+- **Your work** — assigned tickets, your open PRs, and recent merges.
 
-Every item reads in the same shape, so they're comparable at a glance — and you act on
-any of them inline, without switching tabs. See the
-[Command Center docs](https://magna-nz.github.io/forgetop/#command-center) for the full bucket
-rules and keys.
+Every item has the same shape, so pull requests, work items, and pipelines are comparable at a
+glance. Open an item, take action, and keep moving. See the [Command Center docs](https://magna-nz.github.io/forgetop/#command-center)
+for the full bucket rules and keys.
 
-Two more cross-provider views: **`i`** opens a **notification inbox** (mentions, review
-requests, CI failures, assignments), and a **fuzzy command palette** jumps to any item —
-**`Ctrl-P`** in the terminal, **`⌘K`** in the dashboard.
+## What you can do
 
-## Why forgetop
+### Review and ship without context switching
 
-Two popular TUIs inspired this: [gh-dash](https://github.com/dlvhdr/gh-dash) (GitHub only)
-and [azdo](https://github.com/Elpulgo/azdo) (Azure DevOps only). forgetop's angle is
-**one keyboard-driven tool across every forge**, with equal footing for code review
-*and* CI.
+Approve or request changes, merge, comment, reply to threads, and inspect diffs from a single
+cross-provider pull-request view. Your review queue is not limited to one forge.
 
-| Capability | forgetop | gh-dash | azdo |
-| :--- | :---: | :---: | :---: |
-| Forges supported | **6** | GitHub | Azure |
-| Cross-provider action inbox (Command Center) | ✅ | ❌ | ❌ |
-| Cross-provider notification inbox | ✅ | ❌ | ❌ |
-| PRs + Work items + Pipelines | ✅ | PRs only | ✅ Azure |
-| Act (approve / merge / comment) | ✅ | ✅ PRs | partial |
-| Inline line-comment review | ✅ | preview | ❌ |
-| Pipeline drill-in + logs | ✅ | ❌ | ✅ |
-| Approve pipeline gates in-terminal | ✅ | ❌ | ❌ |
-| Filter · sort · saved prefs | ✅ | ✅ | limited |
-| Fuzzy command palette (jump to anything) | ✅ | ❌ | ❌ |
-| Cross-provider aggregation | ✅ | ❌ | ❌ |
-| Desktop notifications | ✅ | ❌ | ❌ |
-| Tokens in OS keychain | ✅ | via `gh` | PAT |
+### Keep delivery moving
 
-…and all of it works the same in the **terminal UI** and the **web dashboard** — they're two
-frontends over one core.
+See CI runs next to the work they affect, drill into stages and logs, trigger a run, and approve
+supported pipeline gates without leaving your flow.
 
-Each section binds to the forges that serve it (Pipelines can aggregate several at once); see
-the [capability matrix](https://magna-nz.github.io/forgetop/#providers-and-capabilities) for
-exactly what each provider serves, including notification-feed support.
+### Find the next useful action
+
+The notification inbox collects mentions, review requests, CI failures, and assignments.
+The command palette jumps to any item with **`Ctrl-P`** in the terminal or **`⌘K`** in the dashboard.
+
+### Use the interface that fits your day
+
+forgetop is the same app in the terminal and the browser. Start both together, run the browser
+dashboard alone, or stay entirely in the TUI — all three use the same local data and actions.
+
+### Keep your tokens local
+
+The browser dashboard is served by forgetop itself on **`127.0.0.1`** with a per-session token.
+Your provider tokens live in your OS keychain, never in plaintext or a hosted service.
+
+## Providers
+
+forgetop connects **GitHub, GitLab, Azure DevOps, Bitbucket, Linear, and Jira**. It presents
+pull requests, work items, pipelines, and notifications wherever a provider supports them, while
+keeping the interaction model consistent across each one. See the [capability matrix](https://magna-nz.github.io/forgetop/#providers-and-capabilities)
+for the exact provider support.
 
 ## Install
 
@@ -135,18 +142,13 @@ connections any time.
 If something isn't connecting, run `forgetop doctor` — it checks your config, keychain
 access, and each connection's token + connectivity.
 
-## Terminal or browser
+## Run it your way
 
-The dashboard is the **same app** as the TUI — Command Center, all three lists, PR review with an
-inline-comment diff viewer, the command palette, sort/filter, themes, and every write action
-— served by forgetop itself, built into the binary, on **`127.0.0.1` only** with a
-per-session token. No separate install, no external network.
-
-- `forgetop` opens **both** (the default). Press **`B`** in the TUI to open the browser, or
-  run **`forgetop --dashboard`** for browser-only (handy over SSH with a forwarded port).
-- Choose what launches under **Settings → When forgetop starts** (or **`,`** in the TUI):
-  *dashboard + terminal*, *terminal only*, or *dashboard only* — stored in your config,
-  shared between the two.
+- `forgetop` opens the terminal and dashboard together by default.
+- Press **`B`** in the TUI to open the browser whenever you need more space, or run
+  **`forgetop --dashboard`** for browser-only use.
+- Choose *dashboard + terminal*, *terminal only*, or *dashboard only* under
+  **Settings → When forgetop starts** (or **`,`** in the TUI).
 
 ## Documentation
 
