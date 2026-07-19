@@ -467,6 +467,7 @@ mod tests {
                 definition_id: "ci".into(),
                 number: Some(1),
                 name: Some("CI".into()),
+                title: None,
                 status,
                 triggered_by: None,
                 branch: None,

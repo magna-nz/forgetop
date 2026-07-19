@@ -123,17 +123,16 @@ export function Pill({ icon, label, color, spin = false }: { icon: string; label
 
 /** Uniform status chip — tinted by the status colour, shaped like the work-items "[Bug]" chip.
  *  Shared by the Command Center rows and the Pull Requests list so they read as one set. */
-export function StatusBadge({ label, color, spin = false }: { label: string; color: string; spin?: boolean }) {
+export function StatusBadge({ label, color }: { label: string; color: string }) {
   return (
     <span
-      className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-xs font-medium whitespace-nowrap shrink-0"
+      className="inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium whitespace-nowrap shrink-0"
       style={{
         color,
         background: `color-mix(in srgb, ${color} 12%, transparent)`,
         border: `1px solid color-mix(in srgb, ${color} 30%, transparent)`,
       }}
     >
-      {spin && <span className="spin" aria-hidden="true">◐</span>}
       {label}
     </span>
   );

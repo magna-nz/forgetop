@@ -110,6 +110,7 @@ export interface PipelineRun {
   definition_id: string;
   number?: number | null;
   name?: string | null;
+  title?: string | null;
   status: PipelineRunStatus;
   triggered_by?: User | null;
   branch?: string | null;

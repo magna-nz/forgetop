@@ -128,6 +128,7 @@ pub fn map_pipeline(v: &Value) -> PipelineRun {
         definition_id: "pipelines".into(),
         number: get_i64(v, "iid").or_else(|| get_i64(v, "id")),
         name: get_str(v, "name").or_else(|| get_str(v, "ref")),
+        title: None,
         status: gl_pipeline_status(get_str(v, "status").as_deref()),
         triggered_by: get_obj(v, "user").map(map_user),
         branch: get_str(v, "ref"),

@@ -290,7 +290,7 @@ fn job(id: &str, name: &str, status: PipelineRunStatus, secs: i64, steps: Vec<Pi
 
 /// Compact (stage-less) run builder for the secondary CI providers.
 #[allow(clippy::too_many_arguments)]
-fn run(id: &str, def: &str, num: i64, name: &str, status: PipelineRunStatus, branch: &str, who: User, updated_h: i64) -> PipelineRun {
+fn run(id: &str, def: &str, num: i64, name: &str, title: &str, status: PipelineRunStatus, branch: &str, who: User, updated_h: i64) -> PipelineRun {
     let now = base();
     let started = now - chrono::Duration::hours(updated_h);
     PipelineRun {
@@ -298,6 +298,7 @@ fn run(id: &str, def: &str, num: i64, name: &str, status: PipelineRunStatus, bra
         definition_id: def.into(),
         number: Some(num),
         name: Some(name.into()),
+        title: Some(title.into()),
         status,
         triggered_by: Some(who),
         branch: Some(branch.into()),
@@ -314,8 +315,8 @@ fn gitlab_pipeline_defs() -> Vec<PipelineDefinition> {
 }
 fn gitlab_runs() -> Vec<PipelineRun> {
     vec![
-        run("gl-9902", "gl-pipeline", 9902, "#9902", PipelineRunStatus::Running, "infra/read-replica", me(), 1),
-        run("gl-9901", "gl-pipeline", 9901, "#9901", PipelineRunStatus::Succeeded, "main", alice(), 6),
+        run("gl-9902", "gl-pipeline", 9902, "#9902", "Add a Postgres read replica", PipelineRunStatus::Running, "infra/read-replica", me(), 1),
+        run("gl-9901", "gl-pipeline", 9901, "#9901", "Cache the customer risk score", PipelineRunStatus::Succeeded, "main", alice(), 6),
     ]
 }
 fn bitbucket_pipeline_defs() -> Vec<PipelineDefinition> {
@@ -323,8 +324,8 @@ fn bitbucket_pipeline_defs() -> Vec<PipelineDefinition> {
 }
 fn bitbucket_runs() -> Vec<PipelineRun> {
     vec![
-        run("bb-441", "bb-default", 441, "#441", PipelineRunStatus::Failed, "feat/rev-rec", me(), 2),
-        run("bb-440", "bb-default", 440, "#440", PipelineRunStatus::Succeeded, "main", dev(), 10),
+        run("bb-441", "bb-default", 441, "#441", "dbt: add revenue recognition model", PipelineRunStatus::Failed, "feat/rev-rec", me(), 2),
+        run("bb-440", "bb-default", 440, "#440", "Tighten CORS on the admin API", PipelineRunStatus::Succeeded, "main", dev(), 10),
     ]
 }
 fn pipeline_defs_for(conn: &str) -> Vec<PipelineDefinition> {
@@ -350,6 +351,7 @@ fn pipeline_runs() -> Vec<PipelineRun> {
             definition_id: "ci".into(),
             number: Some(501),
             name: Some("10.1.100".into()),
+            title: Some("Rework the webhook retry queue".into()),
             status: PipelineRunStatus::Running,
             triggered_by: Some(alice()),
             branch: Some("feature/retry".into()),
@@ -382,6 +384,7 @@ fn pipeline_runs() -> Vec<PipelineRun> {
             definition_id: "ci".into(),
             number: Some(500),
             name: Some("10.1.99".into()),
+            title: Some("Bump Next.js to 14.2.5".into()),
             status: PipelineRunStatus::Failed,
             triggered_by: Some(bob()),
             branch: Some("main".into()),
@@ -427,6 +430,7 @@ fn pipeline_runs() -> Vec<PipelineRun> {
             definition_id: "release".into(),
             number: Some(207),
             name: Some("10.1.98".into()),
+            title: Some("Release 10.1.98".into()),
             status: PipelineRunStatus::Succeeded,
             triggered_by: Some(carol()),
             branch: Some("main".into()),
@@ -452,6 +456,7 @@ fn pipeline_runs() -> Vec<PipelineRun> {
             definition_id: "ci".into(),
             number: Some(502),
             name: Some("10.1.101".into()),
+            title: Some("Rotate the KMS signing keys".into()),
             status: PipelineRunStatus::Queued,
             triggered_by: Some(alice()),
             branch: Some("main".into()),

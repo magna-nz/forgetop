@@ -2627,6 +2627,7 @@ mod tests {
             definition_id: "ci".into(),
             number: Some(101),
             name: Some("CI".into()),
+            title: None,
             status: PipelineRunStatus::Running,
             triggered_by: Some(User { id: "u".into(), display_name: "Dana".into(), handle: None, avatar_url: None }),
             branch: Some("main".into()),
