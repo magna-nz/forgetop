@@ -1,7 +1,7 @@
 <div align="center">
   <img src="docs/forgetop-mark.svg" alt="forgetop logo" width="104" />
   <h1>forgetop</h1>
-  <p><strong>Your work, across every forge — in one command center.</strong></p>
+  <p><strong>Your work, across every forge in one command center.</strong></p>
   <p>A fast, keyboard-driven home for pull requests, work items, and CI pipelines in your terminal, browser, or both.</p>
   <p>
     <a href="https://github.com/magna-nz/forgetop/actions/workflows/ci.yml"><img src="https://github.com/magna-nz/forgetop/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI" /></a>
@@ -16,13 +16,13 @@
 <br />
 
 <div align="center">
-  <img src="docs/terminal-preview-placeholder.svg" alt="Placeholder for the forgetop terminal GIF" width="820" />
+  <img src="docs/dashboard-live.gif" alt="forgetop dashboard live preview" width="820" />
   <br />
-  <sub><strong>In your terminal</strong> — terminal GIF coming soon</sub>
+  <sub><strong>In your browser</strong></sub>
   <br /><br />
-  <img src="docs/dashboard-preview-placeholder.svg" alt="Placeholder for the forgetop dashboard capture" width="820" />
+  <img src="docs/terminal-live.gif" alt="forgetop terminal live preview" width="820" />
   <br />
-  <sub><strong>In your browser</strong> — dashboard still or GIF coming soon</sub>
+  <sub><strong>In your terminal</strong></sub>
 </div>
 
 <br />
