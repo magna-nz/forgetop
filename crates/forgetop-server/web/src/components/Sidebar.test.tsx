@@ -13,12 +13,13 @@ vi.mock("../api", () => ({
 import { Sidebar } from "./Sidebar";
 
 describe("Sidebar", () => {
-  it("places a safe Give Feedback link with connection health", () => {
+  it("places a safe Give Feedback link above the connection-health divider", () => {
     renderWithClient(<Sidebar section="launchpad" onSelect={vi.fn()} collapsed={false} />);
 
     const health = screen.getByText("5/5 connections healthy");
     const feedback = screen.getByRole("link", { name: "Give Feedback" });
-    expect(health.parentElement?.parentElement).toContainElement(feedback);
+    expect(feedback.compareDocumentPosition(health) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(health.parentElement).not.toContainElement(feedback);
     expect(feedback).toHaveAttribute(
       "href",
       "https://github.com/magna-nz/forgetop/issues/new?template=feedback.yml",
