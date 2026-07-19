@@ -1,6 +1,5 @@
-import { useEffect, useRef, useState } from "react";
 import { motion } from "framer-motion";
-import { apiGet, useWorkItems, useWriteAction } from "../api";
+import { useWorkItems } from "../api";
 import { relativeTime, toTime, wiStateColor } from "../format";
 import type { WiRow } from "../types";
 import { Avatar, Chip, List, Skeleton, StateCard, StatusBadge } from "./ui";
@@ -67,88 +66,51 @@ function WiCard({ row, index }: { row: WiRow; index: number }) {
         <span className="truncate font-medium min-w-0" style={{ color: "var(--fg)" }}>
           {wi.title}
         </span>
-        {wi.work_item_type && <span className="shrink-0"><Chip>{wi.work_item_type}</Chip></span>}
+        {wi.work_item_type && (
+          <span className="shrink-0">
+            <Chip>
+              {wi.work_item_type.toLowerCase() === "bug" && <BugIcon />}
+              {wi.work_item_type}
+            </Chip>
+          </span>
+        )}
       </button>
       <div className="flex items-center gap-2 shrink-0">
         <span className="text-xs whitespace-nowrap" style={{ color: "var(--dim)" }}>
           {relativeTime(wi.updated_at)}
         </span>
         {wi.assignee && <Avatar name={wi.assignee.display_name} />}
-        <StateMenu row={row} />
       </div>
     </motion.div>
   );
 }
 
-function StateMenu({ row }: { row: WiRow }) {
-  const [open, setOpen] = useState(false);
-  const [states, setStates] = useState<string[] | null>(null);
-  const [loading, setLoading] = useState(false);
-  const ref = useRef<HTMLDivElement>(null);
-  const { busy, error, run } = useWriteAction();
-
-  // Fetch the allowed transitions lazily, the first time the menu opens.
-  useEffect(() => {
-    if (open && states === null && !loading) {
-      setLoading(true);
-      apiGet<string[]>(`/api/wi/states?conn=${encodeURIComponent(row.connection_id)}&id=${encodeURIComponent(row.work_item.id)}`)
-        .then(setStates)
-        .catch(() => setStates([]))
-        .finally(() => setLoading(false));
-    }
-  }, [open, states, loading, row.connection_id, row.work_item.id]);
-
-  // Close on outside click.
-  useEffect(() => {
-    if (!open) return;
-    const onDoc = (e: MouseEvent) => {
-      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
-    };
-    document.addEventListener("mousedown", onDoc);
-    return () => document.removeEventListener("mousedown", onDoc);
-  }, [open]);
-
-  const move = async (state: string) => {
-    const ok = await run("/api/wi/state", { conn: row.connection_id, id: row.work_item.id, state }, ["work-items", "launchpad"]);
-    if (ok) setOpen(false);
-  };
-
-  const options = (states ?? []).filter((s) => s.toLowerCase() !== row.work_item.state.toLowerCase());
-
+/** Small bug glyph shown inside the [Bug] type chip. Lucide "bug" icon (ISC), inlined so it
+ *  inherits the chip's currentColor and stays offline-friendly. */
+function BugIcon() {
   return (
-    <div className="relative" ref={ref}>
-      <button
-        onClick={() => setOpen((o) => !o)}
-        className="text-xs rounded px-2 py-1"
-        style={{ color: "var(--dim)", border: "1px solid var(--border)", background: "var(--panel2)" }}
-      >
-        Move ▾
-      </button>
-      {open && (
-        <div
-          className="absolute right-0 mt-1 z-10 rounded-md py-1 min-w-40 shadow-lg"
-          style={{ background: "var(--panel)", border: "1px solid var(--border)" }}
-        >
-          {loading && <div className="px-3 py-1.5 text-xs" style={{ color: "var(--dim)" }}>Loading…</div>}
-          {!loading && options.length === 0 && (
-            <div className="px-3 py-1.5 text-xs" style={{ color: "var(--dim)" }}>No transitions available</div>
-          )}
-          {options.map((s) => (
-            <button
-              key={s}
-              disabled={busy}
-              onClick={() => move(s)}
-              className="block w-full text-left px-3 py-1.5 text-xs"
-              style={{ color: "var(--fg)" }}
-              onMouseEnter={(e) => (e.currentTarget.style.background = "var(--sel)")}
-              onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
-            >
-              → {s}
-            </button>
-          ))}
-          {error && <div className="px-3 py-1.5 text-xs" style={{ color: "var(--red)" }}>{error}</div>}
-        </div>
-      )}
-    </div>
+    <svg
+      viewBox="0 0 24 24"
+      width="12"
+      height="12"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="m8 2 1.88 1.88" />
+      <path d="M14.12 3.88 16 2" />
+      <path d="M9 7.13v-1a3.003 3.003 0 1 1 6 0v1" />
+      <path d="M12 20c-3.3 0-6-2.7-6-6v-3a4 4 0 0 1 4-4h4a4 4 0 0 1 4 4v3c0 3.3-2.7 6-6 6" />
+      <path d="M12 20v-9" />
+      <path d="M6.53 9C4.6 8.8 3 7.1 3 5" />
+      <path d="M6 13H2" />
+      <path d="M3 21c0-2.1 1.7-3.9 3.8-4" />
+      <path d="M20.97 5c0 2.1-1.6 3.8-3.5 4" />
+      <path d="M22 13h-4" />
+      <path d="M17.2 17c2.1.1 3.8 1.9 3.8 4" />
+    </svg>
   );
 }
