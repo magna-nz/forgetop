@@ -242,6 +242,10 @@ pub trait PipelineSource: Send + Sync {
     async fn get_run(&self, run_id: &str) -> Result<PipelineRun>;
     async fn logs(&self, run_id: &str, job_id: Option<&str>) -> Result<String>;
     async fn trigger(&self, definition_id: &str, branch: Option<&str>) -> Result<()>;
+    /// Cancel a running or queued run. Unsupported by default.
+    async fn cancel_run(&self, _run_id: &str) -> Result<()> {
+        Err(Error::Provider("cancel_run not supported by this provider".into()))
+    }
     /// Whether this provider can surface and act on pending run approvals/gates.
     /// `false` by default — the UI shows the section as unsupported.
     fn supports_approvals(&self) -> bool {

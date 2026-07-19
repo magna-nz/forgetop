@@ -949,10 +949,15 @@ impl PipelineSource for DemoPipe {
         Ok(pipeline_runs_for(&self.conn)
             .into_iter()
             .filter(|r| query.definition_id.as_ref().is_none_or(|d| &r.definition_id == d))
+            .map(apply_pipe_cancel)
             .collect())
     }
     async fn get_run(&self, run_id: &str) -> Result<PipelineRun> {
-        pipeline_runs_for(&self.conn).into_iter().find(|r| r.id == run_id).ok_or_else(|| forgetop_core::Error::NotFound(run_id.into()))
+        pipeline_runs_for(&self.conn)
+            .into_iter()
+            .find(|r| r.id == run_id)
+            .map(apply_pipe_cancel)
+            .ok_or_else(|| forgetop_core::Error::NotFound(run_id.into()))
     }
     async fn logs(&self, run_id: &str, job_id: Option<&str>) -> Result<String> {
         let job = job_id.unwrap_or("job");
@@ -972,6 +977,10 @@ impl PipelineSource for DemoPipe {
     async fn trigger(&self, _definition_id: &str, _branch: Option<&str>) -> Result<()> {
         Ok(())
     }
+    async fn cancel_run(&self, run_id: &str) -> Result<()> {
+        canceled_runs().lock().unwrap().insert(run_id.to_string());
+        Ok(())
+    }
     fn supports_approvals(&self) -> bool {
         true
     }
@@ -986,6 +995,21 @@ impl PipelineSource for DemoPipe {
     async fn respond_approval(&self, _run_id: &str, _approval_id: &str, _decision: ApprovalDecision, _comment: Option<&str>) -> Result<()> {
         Ok(())
     }
+}
+
+/// Pipeline run ids cancelled this `--demo` session, so cancel_run persists like a real provider:
+/// the run reads back as Canceled through list_runs()/get_run().
+fn canceled_runs() -> &'static Mutex<HashSet<String>> {
+    static STORE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Fold a session cancel onto a freshly-built run.
+fn apply_pipe_cancel(mut run: PipelineRun) -> PipelineRun {
+    if canceled_runs().lock().unwrap().contains(&run.id) {
+        run.status = PipelineRunStatus::Canceled;
+    }
+    run
 }
 
 /// Notification ids marked read this `--demo` session, so mark_read persists like real.
