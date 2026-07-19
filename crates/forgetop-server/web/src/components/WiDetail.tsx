@@ -3,7 +3,7 @@ import { AnimatePresence } from "framer-motion";
 import { useQueryClient } from "@tanstack/react-query";
 import { apiGet, apiPost, useWiDetail } from "../api";
 import { relativeTime, wiStateColor } from "../format";
-import type { CommentThread, WiRef } from "../types";
+import type { CommentThread, User, WiRef, WorkItem } from "../types";
 import { Avatar, Chip, Pill, SlideOver, Timeline } from "./ui";
 
 // ---- opener context ----
@@ -29,9 +29,11 @@ function WiDetailPanel({ wiRef, onClose }: { wiRef: WiRef; onClose: () => void }
   const qc = useQueryClient();
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState<string | null>(null);
+  const [editing, setEditing] = useState(false);
 
   useEffect(() => {
     setNote(null);
+    setEditing(false);
   }, [wiRef.conn, wiRef.id]);
 
   const refresh = () => {
@@ -87,18 +89,42 @@ function WiDetailPanel({ wiRef, onClose }: { wiRef: WiRef; onClose: () => void }
       {wi && data && (
         <div className="p-5 flex flex-col gap-4 max-w-3xl">
           <div className="flex flex-wrap items-center gap-x-4 gap-y-2 text-xs" style={{ color: "var(--dim)" }}>
-            {wi.assignee && (
-              <span className="flex items-center gap-1.5">
-                <Avatar name={wi.assignee.display_name} size={18} /> {wi.assignee.display_name}
-              </span>
-            )}
+            <AssigneePicker
+              wiRef={wiRef}
+              assignee={wi.assignee}
+              busy={busy}
+              onPick={(assigneeId) =>
+                act(assigneeId ? "Reassigned" : "Unassigned", () =>
+                  apiPost("/api/wi/assignee", { conn: wiRef.conn, id: wiRef.id, assignee_id: assigneeId }),
+                )
+              }
+            />
             <MoveState wiRef={wiRef} current={wi.state} busy={busy} onMove={(state) => act(`Moved to ${state}`, () => apiPost("/api/wi/state", { conn: wiRef.conn, id: wiRef.id, state }))} />
+            {!editing && (
+              <button onClick={() => setEditing(true)} className="rounded px-2 py-1" style={{ color: "var(--dim)", border: "1px solid var(--border)", background: "var(--panel2)" }}>
+                Edit
+              </button>
+            )}
           </div>
 
-          {wi.description && (
-            <div className="rounded-lg p-3 text-sm whitespace-pre-wrap" style={{ background: "var(--card)", border: "1px solid var(--border)", color: "var(--fg)" }}>
-              {wi.description}
-            </div>
+          {editing ? (
+            <EditFields
+              wi={wi}
+              busy={busy}
+              onCancel={() => setEditing(false)}
+              onSave={(title, description) =>
+                act("Saved", async () => {
+                  await apiPost("/api/wi/update", { conn: wiRef.conn, id: wiRef.id, title, description });
+                  setEditing(false);
+                })
+              }
+            />
+          ) : (
+            wi.description && (
+              <div className="rounded-lg p-3 text-sm whitespace-pre-wrap" style={{ background: "var(--card)", border: "1px solid var(--border)", color: "var(--fg)" }}>
+                {wi.description}
+              </div>
+            )
           )}
 
           {data.timeline.length > 0 && <Timeline events={data.timeline} />}
@@ -171,6 +197,121 @@ function MoveState({ wiRef, current, busy, onMove }: { wiRef: WiRef; current: st
           ))}
         </div>
       )}
+    </div>
+  );
+}
+
+// ---- assignee picker ----
+
+function AssigneePicker({ wiRef, assignee, busy, onPick }: { wiRef: WiRef; assignee?: User | null; busy: boolean; onPick: (assigneeId: string | null) => void }) {
+  const [open, setOpen] = useState(false);
+  const [users, setUsers] = useState<User[] | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  // Fetch the assignable users lazily, the first time the menu opens.
+  useEffect(() => {
+    if (open && users === null && !loading) {
+      setLoading(true);
+      apiGet<User[]>(`/api/wi/assignees?conn=${encodeURIComponent(wiRef.conn)}&id=${encodeURIComponent(wiRef.id)}`)
+        .then(setUsers)
+        .catch(() => setUsers([]))
+        .finally(() => setLoading(false));
+    }
+  }, [open, users, loading, wiRef.conn, wiRef.id]);
+
+  const pick = (assigneeId: string | null) => {
+    onPick(assigneeId);
+    setOpen(false);
+  };
+
+  return (
+    <div className="relative">
+      <button
+        onClick={() => setOpen((o) => !o)}
+        disabled={busy}
+        className="flex items-center gap-1.5 rounded px-2 py-1"
+        style={{ color: "var(--dim)", border: "1px solid var(--border)", background: "var(--panel2)" }}
+      >
+        {assignee ? (
+          <>
+            <Avatar name={assignee.display_name} size={18} /> {assignee.display_name}
+          </>
+        ) : (
+          "Unassigned"
+        )}{" "}
+        ▾
+      </button>
+      {open && (
+        <div className="absolute left-0 mt-1 z-10 rounded-md py-1 min-w-48 max-h-64 overflow-auto shadow-lg" style={{ background: "var(--panel)", border: "1px solid var(--border)" }}>
+          {loading && <div className="px-3 py-1.5" style={{ color: "var(--dim)" }}>Loading…</div>}
+          <button
+            disabled={busy}
+            onClick={() => pick(null)}
+            className="block w-full text-left px-3 py-1.5"
+            style={{ color: "var(--dim)" }}
+            onMouseEnter={(e) => (e.currentTarget.style.background = "var(--sel)")}
+            onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+          >
+            Unassigned
+          </button>
+          {(users ?? []).map((u) => (
+            <button
+              key={u.id}
+              disabled={busy}
+              onClick={() => pick(u.id)}
+              className="flex items-center gap-2 w-full text-left px-3 py-1.5"
+              style={{ color: "var(--fg)" }}
+              onMouseEnter={(e) => (e.currentTarget.style.background = "var(--sel)")}
+              onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+            >
+              <Avatar name={u.display_name} size={18} /> {u.display_name}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---- title / description edit ----
+
+function EditFields({ wi, busy, onSave, onCancel }: { wi: WorkItem; busy: boolean; onSave: (title?: string, description?: string) => void; onCancel: () => void }) {
+  const [title, setTitle] = useState(wi.title);
+  const [description, setDescription] = useState(wi.description ?? "");
+  const changedTitle = title !== wi.title;
+  const changedDesc = description !== (wi.description ?? "");
+  const dirty = changedTitle || changedDesc;
+  const canSave = !busy && dirty && title.trim().length > 0;
+  return (
+    <div className="rounded-lg p-3 flex flex-col gap-2" style={{ background: "var(--card)", border: "1px solid var(--border)" }}>
+      <input
+        value={title}
+        onChange={(e) => setTitle(e.target.value)}
+        placeholder="Title"
+        className="rounded-md px-2 py-1.5 text-sm outline-none"
+        style={{ background: "var(--bg)", color: "var(--fg)", border: "1px solid var(--border)" }}
+      />
+      <textarea
+        value={description}
+        onChange={(e) => setDescription(e.target.value)}
+        placeholder="Description"
+        rows={6}
+        className="rounded-md px-2 py-1.5 text-sm outline-none"
+        style={{ background: "var(--bg)", color: "var(--fg)", border: "1px solid var(--border)" }}
+      />
+      <div className="flex gap-2">
+        <button
+          disabled={!canSave}
+          onClick={() => onSave(changedTitle ? title : undefined, changedDesc ? description : undefined)}
+          className="rounded-md px-3 py-1.5 text-sm font-medium"
+          style={{ color: "#12151b", background: "var(--accent)", opacity: canSave ? 1 : 0.45, cursor: canSave ? "pointer" : "not-allowed" }}
+        >
+          Save
+        </button>
+        <button onClick={onCancel} className="rounded-md px-3 py-1.5 text-sm" style={{ color: "var(--dim)", border: "1px solid var(--border)", background: "var(--panel2)" }}>
+          Cancel
+        </button>
+      </div>
     </div>
   );
 }
