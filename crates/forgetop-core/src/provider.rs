@@ -217,6 +217,22 @@ pub trait WorkItemSource: Send + Sync {
     async fn available_states(&self, _work_item_id: &str) -> Result<Vec<String>> {
         Ok(Vec::new())
     }
+    /// Users this item can be assigned to (candidates for the assignee picker). The `id` on each
+    /// returned `User` MUST be the exact token this provider's `set_assignee` accepts. Empty by
+    /// default (no picker shown).
+    async fn assignable_users(&self, _work_item_id: &str) -> Result<Vec<User>> {
+        Ok(Vec::new())
+    }
+    /// Assign the item to a user (by an id from `assignable_users`), or `None` to unassign.
+    /// Unsupported by default.
+    async fn set_assignee(&self, _work_item_id: &str, _assignee_id: Option<&str>) -> Result<()> {
+        Err(Error::Provider("set_assignee not supported by this provider".into()))
+    }
+    /// Edit the item's title and/or description (`None` leaves that field unchanged).
+    /// Unsupported by default.
+    async fn update_fields(&self, _work_item_id: &str, _title: Option<&str>, _description: Option<&str>) -> Result<()> {
+        Err(Error::Provider("update_fields not supported by this provider".into()))
+    }
 }
 
 #[async_trait]

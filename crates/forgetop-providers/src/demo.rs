@@ -472,6 +472,42 @@ fn submitted_threads() -> &'static Mutex<HashMap<String, Vec<CommentThread>>> {
     STORE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Work-item edits made this run (reassign / title / description), keyed by item id, so they
+/// persist and read back like a real provider. `assignee: None` = unchanged, `Some(None)` =
+/// unassigned, `Some(Some(u))` = assigned.
+#[derive(Default, Clone)]
+struct WiOverride {
+    assignee: Option<Option<User>>,
+    title: Option<String>,
+    description: Option<String>,
+}
+
+fn wi_overrides() -> &'static Mutex<HashMap<String, WiOverride>> {
+    static STORE: OnceLock<Mutex<HashMap<String, WiOverride>>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The people you can assign demo work to (mirrors a provider's assignable-users call).
+fn demo_assignable() -> Vec<User> {
+    vec![me(), alice(), bob(), carol(), dev()]
+}
+
+/// Fold any edits made this run onto a freshly-built work item.
+fn apply_wi_override(mut wi: WorkItem) -> WorkItem {
+    if let Some(ov) = wi_overrides().lock().unwrap().get(&wi.id) {
+        if let Some(a) = &ov.assignee {
+            wi.assignee = a.clone();
+        }
+        if let Some(t) = &ov.title {
+            wi.title = t.clone();
+        }
+        if let Some(d) = &ov.description {
+            wi.description = Some(d.clone());
+        }
+    }
+    wi
+}
+
 /// Replies posted this run, keyed by `"{pr_id}:{thread_id}"`, so `reply_to_thread` persists
 /// like a real provider: the reply comes back appended to its thread on the next `threads()`.
 fn thread_replies() -> &'static Mutex<HashMap<String, Vec<Comment>>> {
@@ -828,6 +864,7 @@ impl WorkItemSource for DemoWi {
         // The demo's "me" is Alice (u1); mine_only keeps only her items.
         Ok(wis_for(&self.conn)
             .into_iter()
+            .map(apply_wi_override)
             .filter(|w| {
                 query.include_completed
                     || !matches!(w.state_category, WorkItemStateCategory::Completed | WorkItemStateCategory::Canceled)
@@ -836,7 +873,11 @@ impl WorkItemSource for DemoWi {
             .collect())
     }
     async fn get(&self, id: &str) -> Result<WorkItem> {
-        wis_for(&self.conn).into_iter().find(|w| w.id == id).ok_or_else(|| forgetop_core::Error::NotFound(id.into()))
+        wis_for(&self.conn)
+            .into_iter()
+            .find(|w| w.id == id)
+            .map(apply_wi_override)
+            .ok_or_else(|| forgetop_core::Error::NotFound(id.into()))
     }
     async fn threads(&self, id: &str) -> Result<Vec<CommentThread>> {
         // Comments submitted this session persist and come back, like a real provider.
@@ -873,6 +914,25 @@ impl WorkItemSource for DemoWi {
     }
     async fn available_states(&self, _id: &str) -> Result<Vec<String>> {
         Ok(["Backlog", "Todo", "In Progress", "In Review", "Blocked", "Done"].iter().map(|s| s.to_string()).collect())
+    }
+    async fn assignable_users(&self, _id: &str) -> Result<Vec<User>> {
+        Ok(demo_assignable())
+    }
+    async fn set_assignee(&self, id: &str, assignee_id: Option<&str>) -> Result<()> {
+        let user = assignee_id.and_then(|aid| demo_assignable().into_iter().find(|u| u.id == aid));
+        wi_overrides().lock().unwrap().entry(id.to_string()).or_default().assignee = Some(user);
+        Ok(())
+    }
+    async fn update_fields(&self, id: &str, title: Option<&str>, description: Option<&str>) -> Result<()> {
+        let mut store = wi_overrides().lock().unwrap();
+        let ov = store.entry(id.to_string()).or_default();
+        if let Some(t) = title {
+            ov.title = Some(t.to_string());
+        }
+        if let Some(d) = description {
+            ov.description = Some(d.to_string());
+        }
+        Ok(())
     }
 }
 
