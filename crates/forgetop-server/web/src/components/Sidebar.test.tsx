@@ -1,5 +1,4 @@
 import { screen } from "@testing-library/react";
-import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { renderWithClient } from "../test/util";
 
@@ -14,15 +13,18 @@ vi.mock("../api", () => ({
 import { Sidebar } from "./Sidebar";
 
 describe("Sidebar", () => {
-  it("places Give Feedback with connection health and navigates to its section", async () => {
-    const onSelect = vi.fn();
-    renderWithClient(<Sidebar section="launchpad" onSelect={onSelect} collapsed={false} />);
+  it("places a safe Give Feedback link with connection health", () => {
+    renderWithClient(<Sidebar section="launchpad" onSelect={vi.fn()} collapsed={false} />);
 
     const health = screen.getByText("5/5 connections healthy");
-    const feedback = screen.getByRole("button", { name: "Give Feedback" });
+    const feedback = screen.getByRole("link", { name: "Give Feedback" });
     expect(health.parentElement?.parentElement).toContainElement(feedback);
-
-    await userEvent.click(feedback);
-    expect(onSelect).toHaveBeenCalledWith("feedback");
+    expect(feedback).toHaveAttribute(
+      "href",
+      "https://github.com/magna-nz/forgetop/issues/new?template=feedback.yml",
+    );
+    expect(feedback).toHaveAttribute("target", "_blank");
+    expect(feedback).toHaveAttribute("rel", expect.stringContaining("noopener"));
+    expect(feedback).toHaveAttribute("rel", expect.stringContaining("noreferrer"));
   });
 });

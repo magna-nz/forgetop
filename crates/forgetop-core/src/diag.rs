@@ -1,13 +1,18 @@
 //! Lightweight, bounded file logging for diagnostics. Writes are best-effort: diagnostics
 //! must never turn a recoverable application error into a crash.
 
-use std::fs::{self, OpenOptions};
+use std::ffi::OsString;
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
 use chrono::{DateTime, TimeDelta, Utc};
+use fs2::FileExt;
 use regex::Regex;
+
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 /// Retain at most 3 MiB across the active file and five rotated segments.
 pub const MAX_LOG_BYTES: u64 = 3 * 1024 * 1024;
@@ -24,8 +29,19 @@ pub fn log_path() -> PathBuf {
 
 /// Append a timestamped `context: message` line to the log file. Best-effort.
 pub fn log(context: &str, message: &str) {
-    if let Ok(_guard) = LOG_LOCK.lock() {
+    if let Ok(_guard) = LOG_LOCK.try_lock() {
         let _ = LogStore::new(log_path()).append_at(Utc::now(), context, message);
+    }
+}
+
+/// Physically prune expired diagnostics and repair their size and permissions. Best-effort.
+///
+/// Call this once during startup and periodically in long-running processes. If this process or
+/// another forgetop process is already touching the logs, maintenance is skipped rather than
+/// delaying the UI.
+pub fn maintain() {
+    if let Ok(_guard) = LOG_LOCK.try_lock() {
+        let _ = LogStore::new(log_path()).maintain_at(Utc::now());
     }
 }
 
@@ -89,8 +105,12 @@ impl LogStore {
         if index == 0 {
             self.path.clone()
         } else {
-            PathBuf::from(format!("{}.{}", self.path.display(), index))
+            suffixed_path(&self.path, &format!(".{index}"))
         }
+    }
+
+    fn lock_path(&self) -> PathBuf {
+        suffixed_path(&self.path, ".lock")
     }
 
     fn segment_paths(&self) -> Vec<PathBuf> {
@@ -100,9 +120,11 @@ impl LogStore {
     }
 
     fn append_at(&self, now: DateTime<Utc>, context: &str, message: &str) -> io::Result<()> {
-        if let Some(dir) = self.path.parent() {
-            fs::create_dir_all(dir)?;
-        }
+        self.with_exclusive_lock(|store| store.append_unlocked(now, context, message))?;
+        Ok(())
+    }
+
+    fn append_unlocked(&self, now: DateTime<Utc>, context: &str, message: &str) -> io::Result<()> {
         self.prune_expired(now)?;
 
         let line = bounded_entry(now, context, message, self.segment_bytes as usize);
@@ -113,19 +135,58 @@ impl LogStore {
             self.rotate()?;
         }
 
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
+        let mut file = open_private(&self.path, true, false)?;
         file.write_all(line.as_bytes())?;
         self.enforce_total_bound()
+    }
+
+    fn maintain_at(&self, now: DateTime<Utc>) -> io::Result<()> {
+        self.with_exclusive_lock(|store| {
+            store.prune_expired(now)?;
+            store.enforce_total_bound()
+        })?;
+        Ok(())
+    }
+
+    fn with_exclusive_lock<T>(
+        &self,
+        operation: impl FnOnce(&Self) -> io::Result<T>,
+    ) -> io::Result<Option<T>> {
+        if let Some(dir) = self.path.parent() {
+            fs::create_dir_all(dir)?;
+        }
+        let lock = open_private(&self.lock_path(), false, false)?;
+        match lock.try_lock_exclusive() {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(None),
+            Err(error) => return Err(error),
+        }
+        self.repair_segment_permissions()?;
+        operation(self).map(Some)
+    }
+
+    fn repair_segment_permissions(&self) -> io::Result<()> {
+        for path in self.segment_paths() {
+            match repair_private_permissions(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
     }
 
     fn prune_expired(&self, now: DateTime<Utc>) -> io::Result<()> {
         let cutoff = now - self.max_age;
         for path in self.segment_paths() {
-            let Ok(contents) = fs::read_to_string(&path) else {
-                continue;
+            let contents = match fs::read_to_string(&path) {
+                Ok(contents) => contents,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                    fs::remove_file(path)?;
+                    continue;
+                }
+                Err(error) => return Err(error),
             };
             let retained: Vec<String> = contents
                 .lines()
@@ -140,7 +201,7 @@ impl LogStore {
                     Err(error) => return Err(error),
                 }
             } else {
-                fs::write(path, join_lines(&retained))?;
+                write_private(&path, &join_lines(&retained))?;
             }
         }
         Ok(())
@@ -149,7 +210,7 @@ impl LogStore {
     fn rotate(&self) -> io::Result<()> {
         let count = self.segment_count();
         if count == 1 {
-            return fs::write(&self.path, []);
+            return write_private(&self.path, &[]);
         }
 
         let oldest = self.segment_path(count - 1);
@@ -179,10 +240,20 @@ impl LogStore {
             if total <= self.max_bytes {
                 break;
             }
-            let Ok(contents) = fs::read_to_string(&path) else {
-                continue;
+            let size = match fs::metadata(&path) {
+                Ok(metadata) => metadata.len(),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
             };
-            let size = contents.len() as u64;
+            let contents = match fs::read_to_string(&path) {
+                Ok(contents) => contents,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(_) => {
+                    fs::remove_file(&path)?;
+                    total = total.saturating_sub(size);
+                    continue;
+                }
+            };
             let allowed = size.saturating_sub(total - self.max_bytes) as usize;
             let lines = newest_lines_within(contents.lines().map(str::to_owned).collect(), allowed);
             if lines.is_empty() {
@@ -190,7 +261,7 @@ impl LogStore {
                 total = total.saturating_sub(size);
             } else {
                 let retained = join_lines(&lines);
-                fs::write(path, &retained)?;
+                write_private(&path, &retained)?;
                 total = total
                     .saturating_sub(size)
                     .saturating_add(retained.len() as u64);
@@ -200,6 +271,11 @@ impl LogStore {
     }
 
     fn snapshot_at(&self, now: DateTime<Utc>) -> io::Result<DiagnosticSnapshot> {
+        self.with_exclusive_lock(|store| store.snapshot_unlocked(now))?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock, "diagnostic logs are busy"))
+    }
+
+    fn snapshot_unlocked(&self, now: DateTime<Utc>) -> io::Result<DiagnosticSnapshot> {
         let cutoff = now - self.max_age;
         let mut lines = Vec::new();
         for index in (0..self.segment_count()).rev() {
@@ -227,6 +303,46 @@ impl LogStore {
             newest_at,
         })
     }
+}
+
+fn suffixed_path(path: &std::path::Path, suffix: &str) -> PathBuf {
+    let mut value: OsString = path.as_os_str().to_os_string();
+    value.push(suffix);
+    PathBuf::from(value)
+}
+
+fn open_private(path: &std::path::Path, append: bool, truncate: bool) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options
+        .read(!append)
+        .write(true)
+        .create(true)
+        .append(append)
+        .truncate(truncate);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let file = options.open(path)?;
+    repair_private_permissions(path)?;
+    Ok(file)
+}
+
+fn write_private(path: &std::path::Path, contents: &[u8]) -> io::Result<()> {
+    let mut file = open_private(path, false, true)?;
+    file.write_all(contents)
+}
+
+#[cfg(unix)]
+fn repair_private_permissions(path: &std::path::Path) -> io::Result<()> {
+    let permissions = fs::metadata(path)?.permissions();
+    if permissions.mode() & 0o777 != 0o600 {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn repair_private_permissions(path: &std::path::Path) -> io::Result<()> {
+    fs::metadata(path).map(|_| ())
 }
 
 fn bounded_entry(now: DateTime<Utc>, context: &str, message: &str, max_bytes: usize) -> String {
@@ -300,7 +416,7 @@ fn redaction_rules() -> &'static [(Regex, &'static str)] {
                 "$1$2[REDACTED]",
             ),
             (r"(?i)\b(FORGETOP_PAT_[A-Z0-9_]+)(\s*=\s*)[^\s,;&]+", "$1$2[REDACTED]"),
-            (r"(?i)(://)[^\s/@:]+:[^\s/@]+@", "$1[REDACTED]@"),
+            (r"(?i)(://)[^\s/@]+@", "$1[REDACTED]@"),
             (r"(?i)([?&#]t=)[^&#\s]+", "$1[REDACTED]"),
             (r"(?i)\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+", "$1 [REDACTED]"),
             (
@@ -319,6 +435,12 @@ mod tests {
     use super::*;
     use chrono::{DateTime, TimeDelta};
     use tempfile::tempdir;
+
+    #[cfg(unix)]
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn log_path_is_the_forgetop_log_file() {
@@ -419,6 +541,113 @@ mod tests {
     }
 
     #[test]
+    fn maintenance_physically_prunes_expired_entries_without_an_append() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("forgetop.log");
+        let store = LogStore::with_limits(path.clone(), 1024, 512, TimeDelta::hours(24));
+        let now = DateTime::parse_from_rfc3339("2026-07-20T10:00:00Z")
+            .unwrap()
+            .to_utc();
+        fs::write(
+            &path,
+            format!(
+                "{} [fetch] expired\n{} [fetch] retained\n",
+                (now - TimeDelta::hours(25)).to_rfc3339(),
+                now.to_rfc3339()
+            ),
+        )
+        .unwrap();
+
+        store.maintain_at(now).unwrap();
+
+        let contents = fs::read_to_string(path).unwrap();
+        assert!(!contents.contains("expired"));
+        assert!(contents.contains("retained"));
+    }
+
+    #[test]
+    fn contended_interprocess_lock_drops_append_without_mutating_logs() {
+        use fs2::FileExt;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("forgetop.log");
+        let store = LogStore::with_limits(path.clone(), 1024, 512, TimeDelta::hours(24));
+        let now = DateTime::parse_from_rfc3339("2026-07-20T10:00:00Z")
+            .unwrap()
+            .to_utc();
+        store.append_at(now, "fetch", "before-contention").unwrap();
+
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(store.lock_path())
+            .unwrap();
+        lock.try_lock_exclusive().unwrap();
+        store
+            .append_at(now + TimeDelta::seconds(1), "fetch", "must-be-dropped")
+            .unwrap();
+        store.maintain_at(now + TimeDelta::hours(25)).unwrap();
+        FileExt::unlock(&lock).unwrap();
+
+        let contents = fs::read_to_string(path).unwrap();
+        assert!(contents.contains("before-contention"));
+        assert!(!contents.contains("must-be-dropped"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn segment_paths_preserve_non_utf8_log_paths() {
+        let dir = tempdir().unwrap();
+        let mut name = b"forgetop-".to_vec();
+        name.push(0xff);
+        name.extend_from_slice(b".log");
+        let path = dir.path().join(std::ffi::OsString::from_vec(name));
+        let store = LogStore::with_limits(path.clone(), 1024, 512, TimeDelta::hours(24));
+
+        let mut expected = path.as_os_str().as_bytes().to_vec();
+        expected.extend_from_slice(b".1");
+        assert_eq!(store.segment_path(1).as_os_str().as_bytes(), expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn diagnostics_files_are_created_and_repaired_as_owner_only() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("forgetop.log");
+        let store = LogStore::with_limits(path, 360, 120, TimeDelta::hours(24));
+        let now = DateTime::parse_from_rfc3339("2026-07-20T10:00:00Z")
+            .unwrap()
+            .to_utc();
+        for index in 0..4 {
+            store
+                .append_at(
+                    now + TimeDelta::seconds(index),
+                    "fetch",
+                    &format!("entry-{index} {}", "x".repeat(36)),
+                )
+                .unwrap();
+        }
+
+        let mut paths: Vec<_> = store
+            .segment_paths()
+            .into_iter()
+            .filter(|path| path.exists())
+            .collect();
+        paths.push(store.lock_path());
+        assert!(paths.len() >= 3, "expected active, rotated, and lock files");
+        for path in &paths {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o644)).unwrap();
+        }
+
+        store.maintain_at(now + TimeDelta::minutes(1)).unwrap();
+
+        for path in paths {
+            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{} had mode {mode:o}", path.display());
+        }
+    }
+
+    #[test]
     fn snapshot_is_chronological_and_immutable() {
         let dir = tempdir().unwrap();
         let store = LogStore::with_limits(
@@ -475,6 +704,17 @@ mod tests {
         let text = store.snapshot_at(now).unwrap().text();
         assert!(!text.contains("should-not-leave-disk"));
         assert!(text.contains("api_key=[REDACTED]"));
+    }
+
+    #[test]
+    fn sanitizes_single_url_userinfo_without_redacting_plain_email_addresses() {
+        let sanitized =
+            sanitize("url=https://single-credential@example.com/api contact=user@example.com");
+
+        assert_eq!(
+            sanitized,
+            "url=https://[REDACTED]@example.com/api contact=user@example.com"
+        );
     }
 
     #[test]

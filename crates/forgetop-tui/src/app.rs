@@ -20,6 +20,48 @@ use crate::wizard::{provider_sections, section_label, Wizard, WizardOutcome};
 
 const DASHBOARD_OPEN_FAILURE_CONTEXT: &str = "action";
 const DASHBOARD_OPEN_FAILURE_MESSAGE: &str = "failed to open local dashboard in browser";
+const FEEDBACK_ISSUE_URL: &str =
+    "https://github.com/magna-nz/forgetop/issues/new?template=feedback.yml";
+const FEEDBACK_OPEN_FAILURE_CONTEXT: &str = "action";
+const FEEDBACK_OPEN_FAILURE_MESSAGE: &str = "failed to open GitHub feedback form in browser";
+const DIAG_FAILURE_MESSAGE: &str = "operation failed";
+const DIAG_REFRESH: &str = "tui.refresh";
+const DIAG_ACTION: &str = "tui.action";
+const DIAG_RELOAD_PULL_REQUESTS: &str = "tui.reload.pull_requests";
+const DIAG_RELOAD_WORK_ITEMS: &str = "tui.reload.work_items";
+const DIAG_RELOAD_PIPELINES: &str = "tui.reload.pipelines";
+const DIAG_PR_FEEDS: &str = "tui.pr.feeds";
+const DIAG_PR_DETAIL: &str = "tui.pr.detail";
+const DIAG_PR_THREADS: &str = "tui.pr.threads";
+const DIAG_PR_CHANGES: &str = "tui.pr.changes";
+const DIAG_PR_CHECKS: &str = "tui.pr.checks";
+const DIAG_PR_COMMITS: &str = "tui.pr.commits";
+const DIAG_PR_COMMIT_CHANGES: &str = "tui.pr.commit_changes";
+const DIAG_WI_FEEDS: &str = "tui.work_item.feeds";
+const DIAG_WI_THREADS: &str = "tui.work_item.threads";
+const DIAG_WI_STATES: &str = "tui.work_item.states";
+const DIAG_PIPELINE_FEEDS: &str = "tui.pipeline.feeds";
+const DIAG_PIPELINE_DISCOVERY: &str = "tui.pipeline.discovery";
+const DIAG_PIPELINE_RUN: &str = "tui.pipeline.run";
+const DIAG_PIPELINE_APPROVALS: &str = "tui.pipeline.approvals";
+const DIAG_PIPELINE_LOGS: &str = "tui.pipeline.logs";
+const DIAG_LAUNCHPAD_FEEDS: &str = "tui.launchpad.feeds";
+const DIAG_LAUNCHPAD_MINE: &str = "tui.launchpad.mine";
+const DIAG_LAUNCHPAD_REVIEW: &str = "tui.launchpad.review";
+const DIAG_NOTIFICATION_SCAN_FEEDS: &str = "tui.notification_scan.feeds";
+const DIAG_NOTIFICATION_SCAN_REVIEW: &str = "tui.notification_scan.review";
+const DIAG_NOTIFICATION_SCAN_MINE: &str = "tui.notification_scan.mine";
+const DIAG_INBOX_FEEDS: &str = "tui.inbox.feeds";
+const DIAG_INBOX_PR_DETAIL: &str = "tui.inbox.pr_detail";
+const DIAG_INBOX_WI_DETAIL: &str = "tui.inbox.work_item_detail";
+const DIAG_INBOX_MARK_READ: &str = "tui.inbox.mark_read";
+const DIAG_INBOX_MARK_ALL_READ: &str = "tui.inbox.mark_all_read";
+
+type FeedbackOpener = fn(&str) -> std::result::Result<(), String>;
+
+fn system_feedback_opener(target: &str) -> std::result::Result<(), String> {
+    open::that(target).map_err(|error| error.to_string())
+}
 
 /// The section index behind each tab position (0 = Pull Requests, 1 = Work Items, 2 = Pipelines).
 fn section_of(index: usize) -> Section {
@@ -139,9 +181,11 @@ pub struct App {
     /// The cross-provider notification inbox (distinct from `notifications`, the desktop-ping prefs).
     pub inbox: Vec<NotifRow>,
     pub inbox_sel: usize,
-    /// URL of the embedded web dashboard, if its server started. `B` opens it and `F`
-    /// opens its feedback page.
+    /// URL of the embedded web dashboard, if its server started. `B` opens it.
     pub dashboard_url: Option<String>,
+    /// Browser boundary for the global feedback shortcut. A function pointer keeps the
+    /// production path trivial and lets tests exercise ordinary key dispatch without I/O.
+    feedback_opener: FeedbackOpener,
     pub pr_state: TableState,
     pub wi_state: TableState,
     pub pipe_state: TableState,
@@ -672,6 +716,7 @@ impl App {
             inbox: Vec::new(),
             inbox_sel: 0,
             dashboard_url: None,
+            feedback_opener: system_feedback_opener,
             pr_state: TableState::default(),
             wi_state: TableState::default(),
             pipe_state: TableState::default(),
@@ -1432,10 +1477,28 @@ impl App {
         self.open_dashboard_at("");
     }
 
-    /// Open the dashboard's feedback page. The dashboard owns the form; the TUI only
-    /// provides a discoverable shortcut to the same experience.
+    /// Open the same public GitHub issue form used by the dashboard's feedback entry point.
     fn open_feedback(&mut self) {
-        self.open_dashboard_at("#feedback");
+        self.open_feedback_with(self.feedback_opener, forgetop_core::diag::log);
+    }
+
+    /// Small opener seam so tests can verify the exact external destination and safe failure
+    /// logging without launching a browser.
+    fn open_feedback_with<E>(
+        &mut self,
+        opener: impl FnOnce(&str) -> std::result::Result<(), E>,
+        log_failure: impl FnOnce(&str, &str),
+    ) where
+        E: std::fmt::Display,
+    {
+        self.toast = Some(match opener(FEEDBACK_ISSUE_URL) {
+            Ok(()) => "Opening feedback form in your browser…".into(),
+            Err(error) => {
+                // Keep the destination out of diagnostics even though it currently has no secret.
+                log_failure(FEEDBACK_OPEN_FAILURE_CONTEXT, FEEDBACK_OPEN_FAILURE_MESSAGE);
+                format!("Couldn't open feedback form: {error}")
+            }
+        });
     }
 
     /// Open the dashboard at a specific view (e.g. `#settings` for connection management).
@@ -1510,27 +1573,36 @@ impl App {
         let n = &row.notification;
         let (item_type, item_id, url, notif_id) = (n.item_type, n.item_id.clone(), n.url.clone(), n.id.clone());
 
-        self.mark_inbox_read(&conn, &notif_id, deps).await;
+        if let Err(error) = self.mark_inbox_read(&conn, &notif_id, deps).await {
+            self.toast = Some(error);
+            return;
+        }
 
         match (item_type, item_id) {
             (NotificationItemType::PullRequest, Some(id)) => {
                 if let Some(src) = self.pr_source_for(&conn, deps).await {
-                    if let Ok(pr) = src.get(&id).await {
-                        self.from_inbox = true;
-                        self.lp_origin = false;
-                        let (label, purl) = (pr_label(&pr), pr.url.clone());
-                        self.open_pr_view_for(deps, 0, id, label, purl, conn, pr).await;
-                        return;
+                    match src.get(&id).await {
+                        Ok(pr) => {
+                            self.from_inbox = true;
+                            self.lp_origin = false;
+                            let (label, purl) = (pr_label(&pr), pr.url.clone());
+                            self.open_pr_view_for(deps, 0, id, label, purl, conn, pr).await;
+                            return;
+                        }
+                        Err(_) => log_operation_failure(DIAG_INBOX_PR_DETAIL),
                     }
                 }
             }
             (NotificationItemType::WorkItem, Some(id)) => {
                 if let Some(src) = self.wi_source_for(&conn, deps).await {
-                    if let Ok(wi) = src.get(&id).await {
-                        self.from_inbox = true;
-                        self.lp_origin = false;
-                        self.open_wi_view_for(deps, id, conn, wi).await;
-                        return;
+                    match src.get(&id).await {
+                        Ok(wi) => {
+                            self.from_inbox = true;
+                            self.lp_origin = false;
+                            self.open_wi_view_for(deps, id, conn, wi).await;
+                            return;
+                        }
+                        Err(_) => log_operation_failure(DIAG_INBOX_WI_DETAIL),
                     }
                 }
             }
@@ -1550,32 +1622,78 @@ impl App {
 
     async fn mark_selected_inbox_read(&mut self, deps: &AppDeps) {
         if let Some((conn, id)) = self.inbox.get(self.inbox_sel).map(|r| (r.connection_id.clone(), r.notification.id.clone())) {
-            self.mark_inbox_read(&conn, &id, deps).await;
-            self.toast = Some("Marked read".into());
+            self.toast = Some(match self.mark_inbox_read(&conn, &id, deps).await {
+                Ok(()) => "Marked read".into(),
+                Err(error) => error,
+            });
         }
     }
 
-    async fn mark_inbox_read(&mut self, conn: &str, notif_id: &str, deps: &AppDeps) {
+    async fn mark_inbox_read(&mut self, conn: &str, notif_id: &str, deps: &AppDeps) -> std::result::Result<(), String> {
+        let feeds = deps.sections.notification_feeds().await.map_err(|error| {
+            inbox_action_error(
+                "Couldn't load notification connections",
+                error,
+                DIAG_INBOX_FEEDS,
+            )
+        })?;
+        let feed = feeds
+            .iter()
+            .find(|feed| feed.connection.connection_id() == conn)
+            .ok_or_else(|| {
+                inbox_action_error(
+                    "Couldn't mark notification read",
+                    "notification connection unavailable",
+                    DIAG_INBOX_MARK_READ,
+                )
+            })?;
+        feed.source.mark_read(notif_id).await.map_err(|error| {
+            inbox_action_error(
+                "Couldn't mark notification read",
+                error,
+                DIAG_INBOX_MARK_READ,
+            )
+        })?;
         for row in &mut self.inbox {
             if row.connection_id == conn && row.notification.id == notif_id {
                 row.notification.unread = false;
             }
         }
-        if let Ok(feeds) = deps.sections.notification_feeds().await {
-            if let Some(feed) = feeds.iter().find(|f| f.connection.connection_id() == conn) {
-                let _ = feed.source.mark_read(notif_id).await;
-            }
-        }
+        Ok(())
     }
 
     async fn mark_all_inbox_read(&mut self, deps: &AppDeps) {
+        let feeds = match deps.sections.notification_feeds().await {
+            Ok(feeds) => feeds,
+            Err(error) => {
+                self.toast = Some(inbox_action_error(
+                    "Couldn't load notification connections",
+                    error,
+                    DIAG_INBOX_FEEDS,
+                ));
+                return;
+            }
+        };
+        if feeds.is_empty() && !self.inbox.is_empty() {
+            self.toast = Some(inbox_action_error(
+                "Couldn't mark all notifications read",
+                "notification connections unavailable",
+                DIAG_INBOX_MARK_ALL_READ,
+            ));
+            return;
+        }
+        for feed in feeds {
+            if let Err(error) = feed.source.mark_all_read().await {
+                self.toast = Some(inbox_action_error(
+                    "Couldn't mark all notifications read",
+                    error,
+                    DIAG_INBOX_MARK_ALL_READ,
+                ));
+                return;
+            }
+        }
         for row in &mut self.inbox {
             row.notification.unread = false;
-        }
-        if let Ok(feeds) = deps.sections.notification_feeds().await {
-            for feed in feeds {
-                let _ = feed.source.mark_all_read().await;
-            }
         }
         self.toast = Some("All marked read".into());
     }
@@ -1636,6 +1754,10 @@ impl App {
     /// Folds a completed fetch back into the app state: the lists, the Launchpad, the
     /// pipeline notifications (which compare against the seen-sets), and the status line.
     fn apply_reloaded(&mut self, r: Reloaded) {
+        self.apply_reloaded_with_logger(r, forgetop_core::diag::log);
+    }
+
+    fn apply_reloaded_with_logger(&mut self, r: Reloaded, mut log_failure: impl FnMut(&str, &str)) {
         self.prs = r.prs;
         self.wis = r.wis;
         self.pipes = r.pipes;
@@ -1676,9 +1798,7 @@ impl App {
         self.status = if r.errors.is_empty() {
             format!("{} PRs · {} work items · {} runs", self.prs.len(), self.wis.len(), self.pipes.len())
         } else {
-            for e in &r.errors {
-                forgetop_core::diag::log("fetch", e);
-            }
+            log_failure(DIAG_REFRESH, DIAG_FAILURE_MESSAGE);
             r.errors.join("  |  ")
         };
     }
@@ -1719,11 +1839,19 @@ impl App {
                             provider,
                             pr,
                         })),
-                        Err(e) => errors.push(format!("PRs ({name}): {e}")),
+                        Err(e) => push_reload_error(
+                            errors,
+                            format!("PRs ({name}): {e}"),
+                            DIAG_RELOAD_PULL_REQUESTS,
+                        ),
                     }
                 }
             }
-            Err(e) => errors.push(format!("PRs: {e}")),
+            Err(e) => push_reload_error(
+                errors,
+                format!("PRs: {e}"),
+                DIAG_RELOAD_PULL_REQUESTS,
+            ),
         }
     }
 
@@ -1740,11 +1868,19 @@ impl App {
                             provider,
                             wi,
                         })),
-                        Err(e) => errors.push(format!("Work items ({name}): {e}")),
+                        Err(e) => push_reload_error(
+                            errors,
+                            format!("Work items ({name}): {e}"),
+                            DIAG_RELOAD_WORK_ITEMS,
+                        ),
                     }
                 }
             }
-            Err(e) => errors.push(format!("Work items: {e}")),
+            Err(e) => push_reload_error(
+                errors,
+                format!("Work items: {e}"),
+                DIAG_RELOAD_WORK_ITEMS,
+            ),
         }
     }
 
@@ -1759,7 +1895,13 @@ impl App {
                     // Map definition_id → pipeline name so rows can show the pipeline
                     // (e.g. "CI Build") separately from the run/release (e.g. "10.1.100").
                     let def_names: HashMap<String, String> =
-                        feed.source.discover().await.unwrap_or_default().into_iter().map(|d| (d.id, d.name)).collect();
+                        detail_or_default(
+                            feed.source.discover().await,
+                            DIAG_PIPELINE_DISCOVERY,
+                        )
+                        .into_iter()
+                        .map(|d| (d.id, d.name))
+                        .collect();
                     for q in feed_queries(&feed.subscription) {
                         match feed.source.list_runs(&q).await {
                             Ok(runs) => {
@@ -1769,12 +1911,12 @@ impl App {
                                     // extra per-run approval calls to those.
                                     let awaiting_approval = supports
                                         && is_active(run.status)
-                                        && feed
-                                            .source
-                                            .pending_approvals(&run.id)
-                                            .await
-                                            .map(|a| a.iter().any(|x| x.can_respond))
-                                            .unwrap_or(false);
+                                        && detail_or_default(
+                                            feed.source.pending_approvals(&run.id).await,
+                                            DIAG_PIPELINE_APPROVALS,
+                                        )
+                                        .iter()
+                                        .any(|approval| approval.can_respond);
                                     let definition_name = def_names.get(&run.definition_id).cloned();
                                     self.pipes.push(PipeRow {
                                         connection_id: conn_id.clone(),
@@ -1786,12 +1928,20 @@ impl App {
                                     });
                                 }
                             }
-                            Err(e) => errors.push(format!("Pipelines ({name}): {e}")),
+                            Err(e) => push_reload_error(
+                                errors,
+                                format!("Pipelines ({name}): {e}"),
+                                DIAG_RELOAD_PIPELINES,
+                            ),
                         }
                     }
                 }
             }
-            Err(e) => errors.push(format!("Pipelines: {e}")),
+            Err(e) => push_reload_error(
+                errors,
+                format!("Pipelines: {e}"),
+                DIAG_RELOAD_PIPELINES,
+            ),
         }
         self.notify_pipeline_failures();
         self.notify_pending_approvals();
@@ -1887,7 +2037,7 @@ impl App {
             self.open_dashboard();
             return;
         }
-        // `F` opens the dashboard feedback page (available from anywhere). Input-capturing
+        // `F` opens the GitHub feedback issue form (available from anywhere). Input-capturing
         // modes above retain priority so an uppercase F can still be typed into them.
         if key == Key::Char('F') {
             self.open_feedback();
@@ -2019,11 +2169,11 @@ impl App {
                 return;
             }
         };
-        let threads = source.threads(&id).await.unwrap_or_default();
-        let mut files = source.changes(&id).await.unwrap_or_default();
+        let threads = detail_or_default(source.threads(&id).await, DIAG_PR_THREADS);
+        let mut files = detail_or_default(source.changes(&id).await, DIAG_PR_CHANGES);
         files.sort_by(|a, b| a.path.cmp(&b.path)); // cluster by directory for grouping
-        let checks = source.checks(&id).await.unwrap_or_default();
-        let commits = source.commits(&id).await.unwrap_or_default();
+        let checks = detail_or_default(source.checks(&id).await, DIAG_PR_CHECKS);
+        let commits = detail_or_default(source.commits(&id).await, DIAG_PR_COMMITS);
         let diff = DiffView {
             pr_label: label.clone(),
             url: url.clone(),
@@ -2179,7 +2329,7 @@ impl App {
         };
         match source.submit_review(&pr_id, event, &comments).await {
             Ok(()) => {
-                let threads = source.threads(&pr_id).await.unwrap_or_default();
+                let threads = detail_or_default(source.threads(&pr_id).await, DIAG_PR_THREADS);
                 if let Screen::PrView(v) = &mut self.screen {
                     v.pending.clear();
                     v.review_draft = None;
@@ -2208,7 +2358,10 @@ impl App {
                 return;
             }
         };
-        let mut files = source.commit_changes(&pr_id, &sha).await.unwrap_or_default();
+        let mut files = detail_or_default(
+            source.commit_changes(&pr_id, &sha).await,
+            DIAG_PR_COMMIT_CHANGES,
+        );
         if files.is_empty() {
             self.toast = Some("No per-commit diff for this provider".into());
             return;
@@ -2237,7 +2390,7 @@ impl App {
     /// Opens the work-item view for an explicit item (used by the Launchpad).
     async fn open_wi_view_for(&mut self, deps: &AppDeps, id: String, conn_id: String, wi: WorkItem) {
         let threads = match self.wi_source_for(&conn_id, deps).await {
-            Some(src) => src.threads(&id).await.unwrap_or_default(),
+            Some(src) => detail_or_default(src.threads(&id).await, DIAG_WI_THREADS),
             None => Vec::new(),
         };
         self.screen = Screen::WiView(Box::new(WiView { connection_id: conn_id, wi, threads, scroll: 0 }));
@@ -2248,7 +2401,11 @@ impl App {
     /// Show an error to the user *and* record it to the log file, so a failed action is
     /// reviewable after the toast fades (write actions, triggers, config changes).
     fn toast_error(&mut self, msg: String) {
-        forgetop_core::diag::log("action", &msg);
+        self.toast_error_with_logger(msg, forgetop_core::diag::log);
+    }
+
+    fn toast_error_with_logger(&mut self, msg: String, log_failure: impl FnOnce(&str, &str)) {
+        log_failure(DIAG_ACTION, DIAG_FAILURE_MESSAGE);
         self.toast = Some(msg);
     }
 
@@ -2526,13 +2683,24 @@ impl App {
     ) {
         // Enrich with full stages/jobs/steps via get_run (list_runs may be shallow),
         // plus any pending approval gates.
-        let feeds = deps.sections.pipeline_feeds().await.unwrap_or_default();
+        let feeds = detail_or_default(deps.sections.pipeline_feeds().await, DIAG_PIPELINE_FEEDS);
         let (run, supports_approvals, can_respond, approvals) = match feeds.iter().find(|f| f.connection.connection_id() == conn_id) {
             Some(feed) => {
-                let run = feed.source.get_run(&run_id).await.unwrap_or(fallback);
+                let run = detail_or_fallback(
+                    feed.source.get_run(&run_id).await,
+                    DIAG_PIPELINE_RUN,
+                    fallback,
+                );
                 let supports = feed.source.supports_approvals();
                 let can_respond = feed.source.can_respond_to_approvals();
-                let approvals = if supports { feed.source.pending_approvals(&run_id).await.unwrap_or_default() } else { Vec::new() };
+                let approvals = if supports {
+                    detail_or_default(
+                        feed.source.pending_approvals(&run_id).await,
+                        DIAG_PIPELINE_APPROVALS,
+                    )
+                } else {
+                    Vec::new()
+                };
                 (run, supports, can_respond, approvals)
             }
             None => (fallback, false, false, Vec::new()),
@@ -2549,11 +2717,14 @@ impl App {
     async fn refresh_open_pipeline(&mut self, deps: &AppDeps) {
         let Screen::Pipeline(v) = &self.screen else { return };
         let (conn_id, run_id) = (v.connection_id.clone(), v.run.id.clone());
-        let feeds = deps.sections.pipeline_feeds().await.unwrap_or_default();
+        let feeds = detail_or_default(deps.sections.pipeline_feeds().await, DIAG_PIPELINE_FEEDS);
         let Some(feed) = feeds.iter().find(|f| f.connection.connection_id() == conn_id) else { return };
-        let Ok(run) = feed.source.get_run(&run_id).await else { return };
+        let Some(run) = detail_or_none(feed.source.get_run(&run_id).await, DIAG_PIPELINE_RUN) else { return };
         let approvals = if feed.source.supports_approvals() {
-            feed.source.pending_approvals(&run_id).await.unwrap_or_default()
+            detail_or_default(
+                feed.source.pending_approvals(&run_id).await,
+                DIAG_PIPELINE_APPROVALS,
+            )
         } else {
             Vec::new()
         };
@@ -2624,7 +2795,7 @@ impl App {
         let Some(choice) = self.approval_choices.get(index) else { return };
         let (conn_id, run_id, approval_id, decision, label) =
             (choice.connection_id.clone(), choice.run_id.clone(), choice.approval_id.clone(), choice.decision, choice.label.clone());
-        let feeds = deps.sections.pipeline_feeds().await.unwrap_or_default();
+        let feeds = detail_or_default(deps.sections.pipeline_feeds().await, DIAG_PIPELINE_FEEDS);
         let Some(feed) = feeds.iter().find(|f| f.connection.connection_id() == conn_id) else {
             self.toast = Some("Pipeline connection not found".into());
             return;
@@ -2677,13 +2848,20 @@ impl App {
         };
 
         self.toast = Some("Fetching logs…".into());
-        let feeds = deps.sections.pipeline_feeds().await.unwrap_or_default();
+        let feeds = detail_or_default(deps.sections.pipeline_feeds().await, DIAG_PIPELINE_FEEDS);
         let text = match feeds.iter().find(|f| f.connection.connection_id() == conn_id) {
             Some(feed) => match feed.source.logs(&run_id, Some(&job_id)).await {
                 Ok(t) => t,
-                Err(e) => format!("Couldn't fetch logs: {e}"),
+                Err(e) => {
+                    log_operation_failure(DIAG_PIPELINE_LOGS);
+                    self.toast = Some(format!("Couldn't fetch logs: {e}"));
+                    return;
+                }
             },
-            None => "Pipeline connection not found".into(),
+            None => {
+                self.toast = Some("Pipeline connection not found".into());
+                return;
+            }
         };
         let lines: Vec<String> =
             if text.trim().is_empty() { vec!["(no logs returned)".into()] } else { text.lines().map(|l| l.to_string()).collect() };
@@ -3253,10 +3431,10 @@ impl App {
 
     /// Resolves the PR source backing a specific connection (for per-row actions).
     async fn pr_source_for(&self, connection_id: &str, deps: &AppDeps) -> Option<Arc<dyn PullRequestSource>> {
-        deps.sections
-            .pull_request_feeds()
-            .await
-            .ok()?
+        detail_or_none(
+            deps.sections.pull_request_feeds().await,
+            DIAG_PR_FEEDS,
+        )?
             .into_iter()
             .find(|f| f.connection.connection_id() == connection_id)
             .map(|f| f.source)
@@ -3390,8 +3568,8 @@ impl App {
                 // Reflect the change in the open PR view: re-fetch the PR (status / reviewers
                 // / mergeable) and its threads (a new comment), like the work-item handler.
                 if matches!(&self.screen, Screen::PrView(v) if v.pr.id == id) {
-                    let fresh = source.get(&id).await.ok();
-                    let threads = source.threads(&id).await.unwrap_or_default();
+                    let fresh = detail_or_none(source.get(&id).await, DIAG_PR_DETAIL);
+                    let threads = detail_or_default(source.threads(&id).await, DIAG_PR_THREADS);
                     if let Screen::PrView(v) = &mut self.screen {
                         if let Some(pr) = fresh {
                             v.pr = pr;
@@ -3427,10 +3605,10 @@ impl App {
 
     /// Resolves the work-item source backing a specific connection (per-row actions).
     async fn wi_source_for(&self, connection_id: &str, deps: &AppDeps) -> Option<Arc<dyn WorkItemSource>> {
-        deps.sections
-            .work_item_feeds()
-            .await
-            .ok()?
+        detail_or_none(
+            deps.sections.work_item_feeds().await,
+            DIAG_WI_FEEDS,
+        )?
             .into_iter()
             .find(|f| f.connection.connection_id() == connection_id)
             .map(|f| f.source)
@@ -3445,7 +3623,10 @@ impl App {
         };
 
         let mut states = match self.wi_source_for(&conn_id, deps).await {
-            Some(src) => src.available_states(&id).await.unwrap_or_default(),
+            Some(src) => detail_or_default(
+                src.available_states(&id).await,
+                DIAG_WI_STATES,
+            ),
             None => Vec::new(),
         };
         if states.is_empty() {
@@ -3507,7 +3688,7 @@ impl App {
                     }
                 }
                 if matches!(action, Action::WiComment(_)) {
-                    let threads = source.threads(&id).await.unwrap_or_default();
+                    let threads = detail_or_default(source.threads(&id).await, DIAG_WI_THREADS);
                     if let Screen::WiView(v) = &mut self.screen {
                         v.threads = threads;
                     }
@@ -3534,6 +3715,91 @@ fn wi_label(wi: &WorkItem) -> String {
 fn dashboard_target(base: &str, hash: &str) -> String {
     let base = base.split_once('#').map_or(base, |(before_hash, _)| before_hash);
     format!("{base}{hash}")
+}
+
+fn log_operation_failure(operation: &'static str) {
+    forgetop_core::diag::log(operation, DIAG_FAILURE_MESSAGE);
+}
+
+fn detail_or_default<T: Default, E>(
+    result: std::result::Result<T, E>,
+    operation: &'static str,
+) -> T {
+    detail_or_default_with_logger(result, operation, forgetop_core::diag::log)
+}
+
+fn detail_or_default_with_logger<T: Default, E>(
+    result: std::result::Result<T, E>,
+    operation: &'static str,
+    log_failure: impl FnOnce(&str, &str),
+) -> T {
+    match result {
+        Ok(value) => value,
+        Err(_) => {
+            log_failure(operation, DIAG_FAILURE_MESSAGE);
+            T::default()
+        }
+    }
+}
+
+fn detail_or_fallback<T, E>(
+    result: std::result::Result<T, E>,
+    operation: &'static str,
+    fallback: T,
+) -> T {
+    match result {
+        Ok(value) => value,
+        Err(_) => {
+            log_operation_failure(operation);
+            fallback
+        }
+    }
+}
+
+fn detail_or_none<T, E>(result: std::result::Result<T, E>, operation: &'static str) -> Option<T> {
+    match result {
+        Ok(value) => Some(value),
+        Err(_) => {
+            log_operation_failure(operation);
+            None
+        }
+    }
+}
+
+fn inbox_action_error(
+    prefix: &'static str,
+    error: impl std::fmt::Display,
+    operation: &'static str,
+) -> String {
+    inbox_action_error_with_logger(prefix, error, operation, forgetop_core::diag::log)
+}
+
+fn inbox_action_error_with_logger(
+    prefix: &'static str,
+    error: impl std::fmt::Display,
+    operation: &'static str,
+    log_failure: impl FnOnce(&str, &str),
+) -> String {
+    log_failure(operation, DIAG_FAILURE_MESSAGE);
+    format!("{prefix}: {error}")
+}
+
+fn push_reload_error(
+    errors: &mut Vec<String>,
+    detail: String,
+    operation: &'static str,
+) {
+    push_reload_error_with_logger(errors, detail, operation, forgetop_core::diag::log);
+}
+
+fn push_reload_error_with_logger(
+    errors: &mut Vec<String>,
+    detail: String,
+    operation: &'static str,
+    log_failure: impl FnOnce(&str, &str),
+) {
+    log_failure(operation, DIAG_FAILURE_MESSAGE);
+    errors.push(detail);
 }
 
 /// Checklist items for binding a section: connections that support it, ticked if bound.
@@ -3924,7 +4190,13 @@ async fn fetch_pipelines(deps: &AppDeps, errors: &mut Vec<String>) -> Vec<PipeRo
                 let name = feed.connection.display_name().to_string();
                 let conn_id = feed.connection.connection_id().to_string();
                 let def_names: HashMap<String, String> =
-                    feed.source.discover().await.unwrap_or_default().into_iter().map(|d| (d.id, d.name)).collect();
+                    detail_or_default(
+                        feed.source.discover().await,
+                        DIAG_PIPELINE_DISCOVERY,
+                    )
+                    .into_iter()
+                    .map(|d| (d.id, d.name))
+                    .collect();
                 for q in feed_queries(&feed.subscription) {
                     match feed.source.list_runs(&q).await {
                         Ok(runs) => {
@@ -3932,7 +4204,12 @@ async fn fetch_pipelines(deps: &AppDeps, errors: &mut Vec<String>) -> Vec<PipeRo
                             for run in runs {
                                 let awaiting_approval = supports
                                     && is_active(run.status)
-                                    && feed.source.pending_approvals(&run.id).await.map(|a| a.iter().any(|x| x.can_respond)).unwrap_or(false);
+                                    && detail_or_default(
+                                        feed.source.pending_approvals(&run.id).await,
+                                        DIAG_PIPELINE_APPROVALS,
+                                    )
+                                    .iter()
+                                    .any(|approval| approval.can_respond);
                                 let definition_name = def_names.get(&run.definition_id).cloned();
                                 out.push(PipeRow { connection_id: conn_id.clone(), connection: name.clone(), provider, run, definition_name, awaiting_approval });
                             }
@@ -3949,12 +4226,21 @@ async fn fetch_pipelines(deps: &AppDeps, errors: &mut Vec<String>) -> Vec<PipeRo
 
 /// Re-fetches the open pipeline run + its pending approvals (mirrors
 /// [`App::refresh_open_pipeline`]), so the background refresh keeps the view live.
-async fn fetch_open_pipeline(deps: &AppDeps, conn_id: &str, run_id: &str) -> Option<(String, PipelineRun, Vec<PipelineApproval>)> {
-    let feeds = deps.sections.pipeline_feeds().await.unwrap_or_default();
-    let feed = feeds.iter().find(|f| f.connection.connection_id() == conn_id)?;
-    let run = feed.source.get_run(run_id).await.ok()?;
+async fn fetch_open_pipeline(
+    deps: &AppDeps,
+    conn_id: &str,
+    run_id: &str,
+) -> Option<(String, PipelineRun, Vec<PipelineApproval>)> {
+    let feeds = detail_or_default(deps.sections.pipeline_feeds().await, DIAG_PIPELINE_FEEDS);
+    let feed = feeds
+        .iter()
+        .find(|f| f.connection.connection_id() == conn_id)?;
+    let run = detail_or_none(feed.source.get_run(run_id).await, DIAG_PIPELINE_RUN)?;
     let approvals = if feed.source.supports_approvals() {
-        feed.source.pending_approvals(run_id).await.unwrap_or_default()
+        detail_or_default(
+            feed.source.pending_approvals(run_id).await,
+            DIAG_PIPELINE_APPROVALS,
+        )
     } else {
         Vec::new()
     };
@@ -3963,16 +4249,25 @@ async fn fetch_open_pipeline(deps: &AppDeps, conn_id: &str, run_id: &str) -> Opt
 
 async fn fetch_launchpad_prs(deps: &AppDeps) -> (Vec<PrRow>, Vec<PrRow>) {
     let (mut mine_out, mut review_out) = (Vec::new(), Vec::new());
-    if let Ok(feeds) = deps.sections.pull_request_feeds().await {
-        for feed in feeds {
-            let (provider, name, conn_id) = feed_tag(&feed.connection);
-            let mine_q = PullRequestQuery { filter: PullRequestFilter::Mine, include_completed: true, limit: Some(50) };
-            if let Ok(list) = feed.source.list(&mine_q).await {
-                mine_out.extend(list.into_iter().map(|pr| PrRow { connection_id: conn_id.clone(), connection: name.clone(), provider, pr }));
-            }
-            if let Ok(list) = feed.source.list(&pr_query(PullRequestFilter::ReviewRequested)).await {
-                review_out.extend(list.into_iter().map(|pr| PrRow { connection_id: conn_id.clone(), connection: name.clone(), provider, pr }));
-            }
+    let Some(feeds) = detail_or_none(
+        deps.sections.pull_request_feeds().await,
+        DIAG_LAUNCHPAD_FEEDS,
+    ) else {
+        return (mine_out, review_out);
+    };
+    for feed in feeds {
+        let (provider, name, conn_id) = feed_tag(&feed.connection);
+        let mine_q = PullRequestQuery { filter: PullRequestFilter::Mine, include_completed: true, limit: Some(50) };
+        if let Some(list) = detail_or_none(feed.source.list(&mine_q).await, DIAG_LAUNCHPAD_MINE) {
+            mine_out.extend(list.into_iter().map(|pr| PrRow { connection_id: conn_id.clone(), connection: name.clone(), provider, pr }));
+        }
+        if let Some(list) = detail_or_none(
+            feed.source
+                .list(&pr_query(PullRequestFilter::ReviewRequested))
+                .await,
+            DIAG_LAUNCHPAD_REVIEW,
+        ) {
+            review_out.extend(list.into_iter().map(|pr| PrRow { connection_id: conn_id.clone(), connection: name.clone(), provider, pr }));
         }
     }
     (mine_out, review_out)
@@ -3987,7 +4282,10 @@ async fn scan_pr_notifications(deps: &AppDeps, p: &ReloadParams) -> Option<PrSca
     if !want_review && !want_votes {
         return None;
     }
-    let feeds = deps.sections.pull_request_feeds().await.ok()?;
+    let feeds = detail_or_none(
+        deps.sections.pull_request_feeds().await,
+        DIAG_NOTIFICATION_SCAN_FEEDS,
+    )?;
     if feeds.is_empty() {
         return None;
     }
@@ -3997,7 +4295,12 @@ async fn scan_pr_notifications(deps: &AppDeps, p: &ReloadParams) -> Option<PrSca
     for feed in &feeds {
         let conn = feed.connection.connection_id().to_string();
         if want_review {
-            if let Ok(review) = feed.source.list(&pr_query(PullRequestFilter::ReviewRequested)).await {
+            if let Some(review) = detail_or_none(
+                feed.source
+                    .list(&pr_query(PullRequestFilter::ReviewRequested))
+                    .await,
+                DIAG_NOTIFICATION_SCAN_REVIEW,
+            ) {
                 for pr in &review {
                     let key = (conn.clone(), pr.id.clone());
                     if seeded && !p.review_seen.contains(&key) {
@@ -4008,7 +4311,10 @@ async fn scan_pr_notifications(deps: &AppDeps, p: &ReloadParams) -> Option<PrSca
             }
         }
         if want_votes {
-            if let Ok(mine) = feed.source.list(&pr_query(PullRequestFilter::Mine)).await {
+            if let Some(mine) = detail_or_none(
+                feed.source.list(&pr_query(PullRequestFilter::Mine)).await,
+                DIAG_NOTIFICATION_SCAN_MINE,
+            ) {
                 for pr in &mine {
                     let key = (conn.clone(), pr.id.clone());
                     if seeded {
@@ -4131,21 +4437,10 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_target_replaces_an_existing_fragment_and_preserves_the_query() {
-        let base = "http://127.0.0.1:8177/?t=session-secret#settings";
-        assert_eq!(
-            dashboard_target(base, "#feedback"),
-            "http://127.0.0.1:8177/?t=session-secret#feedback"
-        );
-    }
-
-    #[test]
-    fn feedback_dashboard_dispatch_uses_the_feedback_fragment() {
+    fn feedback_dispatch_uses_the_exact_github_issue_form_destination() {
         let mut app = App::new("slate");
-        app.dashboard_url = Some("http://127.0.0.1:8177/?t=session-secret".into());
         let mut opened = None;
-        app.open_dashboard_at_with(
-            "#feedback",
+        app.open_feedback_with(
             |target| {
                 opened = Some(target.to_owned());
                 Ok::<(), std::io::Error>(())
@@ -4155,21 +4450,19 @@ mod tests {
 
         assert_eq!(
             opened.as_deref(),
-            Some("http://127.0.0.1:8177/?t=session-secret#feedback")
+            Some("https://github.com/magna-nz/forgetop/issues/new?template=feedback.yml")
         );
         assert_eq!(
             app.toast.as_deref(),
-            Some("Opening dashboard in your browser…")
+            Some("Opening feedback form in your browser…")
         );
     }
 
     #[test]
-    fn dashboard_open_failure_logs_only_safe_constant_context() {
+    fn feedback_open_failure_is_non_blocking_and_logs_only_safe_constants() {
         let mut app = App::new("slate");
-        app.dashboard_url = Some("http://127.0.0.1:8177/?t=session-secret".into());
         let mut logged = None;
-        app.open_dashboard_at_with(
-            "#feedback",
+        app.open_feedback_with(
             |_| Err(std::io::Error::other("browser unavailable")),
             |context, message| logged = Some((context.to_owned(), message.to_owned())),
         );
@@ -4177,29 +4470,183 @@ mod tests {
         assert_eq!(
             logged,
             Some((
-                DASHBOARD_OPEN_FAILURE_CONTEXT.to_owned(),
-                DASHBOARD_OPEN_FAILURE_MESSAGE.to_owned()
+                FEEDBACK_OPEN_FAILURE_CONTEXT.to_owned(),
+                FEEDBACK_OPEN_FAILURE_MESSAGE.to_owned()
             ))
         );
         let (context, message) = logged.unwrap();
-        assert!(!context.contains("session-secret"));
-        assert!(!message.contains("session-secret"));
+        assert!(!context.contains("github.com"));
+        assert!(!message.contains("github.com"));
         assert_eq!(
             app.toast.as_deref(),
-            Some("Couldn't open dashboard: browser unavailable")
+            Some("Couldn't open feedback form: browser unavailable")
+        );
+        assert!(!app.should_quit, "a browser failure remains non-blocking");
+    }
+
+    #[tokio::test]
+    async fn ordinary_uppercase_f_dispatches_to_the_injected_feedback_opener() {
+        let deps = test_deps();
+        let mut app = App::new("slate");
+        app.feedback_opener = |_| Ok(());
+
+        app.on_key(Key::Char('F'), &deps).await;
+
+        assert_eq!(
+            app.toast.as_deref(),
+            Some("Opening feedback form in your browser…")
+        );
+    }
+
+    #[test]
+    fn refresh_and_action_diagnostics_never_receive_private_provider_errors() {
+        let private_error = "failed https://github.com/acme/private-repo?t=dashboard-secret";
+
+        let mut app = App::new("slate");
+        let mut refresh_logs = Vec::new();
+        app.apply_reloaded_with_logger(
+            Reloaded {
+                prs: Vec::new(),
+                wis: Vec::new(),
+                pipes: Vec::new(),
+                inbox: Vec::new(),
+                lp_prs_mine: Vec::new(),
+                lp_prs_review: Vec::new(),
+                health: Vec::new(),
+                scan: None,
+                open_pipeline: None,
+                errors: vec![private_error.into()],
+            },
+            |context, message| refresh_logs.push((context.to_owned(), message.to_owned())),
+        );
+        assert!(
+            app.status.contains(private_error),
+            "the transient UI keeps useful detail"
+        );
+        assert_eq!(
+            refresh_logs,
+            vec![(DIAG_REFRESH.to_owned(), DIAG_FAILURE_MESSAGE.to_owned())]
+        );
+
+        let mut action_logs = Vec::new();
+        app.toast_error_with_logger(private_error.into(), |context, message| {
+            action_logs.push((context.to_owned(), message.to_owned()))
+        });
+        assert_eq!(app.toast.as_deref(), Some(private_error));
+        assert_eq!(
+            action_logs,
+            vec![(DIAG_ACTION.to_owned(), DIAG_FAILURE_MESSAGE.to_owned())]
+        );
+
+        for (context, message) in refresh_logs.into_iter().chain(action_logs) {
+            assert!(!context.contains("private-repo") && !context.contains("dashboard-secret"));
+            assert!(!message.contains("private-repo") && !message.contains("dashboard-secret"));
+        }
+    }
+
+    #[test]
+    fn detail_fallback_logs_only_the_safe_operation_constant() {
+        let private_error = "failed https://github.com/acme/private-repo?t=dashboard-secret";
+        let mut logged = None;
+        let rows: Vec<String> = detail_or_default_with_logger(
+            Err(private_error),
+            DIAG_PR_THREADS,
+            |context, message| logged = Some((context.to_owned(), message.to_owned())),
+        );
+
+        assert!(rows.is_empty());
+        assert_eq!(
+            logged,
+            Some((DIAG_PR_THREADS.to_owned(), DIAG_FAILURE_MESSAGE.to_owned()))
+        );
+    }
+
+    #[test]
+    fn failed_inbox_action_returns_detail_but_logs_only_safe_constants() {
+        let private_error =
+            "failed https://github.com/acme/private-repo?t=dashboard-secret";
+        let mut logged = None;
+
+        let message = inbox_action_error_with_logger(
+            "Couldn't mark notification read",
+            private_error,
+            DIAG_INBOX_MARK_READ,
+            |context, message| logged = Some((context.to_owned(), message.to_owned())),
+        );
+
+        assert!(message.contains(private_error), "the transient toast keeps useful detail");
+        assert_eq!(
+            logged,
+            Some((
+                DIAG_INBOX_MARK_READ.to_owned(),
+                DIAG_FAILURE_MESSAGE.to_owned()
+            ))
+        );
+        let (context, message) = logged.unwrap();
+        assert!(!context.contains("private-repo") && !context.contains("dashboard-secret"));
+        assert!(!message.contains("private-repo") && !message.contains("dashboard-secret"));
+    }
+
+    #[test]
+    fn inline_reload_error_preserves_ui_detail_but_logs_only_safe_constants() {
+        let private_error =
+            "failed https://github.com/acme/private-repo?t=dashboard-secret";
+        let mut errors = Vec::new();
+        let mut logged = None;
+
+        push_reload_error_with_logger(
+            &mut errors,
+            private_error.into(),
+            DIAG_RELOAD_PULL_REQUESTS,
+            |context, message| logged = Some((context.to_owned(), message.to_owned())),
+        );
+
+        assert_eq!(errors, vec![private_error]);
+        assert_eq!(
+            logged,
+            Some((
+                DIAG_RELOAD_PULL_REQUESTS.to_owned(),
+                DIAG_FAILURE_MESSAGE.to_owned()
+            ))
         );
     }
 
     #[tokio::test]
-    async fn uppercase_f_dispatches_feedback_but_input_contexts_keep_the_key() {
+    async fn failed_inbox_mark_keeps_the_row_unread_and_does_not_report_success() {
         let deps = test_deps();
+        let mut app = App::new("slate");
+        app.inbox = vec![NotifRow {
+            connection_id: "missing".into(),
+            connection: "Missing".into(),
+            provider: ProviderType::GitHub,
+            notification: Notification {
+                id: "n1".into(),
+                kind: NotificationKind::Mention,
+                item_type: NotificationItemType::PullRequest,
+                item_id: None,
+                title: "Private notification".into(),
+                context: String::new(),
+                url: None,
+                unread: true,
+                updated_at: None,
+            },
+        }];
 
-        let mut global = App::new("slate");
-        global.on_key(Key::Char('F'), &deps).await;
-        assert_eq!(
-            global.toast.as_deref(),
-            Some("Web dashboard isn't running — start it with `forgetop --dashboard`")
+        app.mark_selected_inbox_read(&deps).await;
+
+        assert!(app.inbox[0].notification.unread, "failed persistence keeps local state unread");
+        assert!(
+            app.toast
+                .as_deref()
+                .is_some_and(|toast| toast.starts_with("Couldn't mark notification read:")),
+            "the failed action shows a detailed error instead of success"
         );
+        assert_ne!(app.toast.as_deref(), Some("Marked read"));
+    }
+
+    #[tokio::test]
+    async fn input_contexts_and_lowercase_f_take_precedence_over_the_feedback_shortcut() {
+        let deps = test_deps();
 
         let mut lowercase = App::new("slate");
         lowercase.screen = Screen::List;

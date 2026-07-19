@@ -16,7 +16,6 @@ const META: Record<SectionId, { title: string; subtitle: string }> = {
   pipelines: { title: "Pipelines", subtitle: "Recent CI runs across your repositories." },
   notifications: { title: "Notifications", subtitle: "Review requests, mentions, and CI failures." },
   settings: { title: "Settings", subtitle: "Manage the connections shared with the terminal app." },
-  feedback: { title: "Give Feedback", subtitle: "Share a private report, with diagnostics only when you choose." },
 };
 
 export function TopBar({

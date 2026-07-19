@@ -14,8 +14,7 @@ serde_json.workspace = true
 uuid.workspace = true
 rust-embed.workspace = true
 mime_guess.workspace = true
-async-trait.workspace = true
-reqwest.workspace = true
 
 [dev-dependencies]
 forgetop-providers.workspace = true
+reqwest.workspace = true

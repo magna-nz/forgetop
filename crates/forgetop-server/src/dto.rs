@@ -180,7 +180,11 @@ pub async fn pipelines(sections: &SectionService) -> Vec<PipeRow> {
                     for run in runs {
                         // Only in-flight runs can be waiting on a gate — bound the extra calls.
                         let approvals = if supports && is_active(run.status) {
-                            feed.source.pending_approvals(&run.id).await.unwrap_or_default()
+                            feed.source
+                                .pending_approvals(&run.id)
+                                .await
+                                .inspect_err(|_| log_fetch_failure("dashboard.pipelines.pending_approvals"))
+                                .unwrap_or_default()
                         } else {
                             Vec::new()
                         };
@@ -311,6 +315,9 @@ async fn pipe_inputs(sections: &SectionService) -> Vec<PipeInput> {
                                 .source
                                 .pending_approvals(&run.id)
                                 .await
+                                .inspect_err(|_| {
+                                    log_fetch_failure("dashboard.launchpad.pipeline_approvals")
+                                })
                                 .map(|a| a.iter().any(|x| x.can_respond))
                                 .unwrap_or(false);
                         out.push(PipeInput {
@@ -430,22 +437,51 @@ pub async fn pr_detail(sections: &SectionService, conn: &str, id: &str) -> Optio
     let source = pr_source(sections, conn).await?;
     let pull_request = source.get(id).await.inspect_err(|_| log_fetch_failure("dashboard.pr_detail.get")).ok()?;
     // The detail extras are best-effort: a provider that doesn't expose one just yields empties.
-    let threads = source.threads(id).await.unwrap_or_default();
-    let timeline = with_comment_events(source.timeline(id).await.unwrap_or_default(), &threads);
+    let threads = source
+        .threads(id)
+        .await
+        .inspect_err(|_| log_fetch_failure("dashboard.pr_detail.threads"))
+        .unwrap_or_default();
+    let timeline = with_comment_events(
+        source
+            .timeline(id)
+            .await
+            .inspect_err(|_| log_fetch_failure("dashboard.pr_detail.timeline"))
+            .unwrap_or_default(),
+        &threads,
+    );
     Some(PrDetail {
         pull_request,
         threads,
         timeline,
-        changes: source.changes(id).await.unwrap_or_default(),
-        checks: source.checks(id).await.unwrap_or_default(),
-        commits: source.commits(id).await.unwrap_or_default(),
+        changes: source
+            .changes(id)
+            .await
+            .inspect_err(|_| log_fetch_failure("dashboard.pr_detail.changes"))
+            .unwrap_or_default(),
+        checks: source
+            .checks(id)
+            .await
+            .inspect_err(|_| log_fetch_failure("dashboard.pr_detail.checks"))
+            .unwrap_or_default(),
+        commits: source
+            .commits(id)
+            .await
+            .inspect_err(|_| log_fetch_failure("dashboard.pr_detail.commits"))
+            .unwrap_or_default(),
     })
 }
 
 /// Files changed by a single commit on the PR (empty for providers without a per-commit diff API).
 pub async fn pr_commit_changes(sections: &SectionService, conn: &str, id: &str, sha: &str) -> Option<Vec<FileChange>> {
     let source = pr_source(sections, conn).await?;
-    Some(source.commit_changes(id, sha).await.unwrap_or_default())
+    Some(
+        source
+            .commit_changes(id, sha)
+            .await
+            .inspect_err(|_| log_fetch_failure("dashboard.pr_commit_changes"))
+            .unwrap_or_default(),
+    )
 }
 
 // ---- work-item detail ----
@@ -474,8 +510,19 @@ pub async fn wi_detail(sections: &SectionService, conn: &str, id: &str) -> Optio
     let source = wi_source(sections, conn).await?;
     let work_item = source.get(id).await.inspect_err(|_| log_fetch_failure("dashboard.wi_detail.get")).ok()?;
     // Comments are best-effort: a provider that doesn't expose them just yields empties.
-    let threads = source.threads(id).await.unwrap_or_default();
-    let timeline = with_comment_events(source.timeline(id).await.unwrap_or_default(), &threads);
+    let threads = source
+        .threads(id)
+        .await
+        .inspect_err(|_| log_fetch_failure("dashboard.wi_detail.threads"))
+        .unwrap_or_default();
+    let timeline = with_comment_events(
+        source
+            .timeline(id)
+            .await
+            .inspect_err(|_| log_fetch_failure("dashboard.wi_detail.timeline"))
+            .unwrap_or_default(),
+        &threads,
+    );
     Some(WiDetail { work_item, threads, timeline })
 }
 
@@ -506,7 +553,11 @@ pub async fn pipeline_detail(sections: &SectionService, conn: &str, run_id: &str
     let run = source.get_run(run_id).await.inspect_err(|_| log_fetch_failure("dashboard.pipeline_detail.get")).ok()?;
     // Only in-flight runs can be waiting on a gate — mirror the list endpoint's bound.
     let approvals = if source.supports_approvals() && is_active(run.status) {
-        source.pending_approvals(run_id).await.unwrap_or_default()
+        source
+            .pending_approvals(run_id)
+            .await
+            .inspect_err(|_| log_fetch_failure("dashboard.pipeline_detail.pending_approvals"))
+            .unwrap_or_default()
     } else {
         Vec::new()
     };

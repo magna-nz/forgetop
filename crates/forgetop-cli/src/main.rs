@@ -3,6 +3,7 @@
 
 use std::io::IsTerminal;
 use std::sync::Arc;
+use std::time::Duration;
 
 use forgetop_core::config::{
     default_config_path, ConfigStore, ForgetopConfig, InMemoryConfigStore, JsonConfigStore, StartupMode,
@@ -24,6 +25,18 @@ async fn main() {
     }
 }
 
+fn start_diagnostic_maintenance() {
+    forgetop_core::diag::maintain();
+    let _maintenance_task = tokio::spawn(async {
+        let mut interval = tokio::time::interval(Duration::from_secs(60 * 60));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            forgetop_core::diag::maintain();
+        }
+    });
+}
+
 async fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
@@ -39,6 +52,9 @@ async fn run() -> Result<()> {
 
     let demo = args.iter().any(|a| a == "--demo" || a == "-d");
     let is_doctor = args.get(1).map(String::as_str) == Some("doctor");
+    if !demo {
+        start_diagnostic_maintenance();
+    }
 
     // Under --demo, every provider type resolves to a canned demo source (no network).
     let registry = Arc::new(ProviderRegistry::new(if demo { demo_factories() } else { default_factories() }));
@@ -115,7 +131,7 @@ async fn spawn_dashboard(deps: forgetop_server::Deps) -> Option<String> {
     for port in [forgetop_server::DEFAULT_PORT, 0] {
         match forgetop_server::spawn(deps.clone(), port).await {
             Ok(server) => return Some(server.url),
-            Err(e) => forgetop_core::diag::log("dashboard", &format!("bind on port {port} failed: {e}")),
+            Err(_) => forgetop_core::diag::log("dashboard.bind", "operation failed"),
         }
     }
     None

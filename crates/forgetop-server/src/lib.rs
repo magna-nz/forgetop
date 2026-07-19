@@ -16,17 +16,13 @@ use axum::Router;
 use forgetop_core::secret::SecretStore;
 use forgetop_core::service::{ConfigService, ConnectionHealthService, SectionService};
 use rust_embed::RustEmbed;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::actions::ActionError;
-use crate::feedback::SentryFeedbackSink;
 
 mod actions;
 mod connections;
 mod dto;
-mod feedback;
-
-pub use feedback::{FeedbackCategory, FeedbackReport, FeedbackSink};
 
 /// The built dashboard SPA, baked into the binary at compile time (see `build.rs`).
 #[derive(RustEmbed)]
@@ -58,23 +54,14 @@ pub struct Server {
 struct AppState {
     deps: Deps,
     token: Arc<str>,
-    feedback: Arc<dyn FeedbackSink>,
 }
 
 async fn bind(deps: Deps, port: u16) -> std::io::Result<(tokio::net::TcpListener, Server, AppState)> {
-    bind_with_feedback_sink(deps, port, Arc::new(SentryFeedbackSink::from_environment())).await
-}
-
-async fn bind_with_feedback_sink(
-    deps: Deps,
-    port: u16,
-    feedback: Arc<dyn FeedbackSink>,
-) -> std::io::Result<(tokio::net::TcpListener, Server, AppState)> {
     let token = uuid::Uuid::new_v4().to_string();
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await?;
     let bound = listener.local_addr()?.port();
     let url = format!("http://127.0.0.1:{bound}/?t={token}");
-    let state = AppState { deps, token: Arc::from(token.as_str()), feedback };
+    let state = AppState { deps, token: Arc::from(token.as_str()) };
     Ok((listener, Server { port: bound, token, url }, state))
 }
 
@@ -82,20 +69,6 @@ async fn bind_with_feedback_sink(
 /// **Best-effort:** an `Err` just means "no dashboard" — the TUI should carry on regardless.
 pub async fn spawn(deps: Deps, port: u16) -> std::io::Result<Server> {
     let (listener, server, state) = bind(deps, port).await?;
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, router(state)).await;
-    });
-    Ok(server)
-}
-
-/// Spawn with an explicit feedback destination. This keeps delivery injectable for API tests
-/// and for embedders that want to provide a private sink other than Sentry.
-pub async fn spawn_with_feedback_sink(
-    deps: Deps,
-    port: u16,
-    feedback: Arc<dyn FeedbackSink>,
-) -> std::io::Result<Server> {
-    let (listener, server, state) = bind_with_feedback_sink(deps, port, feedback).await?;
     tokio::spawn(async move {
         let _ = axum::serve(listener, router(state)).await;
     });
@@ -148,9 +121,6 @@ fn router(state: AppState) -> Router {
         .route("/api/connections/test", post(test_connection))
         .route("/api/preferences", get(get_preferences))
         .route("/api/preferences/startup", post(set_startup_mode))
-        .route("/api/feedback/status", get(feedback_status))
-        .route("/api/feedback/diagnostics", get(feedback_diagnostics))
-        .route("/api/feedback", post(submit_feedback))
         .layer(middleware::from_fn_with_state(state.clone(), auth))
         .with_state(state);
 
@@ -399,118 +369,5 @@ async fn set_startup_mode(State(s): State<AppState>, Json(req): Json<StartupMode
     match s.deps.config.set_startup_mode(req.mode).await {
         Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
-    }
-}
-
-// ---- feedback ----
-
-#[derive(Serialize)]
-struct FeedbackDiagnosticsStatus {
-    size_bytes: u64,
-    oldest_at: Option<String>,
-    newest_at: Option<String>,
-}
-
-#[derive(Serialize)]
-struct FeedbackStatus {
-    configured: bool,
-    diagnostics: FeedbackDiagnosticsStatus,
-}
-
-#[derive(Deserialize)]
-struct FeedbackRequest {
-    category: FeedbackCategory,
-    summary: String,
-    details: String,
-    #[serde(default)]
-    contact: Option<String>,
-    attach_diagnostics: bool,
-}
-
-async fn feedback_status(State(s): State<AppState>) -> Response {
-    match forgetop_core::diag::snapshot() {
-        Ok(snapshot) => Json(FeedbackStatus {
-            configured: s.feedback.configured(),
-            diagnostics: FeedbackDiagnosticsStatus {
-                size_bytes: snapshot.size_bytes,
-                oldest_at: snapshot.oldest_at.map(|value| value.to_rfc3339()),
-                newest_at: snapshot.newest_at.map(|value| value.to_rfc3339()),
-            },
-        })
-        .into_response(),
-        Err(_) => {
-            forgetop_core::diag::log("dashboard.feedback_status", "could not read diagnostics");
-            (StatusCode::INTERNAL_SERVER_ERROR, "diagnostics are unavailable").into_response()
-        }
-    }
-}
-
-async fn feedback_diagnostics() -> Response {
-    match forgetop_core::diag::snapshot() {
-        Ok(snapshot) => (
-            [
-                (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
-                (header::CONTENT_DISPOSITION, "attachment; filename=\"forgetop-diagnostics.log\""),
-                (header::CACHE_CONTROL, "no-store"),
-            ],
-            snapshot.bytes,
-        )
-            .into_response(),
-        Err(_) => {
-            forgetop_core::diag::log("dashboard.feedback_diagnostics", "could not read diagnostics");
-            (StatusCode::INTERNAL_SERVER_ERROR, "diagnostics are unavailable").into_response()
-        }
-    }
-}
-
-async fn submit_feedback(State(s): State<AppState>, Json(req): Json<FeedbackRequest>) -> Response {
-    if !s.feedback.configured() {
-        return (StatusCode::SERVICE_UNAVAILABLE, "feedback delivery is not configured").into_response();
-    }
-
-    let summary = req.summary.trim();
-    if summary.is_empty() || summary.chars().count() > 120 {
-        return (StatusCode::UNPROCESSABLE_ENTITY, "summary must be between 1 and 120 characters").into_response();
-    }
-    let details = req.details.trim();
-    if details.is_empty() || details.chars().count() > 10_000 {
-        return (StatusCode::UNPROCESSABLE_ENTITY, "details must be between 1 and 10000 characters").into_response();
-    }
-    let contact = req.contact.as_deref().map(str::trim).filter(|value| !value.is_empty());
-    if contact.is_some_and(|value| value.chars().count() > 320) {
-        return (StatusCode::UNPROCESSABLE_ENTITY, "contact must be at most 320 characters").into_response();
-    }
-
-    let diagnostics = if req.attach_diagnostics {
-        match forgetop_core::diag::snapshot() {
-            Ok(snapshot) => Some(snapshot),
-            Err(_) => {
-                forgetop_core::diag::log("dashboard.feedback_submit", "could not read diagnostics");
-                return (StatusCode::INTERNAL_SERVER_ERROR, "diagnostics are unavailable").into_response();
-            }
-        }
-    } else {
-        None
-    };
-    let reference_id = uuid::Uuid::new_v4().to_string();
-    let report = FeedbackReport {
-        reference_id: reference_id.clone(),
-        category: req.category,
-        summary: summary.to_owned(),
-        details: details.to_owned(),
-        contact: contact.map(str::to_owned),
-        version: env!("CARGO_PKG_VERSION"),
-        os: std::env::consts::OS,
-        arch: std::env::consts::ARCH,
-        diagnostics,
-    };
-    match s.feedback.submit(&report).await {
-        Ok(()) => Json(serde_json::json!({ "reference_id": reference_id })).into_response(),
-        Err(_) => {
-            // Never include the report or destination error here: either could contain user text
-            // or endpoint details. The constant is enough to identify the failed operation.
-            forgetop_core::diag::log("dashboard.feedback_submit", "delivery failed");
-            (StatusCode::BAD_GATEWAY, "feedback delivery failed").into_response()
-        }
     }
 }
