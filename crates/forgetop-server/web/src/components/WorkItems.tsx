@@ -3,7 +3,7 @@ import { motion } from "framer-motion";
 import { apiGet, useWorkItems, useWriteAction } from "../api";
 import { relativeTime, toTime, wiStateColor } from "../format";
 import type { WiRow } from "../types";
-import { Avatar, Chip, List, ProviderBadge, Skeleton, StateCard } from "./ui";
+import { Avatar, Chip, List, Skeleton, StateCard, StatusBadge } from "./ui";
 import { ErrorState } from "./ErrorState";
 import { useListView } from "./ControlBar";
 import { useWiOpener } from "./WiDetail";
@@ -54,7 +54,7 @@ function WiCard({ row, index }: { row: WiRow; index: number }) {
       initial={{ opacity: 0, y: 6 }}
       animate={{ opacity: 1, y: 0 }}
       transition={{ duration: 0.22, delay: Math.min(index * 0.02, 0.3), ease: "easeOut" }}
-      className="flex items-start gap-3 rounded-lg px-4 py-3"
+      className="flex items-start gap-3 rounded-lg px-3 py-2"
       style={{ background: "var(--card)", border: "1px solid var(--border)" }}
     >
       <button
@@ -63,16 +63,12 @@ function WiCard({ row, index }: { row: WiRow; index: number }) {
         style={{ cursor: "pointer" }}
       >
         <div className="flex items-center gap-2">
-          <span className="inline-flex items-center gap-1.5 text-xs font-medium whitespace-nowrap" style={{ color }}>
-            <span>●</span>
-            {wi.state}
-          </span>
+          <StatusBadge label={wi.state} color={color} />
           <span className="truncate font-medium" style={{ color: "var(--fg)" }}>
             {wi.title}
           </span>
         </div>
-        <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1.5">
-          <ProviderBadge provider={row.provider} connection={row.connection} />
+        <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1.5">
           {wi.identifier && <span className="mono text-xs" style={{ color: "var(--dim)" }}>{wi.identifier}</span>}
           {wi.work_item_type && <Chip>{wi.work_item_type}</Chip>}
         </div>
