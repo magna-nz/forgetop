@@ -4,7 +4,9 @@ import { useQueryClient } from "@tanstack/react-query";
 import { apiGetText, apiPost, usePipelineDetail } from "../api";
 import { pipeMeta, relativeTime } from "../format";
 import type { PipeRef, PipelineApproval, PipelineJob } from "../types";
-import { Avatar, Chip, Pill, SlideOver } from "./ui";
+import { Avatar, Chip, SlideOver, StatusBadge } from "./ui";
+
+const cap = (s: string): string => (s.length ? s[0].toUpperCase() + s.slice(1) : s);
 
 // ---- opener context ----
 
@@ -65,7 +67,12 @@ function PipelineDetailPanel({ pipeRef, onClose }: { pipeRef: PipeRef; onClose: 
 
   const header = (
     <>
-      {meta && <Pill icon={meta.icon} label={meta.label} color={meta.color} spin={meta.running} />}
+      {meta && (
+        <div className="flex items-center gap-1.5 shrink-0">
+          <StatusBadge label={cap(meta.label)} color={meta.color} />
+          {meta.running && <span className="spin text-xs" style={{ color: meta.color }} aria-hidden="true">◐</span>}
+        </div>
+      )}
       <div className="flex-1 min-w-0">
         <div className="font-medium truncate" style={{ color: "var(--fg)" }}>
           {label ?? (isLoading ? "Loading…" : "Pipeline run")}
@@ -74,7 +81,7 @@ function PipelineDetailPanel({ pipeRef, onClose }: { pipeRef: PipeRef; onClose: 
           <div className="flex items-center gap-2 mt-1 text-xs" style={{ color: "var(--dim)" }}>
             {run.branch && <Chip title="branch">⑂ {run.branch}</Chip>}
             {run.commit_sha && <span className="mono">{run.commit_sha.slice(0, 7)}</span>}
-            <span>{relativeTime(run.finished_at ?? run.started_at)}</span>
+            <span className="whitespace-nowrap">{relativeTime(run.finished_at ?? run.started_at)}</span>
           </div>
         )}
       </div>
