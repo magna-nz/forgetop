@@ -1,34 +1,37 @@
-# forgetop
+<div align="center">
+  <img src="docs/forgetop-mark.svg" alt="forgetop logo" width="104" />
+  <h1>forgetop</h1>
+  <p><strong>Your work, across every forge — in one command center.</strong></p>
+  <p>A fast, keyboard-driven home for pull requests, work items, and CI pipelines in your terminal, browser, or both.</p>
+  <p>
+    <a href="https://github.com/magna-nz/forgetop/actions/workflows/ci.yml"><img src="https://github.com/magna-nz/forgetop/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI" /></a>
+    <a href="https://github.com/magna-nz/forgetop/releases/latest"><img src="https://img.shields.io/github/v/release/magna-nz/forgetop?sort=semver&label=release" alt="Latest release" /></a>
+    <a href="https://magna-nz.github.io/forgetop/"><img src="https://img.shields.io/badge/docs-read_the_docs-3178C6" alt="Documentation" /></a>
+    <a href="https://discord.gg/yebAJdcGu"><img src="https://img.shields.io/badge/Discord-Join%20the%20community-5865F2?logo=discord&logoColor=white" alt="Join the Discord community" /></a>
+    <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="MIT License" /></a>
+  </p>
+  <p><a href="#install">Install</a> · <a href="#quick-start">Quick start</a> · <a href="#the-command-center">Command Center</a> · <a href="https://magna-nz.github.io/forgetop/">Documentation</a> · <a href="https://discord.gg/yebAJdcGu">Discord</a></p>
+</div>
 
-A fast, keyboard-driven command center for your pull requests, work items, and CI
-pipelines — across **GitHub**, **GitLab**, **Azure DevOps**, **Bitbucket**, **Linear**,
-and **Jira** — in your **terminal**, your **browser**, or both.
-
-📖 **Docs: [magna-nz.github.io/forgetop](https://magna-nz.github.io/forgetop/)**
-
-[![CI](https://github.com/magna-nz/forgetop/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/magna-nz/forgetop/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/magna-nz/forgetop?sort=semver&label=release)](https://github.com/magna-nz/forgetop/releases/latest)
-[![Docs](https://img.shields.io/badge/docs-magna--nz.github.io%2Fforgetop-blue)](https://magna-nz.github.io/forgetop/)
-[![Rust](https://img.shields.io/badge/built%20with-Rust-DEA584?logo=rust&logoColor=white)](https://www.rust-lang.org)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-
-Checking GitHub for reviews, Azure for failing builds, and Jira for tickets is a lot of
-tabs. forgetop pulls your pull requests, work items, and pipelines into one command center
-— and lets you *act* on them (approve, merge, comment, change state, drill into pipeline
-stages, trigger runs). Run it as a fast terminal UI, a browser dashboard, or **both at
-once** (the default). Tokens live in your OS keychain, never in plaintext.
+<br />
 
 <div align="center">
-  <img src="docs/launchpad2.gif" alt="The Command Center in the terminal" width="820">
-  <br/>
-  <sub><b>In your terminal</b></sub>
-  <br/><br/>
-  <img src="docs/dashboard.gif" alt="The Command Center in the web dashboard" width="820">
-  <br/>
-  <sub><b>…or your browser</b></sub>
-  <br/><br/>
-  <sub>The <b>Command Center</b> — the same triaged, actionable queue in your terminal and your browser. Same data, same actions. Your call.</sub>
+  <img src="docs/terminal-preview-placeholder.svg" alt="Placeholder for the forgetop terminal GIF" width="820" />
+  <br />
+  <sub><strong>In your terminal</strong> — terminal GIF coming soon</sub>
+  <br /><br />
+  <img src="docs/dashboard-preview-placeholder.svg" alt="Placeholder for the forgetop dashboard capture" width="820" />
+  <br />
+  <sub><strong>In your browser</strong> — dashboard still or GIF coming soon</sub>
 </div>
+
+<br />
+
+Checking GitHub for reviews, Azure for failing builds, and Jira for tickets is a lot of tabs.
+forgetop pulls your pull requests, work items, and pipelines into one command center — and lets
+you act on them: approve, merge, comment, change state, drill into pipeline stages, and trigger
+runs. It supports **GitHub**, **GitLab**, **Azure DevOps**, **Bitbucket**, **Linear**, and
+**Jira**. Tokens live in your OS keychain, never in plaintext.
 
 ---
 
