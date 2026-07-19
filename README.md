@@ -59,27 +59,27 @@ for the full bucket rules and keys.
 
 ## What you can do
 
-### Review and ship without context switching
+### 🔎 Review and ship without context switching
 
 Approve or request changes, merge, comment, reply to threads, and inspect diffs from a single
 cross-provider pull-request view. Your review queue is not limited to one forge.
 
-### Keep delivery moving
+### ⚡ Keep delivery moving
 
 See CI runs next to the work they affect, drill into stages and logs, trigger a run, and approve
 supported pipeline gates without leaving your flow.
 
-### Find the next useful action
+### 🎯 Find the next useful action
 
 The notification inbox collects mentions, review requests, CI failures, and assignments.
 The command palette jumps to any item with **`Ctrl-P`** in the terminal or **`⌘K`** in the dashboard.
 
-### Use the interface that fits your day
+### ⌨️ Use the interface that fits your day
 
 forgetop is the same app in the terminal and the browser. Start both together, run the browser
 dashboard alone, or stay entirely in the TUI — all three use the same local data and actions.
 
-### Keep your tokens local
+### 🔒 Keep your tokens local
 
 The browser dashboard is served by forgetop itself on **`127.0.0.1`** with a per-session token.
 Your provider tokens live in your OS keychain, never in plaintext or a hosted service.
