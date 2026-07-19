@@ -1,10 +1,12 @@
 import { useIsFetching, useQueryClient } from "@tanstack/react-query";
 import { AnimatePresence, motion } from "framer-motion";
 import { useEffect, useRef, useState } from "react";
-import { useNotifications } from "../api";
+import { apiPost, useNotifications } from "../api";
 import { notificationMeta, relativeTime, toTime } from "../format";
 import { useNavigateSection } from "../nav";
-import type { SectionId } from "../types";
+import type { NotifRow, SectionId } from "../types";
+import { usePrOpener } from "./PrDetail";
+import { useWiOpener } from "./WiDetail";
 
 const META: Record<SectionId, { title: string; subtitle: string }> = {
   // "Command Center" is the user-facing name for the launchpad section (code keeps `launchpad`).
@@ -32,11 +34,30 @@ export function TopBar({
   const qc = useQueryClient();
   const { data: notifications } = useNotifications();
   const navigate = useNavigateSection();
+  const openPr = usePrOpener();
+  const openWi = useWiOpener();
   const [notificationsOpen, setNotificationsOpen] = useState(false);
   const notificationRef = useRef<HTMLDivElement>(null);
   const unread = notifications?.filter((r) => r.notification.unread).length ?? 0;
   // Newest first — the standard notification-bell order.
   const orderedNotifications = [...(notifications ?? [])].sort((a, b) => toTime(b.notification.updated_at) - toTime(a.notification.updated_at));
+
+  // Clicking a popup notification opens its item (PR/work-item in-app, else the provider URL),
+  // marks it read, and closes the popup — same behaviour as a row on the Notifications page.
+  const openNotification = (row: NotifRow) => {
+    const n = row.notification;
+    const conn = row.connection_id;
+    if (n.unread) {
+      void apiPost("/api/notification/read", { conn, id: n.id }).then(() => {
+        qc.invalidateQueries({ queryKey: ["notifications"] });
+        qc.invalidateQueries({ queryKey: ["launchpad"] });
+      });
+    }
+    if (n.item_id != null && n.item_type === "PullRequest") openPr({ conn, id: n.item_id });
+    else if (n.item_id != null && n.item_type === "WorkItem") openWi({ conn, id: n.item_id });
+    else if (n.url) window.open(n.url, "_blank", "noopener,noreferrer");
+    setNotificationsOpen(false);
+  };
 
   useEffect(() => {
     if (!notificationsOpen) return;
@@ -150,13 +171,21 @@ export function TopBar({
                     const n = row.notification;
                     const kind = notificationMeta(n.kind);
                     return (
-                      <div key={`${row.connection_id}:${n.id}`} className="flex items-center gap-2 px-3 py-2" style={{ borderBottom: "1px solid var(--border)" }}>
+                      <button
+                        key={`${row.connection_id}:${n.id}`}
+                        type="button"
+                        onClick={() => openNotification(row)}
+                        className="flex w-full items-center gap-2 px-3 py-2 text-left transition-colors"
+                        style={{ borderBottom: "1px solid var(--border)", cursor: "pointer" }}
+                        onMouseEnter={(e) => (e.currentTarget.style.background = "var(--sel)")}
+                        onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+                      >
                         <div className="min-w-0 flex-1">
                           <div className="truncate text-xs font-medium" style={{ color: n.unread ? "var(--fg)" : "var(--dim)" }}>{n.title}</div>
                           <div className="text-[11px]" style={{ color: kind.color }}>{kind.label}</div>
                         </div>
                         <span className="shrink-0 text-[11px] whitespace-nowrap" style={{ color: "var(--dim)" }}>{relativeTime(n.updated_at)}</span>
-                      </div>
+                      </button>
                     );
                   })
                 )}
