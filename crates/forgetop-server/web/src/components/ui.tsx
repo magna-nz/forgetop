@@ -121,6 +121,23 @@ export function Pill({ icon, label, color, spin = false }: { icon: string; label
   );
 }
 
+/** Uniform status chip — tinted by the status colour, shaped like the work-items "[Bug]" chip.
+ *  Shared by the Command Center rows and the Pull Requests list so they read as one set. */
+export function StatusBadge({ label, color }: { label: string; color: string }) {
+  return (
+    <span
+      className="inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium whitespace-nowrap shrink-0"
+      style={{
+        color,
+        background: `color-mix(in srgb, ${color} 12%, transparent)`,
+        border: `1px solid color-mix(in srgb, ${color} 30%, transparent)`,
+      }}
+    >
+      {label}
+    </span>
+  );
+}
+
 export function Chip({ children, title }: { children: ReactNode; title?: string }) {
   return (
     <span
@@ -138,17 +155,19 @@ export function Row({
   index = 0,
   href,
   onClick,
+  dense = false,
 }: {
   children: ReactNode;
   index?: number;
   href?: string | null;
   onClick?: () => void;
+  dense?: boolean;
 }) {
   const common = {
     initial: { opacity: 0, y: 6 },
     animate: { opacity: 1, y: 0 },
     transition: { duration: 0.22, delay: Math.min(index * 0.02, 0.3), ease: "easeOut" as const },
-    className: "group block rounded-lg px-4 py-3 transition-colors w-full text-left",
+    className: `group block rounded-lg transition-colors w-full text-left ${dense ? "px-3 py-2" : "px-4 py-3"}`,
     style: { background: "var(--card)", border: "1px solid var(--border)", cursor: href || onClick ? "pointer" : "default" },
     onMouseEnter: (e: React.MouseEvent<HTMLElement>) => (e.currentTarget.style.background = "var(--card-hover)"),
     onMouseLeave: (e: React.MouseEvent<HTMLElement>) => (e.currentTarget.style.background = "var(--card)"),

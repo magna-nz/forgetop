@@ -3,7 +3,7 @@ import { motion } from "framer-motion";
 import { useLaunchpad } from "../api";
 import { checkMeta, pipeMeta, prStatusMeta, relativeTime, wiStateColor } from "../format";
 import type { LaunchpadMore, LaunchpadRow, SectionId } from "../types";
-import { Skeleton, StateCard } from "./ui";
+import { Skeleton, StateCard, StatusBadge } from "./ui";
 import { ErrorState } from "./ErrorState";
 import { usePrOpener } from "./PrDetail";
 import { useWiOpener } from "./WiDetail";
@@ -237,24 +237,6 @@ function statusBadge(row: LaunchpadRow): { label: string; color: string } {
   }
   const m = pipeMeta(row.run.status);
   return { label: row.run.status === "Failed" ? "Error" : capitalize(m.label), color: m.color };
-}
-
-/** Uniform status chip used across every Command Center row so they read as one set —
- *  tinted by the status colour, shaped like the work-items "[Bug]" chip. Command Center only;
- *  the list views (Pull Requests, Work Items, Pipelines) keep their status dots for now. */
-function StatusBadge({ label, color }: { label: string; color: string }) {
-  return (
-    <span
-      className="inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium whitespace-nowrap shrink-0"
-      style={{
-        color,
-        background: `color-mix(in srgb, ${color} 12%, transparent)`,
-        border: `1px solid color-mix(in srgb, ${color} 30%, transparent)`,
-      }}
-    >
-      {label}
-    </span>
-  );
 }
 
 function rowId(row: LaunchpadRow): string {
