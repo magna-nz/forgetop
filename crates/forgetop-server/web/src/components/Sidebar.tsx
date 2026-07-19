@@ -1,5 +1,5 @@
 import { motion } from "framer-motion";
-import { useHealth, useLaunchpad, useNotifications, usePipelines, usePullRequests, useWorkItems } from "../api";
+import { useHealth, useLaunchpad, usePipelines, usePullRequests, useWorkItems } from "../api";
 import { useTheme } from "../theme";
 import type { SectionId } from "../types";
 
@@ -9,7 +9,6 @@ const NAV: { id: SectionId; label: string; icon: string }[] = [
   { id: "prs", label: "Pull Requests", icon: "⇄" },
   { id: "work-items", label: "Work Items", icon: "◧" },
   { id: "pipelines", label: "Pipelines", icon: "⛓" },
-  { id: "notifications", label: "Notifications", icon: "◔" },
   { id: "settings", label: "Settings", icon: "⚙" },
 ];
 
@@ -26,16 +25,15 @@ export function Sidebar({
   const prs = usePullRequests();
   const wis = useWorkItems();
   const pipes = usePipelines();
-  const notifs = useNotifications();
   const health = useHealth();
 
-  const counts: Record<SectionId, number | undefined> = {
+  // Notifications is no longer in the sidebar (it lives in the top-bar bell), so it has no count here.
+  const counts: Partial<Record<SectionId, number | undefined>> = {
     // Launchpad badge counts only actionable (non-muted) items — things truly waiting on you.
     launchpad: lp.data?.rows.filter((r) => !r.muted).length,
     prs: prs.data?.length,
     "work-items": wis.data?.length,
     pipelines: pipes.data?.length,
-    notifications: notifs.data?.filter((n) => n.notification.unread).length,
     settings: undefined,
   };
 
@@ -86,8 +84,8 @@ export function Sidebar({
                 <span
                   className="relative z-10 mono rounded-full px-1.5 text-xs"
                   style={{
-                    background: item.id === "notifications" || item.id === "launchpad" ? "var(--accent)" : "var(--panel2)",
-                    color: item.id === "notifications" || item.id === "launchpad" ? "#10233b" : "var(--dim)",
+                    background: item.id === "launchpad" ? "var(--accent)" : "var(--panel2)",
+                    color: item.id === "launchpad" ? "#10233b" : "var(--dim)",
                   }}
                 >
                   {count}
