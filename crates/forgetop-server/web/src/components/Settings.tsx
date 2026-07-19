@@ -2,9 +2,8 @@ import { useState } from "react";
 import { motion } from "framer-motion";
 import { useQueryClient } from "@tanstack/react-query";
 import { apiPost, useConnections, useHealth, usePreferences, useWriteAction } from "../api";
-import { providerMeta } from "../format";
 import type { ConnectionRow, StartupMode } from "../types";
-import { ProviderBadge, Skeleton, StateCard } from "./ui";
+import { Skeleton, StateCard, StatusBadge } from "./ui";
 import { ErrorState } from "./ErrorState";
 import { ConnectionForm } from "./ConnectionForm";
 
@@ -149,7 +148,6 @@ function ConnectionCard({
   onEdit: () => void;
   onChanged: () => void;
 }) {
-  const meta = providerMeta(conn.provider);
   const { busy, run } = useWriteAction();
   const [tested, setTested] = useState<boolean | null>(null);
 
@@ -168,37 +166,16 @@ function ConnectionCard({
     }
   };
 
-  const dot = tested ?? healthy;
+  const status = tested ?? healthy; // boolean | undefined
   return (
-    <div className="flex items-center gap-3 rounded-lg px-4 py-3" style={{ background: "var(--card)", border: "1px solid var(--border)" }}>
-      <span className="inline-block w-2.5 h-2.5 rounded-full shrink-0" style={{ background: meta.color }} title={meta.label} />
-      <div className="flex-1 min-w-0">
-        <div className="flex items-center gap-2">
-          <span className="font-medium truncate" style={{ color: "var(--fg)" }}>{conn.display_name}</span>
-          {dot != null && (
-            <span
-              className="text-xs px-1.5 rounded-full"
-              style={{ color: dot ? "var(--green)" : "var(--red)", border: `1px solid ${dot ? "var(--green)" : "var(--red)"}` }}
-            >
-              {dot ? "connected" : "auth failed"}
-            </span>
-          )}
-          {!conn.has_token && conn.provider !== "Demo" && (
-            <span className="text-xs px-1.5 rounded-full" style={{ color: "var(--yellow)", border: "1px solid var(--yellow)" }}>
-              no token
-            </span>
-          )}
-        </div>
-        <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1">
-          <ProviderBadge provider={conn.provider} connection={meta.label} />
-          {conn.sections.length > 0 ? (
-            <span className="text-xs" style={{ color: "var(--dim)" }}>
-              {conn.sections.map((s) => SECTION_LABEL[s] ?? s).join(" · ")}
-            </span>
-          ) : (
-            <span className="text-xs" style={{ color: "var(--dim)" }}>not shown in any section</span>
-          )}
-        </div>
+    <div className="flex items-center gap-3 rounded-lg px-3 py-2" style={{ background: "var(--card)", border: "1px solid var(--border)" }}>
+      <div className="flex-1 min-w-0 flex items-center gap-2">
+        {/* Status badge follows the app convention (tinted StatusBadge) and sits before the name. */}
+        {status != null && <StatusBadge label={status ? "Connected" : "Auth failed"} color={status ? "var(--green)" : "var(--red)"} />}
+        <span className="font-medium truncate" style={{ color: "var(--fg)" }}>{conn.display_name}</span>
+        <span className="text-xs shrink-0" style={{ color: "var(--dim)" }}>
+          {conn.sections.length > 0 ? conn.sections.map((s) => SECTION_LABEL[s] ?? s).join(" · ") : "not shown in any section"}
+        </span>
       </div>
       <div className="flex items-center gap-1.5 shrink-0">
         <SmallBtn label="Test" onClick={test} disabled={busy} />
