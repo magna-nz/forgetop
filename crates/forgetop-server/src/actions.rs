@@ -96,6 +96,22 @@ pub struct WiCommentReq {
 }
 
 #[derive(Deserialize)]
+pub struct WiAssigneeReq {
+    pub conn: String,
+    pub id: String,
+    /// The chosen assignee's id (from the assignable-users list), or `None` to unassign.
+    pub assignee_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct WiUpdateReq {
+    pub conn: String,
+    pub id: String,
+    pub title: Option<String>,
+    pub description: Option<String>,
+}
+
+#[derive(Deserialize)]
 pub struct PipelineApprovalReq {
     pub conn: String,
     pub run_id: String,
@@ -166,6 +182,21 @@ pub async fn wi_set_state(sections: &SectionService, req: WiStateReq) -> Result<
 pub async fn wi_comment(sections: &SectionService, req: WiCommentReq) -> Result<(), ActionError> {
     let source = dto::wi_source(sections, &req.conn).await.ok_or(ActionError::NotFound)?;
     source.add_comment(&req.id, &req.body).await.map_err(failed)
+}
+
+pub async fn wi_assignees(sections: &SectionService, conn: &str, id: &str) -> Option<Vec<forgetop_core::domain::User>> {
+    let source = dto::wi_source(sections, conn).await?;
+    Some(source.assignable_users(id).await.unwrap_or_default())
+}
+
+pub async fn wi_set_assignee(sections: &SectionService, req: WiAssigneeReq) -> Result<(), ActionError> {
+    let source = dto::wi_source(sections, &req.conn).await.ok_or(ActionError::NotFound)?;
+    source.set_assignee(&req.id, req.assignee_id.as_deref()).await.map_err(failed)
+}
+
+pub async fn wi_update(sections: &SectionService, req: WiUpdateReq) -> Result<(), ActionError> {
+    let source = dto::wi_source(sections, &req.conn).await.ok_or(ActionError::NotFound)?;
+    source.update_fields(&req.id, req.title.as_deref(), req.description.as_deref()).await.map_err(failed)
 }
 
 pub async fn pipeline_approval(sections: &SectionService, req: PipelineApprovalReq) -> Result<(), ActionError> {
