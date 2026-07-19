@@ -2,7 +2,10 @@
 
 Guidance for AI coding agents (Codex, Claude, Cursor, …) working in this repo.
 Humans: this doubles as a quick contributor reference. For architecture and the dashboard
-design intent see `SPEC.md`; for day-to-day status see `STATUS.md` (both are local/gitignored).
+design intent see `SPEC.md`; for day-to-day status see `STATUS.md`. Both are **gitignored**
+(so a fresh clone won't have them) but are backed up to the private repo `magna-nz/dev-specs`
+— locally at `~/Desktop/dev-specs/forgetop/`. If a file is missing from the repo root, read the
+backup; if both exist, the most recently modified one is current.
 
 ## What this is
 **forgetop** — one Rust binary, **two frontends over one data/action layer**: a terminal UI
