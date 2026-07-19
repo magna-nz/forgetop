@@ -280,6 +280,56 @@ async fn github_pipeline_approval_gate_lifecycle() {
 }
 
 #[tokio::test]
+async fn github_pipeline_cancel_lifecycle() {
+    let gh = skip_if_none!(harness::github(), "github");
+    let raw = GhRaw::from_env().expect("github raw client");
+    harness::maybe_sweep(raw.sweep()).await;
+    let prefix = harness::run_prefix();
+
+    // Fixture: a dispatched workflow with a long-running job, leaving time to cancel it.
+    let default = raw.default_branch().await;
+    let wf_file = format!("{prefix}.yml");
+    let wf_path = format!(".github/workflows/{wf_file}");
+    let yaml = format!(
+        "name: {prefix}\non:\n  workflow_dispatch:\njobs:\n  long-running:\n    runs-on: ubuntu-latest\n    steps:\n      - run: sleep 120\n"
+    );
+    raw.put_file(&wf_path, &yaml, &default, &format!("{prefix}: add cancellable workflow")).await;
+    raw.dispatch(&wf_file, &default).await;
+
+    // Wait for the dispatched run to be queued or executing before cancelling it.
+    let run_id = {
+        let raw = &raw;
+        let wf = wf_file.as_str();
+        harness::poll(harness::POLL_GATE, move || async move {
+            raw.workflow_runs(wf)
+                .await
+                .into_iter()
+                .find(|(_, s)| s == "in_progress" || s == "queued")
+                .map(|(id, _)| id)
+        })
+        .await
+    }
+    .expect("a dispatched run became queued or in progress");
+
+    let pipe = gh.conn.pipelines().expect("github pipelines");
+    pipe.cancel_run(&run_id).await.expect("cancel");
+
+    let cancelled = {
+        let pipe = &pipe;
+        let run_id = run_id.as_str();
+        harness::poll(harness::POLL_LIST, move || async move {
+            pipe.get_run(run_id).await.ok().filter(|run| matches!(run.status, PipelineRunStatus::Canceled))
+        })
+        .await
+    };
+    assert!(cancelled.is_some(), "the run reads back as canceled after cancellation");
+
+    // Teardown.
+    raw.delete_run(&run_id).await;
+    raw.delete_file(&wf_path, &default, &format!("{prefix}: remove workflow")).await;
+}
+
+#[tokio::test]
 async fn github_lists_notifications() {
     let gh = skip_if_none!(harness::github(), "github");
     let notifs = gh.conn.notifications().expect("github advertises notifications");

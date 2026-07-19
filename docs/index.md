@@ -75,7 +75,7 @@ html[data-surface="tui"] .surface-dash{display:none}
   items merge into one list, tagged by provider. All your PRs across GitHub *and*
   GitLab *and* Azure, in a single view.
 - **Do work, not just watch it** — approve / request changes / merge / comment on
-  PRs, change work-item states, trigger pipeline runs — all from the keyboard.
+  PRs, change work-item states, re-run or cancel pipeline runs — all from the keyboard.
 - **Real code review** — a full-screen PR view with Conversation, Commits, Checks,
   and Diff tabs; **syntax-highlighted** diffs grouped by directory, per-file
   **viewed** checkboxes, thread jump-navigation, a line cursor in the patch;
@@ -85,8 +85,10 @@ html[data-surface="tui"] .surface-dash{display:none}
   merged / commented.
 - **Pipeline drill-in** — expand stages → jobs → steps with per-node **durations**,
   **failure reasons**, a scrollable **logs** pane, and open-in-browser.
-- **Pipeline approvals** — see which runs are blocked on a gate you can action
-  (red **Approval needed**), and approve / reject them without leaving the terminal
+- **Pipeline actions** — from a run's detail pane, **re-run** a failed run or
+  **cancel** a running/queued one (GitHub, GitLab, Azure DevOps, Bitbucket).
+- **Pipeline approvals** — see which runs are blocked on a gate (red
+  **Approval needed**); acting on a gate is available in the terminal
   (GitHub, Azure DevOps, GitLab).
 - **Filter, sort, and shape** — a live quick-filter, per-column sorting, work-item
   state visibility, and pipeline subscriptions — all remembered per view.
