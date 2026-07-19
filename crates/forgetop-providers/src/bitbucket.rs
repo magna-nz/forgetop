@@ -244,6 +244,7 @@ pub fn map_pipeline(v: &Value, workspace: &str, repo: &str) -> PipelineRun {
         definition_id: "pipelines".into(),
         number,
         name: get_obj(v, "target").and_then(|t| get_str(t, "ref_name")),
+        title: get_obj(v, "target").and_then(|t| get_obj(t, "commit")).and_then(|c| get_str(c, "message")).map(|m| m.lines().next().unwrap_or("").to_string()),
         status: bb_status(get_obj(v, "state")),
         triggered_by: get_obj(v, "creator").map(map_user),
         branch: get_obj(v, "target").and_then(|t| get_str(t, "ref_name")),

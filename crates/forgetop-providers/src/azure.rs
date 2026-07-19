@@ -163,6 +163,7 @@ pub fn map_build(v: &Value) -> PipelineRun {
         definition_id: get_obj(v, "definition").and_then(|d| get_i64(d, "id")).map(|n| n.to_string()).unwrap_or_else(|| "0".into()),
         number: None,
         name: get_str(v, "buildNumber").or_else(|| get_obj(v, "definition").and_then(|d| get_str(d, "name"))),
+        title: None,
         status,
         triggered_by: get_obj(v, "requestedFor").map(map_user),
         branch: strip_ref(get_str(v, "sourceBranch")),

@@ -315,6 +315,9 @@ pub struct PipelineRun {
     pub definition_id: String,
     pub number: Option<i64>,
     pub name: Option<String>,
+    /// A human-readable title for the run — the triggering PR title or commit-message subject
+    /// where the provider exposes it (GitHub `display_title`). `None` when unavailable.
+    pub title: Option<String>,
     pub status: PipelineRunStatus,
     pub triggered_by: Option<User>,
     pub branch: Option<String>,
