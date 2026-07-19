@@ -3,7 +3,7 @@ import { motion } from "framer-motion";
 import { apiGet, useWorkItems, useWriteAction } from "../api";
 import { relativeTime, toTime, wiStateColor } from "../format";
 import type { WiRow } from "../types";
-import { Avatar, Chip, List, ProviderBadge, Skeleton, StateCard } from "./ui";
+import { Avatar, Chip, List, Skeleton, StateCard, StatusBadge } from "./ui";
 import { ErrorState } from "./ErrorState";
 import { useListView } from "./ControlBar";
 import { useWiOpener } from "./WiDetail";
@@ -54,37 +54,27 @@ function WiCard({ row, index }: { row: WiRow; index: number }) {
       initial={{ opacity: 0, y: 6 }}
       animate={{ opacity: 1, y: 0 }}
       transition={{ duration: 0.22, delay: Math.min(index * 0.02, 0.3), ease: "easeOut" }}
-      className="flex items-start gap-3 rounded-lg px-4 py-3"
+      className="flex items-center gap-3 rounded-lg px-3 py-1.5"
       style={{ background: "var(--card)", border: "1px solid var(--border)" }}
     >
       <button
         onClick={() => open({ conn: row.connection_id, id: wi.id })}
-        className="flex-1 min-w-0 text-left"
+        className="flex-1 min-w-0 text-left flex items-center gap-2"
         style={{ cursor: "pointer" }}
       >
-        <div className="flex items-center gap-2">
-          <span className="inline-flex items-center gap-1.5 text-xs font-medium whitespace-nowrap" style={{ color }}>
-            <span>●</span>
-            {wi.state}
-          </span>
-          <span className="truncate font-medium" style={{ color: "var(--fg)" }}>
-            {wi.title}
-          </span>
-        </div>
-        <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1.5">
-          <ProviderBadge provider={row.provider} connection={row.connection} />
-          {wi.identifier && <span className="mono text-xs" style={{ color: "var(--dim)" }}>{wi.identifier}</span>}
-          {wi.work_item_type && <Chip>{wi.work_item_type}</Chip>}
-        </div>
+        <StatusBadge label={wi.state} color={color} />
+        {wi.identifier && <span className="mono text-xs shrink-0" style={{ color: "var(--dim)" }}>{wi.identifier}</span>}
+        <span className="truncate font-medium min-w-0" style={{ color: "var(--fg)" }}>
+          {wi.title}
+        </span>
+        {wi.work_item_type && <span className="shrink-0"><Chip>{wi.work_item_type}</Chip></span>}
       </button>
-      <div className="flex flex-col items-end gap-2 shrink-0">
+      <div className="flex items-center gap-2 shrink-0">
+        <span className="text-xs whitespace-nowrap" style={{ color: "var(--dim)" }}>
+          {relativeTime(wi.updated_at)}
+        </span>
+        {wi.assignee && <Avatar name={wi.assignee.display_name} />}
         <StateMenu row={row} />
-        <div className="flex items-center gap-2">
-          <span className="text-xs whitespace-nowrap" style={{ color: "var(--dim)" }}>
-            {relativeTime(wi.updated_at)}
-          </span>
-          {wi.assignee && <Avatar name={wi.assignee.display_name} />}
-        </div>
       </div>
     </motion.div>
   );
