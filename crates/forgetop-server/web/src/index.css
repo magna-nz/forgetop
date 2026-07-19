@@ -149,3 +149,17 @@ body {
 .pulse {
   animation: pulse-dot 1.4s ease-in-out infinite;
 }
+
+/* Every clickable control gets the hand cursor and a subtle lighten on hover, app-wide —
+   so any button feels interactive even if it doesn't set its own hover style. */
+button:not(:disabled),
+[role="button"]:not([aria-disabled="true"]),
+select:not(:disabled),
+a[href] {
+  cursor: pointer;
+}
+button:not(:disabled):hover,
+[role="button"]:not([aria-disabled="true"]):hover,
+select:not(:disabled):hover {
+  filter: brightness(1.12);
+}
