@@ -77,6 +77,23 @@ ls crates/forgetop-server/web/dist/assets/index-*.js                # local
   helpers, error handling, and naming. Don't introduce new patterns without cause.
 - Security: the dashboard binds `127.0.0.1` only, gated by a per-session token. Never widen that.
 
+## Where the dashboard code lives (`crates/forgetop-server/web/src/`)
+- **Shared UI** — `components/ui.tsx`: `StatusBadge`, `Pill`, `Chip`, `Row`, `Avatar`, `SlideOver`, `Timeline`, `List`, …
+- **Lists** — `components/PullRequests.tsx`, `WorkItems.tsx`, `Pipelines.tsx`; the Command Center is `Launchpad.tsx`. All lists share the sort/filter control bar + generic data-derived `facet` in `components/ControlBar.tsx` (`useListView`).
+- **Detail panes** (right-hand slide-overs) — `components/PrDetail.tsx`, `WiDetail.tsx`, `PipelineDetail.tsx`. Each exposes an opener context (`usePrOpener`/`useWiOpener`/`usePipelineOpener`) and an `act()` helper that runs a write then invalidates the affected queries.
+- **Types** — `types.ts` mirrors the Rust DTOs in `crates/forgetop-server/src/dto.rs`. **Keep them in sync.**
+- **Data** — `api.ts` (TanStack Query hooks); provider-capability gating in `capabilities.ts`; status colours/labels in `format.ts`.
+
+## Adding a field or action across the stack (the common recipe)
+Data flows **provider trait → provider impls + demo → server DTO → `types.ts` → component**. To add something end-to-end:
+1. **Domain/trait** (`forgetop-core`): add the field to the domain struct, or a method to the provider trait *with a compile-safe default* (so providers adopt it incrementally).
+2. **Providers + demo** (`forgetop-providers`): populate/implement it in each provider's mapper, and in `demo.rs` (give the demo believable data — the demo is how changes are verified). A method rippling across N provider files is a good Codex fan-out; a shared struct/trait change is not (it touches every provider + the TUI — keep it on the supervisor).
+3. **Server** (`forgetop-server/src`): thread it through the DTO in `dto.rs` (and add a `POST /api/…` handler in `lib.rs` + `actions.rs` for a write action, mirroring an existing one).
+4. **Frontend**: add the field to `types.ts`, then use it in the component.
+5. **Verify** in `--demo`, add/adjust a `vitest` (frontend) or integration test (providers), run clippy + tsc.
+
+Two panels already demonstrate the full pattern end-to-end: WI **reassign/edit** (`assignable_users`/`set_assignee`/`update_fields`) and pipeline **cancel** (`cancel_run`) — copy their shape.
+
 ## If you are a delegated (sandboxed) worker
 When dispatched to implement one file:
 - **Edit only the file you were told to.** Do not touch other crates/files.
