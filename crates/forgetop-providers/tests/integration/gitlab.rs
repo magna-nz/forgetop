@@ -214,6 +214,59 @@ async fn gitlab_manual_job_approval_lifecycle() {
 }
 
 #[tokio::test]
+async fn gitlab_pipeline_cancel_lifecycle() {
+    let gl = skip_if_none!(harness::gitlab(), "gitlab");
+    let raw = GlRaw::from_env().expect("gitlab raw");
+    harness::maybe_sweep(raw.sweep()).await;
+    let prefix = harness::run_prefix();
+
+    // Fixture: a throwaway branch carrying a long-running job, so the .gitlab-ci.yml never
+    // lands on the default branch (which would trigger CI on every later push/test).
+    let default_branch = raw.default_branch().await;
+    let branch = format!("{prefix}-cancel");
+    raw.create_branch(&branch, &default_branch).await;
+    raw.put_file(".gitlab-ci.yml", "job:\n  script:\n    - sleep 120\n", &branch, &format!("{prefix}: add ci")).await;
+    let pipeline_id = match raw.create_pipeline(&branch).await {
+        Ok(id) => id,
+        Err(e) => {
+            // GitLab.com can block CI on unvalidated accounts — treat that as a skip.
+            eprintln!("SKIP gitlab pipeline cancellation: CI can't run on this account ({e})");
+            raw.delete_branch(&branch).await;
+            return;
+        }
+    };
+    let id = pipeline_id.to_string();
+
+    let pipe = gl.conn.pipelines().expect("gitlab pipelines");
+    // Let GitLab register the new pipeline before requesting cancellation.
+    let _ = {
+        let pipe = &pipe;
+        let id = id.as_str();
+        harness::poll(harness::POLL_LIST, move || async move {
+            pipe.get_run(id)
+                .await
+                .ok()
+                .filter(|run| matches!(run.status, PipelineRunStatus::Queued | PipelineRunStatus::Running))
+        })
+        .await
+    };
+    pipe.cancel_run(&id).await.expect("cancel");
+
+    let cancelled = {
+        let pipe = &pipe;
+        let id = id.as_str();
+        harness::poll(harness::POLL_LIST, move || async move {
+            pipe.get_run(id).await.ok().filter(|run| matches!(run.status, PipelineRunStatus::Canceled))
+        })
+        .await
+    };
+    assert!(cancelled.is_some(), "the pipeline reads back as canceled after cancellation");
+
+    raw.delete_pipeline(pipeline_id).await;
+    raw.delete_branch(&branch).await;
+}
+
+#[tokio::test]
 async fn gitlab_lists_notifications() {
     let gl = skip_if_none!(harness::gitlab(), "gitlab");
     let notifs = gl.conn.notifications().expect("gitlab advertises notifications");

@@ -767,6 +767,14 @@ impl PipelineSource for AzurePipe {
         run.stages = self.0.read_stages(run_id).await;
         Ok(run)
     }
+    async fn cancel_run(&self, run_id: &str) -> Result<()> {
+        let url = format!("{}/{}/_apis/build/builds/{run_id}?{API}", self.0.base, self.0.project);
+        let resp = self.0.http.patch(&url).json(&json!({ "status": "cancelling" })).send().await.map_err(prov)?;
+        if !resp.status().is_success() {
+            return Err(Error::Provider(format!("PATCH {url} -> {}", resp.status())));
+        }
+        Ok(())
+    }
     async fn logs(&self, run_id: &str, job_id: Option<&str>) -> Result<String> {
         let url = format!("{}/{}/_apis/build/builds/{run_id}/timeline?{API}", self.0.base, self.0.project);
         let v = self.0.get_json(&url).await?;

@@ -150,6 +150,27 @@ async fn azure_work_item_lifecycle() {
     raw.delete_work_item(wid).await;
 }
 
+#[tokio::test]
+async fn azure_pipeline_cancel_lifecycle() {
+    let az = skip_if_none!(harness::azure(), "azure");
+    let raw = AzRaw::from_env().expect("azure raw");
+    let pipeline_id = skip_if_none!(harness::env("FORGETOP_IT_AZURE_PIPELINE_ID"), "azure pipeline");
+    let run_id = raw.queue_pipeline(&pipeline_id).await;
+
+    let pipe = az.conn.pipelines().expect("azure pipelines");
+    pipe.cancel_run(&run_id).await.expect("cancel");
+
+    let cancelled = {
+        let pipe = &pipe;
+        let run_id = run_id.as_str();
+        harness::poll(harness::POLL_GATE, move || async move {
+            pipe.get_run(run_id).await.ok().filter(|run| matches!(run.status, PipelineRunStatus::Canceled))
+        })
+        .await
+    };
+    assert!(cancelled.is_some(), "the run reads back as canceled");
+}
+
 /// Full tear-up/down of an Azure approval gate: create an environment + Approval
 /// check + a YAML pipeline that deploys to it, queue it, approve via the adapter,
 /// then delete everything. Needs agent capacity to *run* — but the approval pauses

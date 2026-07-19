@@ -113,6 +113,7 @@ fn router(state: AppState) -> Router {
         .route("/api/pipeline/logs", get(pipeline_logs))
         .route("/api/pipeline/approval", post(pipeline_approval))
         .route("/api/pipeline/trigger", post(pipeline_trigger))
+        .route("/api/pipeline/cancel", post(pipeline_cancel))
         .route("/api/notification/read", post(notification_read))
         .route("/api/providers", get(providers))
         .route("/api/connections", get(list_connections).post(save_connection))
@@ -311,6 +312,9 @@ async fn pipeline_approval(State(s): State<AppState>, Json(req): Json<actions::P
 }
 async fn pipeline_trigger(State(s): State<AppState>, Json(req): Json<actions::PipelineTriggerReq>) -> Response {
     action_response(actions::pipeline_trigger(&s.deps.sections, req).await)
+}
+async fn pipeline_cancel(State(s): State<AppState>, Json(req): Json<actions::PipelineCancelReq>) -> Response {
+    action_response(actions::pipeline_cancel(&s.deps.sections, req).await)
 }
 
 async fn notification_read(State(s): State<AppState>, Json(req): Json<actions::NotifReadReq>) -> Response {

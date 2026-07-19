@@ -432,6 +432,9 @@ impl PipelineSource for BitbucketPipe {
         let body = json!({ "target": { "type": "pipeline_ref_target", "ref_type": "branch", "ref_name": branch.unwrap_or("main") } });
         self.0.post_ok(&self.0.repo_path("/pipelines"), body).await
     }
+    async fn cancel_run(&self, run_id: &str) -> Result<()> {
+        self.0.post_ok(&self.0.repo_path(&format!("/pipelines/{}/stopPipeline", enc_uuid(run_id))), json!({})).await
+    }
 }
 
 pub struct BitbucketConnection {

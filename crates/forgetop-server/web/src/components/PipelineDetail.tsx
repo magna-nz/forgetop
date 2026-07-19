@@ -58,12 +58,10 @@ function PipelineDetailPanel({ pipeRef, onClose }: { pipeRef: PipeRef; onClose: 
   const meta = run ? pipeMeta(run.status) : null;
   const label = run ? run.name ?? (run.number != null ? `Run #${run.number}` : run.definition_id) : null;
 
-  const respond = (approvalId: string, decision: "Approve" | "Reject") =>
-    act(decision === "Approve" ? "Approved" : "Rejected", () =>
-      apiPost("/api/pipeline/approval", { conn: pipeRef.conn, run_id: pipeRef.runId, approval_id: approvalId, decision }),
-    );
   const retry = () =>
     act("Re-run triggered", () => apiPost("/api/pipeline/trigger", { conn: pipeRef.conn, definition_id: run!.definition_id }));
+  const cancel = () =>
+    act("Cancel requested", () => apiPost("/api/pipeline/cancel", { conn: pipeRef.conn, run_id: pipeRef.runId }));
 
   const header = (
     <>
@@ -100,12 +98,13 @@ function PipelineDetailPanel({ pipeRef, onClose }: { pipeRef: PipeRef; onClose: 
             </div>
           )}
 
-          {(data.approvals.length > 0 || run.status === "Failed") && (
+          {(data.approvals.length > 0 || run.status === "Failed" || run.status === "Running" || run.status === "Queued") && (
             <div className="flex flex-wrap items-center gap-2 rounded-lg px-3 py-2.5" style={{ background: "var(--card)", border: "1px solid var(--border)" }}>
               {data.approvals.map((g) => (
-                <Gate key={g.id} gate={g} busy={busy} onRespond={respond} />
+                <Gate key={g.id} gate={g} />
               ))}
               {run.status === "Failed" && <ActBtn label="↻ Re-run" color="var(--blue)" disabled={busy} onClick={retry} />}
+              {(run.status === "Running" || run.status === "Queued") && <ActBtn label="■ Cancel" color="var(--red)" disabled={busy} onClick={cancel} />}
             </div>
           )}
 
@@ -197,19 +196,11 @@ function Job({ job, pipeRef }: { job: PipelineJob; pipeRef: PipeRef }) {
 
 // ---- approval gate ----
 
-function Gate({ gate, busy, onRespond }: { gate: PipelineApproval; busy: boolean; onRespond: (id: string, decision: "Approve" | "Reject") => void }) {
+function Gate({ gate }: { gate: PipelineApproval }) {
+  // Approvals aren't available across all providers, so a pending gate is surfaced as info
+  // (matching the list's "Approval needed" badge) rather than an approve/reject action.
   return (
-    <div className="flex items-center gap-1.5">
-      <span className="text-xs" style={{ color: "var(--yellow)" }}>⏳ {gate.name}</span>
-      {gate.can_respond ? (
-        <>
-          <ActBtn label="Approve" color="var(--green)" disabled={busy} onClick={() => onRespond(gate.id, "Approve")} />
-          <ActBtn label="Reject" color="var(--red)" disabled={busy} onClick={() => onRespond(gate.id, "Reject")} />
-        </>
-      ) : (
-        <span className="text-xs" style={{ color: "var(--dim)" }}>(awaiting others)</span>
-      )}
-    </div>
+    <span className="text-xs" style={{ color: "var(--yellow)" }}>⏳ {gate.name} — approval needed</span>
   );
 }
 
