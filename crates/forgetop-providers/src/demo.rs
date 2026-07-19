@@ -311,7 +311,7 @@ fn run(id: &str, def: &str, num: i64, name: &str, title: &str, status: PipelineR
 }
 
 fn gitlab_pipeline_defs() -> Vec<PipelineDefinition> {
-    vec![PipelineDefinition { id: "gl-pipeline".into(), name: "pipeline".into(), path: Some(".gitlab-ci.yml".into()), url: None }]
+    vec![PipelineDefinition { id: "gl-pipeline".into(), name: "Integration Suite".into(), path: Some(".gitlab-ci.yml".into()), url: None }]
 }
 fn gitlab_runs() -> Vec<PipelineRun> {
     vec![
@@ -320,7 +320,7 @@ fn gitlab_runs() -> Vec<PipelineRun> {
     ]
 }
 fn bitbucket_pipeline_defs() -> Vec<PipelineDefinition> {
-    vec![PipelineDefinition { id: "bb-default".into(), name: "default".into(), path: Some("bitbucket-pipelines.yml".into()), url: None }]
+    vec![PipelineDefinition { id: "bb-default".into(), name: "Deploy to Staging".into(), path: Some("bitbucket-pipelines.yml".into()), url: None }]
 }
 fn bitbucket_runs() -> Vec<PipelineRun> {
     vec![

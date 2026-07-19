@@ -47,7 +47,9 @@ export function Pipelines() {
 function PipeCard({ row, index }: { row: PipeRow; index: number }) {
   const run = row.run;
   const meta = pipeMeta(run.status);
-  const label = run.name ?? (run.number != null ? `Run #${run.number}` : run.definition_id);
+  // Pipeline (definition) name first, then the run's own name/number.
+  const pipelineName = row.definition_name ?? run.definition_id;
+  const runName = run.name ?? (run.number != null ? `#${run.number}` : "");
   // A pending gate → a red "Approval needed" badge (like the PR Mergeable badge). Actions
   // (approve / re-run / cancel) live in the pane, not on the row.
   const needsApproval = row.approvals.length > 0;
@@ -66,12 +68,12 @@ function PipeCard({ row, index }: { row: PipeRow; index: number }) {
         className="flex-1 min-w-0 text-left flex items-center gap-2"
         style={{ cursor: "pointer" }}
       >
-        {/* Fixed-width leading columns so the run number, branch, commit and title line up
-            across rows regardless of how wide each status word is. */}
+        {/* Fixed-width status column so the pipeline name lines up across rows. */}
         <span className="shrink-0" style={{ width: 84 }}>
           <StatusBadge label={cap(meta.label)} color={meta.color} />
         </span>
-        <span className="font-medium shrink-0 truncate" style={{ width: 72, color: "var(--fg)" }}>{label}</span>
+        <span className="font-medium shrink-0" style={{ color: "var(--fg)" }}>{pipelineName}</span>
+        {runName && <span className="mono text-xs shrink-0" style={{ color: "var(--dim)" }}>{runName}</span>}
         {run.branch && (
           <span className="shrink-0">
             <Chip title="branch">⑂ {run.branch}</Chip>

@@ -158,6 +158,7 @@ export interface PipeRow {
   connection: string;
   provider: ProviderType;
   run: PipelineRun;
+  definition_name?: string | null;
   approvals: PipelineApproval[];
 }
 
