@@ -2,7 +2,7 @@ import { motion } from "framer-motion";
 import { usePipelines, useWriteAction } from "../api";
 import { pipeMeta, relativeTime, toTime } from "../format";
 import type { PipeRow } from "../types";
-import { Avatar, Chip, List, Pill, ProviderBadge, Skeleton, StateCard } from "./ui";
+import { Avatar, Chip, List, Skeleton, StateCard, StatusBadge } from "./ui";
 import { ErrorState } from "./ErrorState";
 import { useListView } from "./ControlBar";
 import { usePipelineOpener } from "./PipelineDetail";
@@ -61,7 +61,7 @@ function PipeCard({ row, index }: { row: PipeRow; index: number }) {
       initial={{ opacity: 0, y: 6 }}
       animate={{ opacity: 1, y: 0 }}
       transition={{ duration: 0.22, delay: Math.min(index * 0.02, 0.3), ease: "easeOut" }}
-      className="rounded-lg px-4 py-3"
+      className="rounded-lg px-3 py-2"
       style={{ background: "var(--card)", border: "1px solid var(--border)" }}
     >
       <div className="flex items-start gap-3">
@@ -71,13 +71,12 @@ function PipeCard({ row, index }: { row: PipeRow; index: number }) {
           style={{ cursor: "pointer" }}
         >
           <div className="flex items-center gap-2">
-            <Pill icon={meta.icon} label={meta.label} color={meta.color} spin={meta.running} />
+            <StatusBadge label={cap(meta.label)} color={meta.color} spin={meta.running} />
             <span className="truncate font-medium" style={{ color: "var(--fg)" }}>
               {label}
             </span>
           </div>
-          <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1.5">
-            <ProviderBadge provider={row.provider} connection={row.connection} />
+          <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1.5">
             {run.branch && <Chip title="branch">⑂ {run.branch}</Chip>}
             {run.commit_sha && <span className="mono text-xs" style={{ color: "var(--dim)" }}>{run.commit_sha.slice(0, 7)}</span>}
           </div>
@@ -108,6 +107,8 @@ function PipeCard({ row, index }: { row: PipeRow; index: number }) {
     </motion.div>
   );
 }
+
+const cap = (s: string): string => (s.length ? s[0].toUpperCase() + s.slice(1) : s);
 
 function ActBtn({ label, color, onClick, disabled }: { label: string; color: string; onClick: () => void; disabled?: boolean }) {
   return (
