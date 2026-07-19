@@ -35,7 +35,8 @@ export function TopBar({
   const [notificationsOpen, setNotificationsOpen] = useState(false);
   const notificationRef = useRef<HTMLDivElement>(null);
   const unread = notifications?.filter((r) => r.notification.unread).length ?? 0;
-  const orderedNotifications = [...(notifications ?? [])].sort((a, b) => toTime(a.notification.updated_at) - toTime(b.notification.updated_at));
+  // Newest first — the standard notification-bell order.
+  const orderedNotifications = [...(notifications ?? [])].sort((a, b) => toTime(b.notification.updated_at) - toTime(a.notification.updated_at));
 
   useEffect(() => {
     if (!notificationsOpen) return;
