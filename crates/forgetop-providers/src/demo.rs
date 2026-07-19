@@ -985,6 +985,10 @@ impl PipelineSource for DemoPipe {
         true
     }
     async fn pending_approvals(&self, run_id: &str) -> Result<Vec<PipelineApproval>> {
+        // A cancelled run no longer has a live gate.
+        if canceled_runs().lock().unwrap().contains(run_id) {
+            return Ok(Vec::new());
+        }
         // The running CI run (#501) waits on a production deployment gate you can act on.
         Ok(if run_id == "r501" {
             vec![PipelineApproval { id: "production".into(), name: "production".into(), can_respond: true }]

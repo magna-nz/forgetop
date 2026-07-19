@@ -220,20 +220,18 @@ async fn gitlab_pipeline_cancel_lifecycle() {
     harness::maybe_sweep(raw.sweep()).await;
     let prefix = harness::run_prefix();
 
-    // Fixture: a long-running job leaves time for the pipeline cancellation to reach GitLab.
+    // Fixture: a throwaway branch carrying a long-running job, so the .gitlab-ci.yml never
+    // lands on the default branch (which would trigger CI on every later push/test).
     let default_branch = raw.default_branch().await;
-    raw.put_file(
-        ".gitlab-ci.yml",
-        "job:\n  script:\n    - sleep 120\n",
-        &default_branch,
-        &format!("{prefix}: add ci"),
-    )
-    .await;
-    let pipeline_id = match raw.create_pipeline(&default_branch).await {
+    let branch = format!("{prefix}-cancel");
+    raw.create_branch(&branch, &default_branch).await;
+    raw.put_file(".gitlab-ci.yml", "job:\n  script:\n    - sleep 120\n", &branch, &format!("{prefix}: add ci")).await;
+    let pipeline_id = match raw.create_pipeline(&branch).await {
         Ok(id) => id,
         Err(e) => {
             // GitLab.com can block CI on unvalidated accounts — treat that as a skip.
             eprintln!("SKIP gitlab pipeline cancellation: CI can't run on this account ({e})");
+            raw.delete_branch(&branch).await;
             return;
         }
     };
@@ -265,7 +263,7 @@ async fn gitlab_pipeline_cancel_lifecycle() {
     assert!(cancelled.is_some(), "the pipeline reads back as canceled after cancellation");
 
     raw.delete_pipeline(pipeline_id).await;
-    // GlRaw has no delete-file helper, so the .gitlab-ci.yml fixture remains on the default branch.
+    raw.delete_branch(&branch).await;
 }
 
 #[tokio::test]
