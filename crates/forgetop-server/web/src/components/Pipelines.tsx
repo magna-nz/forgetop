@@ -66,15 +66,19 @@ function PipeCard({ row, index }: { row: PipeRow; index: number }) {
         className="flex-1 min-w-0 text-left flex items-center gap-2"
         style={{ cursor: "pointer" }}
       >
-        <StatusBadge label={cap(meta.label)} color={meta.color} />
-        <span className="font-medium shrink-0" style={{ color: "var(--fg)" }}>{label}</span>
+        {/* Fixed-width leading columns so the run number, branch, commit and title line up
+            across rows regardless of how wide each status word is. */}
+        <span className="shrink-0" style={{ width: 84 }}>
+          <StatusBadge label={cap(meta.label)} color={meta.color} />
+        </span>
+        <span className="font-medium shrink-0 truncate" style={{ width: 72, color: "var(--fg)" }}>{label}</span>
         {run.branch && (
           <span className="shrink-0">
             <Chip title="branch">⑂ {run.branch}</Chip>
           </span>
         )}
         {run.commit_sha && <span className="mono text-xs shrink-0" style={{ color: "var(--dim)" }}>{run.commit_sha.slice(0, 7)}</span>}
-        {run.title && <span className="truncate text-sm min-w-0" style={{ color: "var(--dim)" }}>{run.title}</span>}
+        {run.title && <span className="truncate text-sm italic min-w-0" style={{ color: "var(--dim)" }}>{run.title}</span>}
         {needsApproval && (
           <span className="shrink-0">
             <Pill icon="⏳" label="Approval needed" color="var(--red)" />
