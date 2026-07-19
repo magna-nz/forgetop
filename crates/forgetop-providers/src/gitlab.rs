@@ -669,6 +669,9 @@ impl PipelineSource for GitLabPipe {
         let url = self.0.project_path("/pipeline");
         self.0.post_json(&url, json!({ "ref": branch.unwrap_or("main") })).await
     }
+    async fn cancel_run(&self, run_id: &str) -> Result<()> {
+        self.0.post_json(&self.0.project_path(&format!("/pipelines/{run_id}/cancel")), json!({})).await
+    }
     fn supports_approvals(&self) -> bool {
         true
     }

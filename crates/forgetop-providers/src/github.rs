@@ -759,6 +759,10 @@ impl PipelineSource for GitHubPipe {
         let url = self.0.repo_path(&format!("/actions/workflows/{definition_id}/dispatches"));
         self.0.post_json(&url, json!({ "ref": branch.unwrap_or("main") })).await
     }
+    async fn cancel_run(&self, run_id: &str) -> Result<()> {
+        let url = self.0.repo_path(&format!("/actions/runs/{run_id}/cancel"));
+        self.0.post_json(&url, json!({})).await
+    }
     fn supports_approvals(&self) -> bool {
         true
     }
