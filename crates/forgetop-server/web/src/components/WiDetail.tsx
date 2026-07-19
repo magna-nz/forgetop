@@ -244,16 +244,20 @@ function AssigneePicker({ wiRef, assignee, busy, onPick }: { wiRef: WiRef; assig
       {open && (
         <div className="absolute left-0 mt-1 z-10 rounded-md py-1 min-w-48 max-h-64 overflow-auto shadow-lg" style={{ background: "var(--panel)", border: "1px solid var(--border)" }}>
           {loading && <div className="px-3 py-1.5" style={{ color: "var(--dim)" }}>Loading…</div>}
-          <button
-            disabled={busy}
-            onClick={() => pick(null)}
-            className="block w-full text-left px-3 py-1.5"
-            style={{ color: "var(--dim)" }}
-            onMouseEnter={(e) => (e.currentTarget.style.background = "var(--sel)")}
-            onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
-          >
-            Unassigned
-          </button>
+          {/* Only offer Unassign when there's actually an assignee — avoids a no-op clear
+              (and the Azure "remove an unset field" 400), mirroring how Move hides the current state. */}
+          {assignee && (
+            <button
+              disabled={busy}
+              onClick={() => pick(null)}
+              className="block w-full text-left px-3 py-1.5"
+              style={{ color: "var(--dim)" }}
+              onMouseEnter={(e) => (e.currentTarget.style.background = "var(--sel)")}
+              onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+            >
+              Unassign
+            </button>
+          )}
           {(users ?? []).map((u) => (
             <button
               key={u.id}

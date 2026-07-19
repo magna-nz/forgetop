@@ -66,13 +66,29 @@ describe("WiDetail", () => {
     );
 
     await userEvent.click(await screen.findByRole("button", { name: /Sam Rivera/ }));
-    await userEvent.click(await screen.findByRole("button", { name: "Unassigned" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Unassign" }));
 
     await waitFor(() =>
       expect(
         posts.some((p) => p.url.includes("/api/wi/assignee") && (p.body as { assignee_id?: string | null }).assignee_id == null),
       ).toBe(true),
     );
+  });
+
+  it("hides Unassign when the item is already unassigned", async () => {
+    const d = detail();
+    d.work_item.assignee = null;
+    mockFetch({ get: { "/api/wi/detail": d, "/api/wi/assignees": users } });
+    renderWithClient(
+      <WiDetailProvider>
+        <Opener conn="c" id="w1" />
+      </WiDetailProvider>,
+    );
+
+    // The trigger reads "Unassigned"; opening it must NOT offer an Unassign action.
+    await userEvent.click(await screen.findByRole("button", { name: /Unassigned/ }));
+    await screen.findByRole("button", { name: /Priya Nair/ }); // dropdown is open
+    expect(screen.queryByRole("button", { name: "Unassign" })).not.toBeInTheDocument();
   });
 
   it("edits the title, posting only the changed field to /api/wi/update", async () => {
