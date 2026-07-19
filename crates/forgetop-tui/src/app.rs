@@ -18,6 +18,9 @@ use crate::palette::{self, PaletteKind};
 use crate::theme::Theme;
 use crate::wizard::{provider_sections, section_label, Wizard, WizardOutcome};
 
+const DASHBOARD_OPEN_FAILURE_CONTEXT: &str = "action";
+const DASHBOARD_OPEN_FAILURE_MESSAGE: &str = "failed to open local dashboard in browser";
+
 /// The section index behind each tab position (0 = Pull Requests, 1 = Work Items, 2 = Pipelines).
 fn section_of(index: usize) -> Section {
     match index {
@@ -136,7 +139,8 @@ pub struct App {
     /// The cross-provider notification inbox (distinct from `notifications`, the desktop-ping prefs).
     pub inbox: Vec<NotifRow>,
     pub inbox_sel: usize,
-    /// URL of the embedded web dashboard, if its server started. `B` opens it.
+    /// URL of the embedded web dashboard, if its server started. `B` opens it and `F`
+    /// opens its feedback page.
     pub dashboard_url: Option<String>,
     pub pr_state: TableState,
     pub wi_state: TableState,
@@ -1428,17 +1432,39 @@ impl App {
         self.open_dashboard_at("");
     }
 
+    /// Open the dashboard's feedback page. The dashboard owns the form; the TUI only
+    /// provides a discoverable shortcut to the same experience.
+    fn open_feedback(&mut self) {
+        self.open_dashboard_at("#feedback");
+    }
+
     /// Open the dashboard at a specific view (e.g. `#settings` for connection management).
     fn open_dashboard_at(&mut self, hash: &str) {
-        self.toast = Some(match &self.dashboard_url {
-            Some(url) => {
-                let target = format!("{url}{hash}");
-                match open::that(&target) {
-                    Ok(_) => "Opening dashboard in your browser…".into(),
-                    Err(e) => format!("Couldn't open dashboard: {e}"),
-                }
+        self.open_dashboard_at_with(hash, |target| open::that(target), forgetop_core::diag::log);
+    }
+
+    /// Dashboard opener seam kept deliberately small: production delegates to the OS while
+    /// tests can assert the exact fragment and failure logging without launching a browser.
+    fn open_dashboard_at_with<E>(
+        &mut self,
+        hash: &str,
+        opener: impl FnOnce(&str) -> std::result::Result<(), E>,
+        log_failure: impl FnOnce(&str, &str),
+    ) where
+        E: std::fmt::Display,
+    {
+        let Some(url) = &self.dashboard_url else {
+            self.toast = Some("Web dashboard isn't running — start it with `forgetop --dashboard`".into());
+            return;
+        };
+        let target = dashboard_target(url, hash);
+        self.toast = Some(match opener(&target) {
+            Ok(()) => "Opening dashboard in your browser…".into(),
+            Err(error) => {
+                // Never log `target`: it contains the dashboard's per-session access token.
+                log_failure(DASHBOARD_OPEN_FAILURE_CONTEXT, DASHBOARD_OPEN_FAILURE_MESSAGE);
+                format!("Couldn't open dashboard: {error}")
             }
-            None => "Web dashboard isn't running — start it with `forgetop --dashboard`".into(),
         });
     }
 
@@ -1859,6 +1885,12 @@ impl App {
         // `B` opens the web dashboard in the browser (available from anywhere).
         if key == Key::Char('B') {
             self.open_dashboard();
+            return;
+        }
+        // `F` opens the dashboard feedback page (available from anywhere). Input-capturing
+        // modes above retain priority so an uppercase F can still be typed into them.
+        if key == Key::Char('F') {
+            self.open_feedback();
             return;
         }
 
@@ -3498,6 +3530,12 @@ fn wi_label(wi: &WorkItem) -> String {
     format!("{id}— {title}")
 }
 
+/// Builds a dashboard target without retaining a stale fragment from a previous route.
+fn dashboard_target(base: &str, hash: &str) -> String {
+    let base = base.split_once('#').map_or(base, |(before_hash, _)| before_hash);
+    format!("{base}{hash}")
+}
+
 /// Checklist items for binding a section: connections that support it, ticked if bound.
 fn section_bind_items(connections: &[Connection], section: Section, bound: &HashSet<String>) -> Vec<ToggleItem> {
     connections
@@ -4071,6 +4109,146 @@ fn feed_queries(sub: &forgetop_core::config::PipelineSubscription) -> Vec<Pipeli
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_deps() -> AppDeps {
+        use forgetop_core::config::InMemoryConfigStore;
+        use forgetop_core::secret::InMemorySecretStore;
+        use forgetop_core::service::ConnectionResolver;
+
+        let registry = Arc::new(ProviderRegistry::new(Vec::new()));
+        let secrets = Arc::new(InMemorySecretStore::default());
+        let config = Arc::new(ConfigService::new(
+            Arc::new(InMemoryConfigStore::default()),
+            secrets.clone(),
+            registry.clone(),
+        ));
+        let resolver = Arc::new(ConnectionResolver::new(config.clone(), registry, secrets));
+        AppDeps {
+            sections: Arc::new(SectionService::new(config.clone(), resolver.clone())),
+            health: Arc::new(ConnectionHealthService::new(config.clone(), resolver)),
+            config,
+        }
+    }
+
+    #[test]
+    fn dashboard_target_replaces_an_existing_fragment_and_preserves_the_query() {
+        let base = "http://127.0.0.1:8177/?t=session-secret#settings";
+        assert_eq!(
+            dashboard_target(base, "#feedback"),
+            "http://127.0.0.1:8177/?t=session-secret#feedback"
+        );
+    }
+
+    #[test]
+    fn feedback_dashboard_dispatch_uses_the_feedback_fragment() {
+        let mut app = App::new("slate");
+        app.dashboard_url = Some("http://127.0.0.1:8177/?t=session-secret".into());
+        let mut opened = None;
+        app.open_dashboard_at_with(
+            "#feedback",
+            |target| {
+                opened = Some(target.to_owned());
+                Ok::<(), std::io::Error>(())
+            },
+            |_, _| {},
+        );
+
+        assert_eq!(
+            opened.as_deref(),
+            Some("http://127.0.0.1:8177/?t=session-secret#feedback")
+        );
+        assert_eq!(
+            app.toast.as_deref(),
+            Some("Opening dashboard in your browser…")
+        );
+    }
+
+    #[test]
+    fn dashboard_open_failure_logs_only_safe_constant_context() {
+        let mut app = App::new("slate");
+        app.dashboard_url = Some("http://127.0.0.1:8177/?t=session-secret".into());
+        let mut logged = None;
+        app.open_dashboard_at_with(
+            "#feedback",
+            |_| Err(std::io::Error::other("browser unavailable")),
+            |context, message| logged = Some((context.to_owned(), message.to_owned())),
+        );
+
+        assert_eq!(
+            logged,
+            Some((
+                DASHBOARD_OPEN_FAILURE_CONTEXT.to_owned(),
+                DASHBOARD_OPEN_FAILURE_MESSAGE.to_owned()
+            ))
+        );
+        let (context, message) = logged.unwrap();
+        assert!(!context.contains("session-secret"));
+        assert!(!message.contains("session-secret"));
+        assert_eq!(
+            app.toast.as_deref(),
+            Some("Couldn't open dashboard: browser unavailable")
+        );
+    }
+
+    #[tokio::test]
+    async fn uppercase_f_dispatches_feedback_but_input_contexts_keep_the_key() {
+        let deps = test_deps();
+
+        let mut global = App::new("slate");
+        global.on_key(Key::Char('F'), &deps).await;
+        assert_eq!(
+            global.toast.as_deref(),
+            Some("Web dashboard isn't running — start it with `forgetop --dashboard`")
+        );
+
+        let mut lowercase = App::new("slate");
+        lowercase.screen = Screen::List;
+        lowercase.active = 0;
+        lowercase.on_key(Key::Char('f'), &deps).await;
+        assert!(
+            matches!(
+                lowercase.overlay,
+                Some(Overlay::Toggle {
+                    kind: ToggleKind::PrStatuses,
+                    ..
+                })
+            ),
+            "lowercase f keeps the existing status-filter binding"
+        );
+
+        let mut input = App::new("slate");
+        input.dashboard_url = Some("http://127.0.0.1:8177/?t=session-secret".into());
+        input.overlay = Some(Overlay::Input {
+            title: "Comment".into(),
+            buffer: String::new(),
+            kind: InputKind::PrComment,
+        });
+        input.on_key(Key::Char('F'), &deps).await;
+        let Some(Overlay::Input { buffer, .. }) = &input.overlay else {
+            panic!("input overlay should remain open");
+        };
+        assert_eq!(buffer, "F", "the input receives F instead of opening a browser");
+
+        let mut palette = App::new("slate");
+        palette.dashboard_url = Some("http://127.0.0.1:8177/?t=session-secret".into());
+        palette.overlay = Some(Overlay::Palette {
+            query: String::new(),
+            candidates: Vec::new(),
+            results: Vec::new(),
+            selected: 0,
+        });
+        palette.on_key(Key::Char('F'), &deps).await;
+        let Some(Overlay::Palette { query, .. }) = &palette.overlay else {
+            panic!("palette should remain open");
+        };
+        assert_eq!(query, "F", "the palette receives F instead of opening a browser");
+
+        let mut filter = App::new("slate");
+        filter.dashboard_url = Some("http://127.0.0.1:8177/?t=session-secret".into());
+        filter.filtering = true;
+        filter.on_key(Key::Char('F'), &deps).await;
+        assert_eq!(filter.active_filter(), "F", "the quick filter receives F");
+    }
 
     fn pr(url: Option<&str>) -> PullRequest {
         PullRequest {

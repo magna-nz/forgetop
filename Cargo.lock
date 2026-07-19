@@ -741,6 +741,7 @@ dependencies = [
 name = "forgetop-server"
 version = "0.9.3"
 dependencies = [
+ "async-trait",
  "axum",
  "forgetop-core",
  "forgetop-providers",

@@ -112,6 +112,9 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       BUILD_MANIFEST_NAME: target/distrib/${{ join(matrix.targets, '-') }}-dist-manifest.json
+      # Embedded into official binaries as an ingestion-only client DSN. The project
+      # account remains private and no read/admin credential is shipped.
+      FORGETOP_FEEDBACK_DSN: ${{ secrets.FORGETOP_FEEDBACK_DSN }}
     steps:
       - name: enable windows longpaths
         run: |

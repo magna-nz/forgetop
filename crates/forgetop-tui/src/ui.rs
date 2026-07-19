@@ -1073,13 +1073,14 @@ fn render_health(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 /// Context-aware key glossary for the active tab (azdo-style bar along the bottom). Appends the
-/// web-dashboard hint on every screen where `B` actually opens it — i.e. everywhere except while
-/// the wizard, an overlay, or the quick-filter is capturing input — so people discover it exists.
+/// dashboard shortcuts on every screen where `B` and `F` actually open them — i.e. everywhere
+/// except while the wizard, an overlay, or the quick-filter is capturing input.
 fn footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
     let mut keys = base_footer_keys(app);
     // Prepend (not append) so it survives the footer being clipped on narrow terminals — the
-    // whole point is that people always see the dashboard exists.
+    // whole point is that people always see the dashboard and feedback entry points exist.
     if app.dashboard_url.is_some() && app.wizard.is_none() && app.overlay.is_none() && !app.filtering {
+        keys.insert(0, ("F", "feedback"));
         keys.insert(0, ("B", "browser dashboard"));
     }
     keys
@@ -2005,6 +2006,7 @@ fn help_sections() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
                 ("Ctrl-P", "Jump to any item (command palette)"),
                 ("i", "Notification inbox (mentions, reviews, CI, assignments)"),
                 ("B", "Open the web dashboard in your browser"),
+                ("F", "Give feedback in the web dashboard"),
                 ("/", "Quick-filter the list"),
                 ("S", "Sort by column (re-pick flips direction)"),
                 ("o", "Open selected in browser"),
@@ -2757,10 +2759,24 @@ mod tests {
         app.screen = Screen::List;
         // No dashboard running → no hint.
         assert!(!render_to_string(&mut app, 120, 24).contains("browser dashboard"));
+        assert!(!render_to_string(&mut app, 120, 24).contains("feedback"));
         // Dashboard running → the hint shows so TUI users discover it.
         app.dashboard_url = Some("http://127.0.0.1:8177/?t=x".into());
         let out = render_to_string(&mut app, 120, 24);
         assert!(out.contains("browser dashboard") && out.contains("B"), "footer advertises the dashboard");
+        assert!(out.contains("feedback") && out.contains("F"), "footer advertises feedback");
+    }
+
+    #[test]
+    fn footer_hides_dashboard_shortcuts_while_input_is_captured() {
+        let mut app = App::new("slate");
+        app.screen = Screen::List;
+        app.dashboard_url = Some("http://127.0.0.1:8177/?t=x".into());
+        app.filtering = true;
+
+        let out = render_to_string(&mut app, 120, 24);
+        assert!(!out.contains("browser dashboard"));
+        assert!(!out.contains("feedback"));
     }
 
     #[test]

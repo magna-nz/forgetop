@@ -16,13 +16,17 @@ use axum::Router;
 use forgetop_core::secret::SecretStore;
 use forgetop_core::service::{ConfigService, ConnectionHealthService, SectionService};
 use rust_embed::RustEmbed;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::actions::ActionError;
+use crate::feedback::SentryFeedbackSink;
 
 mod actions;
 mod connections;
 mod dto;
+mod feedback;
+
+pub use feedback::{FeedbackCategory, FeedbackReport, FeedbackSink};
 
 /// The built dashboard SPA, baked into the binary at compile time (see `build.rs`).
 #[derive(RustEmbed)]
@@ -54,14 +58,23 @@ pub struct Server {
 struct AppState {
     deps: Deps,
     token: Arc<str>,
+    feedback: Arc<dyn FeedbackSink>,
 }
 
 async fn bind(deps: Deps, port: u16) -> std::io::Result<(tokio::net::TcpListener, Server, AppState)> {
+    bind_with_feedback_sink(deps, port, Arc::new(SentryFeedbackSink::from_environment())).await
+}
+
+async fn bind_with_feedback_sink(
+    deps: Deps,
+    port: u16,
+    feedback: Arc<dyn FeedbackSink>,
+) -> std::io::Result<(tokio::net::TcpListener, Server, AppState)> {
     let token = uuid::Uuid::new_v4().to_string();
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await?;
     let bound = listener.local_addr()?.port();
     let url = format!("http://127.0.0.1:{bound}/?t={token}");
-    let state = AppState { deps, token: Arc::from(token.as_str()) };
+    let state = AppState { deps, token: Arc::from(token.as_str()), feedback };
     Ok((listener, Server { port: bound, token, url }, state))
 }
 
@@ -69,6 +82,20 @@ async fn bind(deps: Deps, port: u16) -> std::io::Result<(tokio::net::TcpListener
 /// **Best-effort:** an `Err` just means "no dashboard" — the TUI should carry on regardless.
 pub async fn spawn(deps: Deps, port: u16) -> std::io::Result<Server> {
     let (listener, server, state) = bind(deps, port).await?;
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router(state)).await;
+    });
+    Ok(server)
+}
+
+/// Spawn with an explicit feedback destination. This keeps delivery injectable for API tests
+/// and for embedders that want to provide a private sink other than Sentry.
+pub async fn spawn_with_feedback_sink(
+    deps: Deps,
+    port: u16,
+    feedback: Arc<dyn FeedbackSink>,
+) -> std::io::Result<Server> {
+    let (listener, server, state) = bind_with_feedback_sink(deps, port, feedback).await?;
     tokio::spawn(async move {
         let _ = axum::serve(listener, router(state)).await;
     });
@@ -121,6 +148,9 @@ fn router(state: AppState) -> Router {
         .route("/api/connections/test", post(test_connection))
         .route("/api/preferences", get(get_preferences))
         .route("/api/preferences/startup", post(set_startup_mode))
+        .route("/api/feedback/status", get(feedback_status))
+        .route("/api/feedback/diagnostics", get(feedback_diagnostics))
+        .route("/api/feedback", post(submit_feedback))
         .layer(middleware::from_fn_with_state(state.clone(), auth))
         .with_state(state);
 
@@ -222,11 +252,14 @@ struct PipelineLogsQuery {
 
 /// Turns an action outcome into a response: `{ok:true}`, 404 (no such connection/capability),
 /// or 502 (the provider call failed).
-fn action_response(result: Result<(), ActionError>) -> Response {
+fn action_response(operation: &'static str, result: Result<(), ActionError>) -> Response {
     match result {
         Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
         Err(ActionError::NotFound) => (StatusCode::NOT_FOUND, "connection or capability not found").into_response(),
-        Err(ActionError::Failed(msg)) => (StatusCode::BAD_GATEWAY, msg).into_response(),
+        Err(ActionError::Failed(msg)) => {
+            forgetop_core::diag::log(operation, "provider action failed");
+            (StatusCode::BAD_GATEWAY, msg).into_response()
+        }
     }
 }
 
@@ -245,22 +278,22 @@ async fn pr_detail(State(s): State<AppState>, Query(q): Query<ItemQuery>) -> Res
 }
 
 async fn pr_vote(State(s): State<AppState>, Json(req): Json<actions::PrVoteReq>) -> Response {
-    action_response(actions::pr_vote(&s.deps.sections, req).await)
+    action_response("dashboard.pr_vote", actions::pr_vote(&s.deps.sections, req).await)
 }
 async fn pr_merge(State(s): State<AppState>, Json(req): Json<actions::PrMergeReq>) -> Response {
-    action_response(actions::pr_merge(&s.deps.sections, req).await)
+    action_response("dashboard.pr_merge", actions::pr_merge(&s.deps.sections, req).await)
 }
 async fn pr_revert(State(s): State<AppState>, Json(req): Json<actions::PrRevertReq>) -> Response {
-    action_response(actions::pr_revert(&s.deps.sections, req).await)
+    action_response("dashboard.pr_revert", actions::pr_revert(&s.deps.sections, req).await)
 }
 async fn pr_comment(State(s): State<AppState>, Json(req): Json<actions::PrCommentReq>) -> Response {
-    action_response(actions::pr_comment(&s.deps.sections, req).await)
+    action_response("dashboard.pr_comment", actions::pr_comment(&s.deps.sections, req).await)
 }
 async fn pr_reply(State(s): State<AppState>, Json(req): Json<actions::PrReplyReq>) -> Response {
-    action_response(actions::pr_reply(&s.deps.sections, req).await)
+    action_response("dashboard.pr_reply", actions::pr_reply(&s.deps.sections, req).await)
 }
 async fn pr_review(State(s): State<AppState>, Json(req): Json<actions::PrReviewReq>) -> Response {
-    action_response(actions::pr_review(&s.deps.sections, req).await)
+    action_response("dashboard.pr_review", actions::pr_review(&s.deps.sections, req).await)
 }
 
 async fn wi_detail(State(s): State<AppState>, Query(q): Query<ItemQuery>) -> Response {
@@ -276,10 +309,10 @@ async fn wi_states(State(s): State<AppState>, Query(q): Query<ItemQuery>) -> Res
     }
 }
 async fn wi_state(State(s): State<AppState>, Json(req): Json<actions::WiStateReq>) -> Response {
-    action_response(actions::wi_set_state(&s.deps.sections, req).await)
+    action_response("dashboard.wi_state", actions::wi_set_state(&s.deps.sections, req).await)
 }
 async fn wi_comment(State(s): State<AppState>, Json(req): Json<actions::WiCommentReq>) -> Response {
-    action_response(actions::wi_comment(&s.deps.sections, req).await)
+    action_response("dashboard.wi_comment", actions::wi_comment(&s.deps.sections, req).await)
 }
 async fn wi_assignees(State(s): State<AppState>, Query(q): Query<ItemQuery>) -> Response {
     match actions::wi_assignees(&s.deps.sections, &q.conn, &q.id).await {
@@ -288,10 +321,10 @@ async fn wi_assignees(State(s): State<AppState>, Query(q): Query<ItemQuery>) -> 
     }
 }
 async fn wi_assignee(State(s): State<AppState>, Json(req): Json<actions::WiAssigneeReq>) -> Response {
-    action_response(actions::wi_set_assignee(&s.deps.sections, req).await)
+    action_response("dashboard.wi_assignee", actions::wi_set_assignee(&s.deps.sections, req).await)
 }
 async fn wi_update(State(s): State<AppState>, Json(req): Json<actions::WiUpdateReq>) -> Response {
-    action_response(actions::wi_update(&s.deps.sections, req).await)
+    action_response("dashboard.wi_update", actions::wi_update(&s.deps.sections, req).await)
 }
 
 async fn pipeline_detail(State(s): State<AppState>, Query(q): Query<RunQuery>) -> Response {
@@ -308,17 +341,17 @@ async fn pipeline_logs(State(s): State<AppState>, Query(q): Query<PipelineLogsQu
 }
 
 async fn pipeline_approval(State(s): State<AppState>, Json(req): Json<actions::PipelineApprovalReq>) -> Response {
-    action_response(actions::pipeline_approval(&s.deps.sections, req).await)
+    action_response("dashboard.pipeline_approval", actions::pipeline_approval(&s.deps.sections, req).await)
 }
 async fn pipeline_trigger(State(s): State<AppState>, Json(req): Json<actions::PipelineTriggerReq>) -> Response {
-    action_response(actions::pipeline_trigger(&s.deps.sections, req).await)
+    action_response("dashboard.pipeline_trigger", actions::pipeline_trigger(&s.deps.sections, req).await)
 }
 async fn pipeline_cancel(State(s): State<AppState>, Json(req): Json<actions::PipelineCancelReq>) -> Response {
-    action_response(actions::pipeline_cancel(&s.deps.sections, req).await)
+    action_response("dashboard.pipeline_cancel", actions::pipeline_cancel(&s.deps.sections, req).await)
 }
 
 async fn notification_read(State(s): State<AppState>, Json(req): Json<actions::NotifReadReq>) -> Response {
-    action_response(actions::notif_read(&s.deps.sections, req).await)
+    action_response("dashboard.notification_read", actions::notif_read(&s.deps.sections, req).await)
 }
 
 // ---- connection management ----
@@ -366,5 +399,118 @@ async fn set_startup_mode(State(s): State<AppState>, Json(req): Json<StartupMode
     match s.deps.config.set_startup_mode(req.mode).await {
         Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
+    }
+}
+
+// ---- feedback ----
+
+#[derive(Serialize)]
+struct FeedbackDiagnosticsStatus {
+    size_bytes: u64,
+    oldest_at: Option<String>,
+    newest_at: Option<String>,
+}
+
+#[derive(Serialize)]
+struct FeedbackStatus {
+    configured: bool,
+    diagnostics: FeedbackDiagnosticsStatus,
+}
+
+#[derive(Deserialize)]
+struct FeedbackRequest {
+    category: FeedbackCategory,
+    summary: String,
+    details: String,
+    #[serde(default)]
+    contact: Option<String>,
+    attach_diagnostics: bool,
+}
+
+async fn feedback_status(State(s): State<AppState>) -> Response {
+    match forgetop_core::diag::snapshot() {
+        Ok(snapshot) => Json(FeedbackStatus {
+            configured: s.feedback.configured(),
+            diagnostics: FeedbackDiagnosticsStatus {
+                size_bytes: snapshot.size_bytes,
+                oldest_at: snapshot.oldest_at.map(|value| value.to_rfc3339()),
+                newest_at: snapshot.newest_at.map(|value| value.to_rfc3339()),
+            },
+        })
+        .into_response(),
+        Err(_) => {
+            forgetop_core::diag::log("dashboard.feedback_status", "could not read diagnostics");
+            (StatusCode::INTERNAL_SERVER_ERROR, "diagnostics are unavailable").into_response()
+        }
+    }
+}
+
+async fn feedback_diagnostics() -> Response {
+    match forgetop_core::diag::snapshot() {
+        Ok(snapshot) => (
+            [
+                (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+                (header::CONTENT_DISPOSITION, "attachment; filename=\"forgetop-diagnostics.log\""),
+                (header::CACHE_CONTROL, "no-store"),
+            ],
+            snapshot.bytes,
+        )
+            .into_response(),
+        Err(_) => {
+            forgetop_core::diag::log("dashboard.feedback_diagnostics", "could not read diagnostics");
+            (StatusCode::INTERNAL_SERVER_ERROR, "diagnostics are unavailable").into_response()
+        }
+    }
+}
+
+async fn submit_feedback(State(s): State<AppState>, Json(req): Json<FeedbackRequest>) -> Response {
+    if !s.feedback.configured() {
+        return (StatusCode::SERVICE_UNAVAILABLE, "feedback delivery is not configured").into_response();
+    }
+
+    let summary = req.summary.trim();
+    if summary.is_empty() || summary.chars().count() > 120 {
+        return (StatusCode::UNPROCESSABLE_ENTITY, "summary must be between 1 and 120 characters").into_response();
+    }
+    let details = req.details.trim();
+    if details.is_empty() || details.chars().count() > 10_000 {
+        return (StatusCode::UNPROCESSABLE_ENTITY, "details must be between 1 and 10000 characters").into_response();
+    }
+    let contact = req.contact.as_deref().map(str::trim).filter(|value| !value.is_empty());
+    if contact.is_some_and(|value| value.chars().count() > 320) {
+        return (StatusCode::UNPROCESSABLE_ENTITY, "contact must be at most 320 characters").into_response();
+    }
+
+    let diagnostics = if req.attach_diagnostics {
+        match forgetop_core::diag::snapshot() {
+            Ok(snapshot) => Some(snapshot),
+            Err(_) => {
+                forgetop_core::diag::log("dashboard.feedback_submit", "could not read diagnostics");
+                return (StatusCode::INTERNAL_SERVER_ERROR, "diagnostics are unavailable").into_response();
+            }
+        }
+    } else {
+        None
+    };
+    let reference_id = uuid::Uuid::new_v4().to_string();
+    let report = FeedbackReport {
+        reference_id: reference_id.clone(),
+        category: req.category,
+        summary: summary.to_owned(),
+        details: details.to_owned(),
+        contact: contact.map(str::to_owned),
+        version: env!("CARGO_PKG_VERSION"),
+        os: std::env::consts::OS,
+        arch: std::env::consts::ARCH,
+        diagnostics,
+    };
+    match s.feedback.submit(&report).await {
+        Ok(()) => Json(serde_json::json!({ "reference_id": reference_id })).into_response(),
+        Err(_) => {
+            // Never include the report or destination error here: either could contain user text
+            // or endpoint details. The constant is enough to identify the failed operation.
+            forgetop_core::diag::log("dashboard.feedback_submit", "delivery failed");
+            (StatusCode::BAD_GATEWAY, "feedback delivery failed").into_response()
+        }
     }
 }

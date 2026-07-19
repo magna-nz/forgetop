@@ -349,4 +349,29 @@ export interface Preferences {
   startup_mode: StartupMode;
 }
 
-export type SectionId = "launchpad" | "prs" | "work-items" | "pipelines" | "notifications" | "settings";
+export interface FeedbackDiagnostics {
+  size_bytes: number;
+  oldest_at: string | null;
+  newest_at: string | null;
+}
+
+export interface FeedbackStatus {
+  configured: boolean;
+  diagnostics: FeedbackDiagnostics;
+}
+
+export type FeedbackCategory = "bug" | "idea" | "other";
+
+export interface FeedbackRequest {
+  category: FeedbackCategory;
+  summary: string;
+  details: string;
+  contact?: string | null;
+  attach_diagnostics: boolean;
+}
+
+export interface FeedbackResponse {
+  reference_id: string;
+}
+
+export type SectionId = "launchpad" | "prs" | "work-items" | "pipelines" | "notifications" | "settings" | "feedback";

@@ -104,7 +104,21 @@ export function Sidebar({
           />
           {total === 0 ? "No connections" : `${healthy}/${total} connections healthy`}
         </div>
-        <div className="mt-1.5 flex items-center justify-between">
+        <button
+          type="button"
+          onClick={() => onSelect("feedback")}
+          aria-current={section === "feedback" ? "page" : undefined}
+          className="mt-3 flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-left text-xs font-medium transition-colors"
+          style={{
+            color: section === "feedback" ? "var(--fg)" : "var(--dim)",
+            background: section === "feedback" ? "var(--sel)" : "var(--panel2)",
+            border: `1px solid ${section === "feedback" ? "var(--accent)" : "var(--border)"}`,
+          }}
+        >
+          <span aria-hidden="true" style={{ color: "var(--accent)" }}>◇</span>
+          <span>Give Feedback</span>
+        </button>
+        <div className="mt-2 flex items-center justify-between">
           <span className="opacity-70">Live · every 15s</span>
           <button
             onClick={cycleTheme}

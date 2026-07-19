@@ -13,6 +13,7 @@ import { WorkItems } from "./components/WorkItems";
 import { Pipelines } from "./components/Pipelines";
 import { Notifications } from "./components/Notifications";
 import { Settings } from "./components/Settings";
+import { Feedback } from "./components/Feedback";
 import { NavContext } from "./nav";
 import type { SectionId } from "./types";
 
@@ -23,13 +24,17 @@ const VIEWS: Record<SectionId, ComponentType> = {
   pipelines: Pipelines,
   notifications: Notifications,
   settings: Settings,
+  feedback: Feedback,
 };
 
-const SECTIONS: SectionId[] = ["launchpad", "prs", "work-items", "pipelines", "notifications", "settings"];
-const sectionFromHash = (): SectionId | undefined => {
+const SECTIONS: SectionId[] = ["launchpad", "prs", "work-items", "pipelines", "notifications", "settings", "feedback"];
+export const sectionFromHash = (): SectionId | undefined => {
   const h = window.location.hash.replace(/^#/, "");
   return SECTIONS.find((s) => s === h);
 };
+
+export const shouldShowFirstRun = (section: SectionId, connectionCount: number | undefined, skipped: boolean) =>
+  connectionCount === 0 && !skipped && section !== "feedback";
 
 export default function App() {
   // The TUI deep-links here (e.g. `#settings` when you press C), so honour the hash on load.
@@ -43,7 +48,7 @@ export default function App() {
   const View = VIEWS[section];
 
   // First launch with nothing configured → the setup wizard, like the TUI.
-  const firstRun = connections.data?.length === 0 && !skippedFirstRun;
+  const firstRun = shouldShowFirstRun(section, connections.data?.length, skippedFirstRun);
 
   // Cmd/Ctrl-K toggles the command palette from anywhere.
   useEffect(() => {
