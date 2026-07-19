@@ -25,6 +25,7 @@ export function WorkItems() {
       { label: "Not started", match: (r) => ["Unstarted", "Backlog", "Triage"].includes(r.work_item.state_category) },
     ],
     statusLabel: "Show",
+    facet: { label: "Type", value: (r) => r.work_item.work_item_type },
   });
 
   if (isLoading) return <Skeleton />;

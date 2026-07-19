@@ -5,6 +5,7 @@ export interface ListControls {
   sort: number;
   conn: string; // "" = all connections
   status: string; // "" = all statuses
+  facet: string; // "" = all (data-derived facet, e.g. work-item type)
 }
 
 function usePref(key: string, defaultStatus = ""): [ListControls, (patch: Partial<ListControls>) => void] {
@@ -12,11 +13,11 @@ function usePref(key: string, defaultStatus = ""): [ListControls, (patch: Partia
   const [state, setState] = useState<ListControls>(() => {
     try {
       const s = localStorage.getItem(storageKey);
-      if (s) return { sort: 0, conn: "", status: defaultStatus, ...JSON.parse(s) };
+      if (s) return { sort: 0, conn: "", status: defaultStatus, facet: "", ...JSON.parse(s) };
     } catch {
       /* ignore */
     }
-    return { sort: 0, conn: "", status: defaultStatus };
+    return { sort: 0, conn: "", status: defaultStatus, facet: "" };
   });
   const patch = (p: Partial<ListControls>) =>
     setState((prev) => {
@@ -49,6 +50,9 @@ export function useListView<T>(opts: {
   statusLabel?: string;
   /** Index into `statuses` to select on first visit (before the user picks). Defaults to "All". */
   defaultStatus?: number;
+  /** A dropdown whose options are the distinct values present in the rows (e.g. work-item type).
+   *  Only rendered when 2+ distinct values exist, so it reflects what's actually in the list. */
+  facet?: { label: string; value: (r: T) => string | null | undefined };
 }): { rows: T[]; bar: React.ReactNode; total: number } {
   const [ctl, patch] = usePref(opts.storageKey, opts.defaultStatus != null ? String(opts.defaultStatus) : "");
   const all = opts.rows ?? [];
@@ -60,6 +64,17 @@ export function useListView<T>(opts: {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [all]);
 
+  const facetValues = useMemo(() => {
+    if (!opts.facet) return [];
+    const seen = new Set<string>();
+    all.forEach((r) => {
+      const v = opts.facet!.value(r);
+      if (v) seen.add(v);
+    });
+    return [...seen].sort((a, b) => a.localeCompare(b));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [all]);
+
   const sortIdx = Math.min(ctl.sort, opts.sorts.length - 1);
   const statusIdx = ctl.status === "" ? -1 : Number(ctl.status);
 
@@ -67,11 +82,12 @@ export function useListView<T>(opts: {
     let rows = all;
     if (ctl.conn) rows = rows.filter((r) => opts.connId(r) === ctl.conn);
     if (opts.statuses && statusIdx >= 0 && opts.statuses[statusIdx]) rows = rows.filter(opts.statuses![statusIdx].match);
+    if (opts.facet && ctl.facet) rows = rows.filter((r) => opts.facet!.value(r) === ctl.facet);
     const cmp = opts.sorts[sortIdx]?.cmp;
     if (cmp) rows = [...rows].sort(cmp);
     return rows;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [all, ctl.conn, statusIdx, sortIdx]);
+  }, [all, ctl.conn, statusIdx, ctl.facet, sortIdx]);
 
   const bar = (
     <div className="flex flex-wrap items-center gap-2 px-5 pt-4 max-w-5xl mx-auto">
@@ -93,6 +109,14 @@ export function useListView<T>(opts: {
           <option value="">All</option>
           {opts.statuses.map((s, i) => (
             <option key={i} value={i}>{s.label}</option>
+          ))}
+        </Select>
+      )}
+      {opts.facet && facetValues.length > 1 && (
+        <Select value={ctl.facet} onChange={(v) => patch({ facet: v })} label={opts.facet.label}>
+          <option value="">All</option>
+          {facetValues.map((v) => (
+            <option key={v} value={v}>{v}</option>
           ))}
         </Select>
       )}
