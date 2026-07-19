@@ -2,7 +2,7 @@ import { useState } from "react";
 import { usePullRequests, type PrView } from "../api";
 import { checkMeta, prStatusMeta, relativeTime, toTime, voteMeta } from "../format";
 import type { PrRow } from "../types";
-import { Avatar, Chip, List, Pill, ProviderBadge, Row, Skeleton, StateCard } from "./ui";
+import { Avatar, Chip, List, Pill, Row, Skeleton, StateCard, StatusBadge } from "./ui";
 import { ErrorState } from "./ErrorState";
 import { usePrOpener } from "./PrDetail";
 import { useListView } from "./ControlBar";
@@ -109,17 +109,16 @@ function PrCard({ row, index }: { row: PrRow; index: number }) {
   const checks = checkMeta(pr.checks);
   const open = usePrOpener();
   return (
-    <Row index={index} onClick={() => open({ conn: row.connection_id, id: pr.id })}>
+    <Row index={index} dense onClick={() => open({ conn: row.connection_id, id: pr.id })}>
       <div className="flex items-start gap-3">
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2">
-            <Pill icon={status.icon} label={status.label} color={status.color} />
+            <StatusBadge label={cap(status.label)} color={status.color} />
             <span className="truncate font-medium" style={{ color: "var(--fg)" }}>
               {pr.title}
             </span>
           </div>
-          <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1.5">
-            <ProviderBadge provider={row.provider} connection={row.connection} />
+          <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1.5">
             {pr.number != null && <span className="mono text-xs" style={{ color: "var(--dim)" }}>#{pr.number}</span>}
             {pr.source_ref && (
               <Chip title="source → target">
@@ -168,3 +167,5 @@ function shortRef(ref?: string | null): string {
   if (!ref) return "";
   return ref.replace(/^refs\/heads\//, "");
 }
+
+const cap = (s: string): string => (s.length ? s[0].toUpperCase() + s.slice(1) : s);
