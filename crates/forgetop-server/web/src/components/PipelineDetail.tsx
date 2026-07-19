@@ -134,10 +134,13 @@ function PipelineDetailPanel({ pipeRef, onClose }: { pipeRef: PipeRef; onClose: 
             {run.stages.length > 1 && (
               <>
                 <StageFlow stages={run.stages} selected={selectedStage ?? run.stages[0].name} onSelect={setSelectedStage} />
-                <div className="rounded-lg overflow-hidden" style={{ border: "1px solid var(--border)" }}>
-                  {(run.stages.find((stage) => stage.name === (selectedStage ?? run.stages[0].name)) ?? run.stages[0]).jobs.map((job) => (
-                    <Job key={job.id} job={job} pipeRef={pipeRef} />
-                  ))}
+                <div>
+                  <SectionLabel>Plan Steps</SectionLabel>
+                  <div className="rounded-lg overflow-hidden" style={{ border: "1px solid var(--border)" }}>
+                    {(run.stages.find((stage) => stage.name === (selectedStage ?? run.stages[0].name)) ?? run.stages[0]).jobs.map((job) => (
+                      <Job key={job.id} job={job} pipeRef={pipeRef} />
+                    ))}
+                  </div>
                 </div>
               </>
             )}
