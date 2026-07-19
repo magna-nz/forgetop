@@ -167,13 +167,11 @@ function ConnectionCard({
   };
 
   const status = tested ?? healthy; // boolean | undefined
-  const noToken = !conn.has_token && conn.provider !== "Demo";
   return (
     <div className="flex items-center gap-3 rounded-lg px-3 py-2" style={{ background: "var(--card)", border: "1px solid var(--border)" }}>
       <div className="flex-1 min-w-0 flex items-center gap-2">
-        {/* Status badges follow the app convention (tinted StatusBadge) and sit before the name. */}
+        {/* Status badge follows the app convention (tinted StatusBadge) and sits before the name. */}
         {status != null && <StatusBadge label={status ? "Connected" : "Auth failed"} color={status ? "var(--green)" : "var(--red)"} />}
-        {noToken && <StatusBadge label="No token" color="var(--yellow)" />}
         <span className="font-medium truncate" style={{ color: "var(--fg)" }}>{conn.display_name}</span>
         <span className="text-xs shrink-0" style={{ color: "var(--dim)" }}>
           {conn.sections.length > 0 ? conn.sections.map((s) => SECTION_LABEL[s] ?? s).join(" · ") : "not shown in any section"}
