@@ -130,6 +130,12 @@ pub struct PipelineTriggerReq {
 }
 
 #[derive(Deserialize)]
+pub struct PipelineCancelReq {
+    pub conn: String,
+    pub run_id: String,
+}
+
+#[derive(Deserialize)]
 pub struct NotifReadReq {
     pub conn: String,
     pub id: String,
@@ -207,6 +213,11 @@ pub async fn pipeline_approval(sections: &SectionService, req: PipelineApprovalR
 pub async fn pipeline_trigger(sections: &SectionService, req: PipelineTriggerReq) -> Result<(), ActionError> {
     let source = dto::pipe_source(sections, &req.conn).await.ok_or(ActionError::NotFound)?;
     source.trigger(&req.definition_id, req.branch.as_deref()).await.map_err(failed)
+}
+
+pub async fn pipeline_cancel(sections: &SectionService, req: PipelineCancelReq) -> Result<(), ActionError> {
+    let source = dto::pipe_source(sections, &req.conn).await.ok_or(ActionError::NotFound)?;
+    source.cancel_run(&req.run_id).await.map_err(failed)
 }
 
 pub async fn notif_read(sections: &SectionService, req: NotifReadReq) -> Result<(), ActionError> {
