@@ -217,6 +217,9 @@ keychain** — a connection or a setting changed in one shows up in the other.
 ### Opening it
 
 - **From the TUI:** press **`B`** (shown in the footer and `?` help on every screen).
+- **Give feedback:** use the dashboard button beside connection health, or press **`F`**
+  in the TUI. Both open the public GitHub feedback issue form; forgetop does not send
+  logs or credentials.
 - **Headless:** `forgetop --dashboard` serves it and opens your browser — no TTY, so
   it's handy over SSH with a forwarded port.
 - By default, running `forgetop` opens **both** at once.
@@ -743,6 +746,7 @@ the keys valid for where you are. Press `?` for the full panel. The complete set
 | `S` | Sort by a column (re-pick flips direction) |
 | `o` | Open selected item in browser |
 | `B` | Open the web dashboard in your browser |
+| `F` | Open the public GitHub feedback issue form |
 | `,` | Settings — what forgetop opens on launch |
 | `v` | Choose which tabs are visible |
 | `C` | Open the connections page (in the web dashboard) |
@@ -848,8 +852,10 @@ supply a token via an environment variable named `FORGETOP_PAT_<CONNECTION_ID>`
 
 ### Logs & diagnostics
 
-forgetop keeps a small log file next to your config — **`forgetop.log`** in the same
-directory (e.g. `~/.config/forgetop/forgetop.log`). It records:
+forgetop keeps rolling diagnostic files next to your config — **`forgetop.log`** and
+its numbered segments in the same directory (e.g. `~/.config/forgetop/`). The retained
+history is limited to approximately the latest 24 hours and never more than 3 MiB; under
+heavy logging, the size limit wins. It records:
 
 - **Crashes** — if forgetop ever panics it restores your terminal (no garbled screen),
   writes the panic to the log, and prints the path so you can send it on.
@@ -857,9 +863,14 @@ directory (e.g. `~/.config/forgetop/forgetop.log`). It records:
   provider / auth / network fetch failures, which otherwise only flash on screen — each
   timestamped, so intermittent issues are reviewable after the fact.
 
-`forgetop doctor` prints the log's path. Logging is best-effort and contains no secrets.
-The running version is shown in the header (`▟ forgetop v…`) and via `forgetop --version`,
-so it's easy to include when reporting an issue.
+`forgetop doctor` prints the active log's path. Logging is best-effort and redacts common
+credential headers, token fields, credential-bearing URLs, dashboard session tokens, and
+known provider-token formats. Request/response bodies and configuration contents are not
+intentionally logged, but you should still inspect diagnostics before sharing them
+manually. forgetop never attaches them to the GitHub feedback form.
+
+The running version is shown in the header (`▟ forgetop v…`) and via
+`forgetop --version`, so it's easy to include when reporting an issue.
 
 ### Token scopes
 

@@ -1073,14 +1073,17 @@ fn render_health(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 /// Context-aware key glossary for the active tab (azdo-style bar along the bottom). Appends the
-/// web-dashboard hint on every screen where `B` actually opens it — i.e. everywhere except while
-/// the wizard, an overlay, or the quick-filter is capturing input — so people discover it exists.
+/// global browser shortcuts except while the wizard, an overlay, or the quick-filter is
+/// capturing input. Feedback is always available; the local dashboard shortcut is conditional.
 fn footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
     let mut keys = base_footer_keys(app);
     // Prepend (not append) so it survives the footer being clipped on narrow terminals — the
-    // whole point is that people always see the dashboard exists.
-    if app.dashboard_url.is_some() && app.wizard.is_none() && app.overlay.is_none() && !app.filtering {
-        keys.insert(0, ("B", "browser dashboard"));
+    // whole point is that people always see the dashboard and feedback entry points exist.
+    if app.wizard.is_none() && app.overlay.is_none() && !app.filtering {
+        keys.insert(0, ("F", "feedback"));
+        if app.dashboard_url.is_some() {
+            keys.insert(0, ("B", "browser dashboard"));
+        }
     }
     keys
 }
@@ -2005,6 +2008,7 @@ fn help_sections() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
                 ("Ctrl-P", "Jump to any item (command palette)"),
                 ("i", "Notification inbox (mentions, reviews, CI, assignments)"),
                 ("B", "Open the web dashboard in your browser"),
+                ("F", "Give feedback through the GitHub issue form"),
                 ("/", "Quick-filter the list"),
                 ("S", "Sort by column (re-pick flips direction)"),
                 ("o", "Open selected in browser"),
@@ -2752,15 +2756,43 @@ mod tests {
     }
 
     #[test]
-    fn footer_advertises_the_browser_dashboard_when_available() {
+    fn footer_always_advertises_feedback_and_adds_the_dashboard_when_available() {
         let mut app = App::new("slate");
         app.screen = Screen::List;
-        // No dashboard running → no hint.
-        assert!(!render_to_string(&mut app, 120, 24).contains("browser dashboard"));
-        // Dashboard running → the hint shows so TUI users discover it.
+        // GitHub feedback does not depend on the local dashboard.
+        let without_dashboard = render_to_string(&mut app, 120, 24);
+        assert!(!without_dashboard.contains("browser dashboard"));
+        assert!(without_dashboard.contains("feedback") && without_dashboard.contains("F"));
+        // Dashboard running → both browser shortcuts show.
         app.dashboard_url = Some("http://127.0.0.1:8177/?t=x".into());
         let out = render_to_string(&mut app, 120, 24);
         assert!(out.contains("browser dashboard") && out.contains("B"), "footer advertises the dashboard");
+        assert!(out.contains("feedback") && out.contains("F"), "footer advertises feedback");
+    }
+
+    #[test]
+    fn help_describes_feedback_as_a_github_issue_form() {
+        let global = help_sections()
+            .into_iter()
+            .find(|(section, _)| *section == "Global")
+            .expect("global help section")
+            .1;
+        assert_eq!(
+            global.iter().find(|(key, _)| *key == "F"),
+            Some(&("F", "Give feedback through the GitHub issue form"))
+        );
+    }
+
+    #[test]
+    fn footer_hides_dashboard_shortcuts_while_input_is_captured() {
+        let mut app = App::new("slate");
+        app.screen = Screen::List;
+        app.dashboard_url = Some("http://127.0.0.1:8177/?t=x".into());
+        app.filtering = true;
+
+        let out = render_to_string(&mut app, 120, 24);
+        assert!(!out.contains("browser dashboard"));
+        assert!(!out.contains("feedback"));
     }
 
     #[test]

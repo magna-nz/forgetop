@@ -222,11 +222,14 @@ struct PipelineLogsQuery {
 
 /// Turns an action outcome into a response: `{ok:true}`, 404 (no such connection/capability),
 /// or 502 (the provider call failed).
-fn action_response(result: Result<(), ActionError>) -> Response {
+fn action_response(operation: &'static str, result: Result<(), ActionError>) -> Response {
     match result {
         Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
         Err(ActionError::NotFound) => (StatusCode::NOT_FOUND, "connection or capability not found").into_response(),
-        Err(ActionError::Failed(msg)) => (StatusCode::BAD_GATEWAY, msg).into_response(),
+        Err(ActionError::Failed(msg)) => {
+            forgetop_core::diag::log(operation, "provider action failed");
+            (StatusCode::BAD_GATEWAY, msg).into_response()
+        }
     }
 }
 
@@ -245,22 +248,22 @@ async fn pr_detail(State(s): State<AppState>, Query(q): Query<ItemQuery>) -> Res
 }
 
 async fn pr_vote(State(s): State<AppState>, Json(req): Json<actions::PrVoteReq>) -> Response {
-    action_response(actions::pr_vote(&s.deps.sections, req).await)
+    action_response("dashboard.pr_vote", actions::pr_vote(&s.deps.sections, req).await)
 }
 async fn pr_merge(State(s): State<AppState>, Json(req): Json<actions::PrMergeReq>) -> Response {
-    action_response(actions::pr_merge(&s.deps.sections, req).await)
+    action_response("dashboard.pr_merge", actions::pr_merge(&s.deps.sections, req).await)
 }
 async fn pr_revert(State(s): State<AppState>, Json(req): Json<actions::PrRevertReq>) -> Response {
-    action_response(actions::pr_revert(&s.deps.sections, req).await)
+    action_response("dashboard.pr_revert", actions::pr_revert(&s.deps.sections, req).await)
 }
 async fn pr_comment(State(s): State<AppState>, Json(req): Json<actions::PrCommentReq>) -> Response {
-    action_response(actions::pr_comment(&s.deps.sections, req).await)
+    action_response("dashboard.pr_comment", actions::pr_comment(&s.deps.sections, req).await)
 }
 async fn pr_reply(State(s): State<AppState>, Json(req): Json<actions::PrReplyReq>) -> Response {
-    action_response(actions::pr_reply(&s.deps.sections, req).await)
+    action_response("dashboard.pr_reply", actions::pr_reply(&s.deps.sections, req).await)
 }
 async fn pr_review(State(s): State<AppState>, Json(req): Json<actions::PrReviewReq>) -> Response {
-    action_response(actions::pr_review(&s.deps.sections, req).await)
+    action_response("dashboard.pr_review", actions::pr_review(&s.deps.sections, req).await)
 }
 
 async fn wi_detail(State(s): State<AppState>, Query(q): Query<ItemQuery>) -> Response {
@@ -276,10 +279,10 @@ async fn wi_states(State(s): State<AppState>, Query(q): Query<ItemQuery>) -> Res
     }
 }
 async fn wi_state(State(s): State<AppState>, Json(req): Json<actions::WiStateReq>) -> Response {
-    action_response(actions::wi_set_state(&s.deps.sections, req).await)
+    action_response("dashboard.wi_state", actions::wi_set_state(&s.deps.sections, req).await)
 }
 async fn wi_comment(State(s): State<AppState>, Json(req): Json<actions::WiCommentReq>) -> Response {
-    action_response(actions::wi_comment(&s.deps.sections, req).await)
+    action_response("dashboard.wi_comment", actions::wi_comment(&s.deps.sections, req).await)
 }
 async fn wi_assignees(State(s): State<AppState>, Query(q): Query<ItemQuery>) -> Response {
     match actions::wi_assignees(&s.deps.sections, &q.conn, &q.id).await {
@@ -288,10 +291,10 @@ async fn wi_assignees(State(s): State<AppState>, Query(q): Query<ItemQuery>) -> 
     }
 }
 async fn wi_assignee(State(s): State<AppState>, Json(req): Json<actions::WiAssigneeReq>) -> Response {
-    action_response(actions::wi_set_assignee(&s.deps.sections, req).await)
+    action_response("dashboard.wi_assignee", actions::wi_set_assignee(&s.deps.sections, req).await)
 }
 async fn wi_update(State(s): State<AppState>, Json(req): Json<actions::WiUpdateReq>) -> Response {
-    action_response(actions::wi_update(&s.deps.sections, req).await)
+    action_response("dashboard.wi_update", actions::wi_update(&s.deps.sections, req).await)
 }
 
 async fn pipeline_detail(State(s): State<AppState>, Query(q): Query<RunQuery>) -> Response {
@@ -308,17 +311,17 @@ async fn pipeline_logs(State(s): State<AppState>, Query(q): Query<PipelineLogsQu
 }
 
 async fn pipeline_approval(State(s): State<AppState>, Json(req): Json<actions::PipelineApprovalReq>) -> Response {
-    action_response(actions::pipeline_approval(&s.deps.sections, req).await)
+    action_response("dashboard.pipeline_approval", actions::pipeline_approval(&s.deps.sections, req).await)
 }
 async fn pipeline_trigger(State(s): State<AppState>, Json(req): Json<actions::PipelineTriggerReq>) -> Response {
-    action_response(actions::pipeline_trigger(&s.deps.sections, req).await)
+    action_response("dashboard.pipeline_trigger", actions::pipeline_trigger(&s.deps.sections, req).await)
 }
 async fn pipeline_cancel(State(s): State<AppState>, Json(req): Json<actions::PipelineCancelReq>) -> Response {
-    action_response(actions::pipeline_cancel(&s.deps.sections, req).await)
+    action_response("dashboard.pipeline_cancel", actions::pipeline_cancel(&s.deps.sections, req).await)
 }
 
 async fn notification_read(State(s): State<AppState>, Json(req): Json<actions::NotifReadReq>) -> Response {
-    action_response(actions::notif_read(&s.deps.sections, req).await)
+    action_response("dashboard.notification_read", actions::notif_read(&s.deps.sections, req).await)
 }
 
 // ---- connection management ----

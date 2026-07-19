@@ -16,6 +16,10 @@ use forgetop_core::provider::{
 use forgetop_core::service::{ConnectionHealthService, SectionService};
 use serde::Serialize;
 
+fn log_fetch_failure(operation: &'static str) {
+    forgetop_core::diag::log(operation, "provider fetch failed");
+}
+
 /// One item tagged with the connection it came from (the "Provider" column in the TUI).
 #[derive(Serialize)]
 pub struct PrRow {
@@ -110,10 +114,10 @@ impl PrView {
 
 pub async fn pull_requests(sections: &SectionService, view: PrView) -> Vec<PrRow> {
     let mut out = Vec::new();
-    if let Ok(feeds) = sections.pull_request_feeds().await {
+    if let Ok(feeds) = sections.pull_request_feeds().await.inspect_err(|_| log_fetch_failure("dashboard.pull_requests.feeds")) {
         let query = view.query();
         for feed in feeds {
-            if let Ok(list) = feed.source.list(&query).await {
+            if let Ok(list) = feed.source.list(&query).await.inspect_err(|_| log_fetch_failure("dashboard.pull_requests.list")) {
                 out.extend(list.into_iter().filter(|pr| view.keep(pr)).map(|pr| PrRow {
                     connection_id: feed.connection.connection_id().to_string(),
                     connection: feed.connection.display_name().to_string(),
@@ -128,10 +132,10 @@ pub async fn pull_requests(sections: &SectionService, view: PrView) -> Vec<PrRow
 
 pub async fn work_items(sections: &SectionService) -> Vec<WiRow> {
     let mut out = Vec::new();
-    if let Ok(feeds) = sections.work_item_feeds().await {
+    if let Ok(feeds) = sections.work_item_feeds().await.inspect_err(|_| log_fetch_failure("dashboard.work_items.feeds")) {
         let query = WorkItemQuery { mine_only: true, include_completed: false, limit: Some(50) };
         for feed in feeds {
-            if let Ok(list) = feed.source.list(&query).await {
+            if let Ok(list) = feed.source.list(&query).await.inspect_err(|_| log_fetch_failure("dashboard.work_items.list")) {
                 out.extend(list.into_iter().map(|wi| WiRow {
                     connection_id: feed.connection.connection_id().to_string(),
                     connection: feed.connection.display_name().to_string(),
@@ -159,17 +163,28 @@ fn pipe_queries(sub: &PipelineSubscription) -> Vec<PipelineRunQuery> {
 
 pub async fn pipelines(sections: &SectionService) -> Vec<PipeRow> {
     let mut out = Vec::new();
-    if let Ok(feeds) = sections.pipeline_feeds().await {
+    if let Ok(feeds) = sections.pipeline_feeds().await.inspect_err(|_| log_fetch_failure("dashboard.pipelines.feeds")) {
         for feed in feeds {
-            let def_names: std::collections::HashMap<String, String> =
-                feed.source.discover().await.unwrap_or_default().into_iter().map(|d| (d.id, d.name)).collect();
+            let def_names: std::collections::HashMap<String, String> = feed
+                .source
+                .discover()
+                .await
+                .inspect_err(|_| log_fetch_failure("dashboard.pipelines.discover"))
+                .unwrap_or_default()
+                .into_iter()
+                .map(|d| (d.id, d.name))
+                .collect();
             let supports = feed.source.supports_approvals();
             for query in pipe_queries(&feed.subscription) {
-                if let Ok(runs) = feed.source.list_runs(&query).await {
+                if let Ok(runs) = feed.source.list_runs(&query).await.inspect_err(|_| log_fetch_failure("dashboard.pipelines.list")) {
                     for run in runs {
                         // Only in-flight runs can be waiting on a gate — bound the extra calls.
                         let approvals = if supports && is_active(run.status) {
-                            feed.source.pending_approvals(&run.id).await.unwrap_or_default()
+                            feed.source
+                                .pending_approvals(&run.id)
+                                .await
+                                .inspect_err(|_| log_fetch_failure("dashboard.pipelines.pending_approvals"))
+                                .unwrap_or_default()
                         } else {
                             Vec::new()
                         };
@@ -191,9 +206,9 @@ pub async fn pipelines(sections: &SectionService) -> Vec<PipeRow> {
 
 pub async fn notifications(sections: &SectionService) -> Vec<NotifRow> {
     let mut out = Vec::new();
-    if let Ok(feeds) = sections.notification_feeds().await {
+    if let Ok(feeds) = sections.notification_feeds().await.inspect_err(|_| log_fetch_failure("dashboard.notifications.feeds")) {
         for feed in feeds {
-            if let Ok(list) = feed.source.list().await {
+            if let Ok(list) = feed.source.list().await.inspect_err(|_| log_fetch_failure("dashboard.notifications.list")) {
                 out.extend(list.into_iter().map(|n| NotifRow {
                     connection_id: feed.connection.connection_id().to_string(),
                     connection: feed.connection.display_name().to_string(),
@@ -240,10 +255,10 @@ fn is_active(status: PipelineRunStatus) -> bool {
 /// recently-merged ones can surface.
 async fn pr_inputs(sections: &SectionService, filter: PullRequestFilter, include_completed: bool) -> Vec<PrInput> {
     let mut out = Vec::new();
-    if let Ok(feeds) = sections.pull_request_feeds().await {
+    if let Ok(feeds) = sections.pull_request_feeds().await.inspect_err(|_| log_fetch_failure("dashboard.launchpad.pull_request_feeds")) {
         let query = PullRequestQuery { filter, include_completed, limit: Some(50) };
         for feed in feeds {
-            if let Ok(list) = feed.source.list(&query).await {
+            if let Ok(list) = feed.source.list(&query).await.inspect_err(|_| log_fetch_failure("dashboard.launchpad.pull_requests")) {
                 out.extend(list.into_iter().map(|pr| PrInput {
                     connection_id: feed.connection.connection_id().to_string(),
                     connection: feed.connection.display_name().to_string(),
@@ -258,10 +273,10 @@ async fn pr_inputs(sections: &SectionService, filter: PullRequestFilter, include
 
 async fn wi_inputs(sections: &SectionService) -> Vec<WiInput> {
     let mut out = Vec::new();
-    if let Ok(feeds) = sections.work_item_feeds().await {
+    if let Ok(feeds) = sections.work_item_feeds().await.inspect_err(|_| log_fetch_failure("dashboard.launchpad.work_item_feeds")) {
         let query = WorkItemQuery { mine_only: true, include_completed: false, limit: Some(50) };
         for feed in feeds {
-            if let Ok(list) = feed.source.list(&query).await {
+            if let Ok(list) = feed.source.list(&query).await.inspect_err(|_| log_fetch_failure("dashboard.launchpad.work_items")) {
                 out.extend(list.into_iter().map(|wi| WiInput {
                     connection_id: feed.connection.connection_id().to_string(),
                     connection: feed.connection.display_name().to_string(),
@@ -279,13 +294,20 @@ async fn wi_inputs(sections: &SectionService) -> Vec<WiInput> {
 /// to. Mirrors the TUI's pipeline reload.
 async fn pipe_inputs(sections: &SectionService) -> Vec<PipeInput> {
     let mut out = Vec::new();
-    if let Ok(feeds) = sections.pipeline_feeds().await {
+    if let Ok(feeds) = sections.pipeline_feeds().await.inspect_err(|_| log_fetch_failure("dashboard.launchpad.pipeline_feeds")) {
         for feed in feeds {
-            let def_names: std::collections::HashMap<String, String> =
-                feed.source.discover().await.unwrap_or_default().into_iter().map(|d| (d.id, d.name)).collect();
+            let def_names: std::collections::HashMap<String, String> = feed
+                .source
+                .discover()
+                .await
+                .inspect_err(|_| log_fetch_failure("dashboard.launchpad.pipeline_discovery"))
+                .unwrap_or_default()
+                .into_iter()
+                .map(|d| (d.id, d.name))
+                .collect();
             let supports = feed.source.supports_approvals();
             for query in pipe_queries(&feed.subscription) {
-                if let Ok(runs) = feed.source.list_runs(&query).await {
+                if let Ok(runs) = feed.source.list_runs(&query).await.inspect_err(|_| log_fetch_failure("dashboard.launchpad.pipelines")) {
                     for run in runs {
                         let awaiting_approval = supports
                             && is_active(run.status)
@@ -293,6 +315,9 @@ async fn pipe_inputs(sections: &SectionService) -> Vec<PipeInput> {
                                 .source
                                 .pending_approvals(&run.id)
                                 .await
+                                .inspect_err(|_| {
+                                    log_fetch_failure("dashboard.launchpad.pipeline_approvals")
+                                })
                                 .map(|a| a.iter().any(|x| x.can_respond))
                                 .unwrap_or(false);
                         out.push(PipeInput {
@@ -383,6 +408,7 @@ pub async fn pr_source(sections: &SectionService, conn: &str) -> Option<Arc<dyn 
     sections
         .pull_request_feeds()
         .await
+        .inspect_err(|_| log_fetch_failure("dashboard.pull_requests.feeds"))
         .ok()?
         .into_iter()
         .find(|f| f.connection.connection_id() == conn)
@@ -409,24 +435,53 @@ fn with_comment_events(mut timeline: Vec<TimelineEvent>, threads: &[CommentThrea
 
 pub async fn pr_detail(sections: &SectionService, conn: &str, id: &str) -> Option<PrDetail> {
     let source = pr_source(sections, conn).await?;
-    let pull_request = source.get(id).await.ok()?;
+    let pull_request = source.get(id).await.inspect_err(|_| log_fetch_failure("dashboard.pr_detail.get")).ok()?;
     // The detail extras are best-effort: a provider that doesn't expose one just yields empties.
-    let threads = source.threads(id).await.unwrap_or_default();
-    let timeline = with_comment_events(source.timeline(id).await.unwrap_or_default(), &threads);
+    let threads = source
+        .threads(id)
+        .await
+        .inspect_err(|_| log_fetch_failure("dashboard.pr_detail.threads"))
+        .unwrap_or_default();
+    let timeline = with_comment_events(
+        source
+            .timeline(id)
+            .await
+            .inspect_err(|_| log_fetch_failure("dashboard.pr_detail.timeline"))
+            .unwrap_or_default(),
+        &threads,
+    );
     Some(PrDetail {
         pull_request,
         threads,
         timeline,
-        changes: source.changes(id).await.unwrap_or_default(),
-        checks: source.checks(id).await.unwrap_or_default(),
-        commits: source.commits(id).await.unwrap_or_default(),
+        changes: source
+            .changes(id)
+            .await
+            .inspect_err(|_| log_fetch_failure("dashboard.pr_detail.changes"))
+            .unwrap_or_default(),
+        checks: source
+            .checks(id)
+            .await
+            .inspect_err(|_| log_fetch_failure("dashboard.pr_detail.checks"))
+            .unwrap_or_default(),
+        commits: source
+            .commits(id)
+            .await
+            .inspect_err(|_| log_fetch_failure("dashboard.pr_detail.commits"))
+            .unwrap_or_default(),
     })
 }
 
 /// Files changed by a single commit on the PR (empty for providers without a per-commit diff API).
 pub async fn pr_commit_changes(sections: &SectionService, conn: &str, id: &str, sha: &str) -> Option<Vec<FileChange>> {
     let source = pr_source(sections, conn).await?;
-    Some(source.commit_changes(id, sha).await.unwrap_or_default())
+    Some(
+        source
+            .commit_changes(id, sha)
+            .await
+            .inspect_err(|_| log_fetch_failure("dashboard.pr_commit_changes"))
+            .unwrap_or_default(),
+    )
 }
 
 // ---- work-item detail ----
@@ -444,6 +499,7 @@ pub async fn wi_source(sections: &SectionService, conn: &str) -> Option<Arc<dyn 
     sections
         .work_item_feeds()
         .await
+        .inspect_err(|_| log_fetch_failure("dashboard.work_items.feeds"))
         .ok()?
         .into_iter()
         .find(|f| f.connection.connection_id() == conn)
@@ -452,10 +508,21 @@ pub async fn wi_source(sections: &SectionService, conn: &str) -> Option<Arc<dyn 
 
 pub async fn wi_detail(sections: &SectionService, conn: &str, id: &str) -> Option<WiDetail> {
     let source = wi_source(sections, conn).await?;
-    let work_item = source.get(id).await.ok()?;
+    let work_item = source.get(id).await.inspect_err(|_| log_fetch_failure("dashboard.wi_detail.get")).ok()?;
     // Comments are best-effort: a provider that doesn't expose them just yields empties.
-    let threads = source.threads(id).await.unwrap_or_default();
-    let timeline = with_comment_events(source.timeline(id).await.unwrap_or_default(), &threads);
+    let threads = source
+        .threads(id)
+        .await
+        .inspect_err(|_| log_fetch_failure("dashboard.wi_detail.threads"))
+        .unwrap_or_default();
+    let timeline = with_comment_events(
+        source
+            .timeline(id)
+            .await
+            .inspect_err(|_| log_fetch_failure("dashboard.wi_detail.timeline"))
+            .unwrap_or_default(),
+        &threads,
+    );
     Some(WiDetail { work_item, threads, timeline })
 }
 
@@ -474,6 +541,7 @@ pub async fn pipe_source(sections: &SectionService, conn: &str) -> Option<Arc<dy
     sections
         .pipeline_feeds()
         .await
+        .inspect_err(|_| log_fetch_failure("dashboard.pipelines.feeds"))
         .ok()?
         .into_iter()
         .find(|f| f.connection.connection_id() == conn)
@@ -482,10 +550,14 @@ pub async fn pipe_source(sections: &SectionService, conn: &str) -> Option<Arc<dy
 
 pub async fn pipeline_detail(sections: &SectionService, conn: &str, run_id: &str) -> Option<PipelineDetail> {
     let source = pipe_source(sections, conn).await?;
-    let run = source.get_run(run_id).await.ok()?;
+    let run = source.get_run(run_id).await.inspect_err(|_| log_fetch_failure("dashboard.pipeline_detail.get")).ok()?;
     // Only in-flight runs can be waiting on a gate — mirror the list endpoint's bound.
     let approvals = if source.supports_approvals() && is_active(run.status) {
-        source.pending_approvals(run_id).await.unwrap_or_default()
+        source
+            .pending_approvals(run_id)
+            .await
+            .inspect_err(|_| log_fetch_failure("dashboard.pipeline_detail.pending_approvals"))
+            .unwrap_or_default()
     } else {
         Vec::new()
     };
@@ -496,7 +568,7 @@ pub async fn pipeline_detail(sections: &SectionService, conn: &str, run_id: &str
 /// isn't found or the provider can't supply logs.
 pub async fn pipeline_logs(sections: &SectionService, conn: &str, run_id: &str, job_id: Option<&str>) -> Option<String> {
     let source = pipe_source(sections, conn).await?;
-    source.logs(run_id, job_id).await.ok()
+    source.logs(run_id, job_id).await.inspect_err(|_| log_fetch_failure("dashboard.pipeline_logs.get")).ok()
 }
 
 pub async fn health(svc: &ConnectionHealthService) -> Vec<HealthRow> {

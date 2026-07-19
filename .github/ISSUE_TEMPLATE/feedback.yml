@@ -1,0 +1,51 @@
+name: Give feedback
+description: Report a problem, suggest an idea, or share other feedback about forgetop.
+title: "[Feedback] "
+labels:
+  - feedback
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve forgetop.
+
+        > [!WARNING]
+        > GitHub issues are public. Do not include access tokens, API keys, passwords, private repository details, diagnostic logs, or any other secrets.
+
+  - type: dropdown
+    id: category
+    attributes:
+      label: Feedback type
+      description: What kind of feedback would you like to share?
+      options:
+        - Bug
+        - Idea
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: summary
+    attributes:
+      label: Summary
+      description: Briefly describe the problem, idea, or feedback.
+      placeholder: A short, clear summary
+    validations:
+      required: true
+
+  - type: textarea
+    id: details
+    attributes:
+      label: Details
+      description: Tell us what happened, what you expected, or what you would like to see.
+      placeholder: Add enough context to help us understand your feedback, without sharing secrets.
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: public-content
+    attributes:
+      label: Public issue confirmation
+      options:
+        - label: I understand this issue is public and confirm that it contains no secrets or private diagnostic information.
+          required: true

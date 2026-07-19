@@ -96,7 +96,25 @@ export function Sidebar({
         })}
       </nav>
 
-      <div className="mt-auto p-4 text-xs" style={{ borderTop: "1px solid var(--border)", color: "var(--dim)" }}>
+      <div className="mt-auto px-4 pb-4">
+        <a
+          href="https://github.com/magna-nz/forgetop/issues/new?template=feedback.yml"
+          target="_blank"
+          rel="noopener noreferrer"
+          className="flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-left text-xs font-medium transition-colors"
+          style={{
+            color: "var(--dim)",
+            background: "var(--panel2)",
+            border: "1px solid var(--border)",
+          }}
+        >
+          <span aria-hidden="true" style={{ color: "var(--accent)" }}>◇</span>
+          <span>Give Feedback</span>
+          <span className="ml-auto" aria-hidden="true">↗</span>
+        </a>
+      </div>
+
+      <div className="p-4 text-xs" style={{ borderTop: "1px solid var(--border)", color: "var(--dim)" }}>
         <div className="flex items-center gap-2">
           <span
             className="inline-block w-2 h-2 rounded-full"
@@ -104,7 +122,7 @@ export function Sidebar({
           />
           {total === 0 ? "No connections" : `${healthy}/${total} connections healthy`}
         </div>
-        <div className="mt-1.5 flex items-center justify-between">
+        <div className="mt-2 flex items-center justify-between">
           <span className="opacity-70">Live · every 15s</span>
           <button
             onClick={cycleTheme}
