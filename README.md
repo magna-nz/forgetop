@@ -9,6 +9,7 @@
     <a href="https://magna-nz.github.io/forgetop/"><img src="https://img.shields.io/badge/docs-read_the_docs-3178C6" alt="Documentation" /></a>
     <a href="https://discord.gg/yebAJdcGu"><img src="https://img.shields.io/badge/Discord-Join%20the%20community-5865F2?logo=discord&logoColor=white" alt="Join the Discord community" /></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="MIT License" /></a>
+    <a href="https://ko-fi.com/forgetop"><img src="https://ko-fi.com/img/githubbutton_sm.svg" alt="Support forgetop on Ko-fi" /></a>
   </p>
   <p><a href="#install">Install</a> · <a href="#quick-start">Quick start</a> · <a href="#the-command-center">Command Center</a> · <a href="https://magna-nz.github.io/forgetop/">Documentation</a> · <a href="https://discord.gg/yebAJdcGu">Discord</a></p>
 </div>
@@ -171,6 +172,12 @@ cargo run -- --demo
 
 See [How it works](https://magna-nz.github.io/forgetop/#how-it-works) for the crate layout,
 and [INTEGRATION.md](INTEGRATION.md) for the live provider integration tests.
+
+## Support forgetop
+
+forgetop is free and open source. If it saves you tab-switching, consider buying it a coffee:
+
+<a href="https://ko-fi.com/forgetop"><img src="https://ko-fi.com/img/githubbutton_sm.svg" alt="Support forgetop on Ko-fi" /></a>
 
 ## License
 
