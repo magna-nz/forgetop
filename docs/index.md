@@ -17,12 +17,12 @@ and the whole page follows, so you only read the instructions that apply to you.
 choice is remembered.
 
 <style>
-.surface-toggle{display:inline-flex;margin:.1rem 0 1.1rem;border:1px solid #d0d7de;border-radius:7px;overflow:hidden;background:#f6f8fa;font-size:0}
-.surface-toggle .st-btn{appearance:none;-webkit-appearance:none;border:0;background:transparent;color:#57606a;font-family:inherit;font-size:.82rem;font-weight:600;padding:.34rem .85rem;cursor:pointer;line-height:1.3}
-.surface-toggle .st-btn+.st-btn{border-left:1px solid #d0d7de}
-.surface-toggle .st-btn:hover{color:#1a1a1a}
+.surface-toggle{display:inline-flex;margin:.1rem 0 1.1rem;border:1px solid #30363d;border-radius:7px;overflow:hidden;background:#161b22;font-size:0}
+.surface-toggle .st-btn{appearance:none;-webkit-appearance:none;border:0;background:transparent;color:#8b949e;font-family:inherit;font-size:.82rem;font-weight:600;padding:.34rem .85rem;cursor:pointer;line-height:1.3}
+.surface-toggle .st-btn+.st-btn{border-left:1px solid #30363d}
+.surface-toggle .st-btn:hover{color:#e6edf3}
 html[data-surface="dash"] .surface-toggle .st-dash,
-html[data-surface="tui"]  .surface-toggle .st-tui{background:#159957;color:#fff}
+html[data-surface="tui"]  .surface-toggle .st-tui{background:#238636;color:#fff}
 .surface-tui{display:none}
 html[data-surface="tui"] .surface-tui{display:block}
 html[data-surface="tui"] .surface-dash{display:none}
