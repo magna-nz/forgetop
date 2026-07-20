@@ -693,7 +693,7 @@ checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
 
 [[package]]
 name = "forgetop"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "forgetop-core",
  "forgetop-providers",
@@ -705,7 +705,7 @@ dependencies = [
 
 [[package]]
 name = "forgetop-core"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -723,7 +723,7 @@ dependencies = [
 
 [[package]]
 name = "forgetop-providers"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "async-trait",
  "base64",
@@ -740,7 +740,7 @@ dependencies = [
 
 [[package]]
 name = "forgetop-server"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "axum",
  "forgetop-core",
@@ -757,7 +757,7 @@ dependencies = [
 
 [[package]]
 name = "forgetop-tui"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "chrono",
  "crossterm",
