@@ -110,15 +110,9 @@ async fn run() -> Result<()> {
     // Start the dashboard server in the background — best-effort, so a bind failure never takes
     // down the TUI. `B` opens the URL and connection setup happens here. Fall back to an ephemeral
     // port if the default is taken (e.g. a second forgetop) so the dashboard is virtually always up.
+    // Opening the browser for the `both` startup mode is handled by `forgetop_tui::run`, which is
+    // also responsible for the first-run/empty-connections case.
     let dashboard_url = spawn_dashboard(server_deps).await;
-
-    // `both` (the default): open the dashboard in the browser alongside the TUI. `terminal_only`
-    // keeps it in the background until `B`.
-    if startup_mode == StartupMode::Both {
-        if let Some(url) = &dashboard_url {
-            let _ = open::that(url);
-        }
-    }
 
     let theme = config.snapshot().ui.theme.clone().unwrap_or_else(|| "slate".into());
     let deps = AppDeps { sections, health, config };
