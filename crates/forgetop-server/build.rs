@@ -30,10 +30,10 @@ fn main() {
     if has_web && !skip {
         if which_npm() {
             if !web.join("node_modules").exists() {
-                run(Command::new("npm").arg("ci").current_dir(web), "npm ci", ci);
+                run(Command::new(npm_bin()).arg("ci").current_dir(web), "npm ci", ci);
             }
             run(
-                Command::new("npm")
+                Command::new(npm_bin())
                     .args(["run", "build"])
                     .env("FORGETOP_VERSION", env!("CARGO_PKG_VERSION"))
                     .current_dir(web),
@@ -59,8 +59,19 @@ fn main() {
     }
 }
 
+// On Windows, npm is installed as `npm.cmd`, and `std::process::Command` doesn't resolve `.cmd`
+// shims the way a shell does — spawning "npm" directly fails with "program not found" even
+// though it's on PATH.
+fn npm_bin() -> &'static str {
+    if cfg!(windows) {
+        "npm.cmd"
+    } else {
+        "npm"
+    }
+}
+
 fn which_npm() -> bool {
-    Command::new("npm").arg("--version").output().map(|o| o.status.success()).unwrap_or(false)
+    Command::new(npm_bin()).arg("--version").output().map(|o| o.status.success()).unwrap_or(false)
 }
 
 fn run(cmd: &mut Command, label: &str, fatal: bool) {
