@@ -21,3 +21,5 @@ mod ln_raw;
 mod linear;
 mod jira_raw;
 mod jira;
+// Read-only account-scope checks (discovery + fan-out addressing), across providers.
+mod scope;

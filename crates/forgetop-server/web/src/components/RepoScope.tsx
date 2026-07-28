@@ -69,12 +69,17 @@ export function useRepoScope(section: ScopeSection): RepoScopeState {
     })),
   });
 
-  if (scoped.length === 0) return { control: null, noneSelected: false };
-
   const selected = scoped.reduce((n, c) => n + selectedCount(c), 0);
   const available = discovery.reduce((n, q) => n + (q.data?.repositories.length ?? 0), 0);
   const truncated = discovery.some((q) => q.data?.truncated);
   const noneSelected = scoped.every((c) => c.repo_scope !== null && c.repo_scope !== undefined && c.repo_scope.length === 0);
+
+  // Nothing chosen *and* nothing discoverable means there is genuinely nothing to scope — the
+  // built-in demo connections, or a provider whose discovery didn't answer. Showing "0 of 0"
+  // there would be a control that can't do anything.
+  if (scoped.length === 0 || (selected === 0 && available === 0 && !noneSelected)) {
+    return { control: null, noneSelected: false };
+  }
 
   const total = available > 0 ? `${available}${truncated ? "+" : ""}` : "?";
 

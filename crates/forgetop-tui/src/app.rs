@@ -2546,14 +2546,21 @@ impl App {
                 .map(|c| c.repo_scope.as_ref().map(|s| s.len()).unwrap_or(usize::from(c.repository.is_some())))
                 .sum();
             let pages: Vec<_> = conns.iter().filter_map(|c| self.repo_catalog.get(&c.id)).collect();
+            let available: usize = pages.iter().map(|p| p.repositories.len()).sum();
+            let none_selected = conns.iter().all(|c| c.repo_scope.as_ref().is_some_and(|s| s.is_empty()));
+            // Nothing chosen *and* nothing discoverable means there is nothing to scope — the
+            // built-in demo connections, or a provider whose discovery didn't answer.
+            if selected == 0 && available == 0 && !none_selected {
+                return None;
+            }
             Some(ScopeSummary {
                 connections: conns.iter().map(|c| c.id.clone()).collect(),
                 connection_label: conns[0].display_name.clone(),
                 selected,
-                available: (!pages.is_empty()).then(|| pages.iter().map(|p| p.repositories.len()).sum()),
+                available: (!pages.is_empty()).then_some(available),
                 truncated: pages.iter().any(|p| p.truncated),
                 // An emptied scope is a real state; "never chosen" is not the same thing.
-                none_selected: conns.iter().all(|c| c.repo_scope.as_ref().is_some_and(|s| s.is_empty())),
+                none_selected,
             })
         };
         let pr_ids = cfg.pull_requests.as_ref().map(|b| b.ids()).unwrap_or_default();
