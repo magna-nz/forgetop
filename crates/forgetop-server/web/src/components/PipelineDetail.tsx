@@ -1,7 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useState, type ReactNode } from "react";
 import { AnimatePresence } from "framer-motion";
 import { useQueryClient } from "@tanstack/react-query";
-import { apiGetText, apiPost, usePipelineDetail } from "../api";
+import { apiGetText, apiPost, pipelineDetailKey, usePipelineDetail } from "../api";
 import { pipeMeta, relativeTime } from "../format";
 import type { PipeRef, PipelineApproval, PipelineJob, PipelineStage } from "../types";
 import { Avatar, Chip, SlideOver, StatusBadge } from "./ui";
@@ -39,7 +39,7 @@ function PipelineDetailPanel({ pipeRef, onClose }: { pipeRef: PipeRef; onClose: 
   }, [pipeRef.conn, pipeRef.runId]);
 
   const refresh = () => {
-    qc.invalidateQueries({ queryKey: ["pipeline-detail", pipeRef.conn, pipeRef.runId] });
+    qc.invalidateQueries({ queryKey: pipelineDetailKey(pipeRef) });
     qc.invalidateQueries({ queryKey: ["pipelines"] });
     qc.invalidateQueries({ queryKey: ["launchpad"] });
   };
@@ -63,7 +63,7 @@ function PipelineDetailPanel({ pipeRef, onClose }: { pipeRef: PipeRef; onClose: 
   const label = run ? run.name ?? (run.number != null ? `Run #${run.number}` : run.definition_id) : null;
 
   const cancel = () =>
-    act("Cancel requested", () => apiPost("/api/pipeline/cancel", { conn: pipeRef.conn, run_id: pipeRef.runId }));
+    act("Cancel requested", () => apiPost("/api/pipeline/cancel", { conn: pipeRef.conn, repo: pipeRef.repo, run_id: pipeRef.runId }));
 
   const header = (
     <>
@@ -230,7 +230,7 @@ function Job({ job, pipeRef }: { job: PipelineJob; pipeRef: PipeRef }) {
   useEffect(() => {
     if (open && logs === null && !loading && !logErr) {
       setLoading(true);
-      apiGetText(`/api/pipeline/logs?conn=${encodeURIComponent(pipeRef.conn)}&run_id=${encodeURIComponent(pipeRef.runId)}&job=${encodeURIComponent(job.id)}`)
+      apiGetText(`/api/pipeline/logs?conn=${encodeURIComponent(pipeRef.conn)}&run_id=${encodeURIComponent(pipeRef.runId)}&job=${encodeURIComponent(job.id)}${pipeRef.repo ? `&repo=${encodeURIComponent(pipeRef.repo)}` : ""}`)
         .then(setLogs)
         .catch((e) => setLogErr(e instanceof Error ? e.message : String(e)))
         .finally(() => setLoading(false));

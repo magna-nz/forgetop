@@ -6,9 +6,11 @@ import { Avatar, Chip, List, Skeleton, StateCard, StatusBadge } from "./ui";
 import { ErrorState } from "./ErrorState";
 import { useListView } from "./ControlBar";
 import { useWiOpener } from "./WiDetail";
+import { useRepoScope } from "./RepoScope";
 
 export function WorkItems() {
   const { data, isLoading, error } = useWorkItems();
+  const scope = useRepoScope("work_items");
   const { rows, bar } = useListView<WiRow>({
     storageKey: "work-items",
     rows: data,
@@ -30,15 +32,25 @@ export function WorkItems() {
 
   if (isLoading) return <Skeleton />;
   if (error) return <ErrorState error={error} />;
+  if (scope.noneSelected)
+    // Distinct from "nothing to show": nothing was fetched because nothing was asked for.
+    return (
+      <StateCard
+        icon="◍"
+        title="No repositories selected"
+        sub="This connection spans your whole account — choose which repositories it fetches from."
+      />
+    );
   if (!data || data.length === 0)
     return <StateCard icon="◇" title="No work items assigned" sub="Issues and tickets assigned to you appear here." />;
 
   return (
     <>
+      <div className="flex flex-wrap items-center gap-2 px-5 pt-4 max-w-5xl mx-auto">{scope.control}</div>
       {bar}
       <List>
         {rows.map((row, i) => (
-          <WiCard key={`${row.connection_id}:${row.work_item.id}`} row={row} index={i} />
+          <WiCard key={`${row.connection_id}:${row.work_item.repository ?? ""}:${row.work_item.id}`} row={row} index={i} />
         ))}
       </List>
     </>
@@ -58,7 +70,7 @@ function WiCard({ row, index }: { row: WiRow; index: number }) {
       style={{ background: "var(--card)", border: "1px solid var(--border)" }}
     >
       <button
-        onClick={() => open({ conn: row.connection_id, id: wi.id })}
+        onClick={() => open({ conn: row.connection_id, repo: wi.repository, id: wi.id })}
         className="flex-1 min-w-0 text-left flex items-center gap-2"
         style={{ cursor: "pointer" }}
       >

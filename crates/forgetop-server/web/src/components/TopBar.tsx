@@ -53,8 +53,10 @@ export function TopBar({
         qc.invalidateQueries({ queryKey: ["launchpad"] });
       });
     }
-    if (n.item_id != null && n.item_type === "PullRequest") openPr({ conn, id: n.item_id });
-    else if (n.item_id != null && n.item_type === "WorkItem") openWi({ conn, id: n.item_id });
+    // A notification names the repository its item lives in — that is what lets the inbox open
+    // an item on a connection spanning several repositories.
+    if (n.item_id != null && n.item_type === "PullRequest") openPr({ conn, repo: n.repository, id: n.item_id });
+    else if (n.item_id != null && n.item_type === "WorkItem") openWi({ conn, repo: n.repository, id: n.item_id });
     else if (n.url) window.open(n.url, "_blank", "noopener,noreferrer");
     setNotificationsOpen(false);
   };

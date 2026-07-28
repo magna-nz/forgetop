@@ -86,7 +86,7 @@ export function CommandPalette({
       icon: "⇄",
       // PRs open the in-app detail (with the diff + review), like clicking a PR row.
       run: () => {
-        openPr({ conn: r.connection_id, id: r.pull_request.id });
+        openPr({ conn: r.connection_id, repo: r.pull_request.repository, id: r.pull_request.id });
         onClose();
       },
     }));

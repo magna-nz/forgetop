@@ -1,11 +1,12 @@
 import { useState } from "react";
-import { usePullRequests, type PrView } from "../api";
+import { usePrDecoration, usePullRequests, type PrView } from "../api";
 import { checkMeta, prStatusMeta, relativeTime, toTime, voteMeta } from "../format";
 import type { PrRow } from "../types";
 import { Avatar, Chip, List, Pill, Row, Skeleton, StateCard, StatusBadge } from "./ui";
 import { ErrorState } from "./ErrorState";
 import { usePrOpener } from "./PrDetail";
 import { useListView } from "./ControlBar";
+import { useRepoScope } from "./RepoScope";
 
 const PR_VIEWS: { key: PrView; label: string }[] = [
   { key: "all", label: "All Pull Requests" },
@@ -42,9 +43,16 @@ function usePrView(): [PrView, (v: PrView) => void] {
   return [view, set];
 }
 
+/** A row's key. The repository is part of it: one connection now spans an account, so `#7` exists
+ *  in more than one repository and `connection_id:id` alone stops being unique. */
+function rowKey(row: PrRow): string {
+  return `${row.connection_id}:${row.pull_request.repository ?? ""}:${row.pull_request.id}`;
+}
+
 export function PullRequests() {
   const [view, setView] = usePrView();
   const { data, isLoading, error } = usePullRequests(view);
+  const scope = useRepoScope("pull_requests");
   const { rows, bar } = useListView<PrRow>({
     storageKey: "prs",
     rows: data,
@@ -64,14 +72,22 @@ export function PullRequests() {
         <Skeleton />
       ) : error ? (
         <ErrorState error={error} />
+      ) : scope.noneSelected ? (
+        // Distinct from "no pull requests": nothing was fetched because nothing was asked for.
+        <StateCard
+          icon="◍"
+          title="No repositories selected"
+          sub="This connection spans your whole account — choose which repositories it fetches from."
+        />
       ) : !data || data.length === 0 ? (
         <StateCard icon={EMPTY[view].icon} title={EMPTY[view].title} sub={EMPTY[view].sub} />
       ) : (
         <>
+          <div className="flex flex-wrap items-center gap-2 px-5 pt-4 max-w-5xl mx-auto">{scope.control}</div>
           {bar}
           <List>
             {rows.map((row, i) => (
-              <PrCard key={`${row.connection_id}:${row.pull_request.id}`} row={row} index={i} />
+              <PrCard key={rowKey(row)} row={row} index={i} />
             ))}
           </List>
         </>
@@ -105,11 +121,24 @@ function ViewTabs({ view, onChange }: { view: PrView; onChange: (v: PrView) => v
 
 function PrCard({ row, index }: { row: PrRow; index: number }) {
   const pr = row.pull_request;
+  // The list endpoint no longer pays for the decorated fields (GitHub omits them from `/pulls`
+  // entirely), so each visible row fetches its own — bounded by what's on screen rather than
+  // multiplied by every repository in the scope.
+  const { data: decoration } = usePrDecoration({
+    conn: row.connection_id,
+    repo: pr.repository,
+    id: pr.id,
+    updatedAt: pr.updated_at,
+  });
+  const additions = decoration?.additions ?? pr.additions;
+  const deletions = decoration?.deletions ?? pr.deletions;
+  const checkStatus = decoration?.checks ?? pr.checks;
+  const mergeable = decoration?.mergeable ?? pr.mergeable;
   const status = prStatusMeta(pr);
-  const checks = checkMeta(pr.checks);
+  const checks = checkMeta(checkStatus);
   const open = usePrOpener();
   return (
-    <Row index={index} dense onClick={() => open({ conn: row.connection_id, id: pr.id })}>
+    <Row index={index} dense onClick={() => open({ conn: row.connection_id, repo: pr.repository, id: pr.id })}>
       <div className="flex items-start gap-3">
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2">
@@ -120,21 +149,24 @@ function PrCard({ row, index }: { row: PrRow; index: number }) {
           </div>
           <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1.5">
             {pr.number != null && <span className="mono text-xs" style={{ color: "var(--dim)" }}>#{pr.number}</span>}
+            {/* With one connection spanning an account, the connection label no longer
+                distinguishes rows — the repository is what tells them apart. */}
+            {pr.repository && <Chip title="Repository">{pr.repository}</Chip>}
             {pr.source_ref && (
               <Chip title="source → target">
                 {shortRef(pr.source_ref)} <span style={{ color: "var(--dim)" }}>→</span> {shortRef(pr.target_ref) || "?"}
               </Chip>
             )}
             <span className="mono text-xs">
-              <span style={{ color: "var(--green)" }}>+{pr.additions}</span>{" "}
-              <span style={{ color: "var(--red)" }}>−{pr.deletions}</span>
+              <span style={{ color: "var(--green)" }}>+{additions}</span>{" "}
+              <span style={{ color: "var(--red)" }}>−{deletions}</span>
             </span>
-            {pr.checks !== "None" && <Pill icon={checks.icon} label={checks.label} color={checks.color} spin={pr.checks === "Pending"} />}
+            {checkStatus !== "None" && <Pill icon={checks.icon} label={checks.label} color={checks.color} spin={checkStatus === "Pending"} />}
             {pr.reviewers.length > 0 && <Reviewers reviewers={pr.reviewers} />}
             {pr.labels.slice(0, 3).map((l) => (
               <Chip key={l}>{l}</Chip>
             ))}
-            {pr.mergeable === "Mergeable" && <Pill icon="✓" label="Mergeable" color="var(--magenta)" />}
+            {mergeable === "Mergeable" && <Pill icon="✓" label="Mergeable" color="var(--magenta)" />}
           </div>
         </div>
         <div className="flex flex-col items-end gap-2 shrink-0">

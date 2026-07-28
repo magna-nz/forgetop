@@ -85,12 +85,12 @@ function NotifCard({ row, index }: { row: NotifRow; index: number }) {
       : n.item_type === "PullRequest"
         ? () => {
             onOpen();
-            openPr({ conn, id: n.item_id! });
+            openPr({ conn, repo: n.repository, id: n.item_id! });
           }
         : n.item_type === "WorkItem"
           ? () => {
               onOpen();
-              openWi({ conn, id: n.item_id! });
+              openWi({ conn, repo: n.repository, id: n.item_id! });
             }
           : null;
 

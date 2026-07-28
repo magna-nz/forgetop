@@ -174,6 +174,34 @@ pub struct NotifRow {
     pub notification: Notification,
 }
 
+/// A section's repository scope, as the header indicator and empty state read it.
+#[derive(Clone, Debug)]
+pub struct ScopeSummary {
+    /// The repo-addressed connections feeding this section.
+    pub connections: Vec<String>,
+    /// The first one's display name — what the picker is titled with.
+    pub connection_label: String,
+    /// How many repositories are currently fetched from.
+    pub selected: usize,
+    /// How many the credentials can reach, once discovery has run. `None` until then, so the
+    /// indicator never invents a denominator.
+    pub available: Option<usize>,
+    /// Discovery hit its page ceiling — the total reads "37+", never a cap dressed as a total.
+    pub truncated: bool,
+    /// Every connection explicitly chose no repositories. Distinct from "nothing to show".
+    pub none_selected: bool,
+}
+
+impl ScopeSummary {
+    /// "Repos · 5 of 37" for the section header. Truncation is marked, never silent.
+    pub fn label(&self) -> String {
+        match self.available {
+            Some(n) => format!("Repos · {} of {}{}", self.selected, n, if self.truncated { "+" } else { "" }),
+            None => format!("Repos · {}", self.selected),
+        }
+    }
+}
+
 pub struct App {
     pub theme: Theme,
     pub active: usize,
@@ -194,6 +222,12 @@ pub struct App {
     pub health: Vec<ConnectionHealth>,
     /// Which sections are shown in the tab bar, indexed by section (0=PR,1=WI,2=Pipelines).
     pub visible: [bool; 3],
+    /// Per-section repository-scope summary (0=PR, 1=WI, 2=Pipelines), for the header indicator
+    /// and the "no repositories selected" empty state. Recomputed on every reload from config.
+    pub repo_scope: [Option<ScopeSummary>; 3],
+    /// What discovery found per connection, keyed by connection id. Fetched once at startup and
+    /// again whenever the picker opens — the denominator in "5 of 37" has to be a real count.
+    pub repo_catalog: HashMap<String, RepositoryPage>,
     pub status: String,
     pub loading: bool,
     /// Scroll offset for the current list; body height captured during render.
@@ -724,6 +758,8 @@ impl App {
             pr_state: TableState::default(),
             wi_state: TableState::default(),
             pipe_state: TableState::default(),
+            repo_scope: [None, None, None],
+            repo_catalog: HashMap::new(),
             health: Vec::new(),
             visible: [true; 3],
             status: "Loading…".into(),
@@ -1206,7 +1242,7 @@ impl App {
             ToggleItem { id: "pipeline_approval_needed".into(), label: "Pipeline approval needed".into(), on: n.pipeline_approval_needed },
         ];
         self.overlay =
-            Some(Overlay::Toggle { title: "Notifications".into(), kind: ToggleKind::Notifications, min_one: false, items, selected: 0 });
+            Some(Overlay::Toggle { title: "Notifications".into(), kind: ToggleKind::Notifications, min_one: false, items, selected: 0, filter: None });
     }
 
     /// Applies the notifications checklist: the ticked ids become the enabled set.
@@ -1716,6 +1752,23 @@ impl App {
         self.status = "Refreshing…".into();
         let fetched = self.fetch_bundle(deps).await;
         self.apply_reloaded(fetched);
+        // Discovery runs once here, not on every 30s reload: the scope indicator needs a real
+        // denominator, but it doesn't need a fresh one every tick. Opening the picker refreshes it.
+        if self.repo_catalog.is_empty() {
+            self.seed_repo_catalog(deps).await;
+        }
+        self.refresh_repo_scope(deps);
+    }
+
+    /// Fills `repo_catalog` for every repo-addressed connection. Best-effort: a connection whose
+    /// discovery fails simply has no denominator, and everything else keeps working.
+    async fn seed_repo_catalog(&mut self, deps: &AppDeps) {
+        let cfg = deps.config.snapshot();
+        for c in cfg.connections.iter().filter(|c| forgetop_core::setup::is_repo_addressed(c.provider_type)) {
+            if let Ok(page) = deps.sections.discover_repositories(&c.id).await {
+                self.repo_catalog.insert(c.id.clone(), page);
+            }
+        }
     }
 
     /// Parameters the background fetch needs, snapshotted from `self` at spawn time.
@@ -2406,6 +2459,110 @@ impl App {
         self.screen = Screen::WiView(Box::new(WiView { connection_id: conn_id, wi, threads, scroll: 0 }));
     }
 
+    /// Opens the repository-scope picker for the active section.
+    ///
+    /// The scope is per connection, so with more than one bound the picker is opened for the
+    /// first repo-addressed one; the rest are reachable by switching connection filter. Discovery
+    /// is refreshed here rather than on every 30s reload — this is the moment the candidate list
+    /// has to be right.
+    async fn open_repo_scope(&mut self, deps: &AppDeps) {
+        let Some(summary) = self.repo_scope[self.active].clone() else {
+            self.toast = Some("This section's connections aren't repository-scoped".into());
+            return;
+        };
+        let Some(connection_id) = summary.connections.first().cloned() else { return };
+
+        self.toast = Some("Loading repositories…".into());
+        if let Ok(page) = deps.sections.discover_repositories(&connection_id).await {
+            self.repo_catalog.insert(connection_id.clone(), page);
+        }
+        let chosen = self.repo_scope_of(deps, &connection_id);
+        let discovered = self.repo_catalog.get(&connection_id).cloned().unwrap_or_default();
+
+        // Anything already chosen stays listed even if discovery didn't return it, so a saved
+        // scope is never silently dropped by a provider whose discovery is incomplete.
+        let mut repos = chosen.clone();
+        repos.extend(discovered.repositories.iter().filter(|r| !chosen.contains(r)).cloned());
+        if repos.is_empty() {
+            self.toast = Some("No repositories found for this connection's credentials".into());
+            return;
+        }
+        let items = repos
+            .into_iter()
+            .map(|r| ToggleItem { on: chosen.contains(&r), id: r.clone(), label: r })
+            .collect();
+        self.toast = None;
+        self.overlay = Some(Overlay::Toggle {
+            title: format!("Repositories · {}", summary.connection_label),
+            kind: ToggleKind::RepoScope { connection_id },
+            // Ticking none is a real choice — fetch nothing — not a state to be prevented.
+            min_one: false,
+            items,
+            selected: 0,
+            filter: Some(String::new()),
+        });
+    }
+
+    /// The repositories a connection currently fetches from, respecting an explicitly emptied
+    /// scope and only falling back to the legacy single repository when none was ever chosen.
+    fn repo_scope_of(&self, deps: &AppDeps, connection_id: &str) -> Vec<String> {
+        let cfg = deps.config.snapshot();
+        match cfg.find_connection(connection_id) {
+            Some(c) => c.repo_scope.clone().unwrap_or_else(|| c.repository.clone().into_iter().collect()),
+            None => Vec::new(),
+        }
+    }
+
+    async fn apply_repo_scope(&mut self, connection_id: &str, ids: Vec<String>, deps: &AppDeps) {
+        let count = ids.len();
+        if let Err(e) = deps.config.set_repo_scope(connection_id, Some(ids)).await {
+            self.toast_error(format!("Couldn't set the repository scope: {e}"));
+            return;
+        }
+        self.toast = Some(match count {
+            0 => "No repositories selected — nothing will be fetched".to_string(),
+            1 => "Fetching from 1 repository".to_string(),
+            n => format!("Fetching from {n} repositories"),
+        });
+        self.reload_all(deps).await;
+        self.fix_selection();
+    }
+
+    /// Recomputes the per-section scope summary from config. Cheap (no network) — the discovered
+    /// totals come from `repo_catalog`, which is refreshed separately.
+    fn refresh_repo_scope(&mut self, deps: &AppDeps) {
+        let cfg = deps.config.snapshot();
+        let bound = |ids: Vec<String>| -> Option<ScopeSummary> {
+            let conns: Vec<_> = ids
+                .iter()
+                .filter_map(|id| cfg.find_connection(id))
+                .filter(|c| forgetop_core::setup::is_repo_addressed(c.provider_type))
+                .collect();
+            if conns.is_empty() {
+                return None;
+            }
+            let selected = conns
+                .iter()
+                .map(|c| c.repo_scope.as_ref().map(|s| s.len()).unwrap_or(usize::from(c.repository.is_some())))
+                .sum();
+            let pages: Vec<_> = conns.iter().filter_map(|c| self.repo_catalog.get(&c.id)).collect();
+            Some(ScopeSummary {
+                connections: conns.iter().map(|c| c.id.clone()).collect(),
+                connection_label: conns[0].display_name.clone(),
+                selected,
+                available: (!pages.is_empty()).then(|| pages.iter().map(|p| p.repositories.len()).sum()),
+                truncated: pages.iter().any(|p| p.truncated),
+                // An emptied scope is a real state; "never chosen" is not the same thing.
+                none_selected: conns.iter().all(|c| c.repo_scope.as_ref().is_some_and(|s| s.is_empty())),
+            })
+        };
+        let pr_ids = cfg.pull_requests.as_ref().map(|b| b.ids()).unwrap_or_default();
+        let wi_ids = cfg.work_items.as_ref().map(|b| b.ids()).unwrap_or_default();
+        let pipe_ids =
+            cfg.pipelines.as_ref().map(|p| p.subscriptions.iter().map(|s| s.connection_id.clone()).collect()).unwrap_or_default();
+        self.repo_scope = [bound(pr_ids), bound(wi_ids), bound(pipe_ids)];
+    }
+
     /// Where Esc lands when closing an item view: back to the Launchpad if it was
     /// opened from there (row still selected), otherwise the section list.
     /// Show an error to the user *and* record it to the log file, so a failed action is
@@ -2648,6 +2805,9 @@ impl App {
             'f' if self.active == 1 => self.open_wi_states_toggle(),
             // Pipeline trigger (Pipelines tab).
             'T' if self.active == 2 => self.open_pipeline_trigger(),
+            // `g` = which **g**it repositories this section's connections fetch from. Unlike the
+            // `f` filter, this gates what is *fetched*, not what is shown from what was fetched.
+            'g' => self.open_repo_scope(deps).await,
             // Work-item state/comment (u / c) and PR write actions live inside the
             // opened item's view — press Enter first.
             _ => {}
@@ -3107,7 +3267,7 @@ impl App {
             .map(|i| ToggleItem { id: i.to_string(), label: TABS[i].to_string(), on: self.visible[i] })
             .collect();
         self.overlay =
-            Some(Overlay::Toggle { title: "Visible tabs".into(), kind: ToggleKind::Sections, min_one: true, items, selected: 0 });
+            Some(Overlay::Toggle { title: "Visible tabs".into(), kind: ToggleKind::Sections, min_one: true, items, selected: 0, filter: None });
     }
 
     // ---- work-item state visibility ----
@@ -3126,7 +3286,7 @@ impl App {
             .map(|&s| ToggleItem { on: self.pr_shown_statuses.contains(&s), id: pr_status_key(s).into(), label: pr_status_key(s).into() })
             .collect();
         self.overlay =
-            Some(Overlay::Toggle { title: "Show statuses".into(), kind: ToggleKind::PrStatuses, min_one: true, items, selected: 0 });
+            Some(Overlay::Toggle { title: "Show statuses".into(), kind: ToggleKind::PrStatuses, min_one: true, items, selected: 0, filter: None });
     }
 
     /// `ids` are the statuses left ticked. Rebuilds the shown set, then refetches so a
@@ -3151,7 +3311,7 @@ impl App {
             .map(|s| ToggleItem { on: !self.wi_hidden_states.contains(&s), id: s.clone(), label: s })
             .collect();
         self.overlay =
-            Some(Overlay::Toggle { title: "Show states".into(), kind: ToggleKind::WorkItemStates, min_one: false, items, selected: 0 });
+            Some(Overlay::Toggle { title: "Show states".into(), kind: ToggleKind::WorkItemStates, min_one: false, items, selected: 0, filter: None });
     }
 
     async fn apply_toggle(&mut self, kind: ToggleKind, ids: Vec<String>, deps: &AppDeps) {
@@ -3171,6 +3331,9 @@ impl App {
             }
             ToggleKind::Notifications => {
                 self.apply_notifications(ids, deps).await;
+            }
+            ToggleKind::RepoScope { connection_id } => {
+                self.apply_repo_scope(&connection_id, ids, deps).await;
             }
             ToggleKind::SectionBind { section } => {
                 self.apply_section_bind(section, ids, deps).await;
@@ -3239,6 +3402,7 @@ impl App {
             min_one: false,
             items,
             selected: 0,
+            filter: None,
         });
     }
 
@@ -3402,6 +3566,7 @@ impl App {
             min_one: false,
             items,
             selected: 0,
+            filter: None,
         });
     }
 

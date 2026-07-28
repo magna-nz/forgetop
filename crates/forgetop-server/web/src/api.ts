@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import type { ConnectionRow, FileChange, HealthRow, LaunchpadResponse, NotifRow, PipeRef, PipelineDetail, PipeRow, Preferences, PrDetail, PrRef, ProviderInfo, PrRow, WiDetail, WiRef, WiRow } from "./types";
+import type { ConnectionRow, FileChange, HealthRow, LaunchpadResponse, NotifRow, PipeRef, PipelineDetail, PipeRow, Preferences, PrDecoration, PrDetail, PrRef, ProviderInfo, PrRow, RepositoryPage, WiDetail, WiRef, WiRow } from "./types";
 
 // The session token arrives once in the URL (`/?t=…`). We stash it in sessionStorage (so a
 // refresh keeps working) and strip it from the visible URL, then replay it on every API call.
@@ -82,37 +82,87 @@ export function useWriteAction() {
   return { busy, error, run };
 }
 
+/** `&repo=…` for an addressed ref, or nothing. A repository is always a query parameter and
+ *  never a path segment — an `owner/repo` contains a slash — and it stays optional so every
+ *  link written before a connection spanned an account still resolves. */
+const repoParam = (repo?: string | null) => (repo ? `&repo=${encodeURIComponent(repo)}` : "");
+
+// Query keys are **positional**, so a key and the invalidation that clears it drift apart
+// silently — the symptom is a detail view that goes stale after a mutation, intermittently.
+// Building each one here means both sides can only ever use the same shape.
+export const prDetailKey = (ref: Pick<PrRef, "conn" | "repo" | "id">) => ["pr-detail", ref.conn, ref.repo ?? "", ref.id];
+export const wiDetailKey = (ref: Pick<WiRef, "conn" | "repo" | "id">) => ["wi-detail", ref.conn, ref.repo ?? "", ref.id];
+export const pipelineDetailKey = (ref: Pick<PipeRef, "conn" | "repo" | "runId">) => [
+  "pipeline-detail",
+  ref.conn,
+  ref.repo ?? "",
+  ref.runId,
+];
+
 export const usePrDetail = (ref: PrRef | null) =>
   useQuery({
-    queryKey: ["pr-detail", ref?.conn, ref?.id],
-    queryFn: () => api<PrDetail>(`/api/pr/detail?conn=${encodeURIComponent(ref!.conn)}&id=${encodeURIComponent(ref!.id)}`),
+    queryKey: ref ? prDetailKey(ref) : ["pr-detail", null],
+    queryFn: () =>
+      api<PrDetail>(`/api/pr/detail?conn=${encodeURIComponent(ref!.conn)}&id=${encodeURIComponent(ref!.id)}${repoParam(ref!.repo)}`),
     enabled: !!ref,
   });
 
 /** The files changed by a single commit on the PR (for the Commits → Files drill-in). */
 export const usePrCommitChanges = (ref: PrRef | null, sha: string | null) =>
   useQuery({
-    queryKey: ["pr-commit-changes", ref?.conn, ref?.id, sha],
+    queryKey: ["pr-commit-changes", ref?.conn, ref?.repo ?? "", ref?.id, sha],
     queryFn: () =>
       api<FileChange[]>(
-        `/api/pr/commit-changes?conn=${encodeURIComponent(ref!.conn)}&id=${encodeURIComponent(ref!.id)}&sha=${encodeURIComponent(sha!)}`,
+        `/api/pr/commit-changes?conn=${encodeURIComponent(ref!.conn)}&id=${encodeURIComponent(ref!.id)}&sha=${encodeURIComponent(sha!)}${repoParam(ref!.repo)}`,
       ),
     enabled: !!ref && !!sha,
   });
 
+/** One row's decorated fields, fetched lazily because the list endpoint no longer pays for them.
+ *  Keyed (and server-cached) on `updated_at` — the provider's own statement that the PR changed —
+ *  so an entry can never outlive the change that invalidates it. */
+export const usePrDecoration = (row: { conn: string; repo?: string | null; id: string; updatedAt?: string | null } | null) =>
+  useQuery({
+    queryKey: ["pr-decoration", row?.conn, row?.repo ?? "", row?.id, row?.updatedAt ?? ""],
+    queryFn: () =>
+      api<PrDecoration>(
+        `/api/pr/decoration?conn=${encodeURIComponent(row!.conn)}&id=${encodeURIComponent(row!.id)}${repoParam(row!.repo)}` +
+          (row!.updatedAt ? `&updated_at=${encodeURIComponent(row!.updatedAt)}` : ""),
+      ),
+    enabled: !!row,
+    staleTime: 60_000,
+  });
+
 export const useWiDetail = (ref: WiRef | null) =>
   useQuery({
-    queryKey: ["wi-detail", ref?.conn, ref?.id],
-    queryFn: () => api<WiDetail>(`/api/wi/detail?conn=${encodeURIComponent(ref!.conn)}&id=${encodeURIComponent(ref!.id)}`),
+    queryKey: ref ? wiDetailKey(ref) : ["wi-detail", null],
+    queryFn: () =>
+      api<WiDetail>(`/api/wi/detail?conn=${encodeURIComponent(ref!.conn)}&id=${encodeURIComponent(ref!.id)}${repoParam(ref!.repo)}`),
     enabled: !!ref,
   });
 
 export const usePipelineDetail = (ref: PipeRef | null) =>
   useQuery({
-    queryKey: ["pipeline-detail", ref?.conn, ref?.runId],
+    queryKey: ref ? pipelineDetailKey(ref) : ["pipeline-detail", null],
     queryFn: () =>
-      api<PipelineDetail>(`/api/pipeline/detail?conn=${encodeURIComponent(ref!.conn)}&run_id=${encodeURIComponent(ref!.runId)}`),
+      api<PipelineDetail>(
+        `/api/pipeline/detail?conn=${encodeURIComponent(ref!.conn)}&run_id=${encodeURIComponent(ref!.runId)}${repoParam(ref!.repo)}`,
+      ),
     enabled: !!ref,
+  });
+
+/** The repositories a connection could fetch from — the scope picker's candidate list. Only the
+ *  picker calls this, so a provider whose discovery is wrong shows an empty picker; it cannot
+ *  stop an already-scoped connection fetching. */
+export const fetchConnectionRepositories = (connectionId: string) =>
+  api<RepositoryPage>(`/api/connections/repositories?id=${encodeURIComponent(connectionId)}`);
+
+export const useConnectionRepositories = (connectionId: string | null) =>
+  useQuery({
+    queryKey: ["connection-repositories", connectionId],
+    queryFn: () => api<RepositoryPage>(`/api/connections/repositories?id=${encodeURIComponent(connectionId!)}`),
+    enabled: !!connectionId,
+    staleTime: 5 * 60_000,
   });
 
 export const useLaunchpad = () => useQuery({ queryKey: ["launchpad"], queryFn: () => api<LaunchpadResponse>("/api/launchpad") });

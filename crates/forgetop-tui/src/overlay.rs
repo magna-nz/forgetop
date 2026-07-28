@@ -68,6 +68,9 @@ pub enum ToggleKind {
     /// Which connections feed a section (0 = Pull Requests, 1 = Work Items);
     /// item ids are connection ids.
     SectionBind { section: usize },
+    /// Which repositories a connection fetches from; item ids are **connection-relative**
+    /// repository paths. Ticking none is a real choice — fetch nothing — so `min_one` is off.
+    RepoScope { connection_id: String },
 }
 
 /// One row of a [`Overlay::Toggle`] checklist.
@@ -109,7 +112,10 @@ pub enum Overlay {
     Confirm { title: String, message: String, action: Action },
     Picker { title: String, items: Vec<String>, selected: usize, kind: PickerKind },
     Input { title: String, buffer: String, kind: InputKind },
-    Toggle { title: String, kind: ToggleKind, min_one: bool, items: Vec<ToggleItem>, selected: usize },
+    /// A checklist. `filter` makes it searchable: `Some` means typing narrows the list (and
+    /// `selected` indexes the *visible* rows), `None` keeps the plain j/k behaviour. A scope
+    /// picker over a few hundred repositories needs the search; a three-row list doesn't.
+    Toggle { title: String, kind: ToggleKind, min_one: bool, items: Vec<ToggleItem>, selected: usize, filter: Option<String> },
     /// A scrollable, context-agnostic reference of every keybinding.
     Help { scroll: u16 },
     /// The command palette: fuzzy-jump across every already-fetched item. `results` are
@@ -146,6 +152,9 @@ impl Overlay {
             Overlay::Confirm { .. } => vec![("y", "confirm"), ("Esc", "cancel")],
             Overlay::Picker { .. } => vec![("↑↓", "choose"), ("↵", "select"), ("Esc", "cancel")],
             Overlay::Input { .. } => vec![("Esc", "cancel"), ("↵", "submit")],
+            Overlay::Toggle { filter: Some(_), .. } => {
+                vec![("type", "search"), ("↑↓", "move"), ("↵/space", "toggle"), ("Esc", "apply")]
+            }
             Overlay::Toggle { .. } => vec![("↑↓", "move"), ("↵/space", "toggle"), ("Esc", "apply")],
             Overlay::Help { .. } => vec![("↑↓", "scroll"), ("Esc", "close")],
             Overlay::Palette { .. } => vec![("↑↓", "move"), ("↵", "open"), ("Esc", "cancel")],
@@ -189,39 +198,69 @@ impl Overlay {
                 Key::Escape => Outcome::Cancel,
                 _ => Outcome::Keep,
             },
-            Overlay::Toggle { items, selected, min_one, kind, .. } => match key {
-                Key::Up | Key::Char('k') => {
-                    if !items.is_empty() {
-                        *selected = (*selected + items.len() - 1) % items.len();
-                    }
-                    Outcome::Keep
-                }
-                Key::Down | Key::Char('j') => {
-                    if !items.is_empty() {
-                        *selected = (*selected + 1) % items.len();
-                    }
-                    Outcome::Keep
-                }
-                Key::Char(' ') | Key::Enter => {
-                    let on_count = items.iter().filter(|i| i.on).count();
-                    if let Some(item) = items.get_mut(*selected) {
-                        if item.on {
-                            // Optionally keep at least one ticked (used for visible tabs).
-                            if !*min_one || on_count > 1 {
-                                item.on = false;
-                            }
-                        } else {
-                            item.on = true;
+            Overlay::Toggle { items, selected, min_one, kind, filter, .. } => {
+                let visible = visible_toggle_indices(items, filter.as_deref());
+                match key {
+                    // A searchable toggle spends letters on the query, so only the arrows move.
+                    Key::Up | Key::Char('k') if filter.is_none() => {
+                        if !visible.is_empty() {
+                            *selected = (*selected + visible.len() - 1) % visible.len();
                         }
+                        Outcome::Keep
                     }
-                    Outcome::Keep
+                    Key::Down | Key::Char('j') if filter.is_none() => {
+                        if !visible.is_empty() {
+                            *selected = (*selected + 1) % visible.len();
+                        }
+                        Outcome::Keep
+                    }
+                    Key::Up => {
+                        if !visible.is_empty() {
+                            *selected = (*selected + visible.len() - 1) % visible.len();
+                        }
+                        Outcome::Keep
+                    }
+                    Key::Down => {
+                        if !visible.is_empty() {
+                            *selected = (*selected + 1) % visible.len();
+                        }
+                        Outcome::Keep
+                    }
+                    Key::Char(' ') | Key::Enter => {
+                        let on_count = items.iter().filter(|i| i.on).count();
+                        if let Some(item) = visible.get(*selected).and_then(|&i| items.get_mut(i)) {
+                            if item.on {
+                                // Optionally keep at least one ticked (used for visible tabs).
+                                if !*min_one || on_count > 1 {
+                                    item.on = false;
+                                }
+                            } else {
+                                item.on = true;
+                            }
+                        }
+                        Outcome::Keep
+                    }
+                    Key::Char(c) if filter.is_some() => {
+                        if let Some(q) = filter.as_mut() {
+                            q.push(c);
+                        }
+                        *selected = 0;
+                        Outcome::Keep
+                    }
+                    Key::Backspace if filter.is_some() => {
+                        if let Some(q) = filter.as_mut() {
+                            q.pop();
+                        }
+                        *selected = 0;
+                        Outcome::Keep
+                    }
+                    Key::Escape => {
+                        let ids = items.iter().filter(|i| i.on).map(|i| i.id.clone()).collect();
+                        Outcome::Submit(Action::ApplyToggle { kind: kind.clone(), ids })
+                    }
+                    _ => Outcome::Keep,
                 }
-                Key::Escape => {
-                    let ids = items.iter().filter(|i| i.on).map(|i| i.id.clone()).collect();
-                    Outcome::Submit(Action::ApplyToggle { kind: kind.clone(), ids })
-                }
-                _ => Outcome::Keep,
-            },
+            }
             Overlay::Help { scroll } => match key {
                 Key::Up | Key::Char('k') => {
                     *scroll = scroll.saturating_sub(1);
@@ -329,9 +368,75 @@ fn resolve_input(kind: InputKind, text: String) -> Action {
     }
 }
 
+/// The rows a checklist currently shows: everything, or what matches its search query.
+/// `Overlay::Toggle::selected` indexes into this, not into `items`.
+pub fn visible_toggle_indices(items: &[ToggleItem], filter: Option<&str>) -> Vec<usize> {
+    let q = filter.unwrap_or("").trim().to_lowercase();
+    items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| q.is_empty() || item.label.to_lowercase().contains(&q))
+        .map(|(i, _)| i)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn repos(names: &[&str], on: &[&str]) -> Vec<ToggleItem> {
+        names
+            .iter()
+            .map(|n| ToggleItem { id: (*n).into(), label: (*n).into(), on: on.contains(n) })
+            .collect()
+    }
+
+    #[test]
+    fn a_searchable_checklist_narrows_and_toggles_the_visible_row() {
+        // A scope picker over hundreds of repositories needs search; letters go to the query, so
+        // only the arrows move — j/k would otherwise be untypeable.
+        let mut o = Overlay::Toggle {
+            title: "Repositories".into(),
+            kind: ToggleKind::RepoScope { connection_id: "c".into() },
+            min_one: false,
+            items: repos(&["acme/pay", "acme/ledger", "other/web"], &["acme/pay"]),
+            selected: 0,
+            filter: Some(String::new()),
+        };
+        o.handle(Key::Char('l'));
+        o.handle(Key::Char('e'));
+        let Overlay::Toggle { items, filter, .. } = &o else { panic!("toggle") };
+        assert_eq!(filter.as_deref(), Some("le"));
+        assert_eq!(visible_toggle_indices(items, filter.as_deref()), vec![1], "only acme/ledger matches");
+
+        // Space ticks the visible row, not items[selected] — they are different lists.
+        o.handle(Key::Char(' '));
+        let Overlay::Toggle { items, .. } = &o else { panic!("toggle") };
+        assert!(items[1].on, "the matched repository was ticked");
+        assert!(items[0].on && !items[2].on, "the others are untouched");
+    }
+
+    #[test]
+    fn an_emptied_scope_submits_an_empty_list_rather_than_being_prevented() {
+        // Choosing no repositories is a real state — fetch nothing — so `min_one` is off and the
+        // apply carries an empty set rather than silently keeping the last one ticked.
+        let mut o = Overlay::Toggle {
+            title: "Repositories".into(),
+            kind: ToggleKind::RepoScope { connection_id: "c".into() },
+            min_one: false,
+            items: repos(&["acme/pay"], &["acme/pay"]),
+            selected: 0,
+            filter: Some(String::new()),
+        };
+        o.handle(Key::Char(' '));
+        match o.handle(Key::Escape) {
+            Outcome::Submit(Action::ApplyToggle { kind: ToggleKind::RepoScope { connection_id }, ids }) => {
+                assert_eq!(connection_id, "c");
+                assert!(ids.is_empty(), "an emptied scope applies as an empty list");
+            }
+            _ => panic!("expected the scope to be applied"),
+        }
+    }
 
     fn pitem(kind: PaletteKind, id: &str, title: &str) -> PaletteItem {
         PaletteItem {
@@ -475,6 +580,7 @@ mod tests {
             min_one: true,
             items: vec![item("0", true), item("1", true), item("2", true)],
             selected: 1,
+            filter: None,
         };
         o.handle(Key::Char(' ')); // turn item 1 off
         match o.handle(Key::Escape) {
@@ -491,6 +597,7 @@ mod tests {
             min_one: true,
             items: vec![item("0", true)],
             selected: 0,
+            filter: None,
         };
         o.handle(Key::Char(' ')); // would clear the only one — ignored
         match o.handle(Key::Escape) {
@@ -507,6 +614,7 @@ mod tests {
             min_one: false,
             items: vec![item("ci", true)],
             selected: 0,
+            filter: None,
         };
         o.handle(Key::Char(' ')); // clear it — allowed for pipelines
         match o.handle(Key::Escape) {

@@ -46,6 +46,9 @@ export interface CheckSummary {
 
 export interface PullRequest {
   id: string;
+  /** The repository this lives in, **connection-relative** (`acme/pay`). Undefined for
+   *  providers that aren't repo-addressed (Jira, Linear). Mirrors the Rust domain type. */
+  repository?: string | null;
   number?: number | null;
   title: string;
   description?: string | null;
@@ -69,6 +72,9 @@ export interface PullRequest {
 
 export interface WorkItem {
   id: string;
+  /** The repository this lives in, **connection-relative** (`acme/pay`). Undefined for
+   *  providers that aren't repo-addressed (Jira, Linear). Mirrors the Rust domain type. */
+  repository?: string | null;
   identifier?: string | null;
   title: string;
   description?: string | null;
@@ -107,6 +113,9 @@ export interface PipelineStage {
 
 export interface PipelineRun {
   id: string;
+  /** The repository this lives in, **connection-relative** (`acme/pay`). Undefined for
+   *  providers that aren't repo-addressed (Jira, Linear). Mirrors the Rust domain type. */
+  repository?: string | null;
   definition_id: string;
   number?: number | null;
   name?: string | null;
@@ -123,6 +132,9 @@ export interface PipelineRun {
 
 export interface Notification {
   id: string;
+  /** The repository this lives in, **connection-relative** (`acme/pay`). Undefined for
+   *  providers that aren't repo-addressed (Jira, Linear). Mirrors the Rust domain type. */
+  repository?: string | null;
   kind: NotificationKind;
   item_type: NotificationItemType;
   item_id?: string | null;
@@ -257,18 +269,30 @@ export interface LineComment {
 export interface PrRef {
   conn: string;
   id: string;
+  /** The item's **connection-relative** repository. A connection now spans an account, so the
+   *  id alone doesn't say which repository's item this is. Optional: a single-repository
+   *  connection resolves without it. */
+  repo?: string | null;
 }
 
 /** Identifies a work item for the detail view. */
 export interface WiRef {
   conn: string;
   id: string;
+  /** The item's **connection-relative** repository. A connection now spans an account, so the
+   *  id alone doesn't say which repository's item this is. Optional: a single-repository
+   *  connection resolves without it. */
+  repo?: string | null;
 }
 
 /** Identifies a pipeline run for the detail view. */
 export interface PipeRef {
   conn: string;
   runId: string;
+  /** The item's **connection-relative** repository. A connection now spans an account, so the
+   *  id alone doesn't say which repository's item this is. Optional: a single-repository
+   *  connection resolves without it. */
+  repo?: string | null;
 }
 
 export interface WiDetail {
@@ -340,6 +364,9 @@ export interface ConnectionRow {
   project?: string | null;
   repository?: string | null;
   username?: string | null;
+  /** The chosen repository scope, exactly as stored: `null` = never chosen (the legacy single
+   *  repository still applies), `[]` = the user chose none, `[…]` = fetch these. */
+  repo_scope?: string[] | null;
   has_token: boolean;
   sections: string[];
 }
@@ -350,3 +377,23 @@ export interface Preferences {
 }
 
 export type SectionId = "launchpad" | "prs" | "work-items" | "pipelines" | "notifications" | "settings";
+
+/** The fields the PR *list* endpoint omits — GitHub leaves `mergeable`, `changed_files`,
+ *  `additions` and `deletions` out entirely — fetched per visible row from
+ *  `/api/pr/decoration` rather than for every row of every repository in the scope. */
+export interface PrDecoration {
+  mergeable: MergeableState;
+  changed_files: number;
+  additions: number;
+  deletions: number;
+  checks: CheckStatus;
+  check_summary?: CheckSummary | null;
+}
+
+/** The repositories a connection's credentials can reach — the scope picker's candidates. */
+export interface RepositoryPage {
+  repositories: string[];
+  /** True when the provider had more than we fetched, so the picker says "5 of 500+" rather
+   *  than presenting a cap as a total. Truncation must never be silent. */
+  truncated: boolean;
+}

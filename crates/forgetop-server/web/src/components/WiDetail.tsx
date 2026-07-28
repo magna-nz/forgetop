@@ -1,7 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useState, type ReactNode } from "react";
 import { AnimatePresence } from "framer-motion";
 import { useQueryClient } from "@tanstack/react-query";
-import { apiGet, apiPost, useWiDetail } from "../api";
+import { apiGet, apiPost, useWiDetail, wiDetailKey } from "../api";
 import { relativeTime, wiStateColor } from "../format";
 import type { CommentThread, User, WiRef, WorkItem } from "../types";
 import { Avatar, Chip, Pill, SlideOver, Timeline } from "./ui";
@@ -37,7 +37,7 @@ function WiDetailPanel({ wiRef, onClose }: { wiRef: WiRef; onClose: () => void }
   }, [wiRef.conn, wiRef.id]);
 
   const refresh = () => {
-    qc.invalidateQueries({ queryKey: ["wi-detail", wiRef.conn, wiRef.id] });
+    qc.invalidateQueries({ queryKey: wiDetailKey(wiRef) });
     qc.invalidateQueries({ queryKey: ["work-items"] });
     qc.invalidateQueries({ queryKey: ["launchpad"] });
   };
@@ -95,11 +95,11 @@ function WiDetailPanel({ wiRef, onClose }: { wiRef: WiRef; onClose: () => void }
               busy={busy}
               onPick={(assigneeId) =>
                 act(assigneeId ? "Reassigned" : "Unassigned", () =>
-                  apiPost("/api/wi/assignee", { conn: wiRef.conn, id: wiRef.id, assignee_id: assigneeId }),
+                  apiPost("/api/wi/assignee", { conn: wiRef.conn, repo: wiRef.repo, id: wiRef.id, assignee_id: assigneeId }),
                 )
               }
             />
-            <MoveState wiRef={wiRef} current={wi.state} busy={busy} onMove={(state) => act(`Moved to ${state}`, () => apiPost("/api/wi/state", { conn: wiRef.conn, id: wiRef.id, state }))} />
+            <MoveState wiRef={wiRef} current={wi.state} busy={busy} onMove={(state) => act(`Moved to ${state}`, () => apiPost("/api/wi/state", { conn: wiRef.conn, repo: wiRef.repo, id: wiRef.id, state }))} />
             {!editing && (
               <button onClick={() => setEditing(true)} className="rounded px-2 py-1" style={{ color: "var(--dim)", border: "1px solid var(--border)", background: "var(--panel2)" }}>
                 Edit
@@ -114,7 +114,7 @@ function WiDetailPanel({ wiRef, onClose }: { wiRef: WiRef; onClose: () => void }
               onCancel={() => setEditing(false)}
               onSave={(title, description) =>
                 act("Saved", async () => {
-                  await apiPost("/api/wi/update", { conn: wiRef.conn, id: wiRef.id, title, description });
+                  await apiPost("/api/wi/update", { conn: wiRef.conn, repo: wiRef.repo, id: wiRef.id, title, description });
                   setEditing(false);
                 })
               }
@@ -132,7 +132,7 @@ function WiDetailPanel({ wiRef, onClose }: { wiRef: WiRef; onClose: () => void }
           <Comments
             threads={data.threads}
             busy={busy}
-            onComment={(body) => act("Comment posted", () => apiPost("/api/wi/comment", { conn: wiRef.conn, id: wiRef.id, body }))}
+            onComment={(body) => act("Comment posted", () => apiPost("/api/wi/comment", { conn: wiRef.conn, repo: wiRef.repo, id: wiRef.id, body }))}
           />
 
           {note && (
@@ -156,7 +156,7 @@ function MoveState({ wiRef, current, busy, onMove }: { wiRef: WiRef; current: st
   useEffect(() => {
     if (open && states === null && !loading) {
       setLoading(true);
-      apiGet<string[]>(`/api/wi/states?conn=${encodeURIComponent(wiRef.conn)}&id=${encodeURIComponent(wiRef.id)}`)
+      apiGet<string[]>(`/api/wi/states?conn=${encodeURIComponent(wiRef.conn)}&id=${encodeURIComponent(wiRef.id)}${wiRef.repo ? `&repo=${encodeURIComponent(wiRef.repo)}` : ""}`)
         .then(setStates)
         .catch(() => setStates([]))
         .finally(() => setLoading(false));
@@ -212,7 +212,7 @@ function AssigneePicker({ wiRef, assignee, busy, onPick }: { wiRef: WiRef; assig
   useEffect(() => {
     if (open && users === null && !loading) {
       setLoading(true);
-      apiGet<User[]>(`/api/wi/assignees?conn=${encodeURIComponent(wiRef.conn)}&id=${encodeURIComponent(wiRef.id)}`)
+      apiGet<User[]>(`/api/wi/assignees?conn=${encodeURIComponent(wiRef.conn)}&id=${encodeURIComponent(wiRef.id)}${wiRef.repo ? `&repo=${encodeURIComponent(wiRef.repo)}` : ""}`)
         .then(setUsers)
         .catch(() => setUsers([]))
         .finally(() => setLoading(false));
