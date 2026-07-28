@@ -286,6 +286,16 @@ pub fn unified_diff(old: &str, new: &str) -> (String, i64, i64) {
 
 // ---- client ----
 
+/// The organisation-wide `_apis/git/repositories` response → **connection-relative**
+/// `project/repo` paths. Azure has no single field for this, so it is assembled from the
+/// repository's own `project.name` and `name` — never parsed out of a URL.
+pub fn repositories_from_page(v: &Value) -> Vec<String> {
+    get_arr(v, "value")
+        .iter()
+        .filter_map(|r| Some(format!("{}/{}", get_obj(r, "project").and_then(|p| get_str(p, "name"))?, get_str(r, "name")?)))
+        .collect()
+}
+
 pub struct AzureClient {
     http: reqwest::Client,
     base: String,
@@ -385,11 +395,7 @@ impl AzureClient {
     /// `truncated` is always false.
     async fn discover_repositories(&self) -> Result<RepositoryPage> {
         let v = self.get_json(&format!("{}/_apis/git/repositories?{API}", self.base)).await?;
-        let repositories = get_arr(&v, "value")
-            .iter()
-            .filter_map(|r| Some(format!("{}/{}", get_obj(r, "project").and_then(|p| get_str(p, "name"))?, get_str(r, "name")?)))
-            .collect();
-        Ok(RepositoryPage { repositories, truncated: false })
+        Ok(RepositoryPage { repositories: repositories_from_page(&v), truncated: false })
     }
 
     async fn self_id(&self) -> Result<Option<String>> {
@@ -1073,6 +1079,25 @@ impl ProviderFactory for AzureDevOpsFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discovery_assembles_project_and_repo_rather_than_parsing_a_url() {
+        let page: Value = serde_json::from_str(
+            r#"{ "count": 2, "value": [
+                   { "id": "r1", "name": "pay-api", "project": { "id": "p1", "name": "Payments" },
+                     "remoteUrl": "https://dev.azure.com/contoso/Payments/_git/pay-api" },
+                   { "id": "r2", "name": "ledger", "project": { "id": "p2", "name": "Ledger" } } ] }"#,
+        )
+        .unwrap();
+        let repos = repositories_from_page(&page);
+        assert_eq!(repos, vec!["Payments/pay-api".to_string(), "Ledger/ledger".to_string()]);
+        // `remoteUrl` would be the host-qualified spelling; the address is built from the fields.
+        assert!(repos.iter().all(|r| !r.contains("dev.azure.com")));
+        // And each entry is exactly the project/repo shape `split_project_repo` expects.
+        assert!(repos.iter().all(|r| r.split('/').count() == 2));
+        // A repository without a project can't be addressed, so it's dropped rather than guessed.
+        assert!(repositories_from_page(&serde_json::json!({ "value": [ { "name": "orphan" } ] })).is_empty());
+    }
 
     #[test]
     fn approval_gates_from_timeline_picks_pending_with_stage_name() {

@@ -245,6 +245,40 @@ macro_rules! skip_if_none {
     };
 }
 
+/// A live Bitbucket connection from `FORGETOP_IT_BITBUCKET_*`, or `None` to skip.
+///
+/// Bitbucket is the one provider CI has no secrets for, so this exists to make its discovery
+/// path one `.env` paste away from being covered rather than permanently unverified.
+#[allow(dead_code)]
+pub struct BitbucketIt {
+    pub workspace: String,
+    pub repo: String,
+    pub conn: Arc<dyn ProviderConnection>,
+}
+
+#[allow(dead_code)]
+pub fn bitbucket() -> Option<BitbucketIt> {
+    init();
+    let username = env("FORGETOP_IT_BITBUCKET_USERNAME")?;
+    let app_password = env("FORGETOP_IT_BITBUCKET_APP_PASSWORD")?;
+    let workspace = env("FORGETOP_IT_BITBUCKET_WORKSPACE")?;
+    let repo = env("FORGETOP_IT_BITBUCKET_REPO")?;
+    let conn = Connection {
+        id: "it-bitbucket".into(),
+        provider_type: ProviderType::Bitbucket,
+        display_name: "IT Bitbucket".into(),
+        base_url: None,
+        organization: Some(workspace.clone()),
+        project: None,
+        repository: Some(repo.clone()),
+        username: Some(username),
+        credential_ref: None,
+        repo_scope: None,
+    };
+    let conn = registry().create(&conn, Some(app_password)).ok()?;
+    Some(BitbucketIt { workspace, repo, conn })
+}
+
 /// A live connection with an explicit **repository scope**, for the account-scope tests.
 /// `scope` entries are connection-relative (`owner/repo`, `group/project`, `project/repo`).
 #[allow(dead_code)]

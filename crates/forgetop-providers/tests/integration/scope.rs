@@ -86,12 +86,45 @@ async fn azure_org_level_discovery_returns_project_qualified_repositories() {
         projects.len(),
         projects
     );
+    // On a single-project organisation there is no breadth to observe, so this run confirms the
+    // call shape only. On any org with more than one project it upgrades itself to the real
+    // assertion — no code change needed, just richer credentials.
+    if projects.len() > 1 {
+        assert!(
+            page.repositories.len() >= projects.len(),
+            "org-level discovery spans {} projects, so it is genuinely organisation-wide",
+            projects.len()
+        );
+    } else {
+        eprintln!("NOTE azure: this organisation has one project — breadth across several is unobserved here");
+    }
     let configured = format!("{}/{}", az.project, harness::env("FORGETOP_IT_AZURE_REPO").unwrap_or(az.project.clone()));
     assert!(
         page.repositories.contains(&configured),
         "org-level discovery is missing the configured repo '{configured}' — found {:?}",
         page.repositories
     );
+}
+
+/// Bitbucket has no credentials in CI and none in the sample `.env`, so this skips by default —
+/// it exists so the moment someone fills in `FORGETOP_IT_BITBUCKET_*` the one provider whose
+/// discovery is otherwise assumed becomes verified, rather than staying permanently unproven.
+/// (Its *mapping* is pinned without a network by `discovery_maps_a_workspace_page_…` in
+/// `bitbucket.rs`; what only this can prove is the endpoint and the app-password permission.)
+#[tokio::test]
+async fn bitbucket_discovery_lists_the_workspace() {
+    let Some(bb) = harness::bitbucket() else {
+        eprintln!("SKIP bitbucket: no FORGETOP_IT_BITBUCKET_* credentials (CI has none either)");
+        return;
+    };
+    let page = bb.conn.discover_repositories().await.expect("discover repositories — needs Repositories: Read");
+    assert_well_formed(&page, "bitbucket");
+    let expected = format!("{}/{}", bb.workspace, bb.repo);
+    assert!(page.repositories.contains(&expected), "discovery is missing the configured repo '{expected}'");
+    // A Bitbucket connection is deliberately one workspace, so nothing outside it may appear.
+    for repo in &page.repositories {
+        assert!(repo.starts_with(&format!("{}/", bb.workspace)), "'{repo}' is outside the connection's workspace");
+    }
 }
 
 /// The property that matters for a wide scope: every row comes from a repository that was asked

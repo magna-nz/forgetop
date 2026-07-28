@@ -280,6 +280,11 @@ pub fn map_step(v: &Value) -> PipelineJob {
 
 // ---- client ----
 
+/// One page of `/repositories/{workspace}` → **connection-relative** `workspace/slug` paths.
+pub fn repositories_from_page(v: &Value) -> Vec<String> {
+    get_arr(v, "values").iter().filter_map(|r| get_str(r, "full_name")).collect()
+}
+
 pub struct BitbucketClient {
     http: reqwest::Client,
     base: String,
@@ -313,7 +318,7 @@ impl BitbucketClient {
             let url = format!("{}/repositories/{}?pagelen={PER_PAGE}&page={page}&sort=-updated_on", self.base, self.workspace);
             let v = self.get_json(&url).await?;
             let rows = get_arr(&v, "values").to_vec();
-            repositories.extend(rows.iter().filter_map(|r| get_str(r, "full_name")));
+            repositories.extend(repositories_from_page(&v));
             if rows.len() < PER_PAGE {
                 return Ok(RepositoryPage { repositories, truncated: false });
             }
@@ -625,6 +630,30 @@ impl ProviderFactory for BitbucketFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Bitbucket is the one provider with **no** credentials anywhere — not in `.env`, not in CI —
+    /// so its discovery has no live coverage. This pins the part that can be pinned without a
+    /// network: that a real `/repositories/{workspace}` page maps to the connection-relative
+    /// `workspace/slug` spelling addressing needs, and nothing else.
+    #[test]
+    fn discovery_maps_a_workspace_page_to_connection_relative_paths() {
+        let page: Value = serde_json::from_str(
+            r#"{ "pagelen": 100, "size": 2, "page": 1, "values": [
+                   { "uuid": "{a}", "name": "Mobile", "slug": "mobile", "full_name": "northwind/mobile",
+                     "links": { "html": { "href": "https://bitbucket.org/northwind/mobile" } } },
+                   { "uuid": "{b}", "name": "Payments", "slug": "payments", "full_name": "northwind/payments" } ] }"#,
+        )
+        .unwrap();
+        let repos = repositories_from_page(&page);
+        assert_eq!(repos, vec!["northwind/mobile".to_string(), "northwind/payments".to_string()]);
+        // Never the browse URL, however tempting `links.html.href` looks — that is the
+        // host-qualified spelling, and addressing with it silently matches nothing.
+        assert!(repos.iter().all(|r| !r.contains("bitbucket.org")));
+
+        // A page with nothing usable yields nothing rather than a malformed entry.
+        assert!(repositories_from_page(&serde_json::json!({ "values": [ { "slug": "no-full-name" } ] })).is_empty());
+        assert!(repositories_from_page(&serde_json::json!({})).is_empty());
+    }
 
     #[test]
     fn maps_pull_request_with_reviewers() {

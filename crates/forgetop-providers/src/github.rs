@@ -427,6 +427,13 @@ pub fn map_notification(v: &Value) -> Notification {
     }
 }
 
+/// One page of `/user/repos` → **connection-relative** `owner/repo` paths. `full_name` is
+/// already that spelling, so nothing is derived from a URL here — see [`forgetop_core::repo`]
+/// for why that matters.
+pub fn repositories_from_page(v: &Value) -> Vec<String> {
+    v.as_array().map(|a| a.as_slice()).unwrap_or(&[]).iter().filter_map(|r| get_str(r, "full_name")).collect()
+}
+
 pub struct GitHubClient {
     http: reqwest::Client,
     base: String,
@@ -522,7 +529,7 @@ impl GitHubClient {
             );
             let v = self.get_json(&url).await?;
             let rows = v.as_array().cloned().unwrap_or_default();
-            repositories.extend(rows.iter().filter_map(|r| get_str(r, "full_name")));
+            repositories.extend(repositories_from_page(&v));
             if rows.len() < PER_PAGE {
                 return Ok(RepositoryPage { repositories, truncated: false });
             }
@@ -1108,6 +1115,19 @@ mod tests {
         // Opening `#7` on a two-repository connection must not silently pick one of them.
         let err = GitHubPr(client(&["acme/pay", "acme/ledger"])).get(&ItemRef::new("7")).await.unwrap_err();
         assert!(err.to_string().contains("spans 2 repositories"), "got: {err}");
+    }
+
+    #[test]
+    fn discovery_maps_a_user_repos_page_to_connection_relative_paths() {
+        let page: Value = serde_json::from_str(
+            r#"[ { "id": 1, "name": "pay", "full_name": "acme/pay", "html_url": "https://github.com/acme/pay" },
+                 { "id": 2, "name": "ledger", "full_name": "acme/ledger" } ]"#,
+        )
+        .unwrap();
+        let repos = repositories_from_page(&page);
+        assert_eq!(repos, vec!["acme/pay".to_string(), "acme/ledger".to_string()]);
+        assert!(repos.iter().all(|r| !r.contains("github.com")), "never the host-qualified spelling");
+        assert!(repositories_from_page(&serde_json::json!([])).is_empty());
     }
 
     #[test]

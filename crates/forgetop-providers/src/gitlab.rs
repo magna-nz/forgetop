@@ -359,6 +359,11 @@ pub fn map_todo(v: &Value) -> Notification {
     }
 }
 
+/// One page of `/projects` → **connection-relative** `group/project` paths, subgroups intact.
+pub fn repositories_from_page(v: &Value) -> Vec<String> {
+    v.as_array().map(|a| a.as_slice()).unwrap_or(&[]).iter().filter_map(|r| get_str(r, "path_with_namespace")).collect()
+}
+
 pub struct GitLabClient {
     http: reqwest::Client,
     base: String,
@@ -392,7 +397,7 @@ impl GitLabClient {
             );
             let v = self.get_json(&url).await?;
             let rows = v.as_array().cloned().unwrap_or_default();
-            repositories.extend(rows.iter().filter_map(|r| get_str(r, "path_with_namespace")));
+            repositories.extend(repositories_from_page(&v));
             if rows.len() < PER_PAGE {
                 return Ok(RepositoryPage { repositories, truncated: false });
             }
@@ -916,6 +921,19 @@ impl ProviderFactory for GitLabFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discovery_maps_a_projects_page_and_keeps_subgroups() {
+        let page: Value = serde_json::from_str(
+            r#"[ { "id": 1, "path_with_namespace": "platform/infra", "web_url": "https://gitlab.com/platform/infra" },
+                 { "id": 2, "path_with_namespace": "platform/team/api" } ]"#,
+        )
+        .unwrap();
+        let repos = repositories_from_page(&page);
+        // A subgroup is part of the address — taking "the last two segments" would break it.
+        assert_eq!(repos, vec!["platform/infra".to_string(), "platform/team/api".to_string()]);
+        assert!(repos.iter().all(|r| !r.contains("gitlab.com")));
+    }
 
     #[test]
     fn maps_todo_action_and_target() {
