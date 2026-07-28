@@ -124,12 +124,9 @@ function PrCard({ row, index }: { row: PrRow; index: number }) {
   // The list endpoint no longer pays for the decorated fields (GitHub omits them from `/pulls`
   // entirely), so each visible row fetches its own — bounded by what's on screen rather than
   // multiplied by every repository in the scope.
-  const { data: decoration } = usePrDecoration({
-    conn: row.connection_id,
-    repo: pr.repository,
-    id: pr.id,
-    updatedAt: pr.updated_at,
-  });
+  const { data: decoration } = usePrDecoration(
+    row.needs_decoration ? { conn: row.connection_id, repo: pr.repository, id: pr.id, updatedAt: pr.updated_at } : null,
+  );
   const additions = decoration?.additions ?? pr.additions;
   const deletions = decoration?.deletions ?? pr.deletions;
   const checkStatus = decoration?.checks ?? pr.checks;

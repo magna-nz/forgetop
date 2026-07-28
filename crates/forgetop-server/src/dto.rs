@@ -27,6 +27,9 @@ pub struct PrRow {
     pub connection: String,
     pub provider: ProviderType,
     pub pull_request: PullRequest,
+    /// True when this row's decorated fields are missing and worth fetching per row. Only the
+    /// providers whose list endpoint omits them say yes, so the other three cost nothing.
+    pub needs_decoration: bool,
 }
 
 #[derive(Serialize)]
@@ -120,12 +123,15 @@ pub async fn pull_requests(sections: &SectionService, view: PrView) -> Vec<PrRow
     if let Ok(feeds) = sections.pull_request_feeds().await.inspect_err(|_| log_fetch_failure("dashboard.pull_requests.feeds")) {
         let query = view.query();
         for feed in feeds {
+            // The list skipped decoration, so say whether these rows are actually missing anything.
+            let needs_decoration = feed.source.list_omits_decoration();
             if let Ok(list) = feed.source.list(&query).await.inspect_err(|_| log_fetch_failure("dashboard.pull_requests.list")) {
                 out.extend(list.into_iter().filter(|pr| view.keep(pr)).map(|pr| PrRow {
                     connection_id: feed.connection.connection_id().to_string(),
                     connection: feed.connection.display_name().to_string(),
                     provider: feed.connection.provider_type(),
                     pull_request: pr,
+                    needs_decoration,
                 }));
             }
         }
@@ -261,16 +267,21 @@ fn is_active(status: PipelineRunStatus) -> bool {
     matches!(status, PipelineRunStatus::Queued | PipelineRunStatus::Running)
 }
 
-/// Whether the Command Center classifier reads a *decorated* field for this role, and so whether
-/// the fetch has to pay for decoration.
+/// The query behind every Command Center PR fetch. It **decorates**, for two separate reasons —
+/// either one alone would be enough:
 ///
-/// [`launchpad::classify_pr`] reads `mergeable` only on the `Author` branch — a review-requested
-/// PR goes straight to "needs review" without it. So only the "mine" fetch decorates; asking for
-/// it on the review fetch would be per-PR calls whose result is never read. If the classifier
-/// ever starts reading a decorated field for another role, the test below fails rather than the
-/// feed quietly mis-ranking.
-fn needs_decoration(filter: PullRequestFilter) -> bool {
-    matches!(filter, PullRequestFilter::Mine)
+/// * it *ranks* on `mergeable` ([`launchpad::classify_pr`], author branch), and
+/// * it *renders* `checks` on every PR row, whatever the role.
+///
+/// So "decorate only the rows we rank on" would be wrong here: a review-requested row is never
+/// ranked on a decorated field but is still shown with its check status, and turning decoration
+/// off would blank that out. The cost stays bounded because providers decorate **after** the
+/// cross-scope sort and cap, so it scales with the rows returned, not with the repository scope.
+///
+/// The list page is the opposite case and does turn it off — it fetches decoration per visible
+/// row from `/api/pr/decoration` instead.
+fn launchpad_query(filter: PullRequestFilter, include_completed: bool) -> PullRequestQuery {
+    PullRequestQuery { filter, include_completed, limit: Some(50), decorate: true }
 }
 
 /// Fetches PRs for a role into launchpad inputs. `include_completed` is on for your own PRs so
@@ -278,7 +289,7 @@ fn needs_decoration(filter: PullRequestFilter) -> bool {
 async fn pr_inputs(sections: &SectionService, filter: PullRequestFilter, include_completed: bool) -> Vec<PrInput> {
     let mut out = Vec::new();
     if let Ok(feeds) = sections.pull_request_feeds().await.inspect_err(|_| log_fetch_failure("dashboard.launchpad.pull_request_feeds")) {
-        let query = PullRequestQuery { filter, include_completed, limit: Some(50), decorate: needs_decoration(filter) };
+        let query = launchpad_query(filter, include_completed);
         for feed in feeds {
             if let Ok(list) = feed.source.list(&query).await.inspect_err(|_| log_fetch_failure("dashboard.launchpad.pull_requests")) {
                 out.extend(list.into_iter().map(|pr| PrInput {
@@ -651,29 +662,21 @@ mod tests {
         }
     }
 
-    /// The Command Center ranks PRs, and one of the fields it ranks on — `mergeable` — is a
-    /// *decorated* one. So it must request decoration for exactly the rows it ranks on, and no
-    /// more. If the classifier ever starts reading a decorated field for another role, this
-    /// fails rather than the feed quietly mis-ranking.
+    /// Every Command Center fetch decorates — for *both* roles, not just the ranked one.
+    ///
+    /// It is tempting to decorate only what the classifier ranks on, since `classify_pr` reads
+    /// `mergeable` on the author branch alone. That is a trap: the Command Center also *renders*
+    /// `checks` on every PR row, so a review-requested row fetched undecorated still looks
+    /// wrong — it silently loses its check status. Both halves are asserted below, so removing
+    /// either reason still leaves the other holding this test up.
     #[test]
-    fn the_launchpad_decorates_exactly_the_rows_it_ranks_on() {
-        assert!(needs_decoration(PullRequestFilter::Mine), "the classifier reads mergeable for your own PRs");
-        assert!(!needs_decoration(PullRequestFilter::ReviewRequested));
-        assert!(!needs_decoration(PullRequestFilter::All));
+    fn the_launchpad_decorates_every_fetch_it_ranks_or_renders_from() {
+        for filter in [PullRequestFilter::Mine, PullRequestFilter::ReviewRequested, PullRequestFilter::All] {
+            assert!(launchpad_query(filter, false).decorate, "{filter:?} feeds rows the Command Center renders checks on");
+        }
 
-        // Why review-requested needs none: its bucket doesn't depend on any decorated field.
-        let mut decorated = pr(vec![]);
-        decorated.mergeable = MergeableState::Conflicting;
-        decorated.checks = CheckStatus::Failed;
-        decorated.changed_files = 42;
-        assert_eq!(
-            launchpad::classify_pr(&pr(vec![]), launchpad::PrRole::Reviewer).map(|b| b.key()),
-            launchpad::classify_pr(&decorated, launchpad::PrRole::Reviewer).map(|b| b.key()),
-            "a review-requested PR ranks the same however its decorated fields read"
-        );
-
-        // And why "mine" does need it: the same PR lands in a different bucket on `mergeable`
-        // alone, so fetching it undecorated would rank an approved, mergeable PR as not ready.
+        // Reason 1 — ranking: the same PR lands in a different bucket on `mergeable` alone, so an
+        // undecorated "mine" fetch would rank an approved, mergeable PR as not ready to merge.
         let ready = pr(vec![approver()]);
         let mut conflicting = pr(vec![approver()]);
         conflicting.mergeable = MergeableState::Conflicting;
@@ -681,6 +684,50 @@ mod tests {
             launchpad::classify_pr(&ready, launchpad::PrRole::Author).map(|b| b.key()),
             launchpad::classify_pr(&conflicting, launchpad::PrRole::Author).map(|b| b.key()),
         );
+
+        // Reason 2 — rendering: a review-requested row is never *ranked* on a decorated field…
+        let mut decorated = pr(vec![]);
+        decorated.mergeable = MergeableState::Conflicting;
+        decorated.checks = CheckStatus::Failed;
+        assert_eq!(
+            launchpad::classify_pr(&pr(vec![]), launchpad::PrRole::Reviewer).map(|b| b.key()),
+            launchpad::classify_pr(&decorated, launchpad::PrRole::Reviewer).map(|b| b.key()),
+            "ranking alone would say the review fetch needs no decoration"
+        );
+        // …but `checks` is a decorated field the row is drawn with, which is why it does.
+        assert_ne!(decorated.checks, CheckStatus::None, "checks is what an undecorated row would lose");
+    }
+
+    /// Only the provider whose list endpoint actually omits the decorated fields asks the
+    /// dashboard to fetch them per row. GitLab, Azure and Bitbucket fill everything they have
+    /// from the list payload, so asking them would be one call per row returning what we had.
+    #[tokio::test]
+    async fn only_providers_whose_list_omits_decoration_ask_for_a_per_row_fetch() {
+        use forgetop_providers::{bitbucket, github, gitlab};
+        use forgetop_core::provider::{Connection, ProviderFactory};
+
+        let conn = |provider, organization, repository, username| Connection {
+            id: "c".into(),
+            provider_type: provider,
+            display_name: "c".into(),
+            base_url: None,
+            organization,
+            project: None,
+            repository,
+            username,
+            credential_ref: None,
+            repo_scope: None,
+        };
+        let gh = github::GitHubFactory.create(&conn(ProviderType::GitHub, None, Some("acme/pay".into()), None), None).unwrap();
+        assert!(gh.pull_requests().unwrap().list_omits_decoration(), "GitHub's /pulls omits them");
+
+        let gl = gitlab::GitLabFactory.create(&conn(ProviderType::GitLab, None, Some("g/p".into()), None), None).unwrap();
+        assert!(!gl.pull_requests().unwrap().list_omits_decoration(), "GitLab fills them from the list");
+
+        let bb = bitbucket::BitbucketFactory
+            .create(&conn(ProviderType::Bitbucket, Some("ws".into()), Some("repo".into()), Some("u".into())), None)
+            .unwrap();
+        assert!(!bb.pull_requests().unwrap().list_omits_decoration(), "Bitbucket fills them from the list");
     }
 
     /// A subscribed definition id is only unique within its repository, so each pipeline query

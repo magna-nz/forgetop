@@ -150,6 +150,10 @@ export interface PrRow {
   connection: string;
   provider: ProviderType;
   pull_request: PullRequest;
+  /** True when this row's decorated fields are genuinely missing and worth a per-row fetch. Only
+   *  GitHub says yes — the other providers fill them straight from their list payload, so asking
+   *  them would be one call per row that returns what we already have. */
+  needs_decoration?: boolean;
 }
 
 export interface WiRow {

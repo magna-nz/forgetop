@@ -604,6 +604,10 @@ impl PullRequestSource for GitHubPr {
         }
         Ok(pr)
     }
+    fn list_omits_decoration(&self) -> bool {
+        // `/pulls` omits mergeable_state, changed_files, additions and deletions entirely.
+        true
+    }
     async fn decorate(&self, item: &ItemRef) -> Result<PrDecoration> {
         let repo = self.0.resolve(item)?;
         let id = &item.id;

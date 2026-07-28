@@ -11,6 +11,7 @@ const pr = (id: string, title: string, repo: string | null): any => ({
   connection_id: "c",
   connection: "GH",
   provider: "GitHub",
+  needs_decoration: true,
   pull_request: {
     id,
     repository: repo,

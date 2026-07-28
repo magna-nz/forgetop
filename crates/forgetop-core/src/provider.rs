@@ -284,6 +284,17 @@ pub trait PullRequestSource: Send + Sync {
     async fn commits(&self, _item: &ItemRef) -> Result<Vec<Commit>> {
         Ok(Vec::new())
     }
+    /// Whether this provider's *list* endpoint leaves the decorated fields out, so a caller that
+    /// skipped decoration has to fetch them per row to show them.
+    ///
+    /// `false` by default, and that is the right answer for most providers: GitLab, Azure DevOps
+    /// and Bitbucket fill everything they have straight from the list payload, so asking them for
+    /// decoration is a call per row that returns what the caller already had. GitHub is the
+    /// exception — `/pulls` omits `mergeable_state`, `changed_files`, `additions` and `deletions`
+    /// entirely — and overrides this.
+    fn list_omits_decoration(&self) -> bool {
+        false
+    }
     /// The fields the list endpoint omits, for one pull request. Defaults to projecting them out
     /// of a full [`get`](Self::get) — providers with a cheaper route override it.
     async fn decorate(&self, item: &ItemRef) -> Result<PrDecoration> {
