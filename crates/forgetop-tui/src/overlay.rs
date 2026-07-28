@@ -41,6 +41,9 @@ pub enum Action {
     PickApproval { index: usize },
     /// Confirmed: respond to the chosen pipeline-approval gate.
     RespondApproval { index: usize },
+    /// Open the repository-scope picker for the connection at this index of the section's
+    /// repo-addressed connections.
+    OpenRepoScope { index: usize },
     /// Jump to an item chosen in the command palette. The app re-resolves the full
     /// PR / work item / pipeline from its lists by `(kind, id)` and opens its view.
     OpenItem { kind: PaletteKind, id: String, connection_id: String },
@@ -90,6 +93,9 @@ pub enum PickerKind {
     SortColumn { section: usize },
     /// Choose a pipeline-approval gate + decision; resolves to the picked index.
     ApprovalGate,
+    /// Choose which bound connection's repository scope to edit, when a section has more than
+    /// one repo-addressed connection. Resolves to the picked index.
+    RepoScopeConnection,
     /// Shown on Esc when line comments are buffered but unsubmitted: submit or leave.
     PendingExit,
     /// Choose what `forgetop` opens on launch (a shared preference).
@@ -343,6 +349,7 @@ fn resolve_picker(kind: PickerKind, selected: usize, items: &[String]) -> Action
         }
         PickerKind::SortColumn { section } => Action::SetSort { section, index: selected },
         PickerKind::ApprovalGate => Action::PickApproval { index: selected },
+        PickerKind::RepoScopeConnection => Action::OpenRepoScope { index: selected },
         PickerKind::PendingExit => match selected {
             0 => Action::OpenReviewMenu,
             _ => Action::LeavePrView,
@@ -414,6 +421,23 @@ mod tests {
         let Overlay::Toggle { items, .. } = &o else { panic!("toggle") };
         assert!(items[1].on, "the matched repository was ticked");
         assert!(items[0].on && !items[2].on, "the others are untouched");
+    }
+
+    #[test]
+    fn choosing_which_connection_to_scope_resolves_to_that_connection() {
+        // A section can have more than one repo-addressed connection bound, and the scope is per
+        // connection — so picking the first silently would leave the others unreachable.
+        let mut o = Overlay::Picker {
+            title: "Repositories · which connection?".into(),
+            items: vec!["GitHub".into(), "GitLab".into()],
+            selected: 0,
+            kind: PickerKind::RepoScopeConnection,
+        };
+        o.handle(Key::Down);
+        match o.handle(Key::Enter) {
+            Outcome::Submit(Action::OpenRepoScope { index }) => assert_eq!(index, 1, "the second connection was chosen"),
+            _ => panic!("expected the chosen connection to be opened"),
+        }
     }
 
     #[test]

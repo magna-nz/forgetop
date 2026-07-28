@@ -2649,7 +2649,6 @@ mod tests {
     fn scope(selected: usize, available: Option<usize>, truncated: bool, none_selected: bool) -> crate::app::ScopeSummary {
         crate::app::ScopeSummary {
             connections: vec!["c".into()],
-            connection_label: "GH".into(),
             selected,
             available,
             truncated,

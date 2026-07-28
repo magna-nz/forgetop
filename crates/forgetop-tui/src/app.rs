@@ -179,8 +179,6 @@ pub struct NotifRow {
 pub struct ScopeSummary {
     /// The repo-addressed connections feeding this section.
     pub connections: Vec<String>,
-    /// The first one's display name — what the picker is titled with.
-    pub connection_label: String,
     /// How many repositories are currently fetched from.
     pub selected: usize,
     /// How many the credentials can reach, once discovery has run. `None` until then, so the
@@ -228,6 +226,8 @@ pub struct App {
     /// What discovery found per connection, keyed by connection id. Fetched once at startup and
     /// again whenever the picker opens — the denominator in "5 of 37" has to be a real count.
     pub repo_catalog: HashMap<String, RepositoryPage>,
+    /// Connection ids behind an open "which connection?" scope picker, indexed by its selection.
+    repo_scope_choices: Vec<String>,
     pub status: String,
     pub loading: bool,
     /// Scroll offset for the current list; body height captured during render.
@@ -760,6 +760,7 @@ impl App {
             pipe_state: TableState::default(),
             repo_scope: [None, None, None],
             repo_catalog: HashMap::new(),
+            repo_scope_choices: Vec::new(),
             health: Vec::new(),
             visible: [true; 3],
             status: "Loading…".into(),
@@ -2470,7 +2471,36 @@ impl App {
             self.toast = Some("This section's connections aren't repository-scoped".into());
             return;
         };
-        let Some(connection_id) = summary.connections.first().cloned() else { return };
+        // The scope is per connection, so with more than one bound the user has to say which —
+        // picking the first silently would leave the others' scopes unreachable from the TUI.
+        match summary.connections.as_slice() {
+            [] => {}
+            [only] => self.open_repo_scope_for(only.clone(), deps).await,
+            many => {
+                let cfg = deps.config.snapshot();
+                let items = many
+                    .iter()
+                    .map(|id| cfg.find_connection(id).map(|c| c.display_name.clone()).unwrap_or_else(|| id.clone()))
+                    .collect();
+                self.repo_scope_choices = many.to_vec();
+                self.overlay = Some(Overlay::Picker {
+                    title: "Repositories · which connection?".into(),
+                    items,
+                    selected: 0,
+                    kind: PickerKind::RepoScopeConnection,
+                });
+            }
+        }
+    }
+
+    /// Opens the repository-scope checklist for one connection.
+    async fn open_repo_scope_for(&mut self, connection_id: String, deps: &AppDeps) {
+        let label = deps
+            .config
+            .snapshot()
+            .find_connection(&connection_id)
+            .map(|c| c.display_name.clone())
+            .unwrap_or_else(|| connection_id.clone());
 
         self.toast = Some("Loading repositories…".into());
         if let Ok(page) = deps.sections.discover_repositories(&connection_id).await {
@@ -2493,7 +2523,7 @@ impl App {
             .collect();
         self.toast = None;
         self.overlay = Some(Overlay::Toggle {
-            title: format!("Repositories · {}", summary.connection_label),
+            title: format!("Repositories · {label}"),
             kind: ToggleKind::RepoScope { connection_id },
             // Ticking none is a real choice — fetch nothing — not a state to be prevented.
             min_one: false,
@@ -2555,7 +2585,6 @@ impl App {
             }
             Some(ScopeSummary {
                 connections: conns.iter().map(|c| c.id.clone()).collect(),
-                connection_label: conns[0].display_name.clone(),
                 selected,
                 available: (!pages.is_empty()).then_some(available),
                 truncated: pages.iter().any(|p| p.truncated),
@@ -3703,6 +3732,11 @@ impl App {
             Action::DeleteView => self.delete_view(deps).await,
             Action::PickApproval { index } => self.confirm_approval(index),
             Action::RespondApproval { index } => self.respond_approval(index, deps).await,
+            Action::OpenRepoScope { index } => {
+                if let Some(id) = self.repo_scope_choices.get(index).cloned() {
+                    self.open_repo_scope_for(id, deps).await;
+                }
+            }
             Action::OpenItem { kind, id, connection_id } => self.open_palette_item(kind, id, connection_id, deps).await,
             Action::OpenReviewMenu => self.open_review_submit(),
             Action::LeavePrView => self.screen = self.view_origin(),
