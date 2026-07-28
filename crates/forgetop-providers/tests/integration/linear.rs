@@ -35,13 +35,13 @@ async fn linear_work_item_lifecycle() {
     };
     assert!(found.is_some(), "assigned issue appears in the mine-only list");
 
-    assert_eq!(wi.get(&id).await.expect("get").id, id);
-    let states = wi.available_states(&id).await.expect("available states");
+    assert_eq!(wi.get(&ItemRef::new(&id)).await.expect("get").id, id);
+    let states = wi.available_states(&ItemRef::new(&id)).await.expect("available states");
     assert!(!states.is_empty(), "team reports workflow states");
-    wi.add_comment(&id, &format!("{prefix} note")).await.expect("comment");
-    wi.timeline(&id).await.expect("timeline decodes");
+    wi.add_comment(&ItemRef::new(&id), &format!("{prefix} note")).await.expect("comment");
+    wi.timeline(&ItemRef::new(&id)).await.expect("timeline decodes");
 
-    let candidates = wi.assignable_users(&id).await.expect("assignable users");
+    let candidates = wi.assignable_users(&ItemRef::new(&id)).await.expect("assignable users");
     assert!(!candidates.is_empty(), "workspace reports users");
     let viewer_id = candidates
         .iter()
@@ -49,21 +49,21 @@ async fn linear_work_item_lifecycle() {
         .map(|candidate| candidate.id.clone())
         .expect("authenticated viewer appears in assignable users");
 
-    wi.set_assignee(&id, None).await.expect("unassign");
+    wi.set_assignee(&ItemRef::new(&id), None).await.expect("unassign");
     let unassigned = {
         let wi = &wi;
         let id = id.as_str();
-        harness::poll(harness::POLL_LIST, move || async move { wi.get(id).await.ok().filter(|w| w.assignee.is_none()).map(|_| ()) }).await
+        harness::poll(harness::POLL_LIST, move || async move { wi.get(&ItemRef::new(id)).await.ok().filter(|w| w.assignee.is_none()).map(|_| ()) }).await
     };
     assert!(unassigned.is_some(), "issue reports no assignee");
 
-    wi.set_assignee(&id, Some(&viewer_id)).await.expect("assign");
+    wi.set_assignee(&ItemRef::new(&id), Some(&viewer_id)).await.expect("assign");
     let assigned = {
         let wi = &wi;
         let id = id.as_str();
         let viewer_id = viewer_id.as_str();
         harness::poll(harness::POLL_LIST, move || async move {
-            wi.get(id)
+            wi.get(&ItemRef::new(id))
                 .await
                 .ok()
                 .filter(|w| w.assignee.as_ref().is_some_and(|assignee| assignee.id == viewer_id))
@@ -74,13 +74,13 @@ async fn linear_work_item_lifecycle() {
     assert!(assigned.is_some(), "issue reports the authenticated viewer as assignee");
 
     let new_title = format!("{prefix} edited");
-    wi.update_fields(&id, Some(&new_title), Some("edited body")).await.expect("edit");
+    wi.update_fields(&ItemRef::new(&id), Some(&new_title), Some("edited body")).await.expect("edit");
     let edited = {
         let wi = &wi;
         let id = id.as_str();
         let new_title = new_title.as_str();
         harness::poll(harness::POLL_LIST, move || async move {
-            wi.get(id)
+            wi.get(&ItemRef::new(id))
                 .await
                 .ok()
                 .filter(|w| w.title == new_title && w.description.as_deref().is_some_and(|d| d.contains("edited body")))
@@ -90,10 +90,10 @@ async fn linear_work_item_lifecycle() {
     };
     assert!(edited.is_some(), "issue reports edited fields");
 
-    let current = wi.get(&id).await.expect("get").state;
+    let current = wi.get(&ItemRef::new(&id)).await.expect("get").state;
     if let Some(next) = states.iter().find(|s| !s.eq_ignore_ascii_case(&current)) {
-        wi.set_state(&id, next).await.expect("set state");
-        let after = wi.get(&id).await.expect("get after");
+        wi.set_state(&ItemRef::new(&id), next).await.expect("set state");
+        let after = wi.get(&ItemRef::new(&id)).await.expect("get after");
         assert!(after.state.eq_ignore_ascii_case(next), "state moved to {next}, got {}", after.state);
     }
 

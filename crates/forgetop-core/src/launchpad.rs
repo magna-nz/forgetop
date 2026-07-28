@@ -432,6 +432,7 @@ mod tests {
 
     fn authored(draft: bool, votes: &[ReviewVote], checks: CheckStatus, mergeable: MergeableState) -> PullRequest {
         PullRequest {
+            repository: None,
             id: "1".into(),
             number: Some(1),
             title: "t".into(),
@@ -463,6 +464,7 @@ mod tests {
             definition_name: Some("CI Build".into()),
             awaiting_approval: awaiting,
             run: PipelineRun {
+                repository: None,
                 id: "r".into(),
                 definition_id: "ci".into(),
                 number: Some(1),
@@ -488,6 +490,7 @@ mod tests {
 
     fn wi_row(id: &str, cat: WorkItemStateCategory, updated_h: i64) -> WiInput {
         let wi = WorkItem {
+            repository: None,
             id: id.into(),
             identifier: Some(id.into()),
             title: "wi".into(),

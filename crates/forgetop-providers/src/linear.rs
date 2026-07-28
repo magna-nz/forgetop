@@ -42,6 +42,8 @@ pub fn map_state_category(kind: Option<&str>) -> WorkItemStateCategory {
 pub fn map_issue(v: &Value) -> WorkItem {
     let state = get_obj(v, "state");
     WorkItem {
+        // Linear is team-addressed, not repo-addressed — there is no repository to carry.
+        repository: None,
         id: get_str(v, "id").unwrap_or_else(|| "unknown".into()),
         identifier: get_str(v, "identifier"),
         title: get_str(v, "title").unwrap_or_else(|| "(untitled)".into()),
@@ -81,6 +83,7 @@ fn linear_type_kind(t: &str) -> NotificationKind {
 pub fn map_linear_notification(v: &Value) -> Notification {
     let issue = get_obj(v, "issue");
     Notification {
+        repository: None,
         id: get_str(v, "id").unwrap_or_default(),
         kind: linear_type_kind(&get_str(v, "type").unwrap_or_default()),
         item_type: if issue.is_some() { NotificationItemType::WorkItem } else { NotificationItemType::Other },
@@ -135,19 +138,22 @@ impl WorkItemSource for LinearWi {
         let data = self.0.query(&gql, json!({ "first": query.limit.unwrap_or(50), "filter": filter })).await?;
         Ok(get_obj(&data, "issues").map(|i| get_arr(i, "nodes").iter().map(map_issue).collect()).unwrap_or_default())
     }
-    async fn get(&self, id: &str) -> Result<WorkItem> {
+    async fn get(&self, item: &ItemRef) -> Result<WorkItem> {
+        let id: &str = &item.id;
         let gql = format!("query Issue($id:String!){{ issue(id:$id){{ {ISSUE_FIELDS} }} }}");
         let data = self.0.query(&gql, json!({ "id": id })).await?;
         get_obj(&data, "issue").map(map_issue).ok_or_else(|| Error::NotFound(id.into()))
     }
-    async fn threads(&self, id: &str) -> Result<Vec<CommentThread>> {
+    async fn threads(&self, item: &ItemRef) -> Result<Vec<CommentThread>> {
+        let id: &str = &item.id;
         let gql = "query($id:String!){ issue(id:$id){ comments { nodes { id body createdAt user { id name displayName } } } } }";
         let data = self.0.query(gql, json!({ "id": id })).await?;
         let Some(issue) = get_obj(&data, "issue") else { return Ok(vec![]) };
         let comments: Vec<Comment> = get_obj(issue, "comments").map(|c| get_arr(c, "nodes").iter().map(map_comment).collect()).unwrap_or_default();
         Ok(if comments.is_empty() { vec![] } else { vec![CommentThread { id: format!("issue-{id}"), comments, file_path: None, line: None, is_resolved: false }] })
     }
-    async fn timeline(&self, id: &str) -> Result<Vec<TimelineEvent>> {
+    async fn timeline(&self, item: &ItemRef) -> Result<Vec<TimelineEvent>> {
+        let id: &str = &item.id;
         let gql = "query($id:String!){ issue(id:$id){ history(first:50){ nodes { createdAt actor { id name displayName } toState { name } toAssignee { displayName } } } } }";
         let data = self.0.query(gql, json!({ "id": id })).await?;
         let Some(issue) = get_obj(&data, "issue") else { return Ok(vec![]) };
@@ -164,7 +170,8 @@ impl WorkItemSource for LinearWi {
         out.sort_by_key(|e| e.at);
         Ok(out)
     }
-    async fn set_state(&self, id: &str, state: &str) -> Result<()> {
+    async fn set_state(&self, item: &ItemRef, state: &str) -> Result<()> {
+        let id: &str = &item.id;
         let lookup = "query($id:String!){ issue(id:$id){ team { states { nodes { id name } } } } }";
         let data = self.0.query(lookup, json!({ "id": id })).await?;
         let team = get_obj(&data, "issue").and_then(|i| get_obj(i, "team")).ok_or_else(|| Error::Provider(format!("no team for issue '{id}'")))?;
@@ -178,11 +185,12 @@ impl WorkItemSource for LinearWi {
         let mutation = "mutation($id:String!,$stateId:String!){ issueUpdate(id:$id,input:{stateId:$stateId}){ success } }";
         self.0.query(mutation, json!({ "id": id, "stateId": state_id })).await.map(|_| ())
     }
-    async fn add_comment(&self, id: &str, body: &str) -> Result<()> {
+    async fn add_comment(&self, item: &ItemRef, body: &str) -> Result<()> {
+        let id: &str = &item.id;
         let mutation = "mutation($id:String!,$body:String!){ commentCreate(input:{issueId:$id,body:$body}){ success } }";
         self.0.query(mutation, json!({ "id": id, "body": body })).await.map(|_| ())
     }
-    async fn assignable_users(&self, _work_item_id: &str) -> Result<Vec<User>> {
+    async fn assignable_users(&self, _item: &ItemRef) -> Result<Vec<User>> {
         let data = self
             .0
             .query("query { users(first: 100) { nodes { id name displayName avatarUrl } } }", Value::Null)
@@ -201,7 +209,8 @@ impl WorkItemSource for LinearWi {
             })
             .unwrap_or_default())
     }
-    async fn set_assignee(&self, work_item_id: &str, assignee_id: Option<&str>) -> Result<()> {
+    async fn set_assignee(&self, item: &ItemRef, assignee_id: Option<&str>) -> Result<()> {
+        let work_item_id: &str = &item.id;
         let mutation = "mutation($id:String!,$aid:String){ issueUpdate(id:$id,input:{assigneeId:$aid}){ success } }";
         let data = self.0.query(mutation, json!({ "id": work_item_id, "aid": assignee_id })).await?;
         if get_obj(&data, "issueUpdate").map(|u| get_bool(u, "success")).unwrap_or(false) {
@@ -210,7 +219,8 @@ impl WorkItemSource for LinearWi {
             Err(Error::Provider("Linear issueUpdate did not succeed".into()))
         }
     }
-    async fn update_fields(&self, work_item_id: &str, title: Option<&str>, description: Option<&str>) -> Result<()> {
+    async fn update_fields(&self, item: &ItemRef, title: Option<&str>, description: Option<&str>) -> Result<()> {
+        let work_item_id: &str = &item.id;
         if title.is_none() && description.is_none() {
             return Ok(());
         }
@@ -231,7 +241,8 @@ impl WorkItemSource for LinearWi {
             Err(Error::Provider("Linear issueUpdate did not succeed".into()))
         }
     }
-    async fn available_states(&self, id: &str) -> Result<Vec<String>> {
+    async fn available_states(&self, item: &ItemRef) -> Result<Vec<String>> {
+        let id: &str = &item.id;
         let lookup = "query($id:String!){ issue(id:$id){ team { states { nodes { name } } } } }";
         let data = self.0.query(lookup, json!({ "id": id })).await?;
         let states = get_obj(&data, "issue")

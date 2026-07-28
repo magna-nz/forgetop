@@ -15,6 +15,7 @@ use reqwest::header::AUTHORIZATION;
 use serde_json::{json, Value};
 
 use crate::json::*;
+use crate::scope::{self, fan_out, sort_and_cap};
 
 fn prov<E: std::fmt::Display>(e: E) -> Error {
     Error::Provider(e.to_string())
@@ -44,7 +45,7 @@ fn parse_leading_i64(s: &str) -> i64 {
     s.chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse().unwrap_or(0)
 }
 
-pub fn map_merge_request(v: &Value) -> PullRequest {
+pub fn map_merge_request(v: &Value, repo: Option<&str>) -> PullRequest {
     let state = get_str(v, "state");
     let draft = get_bool(v, "draft") || get_bool(v, "work_in_progress");
     let status = match state.as_deref() {
@@ -64,6 +65,12 @@ pub fn map_merge_request(v: &Value) -> PullRequest {
     };
     let number = get_i64(v, "iid");
     PullRequest {
+        // `references.full` is `group/project!42` — its path half is already connection-relative.
+        repository: get_obj(v, "references")
+            .and_then(|r| get_str(r, "full"))
+            .and_then(|full| full.split_once('!').map(|(path, _)| path.to_string()))
+            .filter(|path| !path.is_empty())
+            .or_else(|| repo.map(str::to_string)),
         id: number.map(|n| n.to_string()).unwrap_or_else(|| "0".into()),
         number,
         title: get_str(v, "title").unwrap_or_else(|| "(untitled)".into()),
@@ -90,11 +97,16 @@ pub fn map_merge_request(v: &Value) -> PullRequest {
     }
 }
 
-pub fn map_issue(v: &Value) -> WorkItem {
+pub fn map_issue(v: &Value, repo: Option<&str>) -> WorkItem {
     let state = get_str(v, "state").unwrap_or_else(|| "opened".into());
     let category = if state == "closed" { WorkItemStateCategory::Completed } else { WorkItemStateCategory::Unstarted };
     let number = get_i64(v, "iid");
     WorkItem {
+        repository: get_obj(v, "references")
+            .and_then(|r| get_str(r, "full"))
+            .and_then(|full| full.split_once('#').map(|(path, _)| path.to_string()))
+            .filter(|path| !path.is_empty())
+            .or_else(|| repo.map(str::to_string)),
         id: number.map(|n| n.to_string()).unwrap_or_else(|| "0".into()),
         identifier: number.map(|n| format!("#{n}")),
         title: get_str(v, "title").unwrap_or_else(|| "(untitled)".into()),
@@ -122,8 +134,9 @@ pub fn gl_pipeline_status(status: Option<&str>) -> PipelineRunStatus {
     }
 }
 
-pub fn map_pipeline(v: &Value) -> PipelineRun {
+pub fn map_pipeline(v: &Value, repo: Option<&str>) -> PipelineRun {
     PipelineRun {
+        repository: repo.map(str::to_string),
         id: get_i64(v, "id").map(|n| n.to_string()).unwrap_or_else(|| "0".into()),
         definition_id: "pipelines".into(),
         number: get_i64(v, "iid").or_else(|| get_i64(v, "id")),
@@ -338,6 +351,8 @@ pub fn map_todo(v: &Value) -> Notification {
         item_id,
         title: target.and_then(|t| get_str(t, "title")).unwrap_or_default(),
         context: get_obj(v, "project").and_then(|p| get_str(p, "path_with_namespace")).unwrap_or_default(),
+        // `path_with_namespace` is already the connection-relative `group/project` spelling.
+        repository: get_obj(v, "project").and_then(|p| get_str(p, "path_with_namespace")),
         url: get_str(v, "target_url").or_else(|| target.and_then(|t| get_str(t, "web_url"))),
         unread: get_str(v, "state").as_deref() == Some("pending"),
         updated_at: get_date(v, "updated_at").or_else(|| get_date(v, "created_at")),
@@ -347,14 +362,43 @@ pub fn map_todo(v: &Value) -> Notification {
 pub struct GitLabClient {
     http: reqwest::Client,
     base: String,
-    project: String,
+    /// The projects this connection fetches from, **connection-relative** (`group/project`,
+    /// un-encoded). A GitLab token reaches every project the account is a member of, so this is
+    /// a user-chosen scope, not a permission boundary.
+    scope: Vec<String>,
     self_username: tokio::sync::Mutex<Option<String>>,
-    project_id: tokio::sync::Mutex<Option<i64>>,
 }
 
 impl GitLabClient {
-    fn project_path(&self, suffix: &str) -> String {
-        format!("{}/projects/{}{}", self.base, self.project, suffix)
+    /// `project` is the connection-relative `group/project` path; GitLab wants it URL-encoded.
+    fn project_path(&self, project: &str, suffix: &str) -> String {
+        format!("{}/projects/{}{}", self.base, encode_project(project), suffix)
+    }
+
+    fn resolve(&self, item: &ItemRef) -> Result<String> {
+        scope::resolve_repo(item, &self.scope)
+    }
+
+    /// Every project the token is a member of, most-recently-active first.
+    async fn discover_repositories(&self) -> Result<RepositoryPage> {
+        const PER_PAGE: usize = 100;
+        const MAX_PAGES: usize = 5;
+        let mut repositories = Vec::new();
+        let mut truncated = false;
+        for page in 1..=MAX_PAGES {
+            let url = format!(
+                "{}/projects?membership=true&order_by=last_activity_at&sort=desc&per_page={PER_PAGE}&page={page}",
+                self.base
+            );
+            let v = self.get_json(&url).await?;
+            let rows = v.as_array().cloned().unwrap_or_default();
+            repositories.extend(rows.iter().filter_map(|r| get_str(r, "path_with_namespace")));
+            if rows.len() < PER_PAGE {
+                return Ok(RepositoryPage { repositories, truncated: false });
+            }
+            truncated = page == MAX_PAGES;
+        }
+        Ok(RepositoryPage { repositories, truncated })
     }
 
     async fn get_json(&self, url: &str) -> Result<Value> {
@@ -386,15 +430,6 @@ impl GitLabClient {
         Ok(guard.clone())
     }
 
-    /// The project's numeric id (cached) — needed to scope the user's todos to this project.
-    async fn project_numeric_id(&self) -> Result<Option<i64>> {
-        let mut guard = self.project_id.lock().await;
-        if guard.is_none() {
-            let v = self.get_json(&self.project_path("")).await?;
-            *guard = get_i64(&v, "id");
-        }
-        Ok(*guard)
-    }
 }
 
 macro_rules! source {
@@ -410,11 +445,9 @@ source!(GitLabNotif);
 #[async_trait]
 impl NotificationSource for GitLabNotif {
     async fn list(&self) -> Result<Vec<Notification>> {
-        // Scope to this project so a todo's iid is safe to open in-app.
-        let mut url = format!("{}/todos?state=pending&per_page=50", self.0.base);
-        if let Some(pid) = self.0.project_numeric_id().await? {
-            url.push_str(&format!("&project_id={pid}"));
-        }
+        // Account-level, like the feed itself: each todo carries the project it belongs to, so an
+        // iid is still safe to open in-app without narrowing the query to one project.
+        let url = format!("{}/todos?state=pending&per_page=50", self.0.base);
         let v = self.0.get_json(&url).await?;
         Ok(v.as_array().unwrap_or(&vec![]).iter().map(map_todo).collect())
     }
@@ -429,18 +462,30 @@ impl NotificationSource for GitLabNotif {
 #[async_trait]
 impl PullRequestSource for GitLabPr {
     async fn list(&self, query: &PullRequestQuery) -> Result<Vec<PullRequest>> {
+        // An empty scope is a real state — the user chose no projects. Fetch nothing.
+        let scope = &self.0.scope;
+        if scope.is_empty() {
+            return Ok(Vec::new());
+        }
         let state = if query.include_completed { "all" } else { "opened" };
-        let url = self.0.project_path(&format!("/merge_requests?state={state}&per_page={}", query.limit.unwrap_or(50)));
-        let v = self.0.get_json(&url).await?;
-        let prs: Vec<PullRequest> = v.as_array().unwrap_or(&vec![]).iter().map(map_merge_request).collect();
+        let per_page = query.limit.unwrap_or(50);
+        let rows = fan_out(scope, "gitlab.pull_requests.list", |project| async move {
+            let url = self.0.project_path(&project, &format!("/merge_requests?state={state}&per_page={per_page}"));
+            let v = self.0.get_json(&url).await?;
+            Ok(v.as_array().unwrap_or(&vec![]).iter().map(|mr| map_merge_request(mr, Some(&project))).collect())
+        })
+        .await;
         let me = if query.filter == PullRequestFilter::All { None } else { self.0.self_username().await? };
-        Ok(apply_pull_request_filter(prs, query.filter, me.as_deref()))
+        let filtered = apply_pull_request_filter(rows, query.filter, me.as_deref());
+        Ok(sort_and_cap(filtered, scope.len(), query.limit, |pr| pr.updated_at))
     }
-    async fn get(&self, id: &str) -> Result<PullRequest> {
-        let v = self.0.get_json(&self.0.project_path(&format!("/merge_requests/{id}"))).await?;
-        let mut pr = map_merge_request(&v);
+    async fn get(&self, item: &ItemRef) -> Result<PullRequest> {
+        let project = self.0.resolve(item)?;
+        let id = &item.id;
+        let v = self.0.get_json(&self.0.project_path(&project, &format!("/merge_requests/{id}"))).await?;
+        let mut pr = map_merge_request(&v, Some(&project));
         // The `reviewers` field carries no vote; fold in `approved_by` so approvers show a tick.
-        if let Ok(approvals) = self.0.get_json(&self.0.project_path(&format!("/merge_requests/{id}/approvals"))).await {
+        if let Ok(approvals) = self.0.get_json(&self.0.project_path(&project, &format!("/merge_requests/{id}/approvals"))).await {
             for a in get_arr(&approvals, "approved_by") {
                 let Some(user) = get_obj(a, "user").map(map_user) else { continue };
                 match pr.reviewers.iter_mut().find(|r| r.user.id == user.id) {
@@ -451,16 +496,19 @@ impl PullRequestSource for GitLabPr {
         }
         Ok(pr)
     }
-    async fn threads(&self, id: &str) -> Result<Vec<CommentThread>> {
+    async fn threads(&self, item: &ItemRef) -> Result<Vec<CommentThread>> {
+        let project = self.0.resolve(item)?;
         // Discussions (not flat notes) so each thread carries its discussion id for replies.
-        let v = self.0.get_json(&self.0.project_path(&format!("/merge_requests/{id}/discussions?per_page=100"))).await?;
+        let v = self.0.get_json(&self.0.project_path(&project, &format!("/merge_requests/{}/discussions?per_page=100", item.id))).await?;
         Ok(discussions_to_thread(v.as_array().unwrap_or(&vec![])))
     }
-    async fn timeline(&self, id: &str) -> Result<Vec<TimelineEvent>> {
+    async fn timeline(&self, item: &ItemRef) -> Result<Vec<TimelineEvent>> {
+        let project = self.0.resolve(item)?;
+        let id = &item.id;
         // State changes (merge/close/reopen) + who approved (approvals API carries no timestamp).
-        let states = self.0.get_json(&self.0.project_path(&format!("/merge_requests/{id}/resource_state_events?per_page=100"))).await?;
+        let states = self.0.get_json(&self.0.project_path(&project, &format!("/merge_requests/{id}/resource_state_events?per_page=100"))).await?;
         let mut out: Vec<TimelineEvent> = states.as_array().unwrap_or(&vec![]).iter().filter_map(map_gl_state_event).collect();
-        if let Ok(approvals) = self.0.get_json(&self.0.project_path(&format!("/merge_requests/{id}/approvals"))).await {
+        if let Ok(approvals) = self.0.get_json(&self.0.project_path(&project, &format!("/merge_requests/{id}/approvals"))).await {
             for a in get_arr(&approvals, "approved_by") {
                 if let Some(user) = get_obj(a, "user").map(map_user) {
                     out.push(TimelineEvent { actor: Some(user), kind: TimelineEventKind::Approved, summary: "approved this".into(), at: None });
@@ -470,48 +518,61 @@ impl PullRequestSource for GitLabPr {
         out.sort_by_key(|e| e.at);
         Ok(out)
     }
-    async fn changes(&self, id: &str) -> Result<Vec<FileChange>> {
-        let v = self.0.get_json(&self.0.project_path(&format!("/merge_requests/{id}/changes"))).await?;
+    async fn changes(&self, item: &ItemRef) -> Result<Vec<FileChange>> {
+        let project = self.0.resolve(item)?;
+        let v = self.0.get_json(&self.0.project_path(&project, &format!("/merge_requests/{}/changes", item.id))).await?;
         Ok(get_arr(&v, "changes").iter().map(map_change).collect())
     }
-    async fn commits(&self, id: &str) -> Result<Vec<Commit>> {
-        let v = self.0.get_json(&self.0.project_path(&format!("/merge_requests/{id}/commits?per_page=100"))).await?;
+    async fn commits(&self, item: &ItemRef) -> Result<Vec<Commit>> {
+        let project = self.0.resolve(item)?;
+        let v = self.0.get_json(&self.0.project_path(&project, &format!("/merge_requests/{}/commits?per_page=100", item.id))).await?;
         Ok(v.as_array().unwrap_or(&vec![]).iter().map(map_gl_commit).collect())
     }
-    async fn commit_changes(&self, _id: &str, sha: &str) -> Result<Vec<FileChange>> {
-        let v = self.0.get_json(&self.0.project_path(&format!("/repository/commits/{sha}/diff?per_page=100"))).await?;
+    async fn commit_changes(&self, item: &ItemRef, sha: &str) -> Result<Vec<FileChange>> {
+        let project = self.0.resolve(item)?;
+        let v = self.0.get_json(&self.0.project_path(&project, &format!("/repository/commits/{sha}/diff?per_page=100"))).await?;
         Ok(v.as_array().unwrap_or(&vec![]).iter().map(map_change).collect())
     }
-    async fn checks(&self, id: &str) -> Result<Vec<CheckRun>> {
-        let mr = self.0.get_json(&self.0.project_path(&format!("/merge_requests/{id}"))).await?;
+    async fn checks(&self, item: &ItemRef) -> Result<Vec<CheckRun>> {
+        let project = self.0.resolve(item)?;
+        let mr = self.0.get_json(&self.0.project_path(&project, &format!("/merge_requests/{}", item.id))).await?;
         let Some(sha) = get_str(&mr, "sha") else { return Ok(vec![]) };
-        let v = self.0.get_json(&self.0.project_path(&format!("/repository/commits/{sha}/statuses?per_page=100"))).await?;
+        let v = self.0.get_json(&self.0.project_path(&project, &format!("/repository/commits/{sha}/statuses?per_page=100"))).await?;
         Ok(v.as_array().unwrap_or(&vec![]).iter().map(map_gl_status).collect())
     }
-    async fn add_comment(&self, id: &str, body: &str) -> Result<()> {
-        self.0.post_json(&self.0.project_path(&format!("/merge_requests/{id}/notes")), json!({ "body": body })).await
+    async fn add_comment(&self, item: &ItemRef, body: &str) -> Result<()> {
+        let project = self.0.resolve(item)?;
+        self.0.post_json(&self.0.project_path(&project, &format!("/merge_requests/{}/notes", item.id)), json!({ "body": body })).await
     }
-    async fn reply_to_thread(&self, id: &str, thread_id: &str, body: &str) -> Result<()> {
+    async fn reply_to_thread(&self, item: &ItemRef, thread_id: &str, body: &str) -> Result<()> {
+        let project = self.0.resolve(item)?;
         // Post a note into the existing discussion so it threads under the original comment.
         self.0
-            .post_json(&self.0.project_path(&format!("/merge_requests/{id}/discussions/{thread_id}/notes")), json!({ "body": body }))
+            .post_json(
+                &self.0.project_path(&project, &format!("/merge_requests/{}/discussions/{thread_id}/notes", item.id)),
+                json!({ "body": body }),
+            )
             .await
     }
-    async fn vote(&self, id: &str, vote: ReviewVote) -> Result<()> {
+    async fn vote(&self, item: &ItemRef, vote: ReviewVote) -> Result<()> {
+        let project = self.0.resolve(item)?;
+        let id = &item.id;
         match vote {
             ReviewVote::Approved | ReviewVote::ApprovedWithSuggestions => {
-                self.0.post_json(&self.0.project_path(&format!("/merge_requests/{id}/approve")), json!({})).await
+                self.0.post_json(&self.0.project_path(&project, &format!("/merge_requests/{id}/approve")), json!({})).await
             }
             ReviewVote::Rejected => {
-                self.0.post_json(&self.0.project_path(&format!("/merge_requests/{id}/unapprove")), json!({})).await
+                self.0.post_json(&self.0.project_path(&project, &format!("/merge_requests/{id}/unapprove")), json!({})).await
             }
             _ => Ok(()),
         }
     }
-    async fn merge(&self, id: &str, options: &MergeOptions) -> Result<()> {
+    async fn merge(&self, item: &ItemRef, options: &MergeOptions) -> Result<()> {
+        let project = self.0.resolve(item)?;
+        let id = &item.id;
         // GitLab requires the head SHA to confirm exactly what's being merged
         // ("SHA must be provided when merging"), so fetch the MR's current head first.
-        let mr = self.0.get_json(&self.0.project_path(&format!("/merge_requests/{id}"))).await?;
+        let mr = self.0.get_json(&self.0.project_path(&project, &format!("/merge_requests/{id}"))).await?;
         let sha = get_str(&mr, "sha")
             .or_else(|| get_obj(&mr, "diff_refs").and_then(|d| get_str(d, "head_sha")))
             .ok_or_else(|| Error::Provider(format!("merge request '{id}' has no head SHA")))?;
@@ -520,22 +581,26 @@ impl PullRequestSource for GitLabPr {
             "should_remove_source_branch": options.delete_source_ref,
             "sha": sha,
         });
-        let url = self.0.project_path(&format!("/merge_requests/{id}/merge"));
+        let url = self.0.project_path(&project, &format!("/merge_requests/{id}/merge"));
         self.0.send(self.0.http.put(&url).json(&body), &format!("PUT {url}")).await
     }
-    async fn revert(&self, id: &str) -> Result<()> {
+    async fn revert(&self, item: &ItemRef) -> Result<()> {
+        let project = self.0.resolve(item)?;
+        let id = &item.id;
         // Revert the MR's merge commit onto its target branch (GitLab commits the revert directly).
-        let mr = self.0.get_json(&self.0.project_path(&format!("/merge_requests/{id}"))).await?;
+        let mr = self.0.get_json(&self.0.project_path(&project, &format!("/merge_requests/{id}"))).await?;
         let sha = get_str(&mr, "merge_commit_sha")
             .ok_or_else(|| Error::Provider(format!("merge request '{id}' has no merge commit to revert")))?;
         let branch = get_str(&mr, "target_branch")
             .ok_or_else(|| Error::Provider(format!("merge request '{id}' has no target branch")))?;
-        let url = self.0.project_path(&format!("/repository/commits/{sha}/revert"));
+        let url = self.0.project_path(&project, &format!("/repository/commits/{sha}/revert"));
         self.0.send(self.0.http.post(&url).json(&json!({ "branch": branch })), &format!("POST {url}")).await
     }
-    async fn submit_review(&self, id: &str, event: ReviewVote, comments: &[LineComment]) -> Result<()> {
+    async fn submit_review(&self, item: &ItemRef, event: ReviewVote, comments: &[LineComment]) -> Result<()> {
+        let project = self.0.resolve(item)?;
+        let id = &item.id;
         // GitLab positions a diff note against the MR's base/head/start commits.
-        let mr = self.0.get_json(&self.0.project_path(&format!("/merge_requests/{id}"))).await?;
+        let mr = self.0.get_json(&self.0.project_path(&project, &format!("/merge_requests/{id}"))).await?;
         let refs = get_obj(&mr, "diff_refs");
         let base = refs.and_then(|r| get_str(r, "base_sha"));
         let head = refs.and_then(|r| get_str(r, "head_sha"));
@@ -554,15 +619,20 @@ impl PullRequestSource for GitLabPr {
                 DiffSide::Old => pos["old_line"] = json!(c.line),
             }
             self.0
-                .post_json(&self.0.project_path(&format!("/merge_requests/{id}/discussions")), json!({ "body": c.body, "position": pos }))
+                .post_json(
+                    &self.0.project_path(&project, &format!("/merge_requests/{id}/discussions")),
+                    json!({ "body": c.body, "position": pos }),
+                )
                 .await?;
         }
         match event {
             ReviewVote::Approved | ReviewVote::ApprovedWithSuggestions => {
-                self.0.post_json(&self.0.project_path(&format!("/merge_requests/{id}/approve")), json!({})).await?;
+                self.0.post_json(&self.0.project_path(&project, &format!("/merge_requests/{id}/approve")), json!({})).await?;
             }
             ReviewVote::Rejected => {
-                self.0.post_json(&self.0.project_path(&format!("/merge_requests/{id}/notes")), json!({ "body": "Requested changes" })).await?;
+                self.0
+                    .post_json(&self.0.project_path(&project, &format!("/merge_requests/{id}/notes")), json!({ "body": "Requested changes" }))
+                    .await?;
             }
             _ => {}
         }
@@ -573,49 +643,65 @@ impl PullRequestSource for GitLabPr {
 #[async_trait]
 impl WorkItemSource for GitLabWi {
     async fn list(&self, query: &WorkItemQuery) -> Result<Vec<WorkItem>> {
-        let state = if query.include_completed { "all" } else { "opened" };
-        let mut url = self.0.project_path(&format!("/issues?state={state}&per_page={}", query.limit.unwrap_or(50)));
-        if query.mine_only {
-            url.push_str("&scope=assigned_to_me");
+        let scope = &self.0.scope;
+        if scope.is_empty() {
+            return Ok(Vec::new());
         }
-        let v = self.0.get_json(&url).await?;
-        Ok(v.as_array().unwrap_or(&vec![]).iter().map(map_issue).collect())
+        let state = if query.include_completed { "all" } else { "opened" };
+        let per_page = query.limit.unwrap_or(50);
+        let mine = query.mine_only;
+        let rows = fan_out(scope, "gitlab.work_items.list", |project| async move {
+            let mut url = self.0.project_path(&project, &format!("/issues?state={state}&per_page={per_page}"));
+            if mine {
+                url.push_str("&scope=assigned_to_me");
+            }
+            let v = self.0.get_json(&url).await?;
+            Ok(v.as_array().unwrap_or(&vec![]).iter().map(|i| map_issue(i, Some(&project))).collect())
+        })
+        .await;
+        Ok(sort_and_cap(rows, scope.len(), query.limit, |wi| wi.updated_at))
     }
-    async fn get(&self, id: &str) -> Result<WorkItem> {
-        let v = self.0.get_json(&self.0.project_path(&format!("/issues/{id}"))).await?;
-        Ok(map_issue(&v))
+    async fn get(&self, item: &ItemRef) -> Result<WorkItem> {
+        let project = self.0.resolve(item)?;
+        let v = self.0.get_json(&self.0.project_path(&project, &format!("/issues/{}", item.id))).await?;
+        Ok(map_issue(&v, Some(&project)))
     }
-    async fn threads(&self, id: &str) -> Result<Vec<CommentThread>> {
-        let v = self.0.get_json(&self.0.project_path(&format!("/issues/{id}/notes?per_page=100"))).await?;
-        Ok(notes_to_thread("issue", id, v.as_array().unwrap_or(&vec![])))
+    async fn threads(&self, item: &ItemRef) -> Result<Vec<CommentThread>> {
+        let project = self.0.resolve(item)?;
+        let v = self.0.get_json(&self.0.project_path(&project, &format!("/issues/{}/notes?per_page=100", item.id))).await?;
+        Ok(notes_to_thread("issue", &item.id, v.as_array().unwrap_or(&vec![])))
     }
-    async fn timeline(&self, id: &str) -> Result<Vec<TimelineEvent>> {
-        let states = self.0.get_json(&self.0.project_path(&format!("/issues/{id}/resource_state_events?per_page=100"))).await?;
+    async fn timeline(&self, item: &ItemRef) -> Result<Vec<TimelineEvent>> {
+        let project = self.0.resolve(item)?;
+        let states = self.0.get_json(&self.0.project_path(&project, &format!("/issues/{}/resource_state_events?per_page=100", item.id))).await?;
         let mut out: Vec<TimelineEvent> = states.as_array().unwrap_or(&vec![]).iter().filter_map(map_gl_state_event).collect();
         out.sort_by_key(|e| e.at);
         Ok(out)
     }
-    async fn set_state(&self, id: &str, state: &str) -> Result<()> {
+    async fn set_state(&self, item: &ItemRef, state: &str) -> Result<()> {
+        let project = self.0.resolve(item)?;
         let event = if state.eq_ignore_ascii_case("closed") || state.eq_ignore_ascii_case("close") { "close" } else { "reopen" };
-        let url = self.0.project_path(&format!("/issues/{id}?state_event={event}"));
+        let url = self.0.project_path(&project, &format!("/issues/{}?state_event={event}", item.id));
         self.0.send(self.0.http.put(&url), &format!("PUT {url}")).await
     }
-    async fn available_states(&self, _id: &str) -> Result<Vec<String>> {
+    async fn available_states(&self, _item: &ItemRef) -> Result<Vec<String>> {
         Ok(vec!["opened".into(), "closed".into()])
     }
-    async fn assignable_users(&self, _id: &str) -> Result<Vec<User>> {
-        let v = self.0.get_json(&self.0.project_path("/members/all?per_page=100")).await?;
+    async fn assignable_users(&self, item: &ItemRef) -> Result<Vec<User>> {
+        let project = self.0.resolve(item)?;
+        let v = self.0.get_json(&self.0.project_path(&project, "/members/all?per_page=100")).await?;
         Ok(v.as_array().unwrap_or(&vec![]).iter().map(map_user).collect())
     }
-    async fn set_assignee(&self, id: &str, assignee_id: Option<&str>) -> Result<()> {
+    async fn set_assignee(&self, item: &ItemRef, assignee_id: Option<&str>) -> Result<()> {
+        let project = self.0.resolve(item)?;
         let assignee_ids = match assignee_id {
             Some(assignee_id) => vec![assignee_id.parse::<i64>().map_err(prov)?],
             None => vec![],
         };
-        let url = self.0.project_path(&format!("/issues/{id}"));
+        let url = self.0.project_path(&project, &format!("/issues/{}", item.id));
         self.0.send(self.0.http.put(&url).json(&json!({ "assignee_ids": assignee_ids })), &format!("PUT {url}")).await
     }
-    async fn update_fields(&self, id: &str, title: Option<&str>, description: Option<&str>) -> Result<()> {
+    async fn update_fields(&self, item: &ItemRef, title: Option<&str>, description: Option<&str>) -> Result<()> {
         let mut body = serde_json::Map::new();
         if let Some(title) = title {
             body.insert("title".into(), json!(title));
@@ -626,38 +712,66 @@ impl WorkItemSource for GitLabWi {
         if body.is_empty() {
             return Ok(());
         }
-        let url = self.0.project_path(&format!("/issues/{id}"));
+        let project = self.0.resolve(item)?;
+        let url = self.0.project_path(&project, &format!("/issues/{}", item.id));
         self.0.send(self.0.http.put(&url).json(&Value::Object(body)), &format!("PUT {url}")).await
     }
-    async fn add_comment(&self, id: &str, body: &str) -> Result<()> {
-        self.0.post_json(&self.0.project_path(&format!("/issues/{id}/notes")), json!({ "body": body })).await
+    async fn add_comment(&self, item: &ItemRef, body: &str) -> Result<()> {
+        let project = self.0.resolve(item)?;
+        self.0.post_json(&self.0.project_path(&project, &format!("/issues/{}/notes", item.id)), json!({ "body": body })).await
     }
 }
 
 #[async_trait]
 impl PipelineSource for GitLabPipe {
     async fn discover(&self) -> Result<Vec<PipelineDefinition>> {
-        // GitLab has no named pipeline definitions — model the project's CI as one.
-        Ok(vec![PipelineDefinition { id: "pipelines".into(), name: "GitLab CI".into(), path: None, url: None }])
+        // GitLab has no named pipeline definitions — model each project's CI as one.
+        Ok(self
+            .0
+            .scope
+            .iter()
+            .map(|project| PipelineDefinition {
+                repository: Some(project.clone()),
+                id: "pipelines".into(),
+                name: "GitLab CI".into(),
+                path: None,
+                url: None,
+            })
+            .collect())
     }
     async fn list_runs(&self, query: &PipelineRunQuery) -> Result<Vec<PipelineRun>> {
-        let mut url = self.0.project_path(&format!("/pipelines?per_page={}", query.limit.unwrap_or(25)));
-        if let Some(b) = &query.branch {
-            url.push_str(&format!("&ref={b}"));
+        let scope: Vec<String> = match &query.repository {
+            Some(project) => vec![project.clone()],
+            None => self.0.scope.clone(),
+        };
+        if scope.is_empty() {
+            return Ok(Vec::new());
         }
-        let v = self.0.get_json(&url).await?;
-        Ok(v.as_array().unwrap_or(&vec![]).iter().map(map_pipeline).collect())
+        let per_page = query.limit.unwrap_or(25);
+        let rows = fan_out(&scope, "gitlab.pipelines.list_runs", |project| async move {
+            let mut url = self.0.project_path(&project, &format!("/pipelines?per_page={per_page}"));
+            if let Some(b) = &query.branch {
+                url.push_str(&format!("&ref={b}"));
+            }
+            let v = self.0.get_json(&url).await?;
+            Ok(v.as_array().unwrap_or(&vec![]).iter().map(|p| map_pipeline(p, Some(&project))).collect())
+        })
+        .await;
+        Ok(sort_and_cap(rows, scope.len(), query.limit, |r| r.started_at))
     }
-    async fn get_run(&self, run_id: &str) -> Result<PipelineRun> {
-        let run_v = self.0.get_json(&self.0.project_path(&format!("/pipelines/{run_id}"))).await?;
-        let mut run = map_pipeline(&run_v);
-        if let Ok(jobs_v) = self.0.get_json(&self.0.project_path(&format!("/pipelines/{run_id}/jobs?per_page=100"))).await {
-            run.stages = stages_from_jobs(jobs_v.as_array().unwrap_or(&vec![]));
+    async fn get_run(&self, run: &ItemRef) -> Result<PipelineRun> {
+        let project = self.0.resolve(run)?;
+        let id = &run.id;
+        let run_v = self.0.get_json(&self.0.project_path(&project, &format!("/pipelines/{id}"))).await?;
+        let mut mapped = map_pipeline(&run_v, Some(&project));
+        if let Ok(jobs_v) = self.0.get_json(&self.0.project_path(&project, &format!("/pipelines/{id}/jobs?per_page=100"))).await {
+            mapped.stages = stages_from_jobs(jobs_v.as_array().unwrap_or(&vec![]));
         }
-        Ok(run)
+        Ok(mapped)
     }
-    async fn logs(&self, run_id: &str, _job_id: Option<&str>) -> Result<String> {
-        let jobs_v = self.0.get_json(&self.0.project_path(&format!("/pipelines/{run_id}/jobs?per_page=100"))).await?;
+    async fn logs(&self, run: &ItemRef, _job_id: Option<&str>) -> Result<String> {
+        let project = self.0.resolve(run)?;
+        let jobs_v = self.0.get_json(&self.0.project_path(&project, &format!("/pipelines/{}/jobs?per_page=100", run.id))).await?;
         let lines: Vec<String> = jobs_v
             .as_array()
             .unwrap_or(&vec![])
@@ -666,19 +780,22 @@ impl PipelineSource for GitLabPipe {
             .collect();
         Ok(lines.join("\n"))
     }
-    async fn trigger(&self, _definition_id: &str, branch: Option<&str>) -> Result<()> {
-        let url = self.0.project_path("/pipeline");
+    async fn trigger(&self, definition: &ItemRef, branch: Option<&str>) -> Result<()> {
+        let project = self.0.resolve(definition)?;
+        let url = self.0.project_path(&project, "/pipeline");
         self.0.post_json(&url, json!({ "ref": branch.unwrap_or("main") })).await
     }
-    async fn cancel_run(&self, run_id: &str) -> Result<()> {
-        self.0.post_json(&self.0.project_path(&format!("/pipelines/{run_id}/cancel")), json!({})).await
+    async fn cancel_run(&self, run: &ItemRef) -> Result<()> {
+        let project = self.0.resolve(run)?;
+        self.0.post_json(&self.0.project_path(&project, &format!("/pipelines/{}/cancel", run.id)), json!({})).await
     }
     fn supports_approvals(&self) -> bool {
         true
     }
-    async fn pending_approvals(&self, run_id: &str) -> Result<Vec<PipelineApproval>> {
+    async fn pending_approvals(&self, run: &ItemRef) -> Result<Vec<PipelineApproval>> {
+        let project = self.0.resolve(run)?;
         // Unplayed `manual` jobs on the pipeline are the actionable gates.
-        let jobs_v = self.0.get_json(&self.0.project_path(&format!("/pipelines/{run_id}/jobs?per_page=100"))).await?;
+        let jobs_v = self.0.get_json(&self.0.project_path(&project, &format!("/pipelines/{}/jobs?per_page=100", run.id))).await?;
         Ok(jobs_v
             .as_array()
             .unwrap_or(&vec![])
@@ -690,13 +807,14 @@ impl PipelineSource for GitLabPipe {
             })
             .collect())
     }
-    async fn respond_approval(&self, _run_id: &str, approval_id: &str, decision: ApprovalDecision, _comment: Option<&str>) -> Result<()> {
+    async fn respond_approval(&self, run: &ItemRef, approval_id: &str, decision: ApprovalDecision, _comment: Option<&str>) -> Result<()> {
+        let project = self.0.resolve(run)?;
         // A manual job is approved by playing it, rejected by cancelling it.
         let action = match decision {
             ApprovalDecision::Approve => "play",
             ApprovalDecision::Reject => "cancel",
         };
-        self.0.post_json(&self.0.project_path(&format!("/jobs/{approval_id}/{action}")), json!({})).await
+        self.0.post_json(&self.0.project_path(&project, &format!("/jobs/{approval_id}/{action}")), json!({})).await
     }
 }
 
@@ -733,6 +851,9 @@ impl ProviderConnection for GitLabConnection {
     fn pipelines(&self) -> Option<Arc<dyn PipelineSource>> {
         Some(Arc::new(GitLabPipe(self.client.clone())))
     }
+    async fn discover_repositories(&self) -> Result<RepositoryPage> {
+        self.client.discover_repositories().await
+    }
     async fn check(&self) -> bool {
         self.client.get_json(&format!("{}/user", self.client.base)).await.is_ok()
     }
@@ -767,10 +888,9 @@ impl ProviderFactory for GitLabFactory {
         gitlab_capabilities()
     }
     fn create(&self, connection: &Connection, secret: Option<String>) -> Result<Arc<dyn ProviderConnection>> {
-        let project = connection
-            .repository
-            .clone()
-            .ok_or_else(|| Error::Config("GitLab connection requires a Project (group/project)".into()))?;
+        // A GitLab token reaches every project the account is a member of, so no project is
+        // required up front — the scope picker fills it in after connecting.
+        let scope = connection.resolve_repo_scope(|| connection.repository.clone());
 
         let mut headers = reqwest::header::HeaderMap::new();
         if let Some(pat) = secret {
@@ -781,9 +901,8 @@ impl ProviderFactory for GitLabFactory {
         let client = Arc::new(GitLabClient {
             http,
             base: connection.base_url.clone().unwrap_or_else(|| "https://gitlab.com/api/v4".into()),
-            project: encode_project(&project),
+            scope,
             self_username: tokio::sync::Mutex::new(None),
-            project_id: tokio::sync::Mutex::new(None),
         });
         Ok(Arc::new(GitLabConnection {
             id: connection.id.clone(),
@@ -842,7 +961,7 @@ mod tests {
                  "web_url": "https://gitlab.com/mr/12" }"#,
         )
         .unwrap();
-        let pr = map_merge_request(&v);
+        let pr = map_merge_request(&v, None);
         assert_eq!(pr.number, Some(12));
         assert_eq!(pr.status, PullRequestStatus::Open);
         assert_eq!(pr.mergeable, MergeableState::Mergeable);
@@ -855,9 +974,9 @@ mod tests {
     #[test]
     fn merged_and_draft_status() {
         let merged: Value = serde_json::from_str(r#"{ "iid": 1, "state": "merged" }"#).unwrap();
-        assert_eq!(map_merge_request(&merged).status, PullRequestStatus::Merged);
+        assert_eq!(map_merge_request(&merged, None).status, PullRequestStatus::Merged);
         let draft: Value = serde_json::from_str(r#"{ "iid": 2, "state": "opened", "work_in_progress": true }"#).unwrap();
-        let d = map_merge_request(&draft);
+        let d = map_merge_request(&draft, None);
         assert_eq!(d.status, PullRequestStatus::Draft);
         assert_eq!(d.mergeable, MergeableState::Blocked);
     }
@@ -865,18 +984,18 @@ mod tests {
     #[test]
     fn maps_issue_states() {
         let open: Value = serde_json::from_str(r#"{ "iid": 5, "title": "Bug", "state": "opened", "assignees": [ { "username": "x", "name": "X" } ] }"#).unwrap();
-        let wi = map_issue(&open);
+        let wi = map_issue(&open, None);
         assert_eq!(wi.identifier.as_deref(), Some("#5"));
         assert_eq!(wi.state_category, WorkItemStateCategory::Unstarted);
         assert_eq!(wi.assignee.unwrap().display_name, "X");
         let closed: Value = serde_json::from_str(r#"{ "iid": 6, "title": "Done", "state": "closed" }"#).unwrap();
-        assert_eq!(map_issue(&closed).state_category, WorkItemStateCategory::Completed);
+        assert_eq!(map_issue(&closed, None).state_category, WorkItemStateCategory::Completed);
     }
 
     #[test]
     fn maps_pipeline_and_groups_jobs_into_stages() {
         let p: Value = serde_json::from_str(r#"{ "id": 100, "iid": 7, "status": "running", "ref": "main", "sha": "abc" }"#).unwrap();
-        let run = map_pipeline(&p);
+        let run = map_pipeline(&p, None);
         assert_eq!(run.status, PipelineRunStatus::Running);
         assert_eq!(run.branch.as_deref(), Some("main"));
 

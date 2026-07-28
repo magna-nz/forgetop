@@ -20,7 +20,9 @@ pub enum Action {
     PrReply(String),
     WiSetState(String),
     WiComment(String),
-    PipelineTrigger { connection_id: String, definition_id: String, branch: Option<String>, label: String },
+    /// `repo` is the definition's **connection-relative** repository — a connection spanning
+    /// several has no single "own" one to fall back on, so the target must be carried explicitly.
+    PipelineTrigger { connection_id: String, repo: Option<String>, definition_id: String, branch: Option<String>, label: String },
     RemoveConnection { id: String, label: String },
     /// Result of a checklist: the ids that ended up ticked, tagged with what they are.
     ApplyToggle { kind: ToggleKind, ids: Vec<String> },

@@ -13,6 +13,7 @@ use serde_json::{json, Value};
 use similar::{ChangeTag, TextDiff};
 
 use crate::json::*;
+use crate::scope::{self, fan_out, sort_and_cap};
 
 const API: &str = "api-version=7.1";
 
@@ -59,7 +60,7 @@ pub fn to_vote(vote: ReviewVote) -> i64 {
     }
 }
 
-pub fn map_pull_request(v: &Value) -> PullRequest {
+pub fn map_pull_request(v: &Value, repo: Option<&str>) -> PullRequest {
     let is_draft = get_bool(v, "isDraft");
     let status = match get_str(v, "status").as_deref() {
         Some("completed") => PullRequestStatus::Merged,
@@ -79,6 +80,10 @@ pub fn map_pull_request(v: &Value) -> PullRequest {
     };
     let id = get_i64(v, "pullRequestId");
     PullRequest {
+        // `repository.project.name` + `repository.name` is the connection-relative `project/repo`.
+        repository: get_obj(v, "repository")
+            .and_then(|r| Some(format!("{}/{}", get_obj(r, "project").and_then(|p| get_str(p, "name"))?, get_str(r, "name")?)))
+            .or_else(|| repo.map(str::to_string)),
         id: id.map(|n| n.to_string()).unwrap_or_else(|| "0".into()),
         number: id,
         title: get_str(v, "title").unwrap_or_else(|| "(untitled)".into()),
@@ -119,11 +124,14 @@ fn field_str(fields: &Value, name: &str) -> Option<String> {
     fields.get(name).and_then(|x| x.as_str()).map(|s| s.to_string())
 }
 
-pub fn map_work_item(v: &Value) -> WorkItem {
+/// `project` is the Team Project the item belongs to — Azure work items are project-addressed,
+/// not repo-addressed, so a bare project name is the correct address here.
+pub fn map_work_item(v: &Value, project: Option<&str>) -> WorkItem {
     let fields = get_obj(v, "fields").unwrap_or(v);
     let state = field_str(fields, "System.State").unwrap_or_else(|| "New".into());
     let id = get_i64(v, "id");
     WorkItem {
+        repository: field_str(fields, "System.TeamProject").or_else(|| project.map(str::to_string)),
         id: id.map(|n| n.to_string()).unwrap_or_else(|| "0".into()),
         identifier: id.map(|n| n.to_string()),
         title: field_str(fields, "System.Title").unwrap_or_else(|| "(untitled)".into()),
@@ -138,8 +146,10 @@ pub fn map_work_item(v: &Value) -> WorkItem {
     }
 }
 
-pub fn map_definition(v: &Value) -> PipelineDefinition {
+/// Azure pipelines are project-addressed too, so `project` is a bare Team Project name.
+pub fn map_definition(v: &Value, project: Option<&str>) -> PipelineDefinition {
     PipelineDefinition {
+        repository: get_obj(v, "project").and_then(|p| get_str(p, "name")).or_else(|| project.map(str::to_string)),
         id: get_i64(v, "id").map(|n| n.to_string()).unwrap_or_else(|| "0".into()),
         name: get_str(v, "name").unwrap_or_else(|| "(pipeline)".into()),
         path: get_str(v, "path"),
@@ -147,7 +157,7 @@ pub fn map_definition(v: &Value) -> PipelineDefinition {
     }
 }
 
-pub fn map_build(v: &Value) -> PipelineRun {
+pub fn map_build(v: &Value, project: Option<&str>) -> PipelineRun {
     let status = match get_str(v, "status").as_deref() {
         Some("completed") => match get_str(v, "result").as_deref() {
             Some("succeeded") => PipelineRunStatus::Succeeded,
@@ -159,6 +169,7 @@ pub fn map_build(v: &Value) -> PipelineRun {
         _ => PipelineRunStatus::Queued,
     };
     PipelineRun {
+        repository: get_obj(v, "project").and_then(|p| get_str(p, "name")).or_else(|| project.map(str::to_string)),
         id: get_i64(v, "id").map(|n| n.to_string()).unwrap_or_else(|| "0".into()),
         definition_id: get_obj(v, "definition").and_then(|d| get_i64(d, "id")).map(|n| n.to_string()).unwrap_or_else(|| "0".into()),
         number: None,
@@ -278,9 +289,25 @@ pub fn unified_diff(old: &str, new: &str) -> (String, i64, i64) {
 pub struct AzureClient {
     http: reqwest::Client,
     base: String,
-    project: String,
-    repository: String,
+    /// The repositories this connection fetches from, **connection-relative** (`project/repo`).
+    /// An Azure PAT reaches every repository in the organization, so this is a user-chosen scope.
+    scope: Vec<String>,
     self_id: tokio::sync::Mutex<Option<String>>,
+}
+
+/// Splits a connection-relative Azure scope entry into its two address components. Azure project
+/// and repository names cannot themselves contain `/`, so the first separator is the boundary.
+fn split_project_repo(entry: &str) -> (String, String) {
+    match entry.split_once('/') {
+        Some((project, repo)) => (project.to_string(), repo.to_string()),
+        // A bare name addresses a Team Project whose repo is named after it (Azure's own default).
+        None => (entry.to_string(), entry.to_string()),
+    }
+}
+
+/// The Team Project half of a scope entry. Work items and pipelines are addressed by this.
+fn project_part(entry: &str) -> String {
+    split_project_repo(entry).0
 }
 
 impl AzureClient {
@@ -300,8 +327,69 @@ impl AzureClient {
         resp.json().await.map_err(prov)
     }
 
-    fn pr_base(&self, id: &str) -> String {
-        format!("{}/{}/_apis/git/repositories/{}/pullRequests/{}", self.base, self.project, self.repository, id)
+    /// `repo` is the connection-relative `project/repo` scope entry.
+    fn pr_base(&self, repo: &str, id: &str) -> String {
+        let (project, repository) = split_project_repo(repo);
+        format!("{}/{project}/_apis/git/repositories/{repository}/pullRequests/{id}", self.base)
+    }
+
+    fn git_base(&self, repo: &str) -> String {
+        let (project, repository) = split_project_repo(repo);
+        format!("{}/{project}/_apis/git/repositories/{repository}", self.base)
+    }
+
+    fn resolve(&self, item: &ItemRef) -> Result<String> {
+        scope::resolve_repo(item, &self.scope)
+    }
+
+    /// The distinct Team Projects the scope covers, in first-seen order.
+    ///
+    /// Work items and pipelines are addressed **per project**, while the scope is per repository —
+    /// so fanning them out over the scope directly would query a project once per repository it
+    /// contains and return every item twice. Deduplicating here is what stops that.
+    fn projects(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for entry in &self.scope {
+            let project = project_part(entry);
+            if !out.contains(&project) {
+                out.push(project);
+            }
+        }
+        out
+    }
+
+    /// The Team Project to address a project-scoped call at.
+    fn resolve_project(&self, item: &ItemRef) -> Result<String> {
+        if let Some(repo) = &item.repo {
+            return Ok(project_part(repo));
+        }
+        let projects = self.projects();
+        match projects.as_slice() {
+            [only] => Ok(only.clone()),
+            [] => Err(Error::Config(
+                "this connection has no repositories selected — choose some in the repository scope picker".into(),
+            )),
+            _ => Err(Error::Config(format!(
+                "this connection spans {} projects, so '{}' needs the project it belongs to",
+                projects.len(),
+                item.id
+            ))),
+        }
+    }
+
+    /// Every Git repository in the organization, as connection-relative `project/repo`.
+    ///
+    /// The project segment is deliberately omitted from the path: `{org}/_apis/git/repositories`
+    /// lists organization-wide, which is what makes one connection cover the whole account.
+    /// Azure returns the full set in a single response, so there is nothing to paginate and
+    /// `truncated` is always false.
+    async fn discover_repositories(&self) -> Result<RepositoryPage> {
+        let v = self.get_json(&format!("{}/_apis/git/repositories?{API}", self.base)).await?;
+        let repositories = get_arr(&v, "value")
+            .iter()
+            .filter_map(|r| Some(format!("{}/{}", get_obj(r, "project").and_then(|p| get_str(p, "name"))?, get_str(r, "name")?)))
+            .collect();
+        Ok(RepositoryPage { repositories, truncated: false })
     }
 
     async fn self_id(&self) -> Result<Option<String>> {
@@ -313,17 +401,19 @@ impl AzureClient {
         Ok(guard.clone())
     }
 
-    async fn item_content(&self, path: &str, commit: &str) -> Option<String> {
+    async fn item_content(&self, repo: &str, path: &str, commit: &str) -> Option<String> {
         let url = format!(
-            "{}/{}/_apis/git/repositories/{}/items?path={}&versionDescriptor.versionType=commit&versionDescriptor.version={}&includeContent=true&{API}",
-            self.base, self.project, self.repository, urlencoding(path), commit
+            "{}/items?path={}&versionDescriptor.versionType=commit&versionDescriptor.version={}&includeContent=true&{API}",
+            self.git_base(repo),
+            urlencoding(path),
+            commit
         );
         let v = self.get_json(&url).await.ok()?;
         get_str(&v, "content")
     }
 
-    async fn read_stages(&self, run_id: &str) -> Vec<PipelineStage> {
-        let url = format!("{}/{}/_apis/build/builds/{run_id}/timeline?{API}", self.base, self.project);
+    async fn read_stages(&self, project: &str, run_id: &str) -> Vec<PipelineStage> {
+        let url = format!("{}/{project}/_apis/build/builds/{run_id}/timeline?{API}", self.base);
         let Ok(v) = self.get_json(&url).await else { return vec![] };
         let records: Vec<&Value> = get_arr(&v, "records").iter().collect();
         records
@@ -364,8 +454,8 @@ impl AzureClient {
     }
 
     /// Pending approval gates on a build run, read from its timeline.
-    async fn approval_gates(&self, run_id: &str) -> Result<Vec<PipelineApproval>> {
-        let url = format!("{}/{}/_apis/build/builds/{run_id}/timeline?{API}", self.base, self.project);
+    async fn approval_gates(&self, project: &str, run_id: &str) -> Result<Vec<PipelineApproval>> {
+        let url = format!("{}/{project}/_apis/build/builds/{run_id}/timeline?{API}", self.base);
         let v = self.get_json(&url).await?;
         Ok(approval_gates_from_timeline(get_arr(&v, "records")))
     }
@@ -431,23 +521,36 @@ impl AzureWi {
 #[async_trait]
 impl PullRequestSource for AzurePr {
     async fn list(&self, query: &PullRequestQuery) -> Result<Vec<PullRequest>> {
+        let scope = &self.0.scope;
+        if scope.is_empty() {
+            return Ok(Vec::new());
+        }
         let status = if query.include_completed { "all" } else { "active" };
-        let url = format!(
-            "{}/{}/_apis/git/repositories/{}/pullrequests?searchCriteria.status={status}&$top={}&{API}",
-            self.0.base, self.0.project, self.0.repository, query.limit.unwrap_or(50)
-        );
-        let v = self.0.get_json(&url).await?;
-        let prs: Vec<PullRequest> = get_arr(&v, "value").iter().map(map_pull_request).collect();
+        let top = query.limit.unwrap_or(50);
+        let rows = fan_out(scope, "azure.pull_requests.list", |repo| async move {
+            let (project, repository) = split_project_repo(&repo);
+            let url = format!(
+                "{}/{project}/_apis/git/repositories/{repository}/pullrequests?searchCriteria.status={status}&$top={top}&{API}",
+                self.0.base
+            );
+            let v = self.0.get_json(&url).await?;
+            Ok(get_arr(&v, "value").iter().map(|pr| map_pull_request(pr, Some(&repo))).collect())
+        })
+        .await;
         let me = if query.filter == PullRequestFilter::All { None } else { self.0.self_id().await? };
-        Ok(apply_pull_request_filter(prs, query.filter, me.as_deref()))
+        let filtered = apply_pull_request_filter(rows, query.filter, me.as_deref());
+        // Azure's PR payload carries no `updated_at`, so creation date is the best recency key.
+        Ok(sort_and_cap(filtered, scope.len(), query.limit, |pr| pr.created_at))
     }
-    async fn get(&self, id: &str) -> Result<PullRequest> {
-        Ok(map_pull_request(&self.0.get_json(&format!("{}?{API}", self.0.pr_base(id))).await?))
+    async fn get(&self, item: &ItemRef) -> Result<PullRequest> {
+        let repo = self.0.resolve(item)?;
+        Ok(map_pull_request(&self.0.get_json(&format!("{}?{API}", self.0.pr_base(&repo, &item.id))).await?, Some(&repo)))
     }
-    async fn timeline(&self, id: &str) -> Result<Vec<TimelineEvent>> {
+    async fn timeline(&self, item: &ItemRef) -> Result<Vec<TimelineEvent>> {
+        let repo = self.0.resolve(item)?;
         // Azure has no single timeline endpoint; derive events from the reviewers' votes and the
         // PR's completion status (vote timestamps aren't exposed, so those events carry no time).
-        let pr = self.0.get_json(&format!("{}?{API}", self.0.pr_base(id))).await?;
+        let pr = self.0.get_json(&format!("{}?{API}", self.0.pr_base(&repo, &item.id))).await?;
         let mut out = Vec::new();
         for r in get_arr(&pr, "reviewers") {
             let (kind, summary) = match get_i64(r, "vote").unwrap_or(0) {
@@ -476,8 +579,9 @@ impl PullRequestSource for AzurePr {
         out.sort_by_key(|e| e.at);
         Ok(out)
     }
-    async fn threads(&self, id: &str) -> Result<Vec<CommentThread>> {
-        let v = self.0.get_json(&format!("{}/threads?{API}", self.0.pr_base(id))).await?;
+    async fn threads(&self, item: &ItemRef) -> Result<Vec<CommentThread>> {
+        let repo = self.0.resolve(item)?;
+        let v = self.0.get_json(&format!("{}/threads?{API}", self.0.pr_base(&repo, &item.id))).await?;
         Ok(get_arr(&v, "value")
             .iter()
             .map(|t| CommentThread {
@@ -497,8 +601,10 @@ impl PullRequestSource for AzurePr {
             })
             .collect())
     }
-    async fn changes(&self, id: &str) -> Result<Vec<FileChange>> {
-        let iters = self.0.get_json(&format!("{}/iterations?{API}", self.0.pr_base(id))).await?;
+    async fn changes(&self, item: &ItemRef) -> Result<Vec<FileChange>> {
+        let repo = self.0.resolve(item)?;
+        let pr_base = self.0.pr_base(&repo, &item.id);
+        let iters = self.0.get_json(&format!("{pr_base}/iterations?{API}")).await?;
         let iterations = get_arr(&iters, "value");
         let Some(last) = iterations.last() else { return Ok(vec![]) };
         let new_commit = get_obj(last, "sourceRefCommit").and_then(|c| get_str(c, "commitId"));
@@ -507,7 +613,7 @@ impl PullRequestSource for AzurePr {
             .or_else(|| get_obj(last, "targetRefCommit").and_then(|c| get_str(c, "commitId")));
         let iter_id = get_i64(last, "id").unwrap_or(1);
 
-        let changes = self.0.get_json(&format!("{}/iterations/{iter_id}/changes?{API}", self.0.pr_base(id))).await?;
+        let changes = self.0.get_json(&format!("{pr_base}/iterations/{iter_id}/changes?{API}")).await?;
         let mut out = Vec::new();
         for raw in get_arr(&changes, "changeEntries") {
             if get_obj(raw, "item").map(|i| get_bool(i, "isFolder")).unwrap_or(false) {
@@ -517,14 +623,14 @@ impl PullRequestSource for AzurePr {
             let old = if matches!(change.kind, FileChangeKind::Added) {
                 Some(String::new())
             } else if let Some(c) = &base_commit {
-                self.0.item_content(&change.path, c).await
+                self.0.item_content(&repo, &change.path, c).await
             } else {
                 None
             };
             let new = if matches!(change.kind, FileChangeKind::Deleted) {
                 Some(String::new())
             } else if let Some(c) = &new_commit {
-                self.0.item_content(&change.path, c).await
+                self.0.item_content(&repo, &change.path, c).await
             } else {
                 None
             };
@@ -538,17 +644,19 @@ impl PullRequestSource for AzurePr {
         }
         Ok(out)
     }
-    async fn commits(&self, id: &str) -> Result<Vec<Commit>> {
-        let v = self.0.get_json(&format!("{}/commits?{API}", self.0.pr_base(id))).await?;
+    async fn commits(&self, item: &ItemRef) -> Result<Vec<Commit>> {
+        let repo = self.0.resolve(item)?;
+        let v = self.0.get_json(&format!("{}/commits?{API}", self.0.pr_base(&repo, &item.id))).await?;
         Ok(get_arr(&v, "value").iter().map(map_az_commit).collect())
     }
-    async fn commit_changes(&self, _id: &str, sha: &str) -> Result<Vec<FileChange>> {
+    async fn commit_changes(&self, item: &ItemRef, sha: &str) -> Result<Vec<FileChange>> {
+        let repo = self.0.resolve(item)?;
         // Diff the commit against its first parent, computing each file's patch from item content
         // (same approach as the whole-PR `changes`). A root commit diffs against an empty tree.
-        let repo = format!("{}/{}/_apis/git/repositories/{}", self.0.base, self.0.project, self.0.repository);
-        let commit = self.0.get_json(&format!("{repo}/commits/{sha}?{API}")).await?;
+        let git = self.0.git_base(&repo);
+        let commit = self.0.get_json(&format!("{git}/commits/{sha}?{API}")).await?;
         let parent = get_arr(&commit, "parents").first().and_then(|p| p.as_str().map(String::from));
-        let changes = self.0.get_json(&format!("{repo}/commits/{sha}/changes?{API}")).await?;
+        let changes = self.0.get_json(&format!("{git}/commits/{sha}/changes?{API}")).await?;
         let mut out = Vec::new();
         for raw in get_arr(&changes, "changes") {
             if get_obj(raw, "item").map(|i| get_bool(i, "isFolder")).unwrap_or(false) {
@@ -558,14 +666,14 @@ impl PullRequestSource for AzurePr {
             let old = if matches!(change.kind, FileChangeKind::Added) {
                 Some(String::new())
             } else if let Some(p) = &parent {
-                self.0.item_content(&change.path, p).await
+                self.0.item_content(&repo, &change.path, p).await
             } else {
                 Some(String::new())
             };
             let new = if matches!(change.kind, FileChangeKind::Deleted) {
                 Some(String::new())
             } else {
-                self.0.item_content(&change.path, sha).await
+                self.0.item_content(&repo, &change.path, sha).await
             };
             if let (Some(o), Some(n)) = (old, new) {
                 let (patch, adds, dels) = unified_diff(&o, &n);
@@ -577,44 +685,52 @@ impl PullRequestSource for AzurePr {
         }
         Ok(out)
     }
-    async fn checks(&self, id: &str) -> Result<Vec<CheckRun>> {
-        let v = self.0.get_json(&format!("{}/statuses?{API}", self.0.pr_base(id))).await?;
+    async fn checks(&self, item: &ItemRef) -> Result<Vec<CheckRun>> {
+        let repo = self.0.resolve(item)?;
+        let v = self.0.get_json(&format!("{}/statuses?{API}", self.0.pr_base(&repo, &item.id))).await?;
         Ok(get_arr(&v, "value").iter().map(map_az_status).collect())
     }
-    async fn add_comment(&self, id: &str, body: &str) -> Result<()> {
+    async fn add_comment(&self, item: &ItemRef, body: &str) -> Result<()> {
+        let repo = self.0.resolve(item)?;
         self.0
-            .post_json_read(&format!("{}/threads?{API}", self.0.pr_base(id)), json!({ "comments": [ { "content": body, "commentType": 1 } ], "status": 1 }))
+            .post_json_read(
+                &format!("{}/threads?{API}", self.0.pr_base(&repo, &item.id)),
+                json!({ "comments": [ { "content": body, "commentType": 1 } ], "status": 1 }),
+            )
             .await
             .map(|_| ())
     }
-    async fn reply_to_thread(&self, id: &str, thread_id: &str, body: &str) -> Result<()> {
+    async fn reply_to_thread(&self, item: &ItemRef, thread_id: &str, body: &str) -> Result<()> {
+        let repo = self.0.resolve(item)?;
         // Append a reply comment to an existing thread; parentCommentId 1 is the thread's root.
         self.0
             .post_json_read(
-                &format!("{}/threads/{thread_id}/comments?{API}", self.0.pr_base(id)),
+                &format!("{}/threads/{thread_id}/comments?{API}", self.0.pr_base(&repo, &item.id)),
                 json!({ "content": body, "parentCommentId": 1, "commentType": 1 }),
             )
             .await
             .map(|_| ())
     }
-    async fn vote(&self, id: &str, vote: ReviewVote) -> Result<()> {
+    async fn vote(&self, item: &ItemRef, vote: ReviewVote) -> Result<()> {
+        let repo = self.0.resolve(item)?;
         let self_id = self.0.self_id().await?.ok_or_else(|| Error::Provider("could not resolve authenticated user".into()))?;
-        let url = format!("{}/reviewers/{self_id}?{API}", self.0.pr_base(id));
+        let url = format!("{}/reviewers/{self_id}?{API}", self.0.pr_base(&repo, &item.id));
         let resp = self.0.http.put(&url).json(&json!({ "vote": to_vote(vote) })).send().await.map_err(prov)?;
         if !resp.status().is_success() {
             return Err(Error::Provider(format!("PUT {url} -> {}", resp.status())));
         }
         Ok(())
     }
-    async fn merge(&self, id: &str, options: &MergeOptions) -> Result<()> {
-        let pr = self.0.get_json(&format!("{}?{API}", self.0.pr_base(id))).await?;
+    async fn merge(&self, item: &ItemRef, options: &MergeOptions) -> Result<()> {
+        let repo = self.0.resolve(item)?;
+        let pr = self.0.get_json(&format!("{}?{API}", self.0.pr_base(&repo, &item.id))).await?;
         let source = get_obj(&pr, "lastMergeSourceCommit").and_then(|c| get_str(c, "commitId"));
         let strategy = match options.strategy {
             MergeStrategy::Squash => "squash",
             MergeStrategy::Rebase => "rebase",
             MergeStrategy::Merge => "noFastForward",
         };
-        let url = format!("{}?{API}", self.0.pr_base(id));
+        let url = format!("{}?{API}", self.0.pr_base(&repo, &item.id));
         let body = json!({ "status": "completed", "lastMergeSourceCommit": { "commitId": source }, "completionOptions": { "mergeStrategy": strategy, "deleteSourceBranch": options.delete_source_ref } });
         let resp = self.0.http.patch(&url).json(&body).send().await.map_err(prov)?;
         if !resp.status().is_success() {
@@ -622,13 +738,15 @@ impl PullRequestSource for AzurePr {
         }
         Ok(())
     }
-    async fn revert(&self, id: &str) -> Result<()> {
+    async fn revert(&self, item: &ItemRef) -> Result<()> {
+        let repo = self.0.resolve(item)?;
+        let id = &item.id;
         // Azure creates the revert on a new branch off the PR's target; the user opens a PR from it.
-        let pr = self.0.get_json(&format!("{}?{API}", self.0.pr_base(id))).await?;
+        let pr = self.0.get_json(&format!("{}?{API}", self.0.pr_base(&repo, id))).await?;
         let onto = get_str(&pr, "targetRefName")
             .ok_or_else(|| Error::Provider(format!("pull request '{id}' has no target branch")))?;
         let pr_id: i64 = id.parse().map_err(|_| Error::Provider(format!("pull request id '{id}' is not numeric")))?;
-        let url = format!("{}/{}/_apis/git/repositories/{}/reverts?{API}", self.0.base, self.0.project, self.0.repository);
+        let url = format!("{}/reverts?{API}", self.0.git_base(&repo));
         let body = json!({
             "generatedRefName": format!("refs/heads/revert-pr-{id}"),
             "ontoRefName": onto,
@@ -645,6 +763,12 @@ impl PullRequestSource for AzurePr {
 #[async_trait]
 impl WorkItemSource for AzureWi {
     async fn list(&self, query: &WorkItemQuery) -> Result<Vec<WorkItem>> {
+        // Work items are project-addressed, so this fans out over the scope's *distinct projects*
+        // — not its repositories. Two repositories in one project must not query it twice.
+        let projects = self.0.projects();
+        if projects.is_empty() {
+            return Ok(Vec::new());
+        }
         let mut conditions = vec!["[System.TeamProject] = @project".to_string()];
         if query.mine_only {
             conditions.push("[System.AssignedTo] = @me".into());
@@ -653,24 +777,34 @@ impl WorkItemSource for AzureWi {
             conditions.push("[System.State] NOT IN ('Closed', 'Done', 'Removed')".into());
         }
         let wiql = format!("SELECT [System.Id] FROM WorkItems WHERE {} ORDER BY [System.ChangedDate] DESC", conditions.join(" AND "));
-        let url = format!("{}/{}/_apis/wit/wiql?$top={}&{API}", self.0.base, self.0.project, query.limit.unwrap_or(50));
-        let ids_v = self.0.post_json_read(&url, json!({ "query": wiql })).await?;
-        let ids: Vec<String> = get_arr(&ids_v, "workItems").iter().filter_map(|w| get_i64(w, "id")).map(|n| n.to_string()).collect();
-        if ids.is_empty() {
-            return Ok(vec![]);
-        }
-        let v = self.0.get_json(&format!("{}/_apis/wit/workitems?ids={}&{API}", self.0.base, ids.join(","))).await?;
-        Ok(get_arr(&v, "value").iter().map(map_work_item).collect())
+        let top = query.limit.unwrap_or(50);
+        let rows = fan_out(&projects, "azure.work_items.list", |project| {
+            let wiql = wiql.clone();
+            async move {
+                let url = format!("{}/{project}/_apis/wit/wiql?$top={top}&{API}", self.0.base);
+                let ids_v = self.0.post_json_read(&url, json!({ "query": wiql })).await?;
+                let ids: Vec<String> = get_arr(&ids_v, "workItems").iter().filter_map(|w| get_i64(w, "id")).map(|n| n.to_string()).collect();
+                if ids.is_empty() {
+                    return Ok(vec![]);
+                }
+                let v = self.0.get_json(&format!("{}/_apis/wit/workitems?ids={}&{API}", self.0.base, ids.join(","))).await?;
+                Ok(get_arr(&v, "value").iter().map(|w| map_work_item(w, Some(&project))).collect())
+            }
+        })
+        .await;
+        Ok(sort_and_cap(rows, projects.len(), query.limit, |wi| wi.updated_at))
     }
-    async fn get(&self, id: &str) -> Result<WorkItem> {
-        Ok(map_work_item(&self.0.get_json(&format!("{}/_apis/wit/workitems/{id}?{API}", self.0.base)).await?))
+    async fn get(&self, item: &ItemRef) -> Result<WorkItem> {
+        // Work items are addressable organization-wide by id, so no project segment is needed.
+        let v = self.0.get_json(&format!("{}/_apis/wit/workitems/{}?{API}", self.0.base, item.id)).await?;
+        Ok(map_work_item(&v, item.repo.as_deref()))
     }
-    async fn threads(&self, _id: &str) -> Result<Vec<CommentThread>> {
+    async fn threads(&self, _item: &ItemRef) -> Result<Vec<CommentThread>> {
         Ok(vec![])
     }
-    async fn timeline(&self, id: &str) -> Result<Vec<TimelineEvent>> {
+    async fn timeline(&self, item: &ItemRef) -> Result<Vec<TimelineEvent>> {
         // Work-item revisions: surface each System.State change.
-        let v = self.0.get_json(&format!("{}/_apis/wit/workItems/{id}/updates?{API}", self.0.base)).await?;
+        let v = self.0.get_json(&format!("{}/_apis/wit/workItems/{}/updates?{API}", self.0.base, item.id)).await?;
         let mut out = Vec::new();
         for u in get_arr(&v, "value") {
             let state = get_obj(u, "fields").and_then(|f| get_obj(f, "System.State")).and_then(|s| get_str(s, "newValue"));
@@ -686,31 +820,34 @@ impl WorkItemSource for AzureWi {
         out.sort_by_key(|e| e.at);
         Ok(out)
     }
-    async fn set_state(&self, id: &str, state: &str) -> Result<()> {
-        self.patch_work_item(id, json!([ { "op": "add", "path": "/fields/System.State", "value": state } ])).await
+    async fn set_state(&self, item: &ItemRef, state: &str) -> Result<()> {
+        self.patch_work_item(&item.id, json!([ { "op": "add", "path": "/fields/System.State", "value": state } ])).await
     }
-    async fn add_comment(&self, id: &str, body: &str) -> Result<()> {
-        let url = format!("{}/{}/_apis/wit/workItems/{id}/comments?api-version=7.1-preview.3", self.0.base, self.0.project);
+    async fn add_comment(&self, item: &ItemRef, body: &str) -> Result<()> {
+        let project = self.0.resolve_project(item)?;
+        let url = format!("{}/{project}/_apis/wit/workItems/{}/comments?api-version=7.1-preview.3", self.0.base, item.id);
         self.0.post_json_read(&url, json!({ "text": body })).await.map(|_| ())
     }
-    async fn available_states(&self, id: &str) -> Result<Vec<String>> {
+    async fn available_states(&self, item: &ItemRef) -> Result<Vec<String>> {
+        let project = self.0.resolve_project(item)?;
         // The states come from the item's work-item type workflow.
-        let item = self.0.get_json(&format!("{}/_apis/wit/workitems/{id}?{API}", self.0.base)).await?;
-        let Some(t) = get_obj(&item, "fields").and_then(|f| get_str(f, "System.WorkItemType")) else {
+        let wi = self.0.get_json(&format!("{}/_apis/wit/workitems/{}?{API}", self.0.base, item.id)).await?;
+        let Some(t) = get_obj(&wi, "fields").and_then(|f| get_str(f, "System.WorkItemType")) else {
             return Ok(Vec::new());
         };
-        let url = format!("{}/{}/_apis/wit/workItemTypes/{}/states?{API}", self.0.base, self.0.project, urlencoding(&t));
+        let url = format!("{}/{project}/_apis/wit/workItemTypes/{}/states?{API}", self.0.base, urlencoding(&t));
         let v = self.0.get_json(&url).await?;
         Ok(get_arr(&v, "value").iter().filter_map(|s| get_str(s, "name")).collect())
     }
-    async fn assignable_users(&self, _work_item_id: &str) -> Result<Vec<User>> {
-        let teams = self.0.get_json(&format!("{}/_apis/projects/{}/teams?{API}", self.0.base, self.0.project)).await?;
+    async fn assignable_users(&self, item: &ItemRef) -> Result<Vec<User>> {
+        let project = self.0.resolve_project(item)?;
+        let teams = self.0.get_json(&format!("{}/_apis/projects/{project}/teams?{API}", self.0.base)).await?;
         let Some(team_id) = get_arr(&teams, "value").first().and_then(|t| get_str(t, "id")) else {
             return Ok(Vec::new());
         };
         let members = self
             .0
-            .get_json(&format!("{}/_apis/projects/{}/teams/{team_id}/members?{API}", self.0.base, self.0.project))
+            .get_json(&format!("{}/_apis/projects/{project}/teams/{team_id}/members?{API}", self.0.base))
             .await?;
         Ok(get_arr(&members, "value")
             .iter()
@@ -726,14 +863,14 @@ impl WorkItemSource for AzureWi {
             })
             .collect())
     }
-    async fn set_assignee(&self, id: &str, assignee_id: Option<&str>) -> Result<()> {
+    async fn set_assignee(&self, item: &ItemRef, assignee_id: Option<&str>) -> Result<()> {
         let patch = match assignee_id {
             Some(unique_name) => json!([ { "op": "add", "path": "/fields/System.AssignedTo", "value": unique_name } ]),
             None => json!([ { "op": "remove", "path": "/fields/System.AssignedTo" } ]),
         };
-        self.patch_work_item(id, patch).await
+        self.patch_work_item(&item.id, patch).await
     }
-    async fn update_fields(&self, id: &str, title: Option<&str>, description: Option<&str>) -> Result<()> {
+    async fn update_fields(&self, item: &ItemRef, title: Option<&str>, description: Option<&str>) -> Result<()> {
         let mut patch = Vec::new();
         if let Some(title) = title {
             patch.push(json!({ "op": "add", "path": "/fields/System.Title", "value": title }));
@@ -744,40 +881,63 @@ impl WorkItemSource for AzureWi {
         if patch.is_empty() {
             return Ok(());
         }
-        self.patch_work_item(id, json!(patch)).await
+        self.patch_work_item(&item.id, json!(patch)).await
     }
 }
 
 #[async_trait]
 impl PipelineSource for AzurePipe {
     async fn discover(&self) -> Result<Vec<PipelineDefinition>> {
-        let v = self.0.get_json(&format!("{}/{}/_apis/build/definitions?{API}", self.0.base, self.0.project)).await?;
-        Ok(get_arr(&v, "value").iter().map(map_definition).collect())
+        // Build definitions belong to a *project*, not a repository. Fanning out over the scope's
+        // repositories would return every definition once per repository in its project; the
+        // distinct-project list is what keeps a two-repo project from duplicating them.
+        let projects = self.0.projects();
+        Ok(fan_out(&projects, "azure.pipelines.discover", |project| async move {
+            let v = self.0.get_json(&format!("{}/{project}/_apis/build/definitions?{API}", self.0.base)).await?;
+            Ok(get_arr(&v, "value").iter().map(|d| map_definition(d, Some(&project))).collect())
+        })
+        .await)
     }
     async fn list_runs(&self, query: &PipelineRunQuery) -> Result<Vec<PipelineRun>> {
-        let mut url = format!("{}/{}/_apis/build/builds?$top={}&{API}", self.0.base, self.0.project, query.limit.unwrap_or(25));
-        if let Some(def) = &query.definition_id {
-            url.push_str(&format!("&definitions={def}"));
+        // Same reasoning as `discover`: per project, deduplicated, never per repository.
+        let projects: Vec<String> = match &query.repository {
+            Some(repo) => vec![project_part(repo)],
+            None => self.0.projects(),
+        };
+        if projects.is_empty() {
+            return Ok(Vec::new());
         }
-        let v = self.0.get_json(&url).await?;
-        Ok(get_arr(&v, "value").iter().map(map_build).collect())
+        let top = query.limit.unwrap_or(25);
+        let rows = fan_out(&projects, "azure.pipelines.list_runs", |project| async move {
+            let mut url = format!("{}/{project}/_apis/build/builds?$top={top}&{API}", self.0.base);
+            if let Some(def) = &query.definition_id {
+                url.push_str(&format!("&definitions={def}"));
+            }
+            let v = self.0.get_json(&url).await?;
+            Ok(get_arr(&v, "value").iter().map(|b| map_build(b, Some(&project))).collect())
+        })
+        .await;
+        Ok(sort_and_cap(rows, projects.len(), query.limit, |r| r.started_at))
     }
-    async fn get_run(&self, run_id: &str) -> Result<PipelineRun> {
-        let build = self.0.get_json(&format!("{}/{}/_apis/build/builds/{run_id}?{API}", self.0.base, self.0.project)).await?;
-        let mut run = map_build(&build);
-        run.stages = self.0.read_stages(run_id).await;
-        Ok(run)
+    async fn get_run(&self, run: &ItemRef) -> Result<PipelineRun> {
+        let project = self.0.resolve_project(run)?;
+        let build = self.0.get_json(&format!("{}/{project}/_apis/build/builds/{}?{API}", self.0.base, run.id)).await?;
+        let mut mapped = map_build(&build, Some(&project));
+        mapped.stages = self.0.read_stages(&project, &run.id).await;
+        Ok(mapped)
     }
-    async fn cancel_run(&self, run_id: &str) -> Result<()> {
-        let url = format!("{}/{}/_apis/build/builds/{run_id}?{API}", self.0.base, self.0.project);
+    async fn cancel_run(&self, run: &ItemRef) -> Result<()> {
+        let project = self.0.resolve_project(run)?;
+        let url = format!("{}/{project}/_apis/build/builds/{}?{API}", self.0.base, run.id);
         let resp = self.0.http.patch(&url).json(&json!({ "status": "cancelling" })).send().await.map_err(prov)?;
         if !resp.status().is_success() {
             return Err(Error::Provider(format!("PATCH {url} -> {}", resp.status())));
         }
         Ok(())
     }
-    async fn logs(&self, run_id: &str, job_id: Option<&str>) -> Result<String> {
-        let url = format!("{}/{}/_apis/build/builds/{run_id}/timeline?{API}", self.0.base, self.0.project);
+    async fn logs(&self, run: &ItemRef, job_id: Option<&str>) -> Result<String> {
+        let project = self.0.resolve_project(run)?;
+        let url = format!("{}/{project}/_apis/build/builds/{}/timeline?{API}", self.0.base, run.id);
         let v = self.0.get_json(&url).await?;
         let lines: Vec<String> = get_arr(&v, "records")
             .iter()
@@ -786,13 +946,14 @@ impl PipelineSource for AzurePipe {
             .collect();
         Ok(lines.join("\n"))
     }
-    async fn trigger(&self, definition_id: &str, branch: Option<&str>) -> Result<()> {
-        let def: i64 = definition_id.parse().map_err(prov)?;
+    async fn trigger(&self, definition: &ItemRef, branch: Option<&str>) -> Result<()> {
+        let project = self.0.resolve_project(definition)?;
+        let def: i64 = definition.id.parse().map_err(prov)?;
         let body = match branch {
             Some(b) => json!({ "definition": { "id": def }, "sourceBranch": format!("refs/heads/{b}") }),
             None => json!({ "definition": { "id": def } }),
         };
-        self.0.post_json_read(&format!("{}/{}/_apis/build/builds?{API}", self.0.base, self.0.project), body).await.map(|_| ())
+        self.0.post_json_read(&format!("{}/{project}/_apis/build/builds?{API}", self.0.base), body).await.map(|_| ())
     }
     fn supports_approvals(&self) -> bool {
         true
@@ -803,15 +964,17 @@ impl PipelineSource for AzurePipe {
     fn can_respond_to_approvals(&self) -> bool {
         false
     }
-    async fn pending_approvals(&self, run_id: &str) -> Result<Vec<PipelineApproval>> {
-        self.0.approval_gates(run_id).await
+    async fn pending_approvals(&self, run: &ItemRef) -> Result<Vec<PipelineApproval>> {
+        let project = self.0.resolve_project(run)?;
+        self.0.approval_gates(&project, &run.id).await
     }
-    async fn respond_approval(&self, _run_id: &str, approval_id: &str, decision: ApprovalDecision, comment: Option<&str>) -> Result<()> {
+    async fn respond_approval(&self, run: &ItemRef, approval_id: &str, decision: ApprovalDecision, comment: Option<&str>) -> Result<()> {
+        let project = self.0.resolve_project(run)?;
         let status = match decision {
             ApprovalDecision::Approve => "approved",
             ApprovalDecision::Reject => "rejected",
         };
-        let url = format!("{}/{}/_apis/pipelines/approvals?{API}", self.0.base, self.0.project);
+        let url = format!("{}/{project}/_apis/pipelines/approvals?{API}", self.0.base);
         let body = json!([{ "approvalId": approval_id, "status": status, "comment": comment.unwrap_or("") }]);
         let resp = self.0.http.patch(&url).json(&body).send().await.map_err(prov)?;
         if !resp.status().is_success() {
@@ -851,6 +1014,9 @@ impl ProviderConnection for AzureConnection {
     fn pipelines(&self) -> Option<Arc<dyn PipelineSource>> {
         Some(Arc::new(AzurePipe(self.client.clone())))
     }
+    async fn discover_repositories(&self) -> Result<RepositoryPage> {
+        self.client.discover_repositories().await
+    }
     async fn check(&self) -> bool {
         self.client.get_json(&format!("{}/_apis/connectionData?api-version=7.1-preview", self.client.base)).await.is_ok()
     }
@@ -880,9 +1046,15 @@ impl ProviderFactory for AzureDevOpsFactory {
         azure_capabilities()
     }
     fn create(&self, connection: &Connection, secret: Option<String>) -> Result<Arc<dyn ProviderConnection>> {
+        // The organization stays required — discovery is addressed by it. Project and repository
+        // are not: an organization-scoped PAT reaches every repository in the org, and the scope
+        // picker fills the rest in.
         let org = connection.organization.clone().ok_or_else(|| Error::Config("Azure DevOps connection requires an Organization".into()))?;
-        let project = connection.project.clone().ok_or_else(|| Error::Config("Azure DevOps connection requires a Project".into()))?;
-        let repo = connection.repository.clone().unwrap_or_else(|| project.clone());
+        let scope = connection.resolve_repo_scope(|| {
+            let project = connection.project.clone()?;
+            let repo = connection.repository.clone().unwrap_or_else(|| project.clone());
+            Some(format!("{project}/{repo}"))
+        });
         let base = connection.base_url.clone().unwrap_or_else(|| format!("https://dev.azure.com/{org}"));
         let base = base.trim_end_matches('/').to_string();
 
@@ -893,7 +1065,7 @@ impl ProviderFactory for AzureDevOpsFactory {
         }
         let http = reqwest::Client::builder().default_headers(headers).build().map_err(prov)?;
 
-        let client = Arc::new(AzureClient { http, base, project, repository: repo, self_id: tokio::sync::Mutex::new(None) });
+        let client = Arc::new(AzureClient { http, base, scope, self_id: tokio::sync::Mutex::new(None) });
         Ok(Arc::new(AzureConnection { id: connection.id.clone(), display_name: connection.display_name.clone(), client, caps: azure_capabilities() }))
     }
 }
@@ -923,6 +1095,46 @@ mod tests {
         assert!(gates[0].can_respond);
     }
 
+    fn client_with_scope(scope: &[&str]) -> AzureClient {
+        AzureClient {
+            http: reqwest::Client::new(),
+            base: "https://dev.azure.com/contoso".into(),
+            scope: scope.iter().map(|s| s.to_string()).collect(),
+            self_id: tokio::sync::Mutex::new(None),
+        }
+    }
+
+    #[test]
+    fn splits_a_scope_entry_into_project_and_repo() {
+        assert_eq!(split_project_repo("Payments/pay-api"), ("Payments".to_string(), "pay-api".to_string()));
+        // A bare name is the Azure default: a Team Project whose repo shares its name.
+        assert_eq!(split_project_repo("Payments"), ("Payments".to_string(), "Payments".to_string()));
+        assert_eq!(project_part("Payments/pay-api"), "Payments");
+    }
+
+    #[test]
+    fn work_items_and_pipelines_fan_out_over_distinct_projects_not_repositories() {
+        // Two repositories in one Team Project. Work items and pipelines are project-addressed,
+        // so querying per repository would hit Payments twice and return every item and every
+        // pipeline definition twice. The distinct-project list is what prevents that.
+        let client = client_with_scope(&["Payments/pay-api", "Payments/pay-web", "Ledger/ledger"]);
+        assert_eq!(client.projects(), vec!["Payments".to_string(), "Ledger".to_string()]);
+    }
+
+    #[test]
+    fn a_project_scoped_call_resolves_the_project_from_the_item() {
+        let client = client_with_scope(&["Payments/pay-api", "Ledger/ledger"]);
+        // An item that knows its address resolves even across projects…
+        assert_eq!(client.resolve_project(&ItemRef::in_repo("Ledger/ledger", "42")).unwrap(), "Ledger");
+        // …and a bare project name (what Azure work items carry) resolves too.
+        assert_eq!(client.resolve_project(&ItemRef::in_repo("Ledger", "42")).unwrap(), "Ledger");
+        // An unaddressed item across two projects is refused rather than guessed at.
+        assert!(client.resolve_project(&ItemRef::new("42")).is_err());
+        // One project, however many repositories — no ambiguity, so it still resolves.
+        let single = client_with_scope(&["Payments/pay-api", "Payments/pay-web"]);
+        assert_eq!(single.resolve_project(&ItemRef::new("42")).unwrap(), "Payments");
+    }
+
     #[test]
     fn maps_votes_both_ways() {
         assert_eq!(map_vote(10), ReviewVote::Approved);
@@ -938,7 +1150,7 @@ mod tests {
                  "labels": [ { "name": "infra" } ], "reviewers": [ { "id": "r1", "displayName": "Rev", "vote": 10 } ] }"#,
         )
         .unwrap();
-        let pr = map_pull_request(&v);
+        let pr = map_pull_request(&v, None);
         assert_eq!(pr.status, PullRequestStatus::Open);
         assert_eq!(pr.mergeable, MergeableState::Mergeable);
         assert_eq!(pr.source_ref.as_deref(), Some("feature/x"));
@@ -952,7 +1164,7 @@ mod tests {
             r#"{ "id": 55, "fields": { "System.Title": "WI", "System.State": "Active", "System.WorkItemType": "Bug", "System.AssignedTo": { "id": "u", "displayName": "Dan" } } }"#,
         )
         .unwrap();
-        let wi = map_work_item(&v);
+        let wi = map_work_item(&v, None);
         assert_eq!(wi.state, "Active");
         assert_eq!(wi.state_category, WorkItemStateCategory::Started);
         assert_eq!(wi.assignee.unwrap().display_name, "Dan");
@@ -964,7 +1176,7 @@ mod tests {
             r#"{ "id": 900, "buildNumber": "20260601.1", "status": "completed", "result": "succeeded", "sourceBranch": "refs/heads/main", "definition": { "id": 3, "name": "CI" } }"#,
         )
         .unwrap();
-        let run = map_build(&v);
+        let run = map_build(&v, None);
         assert_eq!(run.definition_id, "3");
         assert_eq!(run.status, PipelineRunStatus::Succeeded);
         assert_eq!(run.branch.as_deref(), Some("main"));

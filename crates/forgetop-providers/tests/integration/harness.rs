@@ -76,6 +76,8 @@ pub fn github() -> Option<GitHubIt> {
         repository: Some(repo.clone()),
         username: None,
         credential_ref: None,
+        // Live suites address a single repository, so the legacy fallback is what we exercise.
+        repo_scope: None,
     };
     let conn = registry().create(&conn, Some(token)).ok()?;
     Some(GitHubIt { owner, repo, conn })
@@ -102,6 +104,8 @@ pub fn gitlab() -> Option<GitLabIt> {
         repository: Some(project.clone()),
         username: None,
         credential_ref: None,
+        // Live suites address a single repository, so the legacy fallback is what we exercise.
+        repo_scope: None,
     };
     let conn = registry().create(&conn, Some(token)).ok()?;
     Some(GitLabIt { project, conn })
@@ -130,6 +134,8 @@ pub fn azure() -> Option<AzureIt> {
         repository: Some(repo),
         username: None,
         credential_ref: None,
+        // Live suites address a single repository, so the legacy fallback is what we exercise.
+        repo_scope: None,
     };
     let conn = registry().create(&conn, Some(pat)).ok()?;
     Some(AzureIt { org, project, conn })
@@ -153,6 +159,8 @@ pub fn linear() -> Option<LinearIt> {
         repository: None,
         username: None,
         credential_ref: None,
+        // Live suites address a single repository, so the legacy fallback is what we exercise.
+        repo_scope: None,
     };
     let conn = registry().create(&conn, Some(key)).ok()?;
     Some(LinearIt { conn })
@@ -180,6 +188,7 @@ pub fn jira() -> Option<JiraIt> {
         repository: None,
         username: Some(email),
         credential_ref: None,
+        repo_scope: None,
     };
     let conn = registry().create(&conn, Some(token)).ok()?;
     Some(JiraIt { project, conn })

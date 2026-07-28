@@ -228,6 +228,26 @@ impl ConfigService {
         self.persist(cfg).await
     }
 
+    /// Replaces a connection's repository scope. `Some(vec![])` is a real, respected state — the
+    /// user chose no repositories — and must not be confused with `None`, which means the scope
+    /// was never established and the legacy single repository still applies.
+    pub async fn set_repo_scope(&self, connection_id: &str, scope: Option<Vec<String>>) -> Result<()> {
+        let mut cfg = self.snapshot();
+        let conn = cfg
+            .connections
+            .iter_mut()
+            .find(|c| c.id == connection_id)
+            .ok_or_else(|| Error::Config(format!("unknown connection '{connection_id}'")))?;
+        conn.repo_scope = scope;
+        self.persist(cfg).await
+    }
+
+    /// A connection's stored scope, exactly as stored (including the `None` / `Some([])`
+    /// distinction) — the picker needs to tell "never chosen" from "chose none".
+    pub fn repo_scope(&self, connection_id: &str) -> Option<Vec<String>> {
+        self.snapshot().find_connection(connection_id).and_then(|c| c.repo_scope.clone())
+    }
+
     pub async fn set_theme(&self, theme: Option<String>) -> Result<()> {
         let mut cfg = self.snapshot();
         cfg.ui.theme = theme;
@@ -416,6 +436,14 @@ impl SectionService {
         Ok(self.resolver.resolve(connection_id).await?.and_then(|c| c.pipelines()))
     }
 
+    /// The repositories a connection's credentials can reach, for its scope picker.
+    pub async fn discover_repositories(&self, connection_id: &str) -> Result<RepositoryPage> {
+        match self.resolver.resolve(connection_id).await? {
+            Some(conn) => conn.discover_repositories().await,
+            None => Ok(RepositoryPage::default()),
+        }
+    }
+
     pub async fn pipeline_feeds(&self) -> Result<Vec<PipelineFeed>> {
         let cfg = self.config.snapshot();
         let Some(binding) = cfg.pipelines else { return Ok(Vec::new()) };
@@ -429,6 +457,36 @@ impl SectionService {
         }
         Ok(feeds)
     }
+}
+
+/// How many repositories a brand-new connection starts scoped to — the most recently active
+/// ones. Small on purpose: the cost of a refresh is one list call per repository, and the user
+/// widens it from the scope picker.
+pub const DEFAULT_REPO_SCOPE_SIZE: usize = 5;
+
+/// Gives a freshly-added connection a starting repository scope: the most recently active
+/// repositories its credentials can reach, capped at [`DEFAULT_REPO_SCOPE_SIZE`].
+///
+/// Best-effort and deliberately inert on anything already established — it only acts when the
+/// scope has never been set *and* no legacy single repository was supplied, so it can neither
+/// overwrite a user's choice nor change an existing connection. If discovery fails or returns
+/// nothing, the scope stays `None` and the connection behaves exactly as it did before.
+pub async fn seed_default_repo_scope(
+    config: &ConfigService,
+    sections: &SectionService,
+    connection_id: &str,
+) -> Result<Option<Vec<String>>> {
+    let Some(conn) = config.snapshot().find_connection(connection_id).cloned() else { return Ok(None) };
+    if conn.repo_scope.is_some() || conn.repository.is_some() {
+        return Ok(None);
+    }
+    let page = sections.discover_repositories(connection_id).await.unwrap_or_default();
+    if page.repositories.is_empty() {
+        return Ok(None);
+    }
+    let scope: Vec<String> = page.repositories.into_iter().take(DEFAULT_REPO_SCOPE_SIZE).collect();
+    config.set_repo_scope(connection_id, Some(scope.clone())).await?;
+    Ok(Some(scope))
 }
 
 /// A configured connection and whether it's currently reachable/authed.
@@ -519,6 +577,7 @@ mod tests {
             repository: None,
             username: None,
             credential_ref: None,
+            repo_scope: None,
         }
     }
 
@@ -562,6 +621,28 @@ mod tests {
         assert!(cfg.pull_requests.is_none());
         assert!(cfg.pipelines.unwrap().subscriptions.is_empty());
         assert_eq!(secrets.get("gh-1").unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn repo_scope_persists_including_the_empty_choice() {
+        let (svc, _) = service();
+        let mut c = conn("gh-1", ProviderType::GitHub);
+        c.repository = Some("acme/pay".into());
+        svc.add_or_update_connection(c, None).await.unwrap();
+
+        // Never set → absent, so the legacy repository is still what the factory resolves.
+        assert_eq!(svc.repo_scope("gh-1"), None);
+
+        svc.set_repo_scope("gh-1", Some(vec!["acme/pay".into(), "acme/ledger".into()])).await.unwrap();
+        assert_eq!(svc.repo_scope("gh-1").unwrap().len(), 2);
+
+        // "I chose none" is a real, persisted state — not the same as never having chosen.
+        svc.set_repo_scope("gh-1", Some(vec![])).await.unwrap();
+        assert_eq!(svc.repo_scope("gh-1"), Some(vec![]));
+        svc.load().await.unwrap();
+        assert_eq!(svc.repo_scope("gh-1"), Some(vec![]), "an emptied scope survives a reload");
+
+        assert!(svc.set_repo_scope("nope", None).await.is_err());
     }
 
     #[tokio::test]

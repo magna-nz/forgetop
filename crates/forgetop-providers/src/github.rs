@@ -11,6 +11,7 @@ use reqwest::header::{ACCEPT, AUTHORIZATION, USER_AGENT};
 use serde_json::{json, Value};
 
 use crate::json::*;
+use crate::scope::{self, fan_out, sort_and_cap};
 
 fn prov<E: std::fmt::Display>(e: E) -> Error {
     Error::Provider(e.to_string())
@@ -27,7 +28,9 @@ pub fn map_user(v: &Value) -> User {
     }
 }
 
-pub fn map_pull_request(v: &Value) -> PullRequest {
+/// `repo` is the **connection-relative** repository the call was addressed at, used when the
+/// payload doesn't carry its own `base.repo.full_name` (which is itself connection-relative).
+pub fn map_pull_request(v: &Value, repo: Option<&str>) -> PullRequest {
     let merged = v.get("merged_at").map(|x| x.is_string()).unwrap_or(false);
     let state = get_str(v, "state");
     let draft = get_bool(v, "draft");
@@ -54,6 +57,10 @@ pub fn map_pull_request(v: &Value) -> PullRequest {
 
     let number = get_i64(v, "number");
     PullRequest {
+        repository: get_obj(v, "base")
+            .and_then(|b| get_obj(b, "repo"))
+            .and_then(|r| get_str(r, "full_name"))
+            .or_else(|| repo.map(str::to_string)),
         id: number.map(|n| n.to_string()).or_else(|| get_i64(v, "id").map(|n| n.to_string())).unwrap_or_else(|| "0".into()),
         number,
         title: get_str(v, "title").unwrap_or_else(|| "(untitled)".into()),
@@ -138,7 +145,7 @@ pub fn map_commit(v: &Value) -> Commit {
     }
 }
 
-pub fn map_issue(v: &Value) -> WorkItem {
+pub fn map_issue(v: &Value, repo: Option<&str>) -> WorkItem {
     let state = get_str(v, "state").unwrap_or_else(|| "open".into());
     let reason = get_str(v, "state_reason");
     let category = if state == "closed" {
@@ -152,6 +159,7 @@ pub fn map_issue(v: &Value) -> WorkItem {
     };
     let number = get_i64(v, "number");
     WorkItem {
+        repository: repo.map(str::to_string),
         id: number.map(|n| n.to_string()).unwrap_or_else(|| "0".into()),
         identifier: number.map(|n| format!("#{n}")),
         title: get_str(v, "title").unwrap_or_else(|| "(untitled)".into()),
@@ -166,8 +174,9 @@ pub fn map_issue(v: &Value) -> WorkItem {
     }
 }
 
-pub fn map_workflow(v: &Value) -> PipelineDefinition {
+pub fn map_workflow(v: &Value, repo: Option<&str>) -> PipelineDefinition {
     PipelineDefinition {
+        repository: repo.map(str::to_string),
         id: get_i64(v, "id").map(|n| n.to_string()).or_else(|| get_str(v, "path")).unwrap_or_else(|| "0".into()),
         name: get_str(v, "name").unwrap_or_else(|| "(workflow)".into()),
         path: get_str(v, "path"),
@@ -189,9 +198,10 @@ fn status_of(v: &Value) -> PipelineRunStatus {
     }
 }
 
-pub fn map_run(v: &Value) -> PipelineRun {
+pub fn map_run(v: &Value, repo: Option<&str>) -> PipelineRun {
     let completed = get_str(v, "status").as_deref() == Some("completed");
     PipelineRun {
+        repository: get_obj(v, "repository").and_then(|r| get_str(r, "full_name")).or_else(|| repo.map(str::to_string)),
         id: get_i64(v, "id").map(|n| n.to_string()).unwrap_or_else(|| "0".into()),
         definition_id: get_i64(v, "workflow_id").map(|n| n.to_string()).unwrap_or_else(|| "0".into()),
         number: get_i64(v, "run_number"),
@@ -407,6 +417,8 @@ pub fn map_notification(v: &Value) -> Notification {
         kind: github_reason_kind(&get_str(v, "reason").unwrap_or_default()),
         item_type,
         item_id,
+        // `full_name` is already the connection-relative spelling GitHub addresses repos by.
+        repository: repo.and_then(|r| get_str(r, "full_name")),
         title: subject.and_then(|s| get_str(s, "title")).unwrap_or_default(),
         context: repo.and_then(|r| get_str(r, "full_name")).unwrap_or_default(),
         url,
@@ -418,14 +430,21 @@ pub fn map_notification(v: &Value) -> Notification {
 pub struct GitHubClient {
     http: reqwest::Client,
     base: String,
-    owner: String,
-    repo: String,
+    /// The repositories this connection fetches from, **connection-relative** (`owner/repo`).
+    /// A GitHub PAT reaches every repository the account can see, so this is a user-chosen scope,
+    /// not a permission boundary.
+    scope: Vec<String>,
     self_login: tokio::sync::Mutex<Option<String>>,
 }
 
 impl GitHubClient {
-    fn repo_path(&self, suffix: &str) -> String {
-        format!("{}/repos/{}/{}{}", self.base, self.owner, self.repo, suffix)
+    /// `repo` is connection-relative (`owner/repo`) — exactly what GitHub's `/repos/` path wants.
+    fn repo_path(&self, repo: &str, suffix: &str) -> String {
+        format!("{}/repos/{repo}{suffix}", self.base)
+    }
+
+    fn resolve(&self, item: &ItemRef) -> Result<String> {
+        scope::resolve_repo(item, &self.scope)
     }
 
     async fn get_json(&self, url: &str) -> Result<Value> {
@@ -469,13 +488,15 @@ impl GitHubClient {
         Ok(guard.clone())
     }
 
+    /// GitHub's list endpoints omit `mergeable_state`, `changed_files`, `additions` and
+    /// `deletions` entirely, so those only exist after a per-PR fetch (plus one for checks).
     async fn enrich(&self, pr: PullRequest) -> PullRequest {
-        let Some(number) = pr.number else { return pr };
-        match self.get_json(&self.repo_path(&format!("/pulls/{number}"))).await {
+        let (Some(number), Some(repo)) = (pr.number, pr.repository.clone()) else { return pr };
+        match self.get_json(&self.repo_path(&repo, &format!("/pulls/{number}"))).await {
             Ok(detail) => {
-                let mut enriched = map_pull_request(&detail);
+                let mut enriched = map_pull_request(&detail, Some(&repo));
                 if let Some(sha) = get_obj(&detail, "head").and_then(|h| get_str(h, "sha")) {
-                    if let Ok(checks) = self.get_json(&self.repo_path(&format!("/commits/{sha}/check-runs"))).await {
+                    if let Ok(checks) = self.get_json(&self.repo_path(&repo, &format!("/commits/{sha}/check-runs"))).await {
                         let (status, summary) = map_checks(&checks);
                         enriched.checks = status;
                         enriched.check_summary = Some(summary);
@@ -485,6 +506,29 @@ impl GitHubClient {
             }
             Err(_) => pr,
         }
+    }
+
+    /// Every repository the token can reach, most-recently-pushed first. `affiliation` is what
+    /// makes this an *account* listing rather than just the ones the user owns.
+    async fn discover_repositories(&self) -> Result<RepositoryPage> {
+        const PER_PAGE: usize = 100;
+        const MAX_PAGES: usize = 5;
+        let mut repositories = Vec::new();
+        let mut truncated = false;
+        for page in 1..=MAX_PAGES {
+            let url = format!(
+                "{}/user/repos?sort=pushed&direction=desc&per_page={PER_PAGE}&page={page}&affiliation=owner,collaborator,organization_member",
+                self.base
+            );
+            let v = self.get_json(&url).await?;
+            let rows = v.as_array().cloned().unwrap_or_default();
+            repositories.extend(rows.iter().filter_map(|r| get_str(r, "full_name")));
+            if rows.len() < PER_PAGE {
+                return Ok(RepositoryPage { repositories, truncated: false });
+            }
+            truncated = page == MAX_PAGES;
+        }
+        Ok(RepositoryPage { repositories, truncated })
     }
 }
 
@@ -501,107 +545,153 @@ source!(GitHubNotif);
 #[async_trait]
 impl NotificationSource for GitHubNotif {
     async fn list(&self) -> Result<Vec<Notification>> {
-        // Repo-scoped, unread only (the inbox surfaces what still needs you).
-        let v = self.0.get_json(&self.0.repo_path("/notifications?per_page=50")).await?;
+        // Account-level, unread only (the inbox surfaces what still needs you). A notification
+        // feed belongs to the account, not to one repository, so this is a single call however
+        // wide the repository scope is — and it stops the inbox going blank when the scope does.
+        let v = self.0.get_json(&format!("{}/notifications?per_page=50", self.0.base)).await?;
         Ok(v.as_array().unwrap_or(&vec![]).iter().map(map_notification).collect())
     }
     async fn mark_read(&self, id: &str) -> Result<()> {
-        // Marking a thread read is the account-level endpoint.
         self.0.patch_empty(&format!("{}/notifications/threads/{id}", self.0.base)).await
     }
     async fn mark_all_read(&self) -> Result<()> {
-        self.0.put_json(&self.0.repo_path("/notifications"), json!({ "read": true })).await
+        self.0.put_json(&format!("{}/notifications", self.0.base), json!({ "read": true })).await
     }
 }
 
 #[async_trait]
 impl PullRequestSource for GitHubPr {
     async fn list(&self, query: &PullRequestQuery) -> Result<Vec<PullRequest>> {
+        // An empty scope is a real state — the user chose no repositories. Fetch nothing and say
+        // so with an empty list; it is not an error and it is not "no pull requests".
+        let scope = &self.0.scope;
+        if scope.is_empty() {
+            return Ok(Vec::new());
+        }
         let state = if query.include_completed { "all" } else { "open" };
-        let url = self.0.repo_path(&format!("/pulls?state={state}&per_page={}", query.limit.unwrap_or(50)));
-        let v = self.0.get_json(&url).await?;
-        let prs: Vec<PullRequest> = v.as_array().unwrap_or(&vec![]).iter().map(map_pull_request).collect();
+        let per_page = query.limit.unwrap_or(50);
+        let rows = fan_out(scope, "github.pull_requests.list", |repo| async move {
+            let url = self.0.repo_path(&repo, &format!("/pulls?state={state}&per_page={per_page}"));
+            let v = self.0.get_json(&url).await?;
+            Ok(v.as_array().unwrap_or(&vec![]).iter().map(|pr| map_pull_request(pr, Some(&repo))).collect())
+        })
+        .await;
+
         let me = if query.filter == PullRequestFilter::All { None } else { self.0.self_login().await? };
-        let filtered = apply_pull_request_filter(prs, query.filter, me.as_deref());
+        let filtered = apply_pull_request_filter(rows, query.filter, me.as_deref());
+        // Sort and cap once across the whole scope, then decorate only what survived — so the
+        // cost of decoration is bounded by what we return, not multiplied by the scope size.
+        let kept = sort_and_cap(filtered, scope.len(), query.limit, |pr| pr.updated_at);
+        if !query.decorate {
+            return Ok(kept);
+        }
         const CAP: usize = 25;
-        let mut out = Vec::with_capacity(filtered.len());
-        for (i, pr) in filtered.into_iter().enumerate() {
+        let mut out = Vec::with_capacity(kept.len());
+        for (i, pr) in kept.into_iter().enumerate() {
             out.push(if i < CAP { self.0.enrich(pr).await } else { pr });
         }
         Ok(out)
     }
-    async fn get(&self, id: &str) -> Result<PullRequest> {
-        let v = self.0.get_json(&self.0.repo_path(&format!("/pulls/{id}"))).await?;
-        let mut pr = map_pull_request(&v);
+    async fn get(&self, item: &ItemRef) -> Result<PullRequest> {
+        let repo = self.0.resolve(item)?;
+        let id = &item.id;
+        let v = self.0.get_json(&self.0.repo_path(&repo, &format!("/pulls/{id}"))).await?;
+        let mut pr = map_pull_request(&v, Some(&repo));
         // `requested_reviewers` only lists people who *haven't* reviewed yet, so merge the actual
         // review votes in — otherwise an approver shows no tick in the reviewers list.
-        if let Ok(reviews) = self.0.get_json(&self.0.repo_path(&format!("/pulls/{id}/reviews?per_page=100"))).await {
+        if let Ok(reviews) = self.0.get_json(&self.0.repo_path(&repo, &format!("/pulls/{id}/reviews?per_page=100"))).await {
             merge_review_votes(&mut pr.reviewers, reviews.as_array().unwrap_or(&vec![]));
         }
         Ok(pr)
     }
-    async fn threads(&self, id: &str) -> Result<Vec<CommentThread>> {
+    async fn decorate(&self, item: &ItemRef) -> Result<PrDecoration> {
+        let repo = self.0.resolve(item)?;
+        let id = &item.id;
+        let detail = self.0.get_json(&self.0.repo_path(&repo, &format!("/pulls/{id}"))).await?;
+        let mut d = PrDecoration::from_pull_request(&map_pull_request(&detail, Some(&repo)));
+        if let Some(sha) = get_obj(&detail, "head").and_then(|h| get_str(h, "sha")) {
+            if let Ok(checks) = self.0.get_json(&self.0.repo_path(&repo, &format!("/commits/{sha}/check-runs"))).await {
+                let (status, summary) = map_checks(&checks);
+                d.checks = status;
+                d.check_summary = Some(summary);
+            }
+        }
+        Ok(d)
+    }
+    async fn threads(&self, item: &ItemRef) -> Result<Vec<CommentThread>> {
+        let repo = self.0.resolve(item)?;
+        let id = &item.id;
         // The PR conversation is flat issue comments (one bundled thread; GitHub has no reply API
         // for these), plus the real review (diff-line) threads which *do* support replies.
-        let issues = self.0.get_json(&self.0.repo_path(&format!("/issues/{id}/comments?per_page=100"))).await?;
+        let issues = self.0.get_json(&self.0.repo_path(&repo, &format!("/issues/{id}/comments?per_page=100"))).await?;
         let comments: Vec<Comment> = issues.as_array().unwrap_or(&vec![]).iter().map(map_gh_comment).collect();
         let mut threads = Vec::new();
         if !comments.is_empty() {
             threads.push(CommentThread { id: format!("pr-{id}"), comments, file_path: None, line: None, is_resolved: false });
         }
-        let reviews = self.0.get_json(&self.0.repo_path(&format!("/pulls/{id}/comments?per_page=100"))).await?;
+        let reviews = self.0.get_json(&self.0.repo_path(&repo, &format!("/pulls/{id}/comments?per_page=100"))).await?;
         threads.extend(group_gh_review_threads(reviews.as_array().unwrap_or(&vec![])));
         Ok(threads)
     }
-    async fn timeline(&self, id: &str) -> Result<Vec<TimelineEvent>> {
+    async fn timeline(&self, item: &ItemRef) -> Result<Vec<TimelineEvent>> {
+        let repo = self.0.resolve(item)?;
+        let id = &item.id;
         // Reviews (approvals / changes requested) + issue events (merge / close / assign / …).
-        let reviews = self.0.get_json(&self.0.repo_path(&format!("/pulls/{id}/reviews?per_page=100"))).await?;
-        let events = self.0.get_json(&self.0.repo_path(&format!("/issues/{id}/events?per_page=100"))).await?;
+        let reviews = self.0.get_json(&self.0.repo_path(&repo, &format!("/pulls/{id}/reviews?per_page=100"))).await?;
+        let events = self.0.get_json(&self.0.repo_path(&repo, &format!("/issues/{id}/events?per_page=100"))).await?;
         let mut out: Vec<TimelineEvent> = reviews.as_array().unwrap_or(&vec![]).iter().filter_map(map_gh_review).collect();
         out.extend(events.as_array().unwrap_or(&vec![]).iter().filter_map(map_gh_issue_event));
         out.sort_by_key(|e| e.at);
         Ok(out)
     }
-    async fn changes(&self, id: &str) -> Result<Vec<FileChange>> {
-        let v = self.0.get_json(&self.0.repo_path(&format!("/pulls/{id}/files?per_page=100"))).await?;
+    async fn changes(&self, item: &ItemRef) -> Result<Vec<FileChange>> {
+        let repo = self.0.resolve(item)?;
+        let v = self.0.get_json(&self.0.repo_path(&repo, &format!("/pulls/{}/files?per_page=100", item.id))).await?;
         Ok(v.as_array().unwrap_or(&vec![]).iter().map(map_file_change).collect())
     }
-    async fn checks(&self, id: &str) -> Result<Vec<CheckRun>> {
-        let detail = self.0.get_json(&self.0.repo_path(&format!("/pulls/{id}"))).await?;
+    async fn checks(&self, item: &ItemRef) -> Result<Vec<CheckRun>> {
+        let repo = self.0.resolve(item)?;
+        let detail = self.0.get_json(&self.0.repo_path(&repo, &format!("/pulls/{}", item.id))).await?;
         let Some(sha) = get_obj(&detail, "head").and_then(|h| get_str(h, "sha")) else { return Ok(vec![]) };
-        let v = self.0.get_json(&self.0.repo_path(&format!("/commits/{sha}/check-runs"))).await?;
+        let v = self.0.get_json(&self.0.repo_path(&repo, &format!("/commits/{sha}/check-runs"))).await?;
         Ok(get_arr(&v, "check_runs").iter().map(map_check_run).collect())
     }
-    async fn commits(&self, id: &str) -> Result<Vec<Commit>> {
-        let v = self.0.get_json(&self.0.repo_path(&format!("/pulls/{id}/commits?per_page=100"))).await?;
+    async fn commits(&self, item: &ItemRef) -> Result<Vec<Commit>> {
+        let repo = self.0.resolve(item)?;
+        let v = self.0.get_json(&self.0.repo_path(&repo, &format!("/pulls/{}/commits?per_page=100", item.id))).await?;
         Ok(v.as_array().unwrap_or(&vec![]).iter().map(map_commit).collect())
     }
-    async fn commit_changes(&self, _id: &str, sha: &str) -> Result<Vec<FileChange>> {
-        let v = self.0.get_json(&self.0.repo_path(&format!("/commits/{sha}"))).await?;
+    async fn commit_changes(&self, item: &ItemRef, sha: &str) -> Result<Vec<FileChange>> {
+        let repo = self.0.resolve(item)?;
+        let v = self.0.get_json(&self.0.repo_path(&repo, &format!("/commits/{sha}"))).await?;
         Ok(get_arr(&v, "files").iter().map(map_file_change).collect())
     }
-    async fn add_comment(&self, id: &str, body: &str) -> Result<()> {
-        self.0.post_json(&self.0.repo_path(&format!("/issues/{id}/comments")), json!({ "body": body })).await
+    async fn add_comment(&self, item: &ItemRef, body: &str) -> Result<()> {
+        let repo = self.0.resolve(item)?;
+        self.0.post_json(&self.0.repo_path(&repo, &format!("/issues/{}/comments", item.id)), json!({ "body": body })).await
     }
-    async fn reply_to_thread(&self, id: &str, thread_id: &str, body: &str) -> Result<()> {
+    async fn reply_to_thread(&self, item: &ItemRef, thread_id: &str, body: &str) -> Result<()> {
         // The bundled conversation thread ("pr-<id>") is flat issue comments with no reply API, so
         // fall back to a top-level comment; a numeric id is a review thread that supports replies.
         if thread_id.starts_with("pr-") {
-            return self.add_comment(id, body).await;
+            return self.add_comment(item, body).await;
         }
+        let repo = self.0.resolve(item)?;
         self.0
-            .post_json(&self.0.repo_path(&format!("/pulls/{id}/comments/{thread_id}/replies")), json!({ "body": body }))
+            .post_json(&self.0.repo_path(&repo, &format!("/pulls/{}/comments/{thread_id}/replies", item.id)), json!({ "body": body }))
             .await
     }
-    async fn vote(&self, id: &str, vote: ReviewVote) -> Result<()> {
+    async fn vote(&self, item: &ItemRef, vote: ReviewVote) -> Result<()> {
+        let repo = self.0.resolve(item)?;
         let event = match vote {
             ReviewVote::Approved | ReviewVote::ApprovedWithSuggestions => "APPROVE",
             ReviewVote::Rejected => "REQUEST_CHANGES",
             _ => "COMMENT",
         };
-        self.0.post_json(&self.0.repo_path(&format!("/pulls/{id}/reviews")), json!({ "event": event })).await
+        self.0.post_json(&self.0.repo_path(&repo, &format!("/pulls/{}/reviews", item.id)), json!({ "event": event })).await
     }
-    async fn submit_review(&self, id: &str, event: ReviewVote, comments: &[LineComment]) -> Result<()> {
+    async fn submit_review(&self, item: &ItemRef, event: ReviewVote, comments: &[LineComment]) -> Result<()> {
+        let repo = self.0.resolve(item)?;
         let ev = match event {
             ReviewVote::Approved | ReviewVote::ApprovedWithSuggestions => "APPROVE",
             ReviewVote::Rejected => "REQUEST_CHANGES",
@@ -619,16 +709,17 @@ impl PullRequestSource for GitHubPr {
             })
             .collect();
         self.0
-            .post_json(&self.0.repo_path(&format!("/pulls/{id}/reviews")), json!({ "event": ev, "comments": items }))
+            .post_json(&self.0.repo_path(&repo, &format!("/pulls/{}/reviews", item.id)), json!({ "event": ev, "comments": items }))
             .await
     }
-    async fn merge(&self, id: &str, options: &MergeOptions) -> Result<()> {
+    async fn merge(&self, item: &ItemRef, options: &MergeOptions) -> Result<()> {
+        let repo = self.0.resolve(item)?;
         let method = match options.strategy {
             MergeStrategy::Squash => "squash",
             MergeStrategy::Rebase => "rebase",
             MergeStrategy::Merge => "merge",
         };
-        let url = self.0.repo_path(&format!("/pulls/{id}/merge"));
+        let url = self.0.repo_path(&repo, &format!("/pulls/{}/merge", item.id));
         let resp = self.0.http.put(&url).json(&json!({ "merge_method": method })).send().await.map_err(prov)?;
         if !resp.status().is_success() {
             return Err(Error::Provider(format!("PUT {url} -> {}", resp.status())));
@@ -640,32 +731,51 @@ impl PullRequestSource for GitHubPr {
 #[async_trait]
 impl WorkItemSource for GitHubWi {
     async fn list(&self, query: &WorkItemQuery) -> Result<Vec<WorkItem>> {
-        let state = if query.include_completed { "all" } else { "open" };
-        let mut url = self.0.repo_path(&format!("/issues?state={state}&per_page={}", query.limit.unwrap_or(50)));
-        if query.mine_only {
-            // The repo issues endpoint rejects `@me` (422) — it needs the actual login.
-            if let Some(login) = self.0.self_login().await? {
-                url.push_str(&format!("&assignee={login}"));
-            }
+        let scope = &self.0.scope;
+        if scope.is_empty() {
+            return Ok(Vec::new());
         }
-        let v = self.0.get_json(&url).await?;
-        Ok(v.as_array().unwrap_or(&vec![]).iter().filter(|e| !is_pull_request(e)).map(map_issue).collect())
+        let state = if query.include_completed { "all" } else { "open" };
+        let per_page = query.limit.unwrap_or(50);
+        // The repo issues endpoint rejects `@me` (422) — it needs the actual login.
+        let me = if query.mine_only { self.0.self_login().await? } else { None };
+        let rows = fan_out(scope, "github.work_items.list", |repo| {
+            let me = me.clone();
+            async move {
+                let mut url = self.0.repo_path(&repo, &format!("/issues?state={state}&per_page={per_page}"));
+                if let Some(login) = &me {
+                    url.push_str(&format!("&assignee={login}"));
+                }
+                let v = self.0.get_json(&url).await?;
+                Ok(v.as_array()
+                    .unwrap_or(&vec![])
+                    .iter()
+                    .filter(|e| !is_pull_request(e))
+                    .map(|i| map_issue(i, Some(&repo)))
+                    .collect())
+            }
+        })
+        .await;
+        Ok(sort_and_cap(rows, scope.len(), query.limit, |wi| wi.updated_at))
     }
-    async fn get(&self, id: &str) -> Result<WorkItem> {
-        let v = self.0.get_json(&self.0.repo_path(&format!("/issues/{id}"))).await?;
-        Ok(map_issue(&v))
+    async fn get(&self, item: &ItemRef) -> Result<WorkItem> {
+        let repo = self.0.resolve(item)?;
+        let v = self.0.get_json(&self.0.repo_path(&repo, &format!("/issues/{}", item.id))).await?;
+        Ok(map_issue(&v, Some(&repo)))
     }
-    async fn threads(&self, id: &str) -> Result<Vec<CommentThread>> {
-        GitHubPr(self.0.clone()).threads(id).await
+    async fn threads(&self, item: &ItemRef) -> Result<Vec<CommentThread>> {
+        GitHubPr(self.0.clone()).threads(item).await
     }
-    async fn timeline(&self, id: &str) -> Result<Vec<TimelineEvent>> {
-        let events = self.0.get_json(&self.0.repo_path(&format!("/issues/{id}/events?per_page=100"))).await?;
+    async fn timeline(&self, item: &ItemRef) -> Result<Vec<TimelineEvent>> {
+        let repo = self.0.resolve(item)?;
+        let events = self.0.get_json(&self.0.repo_path(&repo, &format!("/issues/{}/events?per_page=100", item.id))).await?;
         let mut out: Vec<TimelineEvent> = events.as_array().unwrap_or(&vec![]).iter().filter_map(map_gh_issue_event).collect();
         out.sort_by_key(|e| e.at);
         Ok(out)
     }
-    async fn assignable_users(&self, _id: &str) -> Result<Vec<User>> {
-        let v = self.0.get_json(&self.0.repo_path("/assignees?per_page=100")).await?;
+    async fn assignable_users(&self, item: &ItemRef) -> Result<Vec<User>> {
+        let repo = self.0.resolve(item)?;
+        let v = self.0.get_json(&self.0.repo_path(&repo, "/assignees?per_page=100")).await?;
         Ok(v.as_array()
             .unwrap_or(&vec![])
             .iter()
@@ -675,16 +785,18 @@ impl WorkItemSource for GitHubWi {
             })
             .collect())
     }
-    async fn set_state(&self, id: &str, state: &str) -> Result<()> {
-        let url = self.0.repo_path(&format!("/issues/{id}"));
+    async fn set_state(&self, item: &ItemRef, state: &str) -> Result<()> {
+        let repo = self.0.resolve(item)?;
+        let url = self.0.repo_path(&repo, &format!("/issues/{}", item.id));
         let resp = self.0.http.patch(&url).json(&json!({ "state": state })).send().await.map_err(prov)?;
         if !resp.status().is_success() {
             return Err(Error::Provider(format!("PATCH {url} -> {}", resp.status())));
         }
         Ok(())
     }
-    async fn set_assignee(&self, id: &str, assignee_id: Option<&str>) -> Result<()> {
-        let url = self.0.repo_path(&format!("/issues/{id}"));
+    async fn set_assignee(&self, item: &ItemRef, assignee_id: Option<&str>) -> Result<()> {
+        let repo = self.0.resolve(item)?;
+        let url = self.0.repo_path(&repo, &format!("/issues/{}", item.id));
         let assignees: Vec<&str> = assignee_id.into_iter().collect();
         let resp = self.0.http.patch(&url).json(&json!({ "assignees": assignees })).send().await.map_err(prov)?;
         if !resp.status().is_success() {
@@ -692,10 +804,11 @@ impl WorkItemSource for GitHubWi {
         }
         Ok(())
     }
-    async fn update_fields(&self, id: &str, title: Option<&str>, description: Option<&str>) -> Result<()> {
+    async fn update_fields(&self, item: &ItemRef, title: Option<&str>, description: Option<&str>) -> Result<()> {
         if title.is_none() && description.is_none() {
             return Ok(());
         }
+        let repo = self.0.resolve(item)?;
         let mut body = serde_json::Map::new();
         if let Some(title) = title {
             body.insert("title".into(), json!(title));
@@ -703,52 +816,73 @@ impl WorkItemSource for GitHubWi {
         if let Some(description) = description {
             body.insert("body".into(), json!(description));
         }
-        let url = self.0.repo_path(&format!("/issues/{id}"));
+        let url = self.0.repo_path(&repo, &format!("/issues/{}", item.id));
         let resp = self.0.http.patch(&url).json(&Value::Object(body)).send().await.map_err(prov)?;
         if !resp.status().is_success() {
             return Err(Error::Provider(format!("PATCH {url} -> {}", resp.status())));
         }
         Ok(())
     }
-    async fn available_states(&self, _id: &str) -> Result<Vec<String>> {
+    async fn available_states(&self, _item: &ItemRef) -> Result<Vec<String>> {
         Ok(vec!["open".into(), "closed".into()])
     }
-    async fn add_comment(&self, id: &str, body: &str) -> Result<()> {
-        self.0.post_json(&self.0.repo_path(&format!("/issues/{id}/comments")), json!({ "body": body })).await
+    async fn add_comment(&self, item: &ItemRef, body: &str) -> Result<()> {
+        let repo = self.0.resolve(item)?;
+        self.0.post_json(&self.0.repo_path(&repo, &format!("/issues/{}/comments", item.id)), json!({ "body": body })).await
     }
 }
 
 #[async_trait]
 impl PipelineSource for GitHubPipe {
     async fn discover(&self) -> Result<Vec<PipelineDefinition>> {
-        let v = self.0.get_json(&self.0.repo_path("/actions/workflows?per_page=100")).await?;
-        Ok(get_arr(&v, "workflows").iter().map(map_workflow).collect())
+        let scope = &self.0.scope;
+        Ok(fan_out(scope, "github.pipelines.discover", |repo| async move {
+            let v = self.0.get_json(&self.0.repo_path(&repo, "/actions/workflows?per_page=100")).await?;
+            Ok(get_arr(&v, "workflows").iter().map(|w| map_workflow(w, Some(&repo))).collect())
+        })
+        .await)
     }
     async fn list_runs(&self, query: &PipelineRunQuery) -> Result<Vec<PipelineRun>> {
-        let mut url = match &query.definition_id {
-            Some(def) => self.0.repo_path(&format!("/actions/workflows/{def}/runs")),
-            None => self.0.repo_path("/actions/runs"),
+        // A query addressed at one repository stays there; an unaddressed one fans out.
+        let scope: Vec<String> = match &query.repository {
+            Some(repo) => vec![repo.clone()],
+            None => self.0.scope.clone(),
         };
-        url.push_str(&format!("?per_page={}", query.limit.unwrap_or(25)));
-        if let Some(b) = &query.branch {
-            url.push_str(&format!("&branch={b}"));
+        if scope.is_empty() {
+            return Ok(Vec::new());
         }
-        let v = self.0.get_json(&url).await?;
-        Ok(get_arr(&v, "workflow_runs").iter().map(map_run).collect())
+        let limit = query.limit.unwrap_or(25);
+        let rows = fan_out(&scope, "github.pipelines.list_runs", |repo| async move {
+            let mut url = match &query.definition_id {
+                Some(def) => self.0.repo_path(&repo, &format!("/actions/workflows/{def}/runs")),
+                None => self.0.repo_path(&repo, "/actions/runs"),
+            };
+            url.push_str(&format!("?per_page={limit}"));
+            if let Some(b) = &query.branch {
+                url.push_str(&format!("&branch={b}"));
+            }
+            let v = self.0.get_json(&url).await?;
+            Ok(get_arr(&v, "workflow_runs").iter().map(|r| map_run(r, Some(&repo))).collect())
+        })
+        .await;
+        Ok(sort_and_cap(rows, scope.len(), query.limit, |r| r.started_at))
     }
-    async fn get_run(&self, run_id: &str) -> Result<PipelineRun> {
-        let run_v = self.0.get_json(&self.0.repo_path(&format!("/actions/runs/{run_id}"))).await?;
-        let mut run = map_run(&run_v);
-        if let Ok(jobs_v) = self.0.get_json(&self.0.repo_path(&format!("/actions/runs/{run_id}/jobs"))).await {
+    async fn get_run(&self, run: &ItemRef) -> Result<PipelineRun> {
+        let repo = self.0.resolve(run)?;
+        let id = &run.id;
+        let run_v = self.0.get_json(&self.0.repo_path(&repo, &format!("/actions/runs/{id}"))).await?;
+        let mut mapped = map_run(&run_v, Some(&repo));
+        if let Ok(jobs_v) = self.0.get_json(&self.0.repo_path(&repo, &format!("/actions/runs/{id}/jobs"))).await {
             let jobs: Vec<PipelineJob> = get_arr(&jobs_v, "jobs").iter().map(map_job).collect();
             if !jobs.is_empty() {
-                run.stages = vec![PipelineStage { name: "jobs".into(), status: run.status, jobs }];
+                mapped.stages = vec![PipelineStage { name: "jobs".into(), status: mapped.status, jobs }];
             }
         }
-        Ok(run)
+        Ok(mapped)
     }
-    async fn logs(&self, run_id: &str, job_id: Option<&str>) -> Result<String> {
-        let jobs_v = self.0.get_json(&self.0.repo_path(&format!("/actions/runs/{run_id}/jobs"))).await?;
+    async fn logs(&self, run: &ItemRef, job_id: Option<&str>) -> Result<String> {
+        let repo = self.0.resolve(run)?;
+        let jobs_v = self.0.get_json(&self.0.repo_path(&repo, &format!("/actions/runs/{}/jobs", run.id))).await?;
         let lines: Vec<String> = get_arr(&jobs_v, "jobs")
             .iter()
             .filter(|j| job_id.is_none() || get_i64(j, "id").map(|n| n.to_string()).as_deref() == job_id)
@@ -756,30 +890,34 @@ impl PipelineSource for GitHubPipe {
             .collect();
         Ok(lines.join("\n"))
     }
-    async fn trigger(&self, definition_id: &str, branch: Option<&str>) -> Result<()> {
-        let url = self.0.repo_path(&format!("/actions/workflows/{definition_id}/dispatches"));
+    async fn trigger(&self, definition: &ItemRef, branch: Option<&str>) -> Result<()> {
+        let repo = self.0.resolve(definition)?;
+        let url = self.0.repo_path(&repo, &format!("/actions/workflows/{}/dispatches", definition.id));
         self.0.post_json(&url, json!({ "ref": branch.unwrap_or("main") })).await
     }
-    async fn cancel_run(&self, run_id: &str) -> Result<()> {
-        let url = self.0.repo_path(&format!("/actions/runs/{run_id}/cancel"));
+    async fn cancel_run(&self, run: &ItemRef) -> Result<()> {
+        let repo = self.0.resolve(run)?;
+        let url = self.0.repo_path(&repo, &format!("/actions/runs/{}/cancel", run.id));
         self.0.post_json(&url, json!({})).await
     }
     fn supports_approvals(&self) -> bool {
         true
     }
-    async fn pending_approvals(&self, run_id: &str) -> Result<Vec<PipelineApproval>> {
+    async fn pending_approvals(&self, run: &ItemRef) -> Result<Vec<PipelineApproval>> {
         // Environments awaiting a required-reviewer decision on this run.
-        let url = self.0.repo_path(&format!("/actions/runs/{run_id}/pending_deployments"));
+        let repo = self.0.resolve(run)?;
+        let url = self.0.repo_path(&repo, &format!("/actions/runs/{}/pending_deployments", run.id));
         let v = self.0.get_json(&url).await?;
         Ok(v.as_array().map(|a| a.as_slice()).unwrap_or(&[]).iter().filter_map(map_pending_deployment).collect())
     }
-    async fn respond_approval(&self, run_id: &str, approval_id: &str, decision: ApprovalDecision, comment: Option<&str>) -> Result<()> {
+    async fn respond_approval(&self, run: &ItemRef, approval_id: &str, decision: ApprovalDecision, comment: Option<&str>) -> Result<()> {
+        let repo = self.0.resolve(run)?;
         let env_id: i64 = approval_id.parse().map_err(|_| Error::Provider("invalid environment id".into()))?;
         let state = match decision {
             ApprovalDecision::Approve => "approved",
             ApprovalDecision::Reject => "rejected",
         };
-        let url = self.0.repo_path(&format!("/actions/runs/{run_id}/pending_deployments"));
+        let url = self.0.repo_path(&repo, &format!("/actions/runs/{}/pending_deployments", run.id));
         self.0.post_json(&url, json!({ "environment_ids": [env_id], "state": state, "comment": comment.unwrap_or("") })).await
     }
 }
@@ -825,6 +963,9 @@ impl ProviderConnection for GitHubConnection {
     fn notifications(&self) -> Option<Arc<dyn NotificationSource>> {
         Some(Arc::new(GitHubNotif(self.client.clone())))
     }
+    async fn discover_repositories(&self) -> Result<RepositoryPage> {
+        self.client.discover_repositories().await
+    }
     async fn check(&self) -> bool {
         self.client.get_json(&format!("{}/user", self.client.base)).await.is_ok()
     }
@@ -845,6 +986,21 @@ pub fn github_capabilities() -> Capabilities {
     }
 }
 
+/// The repositories a GitHub connection fetches from, connection-relative (`owner/repo`).
+///
+/// An explicit scope wins; only its absence falls back to the legacy single repository, which
+/// historically could be spelled either `owner/repo` (what the connect form asks for) or a bare
+/// `repo` alongside an `organization`. Both are normalised here, so an existing connection keeps
+/// working untouched.
+fn github_scope(connection: &Connection) -> Vec<String> {
+    connection.resolve_repo_scope(|| {
+        connection.repository.as_ref().map(|repo| match (repo.contains('/'), connection.organization.as_deref()) {
+            (false, Some(owner)) => format!("{owner}/{repo}"),
+            _ => repo.clone(),
+        })
+    })
+}
+
 pub struct GitHubFactory;
 
 impl ProviderFactory for GitHubFactory {
@@ -855,8 +1011,9 @@ impl ProviderFactory for GitHubFactory {
         github_capabilities()
     }
     fn create(&self, connection: &Connection, secret: Option<String>) -> Result<Arc<dyn ProviderConnection>> {
-        let owner = connection.organization.clone().ok_or_else(|| Error::Config("GitHub connection requires an Organization (owner)".into()))?;
-        let repo = connection.repository.clone().ok_or_else(|| Error::Config("GitHub connection requires a Repository".into()))?;
+        // A GitHub PAT is account-scoped, so nothing here is required any more: a connection with
+        // no repositories yet is a valid account connection whose scope the user picks afterwards.
+        let scope = github_scope(connection);
 
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(USER_AGENT, "forgetop".parse().unwrap());
@@ -869,8 +1026,7 @@ impl ProviderFactory for GitHubFactory {
         let client = Arc::new(GitHubClient {
             http,
             base: connection.base_url.clone().unwrap_or_else(|| "https://api.github.com".into()),
-            owner,
-            repo,
+            scope,
             self_login: tokio::sync::Mutex::new(None),
         });
         Ok(Arc::new(GitHubConnection {
@@ -885,6 +1041,70 @@ impl ProviderFactory for GitHubFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn connection(repository: Option<&str>, organization: Option<&str>, scope: Option<Vec<&str>>) -> Connection {
+        Connection {
+            id: "gh".into(),
+            provider_type: ProviderType::GitHub,
+            display_name: "GitHub".into(),
+            base_url: None,
+            organization: organization.map(str::to_string),
+            project: None,
+            repository: repository.map(str::to_string),
+            username: None,
+            credential_ref: None,
+            repo_scope: scope.map(|s| s.into_iter().map(str::to_string).collect()),
+        }
+    }
+
+    #[test]
+    fn an_existing_single_repository_connection_resolves_exactly_as_before() {
+        // Nothing on disk is rewritten: the legacy repository becomes a one-element scope.
+        assert_eq!(github_scope(&connection(Some("acme/pay"), None, None)), vec!["acme/pay".to_string()]);
+        // …including the older spelling, where the owner lived in `organization`.
+        assert_eq!(github_scope(&connection(Some("pay"), Some("acme"), None)), vec!["acme/pay".to_string()]);
+    }
+
+    #[test]
+    fn an_explicit_scope_wins_and_an_emptied_one_is_respected() {
+        let c = connection(Some("acme/pay"), None, Some(vec!["acme/ledger", "acme/web"]));
+        assert_eq!(github_scope(&c), vec!["acme/ledger".to_string(), "acme/web".to_string()]);
+        // "I chose none" must not silently refill from the legacy repository.
+        assert!(github_scope(&connection(Some("acme/pay"), None, Some(vec![]))).is_empty());
+    }
+
+    #[test]
+    fn a_github_connection_no_longer_needs_a_repository_to_be_created() {
+        // A PAT is account-scoped, so an account connection with nothing picked yet is valid —
+        // and before this change the connect form could save one that then failed on every fetch.
+        assert!(GitHubFactory.create(&connection(None, None, None), Some("pat".into())).is_ok());
+    }
+
+    fn client(scope: &[&str]) -> Arc<GitHubClient> {
+        Arc::new(GitHubClient {
+            http: reqwest::Client::new(),
+            // Unroutable on purpose: any request at all would fail the test rather than hang.
+            base: "http://127.0.0.1:9/never".into(),
+            scope: scope.iter().map(|s| s.to_string()).collect(),
+            self_login: tokio::sync::Mutex::new(None),
+        })
+    }
+
+    #[tokio::test]
+    async fn an_empty_scope_fetches_nothing_and_is_not_an_error() {
+        // "No repositories selected" is a real state: fetch nothing, return an empty list. Never
+        // an error, and never to be confused with "no pull requests".
+        assert!(GitHubPr(client(&[])).list(&PullRequestQuery::default()).await.unwrap().is_empty());
+        assert!(GitHubWi(client(&[])).list(&WorkItemQuery::default()).await.unwrap().is_empty());
+        assert!(GitHubPipe(client(&[])).list_runs(&PipelineRunQuery::default()).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_wide_scope_refuses_an_unaddressed_item_rather_than_guessing() {
+        // Opening `#7` on a two-repository connection must not silently pick one of them.
+        let err = GitHubPr(client(&["acme/pay", "acme/ledger"])).get(&ItemRef::new("7")).await.unwrap_err();
+        assert!(err.to_string().contains("spans 2 repositories"), "got: {err}");
+    }
 
     #[test]
     fn notification_reasons_cover_pr_activity() {
@@ -958,7 +1178,7 @@ mod tests {
                  "labels": [ { "name": "banking" } ], "requested_reviewers": [ { "id": 8, "login": "rev" } ] }"#,
         )
         .unwrap();
-        let pr = map_pull_request(&v);
+        let pr = map_pull_request(&v, None);
         assert_eq!(pr.id, "42");
         assert_eq!(pr.status, PullRequestStatus::Open);
         assert_eq!(pr.mergeable, MergeableState::Mergeable);
@@ -970,9 +1190,9 @@ mod tests {
     #[test]
     fn merged_and_draft_status() {
         let merged: Value = serde_json::from_str(r#"{ "number": 1, "state": "closed", "merged_at": "2026-06-01T10:00:00Z", "user": { "login": "a" } }"#).unwrap();
-        assert_eq!(map_pull_request(&merged).status, PullRequestStatus::Merged);
+        assert_eq!(map_pull_request(&merged, None).status, PullRequestStatus::Merged);
         let draft: Value = serde_json::from_str(r#"{ "number": 2, "state": "open", "draft": true, "user": { "login": "a" } }"#).unwrap();
-        assert_eq!(map_pull_request(&draft).mergeable, MergeableState::Blocked);
+        assert_eq!(map_pull_request(&draft, None).mergeable, MergeableState::Blocked);
     }
 
     #[test]
@@ -994,7 +1214,7 @@ mod tests {
             r#"{ "id": 123, "workflow_id": 99, "run_number": 7, "name": "CI", "status": "completed", "conclusion": "failure", "head_branch": "main" }"#,
         )
         .unwrap();
-        let r = map_run(&run);
+        let r = map_run(&run, None);
         assert_eq!(r.status, PipelineRunStatus::Failed);
         assert_eq!(r.definition_id, "99");
 

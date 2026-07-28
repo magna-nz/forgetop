@@ -2236,6 +2236,7 @@ mod tests {
 
     fn sample_pr() -> PullRequest {
         PullRequest {
+            repository: None,
             id: "1".into(),
             number: Some(42),
             title: "Add the widget".into(),
@@ -2627,6 +2628,7 @@ mod tests {
 
     fn sample_run() -> PipelineRun {
         PipelineRun {
+            repository: None,
             id: "r1".into(),
             definition_id: "ci".into(),
             number: Some(101),
@@ -2851,6 +2853,7 @@ mod tests {
             r
         };
         let wi = WorkItem {
+            repository: None,
             id: "w".into(),
             identifier: Some("FOR-1".into()),
             title: "Investigate flake".into(),
@@ -2956,6 +2959,7 @@ mod tests {
         app.screen = Screen::WiView(Box::new(crate::app::WiView {
             connection_id: "c".into(),
             wi: WorkItem {
+                repository: None,
                 id: "w1".into(),
                 identifier: Some("FOR-1".into()),
                 title: "A task".into(),
@@ -3078,6 +3082,7 @@ mod tests {
             connection: "GitHub".into(),
             provider: ProviderType::GitHub,
             notification: Notification {
+                repository: None,
                 id: id.into(),
                 kind,
                 item_type: NotificationItemType::PullRequest,

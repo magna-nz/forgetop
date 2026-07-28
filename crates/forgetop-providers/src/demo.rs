@@ -118,6 +118,7 @@ fn pr(
 ) -> PullRequest {
     let now = base();
     PullRequest {
+        repository: None,
         id: n.to_string(),
         number: Some(n),
         title: title.into(),
@@ -145,6 +146,7 @@ fn pr(
 fn wi(id: &str, title: &str, state: &str, cat: WorkItemStateCategory, ty: &str, mine: bool, updated_h: i64) -> WorkItem {
     let now = base();
     WorkItem {
+        repository: None,
         id: id.into(),
         identifier: Some(id.into()),
         title: title.into(),
@@ -240,27 +242,46 @@ fn jira_wis() -> Vec<WorkItem> {
     ]
 }
 
-fn prs_for(conn: &str) -> Vec<PullRequest> {
+/// The repository a demo connection's items live in, **connection-relative**.
+///
+/// The demo provider is deliberately exempt from the repository scope — it stays single-repo —
+/// but it still stamps a real repository on everything it returns, so any deep-link or
+/// hard-refresh path carries an address rather than a `None`. It never *validates* one, so a
+/// fixture connection can't fail addressing. (Linear and Jira aren't repo-addressed at all.)
+fn demo_repository(conn: &str) -> Option<String> {
     match conn {
-        "gitlab" => gitlab_prs(),
-        "bitbucket" => bitbucket_prs(),
-        _ => github_prs(),
+        "gitlab" => Some("northwind/platform".into()),
+        "bitbucket" => Some("northwind/mobile".into()),
+        "linear" | "jira" => None,
+        _ => Some("northwind/payments".into()),
     }
 }
 
+fn prs_for(conn: &str) -> Vec<PullRequest> {
+    let repo = demo_repository(conn);
+    let prs = match conn {
+        "gitlab" => gitlab_prs(),
+        "bitbucket" => bitbucket_prs(),
+        _ => github_prs(),
+    };
+    prs.into_iter().map(|mut pr| { pr.repository = repo.clone(); pr }).collect()
+}
+
 fn wis_for(conn: &str) -> Vec<WorkItem> {
-    match conn {
+    let repo = demo_repository(conn);
+    let wis = match conn {
         "gitlab" => gitlab_wis(),
         "linear" => linear_wis(),
         "jira" => jira_wis(),
         _ => github_wis(),
-    }
+    };
+    wis.into_iter().map(|mut w| { w.repository = repo.clone(); w }).collect()
 }
 
 fn pipeline_defs() -> Vec<PipelineDefinition> {
     vec![
-        PipelineDefinition { id: "ci".into(), name: "CI Build".into(), path: Some(".github/workflows/ci.yml".into()), url: None },
-        PipelineDefinition { id: "release".into(), name: "CD (Release)".into(), path: Some(".github/workflows/release.yml".into()), url: None },
+        PipelineDefinition { repository: None, id: "ci".into(), name: "CI Build".into(), path: Some(".github/workflows/ci.yml".into()), url: None },
+        PipelineDefinition { repository: None, id: "release".into(), name: "CD (Release)".into(), path: Some(".github/workflows/release.yml".into()), url: None },
     ]
 }
 
@@ -294,6 +315,7 @@ fn run(id: &str, def: &str, num: i64, name: &str, title: &str, status: PipelineR
     let now = base();
     let started = now - chrono::Duration::hours(updated_h);
     PipelineRun {
+        repository: None,
         id: id.into(),
         definition_id: def.into(),
         number: Some(num),
@@ -311,7 +333,7 @@ fn run(id: &str, def: &str, num: i64, name: &str, title: &str, status: PipelineR
 }
 
 fn gitlab_pipeline_defs() -> Vec<PipelineDefinition> {
-    vec![PipelineDefinition { id: "gl-pipeline".into(), name: "Integration Suite".into(), path: Some(".gitlab-ci.yml".into()), url: None }]
+    vec![PipelineDefinition { repository: None, id: "gl-pipeline".into(), name: "Integration Suite".into(), path: Some(".gitlab-ci.yml".into()), url: None }]
 }
 fn gitlab_runs() -> Vec<PipelineRun> {
     vec![
@@ -320,7 +342,7 @@ fn gitlab_runs() -> Vec<PipelineRun> {
     ]
 }
 fn bitbucket_pipeline_defs() -> Vec<PipelineDefinition> {
-    vec![PipelineDefinition { id: "bb-default".into(), name: "Deploy to Staging".into(), path: Some("bitbucket-pipelines.yml".into()), url: None }]
+    vec![PipelineDefinition { repository: None, id: "bb-default".into(), name: "Deploy to Staging".into(), path: Some("bitbucket-pipelines.yml".into()), url: None }]
 }
 fn bitbucket_runs() -> Vec<PipelineRun> {
     vec![
@@ -329,24 +351,29 @@ fn bitbucket_runs() -> Vec<PipelineRun> {
     ]
 }
 fn pipeline_defs_for(conn: &str) -> Vec<PipelineDefinition> {
-    match conn {
+    let repo = demo_repository(conn);
+    let defs = match conn {
         "gitlab" => gitlab_pipeline_defs(),
         "bitbucket" => bitbucket_pipeline_defs(),
         _ => pipeline_defs(),
-    }
+    };
+    defs.into_iter().map(|mut d| { d.repository = repo.clone(); d }).collect()
 }
 fn pipeline_runs_for(conn: &str) -> Vec<PipelineRun> {
-    match conn {
+    let repo = demo_repository(conn);
+    let runs = match conn {
         "gitlab" => gitlab_runs(),
         "bitbucket" => bitbucket_runs(),
         _ => pipeline_runs(),
-    }
+    };
+    runs.into_iter().map(|mut r| { r.repository = repo.clone(); r }).collect()
 }
 
 fn pipeline_runs() -> Vec<PipelineRun> {
     let now = base();
     vec![
         PipelineRun {
+            repository: None,
             id: "r501".into(),
             definition_id: "ci".into(),
             number: Some(501),
@@ -380,6 +407,7 @@ fn pipeline_runs() -> Vec<PipelineRun> {
             ],
         },
         PipelineRun {
+            repository: None,
             id: "r500".into(),
             definition_id: "ci".into(),
             number: Some(500),
@@ -426,6 +454,7 @@ fn pipeline_runs() -> Vec<PipelineRun> {
             ],
         },
         PipelineRun {
+            repository: None,
             id: "r207".into(),
             definition_id: "release".into(),
             number: Some(207),
@@ -452,6 +481,7 @@ fn pipeline_runs() -> Vec<PipelineRun> {
             }],
         },
         PipelineRun {
+            repository: None,
             id: "r502".into(),
             definition_id: "ci".into(),
             number: Some(502),
@@ -577,14 +607,16 @@ impl PullRequestSource for DemoPr {
             .collect();
         Ok(apply_pull_request_filter(prs, query.filter, Some("you")))
     }
-    async fn get(&self, id: &str) -> Result<PullRequest> {
+    async fn get(&self, item: &ItemRef) -> Result<PullRequest> {
+        let id: &str = &item.id;
         prs_for(&self.conn)
             .into_iter()
             .find(|p| p.id == id)
             .map(apply_session_state)
             .ok_or_else(|| forgetop_core::Error::NotFound(id.into()))
     }
-    async fn threads(&self, id: &str) -> Result<Vec<CommentThread>> {
+    async fn threads(&self, item: &ItemRef) -> Result<Vec<CommentThread>> {
+        let id: &str = &item.id;
         let mut threads = vec![
             // Anchored to a diff line so it renders inline and `]`/`[` can jump to it.
             CommentThread {
@@ -639,7 +671,8 @@ impl PullRequestSource for DemoPr {
         }
         Ok(threads)
     }
-    async fn timeline(&self, id: &str) -> Result<Vec<TimelineEvent>> {
+    async fn timeline(&self, item: &ItemRef) -> Result<Vec<TimelineEvent>> {
+        let id: &str = &item.id;
         use TimelineEventKind as K;
         let mut events = Vec::new();
         // Derive review events from the PR's actual reviewers, so the timeline matches the
@@ -667,7 +700,7 @@ impl PullRequestSource for DemoPr {
         }
         Ok(events)
     }
-    async fn changes(&self, _id: &str) -> Result<Vec<FileChange>> {
+    async fn changes(&self, _item: &ItemRef) -> Result<Vec<FileChange>> {
         Ok(vec![
             FileChange {
                 path: "src/http/retry.rs".into(),
@@ -724,7 +757,8 @@ impl PullRequestSource for DemoPr {
             },
         ])
     }
-    async fn checks(&self, id: &str) -> Result<Vec<CheckRun>> {
+    async fn checks(&self, item: &ItemRef) -> Result<Vec<CheckRun>> {
+        let id: &str = &item.id;
         // Canned URLs so the dashboard Checks tab is clickable in --demo, like a real provider.
         let url = |name: &str| Some(format!("https://example.test/pr/{id}/checks/{name}"));
         Ok(vec![
@@ -735,14 +769,14 @@ impl PullRequestSource for DemoPr {
             CheckRun { name: "deploy-preview".into(), status: CheckStatus::Pending, url: url("deploy-preview") },
         ])
     }
-    async fn commits(&self, _id: &str) -> Result<Vec<Commit>> {
+    async fn commits(&self, _item: &ItemRef) -> Result<Vec<Commit>> {
         Ok(vec![
             Commit { sha: "a1b2c3d".into(), message: "Add RetryPolicy with jittered backoff".into(), author: "alice".into(), date: Some(base()), url: None },
             Commit { sha: "e4f5a6b".into(), message: "Wire retry into the HTTP client".into(), author: "alice".into(), date: Some(base() - chrono::Duration::hours(3)), url: None },
             Commit { sha: "9c8d7e6".into(), message: "Address review: cap max attempts".into(), author: "bob".into(), date: Some(base() - chrono::Duration::hours(1)), url: None },
         ])
     }
-    async fn commit_changes(&self, _id: &str, sha: &str) -> Result<Vec<FileChange>> {
+    async fn commit_changes(&self, _item: &ItemRef, sha: &str) -> Result<Vec<FileChange>> {
         // Canned per-commit diff so drilling into each commit shows distinct changes.
         let file = match sha {
             "a1b2c3d" => FileChange {
@@ -793,7 +827,8 @@ impl PullRequestSource for DemoPr {
         };
         Ok(vec![file])
     }
-    async fn add_comment(&self, id: &str, body: &str) -> Result<()> {
+    async fn add_comment(&self, item: &ItemRef, body: &str) -> Result<()> {
+        let id: &str = &item.id;
         // Persist as a general (non-line) thread so it comes back from threads() and shows
         // on the Conversation tab after the view refreshes.
         let mut store = submitted_threads().lock().unwrap();
@@ -808,7 +843,8 @@ impl PullRequestSource for DemoPr {
         });
         Ok(())
     }
-    async fn reply_to_thread(&self, id: &str, thread_id: &str, body: &str) -> Result<()> {
+    async fn reply_to_thread(&self, item: &ItemRef, thread_id: &str, body: &str) -> Result<()> {
+        let id: &str = &item.id;
         // Append the reply to its thread so it comes back inline on the next refresh.
         let mut store = thread_replies().lock().unwrap();
         let entry = store.entry(format!("{id}:{thread_id}")).or_default();
@@ -816,7 +852,8 @@ impl PullRequestSource for DemoPr {
         entry.push(Comment { id: format!("reply-{thread_id}-{n}"), author: me(), body: body.into(), created_at: Some(base()) });
         Ok(())
     }
-    async fn vote(&self, id: &str, vote: ReviewVote) -> Result<()> {
+    async fn vote(&self, item: &ItemRef, vote: ReviewVote) -> Result<()> {
+        let id: &str = &item.id;
         // Record your review so list()/get() reflect it on the next fetch, like a real provider:
         // requesting changes marks the PR, approving clears it.
         let mut cr = changes_requested_prs().lock().unwrap();
@@ -831,16 +868,18 @@ impl PullRequestSource for DemoPr {
         }
         Ok(())
     }
-    async fn merge(&self, id: &str, _options: &MergeOptions) -> Result<()> {
+    async fn merge(&self, item: &ItemRef, _options: &MergeOptions) -> Result<()> {
+        let id: &str = &item.id;
         // Record the merge so list()/get() report this PR as freshly merged (→ Recently merged).
         merged_prs().lock().unwrap().insert(id.to_string());
         Ok(())
     }
-    async fn revert(&self, _id: &str) -> Result<()> {
+    async fn revert(&self, _item: &ItemRef) -> Result<()> {
         // Demo revert is a no-op success so the button is present and clickable without a live forge.
         Ok(())
     }
-    async fn submit_review(&self, id: &str, _event: ReviewVote, comments: &[LineComment]) -> Result<()> {
+    async fn submit_review(&self, item: &ItemRef, _event: ReviewVote, comments: &[LineComment]) -> Result<()> {
+        let id: &str = &item.id;
         // Persist each line comment as an open thread by "you", so it comes back from
         // threads() and the diff shows it exactly as a real provider would.
         let mut store = submitted_threads().lock().unwrap();
@@ -877,18 +916,20 @@ impl WorkItemSource for DemoWi {
             .filter(|w| !query.mine_only || w.assignee.as_ref().map(|u| u.id == "me").unwrap_or(false))
             .collect())
     }
-    async fn get(&self, id: &str) -> Result<WorkItem> {
+    async fn get(&self, item: &ItemRef) -> Result<WorkItem> {
+        let id: &str = &item.id;
         wis_for(&self.conn)
             .into_iter()
             .find(|w| w.id == id)
             .map(apply_wi_override)
             .ok_or_else(|| forgetop_core::Error::NotFound(id.into()))
     }
-    async fn threads(&self, id: &str) -> Result<Vec<CommentThread>> {
+    async fn threads(&self, item: &ItemRef) -> Result<Vec<CommentThread>> {
+        let id: &str = &item.id;
         // Comments submitted this session persist and come back, like a real provider.
         Ok(submitted_threads().lock().unwrap().get(id).cloned().unwrap_or_default())
     }
-    async fn timeline(&self, _id: &str) -> Result<Vec<TimelineEvent>> {
+    async fn timeline(&self, _item: &ItemRef) -> Result<Vec<TimelineEvent>> {
         use TimelineEventKind as K;
         let ev = |actor: User, kind: K, summary: &str, hrs: i64| TimelineEvent {
             actor: Some(actor),
@@ -901,10 +942,11 @@ impl WorkItemSource for DemoWi {
             ev(alice(), K::StateChanged, "moved this to In Progress", 26),
         ])
     }
-    async fn set_state(&self, _id: &str, _state: &str) -> Result<()> {
+    async fn set_state(&self, _item: &ItemRef, _state: &str) -> Result<()> {
         Ok(())
     }
-    async fn add_comment(&self, id: &str, body: &str) -> Result<()> {
+    async fn add_comment(&self, item: &ItemRef, body: &str) -> Result<()> {
+        let id: &str = &item.id;
         let mut store = submitted_threads().lock().unwrap();
         let entry = store.entry(id.to_string()).or_default();
         let n = entry.len();
@@ -917,18 +959,20 @@ impl WorkItemSource for DemoWi {
         });
         Ok(())
     }
-    async fn available_states(&self, _id: &str) -> Result<Vec<String>> {
+    async fn available_states(&self, _item: &ItemRef) -> Result<Vec<String>> {
         Ok(["Backlog", "Todo", "In Progress", "In Review", "Blocked", "Done"].iter().map(|s| s.to_string()).collect())
     }
-    async fn assignable_users(&self, _id: &str) -> Result<Vec<User>> {
+    async fn assignable_users(&self, _item: &ItemRef) -> Result<Vec<User>> {
         Ok(demo_assignable())
     }
-    async fn set_assignee(&self, id: &str, assignee_id: Option<&str>) -> Result<()> {
+    async fn set_assignee(&self, item: &ItemRef, assignee_id: Option<&str>) -> Result<()> {
+        let id: &str = &item.id;
         let user = assignee_id.and_then(|aid| demo_assignable().into_iter().find(|u| u.id == aid));
         wi_overrides().lock().unwrap().entry(id.to_string()).or_default().assignee = Some(user);
         Ok(())
     }
-    async fn update_fields(&self, id: &str, title: Option<&str>, description: Option<&str>) -> Result<()> {
+    async fn update_fields(&self, item: &ItemRef, title: Option<&str>, description: Option<&str>) -> Result<()> {
+        let id: &str = &item.id;
         let mut store = wi_overrides().lock().unwrap();
         let ov = store.entry(id.to_string()).or_default();
         if let Some(t) = title {
@@ -957,14 +1001,16 @@ impl PipelineSource for DemoPipe {
             .map(apply_pipe_cancel)
             .collect())
     }
-    async fn get_run(&self, run_id: &str) -> Result<PipelineRun> {
+    async fn get_run(&self, run: &ItemRef) -> Result<PipelineRun> {
+        let run_id: &str = &run.id;
         pipeline_runs_for(&self.conn)
             .into_iter()
             .find(|r| r.id == run_id)
             .map(apply_pipe_cancel)
             .ok_or_else(|| forgetop_core::Error::NotFound(run_id.into()))
     }
-    async fn logs(&self, run_id: &str, job_id: Option<&str>) -> Result<String> {
+    async fn logs(&self, run: &ItemRef, job_id: Option<&str>) -> Result<String> {
+        let run_id: &str = &run.id;
         let job = job_id.unwrap_or("job");
         let mut out = format!("=== logs for run {run_id} · {job} ===\n");
         for i in 1..=24 {
@@ -979,17 +1025,19 @@ impl PipelineSource for DemoPipe {
         }
         Ok(out)
     }
-    async fn trigger(&self, _definition_id: &str, _branch: Option<&str>) -> Result<()> {
+    async fn trigger(&self, _definition: &ItemRef, _branch: Option<&str>) -> Result<()> {
         Ok(())
     }
-    async fn cancel_run(&self, run_id: &str) -> Result<()> {
+    async fn cancel_run(&self, run: &ItemRef) -> Result<()> {
+        let run_id: &str = &run.id;
         canceled_runs().lock().unwrap().insert(run_id.to_string());
         Ok(())
     }
     fn supports_approvals(&self) -> bool {
         true
     }
-    async fn pending_approvals(&self, run_id: &str) -> Result<Vec<PipelineApproval>> {
+    async fn pending_approvals(&self, run: &ItemRef) -> Result<Vec<PipelineApproval>> {
+        let run_id: &str = &run.id;
         // A cancelled run no longer has a live gate.
         if canceled_runs().lock().unwrap().contains(run_id) {
             return Ok(Vec::new());
@@ -1001,7 +1049,7 @@ impl PipelineSource for DemoPipe {
             Vec::new()
         })
     }
-    async fn respond_approval(&self, _run_id: &str, _approval_id: &str, _decision: ApprovalDecision, _comment: Option<&str>) -> Result<()> {
+    async fn respond_approval(&self, _run: &ItemRef, _approval_id: &str, _decision: ApprovalDecision, _comment: Option<&str>) -> Result<()> {
         Ok(())
     }
 }
@@ -1039,6 +1087,7 @@ fn notif(
     updated_h: i64,
 ) -> Notification {
     Notification {
+        repository: None,
         id: id.into(),
         kind,
         item_type: item,
@@ -1198,33 +1247,33 @@ mod tests {
     async fn submitted_review_comments_persist_in_threads() {
         let src = DemoPr { conn: "github".into() };
         // Unique ids so the session-global store can't collide with other tests.
-        let (pr, other) = ("persist-pr-a", "persist-pr-b");
-        let before = src.threads(pr).await.unwrap().len();
+        let (pr, other) = (ItemRef::new("persist-pr-a"), ItemRef::new("persist-pr-b"));
+        let before = src.threads(&pr).await.unwrap().len();
 
         src.submit_review(
-            pr,
+            &pr,
             ReviewVote::NoVote,
             &[LineComment { path: "src/http/retry.rs".into(), line: 7, side: DiffSide::New, body: "please add a test".into() }],
         )
         .await
         .unwrap();
 
-        let after = src.threads(pr).await.unwrap();
+        let after = src.threads(&pr).await.unwrap();
         assert_eq!(after.len(), before + 1, "the submitted comment persists as a new thread");
         assert!(
             after.iter().any(|t| t.comments.iter().any(|c| c.body == "please add a test")),
             "the submitted body comes back from threads()"
         );
         // A different PR is unaffected by what was submitted to this one.
-        assert_eq!(src.threads(other).await.unwrap().len(), before);
+        assert_eq!(src.threads(&other).await.unwrap().len(), before);
     }
 
     #[tokio::test]
     async fn pr_comment_persists_as_a_conversation_thread() {
         let src = DemoPr { conn: "github".into() };
-        let id = "persist-prcomment-a"; // unique id → no cross-test pollution
-        src.add_comment(id, "ship it").await.unwrap();
-        let threads = src.threads(id).await.unwrap();
+        let id = ItemRef::new("persist-prcomment-a"); // unique id → no cross-test pollution
+        src.add_comment(&id, "ship it").await.unwrap();
+        let threads = src.threads(&id).await.unwrap();
         assert!(
             threads.iter().any(|t| t.file_path.is_none() && t.comments.iter().any(|c| c.body == "ship it")),
             "a PR comment comes back as a general (non-line) thread"
@@ -1234,10 +1283,10 @@ mod tests {
     #[tokio::test]
     async fn wi_comment_persists_in_threads() {
         let src = DemoWi { conn: "github".into() };
-        let id = "persist-wicomment-a";
-        let before = src.threads(id).await.unwrap().len();
-        src.add_comment(id, "on it").await.unwrap();
-        let after = src.threads(id).await.unwrap();
+        let id = ItemRef::new("persist-wicomment-a");
+        let before = src.threads(&id).await.unwrap().len();
+        src.add_comment(&id, "on it").await.unwrap();
+        let after = src.threads(&id).await.unwrap();
         assert_eq!(after.len(), before + 1);
         assert!(after.iter().any(|t| t.comments.iter().any(|c| c.body == "on it")));
     }
@@ -1259,7 +1308,7 @@ mod tests {
         let review = ns.iter().find(|n| n.kind == NotificationKind::ReviewRequested).unwrap();
         assert_eq!(review.item_type, NotificationItemType::PullRequest);
         let pr_id = review.item_id.clone().expect("has an item to open");
-        let pr = DemoPr { conn: "github".into() }.get(&pr_id).await.unwrap();
+        let pr = DemoPr { conn: "github".into() }.get(&ItemRef::new(&pr_id)).await.unwrap();
         assert_eq!(pr.id, pr_id, "item_id resolves to a real demo PR");
 
         // Marking read persists for the session.
@@ -1274,7 +1323,7 @@ mod tests {
         // A fabricated id (not a real demo PR) so the session-global store can't pollute
         // other tests' open-PR counts.
         let id = "demo-merge-test-42";
-        src.merge(id, &MergeOptions { strategy: MergeStrategy::Merge, delete_source_ref: false }).await.unwrap();
+        src.merge(&ItemRef::new(id), &MergeOptions { strategy: MergeStrategy::Merge, delete_source_ref: false }).await.unwrap();
 
         // A PR with that id now reports as merged and no longer open/draft.
         let mut p = pr(0, "x", me(), PullRequestStatus::Open, CheckStatus::Passed, MergeableState::Mergeable, vec![], 1, 1, 1, "b", &[]);
@@ -1297,7 +1346,7 @@ mod tests {
         };
 
         // Request changes → a re-fetch (apply_session_state) shows your review as Rejected.
-        src.vote(id, ReviewVote::Rejected).await.unwrap();
+        src.vote(&ItemRef::new(id), ReviewVote::Rejected).await.unwrap();
         let reviewed = apply_session_state(base_pr());
         assert!(
             reviewed.reviewers.iter().any(|r| r.user.id == "me" && r.vote == ReviewVote::Rejected),
@@ -1305,7 +1354,7 @@ mod tests {
         );
 
         // Approving clears it again.
-        src.vote(id, ReviewVote::Approved).await.unwrap();
+        src.vote(&ItemRef::new(id), ReviewVote::Approved).await.unwrap();
         let cleared = apply_session_state(base_pr());
         assert!(cleared.reviewers.iter().all(|r| r.vote != ReviewVote::Rejected), "approving clears the changes-requested review");
     }
@@ -1322,7 +1371,7 @@ mod tests {
     #[tokio::test]
     async fn run_has_stages_jobs_steps() {
         let src = conn().pipelines().unwrap();
-        let run = src.get_run("r500").await.unwrap();
+        let run = src.get_run(&ItemRef::new("r500")).await.unwrap();
         let test = run.stages.iter().find(|s| s.name == "test").unwrap();
         let integ = test.jobs.iter().find(|j| j.name == "integration").unwrap();
         assert!(integ.steps.iter().any(|s| matches!(s.status, PipelineRunStatus::Failed)));
@@ -1360,7 +1409,7 @@ mod tests {
     #[tokio::test]
     async fn work_items_expose_available_states() {
         let src = conn().work_items().unwrap();
-        let states = src.available_states("w1").await.unwrap();
+        let states = src.available_states(&ItemRef::new("w1")).await.unwrap();
         assert!(states.contains(&"In Progress".to_string()) && states.contains(&"Done".to_string()));
         assert!(states.len() >= 4, "a meaningful set of states to pick from");
     }

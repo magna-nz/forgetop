@@ -31,6 +31,7 @@ mod tests {
 
     fn pr(id: &str, author: User, reviewers: Vec<User>) -> PullRequest {
         PullRequest {
+            repository: None,
             id: id.into(),
             number: None,
             title: id.into(),
