@@ -12,6 +12,7 @@ pub mod gitlab;
 pub mod jira;
 pub mod json;
 pub mod linear;
+pub mod scope;
 
 /// All real provider factories, for building a `ProviderRegistry`. The demo provider is
 /// registered separately (see [`demo::demo_factories`]) only under `--demo`.

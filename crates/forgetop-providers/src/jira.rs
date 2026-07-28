@@ -60,6 +60,8 @@ pub fn map_issue(v: &Value, site: &str) -> WorkItem {
         .and_then(|c| get_str(c, "key"));
     let key = get_str(v, "key");
     WorkItem {
+        // Jira is project-addressed, not repo-addressed — there is no repository to carry.
+        repository: None,
         id: key.clone().unwrap_or_else(|| get_str(v, "id").unwrap_or_else(|| "0".into())),
         identifier: key.clone(),
         title: fields.and_then(|f| get_str(f, "summary")).unwrap_or_else(|| "(untitled)".into()),
@@ -149,12 +151,14 @@ impl WorkItemSource for JiraWi {
         Ok(get_arr(&data, "issues").iter().map(|i| map_issue(i, &self.0.site)).collect())
     }
 
-    async fn get(&self, id: &str) -> Result<WorkItem> {
+    async fn get(&self, item: &ItemRef) -> Result<WorkItem> {
+        let id: &str = &item.id;
         let v = self.0.get_json(&format!("{}/issue/{id}", self.0.api)).await?;
         Ok(map_issue(&v, &self.0.site))
     }
 
-    async fn threads(&self, id: &str) -> Result<Vec<CommentThread>> {
+    async fn threads(&self, item: &ItemRef) -> Result<Vec<CommentThread>> {
+        let id: &str = &item.id;
         let v = self.0.get_json(&format!("{}/issue/{id}/comment", self.0.api)).await?;
         let comments: Vec<Comment> = get_arr(&v, "comments").iter().map(map_comment).collect();
         Ok(if comments.is_empty() {
@@ -163,7 +167,8 @@ impl WorkItemSource for JiraWi {
             vec![CommentThread { id: format!("issue-{id}"), comments, file_path: None, line: None, is_resolved: false }]
         })
     }
-    async fn timeline(&self, id: &str) -> Result<Vec<TimelineEvent>> {
+    async fn timeline(&self, item: &ItemRef) -> Result<Vec<TimelineEvent>> {
+        let id: &str = &item.id;
         // The issue changelog: surface status transitions and (re)assignments.
         let v = self.0.get_json(&format!("{}/issue/{id}?expand=changelog", self.0.api)).await?;
         let mut out = Vec::new();
@@ -188,7 +193,8 @@ impl WorkItemSource for JiraWi {
         Ok(out)
     }
 
-    async fn set_state(&self, id: &str, state: &str) -> Result<()> {
+    async fn set_state(&self, item: &ItemRef, state: &str) -> Result<()> {
+        let id: &str = &item.id;
         // Jira changes state via a workflow transition; find the one that lands on `state`.
         let v = self.0.get_json(&format!("{}/issue/{id}/transitions", self.0.api)).await?;
         let transition_id = get_arr(&v, "transitions")
@@ -205,11 +211,13 @@ impl WorkItemSource for JiraWi {
             .await
     }
 
-    async fn add_comment(&self, id: &str, body: &str) -> Result<()> {
+    async fn add_comment(&self, item: &ItemRef, body: &str) -> Result<()> {
+        let id: &str = &item.id;
         self.0.post_ok(&format!("{}/issue/{id}/comment", self.0.api), json!({ "body": body })).await
     }
 
-    async fn assignable_users(&self, id: &str) -> Result<Vec<User>> {
+    async fn assignable_users(&self, item: &ItemRef) -> Result<Vec<User>> {
+        let id: &str = &item.id;
         let v = self
             .0
             .get_json(&format!("{}/user/assignable/search?issueKey={id}&maxResults=100", self.0.api))
@@ -217,11 +225,13 @@ impl WorkItemSource for JiraWi {
         Ok(v.as_array().map(|users| users.iter().map(map_user).collect()).unwrap_or_default())
     }
 
-    async fn set_assignee(&self, id: &str, assignee_id: Option<&str>) -> Result<()> {
+    async fn set_assignee(&self, item: &ItemRef, assignee_id: Option<&str>) -> Result<()> {
+        let id: &str = &item.id;
         self.0.put_ok(&format!("{}/issue/{id}/assignee", self.0.api), json!({ "accountId": assignee_id })).await
     }
 
-    async fn update_fields(&self, id: &str, title: Option<&str>, description: Option<&str>) -> Result<()> {
+    async fn update_fields(&self, item: &ItemRef, title: Option<&str>, description: Option<&str>) -> Result<()> {
+        let id: &str = &item.id;
         if title.is_none() && description.is_none() {
             return Ok(());
         }
@@ -237,7 +247,8 @@ impl WorkItemSource for JiraWi {
         self.0.put_ok(&format!("{}/issue/{id}", self.0.api), json!({ "fields": fields })).await
     }
 
-    async fn available_states(&self, id: &str) -> Result<Vec<String>> {
+    async fn available_states(&self, item: &ItemRef) -> Result<Vec<String>> {
+        let id: &str = &item.id;
         // The states this issue can transition to, from its workflow.
         let v = self.0.get_json(&format!("{}/issue/{id}/transitions", self.0.api)).await?;
         Ok(get_arr(&v, "transitions").iter().filter_map(|t| get_obj(t, "to").and_then(|to| get_str(to, "name"))).collect())

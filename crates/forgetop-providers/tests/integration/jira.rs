@@ -38,40 +38,40 @@ async fn jira_work_item_lifecycle() {
     }
     .expect("assigned issue appears in the mine-only list");
 
-    assert_eq!(wi.get(&id).await.expect("get").id, id);
-    let states = wi.available_states(&id).await.expect("available states (transitions)");
+    assert_eq!(wi.get(&ItemRef::new(&id)).await.expect("get").id, id);
+    let states = wi.available_states(&ItemRef::new(&id)).await.expect("available states (transitions)");
     assert!(!states.is_empty(), "issue reports transitions");
-    wi.add_comment(&id, &format!("{prefix} note")).await.expect("comment");
-    wi.timeline(&id).await.expect("timeline decodes");
+    wi.add_comment(&ItemRef::new(&id), &format!("{prefix} note")).await.expect("comment");
+    wi.timeline(&ItemRef::new(&id)).await.expect("timeline decodes");
 
-    let candidates = wi.assignable_users(&id).await.expect("assignable users");
+    let candidates = wi.assignable_users(&ItemRef::new(&id)).await.expect("assignable users");
     assert!(!candidates.is_empty(), "issue reports assignable users");
 
     let cand = candidates.first().expect("an assignable user");
-    wi.set_assignee(&id, Some(&cand.id)).await.expect("assign");
+    wi.set_assignee(&ItemRef::new(&id), Some(&cand.id)).await.expect("assign");
     let assigned = {
         let wi = &wi;
         let id = id.as_str();
-        harness::poll(harness::POLL_LIST, move || async move { wi.get(id).await.ok().filter(|w| w.assignee.is_some()) }).await
+        harness::poll(harness::POLL_LIST, move || async move { wi.get(&ItemRef::new(id)).await.ok().filter(|w| w.assignee.is_some()) }).await
     };
     assert!(assigned.is_some(), "the issue reads back assigned");
 
-    wi.set_assignee(&id, None).await.expect("unassign");
+    wi.set_assignee(&ItemRef::new(&id), None).await.expect("unassign");
     let unassigned = {
         let wi = &wi;
         let id = id.as_str();
-        harness::poll(harness::POLL_LIST, move || async move { wi.get(id).await.ok().filter(|w| w.assignee.is_none()) }).await
+        harness::poll(harness::POLL_LIST, move || async move { wi.get(&ItemRef::new(id)).await.ok().filter(|w| w.assignee.is_none()) }).await
     };
     assert!(unassigned.is_some(), "the issue reads back unassigned");
 
     let new_title = format!("{prefix} edited");
-    wi.update_fields(&id, Some(&new_title), Some("edited body")).await.expect("edit");
+    wi.update_fields(&ItemRef::new(&id), Some(&new_title), Some("edited body")).await.expect("edit");
     let edited = {
         let wi = &wi;
         let id = id.as_str();
         let new_title = new_title.as_str();
         harness::poll(harness::POLL_LIST, move || async move {
-            wi.get(id).await.ok().filter(|w| {
+            wi.get(&ItemRef::new(id)).await.ok().filter(|w| {
                 w.title == new_title && w.description.as_deref().is_some_and(|d| d.contains("edited body"))
             })
         })
@@ -80,7 +80,7 @@ async fn jira_work_item_lifecycle() {
     assert!(edited.is_some(), "the issue reads back edited");
 
     // Transition to the first available target state.
-    wi.set_state(&id, &states[0]).await.expect("transition");
+    wi.set_state(&ItemRef::new(&id), &states[0]).await.expect("transition");
 
     raw.delete_issue(&key).await;
 }

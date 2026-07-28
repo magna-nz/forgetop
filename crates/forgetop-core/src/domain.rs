@@ -77,8 +77,9 @@ pub enum PipelineRunStatus {
 }
 
 /// Roll-up CI/check state for a pull request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum CheckStatus {
+    #[default]
     None,
     Pending,
     Passed,
@@ -86,8 +87,9 @@ pub enum CheckStatus {
 }
 
 /// Whether a pull request can be merged.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum MergeableState {
+    #[default]
     Unknown,
     Mergeable,
     Blocked,
@@ -235,6 +237,10 @@ pub struct FileChange {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PullRequest {
     pub id: String,
+    /// The repository this pull request lives in, **connection-relative** (`acme/pay`) — see
+    /// [`crate::repo`]. `None` for providers that aren't repo-addressed (Jira, Linear).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
     pub number: Option<i64>,
     pub title: String,
     pub description: Option<String>,
@@ -259,6 +265,11 @@ pub struct PullRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkItem {
     pub id: String,
+    /// Where this item lives, **connection-relative** — a repository (`acme/pay`) for the
+    /// repo-addressed forges, or a bare project name for Azure DevOps, whose work items are
+    /// project-addressed rather than repo-addressed. `None` for Jira and Linear.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
     pub identifier: Option<String>,
     pub title: String,
     pub description: Option<String>,
@@ -274,6 +285,10 @@ pub struct WorkItem {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipelineDefinition {
     pub id: String,
+    /// The repository this definition belongs to, **connection-relative**. `None` for providers
+    /// that aren't repo-addressed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
     pub name: String,
     pub path: Option<String>,
     pub url: Option<String>,
@@ -312,6 +327,10 @@ pub struct PipelineStage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipelineRun {
     pub id: String,
+    /// The repository this run belongs to, **connection-relative**. `None` for providers that
+    /// aren't repo-addressed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
     pub definition_id: String,
     pub number: Option<i64>,
     pub name: Option<String>,
@@ -339,6 +358,37 @@ pub struct PipelineApproval {
     pub name: String,
     /// Whether the authenticated user is allowed to respond to this gate.
     pub can_respond: bool,
+}
+
+/// Addressing helpers: each item knows the repository it came from, so a call site never has to
+/// reconstruct one. Use these instead of building an [`crate::provider::ItemRef`] by hand.
+impl PullRequest {
+    pub fn item_ref(&self) -> crate::provider::ItemRef {
+        crate::provider::ItemRef::maybe(self.repository.clone(), self.id.clone())
+    }
+}
+
+impl WorkItem {
+    pub fn item_ref(&self) -> crate::provider::ItemRef {
+        crate::provider::ItemRef::maybe(self.repository.clone(), self.id.clone())
+    }
+}
+
+impl PipelineRun {
+    pub fn item_ref(&self) -> crate::provider::ItemRef {
+        crate::provider::ItemRef::maybe(self.repository.clone(), self.id.clone())
+    }
+
+    /// Addresses this run's *definition* (for a re-run/trigger), not the run itself.
+    pub fn definition_ref(&self) -> crate::provider::ItemRef {
+        crate::provider::ItemRef::maybe(self.repository.clone(), self.definition_id.clone())
+    }
+}
+
+impl PipelineDefinition {
+    pub fn item_ref(&self) -> crate::provider::ItemRef {
+        crate::provider::ItemRef::maybe(self.repository.clone(), self.id.clone())
+    }
 }
 
 /// A decision on a pending [`PipelineApproval`].
@@ -386,6 +436,10 @@ pub struct Notification {
     /// The underlying PR / work-item / pipeline id, for opening it in-app. `None` when the
     /// notification has no resolvable item (then we fall back to the web URL).
     pub item_id: Option<String>,
+    /// The repository the item lives in, **connection-relative** — needed to address `item_id`
+    /// on a connection that spans several repositories. `None` when the provider doesn't say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
     /// Subject line — the PR/issue title.
     pub title: String,
     /// Where it lives: `org/repo`, or the project / team name.

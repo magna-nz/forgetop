@@ -13,6 +13,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
 use axum::Router;
+use forgetop_core::provider::{ItemRef, PrDecoration};
 use forgetop_core::secret::SecretStore;
 use forgetop_core::service::{ConfigService, ConnectionHealthService, SectionService};
 use rust_embed::RustEmbed;
@@ -50,10 +51,42 @@ pub struct Server {
     pub url: String,
 }
 
+/// Decorated PR fields, cached per `(connection, repository, id, updated_at)`.
+///
+/// `updated_at` is part of the key on purpose: it is the provider's own statement that the PR
+/// changed, so a stale entry can never outlive the change that invalidates it.
+#[derive(Default)]
+struct DecorationCache {
+    entries: std::sync::Mutex<std::collections::HashMap<String, PrDecoration>>,
+}
+
+impl DecorationCache {
+    /// Bounded so a long-running dashboard can't grow it without limit. On overflow the whole
+    /// map is dropped rather than evicted one by one — decoration is cheap to refetch.
+    const MAX: usize = 500;
+
+    fn key(conn: &str, item: &ItemRef, updated_at: Option<&str>) -> String {
+        format!("{conn}\u{1}{}\u{1}{}\u{1}{}", item.repo.as_deref().unwrap_or(""), item.id, updated_at.unwrap_or(""))
+    }
+
+    fn get(&self, key: &str) -> Option<PrDecoration> {
+        self.entries.lock().unwrap().get(key).cloned()
+    }
+
+    fn put(&self, key: String, value: PrDecoration) {
+        let mut entries = self.entries.lock().unwrap();
+        if entries.len() >= Self::MAX {
+            entries.clear();
+        }
+        entries.insert(key, value);
+    }
+}
+
 #[derive(Clone)]
 struct AppState {
     deps: Deps,
     token: Arc<str>,
+    decorations: Arc<DecorationCache>,
 }
 
 async fn bind(deps: Deps, port: u16) -> std::io::Result<(tokio::net::TcpListener, Server, AppState)> {
@@ -61,7 +94,7 @@ async fn bind(deps: Deps, port: u16) -> std::io::Result<(tokio::net::TcpListener
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await?;
     let bound = listener.local_addr()?.port();
     let url = format!("http://127.0.0.1:{bound}/?t={token}");
-    let state = AppState { deps, token: Arc::from(token.as_str()) };
+    let state = AppState { deps, token: Arc::from(token.as_str()), decorations: Arc::new(DecorationCache::default()) };
     Ok((listener, Server { port: bound, token, url }, state))
 }
 
@@ -95,6 +128,7 @@ fn router(state: AppState) -> Router {
         .route("/api/notifications", get(notifications))
         .route("/api/launchpad", get(launchpad))
         .route("/api/pr/detail", get(pr_detail))
+        .route("/api/pr/decoration", get(pr_decoration))
         .route("/api/pr/commit-changes", get(pr_commit_changes))
         .route("/api/pr/vote", post(pr_vote))
         .route("/api/pr/merge", post(pr_merge))
@@ -119,6 +153,8 @@ fn router(state: AppState) -> Router {
         .route("/api/connections", get(list_connections).post(save_connection))
         .route("/api/connections/delete", post(delete_connection))
         .route("/api/connections/test", post(test_connection))
+        .route("/api/connections/repositories", get(connection_repositories))
+        .route("/api/connections/scope", post(set_connection_scope))
         .route("/api/preferences", get(get_preferences))
         .route("/api/preferences/startup", post(set_startup_mode))
         .layer(middleware::from_fn_with_state(state.clone(), auth))
@@ -182,11 +218,23 @@ async fn launchpad(State(s): State<AppState>) -> Json<dto::LaunchpadResponse> {
     Json(dto::launchpad(&s.deps.sections).await)
 }
 
-/// Query params identifying an item within a connection (`?conn=…&id=…`).
+/// Query params identifying an item within a connection (`?conn=…&id=…&repo=…`).
+///
+/// `repo` is a **query parameter**, never a path segment: an `owner/repo` always contains a
+/// slash. It is optional, so every link written before connections spanned an account still
+/// resolves (a single-repository connection needs no address).
 #[derive(Deserialize)]
 struct ItemQuery {
     conn: String,
     id: String,
+    #[serde(default)]
+    repo: Option<String>,
+}
+
+impl ItemQuery {
+    fn item(self) -> (String, ItemRef) {
+        (self.conn, ItemRef::maybe(self.repo, self.id))
+    }
 }
 
 /// Query params identifying a single commit's diff within a PR (`?conn=…&id=…&sha=…`).
@@ -195,6 +243,8 @@ struct CommitQuery {
     conn: String,
     id: String,
     sha: String,
+    #[serde(default)]
+    repo: Option<String>,
 }
 
 /// Query params for the PR list: which view to show (`?view=all|merged|review_requested`).
@@ -209,6 +259,8 @@ struct PrListQuery {
 struct RunQuery {
     conn: String,
     run_id: String,
+    #[serde(default)]
+    repo: Option<String>,
 }
 
 /// Query params for pipeline logs: a run, optionally scoped to a single job (`&job=…`).
@@ -216,6 +268,8 @@ struct RunQuery {
 struct PipelineLogsQuery {
     conn: String,
     run_id: String,
+    #[serde(default)]
+    repo: Option<String>,
     #[serde(default)]
     job: Option<String>,
 }
@@ -234,15 +288,43 @@ fn action_response(operation: &'static str, result: Result<(), ActionError>) -> 
 }
 
 async fn pr_commit_changes(State(s): State<AppState>, Query(q): Query<CommitQuery>) -> Response {
-    match dto::pr_commit_changes(&s.deps.sections, &q.conn, &q.id, &q.sha).await {
+    match dto::pr_commit_changes(&s.deps.sections, &q.conn, &ItemRef::maybe(q.repo, q.id), &q.sha).await {
         Some(changes) => Json(changes).into_response(),
         None => (StatusCode::NOT_FOUND, "pull request not found").into_response(),
     }
 }
 
 async fn pr_detail(State(s): State<AppState>, Query(q): Query<ItemQuery>) -> Response {
-    match dto::pr_detail(&s.deps.sections, &q.conn, &q.id).await {
+    let (conn, item) = q.item();
+    match dto::pr_detail(&s.deps.sections, &conn, &item).await {
         Some(detail) => Json(detail).into_response(),
+        None => (StatusCode::NOT_FOUND, "pull request not found").into_response(),
+    }
+}
+
+/// Query params for one PR's decoration. `updated_at` is the provider's own last-changed stamp
+/// from the list row, and is what makes the cache entry safe to reuse.
+#[derive(Deserialize)]
+struct DecorationQuery {
+    conn: String,
+    id: String,
+    #[serde(default)]
+    repo: Option<String>,
+    #[serde(default)]
+    updated_at: Option<String>,
+}
+
+async fn pr_decoration(State(s): State<AppState>, Query(q): Query<DecorationQuery>) -> Response {
+    let item = ItemRef::maybe(q.repo, q.id);
+    let key = DecorationCache::key(&q.conn, &item, q.updated_at.as_deref());
+    if let Some(hit) = s.decorations.get(&key) {
+        return Json(hit).into_response();
+    }
+    match dto::pr_decoration(&s.deps.sections, &q.conn, &item).await {
+        Some(decoration) => {
+            s.decorations.put(key, decoration.clone());
+            Json(decoration).into_response()
+        }
         None => (StatusCode::NOT_FOUND, "pull request not found").into_response(),
     }
 }
@@ -267,13 +349,15 @@ async fn pr_review(State(s): State<AppState>, Json(req): Json<actions::PrReviewR
 }
 
 async fn wi_detail(State(s): State<AppState>, Query(q): Query<ItemQuery>) -> Response {
-    match dto::wi_detail(&s.deps.sections, &q.conn, &q.id).await {
+    let (conn, item) = q.item();
+    match dto::wi_detail(&s.deps.sections, &conn, &item).await {
         Some(detail) => Json(detail).into_response(),
         None => (StatusCode::NOT_FOUND, "work item not found").into_response(),
     }
 }
 async fn wi_states(State(s): State<AppState>, Query(q): Query<ItemQuery>) -> Response {
-    match actions::wi_states(&s.deps.sections, &q.conn, &q.id).await {
+    let (conn, item) = q.item();
+    match actions::wi_states(&s.deps.sections, &conn, &item).await {
         Some(states) => Json(states).into_response(),
         None => (StatusCode::NOT_FOUND, "work item connection not found").into_response(),
     }
@@ -285,7 +369,8 @@ async fn wi_comment(State(s): State<AppState>, Json(req): Json<actions::WiCommen
     action_response("dashboard.wi_comment", actions::wi_comment(&s.deps.sections, req).await)
 }
 async fn wi_assignees(State(s): State<AppState>, Query(q): Query<ItemQuery>) -> Response {
-    match actions::wi_assignees(&s.deps.sections, &q.conn, &q.id).await {
+    let (conn, item) = q.item();
+    match actions::wi_assignees(&s.deps.sections, &conn, &item).await {
         Some(users) => Json(users).into_response(),
         None => (StatusCode::NOT_FOUND, "work item connection not found").into_response(),
     }
@@ -298,13 +383,13 @@ async fn wi_update(State(s): State<AppState>, Json(req): Json<actions::WiUpdateR
 }
 
 async fn pipeline_detail(State(s): State<AppState>, Query(q): Query<RunQuery>) -> Response {
-    match dto::pipeline_detail(&s.deps.sections, &q.conn, &q.run_id).await {
+    match dto::pipeline_detail(&s.deps.sections, &q.conn, &ItemRef::maybe(q.repo, q.run_id)).await {
         Some(detail) => Json(detail).into_response(),
         None => (StatusCode::NOT_FOUND, "pipeline run not found").into_response(),
     }
 }
 async fn pipeline_logs(State(s): State<AppState>, Query(q): Query<PipelineLogsQuery>) -> Response {
-    match dto::pipeline_logs(&s.deps.sections, &q.conn, &q.run_id, q.job.as_deref()).await {
+    match dto::pipeline_logs(&s.deps.sections, &q.conn, &ItemRef::maybe(q.repo, q.run_id), q.job.as_deref()).await {
         Some(text) => ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], text).into_response(),
         None => (StatusCode::NOT_FOUND, "logs not available").into_response(),
     }
@@ -338,7 +423,7 @@ async fn list_connections(State(s): State<AppState>) -> Json<Vec<connections::Co
     Json(connections::list(&s.deps.config, s.deps.secrets.as_ref()))
 }
 async fn save_connection(State(s): State<AppState>, Json(req): Json<connections::SaveConnectionReq>) -> Response {
-    match connections::save(&s.deps.config, req).await {
+    match connections::save(&s.deps.config, &s.deps.sections, req).await {
         Ok(id) => Json(serde_json::json!({ "ok": true, "id": id })).into_response(),
         Err(msg) => (StatusCode::BAD_GATEWAY, msg).into_response(),
     }
@@ -353,6 +438,36 @@ async fn test_connection(State(s): State<AppState>, Json(req): Json<IdReq>) -> R
     match connections::test(&s.deps.health, &req.id).await {
         Some(healthy) => Json(serde_json::json!({ "healthy": healthy })).into_response(),
         None => (StatusCode::NOT_FOUND, "connection not found").into_response(),
+    }
+}
+
+/// The repositories a connection could fetch from — the scope picker's candidate list. Only
+/// this endpoint calls provider discovery, so discovery being wrong shows an empty picker; it
+/// cannot stop an already-scoped connection fetching.
+async fn connection_repositories(State(s): State<AppState>, Query(q): Query<IdQuery>) -> Response {
+    match s.deps.sections.discover_repositories(&q.id).await {
+        Ok(page) => Json(page).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct IdQuery {
+    id: String,
+}
+
+#[derive(Deserialize)]
+struct ScopeReq {
+    id: String,
+    /// The chosen repositories. An empty list is a real choice — fetch nothing — and is stored
+    /// as such; it is not the same as never having chosen.
+    scope: Vec<String>,
+}
+
+async fn set_connection_scope(State(s): State<AppState>, Json(req): Json<ScopeReq>) -> Response {
+    match s.deps.config.set_repo_scope(&req.id, Some(req.scope)).await {
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
     }
 }
 

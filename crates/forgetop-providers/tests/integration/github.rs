@@ -24,9 +24,9 @@ async fn github_lists_pull_requests() {
     eprintln!("github: {} open PR(s)", list.len());
     // If any exist, get + threads must decode too.
     if let Some(pr) = list.first() {
-        let got = prs.get(&pr.id).await.expect("get a listed PR");
+        let got = prs.get(&ItemRef::new(&pr.id)).await.expect("get a listed PR");
         assert_eq!(got.id, pr.id);
-        prs.threads(&pr.id).await.expect("decode PR threads");
+        prs.threads(&ItemRef::new(&pr.id)).await.expect("decode PR threads");
     }
 }
 
@@ -37,7 +37,7 @@ async fn github_lists_work_items() {
     let list = wi.list(&WorkItemQuery::default()).await.expect("list work items");
     eprintln!("github: {} work item(s)", list.len());
     if let Some(item) = list.first() {
-        let got = wi.get(&item.id).await.expect("get a listed work item");
+        let got = wi.get(&ItemRef::new(&item.id)).await.expect("get a listed work item");
         assert_eq!(got.id, item.id);
     }
 }
@@ -50,10 +50,10 @@ async fn github_lists_pipeline_runs_and_supports_approvals() {
     let runs = pipe.list_runs(&PipelineRunQuery::default()).await.expect("list pipeline runs");
     eprintln!("github: {} pipeline run(s)", runs.len());
     if let Some(run) = runs.first() {
-        let got = pipe.get_run(&run.id).await.expect("get a listed run");
+        let got = pipe.get_run(&ItemRef::new(&run.id)).await.expect("get a listed run");
         assert_eq!(got.id, run.id);
         // A finished run just returns [] — this only checks the call decodes.
-        pipe.pending_approvals(&run.id).await.expect("decode pending approvals");
+        pipe.pending_approvals(&ItemRef::new(&run.id)).await.expect("decode pending approvals");
     }
 }
 
@@ -79,36 +79,36 @@ async fn github_pull_request_lifecycle() {
     // Read paths through the adapter under test.
     let list = prs.list(&PullRequestQuery::default()).await.expect("list PRs");
     assert!(list.iter().any(|p| p.id == id), "the created PR appears in the list");
-    let got = prs.get(&id).await.expect("get PR");
+    let got = prs.get(&ItemRef::new(&id)).await.expect("get PR");
     assert_eq!(got.id, id);
-    let commits = prs.commits(&id).await.expect("commits");
+    let commits = prs.commits(&ItemRef::new(&id)).await.expect("commits");
     assert!(!commits.is_empty(), "PR has commits");
-    prs.checks(&id).await.expect("checks decode");
+    prs.checks(&ItemRef::new(&id)).await.expect("checks decode");
 
     // The head commit's per-commit diff decodes and reports the pushed fixture file.
     let sha = commits.first().expect("a commit").sha.clone();
-    let commit_files = prs.commit_changes(&id, &sha).await.expect("commit changes");
+    let commit_files = prs.commit_changes(&ItemRef::new(&id), &sha).await.expect("commit changes");
     assert!(
         commit_files.iter().any(|f| f.path.contains(&format!("{prefix}.txt"))),
         "the commit reports the file it added"
     );
 
     // Comment write → shows up in threads.
-    prs.add_comment(&id, &format!("{prefix} comment")).await.expect("add comment");
-    let threads = prs.threads(&id).await.expect("threads");
+    prs.add_comment(&ItemRef::new(&id), &format!("{prefix} comment")).await.expect("add comment");
+    let threads = prs.threads(&ItemRef::new(&id)).await.expect("threads");
     assert!(
         threads.iter().any(|t| t.comments.iter().any(|c| c.body.contains(prefix))),
         "the posted comment appears in the PR threads"
     );
 
     // The event timeline decodes (reviews + issue events).
-    prs.timeline(&id).await.expect("timeline decodes");
+    prs.timeline(&ItemRef::new(&id)).await.expect("timeline decodes");
 
     // Reply into that thread. A GitHub PR *conversation* is flat (no reply API), so this exercises
     // the reply_to_thread → add_comment fallback; the reply comes back in the conversation thread.
     let thread_id = threads.iter().find(|t| t.comments.iter().any(|c| c.body.contains(prefix))).expect("our thread").id.clone();
-    prs.reply_to_thread(&id, &thread_id, &format!("{prefix} reply")).await.expect("reply to thread");
-    let after = prs.threads(&id).await.expect("threads after reply");
+    prs.reply_to_thread(&ItemRef::new(&id), &thread_id, &format!("{prefix} reply")).await.expect("reply to thread");
+    let after = prs.threads(&ItemRef::new(&id)).await.expect("threads after reply");
     assert!(
         after.iter().any(|t| t.comments.iter().any(|c| c.body.contains(&format!("{prefix} reply")))),
         "the reply comes back on the PR threads"
@@ -120,22 +120,22 @@ async fn github_pull_request_lifecycle() {
         let prs = &prs;
         let id = id.as_str();
         harness::poll(harness::POLL_MERGE, move || async move {
-            prs.get(id).await.ok().filter(|p| p.mergeable == MergeableState::Mergeable).map(|_| ())
+            prs.get(&ItemRef::new(id)).await.ok().filter(|p| p.mergeable == MergeableState::Mergeable).map(|_| ())
         })
         .await
     };
     assert!(mergeable.is_some(), "the clean PR computes as mergeable");
 
     // Merge write (the actual adapter action) → PR reads back as merged.
-    prs.merge(&id, &MergeOptions { strategy: MergeStrategy::Squash, delete_source_ref: true }).await.expect("merge PR");
+    prs.merge(&ItemRef::new(&id), &MergeOptions { strategy: MergeStrategy::Squash, delete_source_ref: true }).await.expect("merge PR");
     let after = harness::poll(harness::POLL_MERGE, || async {
-        prs.get(&id).await.ok().filter(|p| matches!(p.status, PullRequestStatus::Merged))
+        prs.get(&ItemRef::new(&id)).await.ok().filter(|p| matches!(p.status, PullRequestStatus::Merged))
     })
     .await;
     assert!(after.is_some(), "the PR reads back as merged");
 
     // GitHub has no one-call revert API, so the adapter reports it unsupported rather than faking it.
-    assert!(prs.revert(&id).await.is_err(), "github revert is unsupported");
+    assert!(prs.revert(&ItemRef::new(&id)).await.is_err(), "github revert is unsupported");
 
     // Teardown (squash+delete usually removes the branch already).
     raw.delete_ref(&branch).await;
@@ -164,41 +164,41 @@ async fn github_work_item_lifecycle() {
         .await
     };
     assert!(found.is_some(), "the assigned issue appears in the mine-only list");
-    assert_eq!(wi.get(&id).await.expect("get").id, id);
+    assert_eq!(wi.get(&ItemRef::new(&id)).await.expect("get").id, id);
 
-    let states = wi.available_states(&id).await.expect("available states");
+    let states = wi.available_states(&ItemRef::new(&id)).await.expect("available states");
     assert!(states.iter().any(|s| s.eq_ignore_ascii_case("closed")), "closed is an available state, got {states:?}");
 
-    wi.add_comment(&id, &format!("{prefix} note")).await.expect("comment");
+    wi.add_comment(&ItemRef::new(&id), &format!("{prefix} note")).await.expect("comment");
 
-    let candidates = wi.assignable_users(&id).await.expect("assignable users");
+    let candidates = wi.assignable_users(&ItemRef::new(&id)).await.expect("assignable users");
     assert!(!candidates.is_empty(), "repo reports assignable users");
 
     let cand = candidates.first().expect("an assignable user");
-    wi.set_assignee(&id, Some(&cand.id)).await.expect("assign");
+    wi.set_assignee(&ItemRef::new(&id), Some(&cand.id)).await.expect("assign");
     let assigned = {
         let wi = &wi;
         let id = id.as_str();
-        harness::poll(harness::POLL_LIST, move || async move { wi.get(id).await.ok().filter(|w| w.assignee.is_some()) }).await
+        harness::poll(harness::POLL_LIST, move || async move { wi.get(&ItemRef::new(id)).await.ok().filter(|w| w.assignee.is_some()) }).await
     };
     assert!(assigned.is_some(), "the issue reads back assigned");
 
-    wi.set_assignee(&id, None).await.expect("unassign");
+    wi.set_assignee(&ItemRef::new(&id), None).await.expect("unassign");
     let unassigned = {
         let wi = &wi;
         let id = id.as_str();
-        harness::poll(harness::POLL_LIST, move || async move { wi.get(id).await.ok().filter(|w| w.assignee.is_none()) }).await
+        harness::poll(harness::POLL_LIST, move || async move { wi.get(&ItemRef::new(id)).await.ok().filter(|w| w.assignee.is_none()) }).await
     };
     assert!(unassigned.is_some(), "the issue reads back unassigned");
 
     let new_title = format!("{prefix} edited");
-    wi.update_fields(&id, Some(&new_title), Some("edited body")).await.expect("edit");
+    wi.update_fields(&ItemRef::new(&id), Some(&new_title), Some("edited body")).await.expect("edit");
     let edited = {
         let wi = &wi;
         let id = id.as_str();
         let new_title = new_title.as_str();
         harness::poll(harness::POLL_LIST, move || async move {
-            wi.get(id).await.ok().filter(|w| {
+            wi.get(&ItemRef::new(id)).await.ok().filter(|w| {
                 w.title == new_title && w.description.as_deref().is_some_and(|d| d.contains("edited body"))
             })
         })
@@ -206,8 +206,8 @@ async fn github_work_item_lifecycle() {
     };
     assert!(edited.is_some(), "the issue reads back edited");
 
-    wi.set_state(&id, "closed").await.expect("close issue");
-    let after = wi.get(&id).await.expect("get after close");
+    wi.set_state(&ItemRef::new(&id), "closed").await.expect("close issue");
+    let after = wi.get(&ItemRef::new(&id)).await.expect("get after close");
     assert!(after.state.eq_ignore_ascii_case("closed"), "issue reads back closed, got {}", after.state);
 
     // Teardown: it's already closed (GitHub issues can't be hard-deleted via REST).
@@ -250,7 +250,7 @@ async fn github_pipeline_approval_gate_lifecycle() {
     let pipe = gh.conn.pipelines().expect("github pipelines");
 
     // The adapter surfaces our gate as actionable.
-    let gates = pipe.pending_approvals(&run_id).await.expect("pending approvals");
+    let gates = pipe.pending_approvals(&ItemRef::new(&run_id)).await.expect("pending approvals");
     let gate = gates
         .iter()
         .find(|g| g.name == env_name)
@@ -258,13 +258,13 @@ async fn github_pipeline_approval_gate_lifecycle() {
     assert!(gate.can_respond, "the gate should be actionable by me");
 
     // Approve through the adapter, then the gate clears.
-    pipe.respond_approval(&run_id, &gate.id, ApprovalDecision::Approve, Some("integration approve")).await.expect("approve");
+    pipe.respond_approval(&ItemRef::new(&run_id), &gate.id, ApprovalDecision::Approve, Some("integration approve")).await.expect("approve");
     let cleared = {
         let pipe = &pipe;
         let run_id = run_id.as_str();
         let env_name = env_name.as_str();
         harness::poll(harness::POLL_LIST, move || async move {
-            match pipe.pending_approvals(run_id).await {
+            match pipe.pending_approvals(&ItemRef::new(run_id)).await {
                 Ok(g) if !g.iter().any(|x| x.name == env_name) => Some(()),
                 _ => None,
             }
@@ -309,13 +309,13 @@ async fn github_pipeline_cancel_lifecycle() {
     .expect("a dispatched run began executing");
 
     let pipe = gh.conn.pipelines().expect("github pipelines");
-    pipe.cancel_run(&run_id).await.expect("cancel");
+    pipe.cancel_run(&ItemRef::new(&run_id)).await.expect("cancel");
 
     let cancelled = {
         let pipe = &pipe;
         let run_id = run_id.as_str();
         harness::poll(harness::POLL_LIST, move || async move {
-            pipe.get_run(run_id).await.ok().filter(|run| matches!(run.status, PipelineRunStatus::Canceled))
+            pipe.get_run(&ItemRef::new(run_id)).await.ok().filter(|run| matches!(run.status, PipelineRunStatus::Canceled))
         })
         .await
     };
