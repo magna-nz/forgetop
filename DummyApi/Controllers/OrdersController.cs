@@ -4,6 +4,7 @@ using DummyApi.Services;
 
 namespace DummyApi.Controllers;
 
+// Handles order CRUD and lookup endpoints for the dummy API.
 [ApiController]
 [Route("api/[controller]")]
 public class OrdersController : ControllerBase
