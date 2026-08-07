@@ -19,6 +19,13 @@ public class ProductsController : ControllerBase
     public IActionResult GetAll([FromQuery] string? category = null) =>
         Ok(_productService.GetAll(category));
 
+    [HttpGet("categories")]
+    public IActionResult GetCategories() =>
+        Ok(_productService.GetAll()
+            .Select(p => p.Category)
+            .Distinct()
+            .OrderBy(c => c));
+
     [HttpGet("{id}")]
     public IActionResult GetById(int id)
     {
