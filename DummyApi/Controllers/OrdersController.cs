@@ -30,6 +30,14 @@ public class OrdersController : ControllerBase
     public IActionResult GetByUser(int userId) =>
         Ok(_orderService.GetAll().Where(o => o.UserId == userId));
 
+    [HttpGet("random")]
+    public IActionResult GetRandom()
+    {
+        var orders = _orderService.GetAll().ToList();
+        if (orders.Count == 0) return NotFound();
+        return Ok(orders[Random.Shared.Next(orders.Count)]);
+    }
+
     [HttpPost]
     public IActionResult Create([FromBody] CreateOrderRequest request)
     {
