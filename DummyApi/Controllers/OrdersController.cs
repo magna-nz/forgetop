@@ -26,6 +26,10 @@ public class OrdersController : ControllerBase
         return order is null ? NotFound() : Ok(order);
     }
 
+    [HttpGet("user/{userId}")]
+    public IActionResult GetByUser(int userId) =>
+        Ok(_orderService.GetAll().Where(o => o.UserId == userId));
+
     [HttpPost]
     public IActionResult Create([FromBody] CreateOrderRequest request)
     {
