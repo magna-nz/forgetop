@@ -156,11 +156,11 @@ access, and each connection's token + connectivity.
 forgetop shows a **context-aware key glossary** along the bottom, so you rarely
 need a reference. The full docs live at **[magna-nz.github.io/forgetop](https://magna-nz.github.io/forgetop/)**:
 
-- [Command Center](https://magna-nz.github.io/forgetop/#command-center) — the cross-provider action inbox
-- [Keybindings](https://magna-nz.github.io/forgetop/#keybindings) — every key, per screen
-- [Configuration &amp; tokens](https://magna-nz.github.io/forgetop/#configuration) — config paths, keychain, token scopes per provider
-- [Themes](https://magna-nz.github.io/forgetop/#themes)
-- [How it works](https://magna-nz.github.io/forgetop/#how-it-works) — architecture
+- [Command Center](https://magna-nz.github.io/forgetop/#command-center) — the cross-provider action inbox.
+- [Keybindings](https://magna-nz.github.io/forgetop/#keybindings) — every key, per screen.
+- [Configuration &amp; tokens](https://magna-nz.github.io/forgetop/#configuration) — config paths, keychain, token scopes per provider.
+- [Themes](https://magna-nz.github.io/forgetop/#themes).
+- [How it works](https://magna-nz.github.io/forgetop/#how-it-works) — architecture.
 
 ## Contributing
 
