@@ -87,6 +87,31 @@ ls crates/forgetop-server/web/dist/assets/index-*.js                # local
 - **Types** — `types.ts` mirrors the Rust DTOs in `crates/forgetop-server/src/dto.rs`. **Keep them in sync.**
 - **Data** — `api.ts` (TanStack Query hooks); provider-capability gating in `capabilities.ts`; status colours/labels in `format.ts`.
 
+## A connection is an **account**, not a repository (read before touching a provider)
+A connection's credentials reach the whole account — a GitHub PAT every repo it can see, a GitLab
+token every project it's a member of, an Azure PAT the whole org, a Bitbucket app password the
+whole workspace. So a repository is a **per-call address**, never connection identity.
+
+- **Two spellings, one conversion.** *Host-qualified* (`github.com/acme/pay`) is for matching;
+  *connection-relative* (`acme/pay`) is for addressing and is what a scope entry and any
+  `ItemRef.repo` holds. Convert **only** via `forgetop_core::repo::to_connection_relative` — never
+  with `split('/')` or `trim_start_matches` at a call site. Feeding one where the other belongs
+  doesn't error, it silently mismatches.
+- **Address items with `ItemRef { repo, id }`**, not a bare id: on a connection spanning several
+  repositories, `#7` names more than one PR. A single-repository scope resolves an unaddressed
+  ref; a wider one errors rather than guessing.
+- **`Connection.repo_scope: Option<Vec<String>>`** — `None` = never established (fall back to the
+  legacy single `repository`), `Some([])` = the user chose none (fetch nothing), `Some([…])` =
+  fetch these. Fallbacks key on the scope being **absent**, never on it being **empty**.
+- **List calls fan out** over the scope (`providers::scope::fan_out`, bounded concurrency), and
+  sort + cap **once across the scope** (`sort_and_cap`) — never per repository.
+- **Jira and Linear are out of scope permanently** — project- and team-addressed, so a repository
+  scope has nothing to govern. **Azure work items and pipelines are project-addressed**: fan them
+  out over the scope's *distinct projects*, not its repositories.
+- ⚠️ **The demo provider cannot catch an addressing bug** — it never resolves a repository, so
+  `--demo` passes whether or not addressing is right. Prove addressing with fixtures or the live
+  suite (`tests/integration/scope.rs`).
+
 ## Adding a field or action across the stack (the common recipe)
 Data flows **provider trait → provider impls + demo → server DTO → `types.ts` → component**. To add something end-to-end:
 1. **Domain/trait** (`forgetop-core`): add the field to the domain struct, or a method to the provider trait *with a compile-safe default* (so providers adopt it incrementally).

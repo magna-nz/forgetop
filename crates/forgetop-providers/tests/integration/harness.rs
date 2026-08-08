@@ -76,6 +76,8 @@ pub fn github() -> Option<GitHubIt> {
         repository: Some(repo.clone()),
         username: None,
         credential_ref: None,
+        // Live suites address a single repository, so the legacy fallback is what we exercise.
+        repo_scope: None,
     };
     let conn = registry().create(&conn, Some(token)).ok()?;
     Some(GitHubIt { owner, repo, conn })
@@ -102,6 +104,8 @@ pub fn gitlab() -> Option<GitLabIt> {
         repository: Some(project.clone()),
         username: None,
         credential_ref: None,
+        // Live suites address a single repository, so the legacy fallback is what we exercise.
+        repo_scope: None,
     };
     let conn = registry().create(&conn, Some(token)).ok()?;
     Some(GitLabIt { project, conn })
@@ -130,6 +134,8 @@ pub fn azure() -> Option<AzureIt> {
         repository: Some(repo),
         username: None,
         credential_ref: None,
+        // Live suites address a single repository, so the legacy fallback is what we exercise.
+        repo_scope: None,
     };
     let conn = registry().create(&conn, Some(pat)).ok()?;
     Some(AzureIt { org, project, conn })
@@ -153,6 +159,8 @@ pub fn linear() -> Option<LinearIt> {
         repository: None,
         username: None,
         credential_ref: None,
+        // Live suites address a single repository, so the legacy fallback is what we exercise.
+        repo_scope: None,
     };
     let conn = registry().create(&conn, Some(key)).ok()?;
     Some(LinearIt { conn })
@@ -180,6 +188,7 @@ pub fn jira() -> Option<JiraIt> {
         repository: None,
         username: Some(email),
         credential_ref: None,
+        repo_scope: None,
     };
     let conn = registry().create(&conn, Some(token)).ok()?;
     Some(JiraIt { project, conn })
@@ -234,4 +243,92 @@ macro_rules! skip_if_none {
             }
         }
     };
+}
+
+/// A live Bitbucket connection from `FORGETOP_IT_BITBUCKET_*`, or `None` to skip.
+///
+/// Bitbucket is the one provider CI has no secrets for, so this exists to make its discovery
+/// path one `.env` paste away from being covered rather than permanently unverified.
+#[allow(dead_code)]
+pub struct BitbucketIt {
+    pub workspace: String,
+    pub repo: String,
+    pub conn: Arc<dyn ProviderConnection>,
+}
+
+#[allow(dead_code)]
+pub fn bitbucket() -> Option<BitbucketIt> {
+    init();
+    let username = env("FORGETOP_IT_BITBUCKET_USERNAME")?;
+    let app_password = env("FORGETOP_IT_BITBUCKET_APP_PASSWORD")?;
+    let workspace = env("FORGETOP_IT_BITBUCKET_WORKSPACE")?;
+    let repo = env("FORGETOP_IT_BITBUCKET_REPO")?;
+    let conn = Connection {
+        id: "it-bitbucket".into(),
+        provider_type: ProviderType::Bitbucket,
+        display_name: "IT Bitbucket".into(),
+        base_url: None,
+        organization: Some(workspace.clone()),
+        project: None,
+        repository: Some(repo.clone()),
+        username: Some(username),
+        credential_ref: None,
+        repo_scope: None,
+    };
+    let conn = registry().create(&conn, Some(app_password)).ok()?;
+    Some(BitbucketIt { workspace, repo, conn })
+}
+
+/// A live connection with an explicit **repository scope**, for the account-scope tests.
+/// `scope` entries are connection-relative (`owner/repo`, `group/project`, `project/repo`).
+#[allow(dead_code)]
+pub fn scoped(provider: ProviderType, scope: Vec<String>) -> Option<Arc<dyn ProviderConnection>> {
+    init();
+    let mut conn = match provider {
+        ProviderType::GitHub => Connection {
+            id: "it-github-scoped".into(),
+            provider_type: provider,
+            display_name: "IT GitHub".into(),
+            base_url: env("FORGETOP_IT_GITHUB_HOST"),
+            organization: None,
+            project: None,
+            repository: None,
+            username: None,
+            credential_ref: None,
+            repo_scope: None,
+        },
+        ProviderType::AzureDevOps => Connection {
+            id: "it-azure-scoped".into(),
+            provider_type: provider,
+            display_name: "IT Azure".into(),
+            base_url: None,
+            organization: Some(env("FORGETOP_IT_AZURE_ORG")?),
+            project: None,
+            repository: None,
+            username: None,
+            credential_ref: None,
+            repo_scope: None,
+        },
+        ProviderType::GitLab => Connection {
+            id: "it-gitlab-scoped".into(),
+            provider_type: provider,
+            display_name: "IT GitLab".into(),
+            base_url: env("FORGETOP_IT_GITLAB_HOST").map(|h| format!("{}/api/v4", h.trim_end_matches('/'))),
+            organization: None,
+            project: None,
+            repository: None,
+            username: None,
+            credential_ref: None,
+            repo_scope: None,
+        },
+        _ => return None,
+    };
+    conn.repo_scope = Some(scope);
+    let secret = match provider {
+        ProviderType::GitHub => env("FORGETOP_IT_GITHUB_TOKEN")?,
+        ProviderType::AzureDevOps => env("FORGETOP_IT_AZURE_PAT")?,
+        ProviderType::GitLab => env("FORGETOP_IT_GITLAB_TOKEN")?,
+        _ => return None,
+    };
+    registry().create(&conn, Some(secret)).ok()
 }

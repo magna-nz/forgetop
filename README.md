@@ -182,3 +182,4 @@ forgetop is free and open source. If it saves you tab-switching, consider buying
 ## License
 
 [MIT](LICENSE)
+.

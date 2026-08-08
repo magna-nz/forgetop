@@ -13,6 +13,7 @@ use reqwest::header::AUTHORIZATION;
 use serde_json::{json, Value};
 
 use crate::json::*;
+use crate::scope::{self, fan_out, sort_and_cap};
 
 fn prov<E: std::fmt::Display>(e: E) -> Error {
     Error::Provider(e.to_string())
@@ -45,7 +46,7 @@ fn html_url(v: &Value) -> Option<String> {
     get_obj(v, "links").and_then(|l| get_obj(l, "html")).and_then(|h| get_str(h, "href"))
 }
 
-pub fn map_pull_request(v: &Value) -> PullRequest {
+pub fn map_pull_request(v: &Value, repo: Option<&str>) -> PullRequest {
     let state = get_str(v, "state");
     let draft = get_bool(v, "draft");
     let status = match state.as_deref() {
@@ -56,6 +57,11 @@ pub fn map_pull_request(v: &Value) -> PullRequest {
     };
     let number = get_i64(v, "id");
     PullRequest {
+        // `full_name` is already `workspace/repo` — the connection-relative spelling.
+        repository: get_obj(v, "destination")
+            .and_then(|d| get_obj(d, "repository"))
+            .and_then(|r| get_str(r, "full_name"))
+            .or_else(|| repo.map(str::to_string)),
         id: number.map(|n| n.to_string()).unwrap_or_else(|| "0".into()),
         number,
         title: get_str(v, "title").unwrap_or_else(|| "(untitled)".into()),
@@ -237,9 +243,12 @@ pub fn bb_status(state: Option<&Value>) -> PipelineRunStatus {
     }
 }
 
-pub fn map_pipeline(v: &Value, workspace: &str, repo: &str) -> PipelineRun {
+/// `repo` is the connection-relative `workspace/slug`, which is also exactly the path segment
+/// Bitbucket's web UI wants for a run's deep link.
+pub fn map_pipeline(v: &Value, repo: &str) -> PipelineRun {
     let number = get_i64(v, "build_number");
     PipelineRun {
+        repository: Some(repo.to_string()),
         id: get_str(v, "uuid").unwrap_or_else(|| number.map(|n| n.to_string()).unwrap_or_else(|| "0".into())),
         definition_id: "pipelines".into(),
         number,
@@ -251,7 +260,7 @@ pub fn map_pipeline(v: &Value, workspace: &str, repo: &str) -> PipelineRun {
         commit_sha: get_obj(v, "target").and_then(|t| get_obj(t, "commit")).and_then(|c| get_str(c, "hash")),
         started_at: get_date(v, "created_on"),
         finished_at: get_date(v, "completed_on"),
-        url: number.map(|n| format!("https://bitbucket.org/{workspace}/{repo}/pipelines/results/{n}")),
+        url: number.map(|n| format!("https://bitbucket.org/{repo}/pipelines/results/{n}")),
         stages: vec![],
     }
 }
@@ -271,17 +280,51 @@ pub fn map_step(v: &Value) -> PipelineJob {
 
 // ---- client ----
 
+/// One page of `/repositories/{workspace}` → **connection-relative** `workspace/slug` paths.
+pub fn repositories_from_page(v: &Value) -> Vec<String> {
+    get_arr(v, "values").iter().filter_map(|r| get_str(r, "full_name")).collect()
+}
+
 pub struct BitbucketClient {
     http: reqwest::Client,
     base: String,
+    /// The workspace this connection belongs to. A Bitbucket connection stays **one** workspace:
+    /// it is what the connect form collects, what discovery is addressed by, and what the
+    /// connection *means*. (`/repositories?role=member` would span workspaces — deliberately not
+    /// used.)
     workspace: String,
-    repo: String,
+    /// The repositories this connection fetches from, **connection-relative** (`workspace/slug`).
+    scope: Vec<String>,
     self_name: tokio::sync::Mutex<Option<String>>,
 }
 
 impl BitbucketClient {
-    fn repo_path(&self, suffix: &str) -> String {
-        format!("{}/repositories/{}/{}{}", self.base, self.workspace, self.repo, suffix)
+    /// `repo` is connection-relative (`workspace/slug`) — exactly Bitbucket's path shape.
+    fn repo_path(&self, repo: &str, suffix: &str) -> String {
+        format!("{}/repositories/{repo}{suffix}", self.base)
+    }
+
+    fn resolve(&self, item: &ItemRef) -> Result<String> {
+        scope::resolve_repo(item, &self.scope)
+    }
+
+    /// Every repository in this connection's workspace, most-recently-updated first.
+    async fn discover_repositories(&self) -> Result<RepositoryPage> {
+        const PER_PAGE: usize = 100;
+        const MAX_PAGES: usize = 5;
+        let mut repositories = Vec::new();
+        let mut truncated = false;
+        for page in 1..=MAX_PAGES {
+            let url = format!("{}/repositories/{}?pagelen={PER_PAGE}&page={page}&sort=-updated_on", self.base, self.workspace);
+            let v = self.get_json(&url).await?;
+            let rows = get_arr(&v, "values").to_vec();
+            repositories.extend(repositories_from_page(&v));
+            if rows.len() < PER_PAGE {
+                return Ok(RepositoryPage { repositories, truncated: false });
+            }
+            truncated = page == MAX_PAGES;
+        }
+        Ok(RepositoryPage { repositories, truncated })
     }
 
     async fn get_json(&self, url: &str) -> Result<Value> {
@@ -321,120 +364,173 @@ source!(BitbucketPipe);
 #[async_trait]
 impl PullRequestSource for BitbucketPr {
     async fn list(&self, query: &PullRequestQuery) -> Result<Vec<PullRequest>> {
+        let scope = &self.0.scope;
+        if scope.is_empty() {
+            return Ok(Vec::new());
+        }
         let state = if query.include_completed { "MERGED" } else { "OPEN" };
-        let url = self.0.repo_path(&format!("/pullrequests?state={state}&pagelen={}", query.limit.unwrap_or(50)));
-        let v = self.0.get_json(&url).await?;
-        let prs: Vec<PullRequest> = get_arr(&v, "values").iter().map(map_pull_request).collect();
+        let pagelen = query.limit.unwrap_or(50);
+        let rows = fan_out(scope, "bitbucket.pull_requests.list", |repo| async move {
+            let url = self.0.repo_path(&repo, &format!("/pullrequests?state={state}&pagelen={pagelen}"));
+            let v = self.0.get_json(&url).await?;
+            Ok(get_arr(&v, "values").iter().map(|pr| map_pull_request(pr, Some(&repo))).collect())
+        })
+        .await;
         let me = if query.filter == PullRequestFilter::All { None } else { self.0.self_name().await? };
-        Ok(apply_pull_request_filter(prs, query.filter, me.as_deref()))
+        let filtered = apply_pull_request_filter(rows, query.filter, me.as_deref());
+        Ok(sort_and_cap(filtered, scope.len(), query.limit, |pr| pr.updated_at))
     }
-    async fn get(&self, id: &str) -> Result<PullRequest> {
-        let v = self.0.get_json(&self.0.repo_path(&format!("/pullrequests/{id}"))).await?;
-        Ok(map_pull_request(&v))
+    async fn get(&self, item: &ItemRef) -> Result<PullRequest> {
+        let repo = self.0.resolve(item)?;
+        let v = self.0.get_json(&self.0.repo_path(&repo, &format!("/pullrequests/{}", item.id))).await?;
+        Ok(map_pull_request(&v, Some(&repo)))
     }
-    async fn threads(&self, id: &str) -> Result<Vec<CommentThread>> {
-        let v = self.0.get_json(&self.0.repo_path(&format!("/pullrequests/{id}/comments?pagelen=100"))).await?;
+    async fn threads(&self, item: &ItemRef) -> Result<Vec<CommentThread>> {
+        let repo = self.0.resolve(item)?;
+        let v = self.0.get_json(&self.0.repo_path(&repo, &format!("/pullrequests/{}/comments?pagelen=100", item.id))).await?;
         Ok(group_bb_threads(get_arr(&v, "values")))
     }
-    async fn timeline(&self, id: &str) -> Result<Vec<TimelineEvent>> {
-        let v = self.0.get_json(&self.0.repo_path(&format!("/pullrequests/{id}/activity?pagelen=50"))).await?;
+    async fn timeline(&self, item: &ItemRef) -> Result<Vec<TimelineEvent>> {
+        let repo = self.0.resolve(item)?;
+        let v = self.0.get_json(&self.0.repo_path(&repo, &format!("/pullrequests/{}/activity?pagelen=50", item.id))).await?;
         let mut out: Vec<TimelineEvent> = get_arr(&v, "values").iter().filter_map(map_bb_activity).collect();
         out.sort_by_key(|e| e.at);
         Ok(out)
     }
-    async fn changes(&self, id: &str) -> Result<Vec<FileChange>> {
-        let v = self.0.get_json(&self.0.repo_path(&format!("/pullrequests/{id}/diffstat?pagelen=100"))).await?;
+    async fn changes(&self, item: &ItemRef) -> Result<Vec<FileChange>> {
+        let repo = self.0.resolve(item)?;
+        let v = self.0.get_json(&self.0.repo_path(&repo, &format!("/pullrequests/{}/diffstat?pagelen=100", item.id))).await?;
         Ok(get_arr(&v, "values").iter().map(map_diffstat).collect())
     }
-    async fn commit_changes(&self, _id: &str, sha: &str) -> Result<Vec<FileChange>> {
+    async fn commit_changes(&self, item: &ItemRef, sha: &str) -> Result<Vec<FileChange>> {
+        let repo = self.0.resolve(item)?;
         // A commit's diffstat (vs its first parent), same shape as the whole-PR file list.
-        let v = self.0.get_json(&self.0.repo_path(&format!("/diffstat/{sha}?pagelen=100"))).await?;
+        let v = self.0.get_json(&self.0.repo_path(&repo, &format!("/diffstat/{sha}?pagelen=100"))).await?;
         Ok(get_arr(&v, "values").iter().map(map_diffstat).collect())
     }
-    async fn commits(&self, id: &str) -> Result<Vec<Commit>> {
-        let v = self.0.get_json(&self.0.repo_path(&format!("/pullrequests/{id}/commits?pagelen=100"))).await?;
+    async fn commits(&self, item: &ItemRef) -> Result<Vec<Commit>> {
+        let repo = self.0.resolve(item)?;
+        let v = self.0.get_json(&self.0.repo_path(&repo, &format!("/pullrequests/{}/commits?pagelen=100", item.id))).await?;
         Ok(get_arr(&v, "values").iter().map(map_bb_commit).collect())
     }
-    async fn checks(&self, id: &str) -> Result<Vec<CheckRun>> {
-        let pr = self.0.get_json(&self.0.repo_path(&format!("/pullrequests/{id}"))).await?;
+    async fn checks(&self, item: &ItemRef) -> Result<Vec<CheckRun>> {
+        let repo = self.0.resolve(item)?;
+        let pr = self.0.get_json(&self.0.repo_path(&repo, &format!("/pullrequests/{}", item.id))).await?;
         let Some(hash) = get_obj(&pr, "source").and_then(|s| get_obj(s, "commit")).and_then(|c| get_str(c, "hash")) else {
             return Ok(vec![]);
         };
-        let v = self.0.get_json(&self.0.repo_path(&format!("/commit/{hash}/statuses?pagelen=100"))).await?;
+        let v = self.0.get_json(&self.0.repo_path(&repo, &format!("/commit/{hash}/statuses?pagelen=100"))).await?;
         Ok(get_arr(&v, "values").iter().map(map_bb_status).collect())
     }
-    async fn add_comment(&self, id: &str, body: &str) -> Result<()> {
-        self.0.post_ok(&self.0.repo_path(&format!("/pullrequests/{id}/comments")), json!({ "content": { "raw": body } })).await
+    async fn add_comment(&self, item: &ItemRef, body: &str) -> Result<()> {
+        let repo = self.0.resolve(item)?;
+        self.0
+            .post_ok(&self.0.repo_path(&repo, &format!("/pullrequests/{}/comments", item.id)), json!({ "content": { "raw": body } }))
+            .await
     }
-    async fn reply_to_thread(&self, id: &str, thread_id: &str, body: &str) -> Result<()> {
+    async fn reply_to_thread(&self, item: &ItemRef, thread_id: &str, body: &str) -> Result<()> {
+        let repo = self.0.resolve(item)?;
         // Reply nests under the thread's root comment via `parent.id` (Bitbucket wants an integer).
         let parent_id: i64 = thread_id
             .parse()
             .map_err(|_| Error::Provider(format!("invalid Bitbucket comment id '{thread_id}'")))?;
         self.0
             .post_ok(
-                &self.0.repo_path(&format!("/pullrequests/{id}/comments")),
+                &self.0.repo_path(&repo, &format!("/pullrequests/{}/comments", item.id)),
                 json!({ "content": { "raw": body }, "parent": { "id": parent_id } }),
             )
             .await
     }
-    async fn vote(&self, id: &str, vote: ReviewVote) -> Result<()> {
+    async fn vote(&self, item: &ItemRef, vote: ReviewVote) -> Result<()> {
+        let repo = self.0.resolve(item)?;
+        let id = &item.id;
         match vote {
             ReviewVote::Approved | ReviewVote::ApprovedWithSuggestions => {
-                self.0.post_ok(&self.0.repo_path(&format!("/pullrequests/{id}/approve")), json!({})).await
+                self.0.post_ok(&self.0.repo_path(&repo, &format!("/pullrequests/{id}/approve")), json!({})).await
             }
             ReviewVote::Rejected => {
-                self.0.post_ok(&self.0.repo_path(&format!("/pullrequests/{id}/request-changes")), json!({})).await
+                self.0.post_ok(&self.0.repo_path(&repo, &format!("/pullrequests/{id}/request-changes")), json!({})).await
             }
             _ => Ok(()),
         }
     }
-    async fn merge(&self, id: &str, options: &MergeOptions) -> Result<()> {
+    async fn merge(&self, item: &ItemRef, options: &MergeOptions) -> Result<()> {
+        let repo = self.0.resolve(item)?;
         let strategy = match options.strategy {
             MergeStrategy::Squash => "squash",
             MergeStrategy::Rebase => "fast_forward",
             MergeStrategy::Merge => "merge_commit",
         };
-        self.0.post_ok(&self.0.repo_path(&format!("/pullrequests/{id}/merge")), json!({ "merge_strategy": strategy })).await
+        self.0
+            .post_ok(&self.0.repo_path(&repo, &format!("/pullrequests/{}/merge", item.id)), json!({ "merge_strategy": strategy }))
+            .await
     }
 }
 
 #[async_trait]
 impl PipelineSource for BitbucketPipe {
     async fn discover(&self) -> Result<Vec<PipelineDefinition>> {
-        Ok(vec![PipelineDefinition { id: "pipelines".into(), name: "Bitbucket Pipelines".into(), path: None, url: None }])
+        // Bitbucket has no named pipeline definitions — model each repository's CI as one.
+        Ok(self
+            .0
+            .scope
+            .iter()
+            .map(|repo| PipelineDefinition {
+                repository: Some(repo.clone()),
+                id: "pipelines".into(),
+                name: "Bitbucket Pipelines".into(),
+                path: None,
+                url: None,
+            })
+            .collect())
     }
     async fn list_runs(&self, query: &PipelineRunQuery) -> Result<Vec<PipelineRun>> {
-        let url = self.0.repo_path(&format!("/pipelines?sort=-created_on&pagelen={}", query.limit.unwrap_or(25)));
-        let v = self.0.get_json(&url).await?;
-        Ok(get_arr(&v, "values").iter().map(|p| map_pipeline(p, &self.0.workspace, &self.0.repo)).collect())
+        let scope: Vec<String> = match &query.repository {
+            Some(repo) => vec![repo.clone()],
+            None => self.0.scope.clone(),
+        };
+        if scope.is_empty() {
+            return Ok(Vec::new());
+        }
+        let pagelen = query.limit.unwrap_or(25);
+        let rows = fan_out(&scope, "bitbucket.pipelines.list_runs", |repo| async move {
+            let url = self.0.repo_path(&repo, &format!("/pipelines?sort=-created_on&pagelen={pagelen}"));
+            let v = self.0.get_json(&url).await?;
+            Ok(get_arr(&v, "values").iter().map(|p| map_pipeline(p, &repo)).collect())
+        })
+        .await;
+        Ok(sort_and_cap(rows, scope.len(), query.limit, |r| r.started_at))
     }
-    async fn get_run(&self, run_id: &str) -> Result<PipelineRun> {
-        let uuid = enc_uuid(run_id);
-        let run_v = self.0.get_json(&self.0.repo_path(&format!("/pipelines/{uuid}"))).await?;
-        let mut run = map_pipeline(&run_v, &self.0.workspace, &self.0.repo);
-        if let Ok(steps_v) = self.0.get_json(&self.0.repo_path(&format!("/pipelines/{uuid}/steps"))).await {
+    async fn get_run(&self, run: &ItemRef) -> Result<PipelineRun> {
+        let repo = self.0.resolve(run)?;
+        let uuid = enc_uuid(&run.id);
+        let run_v = self.0.get_json(&self.0.repo_path(&repo, &format!("/pipelines/{uuid}"))).await?;
+        let mut mapped = map_pipeline(&run_v, &repo);
+        if let Ok(steps_v) = self.0.get_json(&self.0.repo_path(&repo, &format!("/pipelines/{uuid}/steps"))).await {
             let jobs: Vec<PipelineJob> = get_arr(&steps_v, "values").iter().map(map_step).collect();
             if !jobs.is_empty() {
-                run.stages = vec![PipelineStage { name: "Steps".into(), status: run.status, jobs }];
+                mapped.stages = vec![PipelineStage { name: "Steps".into(), status: mapped.status, jobs }];
             }
         }
-        Ok(run)
+        Ok(mapped)
     }
-    async fn logs(&self, run_id: &str, _job_id: Option<&str>) -> Result<String> {
-        let steps_v = self.0.get_json(&self.0.repo_path(&format!("/pipelines/{}/steps", enc_uuid(run_id)))).await?;
+    async fn logs(&self, run: &ItemRef, _job_id: Option<&str>) -> Result<String> {
+        let repo = self.0.resolve(run)?;
+        let steps_v = self.0.get_json(&self.0.repo_path(&repo, &format!("/pipelines/{}/steps", enc_uuid(&run.id)))).await?;
         let lines: Vec<String> = get_arr(&steps_v, "values")
             .iter()
             .map(|s| format!("{}: {}", get_str(s, "name").unwrap_or_default(), get_obj(s, "state").and_then(|st| get_str(st, "name")).unwrap_or_default()))
             .collect();
         Ok(lines.join("\n"))
     }
-    async fn trigger(&self, _definition_id: &str, branch: Option<&str>) -> Result<()> {
+    async fn trigger(&self, definition: &ItemRef, branch: Option<&str>) -> Result<()> {
+        let repo = self.0.resolve(definition)?;
         let body = json!({ "target": { "type": "pipeline_ref_target", "ref_type": "branch", "ref_name": branch.unwrap_or("main") } });
-        self.0.post_ok(&self.0.repo_path("/pipelines"), body).await
+        self.0.post_ok(&self.0.repo_path(&repo, "/pipelines"), body).await
     }
-    async fn cancel_run(&self, run_id: &str) -> Result<()> {
-        self.0.post_ok(&self.0.repo_path(&format!("/pipelines/{}/stopPipeline", enc_uuid(run_id))), json!({})).await
+    async fn cancel_run(&self, run: &ItemRef) -> Result<()> {
+        let repo = self.0.resolve(run)?;
+        self.0.post_ok(&self.0.repo_path(&repo, &format!("/pipelines/{}/stopPipeline", enc_uuid(&run.id))), json!({})).await
     }
 }
 
@@ -468,6 +564,9 @@ impl ProviderConnection for BitbucketConnection {
     fn pipelines(&self) -> Option<Arc<dyn PipelineSource>> {
         Some(Arc::new(BitbucketPipe(self.client.clone())))
     }
+    async fn discover_repositories(&self) -> Result<RepositoryPage> {
+        self.client.discover_repositories().await
+    }
     async fn check(&self) -> bool {
         self.client.get_json(&format!("{}/user", self.client.base)).await.is_ok()
     }
@@ -500,7 +599,9 @@ impl ProviderFactory for BitbucketFactory {
             .organization
             .clone()
             .ok_or_else(|| Error::Config("Bitbucket connection requires a Workspace".into()))?;
-        let repo = connection.repository.clone().ok_or_else(|| Error::Config("Bitbucket connection requires a Repository".into()))?;
+        // The workspace stays required — discovery is addressed by it, so a connection without
+        // one could never populate the scope picker. The repository itself is not.
+        let scope = connection.resolve_repo_scope(|| connection.repository.as_ref().map(|r| format!("{workspace}/{r}")));
         let username = connection.username.clone().ok_or_else(|| Error::Config("Bitbucket connection requires a Username".into()))?;
 
         let mut headers = reqwest::header::HeaderMap::new();
@@ -514,7 +615,7 @@ impl ProviderFactory for BitbucketFactory {
             http,
             base: connection.base_url.clone().unwrap_or_else(|| "https://api.bitbucket.org/2.0".into()),
             workspace,
-            repo,
+            scope,
             self_name: tokio::sync::Mutex::new(None),
         });
         Ok(Arc::new(BitbucketConnection {
@@ -530,6 +631,30 @@ impl ProviderFactory for BitbucketFactory {
 mod tests {
     use super::*;
 
+    /// Bitbucket is the one provider with **no** credentials anywhere — not in `.env`, not in CI —
+    /// so its discovery has no live coverage. This pins the part that can be pinned without a
+    /// network: that a real `/repositories/{workspace}` page maps to the connection-relative
+    /// `workspace/slug` spelling addressing needs, and nothing else.
+    #[test]
+    fn discovery_maps_a_workspace_page_to_connection_relative_paths() {
+        let page: Value = serde_json::from_str(
+            r#"{ "pagelen": 100, "size": 2, "page": 1, "values": [
+                   { "uuid": "{a}", "name": "Mobile", "slug": "mobile", "full_name": "northwind/mobile",
+                     "links": { "html": { "href": "https://bitbucket.org/northwind/mobile" } } },
+                   { "uuid": "{b}", "name": "Payments", "slug": "payments", "full_name": "northwind/payments" } ] }"#,
+        )
+        .unwrap();
+        let repos = repositories_from_page(&page);
+        assert_eq!(repos, vec!["northwind/mobile".to_string(), "northwind/payments".to_string()]);
+        // Never the browse URL, however tempting `links.html.href` looks — that is the
+        // host-qualified spelling, and addressing with it silently matches nothing.
+        assert!(repos.iter().all(|r| !r.contains("bitbucket.org")));
+
+        // A page with nothing usable yields nothing rather than a malformed entry.
+        assert!(repositories_from_page(&serde_json::json!({ "values": [ { "slug": "no-full-name" } ] })).is_empty());
+        assert!(repositories_from_page(&serde_json::json!({})).is_empty());
+    }
+
     #[test]
     fn maps_pull_request_with_reviewers() {
         let v: Value = serde_json::from_str(
@@ -541,7 +666,7 @@ mod tests {
                  "links": { "html": { "href": "https://bitbucket.org/w/r/pull-requests/7" } } }"#,
         )
         .unwrap();
-        let pr = map_pull_request(&v);
+        let pr = map_pull_request(&v, None);
         assert_eq!(pr.number, Some(7));
         assert_eq!(pr.status, PullRequestStatus::Open);
         assert_eq!(pr.source_ref.as_deref(), Some("feat"));
@@ -553,9 +678,9 @@ mod tests {
     #[test]
     fn merged_and_declined_status() {
         let merged: Value = serde_json::from_str(r#"{ "id": 1, "state": "MERGED" }"#).unwrap();
-        assert_eq!(map_pull_request(&merged).status, PullRequestStatus::Merged);
+        assert_eq!(map_pull_request(&merged, None).status, PullRequestStatus::Merged);
         let declined: Value = serde_json::from_str(r#"{ "id": 2, "state": "DECLINED" }"#).unwrap();
-        assert_eq!(map_pull_request(&declined).status, PullRequestStatus::Closed);
+        assert_eq!(map_pull_request(&declined, None).status, PullRequestStatus::Closed);
     }
 
     #[test]
@@ -565,16 +690,16 @@ mod tests {
                  "target": { "ref_name": "main" } }"#,
         )
         .unwrap();
-        let run = map_pipeline(&ok, "acme", "app");
+        let run = map_pipeline(&ok, "acme/app");
         assert_eq!(run.status, PipelineRunStatus::Succeeded);
         assert_eq!(run.number, Some(42));
         assert_eq!(run.branch.as_deref(), Some("main"));
         assert_eq!(run.url.as_deref(), Some("https://bitbucket.org/acme/app/pipelines/results/42"));
 
         let failed: Value = serde_json::from_str(r#"{ "state": { "name": "COMPLETED", "result": { "name": "FAILED" } } }"#).unwrap();
-        assert_eq!(map_pipeline(&failed, "a", "b").status, PipelineRunStatus::Failed);
+        assert_eq!(map_pipeline(&failed, "a/b").status, PipelineRunStatus::Failed);
         let running: Value = serde_json::from_str(r#"{ "state": { "name": "IN_PROGRESS" } }"#).unwrap();
-        assert_eq!(map_pipeline(&running, "a", "b").status, PipelineRunStatus::Running);
+        assert_eq!(map_pipeline(&running, "a/b").status, PipelineRunStatus::Running);
     }
 
     #[test]

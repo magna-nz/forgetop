@@ -37,29 +37,29 @@ async fn azure_pull_request_lifecycle() {
     let prs = az.conn.pull_requests().expect("azure PRs");
     let list = prs.list(&PullRequestQuery::default()).await.expect("list");
     assert!(list.iter().any(|p| p.id == id), "created PR appears in the list");
-    assert_eq!(prs.get(&id).await.expect("get").id, id);
-    let commits = prs.commits(&id).await.expect("commits");
+    assert_eq!(prs.get(&ItemRef::new(&id)).await.expect("get").id, id);
+    let commits = prs.commits(&ItemRef::new(&id)).await.expect("commits");
     assert!(!commits.is_empty());
 
     // The head commit's per-commit diff decodes and reports the file the fixture added.
     let sha = commits.first().expect("a commit").sha.clone();
-    let commit_files = prs.commit_changes(&id, &sha).await.expect("commit changes");
+    let commit_files = prs.commit_changes(&ItemRef::new(&id), &sha).await.expect("commit changes");
     assert!(
         commit_files.iter().any(|f| f.path.contains(&format!("{prefix}.txt"))),
         "the commit reports the file it added"
     );
 
-    prs.add_comment(&id, &format!("{prefix} comment")).await.expect("comment");
-    let threads = prs.threads(&id).await.expect("threads");
+    prs.add_comment(&ItemRef::new(&id), &format!("{prefix} comment")).await.expect("comment");
+    let threads = prs.threads(&ItemRef::new(&id)).await.expect("threads");
     assert!(threads.iter().any(|t| t.comments.iter().any(|c| c.body.contains(prefix))), "comment shows in threads");
 
     // The event timeline decodes (reviewer votes + completion status).
-    prs.timeline(&id).await.expect("timeline decodes");
+    prs.timeline(&ItemRef::new(&id)).await.expect("timeline decodes");
 
     // Reply into that thread; the reply comes back nested in the same thread.
     let thread_id = threads.iter().find(|t| t.comments.iter().any(|c| c.body.contains(prefix))).expect("our thread").id.clone();
-    prs.reply_to_thread(&id, &thread_id, &format!("{prefix} reply")).await.expect("reply to thread");
-    let after = prs.threads(&id).await.expect("threads after reply");
+    prs.reply_to_thread(&ItemRef::new(&id), &thread_id, &format!("{prefix} reply")).await.expect("reply to thread");
+    let after = prs.threads(&ItemRef::new(&id)).await.expect("threads after reply");
     assert!(
         after.iter().any(|t| t.id == thread_id && t.comments.iter().any(|c| c.body.contains(&format!("{prefix} reply")))),
         "the reply lands in the thread it targeted"
@@ -71,7 +71,7 @@ async fn azure_pull_request_lifecycle() {
         let prs = &prs;
         let id = id.as_str();
         harness::poll(harness::POLL_MERGE, move || async move {
-            prs.get(id).await.ok().filter(|p| p.mergeable == MergeableState::Mergeable).map(|_| ())
+            prs.get(&ItemRef::new(id)).await.ok().filter(|p| p.mergeable == MergeableState::Mergeable).map(|_| ())
         })
         .await
     };
@@ -79,8 +79,8 @@ async fn azure_pull_request_lifecycle() {
 
     // Merge via the adapter (retry: Azure needs a moment to compute mergeability).
     let merged = harness::poll(harness::POLL_MERGE, || async {
-        if prs.merge(&id, &MergeOptions { strategy: MergeStrategy::Squash, delete_source_ref: true }).await.is_ok() {
-            prs.get(&id).await.ok().filter(|p| matches!(p.status, PullRequestStatus::Merged))
+        if prs.merge(&ItemRef::new(&id), &MergeOptions { strategy: MergeStrategy::Squash, delete_source_ref: true }).await.is_ok() {
+            prs.get(&ItemRef::new(&id)).await.ok().filter(|p| matches!(p.status, PullRequestStatus::Merged))
         } else {
             None
         }
@@ -89,7 +89,7 @@ async fn azure_pull_request_lifecycle() {
 
     // A merged Azure PR reverts via the Reverts API (creates a revert branch off the target).
     if merged.is_some() {
-        prs.revert(&id).await.expect("start a revert of the merged PR");
+        prs.revert(&ItemRef::new(&id)).await.expect("start a revert of the merged PR");
         raw.delete_branch(&format!("revert-pr-{id}")).await; // best-effort; no-ops if not yet created
     }
 
@@ -116,24 +116,24 @@ async fn azure_work_item_lifecycle() {
     let list = wi.list(&WorkItemQuery { mine_only: false, include_completed: true, limit: Some(100) }).await.expect("list");
     assert!(list.iter().any(|w| w.id == id), "created work item appears in the list");
 
-    let got = wi.get(&id).await.expect("get");
-    let states = wi.available_states(&id).await.expect("available states");
+    let got = wi.get(&ItemRef::new(&id)).await.expect("get");
+    let states = wi.available_states(&ItemRef::new(&id)).await.expect("available states");
     assert!(!states.is_empty(), "work item type reports states");
-    wi.add_comment(&id, &format!("{prefix} note")).await.expect("comment");
-    wi.timeline(&id).await.expect("timeline decodes");
+    wi.add_comment(&ItemRef::new(&id), &format!("{prefix} note")).await.expect("comment");
+    wi.timeline(&ItemRef::new(&id)).await.expect("timeline decodes");
 
-    let candidates = wi.assignable_users(&id).await.expect("assignable users");
+    let candidates = wi.assignable_users(&ItemRef::new(&id)).await.expect("assignable users");
     assert!(!candidates.is_empty(), "project team reports members");
 
     let cand = candidates.first().expect("assignable user");
-    wi.set_assignee(&id, Some(&cand.id)).await.expect("assign");
-    assert!(wi.get(&id).await.expect("get assigned").assignee.is_some(), "work item has an assignee");
-    wi.set_assignee(&id, None).await.expect("unassign");
-    assert!(wi.get(&id).await.expect("get unassigned").assignee.is_none(), "work item is unassigned");
+    wi.set_assignee(&ItemRef::new(&id), Some(&cand.id)).await.expect("assign");
+    assert!(wi.get(&ItemRef::new(&id)).await.expect("get assigned").assignee.is_some(), "work item has an assignee");
+    wi.set_assignee(&ItemRef::new(&id), None).await.expect("unassign");
+    assert!(wi.get(&ItemRef::new(&id)).await.expect("get unassigned").assignee.is_none(), "work item is unassigned");
 
     let new_title = format!("{prefix} edited");
-    wi.update_fields(&id, Some(&new_title), Some("edited body")).await.expect("edit");
-    let edited = wi.get(&id).await.expect("get edited");
+    wi.update_fields(&ItemRef::new(&id), Some(&new_title), Some("edited body")).await.expect("edit");
+    let edited = wi.get(&ItemRef::new(&id)).await.expect("get edited");
     assert_eq!(edited.title, new_title);
     assert!(
         edited.description.as_deref().is_some_and(|description| description.contains("edited body")),
@@ -142,8 +142,8 @@ async fn azure_work_item_lifecycle() {
 
     // Move it to a different state and confirm it sticks.
     if let Some(next) = states.iter().find(|s| !s.eq_ignore_ascii_case(&got.state)) {
-        wi.set_state(&id, next).await.expect("set state");
-        let after = wi.get(&id).await.expect("get after");
+        wi.set_state(&ItemRef::new(&id), next).await.expect("set state");
+        let after = wi.get(&ItemRef::new(&id)).await.expect("get after");
         assert!(after.state.eq_ignore_ascii_case(next), "state changed to {next}, got {}", after.state);
     }
 
@@ -158,13 +158,13 @@ async fn azure_pipeline_cancel_lifecycle() {
     let run_id = raw.queue_pipeline(&pipeline_id).await;
 
     let pipe = az.conn.pipelines().expect("azure pipelines");
-    pipe.cancel_run(&run_id).await.expect("cancel");
+    pipe.cancel_run(&ItemRef::new(&run_id)).await.expect("cancel");
 
     let cancelled = {
         let pipe = &pipe;
         let run_id = run_id.as_str();
         harness::poll(harness::POLL_GATE, move || async move {
-            pipe.get_run(run_id).await.ok().filter(|run| matches!(run.status, PipelineRunStatus::Canceled))
+            pipe.get_run(&ItemRef::new(run_id)).await.ok().filter(|run| matches!(run.status, PipelineRunStatus::Canceled))
         })
         .await
     };
@@ -203,7 +203,7 @@ async fn azure_pipeline_approval_full_lifecycle() {
         let pipe = &pipe;
         let run_id = run_id.as_str();
         harness::poll(harness::POLL_GATE, move || async move {
-            pipe.pending_approvals(run_id).await.ok().and_then(|g| g.into_iter().find(|x| x.can_respond))
+            pipe.pending_approvals(&ItemRef::new(run_id)).await.ok().and_then(|g| g.into_iter().find(|x| x.can_respond))
         })
         .await
     };
@@ -214,7 +214,7 @@ async fn azure_pipeline_approval_full_lifecycle() {
     // timeline record id) currently fails. The *detection* below is what's asserted;
     // the respond is attempted and logged pending a fix to the approve mechanism.
     if let Some(gate) = &gate {
-        match pipe.respond_approval(&run_id, &gate.id, ApprovalDecision::Approve, Some("integration approve")).await {
+        match pipe.respond_approval(&ItemRef::new(&run_id), &gate.id, ApprovalDecision::Approve, Some("integration approve")).await {
             Ok(()) => eprintln!("azure: approved gate {}", gate.name),
             Err(e) => eprintln!("azure: respond_approval not yet working (known gap): {e}"),
         }

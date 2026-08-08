@@ -157,10 +157,10 @@ function ItemRow({ row, index, muted }: { row: LaunchpadRow; index: number; mute
   // Every card kind opens its in-app detail panel, matching the list views.
   const onClick =
     row.kind === "pr"
-      ? () => openPr({ conn: row.connection_id, id: row.pull_request.id })
+      ? () => openPr({ conn: row.connection_id, repo: row.pull_request.repository, id: row.pull_request.id })
       : row.kind === "wi"
-        ? () => openWi({ conn: row.connection_id, id: row.work_item.id })
-        : () => openPipe({ conn: row.connection_id, runId: row.run.id });
+        ? () => openWi({ conn: row.connection_id, repo: row.work_item.repository, id: row.work_item.id })
+        : () => openPipe({ conn: row.connection_id, repo: row.run.repository, runId: row.run.id });
   const common = {
     initial: { opacity: 0, y: 4 },
     animate: { opacity: 1, y: 0 },
@@ -239,10 +239,13 @@ function statusBadge(row: LaunchpadRow): { label: string; color: string } {
   return { label: row.run.status === "Failed" ? "Error" : capitalize(m.label), color: m.color };
 }
 
+/// A row's identity within its connection. The repository is part of it: one connection now
+/// spans an account, so `#7` exists in more than one repository and `connection_id:id` alone
+/// stops being unique.
 function rowId(row: LaunchpadRow): string {
-  if (row.kind === "pr") return row.pull_request.id;
-  if (row.kind === "wi") return row.work_item.id;
-  return row.run.id;
+  if (row.kind === "pr") return `${row.pull_request.repository ?? ""}:${row.pull_request.id}`;
+  if (row.kind === "wi") return `${row.work_item.repository ?? ""}:${row.work_item.id}`;
+  return `${row.run.repository ?? ""}:${row.run.id}`;
 }
 
 function kindLabel(kind: LaunchpadRow["kind"]): string {

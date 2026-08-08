@@ -43,7 +43,31 @@ impl FieldSpec {
     }
 }
 
+/// Providers whose items are addressed by a repository, and which therefore carry a repository
+/// scope. Jira is project-addressed and Linear team-addressed, so neither has anything for a
+/// repository scope to govern.
+///
+/// This keys off the provider, **not** off whether its repository field happens to be required —
+/// that field is now legitimately optional everywhere, so anything inferring repo-addressedness
+/// from `required` would have silently changed meaning.
+pub fn is_repo_addressed(provider: ProviderType) -> bool {
+    matches!(
+        provider,
+        ProviderType::GitHub | ProviderType::GitLab | ProviderType::AzureDevOps | ProviderType::Bitbucket
+    )
+}
+
+/// The shared help text on every optional repository field: the connection is an account, and
+/// which repositories it fetches from is chosen afterwards.
+const PICK_LATER: &str = "Leave blank to pick repositories after connecting";
+
 /// The ordered fields a connection to `provider` needs — display name first, secret last.
+///
+/// The rule behind which fields stay required: **a field that discovery itself is addressed by
+/// stays required.** Bitbucket lists repositories at `/repositories/{workspace}` and Azure at
+/// `{org}/_apis/git/repositories`, so a connection missing the workspace or the organization
+/// could never populate its scope picker — it would be empty with no way to fill it. GitHub and
+/// GitLab discover from the token alone, so they need no such field.
 pub fn connection_fields(provider: ProviderType) -> Vec<FieldSpec> {
     let mut out = vec![FieldSpec {
         key: FieldKey::DisplayName,
@@ -56,20 +80,20 @@ pub fn connection_fields(provider: ProviderType) -> Vec<FieldSpec> {
     match provider {
         ProviderType::Demo => {}
         ProviderType::GitHub => {
-            out.push(FieldSpec::text(FieldKey::Repository, "Repository (owner/repo)", "e.g. octocat/hello-world — the owner and repo from the URL", false));
+            out.push(FieldSpec::text(FieldKey::Repository, "Repository (owner/repo)", PICK_LATER, false));
             out.push(FieldSpec::secret("Personal access token", "github.com → Settings → Developer settings → Personal access tokens · scope: repo"));
         }
         ProviderType::AzureDevOps => {
             out.push(FieldSpec::text(FieldKey::Organization, "Organization", "The {org} in dev.azure.com/{org}", true));
-            out.push(FieldSpec::text(FieldKey::Project, "Project", "The team project name (leave blank to use the org default)", false));
-            out.push(FieldSpec::text(FieldKey::Repository, "Repository", "The Git repo name (defaults to the project name)", false));
+            out.push(FieldSpec::text(FieldKey::Project, "Project", PICK_LATER, false));
+            out.push(FieldSpec::text(FieldKey::Repository, "Repository", PICK_LATER, false));
             out.push(FieldSpec::secret("Personal access token", "dev.azure.com → User settings → Personal access tokens · Code, Work Items, Build"));
         }
         ProviderType::Linear => {
             out.push(FieldSpec::secret("API key", "linear.app → Settings → Security & access → API → Personal API keys"));
         }
         ProviderType::GitLab => {
-            out.push(FieldSpec::text(FieldKey::Repository, "Project (group/project)", "e.g. mygroup/myapp — the full path from the URL", true));
+            out.push(FieldSpec::text(FieldKey::Repository, "Project (group/project)", PICK_LATER, false));
             out.push(FieldSpec::secret("Personal access token", "gitlab.com → Preferences → Access Tokens · scope: api"));
         }
         ProviderType::Jira => {
@@ -80,7 +104,7 @@ pub fn connection_fields(provider: ProviderType) -> Vec<FieldSpec> {
         }
         ProviderType::Bitbucket => {
             out.push(FieldSpec::text(FieldKey::Organization, "Workspace", "The {workspace} in bitbucket.org/{workspace}", true));
-            out.push(FieldSpec::text(FieldKey::Repository, "Repository (slug)", "The repo slug from the URL, e.g. my-app", true));
+            out.push(FieldSpec::text(FieldKey::Repository, "Repository (slug)", PICK_LATER, false));
             out.push(FieldSpec::text(FieldKey::Username, "Username", "Your Bitbucket username (not your email)", true));
             out.push(FieldSpec::secret("App password", "Personal settings → App passwords · Pull requests + Pipelines (read & write)"));
         }
@@ -119,6 +143,41 @@ mod tests {
         assert_eq!(fields[0].key, FieldKey::DisplayName);
         assert!(fields.iter().any(|f| f.key == FieldKey::Pat && f.secret));
         assert_eq!(provider_sections(ProviderType::GitHub).len(), 3);
+    }
+
+    /// Rule 1: every repo-addressed provider offers a repository field and does **not** demand it.
+    /// A connection is an account; which repositories it fetches from is chosen afterwards.
+    #[test]
+    fn repo_addressed_providers_offer_an_optional_repository_field() {
+        for provider in selectable_providers().into_iter().filter(|p| is_repo_addressed(*p)) {
+            let fields = connection_fields(provider);
+            let repo = fields
+                .iter()
+                .find(|f| f.key == FieldKey::Repository)
+                .unwrap_or_else(|| panic!("{} offers no repository field", provider.as_str()));
+            assert!(!repo.required, "{} still demands a repository", provider.as_str());
+        }
+        // …and the two that aren't repo-addressed don't offer one at all.
+        for provider in [ProviderType::Jira, ProviderType::Linear] {
+            assert!(!is_repo_addressed(provider));
+            assert!(connection_fields(provider).iter().all(|f| f.key != FieldKey::Repository));
+        }
+    }
+
+    /// Rule 2: a field that **discovery itself is addressed by** stays required, or the scope
+    /// picker would come up empty with no way to fill it.
+    #[test]
+    fn fields_that_discovery_is_addressed_by_stay_required() {
+        let required = |provider: ProviderType, key: FieldKey| {
+            connection_fields(provider).iter().find(|f| f.key == key).is_some_and(|f| f.required)
+        };
+        // Bitbucket discovery is `/repositories/{workspace}`.
+        assert!(required(ProviderType::Bitbucket, FieldKey::Organization), "Bitbucket workspace must stay required");
+        // Azure discovery is `{org}/_apis/git/repositories`.
+        assert!(required(ProviderType::AzureDevOps, FieldKey::Organization), "Azure organization must stay required");
+        // GitHub and GitLab discover from the token alone, so they need no such field.
+        assert!(connection_fields(ProviderType::GitHub).iter().all(|f| f.key != FieldKey::Organization));
+        assert!(connection_fields(ProviderType::GitLab).iter().all(|f| f.key != FieldKey::Organization));
     }
 
     #[test]

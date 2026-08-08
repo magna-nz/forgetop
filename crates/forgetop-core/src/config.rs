@@ -319,6 +319,48 @@ mod tests {
         assert_eq!(StartupMode::effective_from(StartupMode::Both, Some(" dashboard ")), StartupMode::DashboardOnly);
     }
 
+    /// The whole `Option<Vec<String>>` choice rests on this: `Some([])` and `None` must survive a
+    /// real JSON round-trip as *different* values. If an emptied scope came back as `None`, the
+    /// factory would fall back to the legacy single repository and silently refill a scope the
+    /// user had deliberately cleared. (The in-memory store clones rather than serializes, so it
+    /// cannot catch this — only going through JSON can.)
+    #[test]
+    fn an_emptied_repository_scope_survives_json_as_a_different_value_from_never_set() {
+        use crate::domain::ProviderType;
+        use crate::provider::Connection;
+
+        let conn = |repo_scope: Option<Vec<String>>| Connection {
+            id: "gh".into(),
+            provider_type: ProviderType::GitHub,
+            display_name: "GitHub".into(),
+            base_url: None,
+            organization: None,
+            project: None,
+            repository: Some("acme/pay".into()),
+            username: None,
+            credential_ref: None,
+            repo_scope,
+        };
+        let roundtrip = |c: &Connection| -> Connection { serde_json::from_str(&serde_json::to_string(c).unwrap()).unwrap() };
+
+        // Never set → the field isn't written at all, and reads back as absent.
+        let never = conn(None);
+        assert!(!serde_json::to_string(&never).unwrap().contains("repo_scope"));
+        assert_eq!(roundtrip(&never).repo_scope, None);
+        assert_eq!(never.resolve_repo_scope(|| never.repository.clone()), vec!["acme/pay".to_string()]);
+
+        // Chose none → written as `[]`, reads back as `Some([])`, and stays empty.
+        let emptied = conn(Some(vec![]));
+        assert!(serde_json::to_string(&emptied).unwrap().contains(r#""repo_scope":[]"#));
+        let read = roundtrip(&emptied);
+        assert_eq!(read.repo_scope, Some(vec![]));
+        assert!(read.resolve_repo_scope(|| read.repository.clone()).is_empty(), "an emptied scope must not refill");
+
+        // Chose some → exactly those come back.
+        let chosen = conn(Some(vec!["acme/ledger".into()]));
+        assert_eq!(roundtrip(&chosen).repo_scope, Some(vec!["acme/ledger".to_string()]));
+    }
+
     #[test]
     fn binding_ids_merge_legacy_and_dedup() {
         // Legacy single-bind config deserializes and migrates via ids().

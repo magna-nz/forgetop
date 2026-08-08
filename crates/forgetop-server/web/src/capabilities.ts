@@ -22,3 +22,10 @@ export function providerSupports(provider: ProviderType, feature: ProviderFeatur
 export function unsupportedMessage(provider: ProviderType): string {
   return `${providerMeta(provider).label} currently does not support this feature`;
 }
+
+/** Providers whose items are addressed by a repository, and which therefore carry a repository
+ *  scope. Jira is project-addressed and Linear team-addressed, so neither has anything for a
+ *  repository scope to govern. Mirrors `forgetop_core::setup::is_repo_addressed`. */
+export function isRepoAddressed(provider: ProviderType): boolean {
+  return provider === "GitHub" || provider === "GitLab" || provider === "AzureDevOps" || provider === "Bitbucket";
+}

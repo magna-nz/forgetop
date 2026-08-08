@@ -126,4 +126,17 @@ describe("Launchpad", () => {
     await userEvent.click(await screen.findByText("Open me"));
     await waitFor(() => expect(openWi).toHaveBeenCalledWith({ conn: "c", id: "42" }));
   });
+
+  it("draws a review-requested row with its check status", async () => {
+    // The Command Center *renders* `checks` on every PR row, not only on the ones it ranks on.
+    // That is why the server decorates both launchpad fetches: an undecorated review-requested
+    // row still reaches here, and would silently lose this suffix.
+    const row = prRow("needs_review", "Rotate the KMS signing keys", "318");
+    row.pull_request.checks = "Failed";
+    mockFetch({ get: { "/api/launchpad": { rows: [row], more: noOverflow } } });
+    renderWithClient(<Launchpad />);
+
+    expect(await screen.findByText("Rotate the KMS signing keys")).toBeInTheDocument();
+    expect(screen.getByText(/checks failing/i)).toBeInTheDocument();
+  });
 });

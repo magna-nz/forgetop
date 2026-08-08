@@ -6,9 +6,11 @@ import { Avatar, Chip, List, Pill, Skeleton, StateCard, StatusBadge } from "./ui
 import { ErrorState } from "./ErrorState";
 import { useListView } from "./ControlBar";
 import { usePipelineOpener } from "./PipelineDetail";
+import { useRepoScope } from "./RepoScope";
 
 export function Pipelines() {
   const { data, isLoading, error } = usePipelines();
+  const scope = useRepoScope("pipelines");
   const { rows, bar } = useListView<PipeRow>({
     storageKey: "pipelines",
     rows: data,
@@ -29,15 +31,25 @@ export function Pipelines() {
 
   if (isLoading) return <Skeleton />;
   if (error) return <ErrorState error={error} />;
+  if (scope.noneSelected)
+    // Distinct from "nothing to show": nothing was fetched because nothing was asked for.
+    return (
+      <StateCard
+        icon="◍"
+        title="No repositories selected"
+        sub="This connection spans your whole account — choose which repositories it fetches from."
+      />
+    );
   if (!data || data.length === 0)
     return <StateCard icon="◇" title="No pipeline runs" sub="Recent CI runs for your repositories appear here." />;
 
   return (
     <>
+      <div className="flex flex-wrap items-center gap-2 px-5 pt-4 max-w-5xl mx-auto">{scope.control}</div>
       {bar}
       <List>
         {rows.map((row, i) => (
-          <PipeCard key={`${row.connection_id}:${row.run.id}`} row={row} index={i} />
+          <PipeCard key={`${row.connection_id}:${row.run.repository ?? ""}:${row.run.id}`} row={row} index={i} />
         ))}
       </List>
     </>
@@ -64,7 +76,7 @@ function PipeCard({ row, index }: { row: PipeRow; index: number }) {
       style={{ background: "var(--card)", border: "1px solid var(--border)" }}
     >
       <button
-        onClick={() => open({ conn: row.connection_id, runId: run.id })}
+        onClick={() => open({ conn: row.connection_id, repo: run.repository, runId: run.id })}
         className="flex-1 min-w-0 text-left flex items-center gap-2"
         style={{ cursor: "pointer" }}
       >

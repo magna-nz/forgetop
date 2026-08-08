@@ -5,13 +5,13 @@ use std::sync::Arc;
 
 use forgetop_core::config::PipelineSubscription;
 use forgetop_core::domain::{
-    CheckRun, CommentThread, Commit, FileChange, Notification, PipelineApproval, PipelineRun, PipelineRunStatus,
-    ProviderType, PullRequest, PullRequestStatus, TimelineEvent, TimelineEventKind, WorkItem,
+    CheckRun, CommentThread, Commit, FileChange, Notification, PipelineApproval, PipelineDefinition, PipelineRun,
+    PipelineRunStatus, ProviderType, PullRequest, PullRequestStatus, TimelineEvent, TimelineEventKind, WorkItem,
 };
 use forgetop_core::launchpad::{self, EntryItem, PipeInput, PrInput, WiInput};
 use forgetop_core::provider::{
-    PipelineRunQuery, PipelineSource, PullRequestFilter, PullRequestQuery, PullRequestSource, WorkItemQuery,
-    WorkItemSource,
+    ItemRef, PipelineRunQuery, PipelineSource, PrDecoration, PullRequestFilter, PullRequestQuery, PullRequestSource,
+    WorkItemQuery, WorkItemSource,
 };
 use forgetop_core::service::{ConnectionHealthService, SectionService};
 use serde::Serialize;
@@ -27,6 +27,9 @@ pub struct PrRow {
     pub connection: String,
     pub provider: ProviderType,
     pub pull_request: PullRequest,
+    /// True when this row's decorated fields are missing and worth fetching per row. Only the
+    /// providers whose list endpoint omits them say yes, so the other three cost nothing.
+    pub needs_decoration: bool,
 }
 
 #[derive(Serialize)]
@@ -100,7 +103,10 @@ impl PrView {
             PrView::ReviewRequested => (PullRequestFilter::ReviewRequested, false),
             PrView::All => (PullRequestFilter::All, false),
         };
-        PullRequestQuery { filter, include_completed, limit: Some(50) }
+        // The dashboard renders decorated fields (mergeable, +/-) per visible row from
+        // `/api/pr/decoration`, so the list itself doesn't pay for them. On a five-repository
+        // scope that is the difference between one list call per repo and ~50 extra per repo.
+        PullRequestQuery { filter, include_completed, limit: Some(50), decorate: false }
     }
 
     /// `Mine + include_completed` also returns your closed-but-not-merged PRs; drop those.
@@ -117,12 +123,15 @@ pub async fn pull_requests(sections: &SectionService, view: PrView) -> Vec<PrRow
     if let Ok(feeds) = sections.pull_request_feeds().await.inspect_err(|_| log_fetch_failure("dashboard.pull_requests.feeds")) {
         let query = view.query();
         for feed in feeds {
+            // The list skipped decoration, so say whether these rows are actually missing anything.
+            let needs_decoration = feed.source.list_omits_decoration();
             if let Ok(list) = feed.source.list(&query).await.inspect_err(|_| log_fetch_failure("dashboard.pull_requests.list")) {
                 out.extend(list.into_iter().filter(|pr| view.keep(pr)).map(|pr| PrRow {
                     connection_id: feed.connection.connection_id().to_string(),
                     connection: feed.connection.display_name().to_string(),
                     provider: feed.connection.provider_type(),
                     pull_request: pr,
+                    needs_decoration,
                 }));
             }
         }
@@ -150,38 +159,45 @@ pub async fn work_items(sections: &SectionService) -> Vec<WiRow> {
 
 /// Queries for a pipeline subscription — mirrors the TUI: all recent runs when auto-discovering,
 /// else the subscribed definitions.
-fn pipe_queries(sub: &PipelineSubscription) -> Vec<PipelineRunQuery> {
+///
+/// A subscribed definition id is only unique within its repository, so each query is addressed at
+/// the repository discovery says the definition belongs to. Without that, a connection spanning
+/// several repositories would ask every one of them about a definition only one of them has.
+fn pipe_queries(sub: &PipelineSubscription, defs: &[PipelineDefinition]) -> Vec<PipelineRunQuery> {
     if sub.definition_ids.is_empty() {
-        vec![PipelineRunQuery { definition_id: None, branch: None, limit: Some(20) }]
-    } else {
-        sub.definition_ids
-            .iter()
-            .map(|id| PipelineRunQuery { definition_id: Some(id.clone()), branch: None, limit: Some(10) })
-            .collect()
+        return vec![PipelineRunQuery { definition_id: None, repository: None, branch: None, limit: Some(20) }];
     }
+    sub.definition_ids
+        .iter()
+        .map(|id| PipelineRunQuery {
+            repository: defs.iter().find(|d| &d.id == id).and_then(|d| d.repository.clone()),
+            definition_id: Some(id.clone()),
+            branch: None,
+            limit: Some(10),
+        })
+        .collect()
 }
 
 pub async fn pipelines(sections: &SectionService) -> Vec<PipeRow> {
     let mut out = Vec::new();
     if let Ok(feeds) = sections.pipeline_feeds().await.inspect_err(|_| log_fetch_failure("dashboard.pipelines.feeds")) {
         for feed in feeds {
-            let def_names: std::collections::HashMap<String, String> = feed
+            let defs = feed
                 .source
                 .discover()
                 .await
                 .inspect_err(|_| log_fetch_failure("dashboard.pipelines.discover"))
-                .unwrap_or_default()
-                .into_iter()
-                .map(|d| (d.id, d.name))
-                .collect();
+                .unwrap_or_default();
+            let def_names: std::collections::HashMap<String, String> =
+                defs.iter().map(|d| (d.id.clone(), d.name.clone())).collect();
             let supports = feed.source.supports_approvals();
-            for query in pipe_queries(&feed.subscription) {
+            for query in pipe_queries(&feed.subscription, &defs) {
                 if let Ok(runs) = feed.source.list_runs(&query).await.inspect_err(|_| log_fetch_failure("dashboard.pipelines.list")) {
                     for run in runs {
                         // Only in-flight runs can be waiting on a gate — bound the extra calls.
                         let approvals = if supports && is_active(run.status) {
                             feed.source
-                                .pending_approvals(&run.id)
+                                .pending_approvals(&run.item_ref())
                                 .await
                                 .inspect_err(|_| log_fetch_failure("dashboard.pipelines.pending_approvals"))
                                 .unwrap_or_default()
@@ -251,12 +267,29 @@ fn is_active(status: PipelineRunStatus) -> bool {
     matches!(status, PipelineRunStatus::Queued | PipelineRunStatus::Running)
 }
 
+/// The query behind every Command Center PR fetch. It **decorates**, for two separate reasons —
+/// either one alone would be enough:
+///
+/// * it *ranks* on `mergeable` ([`launchpad::classify_pr`], author branch), and
+/// * it *renders* `checks` on every PR row, whatever the role.
+///
+/// So "decorate only the rows we rank on" would be wrong here: a review-requested row is never
+/// ranked on a decorated field but is still shown with its check status, and turning decoration
+/// off would blank that out. The cost stays bounded because providers decorate **after** the
+/// cross-scope sort and cap, so it scales with the rows returned, not with the repository scope.
+///
+/// The list page is the opposite case and does turn it off — it fetches decoration per visible
+/// row from `/api/pr/decoration` instead.
+fn launchpad_query(filter: PullRequestFilter, include_completed: bool) -> PullRequestQuery {
+    PullRequestQuery { filter, include_completed, limit: Some(50), decorate: true }
+}
+
 /// Fetches PRs for a role into launchpad inputs. `include_completed` is on for your own PRs so
 /// recently-merged ones can surface.
 async fn pr_inputs(sections: &SectionService, filter: PullRequestFilter, include_completed: bool) -> Vec<PrInput> {
     let mut out = Vec::new();
     if let Ok(feeds) = sections.pull_request_feeds().await.inspect_err(|_| log_fetch_failure("dashboard.launchpad.pull_request_feeds")) {
-        let query = PullRequestQuery { filter, include_completed, limit: Some(50) };
+        let query = launchpad_query(filter, include_completed);
         for feed in feeds {
             if let Ok(list) = feed.source.list(&query).await.inspect_err(|_| log_fetch_failure("dashboard.launchpad.pull_requests")) {
                 out.extend(list.into_iter().map(|pr| PrInput {
@@ -296,24 +329,23 @@ async fn pipe_inputs(sections: &SectionService) -> Vec<PipeInput> {
     let mut out = Vec::new();
     if let Ok(feeds) = sections.pipeline_feeds().await.inspect_err(|_| log_fetch_failure("dashboard.launchpad.pipeline_feeds")) {
         for feed in feeds {
-            let def_names: std::collections::HashMap<String, String> = feed
+            let defs = feed
                 .source
                 .discover()
                 .await
                 .inspect_err(|_| log_fetch_failure("dashboard.launchpad.pipeline_discovery"))
-                .unwrap_or_default()
-                .into_iter()
-                .map(|d| (d.id, d.name))
-                .collect();
+                .unwrap_or_default();
+            let def_names: std::collections::HashMap<String, String> =
+                defs.iter().map(|d| (d.id.clone(), d.name.clone())).collect();
             let supports = feed.source.supports_approvals();
-            for query in pipe_queries(&feed.subscription) {
+            for query in pipe_queries(&feed.subscription, &defs) {
                 if let Ok(runs) = feed.source.list_runs(&query).await.inspect_err(|_| log_fetch_failure("dashboard.launchpad.pipelines")) {
                     for run in runs {
                         let awaiting_approval = supports
                             && is_active(run.status)
                             && feed
                                 .source
-                                .pending_approvals(&run.id)
+                                .pending_approvals(&run.item_ref())
                                 .await
                                 .inspect_err(|_| {
                                     log_fetch_failure("dashboard.launchpad.pipeline_approvals")
@@ -433,18 +465,18 @@ fn with_comment_events(mut timeline: Vec<TimelineEvent>, threads: &[CommentThrea
     timeline
 }
 
-pub async fn pr_detail(sections: &SectionService, conn: &str, id: &str) -> Option<PrDetail> {
+pub async fn pr_detail(sections: &SectionService, conn: &str, item: &ItemRef) -> Option<PrDetail> {
     let source = pr_source(sections, conn).await?;
-    let pull_request = source.get(id).await.inspect_err(|_| log_fetch_failure("dashboard.pr_detail.get")).ok()?;
+    let pull_request = source.get(item).await.inspect_err(|_| log_fetch_failure("dashboard.pr_detail.get")).ok()?;
     // The detail extras are best-effort: a provider that doesn't expose one just yields empties.
     let threads = source
-        .threads(id)
+        .threads(item)
         .await
         .inspect_err(|_| log_fetch_failure("dashboard.pr_detail.threads"))
         .unwrap_or_default();
     let timeline = with_comment_events(
         source
-            .timeline(id)
+            .timeline(item)
             .await
             .inspect_err(|_| log_fetch_failure("dashboard.pr_detail.timeline"))
             .unwrap_or_default(),
@@ -455,29 +487,36 @@ pub async fn pr_detail(sections: &SectionService, conn: &str, id: &str) -> Optio
         threads,
         timeline,
         changes: source
-            .changes(id)
+            .changes(item)
             .await
             .inspect_err(|_| log_fetch_failure("dashboard.pr_detail.changes"))
             .unwrap_or_default(),
         checks: source
-            .checks(id)
+            .checks(item)
             .await
             .inspect_err(|_| log_fetch_failure("dashboard.pr_detail.checks"))
             .unwrap_or_default(),
         commits: source
-            .commits(id)
+            .commits(item)
             .await
             .inspect_err(|_| log_fetch_failure("dashboard.pr_detail.commits"))
             .unwrap_or_default(),
     })
 }
 
+/// The fields the PR list leaves out, for one pull request — fetched per visible row rather than
+/// for every row of every repository in the scope.
+pub async fn pr_decoration(sections: &SectionService, conn: &str, item: &ItemRef) -> Option<PrDecoration> {
+    let source = pr_source(sections, conn).await?;
+    source.decorate(item).await.inspect_err(|_| log_fetch_failure("dashboard.pr_decoration")).ok()
+}
+
 /// Files changed by a single commit on the PR (empty for providers without a per-commit diff API).
-pub async fn pr_commit_changes(sections: &SectionService, conn: &str, id: &str, sha: &str) -> Option<Vec<FileChange>> {
+pub async fn pr_commit_changes(sections: &SectionService, conn: &str, item: &ItemRef, sha: &str) -> Option<Vec<FileChange>> {
     let source = pr_source(sections, conn).await?;
     Some(
         source
-            .commit_changes(id, sha)
+            .commit_changes(item, sha)
             .await
             .inspect_err(|_| log_fetch_failure("dashboard.pr_commit_changes"))
             .unwrap_or_default(),
@@ -506,18 +545,18 @@ pub async fn wi_source(sections: &SectionService, conn: &str) -> Option<Arc<dyn 
         .map(|f| f.source)
 }
 
-pub async fn wi_detail(sections: &SectionService, conn: &str, id: &str) -> Option<WiDetail> {
+pub async fn wi_detail(sections: &SectionService, conn: &str, item: &ItemRef) -> Option<WiDetail> {
     let source = wi_source(sections, conn).await?;
-    let work_item = source.get(id).await.inspect_err(|_| log_fetch_failure("dashboard.wi_detail.get")).ok()?;
+    let work_item = source.get(item).await.inspect_err(|_| log_fetch_failure("dashboard.wi_detail.get")).ok()?;
     // Comments are best-effort: a provider that doesn't expose them just yields empties.
     let threads = source
-        .threads(id)
+        .threads(item)
         .await
         .inspect_err(|_| log_fetch_failure("dashboard.wi_detail.threads"))
         .unwrap_or_default();
     let timeline = with_comment_events(
         source
-            .timeline(id)
+            .timeline(item)
             .await
             .inspect_err(|_| log_fetch_failure("dashboard.wi_detail.timeline"))
             .unwrap_or_default(),
@@ -548,13 +587,13 @@ pub async fn pipe_source(sections: &SectionService, conn: &str) -> Option<Arc<dy
         .map(|f| f.source)
 }
 
-pub async fn pipeline_detail(sections: &SectionService, conn: &str, run_id: &str) -> Option<PipelineDetail> {
+pub async fn pipeline_detail(sections: &SectionService, conn: &str, run: &ItemRef) -> Option<PipelineDetail> {
     let source = pipe_source(sections, conn).await?;
-    let run = source.get_run(run_id).await.inspect_err(|_| log_fetch_failure("dashboard.pipeline_detail.get")).ok()?;
+    let run = source.get_run(run).await.inspect_err(|_| log_fetch_failure("dashboard.pipeline_detail.get")).ok()?;
     // Only in-flight runs can be waiting on a gate — mirror the list endpoint's bound.
     let approvals = if source.supports_approvals() && is_active(run.status) {
         source
-            .pending_approvals(run_id)
+            .pending_approvals(&run.item_ref())
             .await
             .inspect_err(|_| log_fetch_failure("dashboard.pipeline_detail.pending_approvals"))
             .unwrap_or_default()
@@ -566,9 +605,9 @@ pub async fn pipeline_detail(sections: &SectionService, conn: &str, run_id: &str
 
 /// Logs for a run, optionally scoped to a single job. Best-effort: `None` when the connection
 /// isn't found or the provider can't supply logs.
-pub async fn pipeline_logs(sections: &SectionService, conn: &str, run_id: &str, job_id: Option<&str>) -> Option<String> {
+pub async fn pipeline_logs(sections: &SectionService, conn: &str, run: &ItemRef, job_id: Option<&str>) -> Option<String> {
     let source = pipe_source(sections, conn).await?;
-    source.logs(run_id, job_id).await.inspect_err(|_| log_fetch_failure("dashboard.pipeline_logs.get")).ok()
+    source.logs(run, job_id).await.inspect_err(|_| log_fetch_failure("dashboard.pipeline_logs.get")).ok()
 }
 
 pub async fn health(svc: &ConnectionHealthService) -> Vec<HealthRow> {
@@ -582,4 +621,134 @@ pub async fn health(svc: &ConnectionHealthService) -> Vec<HealthRow> {
             healthy: h.healthy,
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use forgetop_core::domain::{CheckStatus, MergeableState, Reviewer, ReviewVote, User};
+
+    fn pr(reviewers: Vec<Reviewer>) -> PullRequest {
+        PullRequest {
+            repository: Some("acme/pay".into()),
+            id: "7".into(),
+            number: Some(7),
+            title: "Add retries".into(),
+            description: None,
+            author: User { id: "me".into(), display_name: "me".into(), handle: Some("me".into()), avatar_url: None },
+            status: PullRequestStatus::Open,
+            is_draft: false,
+            source_ref: None,
+            target_ref: None,
+            reviewers,
+            labels: vec![],
+            checks: CheckStatus::Passed,
+            check_summary: None,
+            mergeable: MergeableState::Mergeable,
+            changed_files: 0,
+            additions: 0,
+            deletions: 0,
+            created_at: None,
+            updated_at: None,
+            url: None,
+        }
+    }
+
+    fn approver() -> Reviewer {
+        Reviewer {
+            user: User { id: "priya".into(), display_name: "Priya".into(), handle: None, avatar_url: None },
+            vote: ReviewVote::Approved,
+            is_required: false,
+        }
+    }
+
+    /// Every Command Center fetch decorates — for *both* roles, not just the ranked one.
+    ///
+    /// It is tempting to decorate only what the classifier ranks on, since `classify_pr` reads
+    /// `mergeable` on the author branch alone. That is a trap: the Command Center also *renders*
+    /// `checks` on every PR row, so a review-requested row fetched undecorated still looks
+    /// wrong — it silently loses its check status. Both halves are asserted below, so removing
+    /// either reason still leaves the other holding this test up.
+    #[test]
+    fn the_launchpad_decorates_every_fetch_it_ranks_or_renders_from() {
+        for filter in [PullRequestFilter::Mine, PullRequestFilter::ReviewRequested, PullRequestFilter::All] {
+            assert!(launchpad_query(filter, false).decorate, "{filter:?} feeds rows the Command Center renders checks on");
+        }
+
+        // Reason 1 — ranking: the same PR lands in a different bucket on `mergeable` alone, so an
+        // undecorated "mine" fetch would rank an approved, mergeable PR as not ready to merge.
+        let ready = pr(vec![approver()]);
+        let mut conflicting = pr(vec![approver()]);
+        conflicting.mergeable = MergeableState::Conflicting;
+        assert_ne!(
+            launchpad::classify_pr(&ready, launchpad::PrRole::Author).map(|b| b.key()),
+            launchpad::classify_pr(&conflicting, launchpad::PrRole::Author).map(|b| b.key()),
+        );
+
+        // Reason 2 — rendering: a review-requested row is never *ranked* on a decorated field…
+        let mut decorated = pr(vec![]);
+        decorated.mergeable = MergeableState::Conflicting;
+        decorated.checks = CheckStatus::Failed;
+        assert_eq!(
+            launchpad::classify_pr(&pr(vec![]), launchpad::PrRole::Reviewer).map(|b| b.key()),
+            launchpad::classify_pr(&decorated, launchpad::PrRole::Reviewer).map(|b| b.key()),
+            "ranking alone would say the review fetch needs no decoration"
+        );
+        // …but `checks` is a decorated field the row is drawn with, which is why it does.
+        assert_ne!(decorated.checks, CheckStatus::None, "checks is what an undecorated row would lose");
+    }
+
+    /// Only the provider whose list endpoint actually omits the decorated fields asks the
+    /// dashboard to fetch them per row. GitLab, Azure and Bitbucket fill everything they have
+    /// from the list payload, so asking them would be one call per row returning what we had.
+    #[tokio::test]
+    async fn only_providers_whose_list_omits_decoration_ask_for_a_per_row_fetch() {
+        use forgetop_providers::{bitbucket, github, gitlab};
+        use forgetop_core::provider::{Connection, ProviderFactory};
+
+        let conn = |provider, organization, repository, username| Connection {
+            id: "c".into(),
+            provider_type: provider,
+            display_name: "c".into(),
+            base_url: None,
+            organization,
+            project: None,
+            repository,
+            username,
+            credential_ref: None,
+            repo_scope: None,
+        };
+        let gh = github::GitHubFactory.create(&conn(ProviderType::GitHub, None, Some("acme/pay".into()), None), None).unwrap();
+        assert!(gh.pull_requests().unwrap().list_omits_decoration(), "GitHub's /pulls omits them");
+
+        let gl = gitlab::GitLabFactory.create(&conn(ProviderType::GitLab, None, Some("g/p".into()), None), None).unwrap();
+        assert!(!gl.pull_requests().unwrap().list_omits_decoration(), "GitLab fills them from the list");
+
+        let bb = bitbucket::BitbucketFactory
+            .create(&conn(ProviderType::Bitbucket, Some("ws".into()), Some("repo".into()), Some("u".into())), None)
+            .unwrap();
+        assert!(!bb.pull_requests().unwrap().list_omits_decoration(), "Bitbucket fills them from the list");
+    }
+
+    /// A subscribed definition id is only unique within its repository, so each pipeline query
+    /// must be addressed at the repository discovery says the definition belongs to.
+    #[test]
+    fn pipeline_queries_are_addressed_at_the_definition_s_own_repository() {
+        let defs = vec![
+            PipelineDefinition { repository: Some("acme/pay".into()), id: "ci".into(), name: "CI".into(), path: None, url: None },
+            PipelineDefinition { repository: Some("acme/web".into()), id: "release".into(), name: "Release".into(), path: None, url: None },
+        ];
+        let sub = PipelineSubscription {
+            connection_id: "gh".into(),
+            definition_ids: vec!["ci".into(), "release".into()],
+            auto_discover_all: false,
+        };
+        let queries = pipe_queries(&sub, &defs);
+        assert_eq!(queries[0].repository.as_deref(), Some("acme/pay"));
+        assert_eq!(queries[1].repository.as_deref(), Some("acme/web"));
+
+        // Auto-discovery has no definition to place, so it fans out over the whole scope.
+        let all = PipelineSubscription { connection_id: "gh".into(), definition_ids: vec![], auto_discover_all: true };
+        assert_eq!(pipe_queries(&all, &defs)[0].repository, None);
+    }
 }

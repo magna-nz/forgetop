@@ -730,6 +730,7 @@ dependencies = [
  "chrono",
  "dotenvy",
  "forgetop-core",
+ "futures-util",
  "reqwest",
  "serde",
  "serde_json",

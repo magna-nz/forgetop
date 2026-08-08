@@ -32,6 +32,7 @@ async fn demo_deps(seed: bool) -> Deps {
             repository: None,
             username: None,
             credential_ref: None,
+            repo_scope: None,
         };
         config.add_or_update_connection(conn("github", ProviderType::GitHub), None).await.unwrap();
         config.add_or_update_connection(conn("linear", ProviderType::Linear), None).await.unwrap();

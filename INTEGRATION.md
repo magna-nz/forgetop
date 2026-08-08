@@ -57,6 +57,17 @@ crashed test can't leak.
 | Token | PAT with scope **`api`**; you're Maintainer/Owner. |
 | Env | `FORGETOP_IT_GITLAB_TOKEN`, `FORGETOP_IT_GITLAB_PROJECT` (id), `FORGETOP_IT_GITLAB_HOST` (only for self-hosted) |
 
+### Bitbucket
+| | |
+| --- | --- |
+| Container | A repository in a workspace you own. |
+| Token | App password with **Pull requests: read** + **Repositories: read** (discovery lists the whole workspace, so it needs the repository read; the Bitbucket UI normally selects it for you). |
+| Env | `FORGETOP_IT_BITBUCKET_USERNAME`, `FORGETOP_IT_BITBUCKET_APP_PASSWORD`, `FORGETOP_IT_BITBUCKET_WORKSPACE`, `FORGETOP_IT_BITBUCKET_REPO` |
+
+> Bitbucket is the only provider **CI has no secrets for**. Filling these in locally is what turns
+> its repository discovery from "written from the docs" into "verified" — see
+> `tests/integration/scope.rs::bitbucket_discovery_lists_the_workspace`, which skips without them.
+
 ### Azure DevOps
 | | |
 | --- | --- |

@@ -637,6 +637,27 @@ fn list_title(base: String, filter: &str) -> String {
 
 // ---- Pull Requests ----
 
+/// Shown when a section's connections have explicitly chosen no repositories. Deliberately not
+/// "nothing to show": nothing was fetched because nothing was asked for, and the fix is one key.
+const NO_REPOS_HINT: &str = "No repositories selected. Press g to choose which ones to fetch from.";
+
+/// Appends "· Repos · 5 of 37" to a section title, once discovery has a real count to show.
+fn with_scope(base: String, app: &App, section: usize) -> String {
+    match &app.repo_scope[section] {
+        Some(s) => format!("{base} · {}", s.label()),
+        None => base,
+    }
+}
+
+fn scope_is_empty(app: &App, section: usize) -> bool {
+    app.repo_scope[section].as_ref().is_some_and(|s| s.none_selected)
+}
+
+/// The repository column: just the trailing name, since the owner/workspace repeats on every row.
+fn short_repo(repo: Option<&str>) -> String {
+    repo.map(|r| r.rsplit('/').next().unwrap_or(r).to_string()).unwrap_or_default()
+}
+
 fn pr_status(theme: &Theme, pr: &PullRequest) -> (&'static str, ratatui::style::Color) {
     if pr.is_draft {
         return ("◌ draft", theme.dim);
@@ -661,11 +682,13 @@ fn pr_checks(theme: &Theme, pr: &PullRequest) -> (String, ratatui::style::Color)
 fn render_prs(frame: &mut Frame, area: Rect, app: &mut App) {
     let theme = &app.theme;
     let idxs = app.filtered_pr_indices();
-    let base = format!("Pull Requests · {}", crate::app::pr_status_summary(&app.pr_shown_statuses));
+    let base = with_scope(format!("Pull Requests · {}", crate::app::pr_status_summary(&app.pr_shown_statuses)), app, 0);
     let title = list_title(base, &app.filters[0]);
     if idxs.is_empty() {
         let msg = if !app.filters[0].is_empty() {
             "No matches. Esc clears the filter.".to_string()
+        } else if scope_is_empty(app, 0) {
+            NO_REPOS_HINT.to_string()
         } else if app.health.is_empty() {
             FIRST_RUN_HINT.to_string()
         } else if app.loading {
@@ -679,7 +702,9 @@ fn render_prs(frame: &mut Frame, area: Rect, app: &mut App) {
 
     let inner_w = area.width.saturating_sub(2) as usize;
     let dim = Style::default().fg(theme.dim).add_modifier(Modifier::BOLD);
-    let headers = ["", "Provider", "#", "Title", "Author", "Checks", "±", "Updated"];
+    // With one connection spanning an account, the provider/connection column no longer tells
+    // rows apart — the repository is what does.
+    let headers = ["", "Provider", "Repository", "#", "Title", "Author", "Checks", "±", "Updated"];
     let cells: Vec<Vec<(String, Style)>> = idxs
         .iter()
         .map(|&i| &app.prs[i])
@@ -690,6 +715,7 @@ fn render_prs(frame: &mut Frame, area: Rect, app: &mut App) {
             vec![
                 (st.to_string(), Style::default().fg(stc)),
                 (provider_tag(row.provider, &row.connection), Style::default().fg(theme.cyan)),
+                (short_repo(pr.repository.as_deref()), Style::default().fg(theme.dim)),
                 (pr.number.map(|n| format!("#{n}")).unwrap_or_default(), Style::default().fg(theme.dim)),
                 (pr.title.clone(), Style::default().fg(theme.fg)),
                 (pr.author.display_name.clone(), Style::default().fg(theme.blue)),
@@ -729,10 +755,12 @@ fn render_wis(frame: &mut Frame, area: Rect, app: &mut App) {
     } else {
         format!("Work Items · mine · {hidden_in_view} state(s) hidden")
     };
-    let title = list_title(base, &app.filters[1]);
+    let title = list_title(with_scope(base, app, 1), &app.filters[1]);
     if idxs.is_empty() {
         let msg = if !app.filters[1].is_empty() {
             "No matches. Esc clears the filter.".to_string()
+        } else if scope_is_empty(app, 1) {
+            NO_REPOS_HINT.to_string()
         } else if hidden_in_view > 0 {
             "All present states are hidden. Press f to choose states.".to_string()
         } else if app.health.is_empty() {
@@ -775,10 +803,12 @@ fn render_wis(frame: &mut Frame, area: Rect, app: &mut App) {
 fn render_pipes(frame: &mut Frame, area: Rect, app: &mut App) {
     let theme = &app.theme;
     let idxs = app.filtered_pipe_indices();
-    let title = list_title("Pipelines".to_string(), &app.filters[2]);
+    let title = list_title(with_scope("Pipelines".to_string(), app, 2), &app.filters[2]);
     if idxs.is_empty() {
         let msg = if !app.filters[2].is_empty() {
             "No matches. Esc clears the filter.".to_string()
+        } else if scope_is_empty(app, 2) {
+            NO_REPOS_HINT.to_string()
         } else if app.health.is_empty() {
             FIRST_RUN_HINT.to_string()
         } else if app.loading {
@@ -1175,6 +1205,9 @@ fn base_footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
         keys.push(("[ ]", "views"));
     }
     keys.push(("V", "save view"));
+    if app.repo_scope[app.active].is_some() {
+        keys.push(("g", "repos"));
+    }
     keys.push(("/", "find"));
     keys.extend([(",", "settings"), ("v", "tabs"), ("C", "connections"), ("r", "refresh"), ("t", "theme"), ("?", "help"), ("q", "quit")]);
     keys
@@ -1832,11 +1865,12 @@ fn render_overlay(frame: &mut Frame, area: Rect, app: &App) {
             ],
             theme.green,
         ),
-        Overlay::Toggle { items, selected, .. } => (
-            items
-                .iter()
+        Overlay::Toggle { items, selected, filter, .. } => (
+            crate::overlay::visible_toggle_indices(items, filter.as_deref())
+                .into_iter()
                 .enumerate()
-                .map(|(i, item)| {
+                .map(|(i, idx)| {
+                    let item = &items[idx];
                     let (arrow, arrow_color) = if item.on { ("▶", theme.green) } else { ("·", theme.dim) };
                     let cursor = if i == *selected { "▐ " } else { "  " };
                     let label_style = if i == *selected {
@@ -1852,7 +1886,23 @@ fn render_overlay(frame: &mut Frame, area: Rect, app: &App) {
                         Span::styled(item.label.clone(), label_style),
                     ])
                 })
-                .collect(),
+                .collect::<Vec<Line>>()
+                .into_iter()
+                .fold(
+                    match filter {
+                        // A searchable checklist shows what's being typed, or it looks broken
+                        // when the list narrows to nothing.
+                        Some(q) => vec![Line::from(Span::styled(
+                            format!("search: {q}▏"),
+                            Style::default().fg(theme.dim).add_modifier(Modifier::ITALIC),
+                        ))],
+                        None => Vec::new(),
+                    },
+                    |mut acc, line| {
+                        acc.push(line);
+                        acc
+                    },
+                ),
             theme.green,
         ),
         Overlay::Help { .. } | Overlay::Palette { .. } => return, // handled above
@@ -2011,6 +2061,7 @@ fn help_sections() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
                 ("F", "Give feedback through the GitHub issue form"),
                 ("/", "Quick-filter the list"),
                 ("S", "Sort by column (re-pick flips direction)"),
+                ("g", "Repositories — which ones this section fetches from"),
                 ("o", "Open selected in browser"),
                 (",", "Settings — what forgetop opens on launch"),
                 ("v", "Choose which tabs are visible"),
@@ -2236,6 +2287,7 @@ mod tests {
 
     fn sample_pr() -> PullRequest {
         PullRequest {
+            repository: None,
             id: "1".into(),
             number: Some(42),
             title: "Add the widget".into(),
@@ -2594,6 +2646,78 @@ mod tests {
         assert!(out.contains("GitHub") && out.contains("MyHub"), "row is tagged with its provider · connection");
     }
 
+    fn scope(selected: usize, available: Option<usize>, truncated: bool, none_selected: bool) -> crate::app::ScopeSummary {
+        crate::app::ScopeSummary {
+            connections: vec!["c".into()],
+            selected,
+            available,
+            truncated,
+            none_selected,
+        }
+    }
+
+    #[test]
+    fn pr_list_shows_the_repository_a_row_belongs_to() {
+        // One connection now spans an account, so the provider/connection tag no longer tells
+        // rows apart — the repository does.
+        let mut app = App::new("slate");
+        app.screen = Screen::List;
+        let mut pr = sample_pr();
+        pr.repository = Some("acme/payments".into());
+        app.prs.push(crate::app::PrRow { connection_id: "c".into(), connection: "GH".into(), provider: ProviderType::GitHub, pr });
+        app.pr_state.select(Some(0));
+        let out = render_to_string(&mut app, 160, 24);
+        assert!(out.contains("Repository"), "repository header present");
+        assert!(out.contains("payments"), "row names the repository it lives in");
+    }
+
+    #[test]
+    fn section_header_reports_how_much_of_the_account_is_in_scope() {
+        let mut app = App::new("slate");
+        app.screen = Screen::List;
+        app.prs.push(crate::app::PrRow { connection_id: "c".into(), connection: "GH".into(), provider: ProviderType::GitHub, pr: sample_pr() });
+        app.pr_state.select(Some(0));
+
+        app.repo_scope[0] = Some(scope(5, Some(37), false, false));
+        assert!(render_to_string(&mut app, 160, 24).contains("Repos · 5 of 37"));
+
+        // Truncation is marked rather than presented as a total.
+        app.repo_scope[0] = Some(scope(5, Some(500), true, false));
+        assert!(render_to_string(&mut app, 160, 24).contains("Repos · 5 of 500+"));
+
+        // Before discovery has answered there is no denominator to invent.
+        app.repo_scope[0] = Some(scope(5, None, false, false));
+        let out = render_to_string(&mut app, 160, 24);
+        assert!(out.contains("Repos · 5") && !out.contains("Repos · 5 of"));
+    }
+
+    #[test]
+    fn an_empty_scope_reads_as_a_choice_not_as_an_empty_section() {
+        // Nothing was fetched because nothing was asked for. "No pull requests" would say the
+        // opposite of what happened, and wouldn't point at the fix.
+        let mut app = App::new("slate");
+        app.screen = Screen::List;
+        app.health.push(forgetop_core::service::ConnectionHealth {
+            connection: forgetop_core::provider::Connection {
+                id: "c".into(),
+                provider_type: ProviderType::GitHub,
+                display_name: "GH".into(),
+                base_url: None,
+                organization: None,
+                project: None,
+                repository: None,
+                username: None,
+                credential_ref: None,
+                repo_scope: Some(vec![]),
+            },
+            healthy: true,
+        });
+        app.repo_scope[0] = Some(scope(0, Some(37), false, true));
+        let out = render_to_string(&mut app, 160, 24);
+        assert!(out.contains("No repositories selected"), "says why the list is empty");
+        assert!(!out.contains("No pull requests"), "and doesn't claim there are none");
+    }
+
     #[test]
     fn pr_write_actions_live_in_the_view_not_the_list() {
         // The PR list footer offers only browse/open — no write actions.
@@ -2627,6 +2751,7 @@ mod tests {
 
     fn sample_run() -> PipelineRun {
         PipelineRun {
+            repository: None,
             id: "r1".into(),
             definition_id: "ci".into(),
             number: Some(101),
@@ -2851,6 +2976,7 @@ mod tests {
             r
         };
         let wi = WorkItem {
+            repository: None,
             id: "w".into(),
             identifier: Some("FOR-1".into()),
             title: "Investigate flake".into(),
@@ -2907,6 +3033,7 @@ mod tests {
                 ToggleItem { id: "1".into(), label: "Work Items".into(), on: false },
             ],
             selected: 0,
+            filter: None,
         });
         let out = render_to_string(&mut app, 100, 24);
         assert!(out.contains("Visible tabs"), "toggle title");
@@ -2956,6 +3083,7 @@ mod tests {
         app.screen = Screen::WiView(Box::new(crate::app::WiView {
             connection_id: "c".into(),
             wi: WorkItem {
+                repository: None,
                 id: "w1".into(),
                 identifier: Some("FOR-1".into()),
                 title: "A task".into(),
@@ -3078,6 +3206,7 @@ mod tests {
             connection: "GitHub".into(),
             provider: ProviderType::GitHub,
             notification: Notification {
+                repository: None,
                 id: id.into(),
                 kind,
                 item_type: NotificationItemType::PullRequest,

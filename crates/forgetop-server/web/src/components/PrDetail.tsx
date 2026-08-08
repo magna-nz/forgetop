@@ -1,7 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import { useQueryClient } from "@tanstack/react-query";
-import { apiPost, useConnections, usePrCommitChanges, usePrDetail } from "../api";
+import { apiPost, prDetailKey, useConnections, usePrCommitChanges, usePrDetail } from "../api";
 import { checkMeta, prStatusMeta, relativeTime, voteMeta } from "../format";
 import { providerSupports, unsupportedMessage } from "../capabilities";
 import { parsePatch } from "../diff";
@@ -64,7 +64,7 @@ function PrDetailPanel({ prRef, onClose }: { prRef: PrRef; onClose: () => void }
   }, [pending.length]);
 
   const refresh = () => {
-    qc.invalidateQueries({ queryKey: ["pr-detail", prRef.conn, prRef.id] });
+    qc.invalidateQueries({ queryKey: prDetailKey(prRef) });
     qc.invalidateQueries({ queryKey: ["prs"] });
     qc.invalidateQueries({ queryKey: ["launchpad"] });
     // Acting on a PR (merge, approve, …) can clear its review-request / mention notification.
@@ -90,13 +90,13 @@ function PrDetailPanel({ prRef, onClose }: { prRef: PrRef; onClose: () => void }
   const closeSoon = () => setTimeout(onClose, 500);
   const vote = (v: "Approved" | "Rejected") =>
     act(v === "Approved" ? "Approved" : "Requested changes", async () => {
-      await apiPost("/api/pr/vote", { conn: prRef.conn, id: prRef.id, vote: v });
+      await apiPost("/api/pr/vote", { conn: prRef.conn, repo: prRef.repo, id: prRef.id, vote: v });
       closeSoon();
     });
   const merge = () =>
     act("Merged", async () => {
       try {
-        await apiPost("/api/pr/merge", { conn: prRef.conn, id: prRef.id, strategy: "Merge" });
+        await apiPost("/api/pr/merge", { conn: prRef.conn, repo: prRef.repo, id: prRef.id, strategy: "Merge" });
       } catch {
         // Providers without a mergeable flag (e.g. Bitbucket) let you try — the API decides.
         throw new Error("Couldn't merge — the PR may not be mergeable.");
@@ -105,14 +105,14 @@ function PrDetailPanel({ prRef, onClose }: { prRef: PrRef; onClose: () => void }
     });
   const revert = () =>
     act("Revert requested", async () => {
-      await apiPost("/api/pr/revert", { conn: prRef.conn, id: prRef.id });
+      await apiPost("/api/pr/revert", { conn: prRef.conn, repo: prRef.repo, id: prRef.id });
       closeSoon();
     });
   const reply = (threadId: string, body: string) =>
-    act("Reply posted", () => apiPost("/api/pr/reply", { conn: prRef.conn, id: prRef.id, thread_id: threadId, body }));
+    act("Reply posted", () => apiPost("/api/pr/reply", { conn: prRef.conn, repo: prRef.repo, id: prRef.id, thread_id: threadId, body }));
   const submitReview = (event: "Approved" | "Rejected" | "NoVote") =>
     act("Review submitted", async () => {
-      await apiPost("/api/pr/review", { conn: prRef.conn, id: prRef.id, event, comments: pending });
+      await apiPost("/api/pr/review", { conn: prRef.conn, repo: prRef.repo, id: prRef.id, event, comments: pending });
       setPending([]);
     });
 
@@ -224,7 +224,7 @@ function PrDetailPanel({ prRef, onClose }: { prRef: PrRef; onClose: () => void }
                   timeline={data.timeline}
                   busy={busy}
                   onReply={reply}
-                  onComment={(body) => act("Comment posted", () => apiPost("/api/pr/comment", { conn: prRef.conn, id: prRef.id, body }))}
+                  onComment={(body) => act("Comment posted", () => apiPost("/api/pr/comment", { conn: prRef.conn, repo: prRef.repo, id: prRef.id, body }))}
                 />
               )}
               {tab === "commits" && (

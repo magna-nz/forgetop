@@ -225,6 +225,8 @@ async fn seed_demo(config: &ConfigService) -> Result<()> {
         repository: None,
         username: None,
         credential_ref: None,
+        // The demo provider is exempt from the repository scope — it stays single-repo.
+        repo_scope: None,
     };
     for c in [
         conn("github", ProviderType::GitHub, "GitHub"),

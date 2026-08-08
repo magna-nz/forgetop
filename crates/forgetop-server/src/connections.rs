@@ -6,7 +6,7 @@
 use forgetop_core::domain::{ProviderType, Section};
 use forgetop_core::provider::Connection;
 use forgetop_core::secret::SecretStore;
-use forgetop_core::service::{ConfigService, ConnectionHealthService};
+use forgetop_core::service::{self, ConfigService, ConnectionHealthService, SectionService};
 use forgetop_core::setup::{self, FieldSpec};
 use serde::{Deserialize, Serialize};
 
@@ -55,6 +55,10 @@ pub struct ConnectionRow {
     pub project: Option<String>,
     pub repository: Option<String>,
     pub username: Option<String>,
+    /// The chosen repository scope, exactly as stored — `null` means never chosen (the legacy
+    /// single repository still applies), `[]` means the user chose none. The picker needs to
+    /// tell those apart.
+    pub repo_scope: Option<Vec<String>>,
     pub has_token: bool,
     pub sections: Vec<&'static str>,
 }
@@ -85,6 +89,7 @@ pub fn list(config: &ConfigService, secrets: &dyn SecretStore) -> Vec<Connection
                 project: c.project.clone(),
                 repository: c.repository.clone(),
                 username: c.username.clone(),
+                repo_scope: c.repo_scope.clone(),
                 has_token,
                 sections,
             }
@@ -128,14 +133,15 @@ fn clean(v: Option<String>) -> Option<String> {
 
 /// Adds or updates a connection (token → keychain) and reconciles its section bindings. Returns
 /// the connection id.
-pub async fn save(config: &ConfigService, req: SaveConnectionReq) -> Result<String, String> {
+pub async fn save(config: &ConfigService, sections: &SectionService, req: SaveConnectionReq) -> Result<String, String> {
     let editing = req.id.clone();
     let id = editing.clone().unwrap_or_else(|| Connection::new_id(req.provider));
 
-    // Preserve the existing keychain reference when editing so we don't orphan the token.
-    let credential_ref = editing.as_ref().and_then(|eid| {
-        config.snapshot().connections.iter().find(|c| &c.id == eid).and_then(|c| c.credential_ref.clone())
-    });
+    // Preserve the existing keychain reference and repository scope when editing, so saving the
+    // form neither orphans the token nor silently resets which repositories the user picked.
+    let existing = editing.as_ref().and_then(|eid| config.snapshot().connections.iter().find(|c| &c.id == eid).cloned());
+    let credential_ref = existing.as_ref().and_then(|c| c.credential_ref.clone());
+    let repo_scope = existing.as_ref().and_then(|c| c.repo_scope.clone());
 
     let display_name = match clean(Some(req.display_name)) {
         Some(n) => n,
@@ -151,6 +157,7 @@ pub async fn save(config: &ConfigService, req: SaveConnectionReq) -> Result<Stri
         repository: clean(req.repository),
         username: clean(req.username),
         credential_ref,
+        repo_scope,
     };
 
     let token = clean(req.token);
@@ -176,6 +183,11 @@ pub async fn save(config: &ConfigService, req: SaveConnectionReq) -> Result<Stri
         };
         result.map_err(|e| e.to_string())?;
     }
+
+    // A brand-new account connection with nothing picked starts on its most recently active
+    // repositories rather than fetching nothing. Best-effort by design: if discovery fails the
+    // scope stays unset and the connection behaves exactly as it did before.
+    let _ = service::seed_default_repo_scope(config, sections, &id).await;
 
     Ok(id)
 }

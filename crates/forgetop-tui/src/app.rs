@@ -111,7 +111,9 @@ struct ReloadParams {
     scan_seeded: bool,
     notifier: Arc<dyn Notifier>,
     /// The open pipeline view's (connection_id, run_id), so the refresh keeps it live.
-    open_pipeline: Option<(String, String)>,
+    /// The open drill-in's `(connection_id, run)` — the run is addressed, so the background
+    /// refresh reaches the same repository the view was opened from.
+    open_pipeline: Option<(String, ItemRef)>,
 }
 
 /// The PR-notification scan's new seen-sets (notifications are fired during the scan).
@@ -172,6 +174,32 @@ pub struct NotifRow {
     pub notification: Notification,
 }
 
+/// A section's repository scope, as the header indicator and empty state read it.
+#[derive(Clone, Debug)]
+pub struct ScopeSummary {
+    /// The repo-addressed connections feeding this section.
+    pub connections: Vec<String>,
+    /// How many repositories are currently fetched from.
+    pub selected: usize,
+    /// How many the credentials can reach, once discovery has run. `None` until then, so the
+    /// indicator never invents a denominator.
+    pub available: Option<usize>,
+    /// Discovery hit its page ceiling — the total reads "37+", never a cap dressed as a total.
+    pub truncated: bool,
+    /// Every connection explicitly chose no repositories. Distinct from "nothing to show".
+    pub none_selected: bool,
+}
+
+impl ScopeSummary {
+    /// "Repos · 5 of 37" for the section header. Truncation is marked, never silent.
+    pub fn label(&self) -> String {
+        match self.available {
+            Some(n) => format!("Repos · {} of {}{}", self.selected, n, if self.truncated { "+" } else { "" }),
+            None => format!("Repos · {}", self.selected),
+        }
+    }
+}
+
 pub struct App {
     pub theme: Theme,
     pub active: usize,
@@ -192,6 +220,14 @@ pub struct App {
     pub health: Vec<ConnectionHealth>,
     /// Which sections are shown in the tab bar, indexed by section (0=PR,1=WI,2=Pipelines).
     pub visible: [bool; 3],
+    /// Per-section repository-scope summary (0=PR, 1=WI, 2=Pipelines), for the header indicator
+    /// and the "no repositories selected" empty state. Recomputed on every reload from config.
+    pub repo_scope: [Option<ScopeSummary>; 3],
+    /// What discovery found per connection, keyed by connection id. Fetched once at startup and
+    /// again whenever the picker opens — the denominator in "5 of 37" has to be a real count.
+    pub repo_catalog: HashMap<String, RepositoryPage>,
+    /// Connection ids behind an open "which connection?" scope picker, indexed by its selection.
+    repo_scope_choices: Vec<String>,
     pub status: String,
     pub loading: bool,
     /// Scroll offset for the current list; body height captured during render.
@@ -407,6 +443,8 @@ pub struct FlatNode {
 /// One approve/reject option offered by the pipeline-approval picker.
 struct ApprovalChoice {
     connection_id: String,
+    /// The run's **connection-relative** repository, so the decision reaches the right one.
+    repo: Option<String>,
     run_id: String,
     approval_id: String,
     decision: ApprovalDecision,
@@ -720,6 +758,9 @@ impl App {
             pr_state: TableState::default(),
             wi_state: TableState::default(),
             pipe_state: TableState::default(),
+            repo_scope: [None, None, None],
+            repo_catalog: HashMap::new(),
+            repo_scope_choices: Vec::new(),
             health: Vec::new(),
             visible: [true; 3],
             status: "Loading…".into(),
@@ -1202,7 +1243,7 @@ impl App {
             ToggleItem { id: "pipeline_approval_needed".into(), label: "Pipeline approval needed".into(), on: n.pipeline_approval_needed },
         ];
         self.overlay =
-            Some(Overlay::Toggle { title: "Notifications".into(), kind: ToggleKind::Notifications, min_one: false, items, selected: 0 });
+            Some(Overlay::Toggle { title: "Notifications".into(), kind: ToggleKind::Notifications, min_one: false, items, selected: 0, filter: None });
     }
 
     /// Applies the notifications checklist: the ticked ids become the enabled set.
@@ -1404,12 +1445,12 @@ impl App {
                     .find(|r| r.connection_id == conn && r.pr.id == id)
                     .map(|r| (pr_label(&r.pr), r.pr.url.clone(), r.pr.clone()));
                 if let Some((label, url, pr)) = found {
-                    self.open_pr_view_for(deps, 0, id, label, url, conn, pr).await;
+                    self.open_pr_view_for(deps, 0, label, url, conn, pr).await;
                 }
             }
             launchpad::EntryKind::Wi => {
                 if let Some(wi) = self.wis.iter().find(|r| r.connection_id == conn && r.wi.id == id).map(|r| r.wi.clone()) {
-                    self.open_wi_view_for(deps, id, conn, wi).await;
+                    self.open_wi_view_for(deps, conn, wi).await;
                 }
             }
             launchpad::EntryKind::Pipe => {
@@ -1449,12 +1490,12 @@ impl App {
                     .find(|r| r.connection_id == conn && r.pr.id == id)
                     .map(|r| (pr_label(&r.pr), r.pr.url.clone(), r.pr.clone()));
                 if let Some((label, url, pr)) = found {
-                    self.open_pr_view_for(deps, 0, id, label, url, conn, pr).await;
+                    self.open_pr_view_for(deps, 0, label, url, conn, pr).await;
                 }
             }
             PaletteKind::Wi => {
                 if let Some(wi) = self.wis.iter().find(|r| r.connection_id == conn && r.wi.id == id).map(|r| r.wi.clone()) {
-                    self.open_wi_view_for(deps, id, conn, wi).await;
+                    self.open_wi_view_for(deps, conn, wi).await;
                 }
             }
             PaletteKind::Pipe => {
@@ -1572,6 +1613,9 @@ impl App {
         let conn = row.connection_id.clone();
         let n = &row.notification;
         let (item_type, item_id, url, notif_id) = (n.item_type, n.item_id.clone(), n.url.clone(), n.id.clone());
+        // A notification names the repository its item lives in, which is what lets the inbox
+        // open an item on a connection that spans several of them.
+        let item_repo = n.repository.clone();
 
         if let Err(error) = self.mark_inbox_read(&conn, &notif_id, deps).await {
             self.toast = Some(error);
@@ -1581,12 +1625,12 @@ impl App {
         match (item_type, item_id) {
             (NotificationItemType::PullRequest, Some(id)) => {
                 if let Some(src) = self.pr_source_for(&conn, deps).await {
-                    match src.get(&id).await {
+                    match src.get(&ItemRef::maybe(item_repo.clone(), id.clone())).await {
                         Ok(pr) => {
                             self.from_inbox = true;
                             self.lp_origin = false;
                             let (label, purl) = (pr_label(&pr), pr.url.clone());
-                            self.open_pr_view_for(deps, 0, id, label, purl, conn, pr).await;
+                            self.open_pr_view_for(deps, 0, label, purl, conn, pr).await;
                             return;
                         }
                         Err(_) => log_operation_failure(DIAG_INBOX_PR_DETAIL),
@@ -1595,11 +1639,11 @@ impl App {
             }
             (NotificationItemType::WorkItem, Some(id)) => {
                 if let Some(src) = self.wi_source_for(&conn, deps).await {
-                    match src.get(&id).await {
+                    match src.get(&ItemRef::maybe(item_repo.clone(), id.clone())).await {
                         Ok(wi) => {
                             self.from_inbox = true;
                             self.lp_origin = false;
-                            self.open_wi_view_for(deps, id, conn, wi).await;
+                            self.open_wi_view_for(deps, conn, wi).await;
                             return;
                         }
                         Err(_) => log_operation_failure(DIAG_INBOX_WI_DETAIL),
@@ -1709,6 +1753,23 @@ impl App {
         self.status = "Refreshing…".into();
         let fetched = self.fetch_bundle(deps).await;
         self.apply_reloaded(fetched);
+        // Discovery runs once here, not on every 30s reload: the scope indicator needs a real
+        // denominator, but it doesn't need a fresh one every tick. Opening the picker refreshes it.
+        if self.repo_catalog.is_empty() {
+            self.seed_repo_catalog(deps).await;
+        }
+        self.refresh_repo_scope(deps);
+    }
+
+    /// Fills `repo_catalog` for every repo-addressed connection. Best-effort: a connection whose
+    /// discovery fails simply has no denominator, and everything else keeps working.
+    async fn seed_repo_catalog(&mut self, deps: &AppDeps) {
+        let cfg = deps.config.snapshot();
+        for c in cfg.connections.iter().filter(|c| forgetop_core::setup::is_repo_addressed(c.provider_type)) {
+            if let Ok(page) = deps.sections.discover_repositories(&c.id).await {
+                self.repo_catalog.insert(c.id.clone(), page);
+            }
+        }
     }
 
     /// Parameters the background fetch needs, snapshotted from `self` at spawn time.
@@ -1722,7 +1783,7 @@ impl App {
             scan_seeded: self.pr_scan_seeded,
             notifier: self.notifier.clone(),
             open_pipeline: match &self.screen {
-                Screen::Pipeline(v) => Some((v.connection_id.clone(), v.run.id.clone())),
+                Screen::Pipeline(v) => Some((v.connection_id.clone(), v.run.item_ref())),
                 _ => None,
             },
         }
@@ -1740,7 +1801,7 @@ impl App {
         let health = deps.health.check_all().await;
         let scan = scan_pr_notifications(&deps, &p).await;
         let open_pipeline = match &p.open_pipeline {
-            Some((conn_id, run_id)) => fetch_open_pipeline(&deps, conn_id, run_id).await,
+            Some((conn_id, run_ref)) => fetch_open_pipeline(&deps, conn_id, run_ref).await,
             None => None,
         };
         Reloaded { prs, wis, pipes, inbox, lp_prs_mine, lp_prs_review, health, scan, open_pipeline, errors }
@@ -1829,6 +1890,10 @@ impl App {
                     filter: self.pr_filter,
                     include_completed: self.pr_wants_completed(),
                     limit: Some(50),
+                    // The TUI renders +/- and the mergeable state inline on the list, so it asks
+                    // for decoration. Providers bound that work to the rows they actually return,
+                    // so the cost doesn't grow with the size of the repository scope.
+                    decorate: true,
                 };
                 for feed in feeds {
                     let (provider, name, conn_id) = feed_tag(&feed.connection);
@@ -1894,15 +1959,10 @@ impl App {
                     let conn_id = feed.connection.connection_id().to_string();
                     // Map definition_id → pipeline name so rows can show the pipeline
                     // (e.g. "CI Build") separately from the run/release (e.g. "10.1.100").
+                    let defs = detail_or_default(feed.source.discover().await, DIAG_PIPELINE_DISCOVERY);
                     let def_names: HashMap<String, String> =
-                        detail_or_default(
-                            feed.source.discover().await,
-                            DIAG_PIPELINE_DISCOVERY,
-                        )
-                        .into_iter()
-                        .map(|d| (d.id, d.name))
-                        .collect();
-                    for q in feed_queries(&feed.subscription) {
+                        defs.iter().map(|d| (d.id.clone(), d.name.clone())).collect();
+                    for q in feed_queries(&feed.subscription, &defs) {
                         match feed.source.list_runs(&q).await {
                             Ok(runs) => {
                                 let supports = feed.source.supports_approvals();
@@ -1912,7 +1972,7 @@ impl App {
                                     let awaiting_approval = supports
                                         && is_active(run.status)
                                         && detail_or_default(
-                                            feed.source.pending_approvals(&run.id).await,
+                                            feed.source.pending_approvals(&run.item_ref()).await,
                                             DIAG_PIPELINE_APPROVALS,
                                         )
                                         .iter()
@@ -2151,17 +2211,17 @@ impl App {
     // ---- full-screen PR / work-item views ----
 
     async fn open_pr_view(&mut self, deps: &AppDeps, tab: usize) {
-        let (id, label, url, conn_id, pr) = match self.selected_pr_row() {
-            Some(row) => (row.pr.id.clone(), pr_label(&row.pr), row.pr.url.clone(), row.connection_id.clone(), row.pr.clone()),
+        let (label, url, conn_id, pr) = match self.selected_pr_row() {
+            Some(row) => (pr_label(&row.pr), row.pr.url.clone(), row.connection_id.clone(), row.pr.clone()),
             None => return,
         };
-        self.open_pr_view_for(deps, tab, id, label, url, conn_id, pr).await;
+        self.open_pr_view_for(deps, tab, label, url, conn_id, pr).await;
     }
 
     /// Opens the PR view for an explicit PR (used by the Launchpad, where the item
     /// isn't the section list's selected row).
     #[allow(clippy::too_many_arguments)]
-    async fn open_pr_view_for(&mut self, deps: &AppDeps, tab: usize, id: String, label: String, url: Option<String>, conn_id: String, pr: PullRequest) {
+    async fn open_pr_view_for(&mut self, deps: &AppDeps, tab: usize, label: String, url: Option<String>, conn_id: String, pr: PullRequest) {
         let source = match self.pr_source_for(&conn_id, deps).await {
             Some(s) => s,
             None => {
@@ -2169,11 +2229,14 @@ impl App {
                 return;
             }
         };
-        let threads = detail_or_default(source.threads(&id).await, DIAG_PR_THREADS);
-        let mut files = detail_or_default(source.changes(&id).await, DIAG_PR_CHANGES);
+        // Address every detail call at the PR's own repository, not just its id: on a connection
+        // spanning several, `#7` alone names more than one pull request.
+        let item = pr.item_ref();
+        let threads = detail_or_default(source.threads(&item).await, DIAG_PR_THREADS);
+        let mut files = detail_or_default(source.changes(&item).await, DIAG_PR_CHANGES);
         files.sort_by(|a, b| a.path.cmp(&b.path)); // cluster by directory for grouping
-        let checks = detail_or_default(source.checks(&id).await, DIAG_PR_CHECKS);
-        let commits = detail_or_default(source.commits(&id).await, DIAG_PR_COMMITS);
+        let checks = detail_or_default(source.checks(&item).await, DIAG_PR_CHECKS);
+        let commits = detail_or_default(source.commits(&item).await, DIAG_PR_COMMITS);
         let diff = DiffView {
             pr_label: label.clone(),
             url: url.clone(),
@@ -2313,10 +2376,11 @@ impl App {
 
     /// Submits the buffered line comments as one review with `event`.
     async fn submit_review(&mut self, event: ReviewVote, deps: &AppDeps) {
-        let (pr_id, comments, conn_id) = match &self.screen {
-            Screen::PrView(v) => (v.pr.id.clone(), v.pending.clone(), v.connection_id.clone()),
+        let (item, comments, conn_id) = match &self.screen {
+            Screen::PrView(v) => (v.pr.item_ref(), v.pending.clone(), v.connection_id.clone()),
             _ => return,
         };
+        let pr_id = item.id.clone();
         if comments.is_empty() {
             return;
         }
@@ -2327,9 +2391,9 @@ impl App {
                 return;
             }
         };
-        match source.submit_review(&pr_id, event, &comments).await {
+        match source.submit_review(&item, event, &comments).await {
             Ok(()) => {
-                let threads = detail_or_default(source.threads(&pr_id).await, DIAG_PR_THREADS);
+                let threads = detail_or_default(source.threads(&item).await, DIAG_PR_THREADS);
                 if let Screen::PrView(v) = &mut self.screen {
                     v.pending.clear();
                     v.review_draft = None;
@@ -2348,7 +2412,7 @@ impl App {
         let Screen::PrView(v) = &self.screen else { return };
         let Some(commit) = v.commits.get(v.commit_sel) else { return };
         let (sha, msg) = (commit.sha.clone(), commit.message.clone());
-        let pr_id = v.pr.id.clone();
+        let item = v.pr.item_ref();
         let conn_id = v.connection_id.clone();
 
         let source = match self.pr_source_for(&conn_id, deps).await {
@@ -2359,7 +2423,7 @@ impl App {
             }
         };
         let mut files = detail_or_default(
-            source.commit_changes(&pr_id, &sha).await,
+            source.commit_changes(&item, &sha).await,
             DIAG_PR_COMMIT_CHANGES,
         );
         if files.is_empty() {
@@ -2380,20 +2444,159 @@ impl App {
     }
 
     async fn open_wi_view(&mut self, deps: &AppDeps) {
-        let (id, conn_id, wi) = match self.selected_wi_row() {
-            Some(row) => (row.wi.id.clone(), row.connection_id.clone(), row.wi.clone()),
+        let (conn_id, wi) = match self.selected_wi_row() {
+            Some(row) => (row.connection_id.clone(), row.wi.clone()),
             None => return,
         };
-        self.open_wi_view_for(deps, id, conn_id, wi).await;
+        self.open_wi_view_for(deps, conn_id, wi).await;
     }
 
     /// Opens the work-item view for an explicit item (used by the Launchpad).
-    async fn open_wi_view_for(&mut self, deps: &AppDeps, id: String, conn_id: String, wi: WorkItem) {
+    async fn open_wi_view_for(&mut self, deps: &AppDeps, conn_id: String, wi: WorkItem) {
         let threads = match self.wi_source_for(&conn_id, deps).await {
-            Some(src) => detail_or_default(src.threads(&id).await, DIAG_WI_THREADS),
+            Some(src) => detail_or_default(src.threads(&wi.item_ref()).await, DIAG_WI_THREADS),
             None => Vec::new(),
         };
         self.screen = Screen::WiView(Box::new(WiView { connection_id: conn_id, wi, threads, scroll: 0 }));
+    }
+
+    /// Opens the repository-scope picker for the active section.
+    ///
+    /// The scope is per connection, so with more than one bound the picker is opened for the
+    /// first repo-addressed one; the rest are reachable by switching connection filter. Discovery
+    /// is refreshed here rather than on every 30s reload — this is the moment the candidate list
+    /// has to be right.
+    async fn open_repo_scope(&mut self, deps: &AppDeps) {
+        let Some(summary) = self.repo_scope[self.active].clone() else {
+            self.toast = Some("This section's connections aren't repository-scoped".into());
+            return;
+        };
+        // The scope is per connection, so with more than one bound the user has to say which —
+        // picking the first silently would leave the others' scopes unreachable from the TUI.
+        match summary.connections.as_slice() {
+            [] => {}
+            [only] => self.open_repo_scope_for(only.clone(), deps).await,
+            many => {
+                let cfg = deps.config.snapshot();
+                let items = many
+                    .iter()
+                    .map(|id| cfg.find_connection(id).map(|c| c.display_name.clone()).unwrap_or_else(|| id.clone()))
+                    .collect();
+                self.repo_scope_choices = many.to_vec();
+                self.overlay = Some(Overlay::Picker {
+                    title: "Repositories · which connection?".into(),
+                    items,
+                    selected: 0,
+                    kind: PickerKind::RepoScopeConnection,
+                });
+            }
+        }
+    }
+
+    /// Opens the repository-scope checklist for one connection.
+    async fn open_repo_scope_for(&mut self, connection_id: String, deps: &AppDeps) {
+        let label = deps
+            .config
+            .snapshot()
+            .find_connection(&connection_id)
+            .map(|c| c.display_name.clone())
+            .unwrap_or_else(|| connection_id.clone());
+
+        self.toast = Some("Loading repositories…".into());
+        if let Ok(page) = deps.sections.discover_repositories(&connection_id).await {
+            self.repo_catalog.insert(connection_id.clone(), page);
+        }
+        let chosen = self.repo_scope_of(deps, &connection_id);
+        let discovered = self.repo_catalog.get(&connection_id).cloned().unwrap_or_default();
+
+        // Anything already chosen stays listed even if discovery didn't return it, so a saved
+        // scope is never silently dropped by a provider whose discovery is incomplete.
+        let mut repos = chosen.clone();
+        repos.extend(discovered.repositories.iter().filter(|r| !chosen.contains(r)).cloned());
+        if repos.is_empty() {
+            self.toast = Some("No repositories found for this connection's credentials".into());
+            return;
+        }
+        let items = repos
+            .into_iter()
+            .map(|r| ToggleItem { on: chosen.contains(&r), id: r.clone(), label: r })
+            .collect();
+        self.toast = None;
+        self.overlay = Some(Overlay::Toggle {
+            title: format!("Repositories · {label}"),
+            kind: ToggleKind::RepoScope { connection_id },
+            // Ticking none is a real choice — fetch nothing — not a state to be prevented.
+            min_one: false,
+            items,
+            selected: 0,
+            filter: Some(String::new()),
+        });
+    }
+
+    /// The repositories a connection currently fetches from, respecting an explicitly emptied
+    /// scope and only falling back to the legacy single repository when none was ever chosen.
+    fn repo_scope_of(&self, deps: &AppDeps, connection_id: &str) -> Vec<String> {
+        let cfg = deps.config.snapshot();
+        match cfg.find_connection(connection_id) {
+            Some(c) => c.repo_scope.clone().unwrap_or_else(|| c.repository.clone().into_iter().collect()),
+            None => Vec::new(),
+        }
+    }
+
+    async fn apply_repo_scope(&mut self, connection_id: &str, ids: Vec<String>, deps: &AppDeps) {
+        let count = ids.len();
+        if let Err(e) = deps.config.set_repo_scope(connection_id, Some(ids)).await {
+            self.toast_error(format!("Couldn't set the repository scope: {e}"));
+            return;
+        }
+        self.toast = Some(match count {
+            0 => "No repositories selected — nothing will be fetched".to_string(),
+            1 => "Fetching from 1 repository".to_string(),
+            n => format!("Fetching from {n} repositories"),
+        });
+        self.reload_all(deps).await;
+        self.fix_selection();
+    }
+
+    /// Recomputes the per-section scope summary from config. Cheap (no network) — the discovered
+    /// totals come from `repo_catalog`, which is refreshed separately.
+    fn refresh_repo_scope(&mut self, deps: &AppDeps) {
+        let cfg = deps.config.snapshot();
+        let bound = |ids: Vec<String>| -> Option<ScopeSummary> {
+            let conns: Vec<_> = ids
+                .iter()
+                .filter_map(|id| cfg.find_connection(id))
+                .filter(|c| forgetop_core::setup::is_repo_addressed(c.provider_type))
+                .collect();
+            if conns.is_empty() {
+                return None;
+            }
+            let selected = conns
+                .iter()
+                .map(|c| c.repo_scope.as_ref().map(|s| s.len()).unwrap_or(usize::from(c.repository.is_some())))
+                .sum();
+            let pages: Vec<_> = conns.iter().filter_map(|c| self.repo_catalog.get(&c.id)).collect();
+            let available: usize = pages.iter().map(|p| p.repositories.len()).sum();
+            let none_selected = conns.iter().all(|c| c.repo_scope.as_ref().is_some_and(|s| s.is_empty()));
+            // Nothing chosen *and* nothing discoverable means there is nothing to scope — the
+            // built-in demo connections, or a provider whose discovery didn't answer.
+            if selected == 0 && available == 0 && !none_selected {
+                return None;
+            }
+            Some(ScopeSummary {
+                connections: conns.iter().map(|c| c.id.clone()).collect(),
+                selected,
+                available: (!pages.is_empty()).then_some(available),
+                truncated: pages.iter().any(|p| p.truncated),
+                // An emptied scope is a real state; "never chosen" is not the same thing.
+                none_selected,
+            })
+        };
+        let pr_ids = cfg.pull_requests.as_ref().map(|b| b.ids()).unwrap_or_default();
+        let wi_ids = cfg.work_items.as_ref().map(|b| b.ids()).unwrap_or_default();
+        let pipe_ids =
+            cfg.pipelines.as_ref().map(|p| p.subscriptions.iter().map(|s| s.connection_id.clone()).collect()).unwrap_or_default();
+        self.repo_scope = [bound(pr_ids), bound(wi_ids), bound(pipe_ids)];
     }
 
     /// Where Esc lands when closing an item view: back to the Launchpad if it was
@@ -2638,6 +2841,9 @@ impl App {
             'f' if self.active == 1 => self.open_wi_states_toggle(),
             // Pipeline trigger (Pipelines tab).
             'T' if self.active == 2 => self.open_pipeline_trigger(),
+            // `g` = which **g**it repositories this section's connections fetch from. Unlike the
+            // `f` filter, this gates what is *fetched*, not what is shown from what was fetched.
+            'g' => self.open_repo_scope(deps).await,
             // Work-item state/comment (u / c) and PR write actions live inside the
             // opened item's view — press Enter first.
             _ => {}
@@ -2687,7 +2893,7 @@ impl App {
         let (run, supports_approvals, can_respond, approvals) = match feeds.iter().find(|f| f.connection.connection_id() == conn_id) {
             Some(feed) => {
                 let run = detail_or_fallback(
-                    feed.source.get_run(&run_id).await,
+                    feed.source.get_run(&ItemRef::maybe(fallback.repository.clone(), run_id.clone())).await,
                     DIAG_PIPELINE_RUN,
                     fallback,
                 );
@@ -2695,7 +2901,7 @@ impl App {
                 let can_respond = feed.source.can_respond_to_approvals();
                 let approvals = if supports {
                     detail_or_default(
-                        feed.source.pending_approvals(&run_id).await,
+                        feed.source.pending_approvals(&run.item_ref()).await,
                         DIAG_PIPELINE_APPROVALS,
                     )
                 } else {
@@ -2716,13 +2922,13 @@ impl App {
     /// Re-fetches the open pipeline drill-in's run + approvals (called on the 30s tick).
     async fn refresh_open_pipeline(&mut self, deps: &AppDeps) {
         let Screen::Pipeline(v) = &self.screen else { return };
-        let (conn_id, run_id) = (v.connection_id.clone(), v.run.id.clone());
+        let (conn_id, run_ref) = (v.connection_id.clone(), v.run.item_ref());
         let feeds = detail_or_default(deps.sections.pipeline_feeds().await, DIAG_PIPELINE_FEEDS);
         let Some(feed) = feeds.iter().find(|f| f.connection.connection_id() == conn_id) else { return };
-        let Some(run) = detail_or_none(feed.source.get_run(&run_id).await, DIAG_PIPELINE_RUN) else { return };
+        let Some(run) = detail_or_none(feed.source.get_run(&run_ref).await, DIAG_PIPELINE_RUN) else { return };
         let approvals = if feed.source.supports_approvals() {
             detail_or_default(
-                feed.source.pending_approvals(&run_id).await,
+                feed.source.pending_approvals(&run_ref).await,
                 DIAG_PIPELINE_APPROVALS,
             )
         } else {
@@ -2753,7 +2959,7 @@ impl App {
         }
         // Two rows per gate — an explicit Approve and Reject — so the picker choice
         // already carries the decision; a confirm follows before we act.
-        let (conn_id, run_id) = (v.connection_id.clone(), v.run.id.clone());
+        let (conn_id, run_ref) = (v.connection_id.clone(), v.run.item_ref());
         let mut choices = Vec::new();
         let mut items = Vec::new();
         for a in actionable {
@@ -2765,7 +2971,8 @@ impl App {
                 items.push(format!("{verb} · {}", a.name));
                 choices.push(ApprovalChoice {
                     connection_id: conn_id.clone(),
-                    run_id: run_id.clone(),
+                    repo: run_ref.repo.clone(),
+                    run_id: run_ref.id.clone(),
                     approval_id: a.id.clone(),
                     decision,
                     label: a.name.clone(),
@@ -2793,14 +3000,19 @@ impl App {
     /// Sends the confirmed approve/reject to the provider, then refreshes the run.
     async fn respond_approval(&mut self, index: usize, deps: &AppDeps) {
         let Some(choice) = self.approval_choices.get(index) else { return };
-        let (conn_id, run_id, approval_id, decision, label) =
-            (choice.connection_id.clone(), choice.run_id.clone(), choice.approval_id.clone(), choice.decision, choice.label.clone());
+        let (conn_id, run, approval_id, decision, label) = (
+            choice.connection_id.clone(),
+            ItemRef::maybe(choice.repo.clone(), choice.run_id.clone()),
+            choice.approval_id.clone(),
+            choice.decision,
+            choice.label.clone(),
+        );
         let feeds = detail_or_default(deps.sections.pipeline_feeds().await, DIAG_PIPELINE_FEEDS);
         let Some(feed) = feeds.iter().find(|f| f.connection.connection_id() == conn_id) else {
             self.toast = Some("Pipeline connection not found".into());
             return;
         };
-        match feed.source.respond_approval(&run_id, &approval_id, decision, None).await {
+        match feed.source.respond_approval(&run, &approval_id, decision, None).await {
             Ok(()) => {
                 let verb = match decision {
                     ApprovalDecision::Approve => "Approved",
@@ -2835,7 +3047,7 @@ impl App {
 
     /// Fetches the selected job's logs and opens the scrollable log pane.
     async fn open_pipeline_logs(&mut self, deps: &AppDeps) {
-        let (conn_id, run_id, job_id, title) = {
+        let (conn_id, run_ref, job_id, title) = {
             let Screen::Pipeline(v) = &self.screen else { return };
             let nodes = v.flatten();
             let node = nodes.get(v.selected);
@@ -2844,13 +3056,13 @@ impl App {
                 return;
             };
             let label = node.map(|n| n.label.clone()).unwrap_or_default();
-            (v.connection_id.clone(), v.run.id.clone(), job_id, format!("Logs · {label}"))
+            (v.connection_id.clone(), v.run.item_ref(), job_id, format!("Logs · {label}"))
         };
 
         self.toast = Some("Fetching logs…".into());
         let feeds = detail_or_default(deps.sections.pipeline_feeds().await, DIAG_PIPELINE_FEEDS);
         let text = match feeds.iter().find(|f| f.connection.connection_id() == conn_id) {
-            Some(feed) => match feed.source.logs(&run_id, Some(&job_id)).await {
+            Some(feed) => match feed.source.logs(&run_ref, Some(&job_id)).await {
                 Ok(t) => t,
                 Err(e) => {
                     log_operation_failure(DIAG_PIPELINE_LOGS);
@@ -2888,16 +3100,23 @@ impl App {
     }
 
     /// The pipeline to trigger — from the drill-in view if open, else the selected list row.
-    fn pipeline_target(&self) -> Option<(String, String, Option<String>, String)> {
+    #[allow(clippy::type_complexity)]
+    fn pipeline_target(&self) -> Option<(String, Option<String>, String, Option<String>, String)> {
         if let Screen::Pipeline(v) = &self.screen {
-            return Some((v.connection_id.clone(), v.definition_id.clone(), v.branch.clone(), v.title.clone()));
+            return Some((v.connection_id.clone(), v.run.repository.clone(), v.definition_id.clone(), v.branch.clone(), v.title.clone()));
         }
         let pipe = self.selected_pipe()?;
-        Some((pipe.connection_id.clone(), pipe.run.definition_id.clone(), pipe.run.branch.clone(), pipe_label(pipe)))
+        Some((
+            pipe.connection_id.clone(),
+            pipe.run.repository.clone(),
+            pipe.run.definition_id.clone(),
+            pipe.run.branch.clone(),
+            pipe_label(pipe),
+        ))
     }
 
     fn open_pipeline_trigger(&mut self) {
-        let Some((connection_id, definition_id, branch, label)) = self.pipeline_target() else { return };
+        let Some((connection_id, repo, definition_id, branch, label)) = self.pipeline_target() else { return };
         let message = match &branch {
             Some(b) => format!("Trigger {label} on {b}?"),
             None => format!("Trigger {label}?"),
@@ -2905,12 +3124,12 @@ impl App {
         self.overlay = Some(Overlay::Confirm {
             title: "Trigger".into(),
             message,
-            action: Action::PipelineTrigger { connection_id, definition_id, branch, label },
+            action: Action::PipelineTrigger { connection_id, repo, definition_id, branch, label },
         });
     }
 
     async fn execute_pipeline_action(&mut self, action: Action, deps: &AppDeps) {
-        let Action::PipelineTrigger { connection_id, definition_id, branch, label } = action else { return };
+        let Action::PipelineTrigger { connection_id, repo, definition_id, branch, label } = action else { return };
         let feeds = match deps.sections.pipeline_feeds().await {
             Ok(f) => f,
             Err(e) => {
@@ -2922,7 +3141,7 @@ impl App {
             self.toast = Some("Pipeline connection not found".into());
             return;
         };
-        match feed.source.trigger(&definition_id, branch.as_deref()).await {
+        match feed.source.trigger(&ItemRef::maybe(repo, definition_id), branch.as_deref()).await {
             Ok(()) => {
                 self.toast = Some(format!("Triggered {label}"));
                 let mut errors = Vec::new();
@@ -3033,12 +3252,22 @@ impl App {
             repository: draft.repository,
             username: draft.username,
             credential_ref: None,
+            // A brand-new connection has no scope yet; it is seeded from discovery below.
+            repo_scope: None,
         };
 
         if let Err(e) = deps.config.add_or_update_connection(connection, draft.pat).await {
             self.toast_error(format!("Add failed: {e}"));
             return;
         }
+
+        // A brand-new account connection with nothing picked starts on its most recently active
+        // repositories rather than fetching nothing. Best-effort: if discovery fails the scope
+        // stays unset and the connection behaves exactly as a single-repository one did.
+        let seeded = forgetop_core::service::seed_default_repo_scope(&deps.config, &deps.sections, &id)
+            .await
+            .ok()
+            .flatten();
 
         if let Some(section) = draft.bind_section {
             let result = match section {
@@ -3053,7 +3282,10 @@ impl App {
             }
         }
 
-        self.toast = Some(format!("Added {} connection", provider.as_str()));
+        self.toast = Some(match &seeded {
+            Some(scope) => format!("Added {} connection · {} repositories", provider.as_str(), scope.len()),
+            None => format!("Added {} connection", provider.as_str()),
+        });
         self.reload_all(deps).await;
         self.rebuild_config_view(deps).await;
 
@@ -3071,7 +3303,7 @@ impl App {
             .map(|i| ToggleItem { id: i.to_string(), label: TABS[i].to_string(), on: self.visible[i] })
             .collect();
         self.overlay =
-            Some(Overlay::Toggle { title: "Visible tabs".into(), kind: ToggleKind::Sections, min_one: true, items, selected: 0 });
+            Some(Overlay::Toggle { title: "Visible tabs".into(), kind: ToggleKind::Sections, min_one: true, items, selected: 0, filter: None });
     }
 
     // ---- work-item state visibility ----
@@ -3090,7 +3322,7 @@ impl App {
             .map(|&s| ToggleItem { on: self.pr_shown_statuses.contains(&s), id: pr_status_key(s).into(), label: pr_status_key(s).into() })
             .collect();
         self.overlay =
-            Some(Overlay::Toggle { title: "Show statuses".into(), kind: ToggleKind::PrStatuses, min_one: true, items, selected: 0 });
+            Some(Overlay::Toggle { title: "Show statuses".into(), kind: ToggleKind::PrStatuses, min_one: true, items, selected: 0, filter: None });
     }
 
     /// `ids` are the statuses left ticked. Rebuilds the shown set, then refetches so a
@@ -3115,7 +3347,7 @@ impl App {
             .map(|s| ToggleItem { on: !self.wi_hidden_states.contains(&s), id: s.clone(), label: s })
             .collect();
         self.overlay =
-            Some(Overlay::Toggle { title: "Show states".into(), kind: ToggleKind::WorkItemStates, min_one: false, items, selected: 0 });
+            Some(Overlay::Toggle { title: "Show states".into(), kind: ToggleKind::WorkItemStates, min_one: false, items, selected: 0, filter: None });
     }
 
     async fn apply_toggle(&mut self, kind: ToggleKind, ids: Vec<String>, deps: &AppDeps) {
@@ -3135,6 +3367,9 @@ impl App {
             }
             ToggleKind::Notifications => {
                 self.apply_notifications(ids, deps).await;
+            }
+            ToggleKind::RepoScope { connection_id } => {
+                self.apply_repo_scope(&connection_id, ids, deps).await;
             }
             ToggleKind::SectionBind { section } => {
                 self.apply_section_bind(section, ids, deps).await;
@@ -3203,6 +3438,7 @@ impl App {
             min_one: false,
             items,
             selected: 0,
+            filter: None,
         });
     }
 
@@ -3366,6 +3602,7 @@ impl App {
             min_one: false,
             items,
             selected: 0,
+            filter: None,
         });
     }
 
@@ -3495,6 +3732,11 @@ impl App {
             Action::DeleteView => self.delete_view(deps).await,
             Action::PickApproval { index } => self.confirm_approval(index),
             Action::RespondApproval { index } => self.respond_approval(index, deps).await,
+            Action::OpenRepoScope { index } => {
+                if let Some(id) = self.repo_scope_choices.get(index).cloned() {
+                    self.open_repo_scope_for(id, deps).await;
+                }
+            }
             Action::OpenItem { kind, id, connection_id } => self.open_palette_item(kind, id, connection_id, deps).await,
             Action::OpenReviewMenu => self.open_review_submit(),
             Action::LeavePrView => self.screen = self.view_origin(),
@@ -3510,14 +3752,17 @@ impl App {
 
     async fn execute_pr_action(&mut self, action: Action, deps: &AppDeps) {
         // Resolve the PR + its connection from the open view, else the selected row.
+        // Address the PR by repository + id: `#7` alone doesn't say which repository's #7 to
+        // merge on a connection that spans several.
         let target = match &self.screen {
-            Screen::PrView(v) => Some((v.pr.id.clone(), v.connection_id.clone())),
-            _ => self.selected_pr_row().map(|r| (r.pr.id.clone(), r.connection_id.clone())),
+            Screen::PrView(v) => Some((v.pr.item_ref(), v.connection_id.clone())),
+            _ => self.selected_pr_row().map(|r| (r.pr.item_ref(), r.connection_id.clone())),
         };
-        let Some((id, conn_id)) = target else {
+        let Some((item, conn_id)) = target else {
             self.toast = Some("Nothing selected".into());
             return;
         };
+        let id = item.id.clone();
         let source = match self.pr_source_for(&conn_id, deps).await {
             Some(s) => s,
             None => {
@@ -3527,18 +3772,18 @@ impl App {
         };
 
         let result = match &action {
-            Action::PrVote(vote) => source.vote(&id, *vote).await.map(|_| vote_message(*vote).to_string()),
+            Action::PrVote(vote) => source.vote(&item, *vote).await.map(|_| vote_message(*vote).to_string()),
             Action::PrMerge(strategy) => source
-                .merge(&id, &MergeOptions { strategy: *strategy, delete_source_ref: false })
+                .merge(&item, &MergeOptions { strategy: *strategy, delete_source_ref: false })
                 .await
                 .map(|_| format!("Merged ({strategy:?})")),
-            Action::PrRevert => source.revert(&id).await.map(|_| "Revert requested".to_string()),
+            Action::PrRevert => source.revert(&item).await.map(|_| "Revert requested".to_string()),
             Action::PrComment(text) => {
                 if text.trim().is_empty() {
                     self.toast = Some("Empty comment — nothing sent".into());
                     return;
                 }
-                source.add_comment(&id, text).await.map(|_| "Comment added".to_string())
+                source.add_comment(&item, text).await.map(|_| "Comment added".to_string())
             }
             Action::PrReply(text) => {
                 if text.trim().is_empty() {
@@ -3553,7 +3798,7 @@ impl App {
                     self.toast = Some("No thread selected to reply to".into());
                     return;
                 };
-                source.reply_to_thread(&id, &thread_id, text).await.map(|_| "Reply posted".to_string())
+                source.reply_to_thread(&item, &thread_id, text).await.map(|_| "Reply posted".to_string())
             }
             _ => return,
         };
@@ -3568,8 +3813,8 @@ impl App {
                 // Reflect the change in the open PR view: re-fetch the PR (status / reviewers
                 // / mergeable) and its threads (a new comment), like the work-item handler.
                 if matches!(&self.screen, Screen::PrView(v) if v.pr.id == id) {
-                    let fresh = detail_or_none(source.get(&id).await, DIAG_PR_DETAIL);
-                    let threads = detail_or_default(source.threads(&id).await, DIAG_PR_THREADS);
+                    let fresh = detail_or_none(source.get(&item).await, DIAG_PR_DETAIL);
+                    let threads = detail_or_default(source.threads(&item).await, DIAG_PR_THREADS);
                     if let Screen::PrView(v) = &mut self.screen {
                         if let Some(pr) = fresh {
                             v.pr = pr;
@@ -3617,14 +3862,14 @@ impl App {
     /// State picker for the open work item, pulling the provider's real available
     /// states (falling back to states seen across the loaded items).
     async fn open_wi_state(&mut self, deps: &AppDeps) {
-        let (id, current, title, conn_id) = match &self.screen {
-            Screen::WiView(v) => (v.wi.id.clone(), v.wi.state.clone(), format!("Set state — {}", wi_label(&v.wi)), v.connection_id.clone()),
+        let (item, current, title, conn_id) = match &self.screen {
+            Screen::WiView(v) => (v.wi.item_ref(), v.wi.state.clone(), format!("Set state — {}", wi_label(&v.wi)), v.connection_id.clone()),
             _ => return,
         };
 
         let mut states = match self.wi_source_for(&conn_id, deps).await {
             Some(src) => detail_or_default(
-                src.available_states(&id).await,
+                src.available_states(&item).await,
                 DIAG_WI_STATES,
             ),
             None => Vec::new(),
@@ -3651,10 +3896,10 @@ impl App {
 
     async fn execute_wi_action(&mut self, action: Action, deps: &AppDeps) {
         let target = match &self.screen {
-            Screen::WiView(v) => Some((v.wi.id.clone(), v.connection_id.clone())),
-            _ => self.selected_wi_row().map(|r| (r.wi.id.clone(), r.connection_id.clone())),
+            Screen::WiView(v) => Some((v.wi.item_ref(), v.connection_id.clone())),
+            _ => self.selected_wi_row().map(|r| (r.wi.item_ref(), r.connection_id.clone())),
         };
-        let Some((id, conn_id)) = target else {
+        let Some((item, conn_id)) = target else {
             self.toast = Some("Nothing selected".into());
             return;
         };
@@ -3667,13 +3912,13 @@ impl App {
         };
 
         let result = match &action {
-            Action::WiSetState(state) => source.set_state(&id, state).await.map(|_| format!("State → {state}")),
+            Action::WiSetState(state) => source.set_state(&item, state).await.map(|_| format!("State → {state}")),
             Action::WiComment(text) => {
                 if text.trim().is_empty() {
                     self.toast = Some("Empty comment — nothing sent".into());
                     return;
                 }
-                source.add_comment(&id, text).await.map(|_| "Comment added".to_string())
+                source.add_comment(&item, text).await.map(|_| "Comment added".to_string())
             }
             _ => return,
         };
@@ -3688,7 +3933,7 @@ impl App {
                     }
                 }
                 if matches!(action, Action::WiComment(_)) {
-                    let threads = detail_or_default(source.threads(&id).await, DIAG_WI_THREADS);
+                    let threads = detail_or_default(source.threads(&item).await, DIAG_WI_THREADS);
                     if let Screen::WiView(v) = &mut self.screen {
                         v.threads = threads;
                     }
@@ -4118,7 +4363,7 @@ pub enum Key {
 }
 
 fn pr_query(filter: PullRequestFilter) -> PullRequestQuery {
-    PullRequestQuery { filter, include_completed: false, limit: Some(50) }
+    PullRequestQuery { filter, include_completed: false, limit: Some(50), decorate: true }
 }
 
 // ---- background fetch helpers (no `&mut self`, safe to run in a spawned task) ----
@@ -4127,7 +4372,7 @@ async fn fetch_pull_requests(deps: &AppDeps, filter: PullRequestFilter, complete
     let mut out = Vec::new();
     match deps.sections.pull_request_feeds().await {
         Ok(feeds) => {
-            let query = PullRequestQuery { filter, include_completed: completed, limit: Some(50) };
+            let query = PullRequestQuery { filter, include_completed: completed, limit: Some(50), decorate: true };
             for feed in feeds {
                 let (provider, name, conn_id) = feed_tag(&feed.connection);
                 match feed.source.list(&query).await {
@@ -4189,15 +4434,10 @@ async fn fetch_pipelines(deps: &AppDeps, errors: &mut Vec<String>) -> Vec<PipeRo
                 let provider = feed.connection.provider_type();
                 let name = feed.connection.display_name().to_string();
                 let conn_id = feed.connection.connection_id().to_string();
+                let defs = detail_or_default(feed.source.discover().await, DIAG_PIPELINE_DISCOVERY);
                 let def_names: HashMap<String, String> =
-                    detail_or_default(
-                        feed.source.discover().await,
-                        DIAG_PIPELINE_DISCOVERY,
-                    )
-                    .into_iter()
-                    .map(|d| (d.id, d.name))
-                    .collect();
-                for q in feed_queries(&feed.subscription) {
+                    defs.iter().map(|d| (d.id.clone(), d.name.clone())).collect();
+                for q in feed_queries(&feed.subscription, &defs) {
                     match feed.source.list_runs(&q).await {
                         Ok(runs) => {
                             let supports = feed.source.supports_approvals();
@@ -4205,7 +4445,7 @@ async fn fetch_pipelines(deps: &AppDeps, errors: &mut Vec<String>) -> Vec<PipeRo
                                 let awaiting_approval = supports
                                     && is_active(run.status)
                                     && detail_or_default(
-                                        feed.source.pending_approvals(&run.id).await,
+                                        feed.source.pending_approvals(&run.item_ref()).await,
                                         DIAG_PIPELINE_APPROVALS,
                                     )
                                     .iter()
@@ -4229,22 +4469,22 @@ async fn fetch_pipelines(deps: &AppDeps, errors: &mut Vec<String>) -> Vec<PipeRo
 async fn fetch_open_pipeline(
     deps: &AppDeps,
     conn_id: &str,
-    run_id: &str,
+    run_ref: &ItemRef,
 ) -> Option<(String, PipelineRun, Vec<PipelineApproval>)> {
     let feeds = detail_or_default(deps.sections.pipeline_feeds().await, DIAG_PIPELINE_FEEDS);
     let feed = feeds
         .iter()
         .find(|f| f.connection.connection_id() == conn_id)?;
-    let run = detail_or_none(feed.source.get_run(run_id).await, DIAG_PIPELINE_RUN)?;
+    let run = detail_or_none(feed.source.get_run(run_ref).await, DIAG_PIPELINE_RUN)?;
     let approvals = if feed.source.supports_approvals() {
         detail_or_default(
-            feed.source.pending_approvals(run_id).await,
+            feed.source.pending_approvals(run_ref).await,
             DIAG_PIPELINE_APPROVALS,
         )
     } else {
         Vec::new()
     };
-    Some((run_id.to_string(), run, approvals))
+    Some((run_ref.id.clone(), run, approvals))
 }
 
 async fn fetch_launchpad_prs(deps: &AppDeps) -> (Vec<PrRow>, Vec<PrRow>) {
@@ -4257,7 +4497,7 @@ async fn fetch_launchpad_prs(deps: &AppDeps) -> (Vec<PrRow>, Vec<PrRow>) {
     };
     for feed in feeds {
         let (provider, name, conn_id) = feed_tag(&feed.connection);
-        let mine_q = PullRequestQuery { filter: PullRequestFilter::Mine, include_completed: true, limit: Some(50) };
+        let mine_q = PullRequestQuery { filter: PullRequestFilter::Mine, include_completed: true, limit: Some(50), decorate: true };
         if let Some(list) = detail_or_none(feed.source.list(&mine_q).await, DIAG_LAUNCHPAD_MINE) {
             mine_out.extend(list.into_iter().map(|pr| PrRow { connection_id: conn_id.clone(), connection: name.clone(), provider, pr }));
         }
@@ -4401,15 +4641,23 @@ fn wi_query() -> WorkItemQuery {
 }
 
 /// One query per subscribed definition, or a single catch-all when auto-discovering.
-fn feed_queries(sub: &forgetop_core::config::PipelineSubscription) -> Vec<PipelineRunQuery> {
+///
+/// A subscribed definition id is only unique within its repository, so each query is addressed at
+/// the repository discovery says the definition belongs to — otherwise a connection spanning
+/// several would ask every one of them about a definition only one of them has.
+fn feed_queries(sub: &forgetop_core::config::PipelineSubscription, defs: &[PipelineDefinition]) -> Vec<PipelineRunQuery> {
     if sub.auto_discover_all || sub.definition_ids.is_empty() {
-        vec![PipelineRunQuery { definition_id: None, branch: None, limit: Some(20) }]
-    } else {
-        sub.definition_ids
-            .iter()
-            .map(|id| PipelineRunQuery { definition_id: Some(id.clone()), branch: None, limit: Some(10) })
-            .collect()
+        return vec![PipelineRunQuery { definition_id: None, repository: None, branch: None, limit: Some(20) }];
     }
+    sub.definition_ids
+        .iter()
+        .map(|id| PipelineRunQuery {
+            repository: defs.iter().find(|d| &d.id == id).and_then(|d| d.repository.clone()),
+            definition_id: Some(id.clone()),
+            branch: None,
+            limit: Some(10),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -4620,6 +4868,7 @@ mod tests {
             connection: "Missing".into(),
             provider: ProviderType::GitHub,
             notification: Notification {
+                repository: None,
                 id: "n1".into(),
                 kind: NotificationKind::Mention,
                 item_type: NotificationItemType::PullRequest,
@@ -4699,6 +4948,7 @@ mod tests {
 
     fn pr(url: Option<&str>) -> PullRequest {
         PullRequest {
+            repository: None,
             id: "1".into(),
             number: Some(1),
             title: "t".into(),
@@ -4724,6 +4974,7 @@ mod tests {
 
     fn wi(url: Option<&str>) -> WorkItem {
         WorkItem {
+            repository: None,
             id: "w".into(),
             identifier: None,
             title: "t".into(),
@@ -4754,6 +5005,7 @@ mod tests {
             connection: "GitHub".into(),
             provider: ProviderType::GitHub,
             notification: Notification {
+                repository: None,
                 id: id.into(),
                 kind: NotificationKind::Mention,
                 item_type: NotificationItemType::WorkItem,
@@ -4976,6 +5228,7 @@ mod tests {
 
     fn failed_run() -> PipelineRun {
         PipelineRun {
+            repository: None,
             id: "r1".into(),
             definition_id: "ci".into(),
             number: Some(1),
@@ -5102,6 +5355,7 @@ mod tests {
             definition_name: None,
             awaiting_approval: awaiting,
             run: PipelineRun {
+                repository: None,
                 id: id.into(),
                 definition_id: "ci".into(),
                 number: Some(1),
@@ -5193,6 +5447,7 @@ mod tests {
             definition_name: None,
             awaiting_approval: false,
             run: PipelineRun {
+                repository: None,
                 id: id.into(),
                 definition_id: "ci".into(),
                 number: Some(1),
@@ -5231,6 +5486,7 @@ mod tests {
             definition_name: None,
             awaiting_approval: awaiting,
             run: PipelineRun {
+                repository: None,
                 id: id.into(),
                 definition_id: "ci".into(),
                 number: None,
@@ -5295,6 +5551,7 @@ mod tests {
             repository: None,
             username: None,
             credential_ref: None,
+            repo_scope: None,
         };
         let conns = vec![mk("gh", ProviderType::GitHub), mk("lin", ProviderType::Linear), mk("bb", ProviderType::Bitbucket)];
         let bound: HashSet<String> = ["gh".to_string()].into_iter().collect();
