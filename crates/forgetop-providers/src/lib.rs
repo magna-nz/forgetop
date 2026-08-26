@@ -9,6 +9,7 @@ pub mod bitbucket;
 pub mod demo;
 pub mod github;
 pub mod gitlab;
+pub mod html;
 pub mod jira;
 pub mod json;
 pub mod linear;
