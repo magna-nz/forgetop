@@ -12,6 +12,7 @@ use reqwest::header::AUTHORIZATION;
 use serde_json::{json, Value};
 use similar::{ChangeTag, TextDiff};
 
+use crate::html;
 use crate::json::*;
 use crate::scope::{self, fan_out, sort_and_cap};
 
@@ -135,7 +136,9 @@ pub fn map_work_item(v: &Value, project: Option<&str>) -> WorkItem {
         id: id.map(|n| n.to_string()).unwrap_or_else(|| "0".into()),
         identifier: id.map(|n| n.to_string()),
         title: field_str(fields, "System.Title").unwrap_or_else(|| "(untitled)".into()),
-        description: field_str(fields, "System.Description"),
+        // `System.Description` is an HTML field. Neither frontend renders HTML, so it's flattened
+        // to text here rather than leaking `<div>`/`<br>` markup into the sidebar (issue #162).
+        description: field_str(fields, "System.Description").map(|d| html::to_text(&d)).filter(|d| !d.is_empty()),
         state_category: map_state(&state),
         state,
         work_item_type: field_str(fields, "System.WorkItemType"),
@@ -882,7 +885,10 @@ impl WorkItemSource for AzureWi {
             patch.push(json!({ "op": "add", "path": "/fields/System.Title", "value": title }));
         }
         if let Some(description) = description {
-            patch.push(json!({ "op": "add", "path": "/fields/System.Description", "value": description }));
+            // The editor round-trips the flattened text from `map_work_item`, so the write side
+            // puts it back into the HTML the field expects — otherwise every line break is lost.
+            let value = html::to_html(description);
+            patch.push(json!({ "op": "add", "path": "/fields/System.Description", "value": value }));
         }
         if patch.is_empty() {
             return Ok(());
@@ -1193,6 +1199,22 @@ mod tests {
         assert_eq!(wi.state, "Active");
         assert_eq!(wi.state_category, WorkItemStateCategory::Started);
         assert_eq!(wi.assignee.unwrap().display_name, "Dan");
+    }
+
+    #[test]
+    fn flattens_the_html_description_azure_returns() {
+        // `System.Description` is HTML; the sidebar shows text, so the markup is stripped here.
+        let v: Value = serde_json::from_str(
+            r#"{ "id": 56, "fields": { "System.Title": "WI", "System.State": "New",
+                 "System.Description": "<div>Token expires&nbsp;early.</div><div><br></div><ul><li>Sign in</li></ul>" } }"#,
+        )
+        .unwrap();
+        let wi = map_work_item(&v, None);
+        assert_eq!(wi.description.as_deref(), Some("Token expires early.\n\n- Sign in"));
+
+        // An empty HTML shell is no description at all, not an empty pane.
+        let blank: Value = serde_json::from_str(r#"{ "id": 57, "fields": { "System.Description": "<div><br></div>" } }"#).unwrap();
+        assert_eq!(map_work_item(&blank, None).description, None);
     }
 
     #[test]

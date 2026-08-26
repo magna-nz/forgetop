@@ -3070,6 +3070,42 @@ mod tests {
     }
 
     #[test]
+    fn work_item_description_renders_as_readable_lines_not_markup() {
+        // The string here is exactly what `azure::map_work_item` produces for an Azure work item
+        // (see `azure::tests::flattens_the_html_description_azure_returns`) — issue #162 was this
+        // pane showing the raw `<div>`/`<br>` markup instead, on one unbroken line.
+        let mut app = App::new("slate");
+        app.screen = Screen::WiView(Box::new(crate::app::WiView {
+            connection_id: "azure".into(),
+            wi: WorkItem {
+                repository: Some("Payments".into()),
+                id: "4821".into(),
+                identifier: Some("4821".into()),
+                title: "Refresh token dropped after 60 minutes".into(),
+                description: Some("The refresh token is dropped after 60 minutes.\n\nRepro steps\n- Sign in\n- Wait > 1 hour".into()),
+                state: "Active".into(),
+                state_category: WorkItemStateCategory::Started,
+                work_item_type: Some("Bug".into()),
+                assignee: None,
+                created_at: None,
+                updated_at: None,
+                url: None,
+            },
+            threads: vec![],
+            scroll: 0,
+        }));
+        let view = render_to_string(&mut app, 140, 30);
+        for tag in ["<div", "<br", "<span", "&nbsp;", "&gt;", "&amp;"] {
+            assert!(!view.contains(tag), "markup {tag} leaked into the work item pane");
+        }
+        // Each line of the description lands on its own row, rather than running together.
+        assert!(view.contains("The refresh token is dropped after 60 minutes."), "first line renders");
+        assert!(view.contains("Repro steps"), "heading renders on its own line");
+        assert!(view.contains("- Sign in"), "list item renders");
+        assert!(view.contains("- Wait > 1 hour"), "a decoded `&gt;` renders as the character");
+    }
+
+    #[test]
     fn work_items_list_is_browse_only_actions_in_the_view() {
         // The WI list offers browse + the states filter — no state-change / comment.
         let mut app = App::new("slate");
