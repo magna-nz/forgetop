@@ -1,0 +1,68 @@
+name: Deploy Pages
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build docs and public demo
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Configure GitHub Pages
+        id: pages
+        uses: actions/configure-pages@v5
+      - name: Build documentation
+        uses: actions/jekyll-build-pages@v1
+        with:
+          source: ./docs
+          destination: ./docs-site
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: demo/package-lock.json
+      - name: Install public demo dependencies
+        working-directory: demo
+        run: npm ci
+      - name: Build public demo
+        working-directory: demo
+        run: npm run build
+      - name: Add public demo to the Pages artifact
+        run: |
+          mkdir -p site-artifact/demo
+          cp -R docs-site/. site-artifact/
+          cp -R demo/dist/. site-artifact/demo/
+          touch site-artifact/.nojekyll
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: ./site-artifact
+
+  deploy:
+    name: deploy
+    if: github.event_name != 'pull_request'
+    needs: build
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
