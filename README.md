@@ -6,6 +6,8 @@
   <p>
     <a href="https://github.com/magna-nz/forgetop/actions/workflows/ci.yml"><img src="https://github.com/magna-nz/forgetop/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI" /></a>
     <a href="https://github.com/magna-nz/forgetop/releases/latest"><img src="https://img.shields.io/github/v/release/magna-nz/forgetop?sort=semver&label=release" alt="Latest release" /></a>
+    <a href="https://github.com/magna-nz/forgetop/pulls?q=is%3Apr+is%3Aclosed"><img src="https://img.shields.io/github/issues-pr-closed/magna-nz/forgetop?label=pull%20requests" alt="Closed pull requests" /></a>
+    <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey" alt="Platforms: macOS, Linux, Windows" />
     <a href="https://magna-nz.github.io/forgetop/"><img src="https://img.shields.io/badge/docs-read_the_docs-3178C6" alt="Documentation" /></a>
     <a href="https://discord.gg/yebAJdcGu"><img src="https://img.shields.io/badge/Discord-Join%20the%20community-5865F2?logo=discord&logoColor=white" alt="Join the Discord community" /></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="MIT License" /></a>
