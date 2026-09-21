@@ -1,0 +1,934 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>forgetop Documentation</title>
+<meta name="description" content="Pull requests, work items, and CI pipelines across GitHub, GitLab, Azure DevOps, Bitbucket, Linear, and Jira — a keyboard-driven terminal UI and a web dashboard.">
+<link rel="icon" href="forgetop-mark.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;650;700&family=Source+Sans+3:wght@400;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="site.css">
+<script>
+/* Pick the reader's remembered surface before first paint, so the page never
+   flashes the wrong set of instructions. The rest of the behaviour is in site.js. */
+(function () {
+  var pref;
+  try { pref = localStorage.getItem('forgetop-docs-surface'); } catch (e) {}
+  document.documentElement.setAttribute('data-surface', pref === 'tui' ? 'tui' : 'dash');
+})();
+</script>
+</head>
+<body>
+<a class="skip" href="#introduction">Skip to content</a>
+<header class="topbar">
+<img src="forgetop-mark.svg" alt="">
+<span class="title">forgetop</span>
+<span class="sub">One command center for every forge</span>
+<span class="spacer"></span>
+<button type="button" class="nav-toggle" aria-expanded="false" aria-controls="sitenav">Contents</button>
+<a class="toplink" href="https://github.com/magna-nz/forgetop#readme">Install</a>
+<a class="toplink" href="https://github.com/magna-nz/forgetop">GitHub</a>
+</header>
+<div class="layout">
+<nav class="sidebar" id="sitenav" aria-label="Sections">
+<div class="nav-group">
+<p class="nav-label">Overview</p>
+<ul>
+<li><a href="#introduction">Introduction</a>
+</li>
+<li><a href="#what-forgetop-does">What forgetop does</a>
+</li>
+<li><a href="#core-concepts">Core concepts</a>
+<ul class="sub-nav">
+<li><a href="#sections-and-bindings">Sections and bindings</a></li>
+<li><a href="#providers-and-capabilities">Providers and capabilities</a></li>
+<li><a href="#cross-provider-aggregation">Cross-provider aggregation</a></li>
+<li><a href="#security">Security</a></li>
+</ul>
+</li>
+<li><a href="#getting-started">Getting started</a>
+<ul class="sub-nav">
+<li><a href="#diagnosing-setup">Diagnosing setup</a></li>
+<li><a href="#command-line-options">Command-line options</a></li>
+</ul>
+</li>
+</ul></div>
+<div class="nav-group">
+<p class="nav-label">Surfaces</p>
+<ul>
+<li><a href="#web-dashboard">Web dashboard</a>
+<ul class="sub-nav">
+<li><a href="#opening-it">Opening it</a></li>
+<li><a href="#when-forgetop-starts">When forgetop starts</a></li>
+<li><a href="#connections-settings">Connections &amp; settings</a></li>
+<li><a href="#security-1">Security</a></li>
+</ul>
+</li>
+<li><a href="#command-center">Command Center</a>
+</li>
+<li><a href="#pull-requests">Pull Requests</a>
+</li>
+<li><a href="#work-items">Work Items</a>
+</li>
+<li><a href="#pipelines">Pipelines</a>
+<ul class="sub-nav">
+<li><a href="#approvals">Approvals</a></li>
+</ul>
+</li>
+</ul></div>
+<div class="nav-group">
+<p class="nav-label">Working a list</p>
+<ul>
+<li><a href="#filtering-and-sorting">Filtering and sorting</a>
+</li>
+<li><a href="#command-palette">Command palette</a>
+</li>
+<li><a href="#notification-inbox">Notification inbox</a>
+</li>
+<li><a href="#saved-views">Saved views</a>
+</li>
+<li><a href="#notifications">Notifications</a>
+</li>
+</ul></div>
+<div class="nav-group">
+<p class="nav-label">Reference</p>
+<ul>
+<li><a href="#keybindings">Keybindings</a>
+<ul class="sub-nav">
+<li><a href="#global">Global</a></li>
+<li><a href="#command-center-1">Command Center</a></li>
+<li><a href="#saved-views-1">Saved views</a></li>
+<li><a href="#pull-requests-list">Pull Requests (list)</a></li>
+<li><a href="#inside-the-pr-view">Inside the PR view</a></li>
+<li><a href="#work-items-1">Work Items</a></li>
+<li><a href="#pipelines-1">Pipelines</a></li>
+<li><a href="#connections-terminal-fallback">Connections (terminal fallback)</a></li>
+</ul>
+</li>
+<li><a href="#configuration">Configuration</a>
+<ul class="sub-nav">
+<li><a href="#tokens">Tokens</a></li>
+<li><a href="#logs-diagnostics">Logs &amp; diagnostics</a></li>
+<li><a href="#token-scopes">Token scopes</a></li>
+</ul>
+</li>
+<li><a href="#themes">Themes</a>
+</li>
+<li><a href="#how-it-works">How it works</a>
+</li>
+<li><a href="#development">Development</a>
+</li>
+</ul></div>
+</nav>
+<div class="main">
+<section class="section" id="introduction">
+<div class="row">
+<div class="prose">
+<div class="eyebrow">Documentation</div>
+<h2 id="introduction">forgetop <a class="anchor" href="#introduction" aria-label="Link to this section">#</a></h2>
+<p class="lede">A fast, keyboard-driven command center for your <strong>pull requests, work items, and CI pipelines</strong> — in one place.</p>
+<p>Across GitHub, GitLab, Azure DevOps, Bitbucket, Linear, and Jira. Triage and <em>act</em> on everything without tab-hopping between forges, as a terminal UI <strong>and</strong> a web dashboard.</p>
+<ul class="providers">
+<li><img class="gh-light" src="providers/github.svg" alt=""><img class="gh-dark" src="providers/github-dark.svg" alt="">GitHub</li>
+<li><img src="providers/gitlab.svg" alt="">GitLab</li>
+<li><img src="providers/azuredevops.svg" alt="">Azure DevOps</li>
+<li><img src="providers/bitbucket.svg" alt="">Bitbucket</li>
+<li><img src="providers/linear.svg" alt="">Linear</li>
+<li><img src="providers/jira.svg" alt="">Jira</li>
+</ul>
+<p>This is the full reference. For install and a 60-second start, see the <a href="https://github.com/magna-nz/forgetop#readme">README</a>.</p>
+<div class="note">
+<p>Many sections below have a <strong>Terminal / Dashboard</strong> switch — pick the surface you're using and the whole page follows, so you only read the instructions that apply to you. Your choice is remembered.</p>
+</div>
+</div>
+<div class="rail"><div class="codeblock"><div class="cb-head"><span class="cb-title">try it</span><span class="cb-lang">sh</span></div><pre><code class="language-sh">forgetop --demo</code></pre></div>
+<p class="rail-note">Built-in demo data, nothing written to disk. <a href="#getting-started">Getting started</a> covers running it against your own accounts.</p></div>
+</div>
+</section>
+<section class="section" id="what-forgetop-does">
+<div class="row">
+<div class="prose">
+<div class="eyebrow">Overview</div>
+<h2 id="what-forgetop-does">What forgetop does <a class="anchor" href="#what-forgetop-does" aria-label="Link to this section">#</a></h2>
+<p class="lede">A short inventory of the whole app, before the section-by-section detail.</p>
+<ul>
+<li><strong>The Command Center</strong> — the default landing screen: one cross-provider <strong>action inbox</strong> that triages every PR, work item, and pipeline into "what needs you", so you start on your queue instead of scrolling three separate lists.
+</li>
+<li><strong>Terminal <em>or</em> browser</strong> — the same app as a keyboard-driven TUI <em>and</em> a local <strong>web dashboard</strong>, opened together by default. Everything below works in both.
+</li>
+<li><strong>Three sections in one dashboard</strong> — Pull Requests, Work Items, and Pipelines, each a tab you can act on.
+</li>
+<li><strong>Six forges</strong> — GitHub, GitLab, Azure DevOps, Bitbucket, Linear, and Jira, plus a built-in <code>--demo</code>.
+</li>
+<li><strong>Cross-provider aggregation</strong> — bind several connections to a section and their items merge into one list, tagged by provider. All your PRs across GitHub <em>and</em> GitLab <em>and</em> Azure, in a single view.
+</li>
+<li><strong>Do work, not just watch it</strong> — approve / request changes / merge / comment on PRs, change work-item states, re-run or cancel pipeline runs — all from the keyboard.
+</li>
+<li><strong>Real code review</strong> — a full-screen PR view with Conversation, Commits, Checks, and Diff tabs; <strong>syntax-highlighted</strong> diffs grouped by directory, per-file <strong>viewed</strong> checkboxes, thread jump-navigation, a line cursor in the patch; <strong>inline line comments buffered locally then submitted as one review</strong> (Comment / Approve / Request changes); <strong>replying in-thread</strong> to someone else's comment; and an <strong>event timeline</strong> of who approved / requested changes / merged / commented.
+</li>
+<li><strong>Pipeline drill-in</strong> — expand stages → jobs → steps with per-node <strong>durations</strong>, <strong>failure reasons</strong>, a scrollable <strong>logs</strong> pane, and open-in-browser.
+</li>
+<li><strong>Pipeline actions</strong> — from a run's detail pane, <strong>re-run</strong> a failed run or <strong>cancel</strong> a running/queued one (GitHub, GitLab, Azure DevOps, Bitbucket).
+</li>
+<li><strong>Pipeline approvals</strong> — see which runs are blocked on a gate (red <strong>Approval needed</strong>); acting on a gate is available in the terminal (GitHub, Azure DevOps, GitLab).
+</li>
+<li><strong>Filter, sort, and shape</strong> — a live quick-filter, per-column sorting, work-item state visibility, and pipeline subscriptions — all remembered per view.
+</li>
+<li><strong>Command palette (<code>Ctrl-P</code>)</strong> — fuzzy-jump to any PR, work item, or pipeline across every provider from one search box, without scrolling or switching tabs.
+</li>
+<li><strong>Notification inbox (<code>i</code>)</strong> — your cross-provider notification stream (reviews, mentions, CI failures, assignments) in one list, with a top-left unread indicator; <code>Enter</code> drills straight into the item. GitHub, GitLab, and Linear.
+</li>
+<li><strong>Saved views</strong> — bundle a filter + sort + state into a named view and flip between them from an always-visible view bar (<code>[</code> / <code>]</code>).
+</li>
+<li><strong>Desktop notifications</strong> — get pinged when a pipeline fails, a review is requested, or your PR is approved / gets changes requested — across every connected provider.
+</li>
+<li><strong>Secure by default</strong> — tokens live in your OS keychain; the config file only ever holds a reference.
+</li>
+</ul>
+</div>
+<div class="rail"></div>
+</div>
+</section>
+<section class="section" id="core-concepts">
+<div class="row">
+<div class="prose">
+<div class="eyebrow">Model</div>
+<h2 id="core-concepts">Core concepts <a class="anchor" href="#core-concepts" aria-label="Link to this section">#</a></h2>
+<p class="lede">Sections, connections, capabilities — and where your tokens actually live.</p>
+<h3 id="sections-and-bindings">Sections and bindings <a class="anchor" href="#sections-and-bindings" aria-label="Link to this section">#</a></h3>
+<p>forgetop has three <strong>sections</strong>: Pull Requests, Work Items, and Pipelines. Each is bound to one or more <strong>connections</strong> (a configured account on a forge). A section only shows data from the connections bound to it. You manage connections and bindings in the <a href="#web-dashboard">web dashboard</a> — press <code>C</code> in the TUI to open it.</p>
+<h3 id="providers-and-capabilities">Providers and capabilities <a class="anchor" href="#providers-and-capabilities" aria-label="Link to this section">#</a></h3>
+<p>Each provider advertises <strong>capabilities</strong> — which sections it can serve. A connection only ever offers what it can actually do, so the UI never dangles a dead option:</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Provider</th><th class="mid">Pull Requests</th><th class="mid">Work Items</th><th class="mid">Pipelines</th></tr></thead>
+<tbody>
+<tr><td>GitHub</td><td class="mid">yes</td><td class="mid">yes (Issues)</td><td class="mid">yes (Actions)</td></tr>
+<tr><td>GitLab</td><td class="mid">yes (MRs)</td><td class="mid">yes (Issues)</td><td class="mid">yes (CI)</td></tr>
+<tr><td>Azure DevOps</td><td class="mid">yes</td><td class="mid">yes</td><td class="mid">yes (Builds)</td></tr>
+<tr><td>Bitbucket</td><td class="mid">yes</td><td class="mid">–</td><td class="mid">yes (Pipelines)</td></tr>
+<tr><td>Linear</td><td class="mid">–</td><td class="mid">yes</td><td class="mid">–</td></tr>
+<tr><td>Jira</td><td class="mid">–</td><td class="mid">yes</td><td class="mid">–</td></tr>
+</tbody></table></div>
+<h3 id="cross-provider-aggregation">Cross-provider aggregation <a class="anchor" href="#cross-provider-aggregation" aria-label="Link to this section">#</a></h3>
+<p>Every section aggregates. Bind two or more connections to Pull Requests (or Work Items, or Pipelines) and their items merge into a single list with a <strong>Provider</strong> column so you can tell them apart. Filtering, sorting, and actions all work across the combined list — and each action targets the row's <em>own</em> provider, so approving a GitLab MR and merging a GitHub PR just work from the same screen.</p>
+<p>Try it live: <code>forgetop --demo</code> seeds two demo connections so you can see the merged lists immediately.</p>
+<h3 id="security">Security <a class="anchor" href="#security" aria-label="Link to this section">#</a></h3>
+<p>Tokens are written to the OS keychain (macOS Keychain, Windows Credential Manager, Linux Secret Service). The JSON config only stores a <em>reference</em> to each token — never the secret itself. For headless use you can supply a token via an environment variable instead (see <a href="#configuration">Configuration</a>).</p>
+<p>The <a href="#web-dashboard">web dashboard</a> is served on <strong><code>127.0.0.1</code> only</strong>, gated by a <strong>per-session token</strong> carried in its URL. Because its API can act on your behalf (merge a PR, change a state), it never listens off-loopback and never accepts cross-origin requests; the token is never returned by the API, written to config, or logged.</p>
+</div>
+<div class="rail"></div>
+</div>
+</section>
+<section class="section" id="getting-started">
+<div class="row">
+<div class="prose">
+<div class="eyebrow">Get started</div>
+<h2 id="getting-started">Getting started <a class="anchor" href="#getting-started" aria-label="Link to this section">#</a></h2>
+<p class="lede">Try it with the built-in demo, then point it at your own accounts.</p>
+<p>Try it with no setup — everything is in memory, nothing is written:</p>
+</div>
+<div class="rail"><div class="codeblock"><div class="cb-head"><span class="cb-title">demo</span><span class="cb-lang">sh</span></div><pre><code class="language-sh">forgetop --demo</code></pre></div></div>
+</div>
+<div class="row">
+<div class="prose">
+<p>Then run it for real:</p>
+</div>
+<div class="rail"><div class="codeblock"><div class="cb-head"><span class="cb-title">run it</span><span class="cb-lang">sh</span></div><pre><code class="language-sh">forgetop</code></pre></div></div>
+</div>
+<div class="row">
+<div class="prose">
+<p>This opens the <strong>terminal UI and the web dashboard together</strong> (the default). On first launch — before any connection has a token — the dashboard drops into a quick setup: pick a provider, paste a token, choose which sections it feeds. Tokens go to your OS keychain and are shared straight back to the terminal. Press <strong><code>C</code></strong> in the TUI (or open the dashboard's <strong>Settings</strong>) to manage connections any time, and <strong><code>?</code></strong> shows every keybinding. See <a href="#web-dashboard">Web dashboard</a> for the run modes.</p>
+<h3 id="diagnosing-setup">Diagnosing setup <a class="anchor" href="#diagnosing-setup" aria-label="Link to this section">#</a></h3>
+<p>If a connection isn't working, run the diagnostic — it checks the config location, keychain access, and each connection's token + connectivity, without opening the UI:</p>
+</div>
+<div class="rail"><div class="codeblock"><div class="cb-head"><span class="cb-title">diagnose</span><span class="cb-lang">sh</span></div><pre><code class="language-sh">forgetop doctor</code></pre></div></div>
+</div>
+<div class="row">
+<div class="prose">
+<p>It prints a line per connection (<code>✓</code> healthy, <code>⚠</code> no token, <code>✗</code> token present but auth failed), so you can see at a glance whether it's a missing token, a bad scope, or an expired credential.</p>
+<h3 id="command-line-options">Command-line options <a class="anchor" href="#command-line-options" aria-label="Link to this section">#</a></h3>
+<div class="table-wrap"><table>
+<thead><tr><th>Command</th><th>What it does</th></tr></thead>
+<tbody>
+<tr><td><code>forgetop</code></td><td>Launch — the terminal UI and the web dashboard together (default)</td></tr>
+<tr><td><code>forgetop --dashboard</code></td><td>Serve <strong>only</strong> the web dashboard (headless — no TUI)</td></tr>
+<tr><td><code>forgetop --demo</code> (<code>-d</code>)</td><td>Launch with built-in demo data (no setup)</td></tr>
+<tr><td><code>forgetop doctor</code></td><td>Diagnose config, keychain access, and connection health</td></tr>
+<tr><td><code>forgetop --version</code> (<code>-V</code>)</td><td>Print the version and exit</td></tr>
+<tr><td><code>forgetop --help</code> (<code>-h</code>)</td><td>Show usage and exit</td></tr>
+</tbody></table></div>
+<p>Set <strong><code>FORGETOP_STARTUP</code></strong> = <code>both</code> / <code>terminal_only</code> / <code>dashboard_only</code> to override what launches for a single run (handy with <code>--demo</code>, whose config is in-memory).</p>
+</div>
+<div class="rail"></div>
+</div>
+</section>
+<section class="section" id="web-dashboard">
+<div class="row">
+<div class="prose">
+<div class="eyebrow">Surface</div>
+<h2 id="web-dashboard">Web dashboard <a class="anchor" href="#web-dashboard" aria-label="Link to this section">#</a></h2>
+<p class="lede">The same app in a browser, built into the binary and served on loopback.</p>
+<p>forgetop ships the <strong>same app as a local web dashboard</strong> — the Command Center, all three lists, PR review with an inline-comment diff viewer, the command palette, sort/filter, themes, and every write action (approve, merge, comment, submit a review, change a work-item state, approve a pipeline gate, retry a run, mark a notification read). It's a React app <strong>built into the binary</strong> and served by forgetop itself — no separate install, no external network.</p>
+<p>The terminal UI and the dashboard are two frontends over one core, so they show the <strong>same data</strong>, act through the <strong>same providers</strong>, and share the <strong>same config + keychain</strong> — a connection or a setting changed in one shows up in the other.</p>
+<h3 id="opening-it">Opening it <a class="anchor" href="#opening-it" aria-label="Link to this section">#</a></h3>
+<ul>
+<li><strong>From the TUI:</strong> press <strong><code>B</code></strong> (shown in the footer and <code>?</code> help on every screen).
+</li>
+<li><strong>Give feedback:</strong> use the dashboard button beside connection health, or press <strong><code>F</code></strong> in the TUI. Both open the public GitHub feedback issue form; forgetop does not send logs or credentials.
+</li>
+<li><strong>Headless:</strong> <code>forgetop --dashboard</code> serves it and opens your browser — no TTY, so it's handy over SSH with a forwarded port.
+</li>
+<li>By default, running <code>forgetop</code> opens <strong>both</strong> at once.
+</li>
+</ul>
+<h3 id="when-forgetop-starts">When forgetop starts <a class="anchor" href="#when-forgetop-starts" aria-label="Link to this section">#</a></h3>
+<p>A shared preference decides what launches — set it in the dashboard under <strong>Settings → When forgetop starts</strong>, or press <strong><code>,</code></strong> in the TUI:</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Option</th><th>Behaviour</th></tr></thead>
+<tbody>
+<tr><td><strong>Dashboard + terminal</strong> (default)</td><td>Opens both together</td></tr>
+<tr><td><strong>Terminal only</strong></td><td>Just the TUI (the server still runs in the background, so <code>B</code> works)</td></tr>
+<tr><td><strong>Dashboard only</strong></td><td>Just the browser dashboard — same as <code>forgetop --dashboard</code></td></tr>
+</tbody></table></div>
+<p>The choice is stored in your config and shared between the two. For a one-off override (without changing the saved setting) use the <code>FORGETOP_STARTUP</code> env var above.</p>
+<h3 id="connections-settings">Connections &amp; settings <a class="anchor" href="#connections-settings" aria-label="Link to this section">#</a></h3>
+<p>Connection setup lives in the dashboard's <strong>Settings</strong> page: add a provider from a form tailored to it, paste a token (stored in the OS keychain), tick which sections it feeds, and <strong>Test</strong> / <strong>Edit</strong> / <strong>Delete</strong> it. First launch with nothing set up opens this automatically. Pressing <strong><code>C</code></strong> in the TUI jumps straight here.</p>
+<h3 id="security-1">Security <a class="anchor" href="#security-1" aria-label="Link to this section">#</a></h3>
+<p>The server binds <strong><code>127.0.0.1</code> only</strong> and gates its API with a <strong>per-session token</strong> in the URL — see <a href="#security">Security</a>.</p>
+</div>
+<div class="rail"></div>
+</div>
+</section>
+<section class="section" id="command-center">
+<div class="row">
+<div class="prose">
+<div class="eyebrow">Surface</div>
+<h2 id="command-center">Command Center <a class="anchor" href="#command-center" aria-label="Link to this section">#</a></h2>
+<p class="lede">The landing screen: everything that needs you, from every provider, on one page.</p>
+<div class="surface-toggle" role="group" aria-label="Show Command Center instructions for"><button type="button" class="st-btn st-tui" data-surface-set="tui">Terminal</button><button type="button" class="st-btn st-dash" data-surface-set="dash">Dashboard</button></div>
+<p>The <strong>Command Center</strong> is the screen forgetop opens on. Instead of browsing by type, it answers one question — <em>what needs me right now?</em> — by pulling every PR, work item, and pipeline across every connected provider into a single, prioritised page. The Pull Requests / Work Items / Pipelines views are still there as drill-downs.</p>
+<p>It's split into <strong>two columns</strong>:</p>
+<ul>
+<li><strong>Needs you</strong> (left) — things ripe for action now, in urgency order:
+<ul>
+<li><strong>Needs your review</strong> — PRs where you're a requested reviewer.
+</li>
+<li><strong>Approvals waiting</strong> — pipeline runs blocked on a gate you can approve.
+</li>
+<li><strong>Ready to merge</strong> — your PRs that are approved, mergeable, and green.
+</li>
+<li><strong>Needs fixing</strong> — your PRs with changes requested / failing checks / conflicts, <strong>and</strong> failed pipeline runs.
+</li>
+</ul>
+</li>
+<li><strong>Your work</strong> (right) — your own things:
+<ul>
+<li><strong>Assigned to you</strong> — work items assigned to you.
+</li>
+<li><strong>Your open pull requests</strong> — the full list of your open authored PRs (a PR that's also an action item on the left still appears here; this is the complete list).
+</li>
+<li><strong>Recently merged</strong> — your PRs merged in the last few days.
+</li>
+</ul>
+</li>
+</ul>
+<p>Every row is laid out on one aligned grid so PRs, pipelines (<code>CI</code>), and work items (<code>WI</code>) read as siblings: a coloured <strong>type badge</strong>, a <strong>status</strong> signal (a PR shows its review state — <code>✓ ok</code>, <code>○ review</code>, <code>✗ changes</code>, <code>◌ draft</code>; a pipeline its run status; a work item its state), a short <strong>#ref</strong>, the <strong>title</strong>, one type-specific <strong>detail</strong> (PR <code>+/-</code>, pipeline branch, work-item type), the <strong>provider</strong>, and the <strong>age</strong> (which reddens once it's stale). For pipelines the title is the <strong>pipeline name</strong> (e.g. <code>CI Build</code>) and the ref is the <strong>run/release</strong> (e.g. <code>10.1.100</code>).</p>
+<div class="surface surface-dash">
+<p><strong>Getting around:</strong> the two columns scroll independently. <strong>Click a card</strong> to open it — a pull request opens its in-app <strong>review panel</strong> right here; work items and pipelines open in their provider (open them from the Work Items / Pipelines tabs for the in-app panel). When you <strong>act</strong> on an item — submit a review, approve, or merge — it drops off the Command Center straight away rather than waiting for the next poll. The sidebar <strong>Command Center</strong> badge counts only the items that actually need you.</p>
+</div>
+<div class="surface surface-tui">
+<p><strong>Getting around:</strong></p>
+<ul>
+<li><code>↑</code> / <code>↓</code> (or <code>k</code> / <code>j</code>) — move within the focused column.
+</li>
+<li><code>←</code> / <code>→</code> (or <code>h</code> / <code>l</code>) — switch between the two columns.
+</li>
+<li><code>Enter</code> — open the selected item in its <strong>full view</strong> (the same PR / work-item / pipeline view as from the section tabs, with all its actions).
+</li>
+<li><code>Esc</code> — from an item opened here, return to the Command Center with the <strong>same row still selected</strong>.
+</li>
+<li><code>Tab</code>, <code>1</code>–<code>4</code> — switch top-level tabs. <code>r</code> — refresh.
+</li>
+</ul>
+<p>Two touches make it feel live: when you <strong>act</strong> on an item — submit a review, approve, or merge a PR — it drops off the Command Center immediately rather than lingering until the next poll; and the <strong>selected row's title scrolls</strong> horizontally when it's too long to fit, so you can always read it in full. The <code>Command Center (N)</code> tab badge counts the items that actually need you (the reference sections don't inflate it).</p>
+</div>
+</div>
+<div class="rail"></div>
+</div>
+</section>
+<section class="section" id="pull-requests">
+<div class="row">
+<div class="prose">
+<div class="eyebrow">Section</div>
+<h2 id="pull-requests">Pull Requests <a class="anchor" href="#pull-requests" aria-label="Link to this section">#</a></h2>
+<p class="lede">Find a pull request in the list; do the review work inside it.</p>
+<div class="surface-toggle" role="group" aria-label="Show Pull Requests instructions for"><button type="button" class="st-btn st-tui" data-surface-set="tui">Terminal</button><button type="button" class="st-btn st-dash" data-surface-set="dash">Dashboard</button></div>
+<div class="surface surface-dash">
+<p>The Pull Requests view is <strong>browse-and-open</strong>: the list is for finding a PR; every write action lives inside the PR panel.</p>
+<p><strong>On the list:</strong></p>
+<ul>
+<li><strong>Click a card</strong> to open the PR review panel (a slide-over from the right).
+</li>
+<li>The <strong>control bar</strong> across the top filters and sorts: <strong>Show</strong> (Open / Draft / Checks failing), <strong>Connection</strong> (one provider or all), and <strong>Sort</strong> (Recently updated / Oldest / Title). Your choice per list is remembered.
+</li>
+<li>Each card shows the review state, <code>#number</code>, the <code>+/-</code>, checks, reviewers, and labels.
+</li>
+</ul>
+<p>The meta bar under the title shows who opened the PR and the <strong>reviewers</strong>, each with a vote mark: <strong>✓</strong> approved, <strong>✗</strong> changes requested, <strong>·</strong> no vote yet. (These come from the provider's review data — on GitHub/GitLab the votes are read from <code>/reviews</code> and <code>/approvals</code>, not just the requested-reviewer list, so an approver actually shows a tick.)</p>
+<p><strong>Inside the PR panel</strong> (three tabs):</p>
+<ul>
+<li><strong>Conversation</strong> — the description, a <strong>Timeline</strong> of events (see below), the comment threads, a box to add a comment, and <strong>↳ Reply</strong> on each thread.
+</li>
+<li><strong>Commits</strong> — one row per commit; click one to see its diff on the Files tab.
+</li>
+<li><strong>Files</strong> — the changed files with a <strong>left-hand file list</strong> you click between and a syntax-coloured diff; existing review comments render <strong>inline beneath the line they're on</strong>. Hover a line and click the <strong><code>+</code></strong> to write an inline comment, or click <strong>↳ Reply</strong> under any existing comment to answer it in-thread. Selecting a commit on the Commits tab scopes this to that commit's diff.
+</li>
+</ul>
+<p>Checks live on the action-bar badge (below), not a tab.</p>
+<p>The <strong>Timeline</strong> (newest first) shows who did what: approvals, change-requests, merges, state changes and comments — assembled from each provider's timeline/activity/history API (GitHub reviews + issue events, Bitbucket activity, GitLab resource-events + approvals, Azure reviewer votes, plus comments). A provider without a timeline API just shows the comment activity.</p>
+<p>The header has an <strong>↗ open-in-provider</strong> link. The action bar shows a <strong>checks badge</strong> on the left — green <strong>"All checks passed"</strong> or red <strong>"N checks failed"</strong>; click it for a popover listing every check (each links to the provider) — and <strong>Approve</strong>, <strong>Request changes</strong>, <strong>Merge</strong> on the right. Choosing an action closes the panel. Press <strong>Esc</strong> or click the backdrop to close.</p>
+<h3 id="reviewing-code-with-line-comments">Reviewing code with line comments <a class="anchor" href="#reviewing-code-with-line-comments" aria-label="Link to this section">#</a></h3>
+<p>On the <strong>Files</strong> tab, click the <strong><code>+</code></strong> on a code line to write an inline comment. Comments are <strong>buffered as pending</strong> (shown in a blue <em>pending</em> box) so you can comment on several lines first, then submit them together as one review — <strong>Submit comments</strong>, <strong>Request changes</strong>, or <strong>Approve</strong>. If you try to close the panel with comments still pending, forgetop asks before discarding them.</p>
+<ul>
+<li><strong>GitHub</strong> posts it as a single native review.
+</li>
+<li><strong>GitLab</strong> posts positioned discussions (and approves if you chose Approve).
+</li>
+<li><strong>Azure DevOps / Bitbucket</strong> don't expose inline patches, so line comments aren't available there — use the Conversation tab.
+</li>
+</ul>
+<h3 id="replying-to-a-comment">Replying to a comment <a class="anchor" href="#replying-to-a-comment" aria-label="Link to this section">#</a></h3>
+<p>Click <strong>↳ Reply</strong> under any comment to answer it <strong>in-thread</strong> rather than starting a new top-level comment. forgetop uses each provider's real reply API:</p>
+<ul>
+<li><strong>Azure DevOps</strong> and <strong>GitLab</strong> (discussions) nest the reply under the original comment.
+</li>
+<li><strong>Bitbucket</strong> replies to the root comment of the thread.
+</li>
+<li><strong>GitHub</strong> review (diff-line) threads get a native threaded reply. A GitHub PR <strong>conversation</strong> comment is flat — GitHub has no reply API for it — so a reply there posts a new conversation comment.
+</li>
+</ul>
+</div>
+<div class="surface surface-tui">
+<p>The Pull Requests tab is <strong>browse-and-open</strong>: the list is for finding a PR; every write action lives inside the PR view.</p>
+<p><strong>On the list:</strong></p>
+<ul>
+<li><code>Enter</code> — open the full-screen PR view.
+</li>
+<li><code>f</code> — <strong>filter by status</strong>: a checklist of Open / Draft / Merged / Closed; tick which to show. Defaults to Open + Draft; ticking Merged or Closed transparently widens the fetch to include completed PRs, so you can e.g. keep the <strong>Mine</strong> view but see your open <em>and</em> recently-merged PRs together. The list title shows the active set (<code>Pull Requests · Open, Merged</code>). Session-only.
+</li>
+<li><code>[</code> / <code>]</code> — switch <a href="#saved-views">saved views</a>; PRs default to All / Mine / Review-requested.
+</li>
+<li><code>/</code> — quick-filter by typing; <code>S</code> — sort by a column; <code>o</code> — open in browser.
+</li>
+</ul>
+<p><strong>Inside the PR view</strong> (four sub-tabs, switch with <code>←</code>/<code>→</code>):</p>
+<ul>
+<li><strong>Conversation</strong> — description, reviewers, labels, and comment threads.
+</li>
+<li><strong>Commits</strong> — one row per commit; <code>Enter</code> drills into <em>that commit's</em> diff.
+</li>
+<li><strong>Checks</strong> — each named CI check with its status.
+</li>
+<li><strong>Diff</strong> — the changed files, <strong>grouped by directory</strong> and <strong>syntax-highlighted</strong>; <code>Enter</code> on a file drops into a <strong>line cursor</strong> in the patch (<code>↑</code>/<code>↓</code> move line-by-line; the title shows the real file line).
+</li>
+</ul>
+<p>Write actions from the view: <code>a</code> approve, <code>x</code> request changes, <code>m</code> merge (pick a strategy), <code>c</code> comment, <code>r</code> reply to a thread, <code>o</code> open in browser.</p>
+<h4 id="reading-the-diff">Reading the diff</h4>
+<ul>
+<li><strong>Syntax highlighting</strong> — patches are highlighted for common languages (Rust, TS/JS, Python, Go, Java, JSON, YAML), using the theme's colours; other languages render plain. The <code>+</code>/<code>-</code> add/remove colour is always kept.
+</li>
+<li><strong>Viewed checkboxes</strong> — press <strong><code>v</code></strong> on a file to mark it reviewed (<code>[x]</code>); the file-list title tracks your progress as <strong><code>N/M reviewed</code></strong>. Session-only.
+</li>
+<li><strong>Directory grouping</strong> — files are grouped under directory headers so a large PR is easier to scan.
+</li>
+<li><strong>Inline comment threads</strong> — existing review comments render <strong>inline in the diff, beneath the line they're on</strong> (a left bar: accent = open, dim = resolved), so you read them in context instead of a side list. <strong><code>[</code></strong> / <strong><code>]</code></strong> jump the cursor between them, and <strong><code>r</code></strong> replies to the thread under the cursor <strong>in-thread</strong>. (Unanchored / PR-level comments stay on the Conversation tab, where <strong><code>r</code></strong> replies to the thread there.)
+</li>
+</ul>
+<h4 id="reviewing-code-with-line-comments-1">Reviewing code with line comments</h4>
+<p>In the Diff tab's line cursor, press <code>c</code> on a code line to write an inline comment. Comments are <strong>buffered locally</strong> — the line gets a <code>▎</code> marker — so you can comment on several lines first. Press <strong><code>s</code></strong> to submit them all as one review, choosing the verdict: <strong>Comment</strong>, <strong>Approve</strong>, or <strong>Request changes</strong>. If you press <code>Esc</code> <strong>or <code>q</code></strong> to leave with comments still buffered, forgetop asks whether to <strong>submit</strong> or <strong>leave without submitting</strong> first, so you don't lose them by accident.</p>
+<ul>
+<li><strong>GitHub</strong> posts it as a single native review.
+</li>
+<li><strong>GitLab</strong> posts positioned discussions (and approves if you chose Approve).
+</li>
+<li><strong>Azure DevOps / Bitbucket</strong> don't expose inline patches, so the line cursor — and line comments — aren't available there.
+</li>
+</ul>
+</div>
+</div>
+<div class="rail"></div>
+</div>
+</section>
+<section class="section" id="work-items">
+<div class="row">
+<div class="prose">
+<div class="eyebrow">Section</div>
+<h2 id="work-items">Work Items <a class="anchor" href="#work-items" aria-label="Link to this section">#</a></h2>
+<p class="lede">The items assigned to you, with state transitions pulled from the provider.</p>
+<div class="surface-toggle" role="group" aria-label="Show Work Items instructions for"><button type="button" class="st-btn st-tui" data-surface-set="tui">Terminal</button><button type="button" class="st-btn st-dash" data-surface-set="dash">Dashboard</button></div>
+<p>The Work Items view shows only items <strong>assigned to you</strong> — each provider resolves the current user from your token (<code>@me</code>, <code>currentUser()</code>, <code>isMe</code>, …), so there's nothing to configure.</p>
+<div class="surface surface-dash">
+<p>Browse-and-open; the write actions live in the item panel.</p>
+<ul>
+<li><strong>Click a work item</strong> to open its panel: the <strong>description</strong>, a <strong>Timeline</strong> of events (status changes, assignments, comments — from the provider's history: Jira changelog, Linear issue history, Azure work-item revisions, GitHub/GitLab issue events), <strong>comment threads</strong> with a box to add a comment, and a <strong>Move ▾</strong> control to change state.
+</li>
+<li><strong>Move ▾</strong> pulls its choices from the provider itself: Jira's workflow transitions, Linear's team states, Azure's work-item-type states, or open/closed for GitHub/GitLab issues.
+</li>
+<li>The header's <strong>↗</strong> opens the item in its provider.
+</li>
+<li>The <strong>control bar</strong> filters and sorts: <strong>Show</strong> (In progress / Blocked / Not started), <strong>Connection</strong>, and <strong>Sort</strong>.
+</li>
+</ul>
+</div>
+<div class="surface surface-tui">
+<p>The list is browse-and-open; the write actions live in the item view:</p>
+<ul>
+<li><code>Enter</code> — open the item.
+</li>
+<li><code>f</code> (on the list) — a checklist of the <strong>states currently in view</strong>; pick which to show. Built from the loaded items, so it's always provider-accurate (<code>In Progress</code> vs <code>Inprogress</code>). Persisted.
+</li>
+</ul>
+<p>Inside the item view (after <code>Enter</code>):</p>
+<ul>
+<li><code>u</code> — <strong>update state.</strong> The choices are pulled from the provider itself: Jira's workflow transitions, Linear's team states, Azure's work-item-type states, or open/closed for GitHub/GitLab issues. (Falls back to the states seen across the list if a provider can't report them.)
+</li>
+<li><code>c</code> — comment (works on every work-item provider).
+</li>
+<li><code>o</code> — open in browser.
+</li>
+</ul>
+</div>
+</div>
+<div class="rail"></div>
+</div>
+</section>
+<section class="section" id="pipelines">
+<div class="row">
+<div class="prose">
+<div class="eyebrow">Section</div>
+<h2 id="pipelines">Pipelines <a class="anchor" href="#pipelines" aria-label="Link to this section">#</a></h2>
+<p class="lede">Runs, a stages → jobs → steps drill-in, logs, re-runs, and approval gates.</p>
+<div class="surface-toggle" role="group" aria-label="Show Pipelines instructions for"><button type="button" class="st-btn st-tui" data-surface-set="tui">Terminal</button><button type="button" class="st-btn st-dash" data-surface-set="dash">Dashboard</button></div>
+<p>Each entry is a <strong>run</strong>, tagged with its <strong>pipeline</strong> (definition) name — e.g. <code>CI Build</code> or <code>CD (Release)</code> — and its own run name or release (e.g. <code>10.1.100</code>, or its number when it has none).</p>
+<div class="surface surface-dash">
+<ul>
+<li><strong>Click a run</strong> to open its drill-in panel: a <strong>stages → jobs → steps</strong> tree. Each node carries its status; <strong>expand a job</strong> to load its scrollable <strong>logs</strong>, and failed jobs show a short <strong>failure reason</strong> (GitLab's reason, Azure's error/warning counts).
+</li>
+<li>A <strong>failed</strong> run gets a <strong>Re-run</strong> button; a run waiting on a gate shows <strong>Approve</strong> / <strong>Reject</strong> (see below). The header's <strong>↗</strong> opens the run in its provider.
+</li>
+<li>Filter with the control bar's <strong>Show</strong> (Running / Failed / Succeeded / Awaiting approval), plus <strong>Connection</strong> and <strong>Sort</strong>.
+</li>
+</ul>
+</div>
+<div class="surface surface-tui">
+<p>The list shows a <strong>Pipeline</strong> column separate from the <strong>Run</strong> column; sort by <code>Pipeline</code> to group runs by their definition.</p>
+<ul>
+<li><code>Enter</code> — drill into a run: a collapsible <strong>stages → jobs → steps</strong> tree.
+</li>
+<li><code>T</code> — trigger a run.
+</li>
+</ul>
+<p>Inside the drill-in each node shows its <strong>duration</strong>, and failed jobs show a short <strong>failure reason</strong> (GitLab's reason, Azure's error/warning counts). Then:</p>
+<ul>
+<li><code>Enter</code> — expand / collapse the selected node.
+</li>
+<li><code>L</code> — open a scrollable <strong>logs</strong> pane for the selected job (<code>Esc</code> closes).
+</li>
+<li><code>A</code> — approve / reject a waiting gate (see below).
+</li>
+<li><code>o</code> — open the selected job in the browser.
+</li>
+</ul>
+<p>For a connection that discovers many pipelines, open the config screen and press <code>s</code> on it to <strong>subscribe</strong> to just the definitions you care about.</p>
+</div>
+<h3 id="approvals">Approvals <a class="anchor" href="#approvals" aria-label="Link to this section">#</a></h3>
+<p>When a run is blocked on a manual gate — a <strong>GitHub</strong> environment required-reviewer, an <strong>Azure DevOps</strong> approval check, or a <strong>GitLab</strong> manual job — forgetop surfaces it, refreshed on the normal poll (and you can opt into a desktop <a href="#notifications">notification</a> when a gate first appears):</p>
+<div class="surface surface-dash">
+<ul>
+<li>The run shows the waiting gate inline; on providers where forgetop can act (<strong>GitHub</strong>, <strong>GitLab</strong>) it renders <strong>Approve</strong> / <strong>Reject</strong> buttons — both on the card and inside the run's panel.
+</li>
+</ul>
+</div>
+<div class="surface surface-tui">
+<ul>
+<li>The Pipelines list shows a red <strong>Approval needed</strong> column on that run. Inside the run, a banner reads <strong>⏸ Approval needed: {environment}</strong>; on providers where forgetop can act (<strong>GitHub</strong>, <strong>GitLab</strong>) press <code>A</code> to open a picker of Approve / Reject options per gate, then confirm.
+</li>
+</ul>
+</div>
+<p>Acting is <strong>capability-scoped</strong>:</p>
+<ul>
+<li><strong>GitHub / GitLab</strong> — approve or reject in-app (on GitLab a reject cancels the manual job).
+</li>
+<li><strong>Azure DevOps</strong> — <strong>view-only</strong>: the pending gate is surfaced, but Azure doesn't expose the environment check as an actionable approval over the API, so there's no <code>A</code> action — approve it in the Azure UI.
+</li>
+<li><strong>Bitbucket</strong> — approvals aren't surfaced at all (its API can't resume a paused manual step); the run shows an explicit <em>"not supported"</em> note.
+</li>
+</ul>
+</div>
+<div class="rail"></div>
+</div>
+</section>
+<section class="section" id="filtering-and-sorting">
+<div class="row">
+<div class="prose">
+<div class="eyebrow">Shaping</div>
+<h2 id="filtering-and-sorting">Filtering and sorting <a class="anchor" href="#filtering-and-sorting" aria-label="Link to this section">#</a></h2>
+<p class="lede">Cut a busy view down, and keep the shape you chose.</p>
+<div class="surface-toggle" role="group" aria-label="Show Filtering and sorting instructions for"><button type="button" class="st-btn st-tui" data-surface-set="tui">Terminal</button><button type="button" class="st-btn st-dash" data-surface-set="dash">Dashboard</button></div>
+<div class="surface surface-dash">
+<p>Each list has a <strong>control bar</strong> across the top with three dropdowns, remembered per list in your browser:</p>
+<ul>
+<li><strong>Sort</strong> — order the list (Recently updated / Oldest / Title, and so on per section).
+</li>
+<li><strong>Connection</strong> — narrow to one provider, or <strong>All connections</strong>.
+</li>
+<li><strong>Show</strong> — a status filter tuned to the section: PRs (Open / Draft / Checks failing), Work Items (In progress / Blocked / Not started), Pipelines (Running / Failed / Succeeded / Awaiting approval).
+</li>
+</ul>
+<p>All three compose, and all work across the aggregated (multi-provider) list.</p>
+</div>
+<div class="surface surface-tui">
+<p>Four complementary ways to cut a busy view down:</p>
+<ul>
+<li><strong>Quick-filter (<code>/</code>)</strong> — on any list, type to filter rows live; every whitespace-separated token must match (case-insensitive) across the row's key fields. <code>Enter</code> applies, <code>Esc</code> clears. Remembered per tab.
+</li>
+<li><strong>Sort (<code>S</code>)</strong> — pick a column to sort by; re-pick to flip direction. The sorted column shows a <code>▲</code>/<code>▼</code> arrow. Persisted per view.
+</li>
+<li><strong>PR status (<code>f</code> on Pull Requests)</strong> — show only chosen statuses (Open / Draft / Merged / Closed); see <a href="#pull-requests">Pull Requests</a>.
+</li>
+<li><strong>Work-item state visibility (<code>f</code> on Work Items)</strong> — show only chosen states.
+</li>
+<li><strong>Pipeline subscriptions (<code>s</code> in the config screen)</strong> — track only chosen pipeline definitions per connection.
+</li>
+</ul>
+<p>All of these compose, and all work across the aggregated (multi-provider) list.</p>
+</div>
+</div>
+<div class="rail"></div>
+</div>
+</section>
+<section class="section" id="command-palette">
+<div class="row">
+<div class="prose">
+<div class="eyebrow">Navigation</div>
+<h2 id="command-palette">Command palette <a class="anchor" href="#command-palette" aria-label="Link to this section">#</a></h2>
+<p class="lede">Fuzzy-jump to any loaded PR, work item, or pipeline from one box.</p>
+<div class="surface-toggle" role="group" aria-label="Show Command palette instructions for"><button type="button" class="st-btn st-tui" data-surface-set="tui">Terminal</button><button type="button" class="st-btn st-dash" data-surface-set="dash">Dashboard</button></div>
+<p>The <strong>command palette</strong> is a fuzzy jump across <em>everything already loaded</em>: every PR, work item, and pipeline, from every connected provider, in one list. Type to filter (matching the title, author, branch, identifier, or connection); each row carries a status dot in the usual green/blue/red/grey colours. It searches only what's loaded — no network round-trip — so it's instant.</p>
+<div class="surface surface-dash">
+<p>Press <strong><code>⌘K</code></strong> (Ctrl-K on Windows/Linux) from anywhere to open it; type to filter, click a result (or <code>↑</code>/<code>↓</code> then <code>Enter</code>) to open it, <code>Esc</code> to dismiss.</p>
+</div>
+<div class="surface surface-tui">
+<p>Press <strong><code>Ctrl-P</code></strong> (from the Command Center or any list) to open it; <code>↑</code>/<code>↓</code> (or <code>Ctrl-n</code>/<code>Ctrl-p</code>) to move, <code>Enter</code> to open the item's full view, <code>Esc</code> to dismiss.</p>
+</div>
+</div>
+<div class="rail"></div>
+</div>
+</section>
+<section class="section" id="notification-inbox">
+<div class="row">
+<div class="prose">
+<div class="eyebrow">Navigation</div>
+<h2 id="notification-inbox">Notification inbox <a class="anchor" href="#notification-inbox" aria-label="Link to this section">#</a></h2>
+<p class="lede">What just happened, aggregated across every provider that reports it.</p>
+<div class="surface-toggle" role="group" aria-label="Show Notification inbox instructions for"><button type="button" class="st-btn st-tui" data-surface-set="tui">Terminal</button><button type="button" class="st-btn st-dash" data-surface-set="dash">Dashboard</button></div>
+<p>The <strong>notification inbox</strong> is your notification <em>stream</em> aggregated across providers: review requests, @mentions, assignments, CI failures, comments, and state changes, newest first. It answers <em>what just happened</em>, where the Command Center answers <em>what needs me now</em>. A <strong>Notifications</strong> nav item carries an <strong>unread count</strong> that stands out when something's waiting.</p>
+<div class="surface surface-dash">
+<ul>
+<li>Open <strong>Notifications</strong> in the sidebar. Each row shows a kind glyph in the status colours, an unread dot, the title, the repo/project, the connection, and age.
+</li>
+<li><strong>Click a row</strong> to open it in its provider; the <strong>✓ read</strong> button marks it read (and the <strong>Show</strong> filter can narrow to unread). Marking updates the count immediately.
+</li>
+</ul>
+</div>
+<div class="surface surface-tui">
+<p>Press <strong><code>i</code></strong> (from the Command Center or any list) to open the <strong>Inbox</strong>. The <strong><code>Notifications (N) [i]</code></strong> nav item sits at the <strong>far right</strong> of the tab bar — dim grey at zero, <strong>bold yellow</strong> with the count when something's waiting, accent while the Inbox is open. It's a nav item, not part of the <code>Tab</code> cycle.</p>
+<ul>
+<li><code>↑</code>/<code>↓</code> move · <strong><code>Enter</code></strong> opens the item <strong>in-app</strong> (drills straight into that PR / work item) · <code>o</code> opens it in the browser · <code>x</code> marks the row read · <code>A</code> marks everything read · <code>r</code> refreshes · <code>Esc</code> back. Opening or marking updates the count immediately.
+</li>
+<li>Each row shows a kind glyph in the status colours (CI failures red, reviews/assignments accent, mentions magenta), an unread dot, the title, the repo/project, the connection, and age.
+</li>
+</ul>
+</div>
+<p><strong>Provider support.</strong> The inbox is fed by the providers that expose a personal notification feed:</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Provider</th><th class="mid">Notification inbox</th></tr></thead>
+<tbody>
+<tr><td><strong>GitHub</strong></td><td class="mid">✅ (notifications)</td></tr>
+<tr><td><strong>GitLab</strong></td><td class="mid">✅ (todos)</td></tr>
+<tr><td><strong>Linear</strong></td><td class="mid">✅ (notifications)</td></tr>
+<tr><td><strong>Azure DevOps</strong></td><td class="mid">— no personal feed</td></tr>
+<tr><td><strong>Bitbucket</strong></td><td class="mid">— no personal feed</td></tr>
+<tr><td><strong>Jira</strong></td><td class="mid">— no personal feed</td></tr>
+</tbody></table></div>
+<p>Azure DevOps, Bitbucket, and Jira don't offer a personal notification feed in their APIs, so connections for those providers simply don't contribute to the inbox. (This is separate from <a href="#notifications">desktop notifications</a>, which is about which events fire an OS ping.)</p>
+</div>
+<div class="rail"></div>
+</div>
+</section>
+<section class="section" id="saved-views">
+<div class="row">
+<div class="prose">
+<div class="eyebrow">Shaping</div>
+<h2 id="saved-views">Saved views <a class="anchor" href="#saved-views" aria-label="Link to this section">#</a></h2>
+<p class="lede">Bundle a filter, a sort, and a state set into a named view.</p>
+<div class="surface-toggle" role="group" aria-label="Show Saved views instructions for"><button type="button" class="st-btn st-tui" data-surface-set="tui">Terminal</button><button type="button" class="st-btn st-dash" data-surface-set="dash">Dashboard</button></div>
+<div class="surface surface-dash">
+<p>The dashboard doesn't have named saved views — instead, each list <strong>remembers its own control-bar state</strong> (Sort, Connection, Show) in your browser, so a list comes back shaped the way you left it. For the named-view workflow with a switchable view bar, use the terminal (toggle above).</p>
+</div>
+<div class="surface surface-tui">
+<p>A <strong>saved view</strong> is a named bundle of a section's shaping — its base filter, the quick-filter text, the sort, and (on Work Items) which states are hidden. Views live in a horizontal <strong>view bar</strong> above the list, gh-dash style, with the active one highlighted. The bar appears once a section has more than one view.</p>
+<p>Every section starts with sensible defaults: Pull Requests get <strong>All</strong>, <strong>Mine</strong>, and <strong>Review</strong>; Work Items and Pipelines get a single <strong>All</strong>.</p>
+<ul>
+<li><code>[</code> / <code>]</code> — switch to the previous / next view.
+</li>
+<li><code>V</code> — save the current filter + sort + states as a new view (you're prompted for a name), then switch to it.
+</li>
+<li><code>X</code> — delete the current view (with a confirm; you can't delete the last one).
+</li>
+</ul>
+<p>Switching a view re-applies the whole bundle at once, so a <code>Mine</code> view can pin a different sort and quick-filter than <code>Review</code>. Views are persisted per section, so they're waiting next time — except in <code>--demo</code>, where the in-memory config means saved views last only for that session.</p>
+</div>
+</div>
+<div class="rail"></div>
+</div>
+</section>
+<section class="section" id="notifications">
+<div class="row">
+<div class="prose">
+<div class="eyebrow">Alerts</div>
+<h2 id="notifications">Notifications <a class="anchor" href="#notifications" aria-label="Link to this section">#</a></h2>
+<p class="lede">Native desktop pings for the events you opt into.</p>
+<p>forgetop raises native desktop notifications on the events you choose:</p>
+<ul>
+<li><strong>Pipeline failed</strong> — a run transitions into a failed state.
+</li>
+<li><strong>Pipeline approval needed</strong> — a run first starts waiting on a gate you can approve.
+</li>
+<li><strong>Review requested</strong> — you're newly a requested reviewer on a PR.
+</li>
+<li><strong>Your PR approved</strong> / <strong>changes requested</strong> — a reviewer votes on a PR you authored.
+</li>
+</ul>
+<p>Press <strong><code>N</code></strong> anywhere to open a checklist and opt in/out of each event; the choice is persisted. Detection is seeded on load (no startup spam), de-duped, and re-seeded when you change settings — and enabling fires one confirmation notification so you can verify it works on your machine. Every event spans <strong>all bound providers</strong>, not just the first.</p>
+</div>
+<div class="rail"></div>
+</div>
+</section>
+<section class="section" id="keybindings">
+<div class="row">
+<div class="prose">
+<div class="eyebrow">Reference</div>
+<h2 id="keybindings">Keybindings <a class="anchor" href="#keybindings" aria-label="Link to this section">#</a></h2>
+<p class="lede">Every key, grouped by the screen it belongs to.</p>
+<div class="note">
+<p><em>Terminal only</em> — the dashboard is mouse-driven, with <strong><code>⌘K</code></strong> for the <a href="#command-palette">command palette</a>.</p>
+</div>
+<p>forgetop shows a <strong>context-aware key glossary</strong> along the bottom — it only lists the keys valid for where you are. Press <code>?</code> for the full panel. The complete set:</p>
+<h3 id="global">Global <a class="anchor" href="#global" aria-label="Link to this section">#</a></h3>
+<div class="table-wrap"><table class="keys">
+<thead><tr><th>Key</th><th>Action</th></tr></thead>
+<tbody>
+<tr><td><code>←</code> / <code>→</code>, <code>h</code> / <code>l</code>, <code>Tab</code>, <code>1</code>–<code>4</code></td><td>Switch tab (<code>1</code> = Command Center)</td></tr>
+<tr><td><code>↑</code> / <code>↓</code>, <code>k</code> / <code>j</code></td><td>Move selection</td></tr>
+<tr><td><code>Ctrl-P</code></td><td>Command palette — fuzzy-jump to any PR, work item, or pipeline</td></tr>
+<tr><td><code>i</code></td><td>Notification inbox (review requests, mentions, CI failures, assignments)</td></tr>
+<tr><td><code>/</code></td><td>Quick-filter the current list</td></tr>
+<tr><td><code>S</code></td><td>Sort by a column (re-pick flips direction)</td></tr>
+<tr><td><code>o</code></td><td>Open selected item in browser</td></tr>
+<tr><td><code>B</code></td><td>Open the web dashboard in your browser</td></tr>
+<tr><td><code>F</code></td><td>Open the public GitHub feedback issue form</td></tr>
+<tr><td><code>,</code></td><td>Settings — what forgetop opens on launch</td></tr>
+<tr><td><code>v</code></td><td>Choose which tabs are visible</td></tr>
+<tr><td><code>C</code></td><td>Open the connections page (in the web dashboard)</td></tr>
+<tr><td><code>r</code></td><td>Refresh · <code>t</code> cycle theme</td></tr>
+<tr><td><code>N</code></td><td>Notifications — choose which events ping you</td></tr>
+<tr><td><code>?</code></td><td>Show all keybindings (anywhere)</td></tr>
+<tr><td><code>q</code> / <code>Ctrl-C</code></td><td>Quit · <code>Esc</code> back / close</td></tr>
+</tbody></table></div>
+<h3 id="command-center-1">Command Center <a class="anchor" href="#command-center-1" aria-label="Link to this section">#</a></h3>
+<div class="table-wrap"><table class="keys">
+<thead><tr><th>Key</th><th>Action</th></tr></thead>
+<tbody>
+<tr><td><code>↑</code> / <code>↓</code>, <code>k</code> / <code>j</code></td><td>Move within the focused column</td></tr>
+<tr><td><code>←</code> / <code>→</code>, <code>h</code> / <code>l</code></td><td>Switch between the two columns</td></tr>
+<tr><td><code>Enter</code></td><td>Open the selected item in its full view</td></tr>
+<tr><td><code>Esc</code> (in the opened item)</td><td>Return to the Command Center, same row selected</td></tr>
+</tbody></table></div>
+<h3 id="saved-views-1">Saved views <a class="anchor" href="#saved-views-1" aria-label="Link to this section">#</a></h3>
+<div class="table-wrap"><table class="keys">
+<thead><tr><th>Key</th><th>Action</th></tr></thead>
+<tbody>
+<tr><td><code>[</code> / <code>]</code></td><td>Previous / next saved view</td></tr>
+<tr><td><code>V</code></td><td>Save the current filter + sort + states as a view</td></tr>
+<tr><td><code>X</code></td><td>Delete the current view</td></tr>
+</tbody></table></div>
+<h3 id="pull-requests-list">Pull Requests (list) <a class="anchor" href="#pull-requests-list" aria-label="Link to this section">#</a></h3>
+<div class="table-wrap"><table class="keys">
+<thead><tr><th>Key</th><th>Action</th></tr></thead>
+<tbody>
+<tr><td><code>Enter</code></td><td>Open the PR view</td></tr>
+<tr><td><code>f</code></td><td>Filter by status (Open / Draft / Merged / Closed)</td></tr>
+<tr><td><code>[</code> / <code>]</code></td><td>Switch saved views (defaults All / Mine / Review-requested)</td></tr>
+</tbody></table></div>
+<h3 id="inside-the-pr-view">Inside the PR view <a class="anchor" href="#inside-the-pr-view" aria-label="Link to this section">#</a></h3>
+<div class="table-wrap"><table class="keys">
+<thead><tr><th>Key</th><th>Action</th></tr></thead>
+<tbody>
+<tr><td><code>←</code> / <code>→</code></td><td>Switch sub-tab</td></tr>
+<tr><td><code>a</code> / <code>x</code></td><td>Approve / request changes</td></tr>
+<tr><td><code>m</code></td><td>Merge (choose strategy)</td></tr>
+<tr><td><code>c</code></td><td>Comment (inline on a diff line, otherwise the PR)</td></tr>
+<tr><td><code>[</code> / <code>]</code> (Diff line cursor)</td><td>Jump between existing comment threads</td></tr>
+<tr><td><code>r</code></td><td>Reply to a comment thread (under the diff cursor, or the Conversation thread)</td></tr>
+<tr><td><code>Enter</code> (Commits)</td><td>Drill into that commit's diff</td></tr>
+<tr><td><code>Enter</code> (Diff, on a file)</td><td>Line cursor within the patch</td></tr>
+<tr><td><code>s</code></td><td>Submit buffered line comments as one review</td></tr>
+<tr><td><code>Esc</code></td><td>Step back (line cursor → file list → close)</td></tr>
+</tbody></table></div>
+<h3 id="work-items-1">Work Items <a class="anchor" href="#work-items-1" aria-label="Link to this section">#</a></h3>
+<div class="table-wrap"><table class="keys">
+<thead><tr><th>Key</th><th>Action</th></tr></thead>
+<tbody>
+<tr><td><code>Enter</code></td><td>Open the item</td></tr>
+<tr><td><code>f</code></td><td>Choose which states to show</td></tr>
+<tr><td><code>u</code> (in the item view)</td><td>Update state (choices pulled from the provider)</td></tr>
+<tr><td><code>c</code> (in the item view)</td><td>Comment</td></tr>
+</tbody></table></div>
+<h3 id="pipelines-1">Pipelines <a class="anchor" href="#pipelines-1" aria-label="Link to this section">#</a></h3>
+<div class="table-wrap"><table class="keys">
+<thead><tr><th>Key</th><th>Action</th></tr></thead>
+<tbody>
+<tr><td><code>Enter</code></td><td>Drill in (stages → jobs → steps)</td></tr>
+<tr><td><code>Enter</code> (in drill-in)</td><td>Expand / collapse a node</td></tr>
+<tr><td><code>L</code></td><td>View the selected job's logs</td></tr>
+<tr><td><code>A</code> (in drill-in)</td><td>Approve / reject a waiting gate (GitHub, GitLab; Azure view-only)</td></tr>
+<tr><td><code>o</code></td><td>Open the selected job in the browser</td></tr>
+<tr><td><code>T</code></td><td>Trigger a run</td></tr>
+</tbody></table></div>
+<h3 id="connections-terminal-fallback">Connections (terminal fallback) <a class="anchor" href="#connections-terminal-fallback" aria-label="Link to this section">#</a></h3>
+<p>Connection management lives in the <a href="#web-dashboard">web dashboard</a> — <code>C</code> opens it and also shows a connections list in the terminal. That list still supports the original keys as a fallback:</p>
+<div class="table-wrap"><table class="keys">
+<thead><tr><th>Key</th><th>Action</th></tr></thead>
+<tbody>
+<tr><td><code>a</code></td><td>Add a connection</td></tr>
+<tr><td><code>p</code> / <code>w</code></td><td>Bind Pull Requests / Work Items (multi-select)</td></tr>
+<tr><td><code>s</code></td><td>Pipeline subscriptions</td></tr>
+<tr><td><code>x</code></td><td>Remove connection</td></tr>
+</tbody></table></div>
+</div>
+<div class="rail"></div>
+</div>
+</section>
+<section class="section" id="configuration">
+<div class="row">
+<div class="prose">
+<div class="eyebrow">Reference</div>
+<h2 id="configuration">Configuration <a class="anchor" href="#configuration" aria-label="Link to this section">#</a></h2>
+<p class="lede">Where config lives, how tokens are stored, and what gets logged.</p>
+<p>Config is a small JSON file, created and managed for you:</p>
+<div class="table-wrap"><table>
+<thead><tr><th>OS</th><th>Path</th></tr></thead>
+<tbody>
+<tr><td>macOS</td><td><code>~/Library/Application Support/forgetop/config.json</code></td></tr>
+<tr><td>Linux</td><td><code>~/.config/forgetop/config.json</code></td></tr>
+<tr><td>Windows</td><td><code>%APPDATA%\forgetop\config.json</code></td></tr>
+</tbody></table></div>
+<p><strong>It never contains secrets</strong> — only a reference to each token in the keychain, plus your bindings and view preferences (saved views, sorts, hidden states, notification choices).</p>
+<h3 id="tokens">Tokens <a class="anchor" href="#tokens" aria-label="Link to this section">#</a></h3>
+<p>You add connections and paste tokens in the dashboard's <strong>Settings</strong> page (see <a href="#web-dashboard">Web dashboard</a>); each token is stored in your OS keychain under the service name <code>forgetop</code>. In headless environments (CI, containers) you can instead supply a token via an environment variable named <code>FORGETOP_PAT_&lt;CONNECTION_ID&gt;</code> (uppercased; non-alphanumeric characters become <code>_</code>).</p>
+<h3 id="logs-diagnostics">Logs &amp; diagnostics <a class="anchor" href="#logs-diagnostics" aria-label="Link to this section">#</a></h3>
+<p>forgetop keeps rolling diagnostic files next to your config — <strong><code>forgetop.log</code></strong> and its numbered segments in the same directory (e.g. <code>~/.config/forgetop/</code>). The retained history is limited to approximately the latest 24 hours and never more than 3 MiB; under heavy logging, the size limit wins. It records:</p>
+<ul>
+<li><strong>Crashes</strong> — if forgetop ever panics it restores your terminal (no garbled screen), writes the panic to the log, and prints the path so you can send it on.
+</li>
+<li><strong>Errors</strong> — a failed action (approve / merge / comment / trigger / …) and background provider / auth / network fetch failures, which otherwise only flash on screen — each timestamped, so intermittent issues are reviewable after the fact.
+</li>
+</ul>
+<p><code>forgetop doctor</code> prints the active log's path. Logging is best-effort and redacts common credential headers, token fields, credential-bearing URLs, dashboard session tokens, and known provider-token formats. Request/response bodies and configuration contents are not intentionally logged, but you should still inspect diagnostics before sharing them manually. forgetop never attaches them to the GitHub feedback form.</p>
+<p>The running version is shown in the header (<code>▟ forgetop v…</code>) and via <code>forgetop --version</code>, so it's easy to include when reporting an issue.</p>
+<h3 id="token-scopes">Token scopes <a class="anchor" href="#token-scopes" aria-label="Link to this section">#</a></h3>
+<div class="table-wrap"><table>
+<thead><tr><th>Provider</th><th>What to create</th><th>Scopes</th></tr></thead>
+<tbody>
+<tr><td>GitHub</td><td>Personal access token</td><td><code>repo</code> (PRs, issues, checks); <code>workflow</code> / Actions read for pipelines</td></tr>
+<tr><td>GitLab</td><td>Personal access token (Settings → Access Tokens)</td><td><code>api</code> (merge requests, issues, pipelines)</td></tr>
+<tr><td>Azure DevOps</td><td>Personal access token</td><td>Code Read, Work Items Read/Write, Build Read/Execute</td></tr>
+<tr><td>Linear</td><td>Personal API key (Settings → Security and access → API)</td><td>default</td></tr>
+<tr><td>Jira</td><td>API token (id.atlassian.com) + your account email</td><td>default (account access)</td></tr>
+<tr><td>Bitbucket</td><td>App password (Personal settings → App passwords) + your username</td><td>Pull requests, Pipelines (read/write)</td></tr>
+</tbody></table></div>
+</div>
+<div class="rail"></div>
+</div>
+</section>
+<section class="section" id="themes">
+<div class="row">
+<div class="prose">
+<div class="eyebrow">Reference</div>
+<h2 id="themes">Themes <a class="anchor" href="#themes" aria-label="Link to this section">#</a></h2>
+<p class="lede">Four built-in themes, remembered per surface.</p>
+<p>Four built-in themes — <code>slate</code> (default), <code>dark</code>, <code>light</code>, and <code>matrix</code>. In the terminal, cycle with <code>t</code> (256-colour palettes, so they render correctly on every terminal, including ones without truecolor); in the <a href="#web-dashboard">web dashboard</a>, use the theme toggle in the sidebar footer. Each side remembers your choice (the dashboard's per browser).</p>
+</div>
+<div class="rail"></div>
+</div>
+</section>
+<section class="section" id="how-it-works">
+<div class="row">
+<div class="prose">
+<div class="eyebrow">Architecture</div>
+<h2 id="how-it-works">How it works <a class="anchor" href="#how-it-works" aria-label="Link to this section">#</a></h2>
+<p class="lede">A Rust workspace: core, providers, terminal UI, server, CLI.</p>
+<p>forgetop is a Rust <a href="https://doc.rust-lang.org/cargo/reference/workspaces.html">Cargo workspace</a>:</p>
+<div class="table-wrap"><table>
+<thead><tr><th>Crate</th><th>Responsibility</th></tr></thead>
+<tbody>
+<tr><td><code>forgetop-core</code></td><td>Domain model, capability-scoped provider traits, config, secrets, services</td></tr>
+<tr><td><code>forgetop-providers</code></td><td>GitHub, GitLab, Azure DevOps, Linear, Jira, Bitbucket, and Demo implementations</td></tr>
+<tr><td><code>forgetop-tui</code></td><td>The <a href="https://ratatui.rs">ratatui</a> terminal UI</td></tr>
+<tr><td><code>forgetop-server</code></td><td>The web dashboard — an <a href="https://github.com/tokio-rs/axum">axum</a> server + an embedded React SPA, over the same services</td></tr>
+<tr><td><code>forgetop-cli</code></td><td>The <code>forgetop</code> binary</td></tr>
+</tbody></table></div>
+<p>A few design ideas hold it together:</p>
+<ul>
+<li><strong>Capability-scoped traits.</strong> Providers implement <code>PullRequestSource</code>, <code>WorkItemSource</code>, and/or <code>PipelineSource</code> — only what they support. The core never assumes a provider can do something it can't, which is how a Linear connection appears for Work Items but not Pull Requests.
+</li>
+<li><strong>Sections resolve to feeds.</strong> A section binds to a set of connections; the service resolves each to a live source (a "feed"). Aggregation is just iterating every feed and tagging each item with its connection — the same shape for PRs, Work Items, and Pipelines.
+</li>
+<li><strong>Config never holds secrets.</strong> The config service persists bindings and preferences and stores only a <code>credential_ref</code> per connection; the actual token lives in the OS keychain via a separate secret store.
+</li>
+<li><strong>Immediate-mode UI, own input loop.</strong> The TUI owns a dedicated input reader thread feeding a <code>tokio</code> loop, and redraws the whole frame each tick — so there are no framework focus fights, and every keystroke is dispatched explicitly.
+</li>
+</ul>
+</div>
+<div class="rail"></div>
+</div>
+</section>
+<section class="section" id="development">
+<div class="row">
+<div class="prose">
+<div class="eyebrow">Contributing</div>
+<h2 id="development">Development <a class="anchor" href="#development" aria-label="Link to this section">#</a></h2>
+<p class="lede">Build it, test it, run it from source.</p>
+</div>
+<div class="rail"><div class="codeblock"><div class="cb-head"><span class="cb-title">from source</span><span class="cb-lang">sh</span></div><pre><code class="language-sh">cargo test        # run the test suite
+cargo clippy      # lint
+cargo run -- --demo</code></pre></div></div>
+</div>
+<div class="row">
+<div class="prose">
+<p>Source: <a href="https://github.com/magna-nz/forgetop">github.com/magna-nz/forgetop</a>.</p>
+</div>
+<div class="rail"></div>
+</div>
+</section>
+<footer class="site-foot">
+<p>forgetop is open source under the MIT licence. Source, releases, and issues live at <a href="https://github.com/magna-nz/forgetop">github.com/magna-nz/forgetop</a>; found something wrong on this page, or in the app? <a href="https://github.com/magna-nz/forgetop/issues/new?template=feedback.yml">Open a feedback issue</a>.</p>
+</footer>
+</div>
+</div>
+<script src="site.js"></script>
+</body>
+</html>
