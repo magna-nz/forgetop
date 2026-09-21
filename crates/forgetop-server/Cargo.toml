@@ -3,6 +3,20 @@ name = "forgetop-server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Local dashboard server and embedded web UI for forgetop. Internal crate: no API stability guarantees, use the `forgetop` binary instead."
+
+# What ends up in the published .crate. Two jobs:
+#
+#   1. Ship `web/dist` — the built dashboard that rust-embed bakes in. It is
+#      gitignored, and cargo skips gitignored files unless `include` names them.
+#   2. Withhold `web/src` and `web/package.json`. Without package.json, build.rs
+#      takes its "no frontend here" path, so `cargo install forgetop` never
+#      shells out to npm and needs no Node toolchain.
+#
+# `cargo publish` packages the working tree, so `web/dist` must be built BEFORE
+# publishing or the crate ships a stale or placeholder dashboard.
+include = ["src/**/*", "build.rs", "web/dist/**/*"]
 
 [dependencies]
 forgetop-core.workspace = true

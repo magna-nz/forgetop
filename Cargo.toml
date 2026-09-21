@@ -17,10 +17,14 @@ repository = "https://github.com/magna-nz/forgetop"
 homepage = "https://github.com/magna-nz/forgetop"
 
 [workspace.dependencies]
-forgetop-core = { path = "crates/forgetop-core" }
-forgetop-providers = { path = "crates/forgetop-providers" }
-forgetop-tui = { path = "crates/forgetop-tui" }
-forgetop-server = { path = "crates/forgetop-server" }
+# Internal crates. crates.io refuses a publish whose path deps carry no version
+# requirement, so each one pairs `path` (used for local builds) with a caret
+# requirement (used by the published crate). Caret, not `=`, so a version bump
+# resolves siblings to the new version without touching these four lines.
+forgetop-core = { path = "crates/forgetop-core", version = "1.0.0" }
+forgetop-providers = { path = "crates/forgetop-providers", version = "1.0.0" }
+forgetop-tui = { path = "crates/forgetop-tui", version = "1.0.0" }
+forgetop-server = { path = "crates/forgetop-server", version = "1.0.0" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

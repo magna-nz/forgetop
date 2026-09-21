@@ -3,6 +3,8 @@ name = "forgetop-providers"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "GitHub, GitLab, Azure DevOps, Bitbucket, Linear, and Jira clients for forgetop. Internal crate: no API stability guarantees, use the `forgetop` binary instead."
 
 [dependencies]
 forgetop-core.workspace = true
