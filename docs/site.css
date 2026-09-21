@@ -1,0 +1,501 @@
+/* forgetop documentation site.
+   Two columns: fixed navigation and prose, with a sticky rail beside the prose
+   for commands. Light by default, dark when the viewer asks for it. Code blocks
+   are always dark; the rail itself is the page background so a long prose run is
+   not shadowed by an empty dark band. */
+
+:root {
+  color-scheme: light;
+
+  --nav-col: 264px;
+  --code-col: 400px;
+  --rail-gap: 44px;
+  --main-pad: 40px;
+  --topbar-h: 56px;
+
+  --bg: #ffffff;
+  --bg-soft: #f7f6fc;
+  --ink: #1e2130;
+  --ink-strong: #12131f;
+  --muted: #5b6072;
+  --faint: #838799;
+  --rule: #e7e5f1;
+  --rule-strong: #d7d3e7;
+  --panel: #ffffff;
+  --accent: #5b43c9;
+  --accent-soft: #eeeafc;
+  --inline-code-bg: #f0edf9;
+  --inline-code-ink: #3f3183;
+
+  /* status palette, shared with the badges below */
+  --ok: #1a7f52;
+  --warn: #9a6400;
+  --bad: #c0392b;
+
+  /* code blocks: always dark */
+  --rail-rule: #2f2a48;
+  --code-bg: #15121f;
+  --code-ink: #ddd8ee;
+  --code-muted: #918ca8;
+  --code-head: #1f1931;
+
+  --tok-comment: #7f7a96;
+  --tok-string: #9fe0b6;
+  --tok-keyword: #b9a8ff;
+  --tok-type: #7fd7e8;
+  --tok-number: #f2b880;
+  --tok-punct: #aaa4c4;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --bg: #12111a;
+    --bg-soft: #1a1826;
+    --ink: #e3e1ee;
+    --ink-strong: #f4f3f9;
+    --muted: #9d9ab0;
+    --faint: #857fa6;
+    --rule: #272435;
+    --rule-strong: #332f45;
+    --panel: #1a1826;
+    --accent: #b9a8ff;
+    --accent-soft: #241f3c;
+    --inline-code-bg: #241f33;
+    --inline-code-ink: #cfc6f5;
+
+    --ok: #3fb984;
+    --warn: #d8a13a;
+    --bad: #e2604f;
+  }
+}
+
+* { box-sizing: border-box; }
+
+html { scroll-behavior: smooth; }
+@media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: "Inter", "Source Sans 3", "Segoe UI", system-ui, -apple-system, sans-serif;
+  font-size: 15px;
+  line-height: 1.62;
+  -webkit-font-smoothing: antialiased;
+}
+
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+a:focus-visible,
+button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 3px; }
+
+code, pre, kbd { font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+
+.prose code,
+.rail-note code {
+  background: var(--inline-code-bg);
+  color: var(--inline-code-ink);
+  font-size: 0.84em;
+  padding: 1px 5px;
+  border-radius: 3px;
+  white-space: nowrap;
+}
+.prose a code { color: var(--accent); }
+
+.skip {
+  position: absolute;
+  left: -9999px;
+  top: 0;
+  background: var(--bg);
+  color: var(--ink);
+  padding: 10px 16px;
+  z-index: 60;
+}
+.skip:focus { left: 8px; top: 8px; border: 1px solid var(--rule-strong); border-radius: 4px; }
+
+/* ---------- top bar ---------- */
+
+.topbar {
+  position: sticky;
+  top: 0;
+  z-index: 30;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  height: var(--topbar-h);
+  padding: 0 20px;
+  background: var(--bg);
+  border-bottom: 1px solid var(--rule);
+}
+.topbar img { width: 26px; height: 26px; display: block; border-radius: 6px; }
+.topbar .title { font-weight: 600; color: var(--ink-strong); letter-spacing: -0.01em; }
+.topbar .sub {
+  color: var(--muted);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  border-left: 1px solid var(--rule-strong);
+  padding-left: 12px;
+}
+.topbar .spacer { flex: 1; }
+.topbar .toplink { color: var(--muted); font-size: 13px; }
+
+/* Hamburger, only on narrow screens. */
+.nav-toggle {
+  display: none;
+  align-items: center;
+  gap: 8px;
+  background: transparent;
+  border: 1px solid var(--rule-strong);
+  border-radius: 5px;
+  color: var(--muted);
+  font: inherit;
+  font-size: 12.5px;
+  padding: 4px 10px;
+  cursor: pointer;
+}
+
+/* ---------- layout ---------- */
+
+.layout {
+  display: grid;
+  grid-template-columns: var(--nav-col) minmax(0, 1fr);
+  align-items: start;
+}
+
+/* ---------- navigation ---------- */
+
+.sidebar {
+  position: sticky;
+  top: var(--topbar-h);
+  max-height: calc(100vh - var(--topbar-h));
+  overflow-y: auto;
+  padding: 26px 16px 80px 20px;
+  border-right: 1px solid var(--rule);
+  background: var(--bg);
+  z-index: 10;
+}
+.nav-group { margin-bottom: 22px; }
+.nav-label {
+  font-size: 11px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--faint);
+  font-weight: 600;
+  margin: 0 0 8px 10px;
+}
+.sidebar ul { list-style: none; margin: 0; padding: 0; }
+.sidebar li { margin: 0; }
+.sidebar a {
+  display: block;
+  padding: 5px 10px;
+  border-radius: 5px;
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1.35;
+}
+.sidebar a:hover { background: var(--bg-soft); color: var(--ink); text-decoration: none; }
+.sidebar a.active {
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 600;
+}
+.sidebar .sub-nav { margin: 2px 0 6px 10px; border-left: 1px solid var(--rule); }
+.sidebar .sub-nav a { font-size: 13px; padding-left: 12px; }
+
+/* ---------- main ---------- */
+
+.main {
+  position: relative;
+  z-index: 1;
+  padding: 0 var(--main-pad) 140px;
+  min-width: 0;
+}
+
+.section { scroll-margin-top: calc(var(--topbar-h) + 8px); }
+/* The section divider and its top spacing belong to the whole row, so the first
+   code block starts level with the section's first line rather than above it. */
+.section > .row:first-child > .prose,
+.section > .row:first-child > .rail { padding-top: 44px; }
+.section + .section > .row:first-child { border-top: 1px solid var(--rule); margin-top: 44px; }
+
+.row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) var(--code-col);
+  gap: var(--rail-gap);
+  align-items: start;
+}
+
+.prose { min-width: 0; padding: 0 8px 20px 0; max-width: 72ch; }
+.rail {
+  min-width: 0;
+  padding: 0 0 20px;
+  /* Stay beside the prose this command belongs to while it scrolls past. The row
+     is only as tall as its prose (align-items: start), so a short rail sticks and
+     a rail taller than the viewport simply scrolls with the page. */
+  position: sticky;
+  top: calc(var(--topbar-h) + 16px);
+}
+.rail:empty { padding: 0; }
+
+h1, h2, h3, h4 { color: var(--ink-strong); line-height: 1.25; text-wrap: balance; }
+h1 { font-size: 30px; font-weight: 650; letter-spacing: -0.02em; margin: 0 0 8px; }
+h2 { font-size: 22px; font-weight: 650; letter-spacing: -0.015em; margin: 0 0 10px; }
+h3 { font-size: 16px; font-weight: 650; margin: 26px 0 8px; scroll-margin-top: calc(var(--topbar-h) + 8px); }
+h4 { font-size: 14px; font-weight: 650; margin: 20px 0 6px; }
+.section h2 { scroll-margin-top: calc(var(--topbar-h) + 8px); }
+
+.eyebrow {
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  font-size: 11px;
+  letter-spacing: 0.11em;
+  text-transform: uppercase;
+  color: var(--faint);
+  margin: 0 0 6px;
+}
+.lede { font-size: 17px; color: var(--muted); }
+
+p { margin: 0 0 14px; }
+ul, ol { margin: 0 0 14px; padding-left: 20px; }
+li { margin: 0 0 6px; }
+li > ul, li > ol { margin: 6px 0 0; }
+strong { font-weight: 650; color: var(--ink-strong); }
+em { color: var(--ink); }
+
+.anchor {
+  color: var(--faint);
+  opacity: 0;
+  margin-left: 8px;
+  font-weight: 400;
+  font-size: 0.8em;
+  text-decoration: none;
+}
+h2:hover .anchor, h3:hover .anchor, .anchor:focus { opacity: 1; }
+
+.note {
+  border-left: 3px solid var(--accent);
+  background: var(--bg-soft);
+  padding: 12px 16px;
+  border-radius: 0 5px 5px 0;
+  margin: 0 0 16px;
+}
+.note p:last-child { margin-bottom: 0; }
+
+/* ---------- provider strip ---------- */
+
+.providers {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin: 0 0 20px;
+  padding: 0;
+  list-style: none;
+}
+.providers li {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 0;
+  padding: 5px 11px 5px 9px;
+  border: 1px solid var(--rule-strong);
+  border-radius: 999px;
+  font-size: 13px;
+  color: var(--muted);
+  background: var(--panel);
+}
+.providers img { width: 15px; height: 15px; display: block; }
+/* The GitHub mark is a solid colour, so it needs the opposite fill per scheme. */
+.providers .gh-dark { display: none; }
+@media (prefers-color-scheme: dark) {
+  .providers .gh-light { display: none; }
+  .providers .gh-dark { display: block; }
+}
+
+/* ---------- surface toggle ---------- */
+
+.surface-toggle {
+  display: inline-flex;
+  margin: 0 0 18px;
+  border: 1px solid var(--rule-strong);
+  border-radius: 7px;
+  overflow: hidden;
+  background: var(--bg-soft);
+  font-size: 0;
+}
+.surface-toggle .st-btn {
+  appearance: none;
+  -webkit-appearance: none;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font-family: inherit;
+  font-size: 12.5px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  padding: 5px 14px;
+  cursor: pointer;
+  line-height: 1.4;
+}
+.surface-toggle .st-btn + .st-btn { border-left: 1px solid var(--rule-strong); }
+.surface-toggle .st-btn:hover { color: var(--ink-strong); }
+html[data-surface="dash"] .surface-toggle .st-dash,
+html[data-surface="tui"] .surface-toggle .st-tui,
+html:not([data-surface]) .surface-toggle .st-dash {
+  background: var(--accent);
+  color: #ffffff;
+}
+@media (prefers-color-scheme: dark) {
+  html[data-surface="dash"] .surface-toggle .st-dash,
+  html[data-surface="tui"] .surface-toggle .st-tui,
+  html:not([data-surface]) .surface-toggle .st-dash { color: #17122b; }
+}
+
+/* Until the script has run, show the dashboard copy: the page is complete with
+   JavaScript off, just fixed to one surface. */
+.surface-tui { display: none; }
+html[data-surface="tui"] .surface-tui { display: block; }
+html[data-surface="tui"] .surface-dash { display: none; }
+
+/* ---------- tables ---------- */
+
+.table-wrap { overflow-x: auto; margin: 0 0 18px; }
+table { border-collapse: collapse; width: 100%; font-size: 14px; }
+th, td { text-align: left; padding: 9px 14px 9px 0; border-bottom: 1px solid var(--rule); vertical-align: top; }
+th {
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  font-size: 10.5px;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--faint);
+  font-weight: 500;
+  border-bottom: 1px solid var(--rule-strong);
+  white-space: nowrap;
+}
+td:last-child, th:last-child { padding-right: 0; }
+td.mid, th.mid { text-align: center; }
+tbody tr:last-child td { border-bottom: none; }
+/* Key columns read as keys: never wrap the shortcut itself. */
+.keys td:first-child { white-space: nowrap; }
+
+/* ---------- code rail ---------- */
+
+.codeblock {
+  background: var(--code-bg);
+  border: 1px solid var(--rail-rule);
+  border-radius: 7px;
+  margin: 0 0 16px;
+  overflow: hidden;
+}
+.codeblock .cb-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 10px 7px 12px;
+  background: var(--code-head);
+  border-bottom: 1px solid var(--rail-rule);
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--code-muted);
+}
+.cb-head .cb-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cb-head .cb-lang { opacity: 0.75; }
+.copy {
+  font-family: inherit;
+  font-size: 10.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--code-muted);
+  background: transparent;
+  border: 1px solid var(--rail-rule);
+  border-radius: 4px;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+.copy:hover { color: #ffffff; border-color: #574d80; }
+.codeblock pre {
+  margin: 0;
+  padding: 13px 14px;
+  overflow-x: auto;
+  color: var(--code-ink);
+  font-size: 12.5px;
+  line-height: 1.62;
+  tab-size: 2;
+}
+.codeblock pre code { background: none; padding: 0; color: inherit; white-space: pre; }
+
+.tok-comment { color: var(--tok-comment); font-style: italic; }
+.tok-string { color: var(--tok-string); }
+.tok-keyword { color: var(--tok-keyword); }
+.tok-type { color: var(--tok-type); }
+.tok-number { color: var(--tok-number); }
+.tok-punct { color: var(--tok-punct); }
+
+.rail-note {
+  color: var(--muted);
+  font-size: 12.5px;
+  line-height: 1.6;
+  margin: -6px 0 16px;
+  padding: 0 2px;
+}
+
+/* ---------- footer ---------- */
+
+.site-foot {
+  border-top: 1px solid var(--rule);
+  margin-top: 48px;
+  padding-top: 20px;
+  color: var(--muted);
+  font-size: 13.5px;
+  max-width: 72ch;
+}
+
+/* ---------- responsive ---------- */
+
+@media (max-width: 1400px) {
+  :root { --code-col: 340px; --rail-gap: 34px; }
+}
+
+@media (max-width: 1180px) {
+  :root { --nav-col: 224px; --code-col: 300px; --rail-gap: 26px; --main-pad: 28px; }
+  .codeblock pre { font-size: 12px; }
+}
+
+@media (max-width: 900px) {
+  :root { --nav-col: 0px; --code-col: 0px; }
+  .layout { display: block; }
+  .nav-toggle { display: inline-flex; }
+  .topbar .sub { display: none; }
+  .sidebar {
+    position: static;
+    max-height: none;
+    overflow: visible;
+    border-right: none;
+    border-bottom: 1px solid var(--rule);
+    padding: 18px 20px 10px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0 28px;
+  }
+  /* Collapsed by default on a phone; the topbar button opens it. */
+  .sidebar[hidden] { display: none; }
+  .nav-group { margin-bottom: 12px; }
+  .sidebar .sub-nav { display: none; }
+  .main { padding: 0 20px 80px; }
+  .row { display: block; }
+  .prose { max-width: none; padding-right: 0; }
+  .rail { padding-bottom: 4px; position: static; }
+  .section > .row:first-child > .prose { padding-top: 30px; }
+  .section > .row:first-child > .rail { padding-top: 0; }
+  .section + .section > .row:first-child { margin-top: 30px; }
+  body { font-size: 15.5px; }
+}
+
+@media print {
+  .sidebar, .topbar, .copy { display: none; }
+  .row { display: block; }
+  .rail { position: static; }
+  .surface-tui, .surface-dash { display: block !important; }
+}
