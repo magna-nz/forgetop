@@ -322,7 +322,13 @@ async fn github_pipeline_cancel_lifecycle() {
         })
         .await
     };
-    assert!(cancelled.is_some(), "the run reads back as canceled after cancellation");
+    if cancelled.is_none() {
+        // This has failed several ways without ever saying what the run actually became,
+        // which made it look like a timeout when it may be a terminal state we don't map to
+        // Canceled. Report the observed state so the next failure is diagnosable.
+        let observed = pipe.get_run(&ItemRef::new(&run_id)).await.map(|r| format!("{:?}", r.status));
+        panic!("the run never read back as canceled after {}s — observed: {observed:?}", harness::POLL_CANCEL);
+    }
 
     // Teardown.
     raw.delete_run(&run_id).await;

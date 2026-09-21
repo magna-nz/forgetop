@@ -49,9 +49,9 @@ jobs:
       # Providers that MUST run. A provider named here whose credentials are missing
       # fails the job instead of skipping silently — a skip is otherwise
       # indistinguishable from a pass, which is how Jira went unnoticed for months.
-      # bitbucket has no CI credentials — its API rejects the account's Atlassian token
-      # (401), so it needs a scoped Bitbucket token before it can be listed here.
-      FORGETOP_IT_PROVIDERS: github,gitlab,azure,linear,jira
+      # All six providers are credentialed. Bitbucket needed a *scoped* Atlassian API token —
+      # the unscoped one Jira uses gets a 401 from the Bitbucket API, and app passwords are gone.
+      FORGETOP_IT_PROVIDERS: github,gitlab,azure,linear,jira,bitbucket
       FORGETOP_IT_GITHUB_TOKEN: ${{ secrets.FORGETOP_IT_GITHUB_TOKEN }}
       FORGETOP_IT_GITHUB_REPO: ${{ secrets.FORGETOP_IT_GITHUB_REPO }}
       FORGETOP_IT_GITLAB_TOKEN: ${{ secrets.FORGETOP_IT_GITLAB_TOKEN }}
@@ -66,6 +66,10 @@ jobs:
       FORGETOP_IT_JIRA_EMAIL: ${{ secrets.FORGETOP_IT_JIRA_EMAIL }}
       FORGETOP_IT_JIRA_SITE: ${{ secrets.FORGETOP_IT_JIRA_SITE }}
       FORGETOP_IT_JIRA_PROJECT: ${{ secrets.FORGETOP_IT_JIRA_PROJECT }}
+      FORGETOP_IT_BITBUCKET_USERNAME: ${{ secrets.FORGETOP_IT_BITBUCKET_USERNAME }}
+      FORGETOP_IT_BITBUCKET_APP_PASSWORD: ${{ secrets.FORGETOP_IT_BITBUCKET_APP_PASSWORD }}
+      FORGETOP_IT_BITBUCKET_WORKSPACE: ${{ secrets.FORGETOP_IT_BITBUCKET_WORKSPACE }}
+      FORGETOP_IT_BITBUCKET_REPO: ${{ secrets.FORGETOP_IT_BITBUCKET_REPO }}
       # The nightly schedule sweeps leaked fixtures; other runs rely on teardown.
       FORGETOP_IT_SWEEP: ${{ github.event_name == 'schedule' && '1' || '' }}
     steps:
