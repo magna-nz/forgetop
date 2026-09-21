@@ -49,8 +49,9 @@ jobs:
       # Providers that MUST run. A provider named here whose credentials are missing
       # fails the job instead of skipping silently — a skip is otherwise
       # indistinguishable from a pass, which is how Jira went unnoticed for months.
-      # Add jira once its four secrets exist; bitbucket has no CI credentials.
-      FORGETOP_IT_PROVIDERS: github,gitlab,azure,linear
+      # bitbucket has no CI credentials — its API rejects the account's Atlassian token
+      # (401), so it needs a scoped Bitbucket token before it can be listed here.
+      FORGETOP_IT_PROVIDERS: github,gitlab,azure,linear,jira
       FORGETOP_IT_GITHUB_TOKEN: ${{ secrets.FORGETOP_IT_GITHUB_TOKEN }}
       FORGETOP_IT_GITHUB_REPO: ${{ secrets.FORGETOP_IT_GITHUB_REPO }}
       FORGETOP_IT_GITLAB_TOKEN: ${{ secrets.FORGETOP_IT_GITLAB_TOKEN }}
