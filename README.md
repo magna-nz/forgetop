@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="docs/forgetop-mark.svg" alt="forgetop logo" width="104" />
+  <img src="https://raw.githubusercontent.com/magna-nz/forgetop/main/docs/forgetop-mark.svg" alt="forgetop logo" width="104" />
   <h1>forgetop</h1>
   <p><strong>Your work, across every forge in one command center.</strong></p>
   <p>A fast, keyboard-driven home for pull requests, work items, and CI pipelines in your terminal, browser, or both.</p>
@@ -7,7 +7,7 @@
     <a href="https://github.com/magna-nz/forgetop/actions/workflows/ci.yml"><img src="https://github.com/magna-nz/forgetop/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI" /></a>
     <a href="https://github.com/magna-nz/forgetop/releases/latest"><img src="https://img.shields.io/github/v/release/magna-nz/forgetop?sort=semver&label=release" alt="Latest release" /></a>
     <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey" alt="Platforms: macOS, Linux, Windows" />
-    <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-8A79E0" alt="MIT License" /></a>
+    <a href="https://github.com/magna-nz/forgetop/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-8A79E0" alt="MIT License" /></a>
     <a href="https://ko-fi.com/forgetop"><img src="https://img.shields.io/badge/Ko--fi-Support%20forgetop-FF5E5B?logo=ko-fi&logoColor=white" alt="Support forgetop on Ko-fi" /></a>
   </p>
   <p><a href="#install">Install</a> · <a href="#quick-start">Quick start</a> · <a href="#the-command-center">Command Center</a> · <a href="https://magna-nz.github.io/forgetop/">Documentation</a></p>
@@ -16,11 +16,11 @@
 <br />
 
 <div align="center">
-  <img src="docs/dashboard-live.gif" alt="forgetop dashboard live preview" width="820" />
+  <img src="https://raw.githubusercontent.com/magna-nz/forgetop/main/docs/dashboard-live.gif" alt="forgetop dashboard live preview" width="820" />
   <br />
   <sub><strong>In your browser</strong></sub>
   <br /><br />
-  <img src="docs/terminal-live.gif" alt="forgetop terminal live preview" width="820" />
+  <img src="https://raw.githubusercontent.com/magna-nz/forgetop/main/docs/terminal-live.gif" alt="forgetop terminal live preview" width="820" />
   <br />
   <sub><strong>In your terminal</strong></sub>
 </div>
@@ -42,34 +42,34 @@ per-session token, and your tokens live in your OS keychain, never in plaintext.
   <tr>
     <td align="center" width="130">
       <picture>
-        <source media="(prefers-color-scheme: dark)" srcset="docs/providers/github-dark.svg" />
-        <img src="docs/providers/github.svg" width="38" height="38" alt="GitHub" />
+        <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/magna-nz/forgetop/main/docs/providers/github-dark.svg" />
+        <img src="https://raw.githubusercontent.com/magna-nz/forgetop/main/docs/providers/github.svg" width="38" height="38" alt="GitHub" />
       </picture>
       <br />
       <sub><b>GitHub</b></sub>
     </td>
     <td align="center" width="130">
-      <img src="docs/providers/gitlab.svg" width="38" height="38" alt="GitLab" />
+      <img src="https://raw.githubusercontent.com/magna-nz/forgetop/main/docs/providers/gitlab.svg" width="38" height="38" alt="GitLab" />
       <br />
       <sub><b>GitLab</b></sub>
     </td>
     <td align="center" width="130">
-      <img src="docs/providers/azuredevops.svg" width="38" height="38" alt="Azure DevOps" />
+      <img src="https://raw.githubusercontent.com/magna-nz/forgetop/main/docs/providers/azuredevops.svg" width="38" height="38" alt="Azure DevOps" />
       <br />
       <sub><b>Azure&nbsp;DevOps</b></sub>
     </td>
     <td align="center" width="130">
-      <img src="docs/providers/bitbucket.svg" width="38" height="38" alt="Bitbucket" />
+      <img src="https://raw.githubusercontent.com/magna-nz/forgetop/main/docs/providers/bitbucket.svg" width="38" height="38" alt="Bitbucket" />
       <br />
       <sub><b>Bitbucket</b></sub>
     </td>
     <td align="center" width="130">
-      <img src="docs/providers/linear.svg" width="38" height="38" alt="Linear" />
+      <img src="https://raw.githubusercontent.com/magna-nz/forgetop/main/docs/providers/linear.svg" width="38" height="38" alt="Linear" />
       <br />
       <sub><b>Linear</b></sub>
     </td>
     <td align="center" width="130">
-      <img src="docs/providers/jira.svg" width="38" height="38" alt="Jira" />
+      <img src="https://raw.githubusercontent.com/magna-nz/forgetop/main/docs/providers/jira.svg" width="38" height="38" alt="Jira" />
       <br />
       <sub><b>Jira</b></sub>
     </td>
@@ -155,7 +155,7 @@ cargo run -- --demo
 ```
 
 See [How it works](https://magna-nz.github.io/forgetop/#how-it-works) for the crate layout,
-and [INTEGRATION.md](INTEGRATION.md) for the live provider integration tests.
+and [INTEGRATION.md](https://github.com/magna-nz/forgetop/blob/main/INTEGRATION.md) for the live provider integration tests.
 
 ## Support forgetop
 
@@ -165,4 +165,4 @@ forgetop is free and open source. If it saves you tab-switching, consider buying
 
 ## License
 
-[MIT](LICENSE)
+[MIT](https://github.com/magna-nz/forgetop/blob/main/LICENSE)
