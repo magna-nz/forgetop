@@ -301,7 +301,7 @@ async fn github_pipeline_cancel_lifecycle() {
     let run_id = {
         let raw = &raw;
         let wf = wf_file.as_str();
-        harness::poll(harness::POLL_GATE, move || async move {
+        harness::poll(harness::POLL_RUNNER, move || async move {
             raw.workflow_runs(wf).await.into_iter().find(|(_, s)| s == "in_progress").map(|(id, _)| id)
         })
         .await
@@ -314,7 +314,7 @@ async fn github_pipeline_cancel_lifecycle() {
     let cancelled = {
         let pipe = &pipe;
         let run_id = run_id.as_str();
-        harness::poll(harness::POLL_LIST, move || async move {
+        harness::poll(harness::POLL_CANCEL, move || async move {
             pipe.get_run(&ItemRef::new(run_id)).await.ok().filter(|run| matches!(run.status, PipelineRunStatus::Canceled))
         })
         .await

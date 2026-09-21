@@ -131,5 +131,7 @@ When dispatched to implement one file:
 
 ## PRs
 Branch off `main`; one PR per change; run tests + clippy + a live `--demo` check before raising it.
-Note that CI has provider secrets for GitHub/GitLab/Azure/Jira/Linear but **not Bitbucket** — implement
-Bitbucket, but it won't be covered by live integration tests.
+Note that CI has provider secrets for GitHub/GitLab/Azure/Linear but **not Jira or Bitbucket** —
+implement them, but they won't be covered by live integration tests until their secrets are added.
+The providers CI *requires* are listed in `FORGETOP_IT_PROVIDERS` (`.github/workflows/integration.yml`):
+a provider named there whose credentials are missing fails the run instead of skipping silently.
