@@ -309,7 +309,10 @@ async fn github_pipeline_cancel_lifecycle() {
     .expect("a dispatched run began executing");
 
     let pipe = gh.conn.pipelines().expect("github pipelines");
-    pipe.cancel_run(&ItemRef::new(&run_id)).await.expect("cancel");
+    // A run that has only just reached `in_progress` is not yet cancellable — GitHub answers
+    // 409 until it settles (and 500 while still queued, which the poll above already avoids).
+    let run_ref = ItemRef::new(&run_id);
+    harness::retry_write(harness::POLL_LIST, || pipe.cancel_run(&run_ref)).await.expect("cancel");
 
     let cancelled = {
         let pipe = &pipe;

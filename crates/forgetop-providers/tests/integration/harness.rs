@@ -40,9 +40,10 @@ pub fn required_providers() -> &'static [String] {
 
 /// Whether `provider` was named in `FORGETOP_IT_PROVIDERS`.
 pub fn is_required(provider: &str) -> bool {
-    // A label may carry a qualifier ("azure pipeline"); the provider is its first word.
-    let base = provider.split_whitespace().next().unwrap_or(provider).to_ascii_lowercase();
-    required_providers().contains(&base)
+    // Exact match only. A qualified label ("azure pipeline") names an *optional* extra that
+    // needs its own variable beyond the provider's credentials, so requiring "azure" must not
+    // drag it in — listing the full label is how you'd opt into requiring one.
+    required_providers().contains(&provider.to_ascii_lowercase())
 }
 
 /// Announces a credential-absence skip, or panics when the provider is required.
