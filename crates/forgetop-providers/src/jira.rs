@@ -147,7 +147,11 @@ impl WorkItemSource for JiraWi {
             "maxResults": query.limit.unwrap_or(50),
             "fields": ["summary", "description", "status", "assignee", "issuetype", "created", "updated"],
         });
-        let data = self.0.post_read(&format!("{}/search", self.0.api), body).await?;
+        // `POST /search` was REMOVED by Atlassian (410 Gone) in favour of `/search/jql`:
+        // https://developer.atlassian.com/changelog/#CHANGE-2046. Staying on the v2 API keeps
+        // `description` plain text — v3 returns Atlassian Document Format, which map_issue
+        // would have to learn to flatten.
+        let data = self.0.post_read(&format!("{}/search/jql", self.0.api), body).await?;
         Ok(get_arr(&data, "issues").iter().map(|i| map_issue(i, &self.0.site)).collect())
     }
 

@@ -248,7 +248,8 @@ pub const POLL_LIST: u64 = 45; // find a just-created item / commits / a gate cl
 pub const POLL_MERGE: u64 = 90; // a PR/MR settling to "merged"
 pub const POLL_GATE: u64 = 180; // a pipeline run reaching its approval gate
 pub const POLL_RUNNER: u64 = 300; // a dispatched run getting picked up by a hosted runner
-pub const POLL_CANCEL: u64 = 150; // a cancelled run settling — the runner has to tear down first
+pub const POLL_CANCEL: u64 = 240; // a cancelled run settling — the runner tears down a job that
+                                  // may still be mid-`sleep`, so this sits well above the fixture's 120s
 
 /// Retries a fallible write until it succeeds, or `timeout_secs` elapses (→ the last error).
 ///
