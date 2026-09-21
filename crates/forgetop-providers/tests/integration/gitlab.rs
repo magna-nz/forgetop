@@ -255,7 +255,9 @@ async fn gitlab_pipeline_cancel_lifecycle() {
     let cancelled = {
         let pipe = &pipe;
         let id = id.as_str();
-        harness::poll(harness::POLL_LIST, move || async move {
+        // Settling a cancellation means stopping a running job, which outlasts POLL_LIST —
+        // the same window GitHub's cancel readback needed.
+        harness::poll(harness::POLL_CANCEL, move || async move {
             pipe.get_run(&ItemRef::new(id)).await.ok().filter(|run| matches!(run.status, PipelineRunStatus::Canceled))
         })
         .await
