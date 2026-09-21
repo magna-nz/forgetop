@@ -1,4 +1,4 @@
 <svg width="256" height="256" viewBox="0 0 256 256" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
-  <title id="title">forgetop logo</title><desc id="desc">A layered terminal window mark derived from the forgetop dashboard icon.</desc>
-  <rect width="256" height="256" rx="56" fill="#10233B"/><path d="M48 48H208V144H144V208H48V48Z" fill="#49D17D"/><path d="M80 80H176V112H112V176H80V80Z" fill="#10233B"/><path d="M112 112H176V144H144V176H112V112Z" fill="#49D17D"/>
+  <title id="title">forgetop logo</title><desc id="desc">A command prompt chevron beside two queue rows, marking one command center for work across every forge.</desc>
+  <rect width="256" height="256" rx="56" fill="#2A1E5C"/><path d="M67 93L102 128L67 163" stroke="#B9A8FF" stroke-width="21" stroke-linecap="round" stroke-linejoin="round"/><rect x="125" y="101" width="74" height="21" rx="6" fill="#E9E2FF"/><rect x="125" y="135" width="51" height="21" rx="6" fill="#8A79E0"/>
 </svg>
