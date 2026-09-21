@@ -20,6 +20,43 @@ pub fn env(key: &str) -> Option<String> {
     std::env::var(key).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
 }
 
+/// The providers this run *requires*, from `FORGETOP_IT_PROVIDERS` (comma-separated,
+/// e.g. `github,gitlab,azure,linear`). A provider named here whose credentials are
+/// absent is a hard **failure**, not a skip.
+///
+/// This exists because a skipped provider is otherwise indistinguishable from a passing
+/// one: the suite exits 0 either way, so a credential that was never added (or that
+/// silently lapsed) reads as green. Naming a provider is the assertion that it really ran.
+/// Providers left out of the list keep the old behaviour and skip quietly when unset.
+pub fn required_providers() -> &'static [String] {
+    static REQUIRED: OnceLock<Vec<String>> = OnceLock::new();
+    REQUIRED.get_or_init(|| {
+        init();
+        env("FORGETOP_IT_PROVIDERS")
+            .map(|raw| raw.split(',').map(|p| p.trim().to_ascii_lowercase()).filter(|p| !p.is_empty()).collect())
+            .unwrap_or_default()
+    })
+}
+
+/// Whether `provider` was named in `FORGETOP_IT_PROVIDERS`.
+pub fn is_required(provider: &str) -> bool {
+    // Exact match only. A qualified label ("azure pipeline") names an *optional* extra that
+    // needs its own variable beyond the provider's credentials, so requiring "azure" must not
+    // drag it in — listing the full label is how you'd opt into requiring one.
+    required_providers().contains(&provider.to_ascii_lowercase())
+}
+
+/// Announces a credential-absence skip, or panics when the provider is required.
+///
+/// The counterpart to `skip_if_none!` for call sites that build their connection with
+/// `let ... else` instead of the macro. Call it, then `return`.
+pub fn skip_absent(provider: &str, detail: &str) {
+    if is_required(provider) {
+        panic!("{provider} is listed in FORGETOP_IT_PROVIDERS but its credentials are not set ({detail}) — add them, or drop it from the list");
+    }
+    eprintln!("SKIP {provider}: {detail}");
+}
+
 /// A stable, unique prefix for every resource this test run creates, so writes are
 /// identifiable and a leaked fixture can be swept later. Shape: `forgetop-it-<hex>`.
 /// (Used from Wave 2 onward, when tests start creating fixtures.)
@@ -210,6 +247,35 @@ pub async fn maybe_sweep<F: std::future::Future<Output = ()>>(sweep: F) {
 pub const POLL_LIST: u64 = 45; // find a just-created item / commits / a gate clearing
 pub const POLL_MERGE: u64 = 90; // a PR/MR settling to "merged"
 pub const POLL_GATE: u64 = 180; // a pipeline run reaching its approval gate
+pub const POLL_RUNNER: u64 = 300; // a dispatched run getting picked up by a hosted runner
+pub const POLL_CANCEL: u64 = 150; // a cancelled run settling — the runner has to tear down first
+
+/// Retries a fallible write until it succeeds, or `timeout_secs` elapses (→ the last error).
+///
+/// Live write APIs reject occasionally for reasons that have nothing to do with the code
+/// under test (Linear's transient `cannot delegate to Linear`, provider-side rate limits).
+/// `poll` covers *reads* settling; this covers a *write* that deserves a second attempt.
+#[allow(dead_code)]
+pub async fn retry_write<T, E, F, Fut>(timeout_secs: u64, mut f: F) -> Result<T, E>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+    E: std::fmt::Display,
+{
+    let start = std::time::Instant::now();
+    loop {
+        match f().await {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                if start.elapsed().as_secs() >= timeout_secs {
+                    return Err(e);
+                }
+                eprintln!("retrying after transient write error: {e}");
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        }
+    }
+}
 
 /// Polls `f` every 2s until it yields `Some`, or `timeout_secs` elapses (→ `None`).
 /// Used to wait on eventually-consistent API state without fixed sleeps.
@@ -238,6 +304,15 @@ macro_rules! skip_if_none {
         match $opt {
             Some(v) => v,
             None => {
+                // Named in FORGETOP_IT_PROVIDERS? Then its absence is a failure, not a skip —
+                // otherwise a missing credential would quietly read as a pass.
+                if $crate::harness::is_required($provider) {
+                    panic!(
+                        "{} is listed in FORGETOP_IT_PROVIDERS but its credentials are not set — \
+                         add them, or drop it from the list",
+                        $provider
+                    );
+                }
                 eprintln!("SKIP {}: credentials not set in the environment", $provider);
                 return;
             }

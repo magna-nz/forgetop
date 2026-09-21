@@ -10,9 +10,21 @@ on:
   schedule:
     - cron: "0 3 * * *" # nightly cleanup sweep
   workflow_dispatch:
+  # Callable so the release pipeline can gate on this suite before it builds or
+  # publishes anything. Callers must pass `secrets: inherit`.
+  # `plan` is optional and unused — dist passes it to every custom job, and an
+  # undeclared input is a hard error, so it is declared and ignored.
+  workflow_call:
+    inputs:
+      plan:
+        required: false
+        type: string
 
 concurrency:
-  group: integration-${{ github.ref }}
+  # `github.workflow` is the CALLER's name for a reusable workflow, so a run started by
+  # Release lands in a different group than the standalone one — without it they share a
+  # group on the same ref and cancel-in-progress kills one of them.
+  group: integration-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -24,10 +36,21 @@ jobs:
     runs-on: ubuntu-latest
     # Fork PRs can't read secrets — skip rather than fail. Same-repo PRs, main,
     # tags, schedule and manual runs proceed.
+    #
+    # The second clause keeps Release's dry-run off PRs: dist runs the whole release
+    # pipeline on every PR, so without it each PR would run this live suite twice and
+    # build two concurrent sets of fixtures. The release gate is what matters on a TAG,
+    # where this clause doesn't apply.
     if: >-
-      github.event_name != 'pull_request' ||
-      github.event.pull_request.head.repo.full_name == github.repository
+      (github.event_name != 'pull_request' ||
+       github.event.pull_request.head.repo.full_name == github.repository) &&
+      !(github.event_name == 'pull_request' && github.workflow == 'Release')
     env:
+      # Providers that MUST run. A provider named here whose credentials are missing
+      # fails the job instead of skipping silently — a skip is otherwise
+      # indistinguishable from a pass, which is how Jira went unnoticed for months.
+      # Add jira once its four secrets exist; bitbucket has no CI credentials.
+      FORGETOP_IT_PROVIDERS: github,gitlab,azure,linear
       FORGETOP_IT_GITHUB_TOKEN: ${{ secrets.FORGETOP_IT_GITHUB_TOKEN }}
       FORGETOP_IT_GITHUB_REPO: ${{ secrets.FORGETOP_IT_GITHUB_REPO }}
       FORGETOP_IT_GITLAB_TOKEN: ${{ secrets.FORGETOP_IT_GITLAB_TOKEN }}

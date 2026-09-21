@@ -30,7 +30,7 @@ fn assert_well_formed(page: &RepositoryPage, what: &str) {
 #[tokio::test]
 async fn github_discovery_lists_the_whole_account() {
     let Some(gh) = harness::github() else {
-        eprintln!("SKIP github: no FORGETOP_IT_GITHUB_* credentials");
+        harness::skip_absent("github", "no FORGETOP_IT_GITHUB_* credentials");
         return;
     };
     let page = gh.conn.discover_repositories().await.expect("discover repositories");
@@ -44,7 +44,7 @@ async fn github_discovery_lists_the_whole_account() {
 #[tokio::test]
 async fn gitlab_discovery_lists_the_member_projects() {
     let Some(gl) = harness::gitlab() else {
-        eprintln!("SKIP gitlab: no FORGETOP_IT_GITLAB_* credentials");
+        harness::skip_absent("gitlab", "no FORGETOP_IT_GITLAB_* credentials");
         return;
     };
     let page = gl.conn.discover_repositories().await.expect("discover projects");
@@ -64,7 +64,7 @@ async fn gitlab_discovery_lists_the_member_projects() {
 #[tokio::test]
 async fn azure_org_level_discovery_returns_project_qualified_repositories() {
     let Some(az) = harness::azure() else {
-        eprintln!("SKIP azure: no FORGETOP_IT_AZURE_* credentials");
+        harness::skip_absent("azure", "no FORGETOP_IT_AZURE_* credentials");
         return;
     };
     let page = az.conn.discover_repositories().await.expect("discover repositories org-wide");
@@ -114,7 +114,7 @@ async fn azure_org_level_discovery_returns_project_qualified_repositories() {
 #[tokio::test]
 async fn bitbucket_discovery_lists_the_workspace() {
     let Some(bb) = harness::bitbucket() else {
-        eprintln!("SKIP bitbucket: no FORGETOP_IT_BITBUCKET_* credentials (CI has none either)");
+        harness::skip_absent("bitbucket", "no FORGETOP_IT_BITBUCKET_* credentials (CI has none either)");
         return;
     };
     let page = bb.conn.discover_repositories().await.expect("discover repositories — needs Repositories: Read");
@@ -132,7 +132,7 @@ async fn bitbucket_discovery_lists_the_workspace() {
 #[tokio::test]
 async fn github_fan_out_returns_rows_only_from_the_scoped_repositories() {
     let Some(gh) = harness::github() else {
-        eprintln!("SKIP github: no FORGETOP_IT_GITHUB_* credentials");
+        harness::skip_absent("github", "no FORGETOP_IT_GITHUB_* credentials");
         return;
     };
     let page = gh.conn.discover_repositories().await.expect("discover repositories");
@@ -172,7 +172,7 @@ async fn github_fan_out_returns_rows_only_from_the_scoped_repositories() {
 #[tokio::test]
 async fn an_empty_scope_fetches_nothing_without_erroring() {
     let Some(conn) = harness::scoped(ProviderType::GitHub, vec![]) else {
-        eprintln!("SKIP github: no FORGETOP_IT_GITHUB_* credentials");
+        harness::skip_absent("github", "no FORGETOP_IT_GITHUB_* credentials");
         return;
     };
     let rows = conn

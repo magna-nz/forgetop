@@ -49,7 +49,8 @@ async fn linear_work_item_lifecycle() {
         .map(|candidate| candidate.id.clone())
         .expect("authenticated viewer appears in assignable users");
 
-    wi.set_assignee(&ItemRef::new(&id), None).await.expect("unassign");
+    let item = ItemRef::new(&id);
+    harness::retry_write(harness::POLL_LIST, || wi.set_assignee(&item, None)).await.expect("unassign");
     let unassigned = {
         let wi = &wi;
         let id = id.as_str();
@@ -57,7 +58,9 @@ async fn linear_work_item_lifecycle() {
     };
     assert!(unassigned.is_some(), "issue reports no assignee");
 
-    wi.set_assignee(&ItemRef::new(&id), Some(&viewer_id)).await.expect("assign");
+    // Linear intermittently answers this write with `cannot delegate to Linear`; every other
+    // step in this test already tolerates a transient API, so this one does too.
+    harness::retry_write(harness::POLL_LIST, || wi.set_assignee(&item, Some(&viewer_id))).await.expect("assign");
     let assigned = {
         let wi = &wi;
         let id = id.as_str();
