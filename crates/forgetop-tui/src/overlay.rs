@@ -165,9 +165,9 @@ impl Overlay {
             Overlay::Picker { .. } => vec![("↑↓", "choose"), ("↵", "select"), ("Esc", "cancel")],
             Overlay::Input { .. } => vec![("Esc", "cancel"), ("↵", "submit")],
             Overlay::Toggle { filter: Some(_), .. } => {
-                vec![("type", "search"), ("↑↓", "move"), ("↵/space", "toggle"), ("Esc", "apply")]
+                vec![("type", "search"), ("↑↓", "move"), ("space", "toggle"), ("↵", "apply")]
             }
-            Overlay::Toggle { .. } => vec![("↑↓", "move"), ("↵/space", "toggle"), ("Esc", "apply")],
+            Overlay::Toggle { .. } => vec![("↑↓", "move"), ("space", "toggle"), ("↵", "apply")],
             Overlay::Help { .. } => vec![("↑↓", "scroll"), ("Esc", "close")],
             Overlay::Palette { .. } => vec![("↑↓", "move"), ("↵", "open"), ("Esc", "cancel")],
         }
@@ -238,7 +238,7 @@ impl Overlay {
                         }
                         Outcome::Keep
                     }
-                    Key::Char(' ') | Key::Enter => {
+                    Key::Char(' ') => {
                         let on_count = items.iter().filter(|i| i.on).count();
                         if let Some(item) = visible.get(*selected).and_then(|&i| items.get_mut(i)) {
                             if item.on {
@@ -266,7 +266,10 @@ impl Overlay {
                         *selected = 0;
                         Outcome::Keep
                     }
-                    Key::Escape => {
+                    // Enter applies, matching every other overlay where Enter is the commit.
+                    // Esc keeps applying too: ticks mutate in place as you go, so there is
+                    // nothing to discard, and existing muscle memory still works.
+                    Key::Enter | Key::Escape => {
                         let ids = items.iter().filter(|i| i.on).map(|i| i.id.clone()).collect();
                         Outcome::Submit(Action::ApplyToggle { kind: kind.clone(), ids })
                     }
@@ -632,6 +635,44 @@ mod tests {
         match o.handle(Key::Escape) {
             Outcome::Submit(Action::ApplyToggle { ids, .. }) => assert_eq!(ids, vec!["0".to_string(), "2".to_string()]),
             _ => panic!("expected ApplyToggle"),
+        }
+    }
+
+    #[test]
+    fn enter_applies_and_does_not_tick_the_row() {
+        let mut o = Overlay::Toggle {
+            title: "".into(),
+            kind: ToggleKind::Sections,
+            min_one: false,
+            items: vec![item("0", true), item("1", false)],
+            selected: 1,
+            filter: None,
+        };
+        // Enter used to toggle the selected row; it must now commit what is already ticked,
+        // leaving item 1 off rather than turning it on as a side effect of applying.
+        match o.handle(Key::Enter) {
+            Outcome::Submit(Action::ApplyToggle { ids, .. }) => assert_eq!(ids, vec!["0".to_string()]),
+            _ => panic!("Enter must apply"),
+        }
+    }
+
+    #[test]
+    fn space_still_ticks_and_esc_still_applies() {
+        let mut o = Overlay::Toggle {
+            title: "".into(),
+            kind: ToggleKind::Sections,
+            min_one: false,
+            items: vec![item("0", true), item("1", false)],
+            selected: 1,
+            filter: None,
+        };
+        assert!(matches!(o.handle(Key::Char(' ')), Outcome::Keep), "space ticks without applying");
+        // Esc keeps applying: ticks mutate in place, so there is nothing to discard.
+        match o.handle(Key::Escape) {
+            Outcome::Submit(Action::ApplyToggle { ids, .. }) => {
+                assert_eq!(ids, vec!["0".to_string(), "1".to_string()])
+            }
+            _ => panic!("Esc must still apply"),
         }
     }
 

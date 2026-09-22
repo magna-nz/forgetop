@@ -46,7 +46,6 @@ pub async fn run(deps: AppDeps, theme_name: &str, dashboard_url: Option<String>)
         app.apply_views(ui.pr_views, ui.work_item_views, ui.pipeline_views);
         app.notifications = ui.notifications;
     }
-    app.reload_all(&deps).await;
 
     // First run — nothing configured, or no connection has a token yet. forgetop is a terminal
     // tool first, so ask here rather than silently handing the user to a browser: the picker
@@ -80,10 +79,14 @@ async fn event_loop(terminal: &mut Term, app: &mut App, deps: &AppDeps) -> Resul
     let mut anim = tokio::time::interval(Duration::from_millis(ANIM_MS));
     anim.tick().await;
 
+    // The first fetch is requested, not awaited. Awaiting it here meant the alternate screen
+    // was entered and then nothing was drawn until every provider had answered — a blank
+    // terminal for as long as the network took, with no spinner to say it was working.
     // Completed background jobs (refreshes) are delivered here and applied on the loop,
     // so network work never blocks rendering — the header spinner keeps animating.
     let (job_tx, mut job_rx) = mpsc::unbounded_channel::<app::AppEvent>();
     app.job_tx = Some(job_tx);
+    app.request_reload(deps);
 
     // Connections and bindings are managed in the dashboard, which shares this process's
     // ConfigService. Without this the terminal sat on stale data until the next tick — up
@@ -105,7 +108,7 @@ async fn event_loop(terminal: &mut Term, app: &mut App, deps: &AppDeps) -> Resul
             // `changed()` errors only once every sender is dropped, which cannot happen
             // while `deps` is alive; the branch then disables itself rather than spinning.
             Ok(()) = data_changed.changed() => app.request_reload(deps),
-            Some(event) = job_rx.recv() => app.on_event(event),
+            Some(event) = job_rx.recv() => app.on_event(event, deps),
             _ = anim.tick() => app.tick_anim(),
         }
     }
