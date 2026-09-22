@@ -112,6 +112,12 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/magna-nz/forgetop/relea
 irm https://github.com/magna-nz/forgetop/releases/latest/download/forgetop-installer.ps1 | iex
 ```
 
+**Cargo** ([crates.io](https://crates.io/crates/forgetop), builds from source, needs a Rust toolchain):
+
+```sh
+cargo install --locked forgetop
+```
+
 Or grab a prebuilt binary for your platform from the
 [latest release](https://github.com/magna-nz/forgetop/releases/latest) (macOS
 Apple Silicon + Intel, Linux x86_64 + arm64, Windows x86_64).
