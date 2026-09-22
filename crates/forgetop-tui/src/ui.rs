@@ -3097,6 +3097,20 @@ mod tests {
     }
 
     #[test]
+    fn a_frame_is_drawable_before_any_data_arrives() {
+        // The regression this guards: startup used to await the whole fetch before the first
+        // draw, so the terminal sat blank for as long as the network took. An app with no
+        // data must still render, and must say it is working.
+        let mut app = App::new("slate");
+        app.loading = true;
+        app.reloading = true;
+        let out = render_to_string(&mut app, 100, 24);
+
+        assert!(out.contains("forgetop"), "the chrome must be drawn with no data: {out}");
+        assert!(out.contains("Refreshing"), "the user must be told a fetch is in flight: {out}");
+    }
+
+    #[test]
     fn awaiting_setup_card_tells_you_where_to_go_and_how_to_back_out() {
         let mut app = App::new("slate");
         app.awaiting_browser_setup = true;

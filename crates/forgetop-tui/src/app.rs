@@ -114,6 +114,9 @@ struct ReloadParams {
     /// The open drill-in's `(connection_id, run)` — the run is addressed, so the background
     /// refresh reaches the same repository the view was opened from.
     open_pipeline: Option<(String, ItemRef)>,
+    /// Discover repositories during this fetch. Set only while `repo_catalog` is empty, so
+    /// discovery still runs once rather than on every poll — it just no longer runs inline.
+    seed_catalog: bool,
 }
 
 /// The PR-notification scan's new seen-sets (notifications are fired during the scan).
@@ -135,6 +138,9 @@ pub struct Reloaded {
     /// Fresh (run_id, run, approvals) for the open pipeline view, if one is open.
     open_pipeline: Option<(String, PipelineRun, Vec<PipelineApproval>)>,
     errors: Vec<String>,
+    /// Repository discovery, when this fetch was asked to seed it. `None` means "not this
+    /// time" and leaves the existing catalog alone.
+    catalog: Option<HashMap<String, RepositoryPage>>,
 }
 
 /// One pipeline run, tagged with the connection it came from (for the provider column).
@@ -1277,9 +1283,14 @@ impl App {
 
     /// Fetches the review-requested and my-PR sets and notifies on new events.
     /// Applies a completed background job on the render loop.
-    pub fn on_event(&mut self, event: AppEvent) {
+    pub fn on_event(&mut self, event: AppEvent, deps: &AppDeps) {
         match event {
-            AppEvent::Reloaded(r) => self.apply_reloaded(*r),
+            AppEvent::Reloaded(r) => {
+                self.apply_reloaded(*r);
+                // The scope indicator's denominator depends on the catalog the fetch may have
+                // just brought back, so it is recomputed here rather than inside the fetch.
+                self.refresh_repo_scope(deps);
+            }
         }
     }
 
@@ -1749,37 +1760,12 @@ impl App {
 
     // ---- data loading ----
 
-    /// A full refresh, run inline (blocking). Used for the initial load and after write
-    /// actions, where the caller wants the fresh data before continuing. The periodic
-    /// poll and manual `r` refresh go through [`request_reload`] instead, which runs the
-    /// same fetch off the render loop so the UI stays live (see the header spinner).
-    pub async fn reload_all(&mut self, deps: &AppDeps) {
-        self.loading = true;
-        self.status = "Refreshing…".into();
-        let fetched = self.fetch_bundle(deps).await;
-        self.apply_reloaded(fetched);
-        // Discovery runs once here, not on every 30s reload: the scope indicator needs a real
-        // denominator, but it doesn't need a fresh one every tick. Opening the picker refreshes it.
-        if self.repo_catalog.is_empty() {
-            self.seed_repo_catalog(deps).await;
-        }
-        self.refresh_repo_scope(deps);
-    }
-
-    /// Fills `repo_catalog` for every repo-addressed connection. Best-effort: a connection whose
-    /// discovery fails simply has no denominator, and everything else keeps working.
-    async fn seed_repo_catalog(&mut self, deps: &AppDeps) {
-        let cfg = deps.config.snapshot();
-        for c in cfg.connections.iter().filter(|c| forgetop_core::setup::is_repo_addressed(c.provider_type)) {
-            if let Ok(page) = deps.sections.discover_repositories(&c.id).await {
-                self.repo_catalog.insert(c.id.clone(), page);
-            }
-        }
-    }
-
     /// Parameters the background fetch needs, snapshotted from `self` at spawn time.
     fn reload_params(&self) -> ReloadParams {
         ReloadParams {
+            // Discovery is a once-per-session cost, so ask for it only until it has landed.
+            // It used to run inline; now it rides along with the background fetch.
+            seed_catalog: self.repo_catalog.is_empty(),
             pr_filter: self.pr_filter,
             pr_completed: self.pr_wants_completed(),
             notifications: self.notifications,
@@ -1809,12 +1795,8 @@ impl App {
             Some((conn_id, run_ref)) => fetch_open_pipeline(&deps, conn_id, run_ref).await,
             None => None,
         };
-        Reloaded { prs, wis, pipes, inbox, lp_prs_mine, lp_prs_review, health, scan, open_pipeline, errors }
-    }
-
-    /// The inline (blocking) variant used by [`reload_all`].
-    async fn fetch_bundle(&self, deps: &AppDeps) -> Reloaded {
-        Self::fetch_all(deps.clone(), self.reload_params()).await
+        let catalog = if p.seed_catalog { Some(discover_repo_catalog(&deps).await) } else { None };
+        Reloaded { prs, wis, pipes, inbox, lp_prs_mine, lp_prs_review, health, scan, open_pipeline, errors, catalog }
     }
 
     /// Folds a completed fetch back into the app state: the lists, the Launchpad, the
@@ -1834,6 +1816,9 @@ impl App {
         self.lp_prs_mine = r.lp_prs_mine;
         self.lp_prs_review = r.lp_prs_review;
         self.health = r.health;
+        if let Some(catalog) = r.catalog {
+            self.repo_catalog = catalog;
+        }
         // A connection landed while we were waiting on the browser — the reason for the
         // waiting card is gone, so retire it rather than leave it sitting over live data.
         // `health` is the same signal the first-run hint keys off, so the two agree.
@@ -2575,7 +2560,7 @@ impl App {
             1 => "Fetching from 1 repository".to_string(),
             n => format!("Fetching from {n} repositories"),
         });
-        self.reload_all(deps).await;
+        self.request_reload(deps);
         self.fix_selection();
     }
 
@@ -3298,7 +3283,7 @@ impl App {
             };
             if let Err(e) = result {
                 self.toast_error(format!("Added, but binding failed: {e}"));
-                self.reload_all(deps).await;
+                self.request_reload(deps);
                 return;
             }
         }
@@ -3307,7 +3292,7 @@ impl App {
             Some(scope) => format!("Added {} connection · {} repositories", provider.as_str(), scope.len()),
             None => format!("Added {} connection", provider.as_str()),
         });
-        self.reload_all(deps).await;
+        self.request_reload(deps);
         self.rebuild_config_view(deps).await;
 
         // First-run: let them choose which notifications to enable.
@@ -3467,7 +3452,7 @@ impl App {
         match deps.config.set_pipeline_definitions(connection_id, ids.clone()).await {
             Ok(()) => {
                 self.toast = Some(format!("Subscribed to {} pipeline(s)", ids.len()));
-                self.reload_all(deps).await;
+                self.request_reload(deps);
                 self.rebuild_config_view(deps).await;
             }
             Err(e) => self.toast = Some(format!("{e}")),
@@ -3651,7 +3636,7 @@ impl App {
         match result {
             Ok(()) => {
                 self.toast = Some("Bindings updated".into());
-                self.reload_all(deps).await;
+                self.request_reload(deps);
                 self.rebuild_config_view(deps).await;
             }
             Err(e) => self.toast = Some(format!("{e}")),
@@ -3672,7 +3657,7 @@ impl App {
         match deps.config.remove_connection(&id).await {
             Ok(()) => {
                 self.toast = Some(format!("Removed {label}"));
-                self.reload_all(deps).await;
+                self.request_reload(deps);
                 self.rebuild_config_view(deps).await;
             }
             Err(e) => self.toast_error(format!("Remove failed: {e}")),
@@ -3992,6 +3977,20 @@ fn wi_label(wi: &WorkItem) -> String {
     let id = wi.identifier.clone().map(|i| format!("{i} ")).unwrap_or_default();
     let title: String = wi.title.chars().take(40).collect();
     format!("{id}— {title}")
+}
+
+/// Discovers repositories for every repo-addressed connection, for the scope indicator's
+/// denominator. Best-effort: a connection whose discovery fails simply has no denominator.
+/// Runs inside the background fetch, never on the render loop.
+async fn discover_repo_catalog(deps: &AppDeps) -> HashMap<String, RepositoryPage> {
+    let mut catalog = HashMap::new();
+    let cfg = deps.config.snapshot();
+    for c in cfg.connections.iter().filter(|c| forgetop_core::setup::is_repo_addressed(c.provider_type)) {
+        if let Ok(page) = deps.sections.discover_repositories(&c.id).await {
+            catalog.insert(c.id.clone(), page);
+        }
+    }
+    catalog
 }
 
 /// Builds a dashboard target without retaining a stale fragment from a previous route.
@@ -4802,6 +4801,7 @@ mod tests {
                 scan: None,
                 open_pipeline: None,
                 errors: vec![private_error.into()],
+                catalog: None,
             },
             |context, message| refresh_logs.push((context.to_owned(), message.to_owned())),
         );
@@ -4963,7 +4963,54 @@ mod tests {
             scan: None,
             open_pipeline: None,
             errors: Vec::new(),
+            catalog: None,
         }
+    }
+
+    #[test]
+    fn discovery_is_requested_only_until_the_catalog_has_landed() {
+        let mut app = App::new("slate");
+        // Empty catalog: this fetch should bring discovery back with it.
+        assert!(app.reload_params().seed_catalog);
+
+        app.repo_catalog.insert("gh-1".into(), RepositoryPage::default());
+        // Already seeded: the 30s poll must not re-discover every repository forever.
+        assert!(!app.reload_params().seed_catalog);
+    }
+
+    #[test]
+    fn a_fetch_that_carried_discovery_replaces_the_catalog() {
+        let mut app = App::new("slate");
+        let mut catalog = HashMap::new();
+        catalog.insert("gh-1".into(), RepositoryPage::default());
+
+        let mut r = reloaded_with_health(Vec::new());
+        r.catalog = Some(catalog);
+        app.apply_reloaded(r);
+        assert_eq!(app.repo_catalog.len(), 1, "discovery from the background fetch must land");
+
+        // A later poll carries no catalog; that must leave the existing one alone rather
+        // than wiping the scope indicator's denominator.
+        app.apply_reloaded(reloaded_with_health(Vec::new()));
+        assert_eq!(app.repo_catalog.len(), 1, "a catalog-less refresh must not clear it");
+    }
+
+    #[tokio::test]
+    async fn a_refresh_request_returns_immediately_instead_of_fetching_inline() {
+        let deps = test_deps();
+        let mut app = App::new("slate");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        app.job_tx = Some(tx);
+
+        app.request_reload(&deps);
+        // Control is back with data still outstanding — that is what keeps the frame drawing.
+        assert!(app.loading, "the loading flag must be set for the footer indicator");
+        assert!(app.reloading, "the refresh must be in flight, not already applied");
+
+        // Single-flight: a second request while one is running must not stack another fetch.
+        app.reloading = true;
+        app.request_reload(&deps);
+        assert!(app.reloading);
     }
 
     #[tokio::test]
@@ -5233,6 +5280,7 @@ mod tests {
             lp_prs_review: vec![],
             health: vec![],
             scan: None,
+            catalog: None,
             open_pipeline: None,
             errors: vec![],
         });
