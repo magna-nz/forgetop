@@ -6,6 +6,7 @@
   <p>
     <a href="https://github.com/magna-nz/forgetop/actions/workflows/ci.yml"><img src="https://github.com/magna-nz/forgetop/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI" /></a>
     <a href="https://github.com/magna-nz/forgetop/releases/latest"><img src="https://img.shields.io/github/v/release/magna-nz/forgetop?sort=semver&label=release" alt="Latest release" /></a>
+    <a href="https://crates.io/crates/forgetop"><img src="https://img.shields.io/crates/v/forgetop?label=crates.io" alt="forgetop on crates.io" /></a>
     <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey" alt="Platforms: macOS, Linux, Windows" />
     <a href="https://github.com/magna-nz/forgetop/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-8A79E0" alt="MIT License" /></a>
     <a href="https://ko-fi.com/forgetop"><img src="https://img.shields.io/badge/Ko--fi-Support%20forgetop-FF5E5B?logo=ko-fi&logoColor=white" alt="Support forgetop on Ko-fi" /></a>
@@ -16,13 +17,13 @@
 <br />
 
 <div align="center">
-  <img src="https://raw.githubusercontent.com/magna-nz/forgetop/main/docs/dashboard-live.gif" alt="forgetop dashboard live preview" width="820" />
-  <br />
-  <sub><strong>In your browser</strong></sub>
-  <br /><br />
   <img src="https://raw.githubusercontent.com/magna-nz/forgetop/main/docs/terminal-live.gif" alt="forgetop terminal live preview" width="820" />
   <br />
   <sub><strong>In your terminal</strong></sub>
+  <br /><br />
+  <img src="https://raw.githubusercontent.com/magna-nz/forgetop/main/docs/dashboard-live.gif" alt="forgetop dashboard live preview" width="820" />
+  <br />
+  <sub><strong>In your browser</strong></sub>
 </div>
 
 <br />
