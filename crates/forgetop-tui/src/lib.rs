@@ -84,6 +84,11 @@ async fn event_loop(terminal: &mut Term, app: &mut App, deps: &AppDeps) -> Resul
     let (job_tx, mut job_rx) = mpsc::unbounded_channel::<app::AppEvent>();
     app.job_tx = Some(job_tx);
 
+    // Connections and bindings are managed in the dashboard, which shares this process's
+    // ConfigService. Without this the terminal sat on stale data until the next tick — up
+    // to REFRESH_SECS of blank screen right after a user finished setup in the browser.
+    let mut data_changed = deps.config.subscribe_data_changed();
+
     loop {
         terminal.draw(|f| ui::render(f, app)).map_err(forgetop_core::Error::from)?;
         if app.should_quit {
@@ -96,6 +101,9 @@ async fn event_loop(terminal: &mut Term, app: &mut App, deps: &AppDeps) -> Resul
                 None => break, // reader thread gone
             },
             _ = ticker.tick() => app.request_reload(deps),
+            // `changed()` errors only once every sender is dropped, which cannot happen
+            // while `deps` is alive; the branch then disables itself rather than spinning.
+            Ok(()) = data_changed.changed() => app.request_reload(deps),
             Some(event) = job_rx.recv() => app.on_event(event),
             _ = anim.tick() => app.tick_anim(),
         }

@@ -14,7 +14,7 @@ use crate::error::{Error, Result};
 
 /// A configured connection: identity, optional scope, and a reference to the PAT in
 /// the secret store (never the secret itself).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Connection {
     pub id: String,
     pub provider_type: ProviderType,

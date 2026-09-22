@@ -10,7 +10,7 @@ use crate::domain::Section;
 use crate::error::Result;
 use crate::provider::Connection;
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct PullRequestBinding {
     /// Connections whose pull requests are aggregated into the PR list.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -20,7 +20,7 @@ pub struct PullRequestBinding {
     pub connection_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct WorkItemBinding {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub connection_ids: Vec<String>,
@@ -52,7 +52,7 @@ impl WorkItemBinding {
 }
 
 /// One connection feeding the Pipelines section, plus the pipelines subscribed from it.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PipelineSubscription {
     pub connection_id: String,
     #[serde(default)]
@@ -61,7 +61,7 @@ pub struct PipelineSubscription {
     pub auto_discover_all: bool,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct PipelineBinding {
     #[serde(default)]
     pub subscriptions: Vec<PipelineSubscription>,
