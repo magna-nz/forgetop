@@ -283,6 +283,10 @@ pub struct App {
     pub overlay: Option<Overlay>,
     /// Add-connection wizard, if running. Takes priority over the overlay/screens.
     pub wizard: Option<Wizard>,
+    /// True while the user has sent setup to the browser and no connection has landed yet.
+    /// Cleared by the first reload that finds one — the dashboard and the TUI share a
+    /// ConfigService, so that reload arrives as soon as the browser saves.
+    pub awaiting_browser_setup: bool,
     /// Current screen — the list, or a full-screen sub-view like the PR diff.
     pub screen: Screen,
     /// Launchpad rows (grouped + sorted), rebuilt each refresh.
@@ -791,6 +795,7 @@ impl App {
             approval_choices: Vec::new(),
             overlay: None,
             wizard: None,
+            awaiting_browser_setup: false,
             screen: Screen::Launchpad,
             lp: Vec::new(),
             lp_overflow: launchpad::Overflow::default(),
@@ -1829,6 +1834,13 @@ impl App {
         self.lp_prs_mine = r.lp_prs_mine;
         self.lp_prs_review = r.lp_prs_review;
         self.health = r.health;
+        // A connection landed while we were waiting on the browser — the reason for the
+        // waiting card is gone, so retire it rather than leave it sitting over live data.
+        // `health` is the same signal the first-run hint keys off, so the two agree.
+        if self.awaiting_browser_setup && !self.health.is_empty() {
+            self.awaiting_browser_setup = false;
+            self.toast = Some("Connection added — you're all set".into());
+        }
         if let Some(scan) = r.scan {
             if let Some(seen) = scan.review_seen {
                 self.review_req_seen = seen;
@@ -2101,6 +2113,15 @@ impl App {
         // modes above retain priority so an uppercase F can still be typed into them.
         if key == Key::Char('F') {
             self.open_feedback();
+            return;
+        }
+        // `n` adds a connection, from anywhere. The first-run hint has always named this key,
+        // and it appears on the Launchpad as well as in empty list sections — and Launchpad
+        // returns before `on_char`, so a per-screen arm would only answer on some of them.
+        // Overlays and the quick filter are handled above, so the confirm prompt's `n` ("no")
+        // and typing `n` into a filter both still win.
+        if key == Key::Char('n') {
+            self.open_setup_picker();
             return;
         }
 
@@ -3474,12 +3495,27 @@ impl App {
 
     // ---- config / connections screen ----
 
-    /// First launch (or nothing set up): connection setup lives in the web dashboard now, so open
-    /// it instead of a terminal wizard.
+    /// First launch, or nothing set up yet: ask where to do it. forgetop is a terminal tool
+    /// first, so the choice is made here rather than by silently opening a browser.
+    pub fn open_setup_picker(&mut self) {
+        self.overlay = Some(Overlay::Picker {
+            title: "Add your provider access tokens".into(),
+            items: vec![
+                "Set up here in the terminal".into(),
+                "Set up in the browser dashboard".into(),
+            ],
+            selected: 0,
+            kind: PickerKind::SetupLocation,
+        });
+    }
+
+    /// The browser half of that choice: open the dashboard at its settings pane and show the
+    /// waiting state until a connection lands.
     pub fn start_setup(&mut self) {
         self.open_dashboard_at("#settings");
         if self.dashboard_url.is_some() {
-            self.toast = Some("Welcome to forgetop — set up your connections in the browser".into());
+            self.awaiting_browser_setup = true;
+            self.toast = Some("Waiting for setup in the browser…".into());
         }
     }
 
@@ -3740,6 +3776,8 @@ impl App {
             Action::OpenItem { kind, id, connection_id } => self.open_palette_item(kind, id, connection_id, deps).await,
             Action::OpenReviewMenu => self.open_review_submit(),
             Action::LeavePrView => self.screen = self.view_origin(),
+            Action::SetupInTerminal => self.start_add_connection(),
+            Action::SetupInBrowser => self.start_setup(),
             Action::SetStartupMode(mode) => {
                 if let Err(e) = deps.config.set_startup_mode(mode).await {
                     self.toast_error(format!("Couldn't save: {e}"));
@@ -3957,7 +3995,7 @@ fn wi_label(wi: &WorkItem) -> String {
 }
 
 /// Builds a dashboard target without retaining a stale fragment from a previous route.
-fn dashboard_target(base: &str, hash: &str) -> String {
+pub(crate) fn dashboard_target(base: &str, hash: &str) -> String {
     let base = base.split_once('#').map_or(base, |(before_hash, _)| before_hash);
     format!("{base}{hash}")
 }
@@ -4891,6 +4929,112 @@ mod tests {
             "the failed action shows a detailed error instead of success"
         );
         assert_ne!(app.toast.as_deref(), Some("Marked read"));
+    }
+
+    fn health(id: &str) -> ConnectionHealth {
+        ConnectionHealth {
+            connection: forgetop_core::provider::Connection {
+                id: id.into(),
+                provider_type: ProviderType::GitHub,
+                display_name: id.into(),
+                base_url: None,
+                organization: None,
+                project: None,
+                repository: None,
+                username: None,
+                credential_ref: Some(id.into()),
+                repo_scope: None,
+            },
+            healthy: true,
+        }
+    }
+
+    /// An otherwise-empty reload carrying just the connection health, which is the
+    /// signal the waiting card and the first-run hint both key off.
+    fn reloaded_with_health(health: Vec<ConnectionHealth>) -> Reloaded {
+        Reloaded {
+            prs: Vec::new(),
+            wis: Vec::new(),
+            pipes: Vec::new(),
+            inbox: Vec::new(),
+            lp_prs_mine: Vec::new(),
+            lp_prs_review: Vec::new(),
+            health,
+            scan: None,
+            open_pipeline: None,
+            errors: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn first_run_asks_where_to_set_up_rather_than_opening_a_browser() {
+        let mut app = App::new("slate");
+        app.open_setup_picker();
+        let Some(Overlay::Picker { title, items, selected, kind }) = &app.overlay else {
+            panic!("expected the setup picker to be open");
+        };
+        assert!(title.contains("access tokens"), "title should say what it wants: {title}");
+        assert_eq!(items.len(), 2);
+        assert!(items[0].contains("terminal"), "the terminal must come first: {items:?}");
+        assert!(items[1].contains("browser"));
+        assert_eq!(*selected, 0, "the terminal is the default");
+        assert!(matches!(kind, PickerKind::SetupLocation));
+        // Nothing has been launched yet — the choice is still the user's.
+        assert!(!app.awaiting_browser_setup);
+        assert!(app.wizard.is_none());
+    }
+
+    #[tokio::test]
+    async fn choosing_the_terminal_opens_the_wizard_and_not_the_browser() {
+        let deps = test_deps();
+        let mut app = App::new("slate");
+        app.dashboard_url = Some("http://127.0.0.1:1/".into());
+        app.open_setup_picker();
+        app.on_key(Key::Enter, &deps).await;
+
+        assert!(app.wizard.is_some(), "the terminal choice must start the wizard");
+        assert!(!app.awaiting_browser_setup, "nothing should be waiting on a browser");
+        assert!(app.overlay.is_none(), "the picker should be gone");
+    }
+
+    #[tokio::test]
+    async fn choosing_the_browser_waits_instead_of_leaving_an_empty_screen() {
+        let deps = test_deps();
+        let mut app = App::new("slate");
+        app.dashboard_url = Some("http://127.0.0.1:1/".into());
+        app.open_setup_picker();
+        app.on_key(Key::Down, &deps).await;
+        app.on_key(Key::Enter, &deps).await;
+
+        assert!(app.awaiting_browser_setup, "the browser choice must show the waiting state");
+        assert!(app.wizard.is_none());
+    }
+
+    #[tokio::test]
+    async fn waiting_state_clears_once_a_connection_lands() {
+        let mut app = App::new("slate");
+        app.awaiting_browser_setup = true;
+
+        // A reload that still finds nothing configured must keep waiting, or the card
+        // would vanish the moment the periodic tick fired and leave a blank screen.
+        app.apply_reloaded(reloaded_with_health(Vec::new()));
+        assert!(app.awaiting_browser_setup, "an empty reload must not clear the waiting state");
+
+        app.apply_reloaded(reloaded_with_health(vec![health("gh-1")]));
+        assert!(!app.awaiting_browser_setup, "a connection landing must clear it");
+        assert!(app.toast.as_deref().unwrap_or_default().contains("all set"));
+    }
+
+    #[tokio::test]
+    async fn n_reopens_the_setup_picker() {
+        let deps = test_deps();
+        let mut app = App::new("slate");
+        // The first-run hint has always told users to press `n`; before this it did nothing.
+        app.on_key(Key::Char('n'), &deps).await;
+        assert!(
+            matches!(&app.overlay, Some(Overlay::Picker { kind: PickerKind::SetupLocation, .. })),
+            "`n` must open the setup picker"
+        );
     }
 
     #[tokio::test]

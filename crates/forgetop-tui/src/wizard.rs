@@ -79,19 +79,23 @@ impl Default for Wizard {
     }
 }
 
+/// Human label for a provider in the picker. `as_str` is the serialised form, which
+/// renders Azure DevOps without its space.
+fn provider_label(p: ProviderType) -> &'static str {
+    match p {
+        ProviderType::AzureDevOps => "Azure DevOps",
+        other => other.as_str(),
+    }
+}
+
 impl Wizard {
     pub fn new() -> Self {
-        let providers = vec![
-            "Demo".into(),
-            "GitHub".into(),
-            "Azure DevOps".into(),
-            "Linear".into(),
-            "GitLab".into(),
-            "Jira".into(),
-            "Bitbucket".into(),
-        ];
+        // One source of truth with the dashboard. The hand-written list this replaced had
+        // drifted: it offered `Demo` as a real choice and ordered the rest differently, so
+        // the two setup paths disagreed about what you could connect to.
+        let providers = forgetop_core::setup::selectable_providers().into_iter().map(provider_label).map(String::from).collect();
         let mut queue = VecDeque::new();
-        queue.push_back(Prompt::pick(Field::Provider, "Provider", "Which platform this connection talks to", providers, 1));
+        queue.push_back(Prompt::pick(Field::Provider, "Provider", "Which platform this connection talks to", providers, 0));
         Wizard { queue, draft: Draft::default(), done: 0 }
     }
 
@@ -163,15 +167,10 @@ impl Wizard {
     fn store(&mut self, prompt: &Prompt) {
         match (&prompt.field, &prompt.kind) {
             (Field::Provider, PromptKind::Pick { selected, .. }) => {
-                self.draft.provider = Some(match selected {
-                    0 => ProviderType::Demo,
-                    1 => ProviderType::GitHub,
-                    2 => ProviderType::AzureDevOps,
-                    3 => ProviderType::Linear,
-                    4 => ProviderType::GitLab,
-                    5 => ProviderType::Jira,
-                    _ => ProviderType::Bitbucket,
-                });
+                // Index straight back into the same list the prompt was built from, so the
+                // labels and the resulting ProviderType cannot drift apart again.
+                let providers = forgetop_core::setup::selectable_providers();
+                self.draft.provider = providers.get(*selected).copied().or_else(|| providers.first().copied());
             }
             (Field::DisplayName, PromptKind::Text { buffer, .. }) => self.draft.display_name = buffer.trim().to_string(),
             (Field::BaseUrl, PromptKind::Text { buffer, .. }) => self.draft.base_url = non_empty(buffer),
@@ -280,9 +279,15 @@ mod tests {
     #[test]
     fn linear_only_asks_for_key_and_binds_work_items() {
         let mut w = Wizard::new();
-        // Move provider selection to Linear (index 3): default is GitHub (1) -> Down twice.
-        w.handle(Key::Down); // 1 -> 2 (Azure DevOps)
-        w.handle(Key::Down); // 2 -> 3 (Linear)
+        // The list is `setup::selectable_providers()`: GitHub, GitLab, Azure DevOps,
+        // Bitbucket, Linear, Jira — default GitHub (0), so Linear (4) is four Downs.
+        let linear = forgetop_core::setup::selectable_providers()
+            .iter()
+            .position(|p| *p == ProviderType::Linear)
+            .expect("Linear is selectable");
+        for _ in 0..linear {
+            w.handle(Key::Down);
+        }
         w.handle(Key::Enter);
         assert_eq!(w.draft.provider, Some(ProviderType::Linear));
         // Display name.
