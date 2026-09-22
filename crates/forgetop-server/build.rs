@@ -16,16 +16,22 @@ fn main() {
     let web = Path::new("web");
     let dist = web.join("dist");
 
-    // Only the frontend sources should trigger a rebuild — Rust-side edits must not re-run npm.
-    println!("cargo:rerun-if-changed=web/src");
-    println!("cargo:rerun-if-changed=web/index.html");
-    println!("cargo:rerun-if-changed=web/package.json");
-    println!("cargo:rerun-if-changed=web/vite.config.ts");
-    println!("cargo:rerun-if-env-changed=FORGETOP_SKIP_WEB_BUILD");
-
     let has_web = web.join("package.json").exists();
     let skip = std::env::var_os("FORGETOP_SKIP_WEB_BUILD").is_some();
     let ci = std::env::var_os("CI").is_some();
+
+    // Only the frontend sources should trigger a rebuild — Rust-side edits must not re-run npm.
+    // The crates.io package ships `web/dist` and no frontend sources at all; naming paths that
+    // don't exist there would make cargo re-run this script on every build, so they're only
+    // registered when the sources are present. The env line always goes out, which is what keeps
+    // cargo from falling back to "re-run whenever any file changes".
+    if has_web {
+        println!("cargo:rerun-if-changed=web/src");
+        println!("cargo:rerun-if-changed=web/index.html");
+        println!("cargo:rerun-if-changed=web/package.json");
+        println!("cargo:rerun-if-changed=web/vite.config.ts");
+    }
+    println!("cargo:rerun-if-env-changed=FORGETOP_SKIP_WEB_BUILD");
 
     if has_web && !skip {
         if which_npm() {

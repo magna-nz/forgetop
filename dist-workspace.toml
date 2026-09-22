@@ -12,7 +12,7 @@ installers = ["shell", "powershell", "homebrew"]
 # A GitHub repo to push Homebrew formulas to
 tap = "magna-nz/homebrew-tap"
 # Publish jobs to run in CI
-publish-jobs = ["homebrew"]
+publish-jobs = ["homebrew", "./publish-crates"]
 # Plan jobs to run in CI
 plan-jobs = ["./integration"]
 # Target platforms to build apps for (Rust target-triple syntax)

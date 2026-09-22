@@ -3,6 +3,8 @@ name = "forgetop-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Domain model, configuration, and keychain-backed token storage for forgetop. Internal crate: no API stability guarantees, use the `forgetop` binary instead."
 
 [dependencies]
 serde.workspace = true
