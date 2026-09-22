@@ -3275,22 +3275,38 @@ impl App {
             .ok()
             .flatten();
 
-        if let Some(section) = draft.bind_section {
+        // Bind every section that was ticked. One failing section does not abandon the rest:
+        // the connection already exists, so the useful outcome is "bound what it could" plus
+        // an honest message about what it could not.
+        let mut bound = 0usize;
+        let mut failed: Vec<String> = Vec::new();
+        for section in &draft.bind_sections {
             let result = match section {
                 Section::PullRequests => deps.config.bind_pull_requests(&id).await,
                 Section::WorkItems => deps.config.bind_work_items(&id).await,
                 Section::Pipelines => deps.config.set_pipeline_auto_discover(&id, true).await,
             };
-            if let Err(e) = result {
-                self.toast_error(format!("Added, but binding failed: {e}"));
-                self.request_reload(deps);
-                return;
+            match result {
+                Ok(()) => bound += 1,
+                Err(e) => failed.push(format!("{}: {e}", section_label(*section))),
             }
         }
 
+        if !failed.is_empty() {
+            self.toast_error(format!("Added, but binding failed — {}", failed.join("; ")));
+            self.request_reload(deps);
+            self.rebuild_config_view(deps).await;
+            return;
+        }
+
+        let sections = match bound {
+            0 => String::new(),
+            1 => " · 1 section".to_string(),
+            n => format!(" · {n} sections"),
+        };
         self.toast = Some(match &seeded {
-            Some(scope) => format!("Added {} connection · {} repositories", provider.as_str(), scope.len()),
-            None => format!("Added {} connection", provider.as_str()),
+            Some(scope) => format!("Added {} connection · {} repositories{sections}", provider.as_str(), scope.len()),
+            None => format!("Added {} connection{sections}", provider.as_str()),
         });
         self.request_reload(deps);
         self.rebuild_config_view(deps).await;

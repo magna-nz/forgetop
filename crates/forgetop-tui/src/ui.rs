@@ -1178,6 +1178,9 @@ fn base_footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
     if let Some(wizard) = &app.wizard {
         return match wizard.current() {
             Some(Prompt { kind: PromptKind::Pick { .. }, .. }) => vec![("↑↓", "choose"), ("↵", "next"), ("Esc", "cancel")],
+            Some(Prompt { kind: PromptKind::Multi { .. }, .. }) => {
+                vec![("↑↓", "move"), ("space", "toggle"), ("↵", "next"), ("Esc", "cancel")]
+            }
             Some(_) => vec![("type", "value"), ("↵", "next"), ("Esc", "cancel")],
             None => vec![("Esc", "cancel")],
         };
@@ -2282,6 +2285,19 @@ fn render_wizard(frame: &mut Frame, area: Rect, app: &App) {
                 }
             }
         }
+        PromptKind::Multi { items, on, selected } => {
+            for (i, item) in items.iter().enumerate() {
+                let tick = if on.get(i).copied().unwrap_or(false) { "[x]" } else { "[ ]" };
+                if i == *selected {
+                    lines.push(Line::from(vec![
+                        Span::styled(" ▐ ", Style::default().fg(accent)),
+                        Span::styled(format!("{tick} {item}"), Style::default().fg(accent).add_modifier(Modifier::BOLD)),
+                    ]));
+                } else {
+                    lines.push(Line::from(Span::styled(format!("   {tick} {item}"), Style::default().fg(theme.fg))));
+                }
+            }
+        }
     }
 
     let hint = footer_keys(app)
@@ -3156,6 +3172,29 @@ mod tests {
         assert!(out.contains("Provider"), "prompt label");
         assert!(out.contains("GitHub") && out.contains("Linear"), "provider options");
         assert!(out.contains("choose") && out.contains("cancel"), "wizard footer hints");
+    }
+
+    #[test]
+    fn the_bind_step_renders_a_checklist_with_everything_ticked() {
+        let mut app = App::new("slate");
+        let mut w = crate::wizard::Wizard::new();
+        // Walk to the bind step: provider, display name, repository, token.
+        w.handle(crate::app::Key::Enter);
+        w.handle(crate::app::Key::Enter);
+        w.handle(crate::app::Key::Enter);
+        for c in "ghp_x".chars() {
+            w.handle(crate::app::Key::Char(c));
+        }
+        w.handle(crate::app::Key::Enter);
+        app.wizard = Some(w);
+
+        let out = render_to_string(&mut app, 100, 30);
+        assert!(out.contains("Sections to populate"), "{out}");
+        assert!(out.contains("[x] Pull Requests"), "rows start ticked: {out}");
+        // The old single-choice affordance is gone; the help line explains the replacement.
+        assert!(!out.contains("Don't bind now"), "{out}");
+        assert!(out.contains("nothing ticked skips"), "{out}");
+        assert!(out.contains("space"), "the hint must name the toggle key: {out}");
     }
 
     #[test]

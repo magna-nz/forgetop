@@ -24,6 +24,10 @@ pub enum Field {
 pub enum PromptKind {
     Text { buffer: String, secret: bool },
     Pick { items: Vec<String>, selected: usize },
+    /// A checklist: space ticks a row, Enter moves on. Used for section binding, where a
+    /// connection usually populates more than one section and picking exactly one was the
+    /// wrong shape.
+    Multi { items: Vec<String>, on: Vec<bool>, selected: usize },
 }
 
 pub struct Prompt {
@@ -45,6 +49,12 @@ impl Prompt {
     fn pick(field: Field, label: &str, help: &str, items: Vec<String>, selected: usize) -> Self {
         Prompt { field, label: label.into(), help: help.into(), required: true, kind: PromptKind::Pick { items, selected } }
     }
+    /// Every row starts ticked: a connection is normally wanted for everything it supports,
+    /// and unticking is the exception.
+    fn multi(field: Field, label: &str, help: &str, items: Vec<String>) -> Self {
+        let on = vec![true; items.len()];
+        Prompt { field, label: label.into(), help: help.into(), required: false, kind: PromptKind::Multi { items, on, selected: 0 } }
+    }
 }
 
 /// The connection being assembled. Empty text fields become `None`.
@@ -58,7 +68,7 @@ pub struct Draft {
     pub repository: Option<String>,
     pub username: Option<String>,
     pub pat: Option<String>,
-    pub bind_section: Option<Section>,
+    pub bind_sections: Vec<Section>,
 }
 
 pub struct Wizard {
@@ -124,6 +134,29 @@ impl Wizard {
                 Key::Escape => WizardOutcome::Cancel,
                 _ => WizardOutcome::Keep,
             },
+            PromptKind::Multi { items, on, selected } => match key {
+                Key::Up | Key::Char('k') => {
+                    if !items.is_empty() {
+                        *selected = (*selected + items.len() - 1) % items.len();
+                    }
+                    WizardOutcome::Keep
+                }
+                Key::Down | Key::Char('j') => {
+                    if !items.is_empty() {
+                        *selected = (*selected + 1) % items.len();
+                    }
+                    WizardOutcome::Keep
+                }
+                Key::Char(' ') => {
+                    if let Some(flag) = on.get_mut(*selected) {
+                        *flag = !*flag;
+                    }
+                    WizardOutcome::Keep
+                }
+                Key::Enter => self.advance(),
+                Key::Escape => WizardOutcome::Cancel,
+                _ => WizardOutcome::Keep,
+            },
             PromptKind::Pick { items, selected } => match key {
                 Key::Up | Key::Char('k') => {
                     if !items.is_empty() {
@@ -179,8 +212,13 @@ impl Wizard {
             (Field::Project, PromptKind::Text { buffer, .. }) => self.draft.project = non_empty(buffer),
             (Field::Repository, PromptKind::Text { buffer, .. }) => self.draft.repository = non_empty(buffer),
             (Field::Pat, PromptKind::Text { buffer, .. }) => self.draft.pat = non_empty(buffer),
-            (Field::Bind, PromptKind::Pick { items, selected }) => {
-                self.draft.bind_section = items.get(*selected).and_then(|l| section_from_label(l));
+            (Field::Bind, PromptKind::Multi { items, on, .. }) => {
+                self.draft.bind_sections = items
+                    .iter()
+                    .zip(on.iter())
+                    .filter(|(_, ticked)| **ticked)
+                    .filter_map(|(label, _)| section_from_label(label))
+                    .collect();
             }
             _ => {}
         }
@@ -198,9 +236,13 @@ impl Wizard {
                 self.queue.push_back(Prompt::text(field, &spec.label, &spec.help, spec.required, spec.default.as_deref().unwrap_or("")));
             }
         }
-        let mut items: Vec<String> = provider_sections(provider).into_iter().map(|s| section_label(s).to_string()).collect();
-        items.push("Don't bind now".into());
-        self.queue.push_back(Prompt::pick(Field::Bind, "Bind to section", "Which section this connection populates", items, 0));
+        let items: Vec<String> = provider_sections(provider).into_iter().map(|s| section_label(s).to_string()).collect();
+        self.queue.push_back(Prompt::multi(
+            Field::Bind,
+            "Sections to populate",
+            "Space toggles a section · nothing ticked skips binding for now",
+            items,
+        ));
     }
 }
 
@@ -265,7 +307,8 @@ mod tests {
         assert!(matches!(w.handle(Key::Enter), WizardOutcome::Keep));
         typ(&mut w, "ghp_xyz");
         w.handle(Key::Enter);
-        // Bind pick defaults to first section (Pull Requests) — Enter commits.
+        // The bind step is a checklist with everything GitHub supports already ticked,
+        // so Enter commits the lot without any further input.
         assert!(matches!(w.handle(Key::Enter), WizardOutcome::Commit));
 
         let d = &w.draft;
@@ -273,7 +316,7 @@ mod tests {
         assert_eq!(d.display_name, "GitHub");
         assert_eq!(d.repository.as_deref(), Some("octo/repo"));
         assert_eq!(d.pat.as_deref(), Some("ghp_xyz"));
-        assert_eq!(d.bind_section, Some(Section::PullRequests));
+        assert_eq!(d.bind_sections, provider_sections(ProviderType::GitHub));
     }
 
     #[test]
@@ -295,8 +338,44 @@ mod tests {
         // API key.
         typ(&mut w, "lin_key");
         w.handle(Key::Enter);
-        // Bind: only Work Items + "Don't bind now" offered.
+        // Bind: Linear only supports Work Items, so that is the only row, ticked.
         assert!(matches!(w.handle(Key::Enter), WizardOutcome::Commit));
-        assert_eq!(w.draft.bind_section, Some(Section::WorkItems));
+        assert_eq!(w.draft.bind_sections, vec![Section::WorkItems]);
+    }
+
+    #[test]
+    fn space_unticks_a_section_and_the_rest_still_bind() {
+        let mut w = Wizard::new();
+        w.handle(Key::Enter); // GitHub
+        w.handle(Key::Enter); // display name (prefilled)
+        w.handle(Key::Enter); // repository (optional, blank)
+        typ(&mut w, "ghp_xyz");
+        w.handle(Key::Enter);
+
+        // On the checklist: untick the first row, leave the others.
+        let all = provider_sections(ProviderType::GitHub);
+        assert!(all.len() > 1, "this test needs a provider supporting several sections");
+        w.handle(Key::Char(' '));
+        assert!(matches!(w.handle(Key::Enter), WizardOutcome::Commit));
+
+        assert_eq!(w.draft.bind_sections, all[1..].to_vec(), "only the unticked row is dropped");
+    }
+
+    #[test]
+    fn unticking_everything_binds_nothing_and_still_commits() {
+        let mut w = Wizard::new();
+        w.handle(Key::Enter);
+        w.handle(Key::Enter);
+        w.handle(Key::Enter);
+        typ(&mut w, "ghp_xyz");
+        w.handle(Key::Enter);
+
+        // "Don't bind now" used to be a row; it is now simply an empty checklist.
+        for _ in 0..provider_sections(ProviderType::GitHub).len() {
+            w.handle(Key::Char(' '));
+            w.handle(Key::Down);
+        }
+        assert!(matches!(w.handle(Key::Enter), WizardOutcome::Commit));
+        assert!(w.draft.bind_sections.is_empty(), "nothing ticked binds nothing");
     }
 }
