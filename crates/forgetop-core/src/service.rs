@@ -2,6 +2,8 @@
 
 use std::sync::{Arc, Mutex};
 
+use tokio::sync::watch;
+
 use crate::config::*;
 use crate::domain::Section;
 use crate::error::{Error, Result};
@@ -16,11 +18,22 @@ pub struct ConfigService {
     secrets: Arc<dyn SecretStore>,
     registry: Arc<ProviderRegistry>,
     config: Mutex<ForgetopConfig>,
+    /// Bumped whenever a persisted change alters what should be fetched — connections
+    /// or section bindings, never UI preferences. The dashboard and the TUI share one
+    /// `ConfigService`, so this is how a connection added in the browser reaches the
+    /// terminal without waiting for the refresh tick.
+    data_changed: watch::Sender<u64>,
 }
 
 impl ConfigService {
     pub fn new(store: Arc<dyn ConfigStore>, secrets: Arc<dyn SecretStore>, registry: Arc<ProviderRegistry>) -> Self {
-        Self { store, secrets, registry, config: Mutex::new(ForgetopConfig::default()) }
+        Self {
+            store,
+            secrets,
+            registry,
+            config: Mutex::new(ForgetopConfig::default()),
+            data_changed: watch::channel(0).0,
+        }
     }
 
     pub async fn load(&self) -> Result<()> {
@@ -35,8 +48,25 @@ impl ConfigService {
 
     async fn persist(&self, cfg: ForgetopConfig) -> Result<()> {
         self.store.save(&cfg).await?;
-        *self.config.lock().unwrap() = cfg;
+        let fetch_changed = {
+            let mut current = self.config.lock().unwrap();
+            let changed = !same_fetch_inputs(&current, &cfg);
+            *current = cfg;
+            changed
+        };
+        // Deliberately after the lock is released, and only for changes that alter what
+        // gets fetched: a theme or sort tweak must not cost a round of network calls.
+        if fetch_changed {
+            self.data_changed.send_modify(|generation| *generation += 1);
+        }
         Ok(())
+    }
+
+    /// Fires whenever connections or section bindings change, from anywhere in the
+    /// process. A `watch` channel coalesces bursts, so the multi-step setup flow
+    /// (add connection, then bind each section) settles into one reload rather than four.
+    pub fn subscribe_data_changed(&self) -> watch::Receiver<u64> {
+        self.data_changed.subscribe()
     }
 
     fn ensure_supports(&self, cfg: &ForgetopConfig, connection_id: &str, section: Section) -> Result<()> {
@@ -520,6 +550,17 @@ impl ConnectionHealthService {
     }
 }
 
+
+/// Whether two configs would produce the same fetches. Compares every field except
+/// `ui`, so a new data-bearing field is included by default rather than being silently
+/// forgotten — the failure mode we want is a redundant refresh, not a stale screen.
+fn same_fetch_inputs(a: &ForgetopConfig, b: &ForgetopConfig) -> bool {
+    a.connections == b.connections
+        && a.pull_requests == b.pull_requests
+        && a.work_items == b.work_items
+        && a.pipelines == b.pipelines
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -597,6 +638,53 @@ mod tests {
         svc.add_or_update_connection(conn("gh-1", ProviderType::GitHub), Some("pat".into())).await.unwrap();
         assert_eq!(svc.snapshot().connections.len(), 1);
         assert_eq!(secrets.get("gh-1").unwrap().as_deref(), Some("pat"));
+    }
+
+    #[tokio::test]
+    async fn connection_and_binding_changes_notify_subscribers() {
+        let (svc, _) = service();
+        let mut rx = svc.subscribe_data_changed();
+
+        svc.add_or_update_connection(conn("gh-1", ProviderType::GitHub), Some("pat".into())).await.unwrap();
+        assert!(rx.has_changed().unwrap(), "adding a connection must wake the TUI");
+        rx.borrow_and_update();
+
+        svc.bind_pull_requests("gh-1").await.unwrap();
+        assert!(rx.has_changed().unwrap(), "binding a section must wake the TUI");
+        rx.borrow_and_update();
+
+        svc.remove_connection("gh-1").await.unwrap();
+        assert!(rx.has_changed().unwrap(), "removing a connection must wake the TUI");
+    }
+
+    #[tokio::test]
+    async fn ui_preferences_do_not_notify_subscribers() {
+        let (svc, _) = service();
+        svc.add_or_update_connection(conn("gh-1", ProviderType::GitHub), None).await.unwrap();
+        let rx = svc.subscribe_data_changed();
+
+        // None of these change what gets fetched, so none should cost a round of
+        // network calls. This is the half of the behaviour that regresses silently.
+        svc.set_theme(Some("slate".into())).await.unwrap();
+        svc.set_startup_mode(crate::config::StartupMode::TerminalOnly).await.unwrap();
+        svc.set_hidden_sections(vec![Section::Pipelines]).await.unwrap();
+        svc.set_notifications(NotificationPrefs::default()).await.unwrap();
+
+        assert!(!rx.has_changed().unwrap(), "a UI preference must not trigger a refetch");
+    }
+
+    #[tokio::test]
+    async fn rewriting_an_identical_connection_does_not_notify() {
+        let (svc, _) = service();
+        svc.add_or_update_connection(conn("gh-1", ProviderType::GitHub), None).await.unwrap();
+        let rx = svc.subscribe_data_changed();
+
+        // The dashboard re-saves on every form submit, including no-op ones.
+        let mut same = conn("gh-1", ProviderType::GitHub);
+        same.credential_ref = Some("gh-1".into());
+        svc.add_or_update_connection(same, None).await.unwrap();
+
+        assert!(!rx.has_changed().unwrap(), "an unchanged rewrite must not trigger a refetch");
     }
 
     #[tokio::test]
