@@ -48,12 +48,13 @@ pub async fn run(deps: AppDeps, theme_name: &str, dashboard_url: Option<String>)
     }
     app.reload_all(&deps).await;
 
-    // First run — nothing configured, or no connection has a token yet: open the web dashboard
-    // for setup (connections are managed there now), rather than a terminal wizard. Otherwise, on
-    // the "Both" startup preference (the default) open the dashboard alongside the TUI.
+    // First run — nothing configured, or no connection has a token yet. forgetop is a terminal
+    // tool first, so ask here rather than silently handing the user to a browser: the picker
+    // offers the in-terminal wizard or the dashboard, and `n` reopens it at any time.
+    // Otherwise, on the "Both" startup preference (the default) open the dashboard alongside.
     let cfg = deps.config.snapshot();
     if cfg.connections.is_empty() || cfg.connections.iter().all(|c| c.credential_ref.is_none()) {
-        app.start_setup();
+        app.open_setup_picker();
     } else if forgetop_core::config::StartupMode::effective(cfg.ui.startup_mode)
         == forgetop_core::config::StartupMode::Both
     {

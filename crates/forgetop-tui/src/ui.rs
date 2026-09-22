@@ -10,7 +10,7 @@ use ratatui::widgets::{
 };
 use ratatui::Frame;
 
-use crate::app::{App, ConfigView, DiffFocus, DiffView, LpSlot, PipelineView, PrView, Screen, WiView, PR_TABS, TABS};
+use crate::app::{dashboard_target, App, ConfigView, DiffFocus, DiffView, LpSlot, PipelineView, PrView, Screen, WiView, PR_TABS, TABS};
 use crate::diff::{cursor_line_label, pending_marks};
 use crate::highlight::{lang_for, HlKind, LineHighlighter};
 use crate::overlay::Overlay;
@@ -20,6 +20,9 @@ use crate::wizard::{Prompt, PromptKind};
 
 /// Shown in empty sections when nothing is configured yet.
 const FIRST_RUN_HINT: &str = "No connections yet — press n to add one, or C for config.";
+
+/// Shown while setup has been handed to the browser and no connection has landed yet.
+const AWAITING_SETUP_TITLE: &str = " Setting up in your browser ";
 
 pub fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
@@ -58,7 +61,59 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         render_wizard(frame, area, app);
     } else if app.overlay.is_some() {
         render_overlay(frame, area, app);
+    } else if app.awaiting_browser_setup {
+        render_awaiting_setup(frame, area, app);
     }
+}
+
+/// The "waiting for setup in the browser" card. Ranks below the wizard and any overlay:
+/// if the user has opened either, that is what they are doing now.
+fn render_awaiting_setup(frame: &mut Frame, area: Rect, app: &App) {
+    let theme = &app.theme;
+    let accent = theme.accent;
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(Span::styled(
+        "Add your provider access tokens in the dashboard.",
+        Style::default().fg(theme.fg).add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(""));
+    match app.dashboard_url.as_deref() {
+        Some(url) => lines.push(Line::from(vec![
+            Span::styled("It should be open at ", Style::default().fg(theme.dim)),
+            Span::styled(dashboard_target(url, "#settings"), Style::default().fg(accent)),
+        ])),
+        None => lines.push(Line::from(Span::styled(
+            "Start it with `forgetop --dashboard`.",
+            Style::default().fg(theme.dim),
+        ))),
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "This screen updates on its own as soon as a connection is saved.",
+        Style::default().fg(theme.dim),
+    )));
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled(" n ", Style::default().fg(theme.bg).bg(accent).add_modifier(Modifier::BOLD)),
+        Span::styled("  set up here instead   ", Style::default().fg(theme.dim)),
+        Span::styled(" B ", Style::default().fg(theme.bg).bg(accent).add_modifier(Modifier::BOLD)),
+        Span::styled("  reopen the dashboard", Style::default().fg(theme.dim)),
+    ]));
+
+    let height = lines.len() as u16 + 3;
+    let width = 72.min(area.width.saturating_sub(6));
+    let rect = centered_rect(width, height, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(accent))
+        .style(Style::default().bg(theme.panel))
+        .title(Span::styled(AWAITING_SETUP_TITLE, Style::default().fg(accent).add_modifier(Modifier::BOLD)));
+
+    frame.render_widget(Clear, rect);
+    frame.render_widget(Paragraph::new(lines).block(block).wrap(Wrap { trim: false }), rect);
 }
 
 fn render_tabs(frame: &mut Frame, area: Rect, app: &App) {
@@ -3039,6 +3094,42 @@ mod tests {
         assert!(out.contains("Visible tabs"), "toggle title");
         assert!(out.contains("▶"), "green arrow marks a visible section");
         assert!(out.contains("toggle"), "toggle footer hint");
+    }
+
+    #[test]
+    fn awaiting_setup_card_tells_you_where_to_go_and_how_to_back_out() {
+        let mut app = App::new("slate");
+        app.awaiting_browser_setup = true;
+        app.dashboard_url = Some("http://127.0.0.1:8177/?t=abc".into());
+        let out = render_to_string(&mut app, 100, 30);
+
+        assert!(out.contains("Setting up in your browser"), "{out}");
+        assert!(out.contains("access tokens"), "{out}");
+        // The address must be the settings route, with the token query preserved.
+        assert!(out.contains("#settings"), "{out}");
+        // Both ways out are offered: do it here instead, or reopen the browser.
+        assert!(out.contains("set up here instead"), "{out}");
+        assert!(out.contains("reopen the dashboard"), "{out}");
+    }
+
+    #[test]
+    fn awaiting_setup_card_says_how_to_start_the_dashboard_when_it_is_not_running() {
+        let mut app = App::new("slate");
+        app.awaiting_browser_setup = true;
+        app.dashboard_url = None;
+        let out = render_to_string(&mut app, 100, 30);
+        assert!(out.contains("forgetop --dashboard"), "{out}");
+    }
+
+    #[test]
+    fn the_wizard_outranks_the_awaiting_card() {
+        // Picking "set up here instead" while waiting must not leave the card on top.
+        let mut app = App::new("slate");
+        app.awaiting_browser_setup = true;
+        app.wizard = Some(crate::wizard::Wizard::new());
+        let out = render_to_string(&mut app, 100, 30);
+        assert!(out.contains("Add connection"), "{out}");
+        assert!(!out.contains("Setting up in your browser"), "{out}");
     }
 
     #[test]

@@ -53,6 +53,10 @@ pub enum Action {
     LeavePrView,
     /// Set the startup preference (what `forgetop` opens on launch).
     SetStartupMode(StartupMode),
+    /// First run: add the first connection here, in the terminal wizard.
+    SetupInTerminal,
+    /// First run: hand setup to the browser dashboard and wait for it to land.
+    SetupInBrowser,
 }
 
 /// What a [`Overlay::Toggle`] checklist is choosing.
@@ -100,6 +104,8 @@ pub enum PickerKind {
     PendingExit,
     /// Choose what `forgetop` opens on launch (a shared preference).
     StartupMode,
+    /// First run: set up the first connection in the terminal, or in the browser.
+    SetupLocation,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -362,6 +368,12 @@ fn resolve_picker(kind: PickerKind, selected: usize, items: &[String]) -> Action
             };
             Action::SetStartupMode(mode)
         }
+        // The terminal is the default and sits first: forgetop is a TUI that happens to
+        // serve a dashboard, and the first screen should say so.
+        PickerKind::SetupLocation => match selected {
+            1 => Action::SetupInBrowser,
+            _ => Action::SetupInTerminal,
+        },
     }
 }
 
@@ -529,6 +541,16 @@ mod tests {
     fn pending_exit_picker_maps_submit_and_leave() {
         assert!(matches!(resolve_picker(PickerKind::PendingExit, 0, &[]), Action::OpenReviewMenu));
         assert!(matches!(resolve_picker(PickerKind::PendingExit, 1, &[]), Action::LeavePrView));
+    }
+
+    #[test]
+    fn setup_location_picker_defaults_to_the_terminal() {
+        let items = vec!["Set up here in the terminal".to_string(), "Set up in the browser".to_string()];
+        // Index 0 is the terminal, and anything unexpected falls back to it rather than
+        // launching a browser the user did not ask for.
+        assert!(matches!(resolve_picker(PickerKind::SetupLocation, 0, &items), Action::SetupInTerminal));
+        assert!(matches!(resolve_picker(PickerKind::SetupLocation, 1, &items), Action::SetupInBrowser));
+        assert!(matches!(resolve_picker(PickerKind::SetupLocation, 99, &items), Action::SetupInTerminal));
     }
 
     #[test]
