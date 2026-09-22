@@ -767,6 +767,7 @@ dependencies = [
  "notify-rust",
  "open",
  "ratatui",
+ "serde",
  "synoptic",
  "tokio",
 ]

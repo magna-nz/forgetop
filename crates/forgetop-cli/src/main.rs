@@ -5,6 +5,7 @@ use std::io::IsTerminal;
 use std::sync::Arc;
 use std::time::Duration;
 
+use forgetop_core::cache::CacheStore;
 use forgetop_core::config::{
     default_config_path, ConfigStore, ForgetopConfig, InMemoryConfigStore, JsonConfigStore, StartupMode,
 };
@@ -115,7 +116,10 @@ async fn run() -> Result<()> {
     let dashboard_url = spawn_dashboard(server_deps).await;
 
     let theme = config.snapshot().ui.theme.clone().unwrap_or_else(|| "slate".into());
-    let deps = AppDeps { sections, health, config };
+    // Demo data is canned and instant, so it has nothing to gain from a cache — and a disabled
+    // store keeps `--demo` to its promise of writing nothing to disk.
+    let cache = Arc::new(if demo { CacheStore::disabled() } else { CacheStore::at_default_path() });
+    let deps = AppDeps { sections, health, config, cache };
     forgetop_tui::run(deps, &theme, dashboard_url).await
 }
 
