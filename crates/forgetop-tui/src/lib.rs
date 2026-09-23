@@ -101,6 +101,11 @@ async fn event_loop(terminal: &mut Term, app: &mut App, deps: &AppDeps) -> Resul
     loop {
         terminal.draw(|f| ui::render(f, app)).map_err(forgetop_core::Error::from)?;
         if app.should_quit {
+            // Writes made off the fetch path — marking notifications read, for one — only reach
+            // the in-memory map; the flush below is in the job arm, which a quit need never pass
+            // through. Without this, reading a notification and pressing `q` leaves the cache
+            // saying unread, and the next launch repaints it that way.
+            deps.cache.flush().await;
             break;
         }
 

@@ -172,10 +172,12 @@ fn take_section<T>(field: &mut Vec<T>, incoming: Vec<T>, ok: bool) {
 
 /// The same swap for the inline `reload_*` methods, which are awaited on the key-handler path.
 ///
-/// They used to `clear()` the list first, so every PR/work-item/pipeline action emptied the
-/// screen for the length of a round trip — the user watched their own rows vanish and come
-/// back — and any optimistic edit the same handler had just made went with them. Building into
-/// a local vec and swapping here means the rows only change at the moment the answer is in.
+/// They used to `clear()` the list first. Nothing was ever *drawn* mid-handler — the loop paints
+/// at the top and `on_key` is awaited to completion — so this was never a visible flicker. What
+/// it was is a failure mode: a reload that errored left the cleared list behind, so an outage
+/// blanked a perfectly good list and the user lost rows they still had. Building into a local
+/// vec and swapping here means a failed reload changes nothing on screen. It also stops the
+/// clear from wiping an optimistic edit the same handler made just before it.
 ///
 /// `ok` is derived the only way an inline reload can know it: whether this section pushed a
 /// failure onto `errors` while it ran. That reduces to [`take_section`]'s rule — empty *and*
@@ -1409,7 +1411,7 @@ impl App {
             if want != self.pr_filter {
                 self.pr_filter = want;
                 let mut errors = Vec::new();
-                self.reload_pull_requests(deps, &mut errors).await;
+                self.reload_pull_requests_for_new_query(deps, &mut errors).await;
                 if let Some(e) = errors.first() {
                     self.toast = Some(e.clone());
                 }
@@ -1754,7 +1756,7 @@ impl App {
             self.pr_shown_statuses.insert(PullRequestStatus::Merged);
         }
         let mut errors = Vec::new();
-        self.reload_pull_requests(deps, &mut errors).await;
+        self.reload_pull_requests_for_new_query(deps, &mut errors).await;
         if let Some(e) = errors.first() {
             self.toast = Some(e.clone());
         }
@@ -2568,6 +2570,18 @@ impl App {
             ),
         }
         take_inline_section(&mut self.prs, rows, errors, before);
+    }
+
+    /// Reloads the PR list after the **query itself** changed — a different filter, or completed
+    /// PRs being shown or hidden.
+    ///
+    /// Separate from [`Self::reload_pull_requests`] because keeping the old rows when a reload
+    /// fails is only honest while the query is the same. Rows fetched for "Mine", left on screen
+    /// under a sub-tab that now reads "Review requested", are not stale — they are mislabelled.
+    /// A changed query therefore drops what it had and shows the failure instead.
+    async fn reload_pull_requests_for_new_query(&mut self, deps: &AppDeps, errors: &mut Vec<String>) {
+        self.prs.clear();
+        self.reload_pull_requests(deps, errors).await;
     }
 
     async fn reload_work_items(&mut self, deps: &AppDeps, errors: &mut Vec<String>) {
@@ -4104,7 +4118,7 @@ impl App {
     async fn apply_pr_statuses(&mut self, shown_ids: Vec<String>, deps: &AppDeps) {
         self.pr_shown_statuses = shown_ids.iter().filter_map(|id| parse_pr_status(id)).collect();
         let mut errors = Vec::new();
-        self.reload_pull_requests(deps, &mut errors).await;
+        self.reload_pull_requests_for_new_query(deps, &mut errors).await;
         self.fix_selection();
         self.list_scroll = 0;
         self.toast = Some(if let Some(e) = errors.first() { e.clone() } else { format!("Showing {}", pr_status_summary(&self.pr_shown_statuses)) });

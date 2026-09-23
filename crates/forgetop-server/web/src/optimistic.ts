@@ -73,9 +73,10 @@ export function markNotificationReadInCache(qc: QueryClient, conn: string, id: s
  */
 export function patchWorkItem(qc: QueryClient, ref: Pick<WiRef, "conn" | "repo" | "id">, patch: Partial<WorkItem>): void {
   // An id only names one item *within a repository* — a connection spans an account, so an
-  // addressed ref has to match the repository too. An unaddressed ref (or a provider that isn't
-  // repo-addressed, which leaves `repository` unset) resolves on the id alone, exactly as the
-  // server does.
+  // addressed ref has to match the repository too. An unaddressed ref falls back to the id alone,
+  // which on a multi-repository connection can touch more than one row; the server is stricter
+  // and errors rather than guessing, so the refetch is what corrects it. Harmless because the
+  // only ref without a repo comes from a detail pane that is showing one specific item.
   const isTarget = (connectionId: string, wi: WorkItem) =>
     connectionId === ref.conn && wi.id === ref.id && (!ref.repo || !wi.repository || wi.repository === ref.repo);
   const apply = (wi: WorkItem): WorkItem => ({ ...wi, ...patch });

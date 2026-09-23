@@ -107,8 +107,11 @@ function ConnectionCard({
 
   const del = async () => {
     if (!window.confirm(`Remove "${conn.display_name}"? This also deletes its token from the keychain.`)) return;
-    await run("/api/connections/delete", { id: conn.id }, []);
-    onRemoved(conn.id);
+    // `run` reports a failure by returning false, not by throwing. Dropping the rows regardless
+    // would show the connection deleted and then, a refetch later, silently undeleted.
+    if (await run("/api/connections/delete", { id: conn.id }, [])) {
+      onRemoved(conn.id);
+    }
   };
   const test = async () => {
     setTested(null);
