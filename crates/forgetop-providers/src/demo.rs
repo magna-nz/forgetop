@@ -33,8 +33,13 @@ fn user(id: &str, name: &str, handle: &str) -> User {
 /// The current user ("you") — a backend engineer at Northwind. `is_user` matches on
 /// handle, so PR filters pass "you".
 fn me() -> User {
-    user("me", "Sam Rivera", "you")
+    user("me", DEMO_ME_NAME, DEMO_ME)
 }
+
+/// The handle [`me`] is reachable by, named once so `list` and `current_user` cannot drift apart
+/// — a mismatch between them would make the demo's locally-derived "Mine" view silently empty.
+const DEMO_ME: &str = "you";
+const DEMO_ME_NAME: &str = "Sam Rivera";
 // Teammates (function names kept short; these are the people around you at Northwind).
 fn alice() -> User {
     user("u1", "Priya Nair", "priya")
@@ -605,7 +610,10 @@ impl PullRequestSource for DemoPr {
             .map(apply_session_state)
             .filter(|p| query.include_completed || matches!(p.status, PullRequestStatus::Open | PullRequestStatus::Draft))
             .collect();
-        Ok(apply_pull_request_filter(prs, query.filter, Some("you")))
+        Ok(apply_pull_request_filter(prs, query.filter, Some(DEMO_ME)))
+    }
+    async fn current_user(&self) -> Result<Option<String>> {
+        Ok(Some(DEMO_ME.to_string()))
     }
     async fn get(&self, item: &ItemRef) -> Result<PullRequest> {
         let id: &str = &item.id;

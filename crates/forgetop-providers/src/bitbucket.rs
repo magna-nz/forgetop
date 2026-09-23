@@ -380,6 +380,9 @@ impl PullRequestSource for BitbucketPr {
         let filtered = apply_pull_request_filter(rows, query.filter, me.as_deref());
         Ok(sort_and_cap(filtered, scope.len(), query.limit, |pr| pr.updated_at))
     }
+    async fn current_user(&self) -> Result<Option<String>> {
+        self.0.self_name().await
+    }
     async fn get(&self, item: &ItemRef) -> Result<PullRequest> {
         let repo = self.0.resolve(item)?;
         let v = self.0.get_json(&self.0.repo_path(&repo, &format!("/pullrequests/{}", item.id))).await?;

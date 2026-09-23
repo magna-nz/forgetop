@@ -268,6 +268,22 @@ pub struct MergeOptions {
 #[async_trait]
 pub trait PullRequestSource: Send + Sync {
     async fn list(&self, query: &PullRequestQuery) -> Result<Vec<PullRequest>>;
+    /// The handle identifying the signed-in user on this connection — the same identity
+    /// [`list`](Self::list) resolves internally when it is asked for `Mine` or `ReviewRequested`.
+    ///
+    /// Exposed so a caller can fetch one *unfiltered* pool and derive those views itself, rather
+    /// than issuing a `list` per filter that re-fetches identical rows. It is matched against a
+    /// user's handle, display name or id by
+    /// [`apply_pull_request_filter`](crate::filter::apply_pull_request_filter).
+    ///
+    /// `None` — the default, and what a provider returns when it cannot establish an identity —
+    /// makes that filter pass everything through rather than silently emptying the list. A caller
+    /// deriving views locally must treat it as "cannot filter", not as "nothing matches": showing
+    /// an unfiltered list under a "Mine" heading is wrong, but quietly showing none of your pull
+    /// requests is worse, and matches what `list` already does in the same situation.
+    async fn current_user(&self) -> Result<Option<String>> {
+        Ok(None)
+    }
     async fn get(&self, item: &ItemRef) -> Result<PullRequest>;
     async fn threads(&self, item: &ItemRef) -> Result<Vec<CommentThread>>;
     /// The event timeline (reviews/approvals, merges, state changes, …), oldest → newest.

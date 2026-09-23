@@ -551,6 +551,9 @@ impl PullRequestSource for AzurePr {
         // Azure's PR payload carries no `updated_at`, so creation date is the best recency key.
         Ok(sort_and_cap(filtered, scope.len(), query.limit, |pr| pr.created_at))
     }
+    async fn current_user(&self) -> Result<Option<String>> {
+        self.0.self_id().await
+    }
     async fn get(&self, item: &ItemRef) -> Result<PullRequest> {
         let repo = self.0.resolve(item)?;
         Ok(map_pull_request(&self.0.get_json(&format!("{}?{API}", self.0.pr_base(&repo, &item.id))).await?, Some(&repo)))
