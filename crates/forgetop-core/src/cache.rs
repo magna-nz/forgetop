@@ -202,6 +202,41 @@ impl CacheStore {
         CachePut::Stored
     }
 
+    /// Edits an entry already in the store, keeping its `fetched_at`.
+    ///
+    /// [`put`](Self::put) is for "here is a fresher response", and its staleness guard compares
+    /// timestamps — so it *refuses* a write carrying the entry's own `fetched_at`, which is
+    /// exactly what editing a cached list in place has to do. This is the seam for that: dropping
+    /// rows from a list is not new data and must not be dated as if it were, or the staleness
+    /// indicator would report an hours-old list as current.
+    ///
+    /// Returns whether anything was written. A missing key is a no-op, and so is an entry that was
+    /// replaced by a real fetch while `edit` ran — that response is newer than this edit and owns
+    /// the key.
+    pub fn rewrite<T: Serialize + serde::de::DeserializeOwned>(&self, key: &str, edit: impl FnOnce(T) -> T) -> bool {
+        if self.path.is_none() {
+            return false;
+        }
+        let Some(entry) = self.get::<T>(key) else { return false };
+        let value = match serde_json::to_value(edit(entry.value)) {
+            Ok(value) => value,
+            Err(err) => {
+                diag::log("cache", &format!("not rewriting {key}: {err}"));
+                return false;
+            }
+        };
+
+        {
+            let mut entries = self.write_entries();
+            match entries.get_mut(key) {
+                Some(stored) if stored.fetched_at == entry.fetched_at => stored.value = value,
+                _ => return false,
+            }
+        }
+        self.dirty.store(true, Ordering::Relaxed);
+        true
+    }
+
     /// Persist to disk if dirty, atomically. Errors are logged, never propagated; the dirty flag
     /// survives a failed write so the next flush retries rather than losing the entries.
     pub async fn flush(&self) {
@@ -311,6 +346,52 @@ mod tests {
         let entry = store.get::<Item>("prs").expect("hit");
         assert_eq!(entry.value, item(2), "the newer value must survive");
         assert_eq!(entry.fetched_at, newer);
+    }
+
+    /// `rewrite` exists precisely because `put` refuses an equal timestamp (above). Editing a
+    /// cached list in place has to carry the entry's own `fetched_at`, so it cannot go through
+    /// `put` — and it must not bump the timestamp to get past the guard either.
+    #[test]
+    fn rewrite_edits_an_entry_in_place_without_redating_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = CacheStore::new(dir.path().join("cache.json"));
+        let at = Utc::now() - TimeDelta::hours(3);
+        store.put("prs", &vec![item(1), item(2)], at);
+
+        let wrote = store.rewrite::<Vec<Item>>("prs", |rows| rows.into_iter().filter(|i| i.id != 1).collect());
+
+        assert!(wrote);
+        let entry = store.get::<Vec<Item>>("prs").expect("hit");
+        assert_eq!(entry.value, vec![item(2)]);
+        assert_eq!(entry.fetched_at, at, "a three-hour-old list must not read as current");
+    }
+
+    #[test]
+    fn rewrite_is_a_no_op_on_a_key_that_is_not_there() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = CacheStore::new(dir.path().join("cache.json"));
+
+        assert!(!store.rewrite::<Vec<Item>>("absent", |rows| rows));
+        assert!(store.get::<Vec<Item>>("absent").is_none());
+    }
+
+    /// A real fetch that lands while the edit is being computed owns the key: it is newer than
+    /// the edit, and re-applying the edit's view of the list would undo it.
+    #[test]
+    fn rewrite_yields_to_a_fetch_that_landed_underneath_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = CacheStore::new(dir.path().join("cache.json"));
+        let at = Utc::now() - TimeDelta::hours(3);
+        store.put("prs", &vec![item(1)], at);
+
+        let wrote = store.rewrite::<Vec<Item>>("prs", |rows| {
+            // Stand in for the response arriving mid-edit.
+            store.put("prs", &vec![item(7)], Utc::now());
+            rows.into_iter().filter(|i| i.id != 1).collect()
+        });
+
+        assert!(!wrote, "the edit must not overwrite the fresher entry");
+        assert_eq!(store.get::<Vec<Item>>("prs").expect("hit").value, vec![item(7)]);
     }
 
     #[test]

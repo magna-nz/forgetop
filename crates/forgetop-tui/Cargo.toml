@@ -17,3 +17,7 @@ open.workspace = true
 notify-rust.workspace = true
 fuzzy-matcher.workspace = true
 synoptic.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+async-trait.workspace = true

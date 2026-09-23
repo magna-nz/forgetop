@@ -109,6 +109,54 @@ fn seed_section<T: serde::de::DeserializeOwned>(
     *oldest = Some(oldest.map_or(entry.fetched_at, |prev| prev.min(entry.fetched_at)));
 }
 
+/// Rewrites one cached section without a removed connection's rows.
+///
+/// `seed_section` is deliberately unfiltered, so rows left here outlive the connection: close
+/// the app before the post-removal reload lands and the next launch seeds them straight back.
+/// Goes through [`CacheStore::rewrite`], not `put`: the entry keeps its `fetched_at`, because
+/// dropping rows from a list doesn't make the rest of it any fresher.
+fn purge_cached_section<T>(cache: &CacheStore, key: &str, conn_id: &str, connection_of: impl Fn(&T) -> &str)
+where
+    T: serde::Serialize + serde::de::DeserializeOwned,
+{
+    cache.rewrite::<Vec<T>>(key, |rows| rows.into_iter().filter(|row| connection_of(row) != conn_id).collect());
+}
+
+/// Clears the unread flag on the cached inbox rows that `matches` picks out.
+///
+/// `self.inbox` is what this session shows; the cache is what the *next launch* shows. Without
+/// this, quitting before the next poll repaints a notification the user already read as unread.
+/// Goes through [`CacheStore::rewrite`] for the same reason `purge_cached_section` does: reading
+/// a notification doesn't make the list any fresher, and `put` would refuse a write whose
+/// timestamp isn't newer anyway.
+fn mark_cached_inbox_read(cache: &CacheStore, matches: impl Fn(&NotifRow) -> bool) {
+    cache.rewrite::<Vec<NotifRow>>(CACHE_KEY_INBOX, |rows| {
+        rows.into_iter()
+            .map(|mut row| {
+                if matches(&row) {
+                    row.notification.unread = false;
+                }
+                row
+            })
+            .collect()
+    });
+}
+
+/// Every cached list a connection contributes rows to. The PR list is keyed by filter and
+/// completed-ness, so all six of its combinations are purged, not just the one on screen.
+fn purge_cached_rows(cache: &CacheStore, conn_id: &str) {
+    for filter in [PullRequestFilter::All, PullRequestFilter::Mine, PullRequestFilter::ReviewRequested] {
+        for completed in [false, true] {
+            purge_cached_section::<PrRow>(cache, &prs_cache_key(filter, completed), conn_id, |r| &r.connection_id);
+        }
+    }
+    purge_cached_section::<PrRow>(cache, CACHE_KEY_LAUNCHPAD_MINE, conn_id, |r| &r.connection_id);
+    purge_cached_section::<PrRow>(cache, CACHE_KEY_LAUNCHPAD_REVIEW, conn_id, |r| &r.connection_id);
+    purge_cached_section::<WiRow>(cache, CACHE_KEY_WORK_ITEMS, conn_id, |r| &r.connection_id);
+    purge_cached_section::<PipeRow>(cache, CACHE_KEY_PIPELINES, conn_id, |r| &r.connection_id);
+    purge_cached_section::<NotifRow>(cache, CACHE_KEY_INBOX, conn_id, |r| &r.connection_id);
+}
+
 /// Puts one freshly-fetched section on screen, unless doing so would replace rows with nothing.
 ///
 /// `ok` is that section's "every feed I consulted answered" flag. Empty *and* failed means the
@@ -120,6 +168,29 @@ fn take_section<T>(field: &mut Vec<T>, incoming: Vec<T>, ok: bool) {
     if ok || !incoming.is_empty() {
         *field = incoming;
     }
+}
+
+/// The same swap for the inline `reload_*` methods, which are awaited on the key-handler path.
+///
+/// They used to `clear()` the list first. Nothing was ever *drawn* mid-handler — the loop paints
+/// at the top and `on_key` is awaited to completion — so this was never a visible flicker. What
+/// it was is a failure mode: a reload that errored left the cleared list behind, so an outage
+/// blanked a perfectly good list and the user lost rows they still had. Building into a local
+/// vec and swapping here means a failed reload changes nothing on screen. It also stops the
+/// clear from wiping an optimistic edit the same handler made just before it.
+///
+/// `ok` is derived the only way an inline reload can know it: whether this section pushed a
+/// failure onto `errors` while it ran. That reduces to [`take_section`]'s rule — empty *and*
+/// failed means the outage erased the rows, so what is on screen stays.
+fn take_inline_section<T>(field: &mut Vec<T>, incoming: Vec<T>, errors: &[String], errors_before: usize) {
+    take_section(field, incoming, errors.len() == errors_before);
+}
+
+/// Whether this provider's work items and pipelines are addressed by *project* rather than by
+/// repository, so their rows' `repository` field holds a Team Project name and a repository
+/// scope entry ("Project/Repo") is not something it can be compared against.
+fn project_addressed_sections(provider: ProviderType) -> bool {
+    matches!(provider, ProviderType::AzureDevOps)
 }
 
 type FeedbackOpener = fn(&str) -> std::result::Result<(), String>;
@@ -1340,7 +1411,7 @@ impl App {
             if want != self.pr_filter {
                 self.pr_filter = want;
                 let mut errors = Vec::new();
-                self.reload_pull_requests(deps, &mut errors).await;
+                self.reload_pull_requests_for_new_query(deps, &mut errors).await;
                 if let Some(e) = errors.first() {
                     self.toast = Some(e.clone());
                 }
@@ -1388,8 +1459,13 @@ impl App {
         let view = self.current_view_snapshot(name.clone());
         self.views[section].push(view);
         self.view_idx[section] = self.views[section].len() - 1;
-        let _ = deps.config.set_views(section_of(section), self.views[section].clone()).await;
-        self.toast = Some(format!("Saved view: {name}"));
+        // Local state first, like every other write here — but a persist that failed must not be
+        // reported as "Saved": the view is on screen and will be gone on the next launch, and the
+        // toast is the only chance the user gets to know that.
+        match deps.config.set_views(section_of(section), self.views[section].clone()).await {
+            Err(e) => self.toast_error(format!("Couldn't save view: {e}")),
+            Ok(()) => self.toast = Some(format!("Saved view: {name}")),
+        }
     }
 
     /// Confirms deleting the active section's current view (never the last one).
@@ -1416,10 +1492,15 @@ impl App {
         let idx = self.view_idx[section].min(self.views[section].len() - 1);
         let removed = self.views[section].remove(idx);
         self.view_idx[section] = idx.min(self.views[section].len() - 1);
-        let _ = deps.config.set_views(section_of(section), self.views[section].clone()).await;
+        let saved = deps.config.set_views(section_of(section), self.views[section].clone()).await;
         let target = self.view_idx[section];
         self.apply_view(section, target, deps).await;
-        self.toast = Some(format!("Deleted view: {}", removed.name));
+        // Reported after `apply_view`, which toasts a "View: …" of its own — a failed delete has
+        // to outrank it, or the only sign the view is coming back is that it comes back.
+        match saved {
+            Err(e) => self.toast_error(format!("Couldn't delete view: {e}")),
+            Ok(()) => self.toast = Some(format!("Deleted view: {}", removed.name)),
+        }
     }
 
     /// The active sort for a section, if any.
@@ -1685,7 +1766,7 @@ impl App {
             self.pr_shown_statuses.insert(PullRequestStatus::Merged);
         }
         let mut errors = Vec::new();
-        self.reload_pull_requests(deps, &mut errors).await;
+        self.reload_pull_requests_for_new_query(deps, &mut errors).await;
         if let Some(e) = errors.first() {
             self.toast = Some(e.clone());
         }
@@ -1975,6 +2056,7 @@ impl App {
                 row.notification.unread = false;
             }
         }
+        mark_cached_inbox_read(&deps.cache, |row| row.connection_id == conn && row.notification.id == notif_id);
         Ok(())
     }
 
@@ -2011,6 +2093,7 @@ impl App {
         for row in &mut self.inbox {
             row.notification.unread = false;
         }
+        mark_cached_inbox_read(&deps.cache, |_| true);
         self.toast = Some("All marked read".into());
     }
 
@@ -2460,7 +2543,8 @@ impl App {
     }
 
     async fn reload_pull_requests(&mut self, deps: &AppDeps, errors: &mut Vec<String>) {
-        self.prs.clear();
+        let before = errors.len();
+        let mut rows = Vec::new();
         match deps.sections.pull_request_feeds().await {
             Ok(feeds) => {
                 let query = PullRequestQuery {
@@ -2475,7 +2559,7 @@ impl App {
                 for feed in feeds {
                     let (provider, name, conn_id) = feed_tag(&feed.connection);
                     match feed.source.list(&query).await {
-                        Ok(list) => self.prs.extend(list.into_iter().map(|pr| PrRow {
+                        Ok(list) => rows.extend(list.into_iter().map(|pr| PrRow {
                             connection_id: conn_id.clone(),
                             connection: name.clone(),
                             provider,
@@ -2495,16 +2579,30 @@ impl App {
                 DIAG_RELOAD_PULL_REQUESTS,
             ),
         }
+        take_inline_section(&mut self.prs, rows, errors, before);
+    }
+
+    /// Reloads the PR list after the **query itself** changed — a different filter, or completed
+    /// PRs being shown or hidden.
+    ///
+    /// Separate from [`Self::reload_pull_requests`] because keeping the old rows when a reload
+    /// fails is only honest while the query is the same. Rows fetched for "Mine", left on screen
+    /// under a sub-tab that now reads "Review requested", are not stale — they are mislabelled.
+    /// A changed query therefore drops what it had and shows the failure instead.
+    async fn reload_pull_requests_for_new_query(&mut self, deps: &AppDeps, errors: &mut Vec<String>) {
+        self.prs.clear();
+        self.reload_pull_requests(deps, errors).await;
     }
 
     async fn reload_work_items(&mut self, deps: &AppDeps, errors: &mut Vec<String>) {
-        self.wis.clear();
+        let before = errors.len();
+        let mut rows = Vec::new();
         match deps.sections.work_item_feeds().await {
             Ok(feeds) => {
                 for feed in feeds {
                     let (provider, name, conn_id) = feed_tag(&feed.connection);
                     match feed.source.list(&wi_query()).await {
-                        Ok(list) => self.wis.extend(list.into_iter().map(|wi| WiRow {
+                        Ok(list) => rows.extend(list.into_iter().map(|wi| WiRow {
                             connection_id: conn_id.clone(),
                             connection: name.clone(),
                             provider,
@@ -2524,10 +2622,12 @@ impl App {
                 DIAG_RELOAD_WORK_ITEMS,
             ),
         }
+        take_inline_section(&mut self.wis, rows, errors, before);
     }
 
     async fn reload_pipelines(&mut self, deps: &AppDeps, errors: &mut Vec<String>) {
-        self.pipes.clear();
+        let before = errors.len();
+        let mut rows = Vec::new();
         match deps.sections.pipeline_feeds().await {
             Ok(feeds) => {
                 for feed in feeds {
@@ -2555,7 +2655,7 @@ impl App {
                                         .iter()
                                         .any(|approval| approval.can_respond);
                                     let definition_name = def_names.get(&run.definition_id).cloned();
-                                    self.pipes.push(PipeRow {
+                                    rows.push(PipeRow {
                                         connection_id: conn_id.clone(),
                                         connection: name.clone(),
                                         provider,
@@ -2580,6 +2680,8 @@ impl App {
                 DIAG_RELOAD_PIPELINES,
             ),
         }
+        take_inline_section(&mut self.pipes, rows, errors, before);
+        // Both read `self.pipes`, so they have to run on the swapped-in rows, not the old ones.
         self.notify_pipeline_failures();
         self.notify_pending_approvals();
     }
@@ -3146,6 +3248,7 @@ impl App {
 
     async fn apply_repo_scope(&mut self, connection_id: &str, ids: Vec<String>, deps: &AppDeps) {
         let count = ids.len();
+        let scope = ids.clone();
         if let Err(e) = deps.config.set_repo_scope(connection_id, Some(ids)).await {
             self.toast_error(format!("Couldn't set the repository scope: {e}"));
             return;
@@ -3155,8 +3258,38 @@ impl App {
             1 => "Fetching from 1 repository".to_string(),
             n => format!("Fetching from {n} repositories"),
         });
+        self.narrow_to_repo_scope(connection_id, &scope, deps);
         self.request_reload(deps);
         self.fix_selection();
+    }
+
+    /// Drops the rows a connection's just-narrowed repository scope no longer covers.
+    ///
+    /// Only *narrowing* is knowable: a repository the user just added has contributed no rows
+    /// yet, so the reload is what brings them. Matching goes through
+    /// [`forgetop_core::repo::matches_scope_entry`], which normalises both sides — a row's
+    /// repository and a scope entry are both meant to be connection-relative, and comparing the
+    /// two spellings by hand is the mismatch that module exists to prevent.
+    fn narrow_to_repo_scope(&mut self, connection_id: &str, scope: &[String], deps: &AppDeps) {
+        // A row with no repository can't be placed in or out of the scope, so it stays — that is
+        // every row from a provider that isn't repo-addressed at all.
+        let covered = |conn: &str, repo: Option<&String>| {
+            conn != connection_id
+                || repo.is_none_or(|r| scope.iter().any(|entry| forgetop_core::repo::matches_scope_entry(r, entry)))
+        };
+        self.prs.retain(|r| covered(&r.connection_id, r.pr.repository.as_ref()));
+        self.lp_prs_mine.retain(|r| covered(&r.connection_id, r.pr.repository.as_ref()));
+        self.lp_prs_review.retain(|r| covered(&r.connection_id, r.pr.repository.as_ref()));
+        // Azure DevOps addresses work items and pipelines by **Team Project**, so their rows
+        // carry a project name where a scope entry holds "Project/Repo" — nothing here could
+        // compare the two without re-deriving that addressing, and a wrong guess would empty
+        // both sections. Those two are left to the reload, which fans out over the projects.
+        self.wis.retain(|r| project_addressed_sections(r.provider) || covered(&r.connection_id, r.wi.repository.as_ref()));
+        self.pipes
+            .retain(|r| project_addressed_sections(r.provider) || covered(&r.connection_id, r.run.repository.as_ref()));
+        self.rebuild_launchpad();
+        // Without this the header keeps reporting "Repos · N of M" with the old N.
+        self.refresh_repo_scope(deps);
     }
 
     /// Recomputes the per-section scope summary from config. Cheap (no network) — the discovered
@@ -3637,10 +3770,41 @@ impl App {
                     ApprovalDecision::Reject => "Rejected",
                 };
                 self.toast = Some(format!("{verb} {label}"));
+                // Drop the decided gate before the refresh, or the picker keeps offering a
+                // decision that has already been made until the round trip lands.
+                self.drop_decided_approval(&conn_id, &run, &approval_id);
                 self.refresh_open_pipeline(deps).await;
             }
             Err(e) => self.toast_error(format!("Approval failed: {e}")),
         }
+    }
+
+    /// Removes a just-decided gate from the open run, and clears the list row's badge once the
+    /// run has no gate left that the user can answer.
+    ///
+    /// The run's **status** is deliberately untouched: what a decision does to a run — resume,
+    /// fail, queue behind another gate — is the provider's to say, and `refresh_open_pipeline`
+    /// is what settles it. Guarded on the run, because the view may have moved on while the
+    /// decision was in flight.
+    fn drop_decided_approval(&mut self, conn_id: &str, run: &ItemRef, approval_id: &str) {
+        let mut still_gated = None;
+        if let Screen::Pipeline(v) = &mut self.screen {
+            if v.connection_id == conn_id && v.run.id == run.id {
+                v.approvals.retain(|a| a.id != approval_id);
+                still_gated = Some(v.approvals.iter().any(|a| a.can_respond));
+            }
+        }
+        // No open view means no local knowledge of what is left on the run, so the row keeps its
+        // badge until the reload says otherwise: a badge that lingers a second is recoverable, a
+        // missing one hides a gate that still wants the user.
+        let Some(still_gated) = still_gated else { return };
+        if !still_gated {
+            for row in self.pipes.iter_mut().filter(|r| r.connection_id == conn_id && r.run.id == run.id) {
+                row.awaiting_approval = false;
+            }
+        }
+        // `awaiting_approval` is what puts a run in the Command Center's Approvals bucket.
+        self.rebuild_launchpad();
     }
 
     fn on_pipeline_key(&mut self, key: Key) {
@@ -3964,7 +4128,7 @@ impl App {
     async fn apply_pr_statuses(&mut self, shown_ids: Vec<String>, deps: &AppDeps) {
         self.pr_shown_statuses = shown_ids.iter().filter_map(|id| parse_pr_status(id)).collect();
         let mut errors = Vec::new();
-        self.reload_pull_requests(deps, &mut errors).await;
+        self.reload_pull_requests_for_new_query(deps, &mut errors).await;
         self.fix_selection();
         self.list_scroll = 0;
         self.toast = Some(if let Some(e) = errors.first() { e.clone() } else { format!("Showing {}", pr_status_summary(&self.pr_shown_statuses)) });
@@ -4132,10 +4296,9 @@ impl App {
         }
     }
 
-    /// `C`: connection management happens in the web dashboard. Open it, and also show the
-    /// terminal connections list as a quick read-only glance / fallback.
+    /// `C`: the terminal connections list, which adds, binds and removes connections on its own.
+    /// It deliberately does *not* open the browser — `B` is the only key that leaves the TUI.
     async fn open_connections(&mut self, deps: &AppDeps) {
-        self.open_dashboard_at("#settings");
         self.open_config(deps).await;
     }
 
@@ -4256,6 +4419,7 @@ impl App {
     }
 
     async fn apply_section_bind(&mut self, section: usize, ids: Vec<String>, deps: &AppDeps) {
+        let bound: HashSet<String> = ids.iter().cloned().collect();
         let result = if section == 0 {
             deps.config.set_pull_request_connections(ids).await
         } else {
@@ -4264,11 +4428,33 @@ impl App {
         match result {
             Ok(()) => {
                 self.toast = Some("Bindings updated".into());
+                self.drop_unbound_rows(section, &bound, deps);
                 self.request_reload(deps);
                 self.rebuild_config_view(deps).await;
             }
             Err(e) => self.toast = Some(format!("{e}")),
         }
+    }
+
+    /// Drops the rows of a connection the user just *un*bound from a section.
+    ///
+    /// Only the unbind half of a binding change is knowable here: a newly bound connection has
+    /// contributed no rows yet, so there is nothing to add until the reload brings them — which
+    /// is why this only ever removes. `section` is 0 for pull requests, 1 for work items, the
+    /// same encoding `apply_section_bind` is called with.
+    fn drop_unbound_rows(&mut self, section: usize, bound: &HashSet<String>, deps: &AppDeps) {
+        if section == 0 {
+            self.prs.retain(|r| bound.contains(&r.connection_id));
+            self.lp_prs_mine.retain(|r| bound.contains(&r.connection_id));
+            self.lp_prs_review.retain(|r| bound.contains(&r.connection_id));
+        } else {
+            self.wis.retain(|r| bound.contains(&r.connection_id));
+        }
+        // The views derived from those lists have to be rebuilt, or the rows stay on screen;
+        // the header's "Repos · N of M" counts bound connections, so it moves too.
+        self.rebuild_launchpad();
+        self.refresh_repo_scope(deps);
+        self.fix_selection();
     }
 
     fn config_remove_selected(&mut self) {
@@ -4280,11 +4466,37 @@ impl App {
         });
     }
 
+    /// Drops everything a just-removed connection contributed, without waiting for the refetch.
+    ///
+    /// The reload kicked off alongside this replaces these lists wholesale a second or two later,
+    /// so this is not about correctness — it is what makes the removal feel instant. The rows are
+    /// gone on the very next frame, and the reload then lands on an identical screen instead of
+    /// being the moment the user finally sees their own action take effect.
+    fn purge_connection(&mut self, id: &str, deps: &AppDeps) {
+        self.prs.retain(|r| r.connection_id != id);
+        self.wis.retain(|r| r.connection_id != id);
+        self.pipes.retain(|r| r.connection_id != id);
+        self.inbox.retain(|r| r.connection_id != id);
+        self.lp_prs_mine.retain(|r| r.connection_id != id);
+        self.lp_prs_review.retain(|r| r.connection_id != id);
+        self.health.retain(|h| h.connection.id != id);
+        self.repo_catalog.remove(id);
+        purge_cached_rows(&deps.cache, id);
+
+        // The views derived from those lists have to be rebuilt, or the rows stay on screen.
+        self.rebuild_launchpad();
+        self.refresh_repo_scope(deps);
+        self.inbox_sel = self.inbox_sel.min(self.inbox.len().saturating_sub(1));
+        self.fix_selection();
+    }
+
     async fn execute_config_action(&mut self, action: Action, deps: &AppDeps) {
         let Action::RemoveConnection { id, label } = action else { return };
         match deps.config.remove_connection(&id).await {
             Ok(()) => {
                 self.toast = Some(format!("Removed {label}"));
+                // Reflect the removal before the refetch, not after it.
+                self.purge_connection(&id, deps);
                 self.request_reload(deps);
                 self.rebuild_config_view(deps).await;
             }
@@ -4492,6 +4704,26 @@ impl App {
         self.selected_wi_row().map(|r| &r.wi)
     }
 
+    /// Reflects an accepted state change on the open work item *and* the list row behind it.
+    ///
+    /// Both, because an action taken from the drill-in that only patched the view would be undone
+    /// on the screen the user presses Esc back to. `state_category` is deliberately left alone:
+    /// which bucket a state name falls in (Backlog/Active/Done) is decided by each provider's
+    /// mapper, not derivable from the name here — the reload that follows is what settles it, and
+    /// is also the resync if the write turns out to have been rejected.
+    fn apply_wi_state(&mut self, conn_id: &str, item: &ItemRef, state: &str) {
+        if let Screen::WiView(v) = &mut self.screen {
+            v.wi.state = state.to_string();
+        }
+        // Matched on the whole `ItemRef`, not the bare id: across a multi-repository connection
+        // the same id names more than one item.
+        for row in self.wis.iter_mut().filter(|r| r.connection_id == conn_id && &r.wi.item_ref() == item) {
+            row.wi.state = state.to_string();
+        }
+        // The Command Center's YourWork bucket reads the work-item rows, so it has to be rebuilt.
+        self.rebuild_launchpad();
+    }
+
     /// Resolves the work-item source backing a specific connection (per-row actions).
     async fn wi_source_for(&self, connection_id: &str, deps: &AppDeps) -> Option<Arc<dyn WorkItemSource>> {
         detail_or_none(
@@ -4570,11 +4802,8 @@ impl App {
         match result {
             Ok(msg) => {
                 self.toast = Some(msg);
-                // Reflect the change in the open view.
                 if let Action::WiSetState(state) = &action {
-                    if let Screen::WiView(v) = &mut self.screen {
-                        v.wi.state = state.clone();
-                    }
+                    self.apply_wi_state(&conn_id, &item, state);
                 }
                 if matches!(action, Action::WiComment(_)) {
                     let threads = detail_or_default(source.threads(&item).await, DIAG_WI_THREADS);
@@ -5756,6 +5985,406 @@ mod tests {
         assert_ne!(app.toast.as_deref(), Some("Marked read"));
     }
 
+    /// Removing a connection used to leave its rows on screen until the background refetch
+    /// answered, so the user watched their own action take effect seconds late. Everything the
+    /// connection contributed must be gone by the time `purge_connection` returns.
+    #[tokio::test]
+    async fn removing_a_connection_clears_its_rows_before_the_refetch() {
+        let deps = test_deps();
+        let mut app = App::new("slate");
+
+        let row = |conn: &str| PrRow {
+            connection_id: conn.into(),
+            connection: "GH".into(),
+            provider: ProviderType::GitHub,
+            pr: pr(None),
+        };
+        let notif = |conn: &str| NotifRow {
+            connection_id: conn.into(),
+            connection: "GH".into(),
+            provider: ProviderType::GitHub,
+            notification: Notification {
+                id: conn.into(),
+                kind: NotificationKind::Mention,
+                item_type: NotificationItemType::WorkItem,
+                item_id: None,
+                repository: None,
+                title: conn.into(),
+                context: "c".into(),
+                url: None,
+                unread: true,
+                updated_at: None,
+            },
+        };
+
+        app.prs = vec![row("gone"), row("kept")];
+        app.lp_prs_mine = vec![row("gone"), row("kept")];
+        app.lp_prs_review = vec![row("gone")];
+        app.inbox = vec![notif("gone"), notif("kept")];
+        app.inbox_sel = 1;
+        app.health = vec![health("gone"), health("kept")];
+        app.repo_catalog.insert("gone".into(), RepositoryPage { repositories: vec!["a/b".into()], truncated: false });
+        app.repo_catalog.insert("kept".into(), RepositoryPage { repositories: vec!["c/d".into()], truncated: false });
+
+        app.purge_connection("gone", &deps);
+
+        let ids = |rows: &[PrRow]| rows.iter().map(|r| r.connection_id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(&app.prs), ["kept"], "list rows must go immediately");
+        assert_eq!(ids(&app.lp_prs_mine), ["kept"], "Launchpad 'mine' rows must go too");
+        assert!(app.lp_prs_review.is_empty(), "Launchpad 'review' rows must go too");
+        assert_eq!(app.inbox.len(), 1, "inbox notifications must go too");
+        assert_eq!(app.inbox.iter().map(|r| r.connection_id.clone()).collect::<Vec<_>>(), ["kept"]);
+        assert_eq!(app.health.iter().map(|h| h.connection.id.clone()).collect::<Vec<_>>(), ["kept"]);
+        assert!(!app.repo_catalog.contains_key("gone"), "the repo catalog is keyed by connection");
+        assert!(app.repo_catalog.contains_key("kept"), "other connections are untouched");
+        // A selection pointing past the shortened list would panic the table widget.
+        assert!(app.inbox_sel < app.inbox.len());
+    }
+
+    /// The on-disk cache has to be purged as well: `seed_section` is unfiltered, so rows left
+    /// behind come back on the next launch if the app closes before the reload lands.
+    #[test]
+    fn removing_a_connection_purges_its_rows_from_the_cache_too() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = CacheStore::new(dir.path().join("cache.json"));
+        let row = |conn: &str| PrRow {
+            connection_id: conn.into(),
+            connection: "GH".into(),
+            provider: ProviderType::GitHub,
+            pr: pr(None),
+        };
+        let fetched_at = Utc::now() - chrono::Duration::hours(3);
+        // The list the user is looking at, and one they are not — both are seeded at launch.
+        let on_screen = prs_cache_key(PullRequestFilter::All, false);
+        let other = prs_cache_key(PullRequestFilter::Mine, true);
+        cache.put(&on_screen, &vec![row("gone"), row("kept")], fetched_at);
+        cache.put(&other, &vec![row("gone")], fetched_at);
+
+        purge_cached_rows(&cache, "gone");
+
+        let seeded = cache.get::<Vec<PrRow>>(&on_screen).expect("entry survives the purge");
+        assert_eq!(seeded.value.len(), 1);
+        assert_eq!(seeded.value[0].connection_id, "kept");
+        assert_eq!(seeded.fetched_at, fetched_at, "dropping rows must not make the rest look fresher");
+        assert!(
+            cache.get::<Vec<PrRow>>(&other).expect("entry survives").value.is_empty(),
+            "every PR filter/completed combination is purged, not just the visible one"
+        );
+    }
+
+    /// The inline `reload_*` methods run on the key-handler path, so whatever they leave in the
+    /// list is what the user is looking at for the length of the round trip. Clearing first put
+    /// an empty screen there; building into a local vec and swapping at the end does not.
+    #[test]
+    fn an_inline_reload_that_failed_leaves_the_rows_that_are_on_screen() {
+        let mut rows = vec![pr_row(pr(None))];
+        let mut errors = Vec::new();
+        let before = errors.len();
+        errors.push("PRs (GitHub): 502".to_string());
+
+        take_inline_section(&mut rows, Vec::new(), &errors, before);
+
+        assert_eq!(rows.len(), 1, "an outage erased the answer, not the pull requests");
+    }
+
+    /// The other half of the rule: a reload that actually answered is authoritative, so an empty
+    /// answer really does mean the list is empty — otherwise the last row of a section could
+    /// never be seen to go.
+    #[test]
+    fn an_inline_reload_that_answered_replaces_the_rows_even_with_nothing() {
+        let mut rows = vec![pr_row(pr(None))];
+        let errors: Vec<String> = Vec::new();
+
+        take_inline_section(&mut rows, Vec::new(), &errors, 0);
+
+        assert!(rows.is_empty());
+    }
+
+    /// One feed of several failing is partial live data: the failure is already in the status
+    /// line, and some fresh rows beat every stale one.
+    #[test]
+    fn a_partly_failed_inline_reload_still_takes_the_rows_that_came_back() {
+        let mut rows = vec![pr_row(pr(Some("https://old")))];
+        let errors = vec!["PRs (GitLab): 502".to_string()];
+
+        take_inline_section(&mut rows, vec![pr_row(pr(Some("https://fresh")))], &errors, 0);
+
+        assert_eq!(rows[0].pr.url.as_deref(), Some("https://fresh"));
+    }
+
+    /// An error the *caller* was already carrying must not be read as this section having
+    /// failed — the `errors` vec is shared across the sections a handler reloads.
+    #[test]
+    fn an_inline_reload_judges_only_the_failures_it_added_itself() {
+        let mut rows = vec![pr_row(pr(None))];
+        let errors = vec!["Work items (GitHub): 502".to_string()];
+
+        take_inline_section(&mut rows, Vec::new(), &errors, errors.len());
+
+        assert!(rows.is_empty(), "the work-item failure says nothing about the PR fetch");
+    }
+
+    /// A decided gate has to leave the run the moment the provider accepts it, or the picker
+    /// keeps offering a decision that has already been made.
+    #[test]
+    fn deciding_a_gate_drops_it_from_the_open_run_without_guessing_the_runs_status() {
+        let mut app = App::new("slate");
+        let mut view = PipelineView::new(
+            "CI".into(),
+            pipeline_run("r1", PipelineRunStatus::Running, vec![]),
+            "c".into(),
+            ProviderType::GitHub,
+            "ci".into(),
+            None,
+        );
+        view.supports_approvals = true;
+        view.can_respond_approvals = true;
+        view.approvals = vec![approval("g1", true), approval("g2", true)];
+        app.screen = Screen::Pipeline(Box::new(view));
+        app.pipes = vec![pipe_row("r1", PipelineRunStatus::Running, true)];
+
+        app.drop_decided_approval("c", &ItemRef::new("r1"), "g1");
+
+        let Screen::Pipeline(v) = &app.screen else { panic!("expected Pipeline") };
+        assert_eq!(v.approvals.iter().map(|a| a.id.clone()).collect::<Vec<_>>(), ["g2"]);
+        assert_eq!(
+            v.run.status,
+            PipelineRunStatus::Running,
+            "what an approval does to a run is the provider's to say, not ours to fake"
+        );
+        assert!(app.pipes[0].awaiting_approval, "a second gate still wants the user");
+
+        app.drop_decided_approval("c", &ItemRef::new("r1"), "g2");
+
+        assert!(!app.pipes[0].awaiting_approval, "the badge goes once nothing is left to answer");
+    }
+
+    /// The badge means "something here still wants *you*", so a gate left behind that the user
+    /// can only look at must not keep it lit.
+    #[test]
+    fn a_gate_the_user_cannot_answer_does_not_keep_the_approval_badge_lit() {
+        let mut app = App::new("slate");
+        let mut view = PipelineView::new(
+            "CI".into(),
+            pipeline_run("r1", PipelineRunStatus::Running, vec![]),
+            "c".into(),
+            ProviderType::GitHub,
+            "ci".into(),
+            None,
+        );
+        view.approvals = vec![approval("g1", true), approval("g2", false)];
+        app.screen = Screen::Pipeline(Box::new(view));
+        app.pipes = vec![pipe_row("r1", PipelineRunStatus::Running, true)];
+
+        app.drop_decided_approval("c", &ItemRef::new("r1"), "g1");
+
+        assert!(!app.pipes[0].awaiting_approval);
+        assert!(
+            !app.lp.iter().any(|e| e.bucket == launchpad::Bucket::ApprovalsWaiting),
+            "the Command Center's approvals bucket is rebuilt off that flag"
+        );
+    }
+
+    /// A run whose view has been navigated away from can't be reasoned about locally, so the
+    /// list row keeps its badge: a badge that lingers a second is recoverable, a missing one
+    /// hides a gate that still needs the user.
+    #[test]
+    fn a_decision_made_against_a_run_that_is_no_longer_open_leaves_the_badge_alone() {
+        let mut app = App::new("slate");
+        app.pipes = vec![pipe_row("r1", PipelineRunStatus::Running, true)];
+
+        app.drop_decided_approval("c", &ItemRef::new("r1"), "g1");
+
+        assert!(app.pipes[0].awaiting_approval);
+    }
+
+    /// An action taken from the drill-in has to land on the list row too, or pressing Esc walks
+    /// back onto the state the user just changed.
+    #[test]
+    fn a_work_item_state_change_lands_on_the_open_view_and_the_row_behind_it() {
+        let mut app = App::new("slate");
+        let item = wi(None);
+        app.wis = vec![wi_row(wi(None)), wi_row(WorkItem { id: "other".into(), ..wi(None) })];
+        app.screen = Screen::WiView(Box::new(WiView {
+            connection_id: "c".into(),
+            wi: item.clone(),
+            threads: Vec::new(),
+            scroll: 0,
+        }));
+
+        app.apply_wi_state("c", &item.item_ref(), "In Progress");
+
+        let Screen::WiView(v) = &app.screen else { panic!("expected WiView") };
+        assert_eq!(v.wi.state, "In Progress");
+        assert_eq!(app.wis[0].wi.state, "In Progress", "the row behind the view moves with it");
+        assert_eq!(
+            app.wis[0].wi.state_category,
+            WorkItemStateCategory::Backlog,
+            "the category is the provider's mapping of the state, not ours to derive"
+        );
+        assert_eq!(app.wis[1].wi.state, "Todo", "another item on the same connection is untouched");
+    }
+
+    /// Unbinding a connection is knowable straight away; binding one is not, because it has
+    /// contributed no rows yet.
+    #[test]
+    fn unbinding_a_connection_drops_its_rows_before_the_refetch() {
+        let deps = test_deps();
+        let mut app = App::new("slate");
+        let row = |conn: &str| PrRow { connection_id: conn.into(), ..pr_row(pr(None)) };
+        app.prs = vec![row("gone"), row("kept")];
+        app.lp_prs_mine = vec![row("gone"), row("kept")];
+        app.lp_prs_review = vec![row("gone")];
+        app.wis = vec![WiRow { connection_id: "gone".into(), ..wi_row(wi(None)) }];
+
+        app.drop_unbound_rows(0, &HashSet::from(["kept".to_string()]), &deps);
+
+        let ids = |rows: &[PrRow]| rows.iter().map(|r| r.connection_id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(&app.prs), ["kept"]);
+        assert_eq!(ids(&app.lp_prs_mine), ["kept"], "the Command Center's PR feeds go too");
+        assert!(app.lp_prs_review.is_empty());
+        assert_eq!(app.wis.len(), 1, "a PR binding says nothing about the work-item section");
+
+        app.drop_unbound_rows(1, &HashSet::new(), &deps);
+
+        assert!(app.wis.is_empty());
+    }
+
+    /// Narrowing the scope is knowable; widening it is not, so only rows outside the new set go.
+    #[test]
+    fn narrowing_the_repository_scope_drops_the_rows_it_no_longer_covers() {
+        let deps = test_deps();
+        let mut app = App::new("slate");
+        let in_repo = |conn: &str, repo: Option<&str>| PrRow {
+            connection_id: conn.into(),
+            pr: PullRequest { repository: repo.map(Into::into), ..pr(None) },
+            ..pr_row(pr(None))
+        };
+        app.prs = vec![
+            in_repo("c", Some("acme/pay")),
+            in_repo("c", Some("acme/legacy")),
+            // The same repository in the host-qualified spelling: comparing the two by hand is
+            // exactly the silent mismatch `repo::matches_scope_entry` exists to prevent.
+            in_repo("c", Some("github.com/acme/pay")),
+            in_repo("c", None),
+            in_repo("other", Some("acme/legacy")),
+        ];
+        app.lp_prs_mine = vec![in_repo("c", Some("acme/legacy"))];
+        // Azure addresses work items by Team Project, so this row's "repository" is a project
+        // name that no scope entry could ever match.
+        app.wis = vec![WiRow {
+            provider: ProviderType::AzureDevOps,
+            wi: WorkItem { repository: Some("Payments".into()), ..wi(None) },
+            ..wi_row(wi(None))
+        }];
+
+        app.narrow_to_repo_scope("c", &["acme/pay".to_string()], &deps);
+
+        let repos = |rows: &[PrRow]| rows.iter().map(|r| r.pr.repository.clone()).collect::<Vec<_>>();
+        assert_eq!(
+            repos(&app.prs),
+            [
+                Some("acme/pay".to_string()),
+                Some("github.com/acme/pay".to_string()),
+                None,
+                Some("acme/legacy".to_string())
+            ],
+            "only this connection's out-of-scope rows go; an unaddressed row can't be placed"
+        );
+        assert!(app.lp_prs_mine.is_empty(), "the Command Center's PR feeds narrow too");
+        assert_eq!(app.wis.len(), 1, "a project-addressed section is left to the reload");
+    }
+
+    /// `self.inbox` is this session; the cache is the *next* launch. Without the rewrite,
+    /// quitting before the next poll repaints a notification the user already read as unread.
+    #[test]
+    fn marking_a_notification_read_rewrites_the_cached_inbox_without_redating_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = CacheStore::new(dir.path().join("cache.json"));
+        let fetched_at = Utc::now() - chrono::Duration::hours(3);
+        cache.put(CACHE_KEY_INBOX, &vec![notif_row("n1"), notif_row("n2")], fetched_at);
+
+        mark_cached_inbox_read(&cache, |row| row.notification.id == "n1");
+
+        let entry = cache.get::<Vec<NotifRow>>(CACHE_KEY_INBOX).expect("entry survives");
+        assert!(!entry.value[0].notification.unread, "the one that was read stays read");
+        assert!(entry.value[1].notification.unread, "the others are untouched");
+        assert_eq!(entry.fetched_at, fetched_at, "reading a notification doesn't make the list fresher");
+
+        mark_cached_inbox_read(&cache, |_| true);
+
+        let entry = cache.get::<Vec<NotifRow>>(CACHE_KEY_INBOX).expect("entry survives");
+        assert!(entry.value.iter().all(|r| !r.notification.unread), "mark-all reaches the cache too");
+    }
+
+    /// A config store that loads fine and refuses every write, for the persist-failure paths.
+    /// Nothing else in the crate can produce one: `InMemoryConfigStore` always succeeds.
+    struct RefusingConfigStore;
+
+    #[async_trait::async_trait]
+    impl forgetop_core::config::ConfigStore for RefusingConfigStore {
+        async fn load(&self) -> forgetop_core::Result<forgetop_core::config::ForgetopConfig> {
+            Ok(forgetop_core::config::ForgetopConfig::default())
+        }
+        async fn save(&self, _config: &forgetop_core::config::ForgetopConfig) -> forgetop_core::Result<()> {
+            Err(forgetop_core::Error::Config("config directory is read-only".into()))
+        }
+    }
+
+    /// `test_deps`, but every config write fails.
+    fn deps_that_cannot_persist() -> AppDeps {
+        use forgetop_core::secret::InMemorySecretStore;
+        use forgetop_core::service::ConnectionResolver;
+
+        let registry = Arc::new(ProviderRegistry::new(Vec::new()));
+        let secrets = Arc::new(InMemorySecretStore::default());
+        let config = Arc::new(ConfigService::new(Arc::new(RefusingConfigStore), secrets.clone(), registry.clone()));
+        let resolver = Arc::new(ConnectionResolver::new(config.clone(), registry, secrets));
+        AppDeps {
+            sections: Arc::new(SectionService::new(config.clone(), resolver.clone())),
+            health: Arc::new(ConnectionHealthService::new(config.clone(), resolver)),
+            config,
+            cache: Arc::new(CacheStore::disabled()),
+        }
+    }
+
+    fn saved_view(name: &str) -> SavedView {
+        SavedView { name: name.into(), filter: None, query: String::new(), sort: None, hidden_states: Vec::new() }
+    }
+
+    /// The view stays on screen — writing local state first is deliberate and matches the rest of
+    /// the app — but "Saved view" would be a lie the user only finds out about on the next launch,
+    /// when the view they think they saved is gone.
+    #[tokio::test]
+    async fn a_view_that_could_not_be_persisted_says_so_instead_of_reporting_success() {
+        let deps = deps_that_cannot_persist();
+        let mut app = App::new("slate");
+
+        app.save_view("Mine only".into(), &deps).await;
+
+        assert_eq!(app.views[0].len(), 1, "the optimistic local write still stands");
+        let toast = app.toast.as_deref().expect("a failed save has to say something");
+        assert!(toast.contains("Couldn't save view"), "{toast}");
+        assert!(!toast.contains("Saved view"), "a refused write must not report success: {toast}");
+    }
+
+    /// Same for the other direction, and the toast has to survive `apply_view` — which sets a
+    /// "View: …" toast of its own after the persist has already been attempted.
+    #[tokio::test]
+    async fn a_view_that_could_not_be_deleted_says_so_rather_than_announcing_the_delete() {
+        let deps = deps_that_cannot_persist();
+        let mut app = App::new("slate");
+        app.views[0] = vec![saved_view("All"), saved_view("Mine")];
+        app.view_idx[0] = 1;
+
+        app.delete_view(&deps).await;
+
+        let toast = app.toast.as_deref().expect("a failed delete has to say something");
+        assert!(toast.contains("Couldn't delete view"), "{toast}");
+        assert!(!toast.contains("Deleted view"), "a refused write must not report success: {toast}");
+        assert!(!toast.starts_with("View:"), "apply_view's toast must not bury the failure: {toast}");
+    }
+
     fn health(id: &str) -> ConnectionHealth {
         ConnectionHealth {
             connection: forgetop_core::provider::Connection {
@@ -5909,6 +6538,26 @@ mod tests {
 
         assert!(app.awaiting_browser_setup, "the browser choice must show the waiting state");
         assert!(app.wizard.is_none());
+    }
+
+    /// `C` used to open the browser as well, from when connection management lived in the
+    /// dashboard. The terminal list does the whole job now, and `B` is the only key that leaves.
+    #[tokio::test]
+    async fn c_opens_the_terminal_connections_list_and_never_the_browser() {
+        let deps = test_deps();
+        for screen in [Screen::Launchpad, Screen::List] {
+            let mut app = App::new("slate");
+            app.screen = screen;
+            app.dashboard_url = Some("http://127.0.0.1:1/".into());
+            app.on_key(Key::Char('C'), &deps).await;
+
+            assert!(matches!(app.screen, Screen::Config(_)), "C must land on the connections list");
+            assert!(
+                !app.toast.as_deref().is_some_and(|t| t.contains("dashboard")),
+                "C must not launch the dashboard: {:?}",
+                app.toast
+            );
+        }
     }
 
     #[tokio::test]

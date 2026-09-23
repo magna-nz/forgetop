@@ -760,6 +760,7 @@ dependencies = [
 name = "forgetop-tui"
 version = "1.0.0"
 dependencies = [
+ "async-trait",
  "chrono",
  "crossterm",
  "forgetop-core",
@@ -769,6 +770,7 @@ dependencies = [
  "ratatui",
  "serde",
  "synoptic",
+ "tempfile",
  "tokio",
 ]
 

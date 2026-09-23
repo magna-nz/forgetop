@@ -3,6 +3,7 @@ import { motion } from "framer-motion";
 import { useQueryClient } from "@tanstack/react-query";
 import { apiPost, useConnections, useHealth, useWriteAction } from "../api";
 import type { ConnectionRow } from "../types";
+import { dropConnectionFromCache } from "../optimistic";
 import { Skeleton, StateCard, StatusBadge } from "./ui";
 import { ErrorState } from "./ErrorState";
 import { ConnectionForm } from "./ConnectionForm";
@@ -23,6 +24,15 @@ export function Settings() {
     ["connections", "health", "launchpad", "prs", "work-items", "pipelines", "notifications"].forEach((k) =>
       qc.invalidateQueries({ queryKey: [k] }),
     );
+  };
+
+  /**
+   * Reflects a removal locally before the refetch, so the card and its rows disappear on the
+   * click rather than when the network answers. See `dropConnectionFromCache`.
+   */
+  const dropConnection = (id: string) => {
+    dropConnectionFromCache(qc, id);
+    refreshAll();
   };
 
   if (isLoading) return <Skeleton />;
@@ -58,7 +68,7 @@ export function Settings() {
               conn={c}
               healthy={healthById.get(c.id)}
               onEdit={() => setEditing(c)}
-              onChanged={refreshAll}
+              onRemoved={dropConnection}
             />
           ))}
         </div>
@@ -84,20 +94,24 @@ function ConnectionCard({
   conn,
   healthy,
   onEdit,
-  onChanged,
+  onRemoved,
 }: {
   conn: ConnectionRow;
   healthy?: boolean;
   onEdit: () => void;
-  onChanged: () => void;
+  /** Reports the removed id so the caller can drop its rows before refetching. */
+  onRemoved: (id: string) => void;
 }) {
   const { busy, run } = useWriteAction();
   const [tested, setTested] = useState<boolean | null>(null);
 
   const del = async () => {
     if (!window.confirm(`Remove "${conn.display_name}"? This also deletes its token from the keychain.`)) return;
-    await run("/api/connections/delete", { id: conn.id }, []);
-    onChanged();
+    // `run` reports a failure by returning false, not by throwing. Dropping the rows regardless
+    // would show the connection deleted and then, a refetch later, silently undeleted.
+    if (await run("/api/connections/delete", { id: conn.id }, [])) {
+      onRemoved(conn.id);
+    }
   };
   const test = async () => {
     setTested(null);

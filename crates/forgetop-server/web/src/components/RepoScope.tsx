@@ -3,6 +3,7 @@ import { useQueries, useQueryClient } from "@tanstack/react-query";
 import { apiPost, fetchConnectionRepositories, useConnections } from "../api";
 import { isRepoAddressed } from "../capabilities";
 import type { ConnectionRow, RepositoryPage } from "../types";
+import { setConnectionScopeInCache } from "../optimistic";
 
 /** Queries invalidated when the scope changes. The scope gates **fetching**, so every list that
  *  fetches has to go back to the provider — unlike the view tabs, which narrow rows already in
@@ -185,11 +186,16 @@ function ConnectionScope({
   const save = async (next: string[]) => {
     setBusy(true);
     setError(null);
+    // The new scope is exactly what we're sending, so the checkbox and the "Repos · N of M"
+    // label can move now; the lists it gates still have to be refetched (see AFFECTED).
+    setConnectionScopeInCache(qc, connection.id, next);
     try {
       await apiPost("/api/connections/scope", { id: connection.id, scope: next });
       AFFECTED.forEach((k) => qc.invalidateQueries({ queryKey: [k] }));
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
+      // The scope never changed server-side, so pull the real one back over the local guess.
+      qc.invalidateQueries({ queryKey: ["connections"] });
     } finally {
       setBusy(false);
     }
