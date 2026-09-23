@@ -20,8 +20,12 @@ pub enum Lang {
     Python,
     Go,
     Java,
+    CSharp,
     Json,
     Yaml,
+    Toml,
+    Markdown,
+    Shell,
 }
 
 impl Lang {
@@ -34,14 +38,21 @@ impl Lang {
             Lang::Python => "py",
             Lang::Go => "go",
             Lang::Java => "java",
+            Lang::CSharp => "cs",
             Lang::Json => "json",
             Lang::Yaml => "yml",
+            Lang::Toml => "toml",
+            Lang::Markdown => "md",
+            Lang::Shell => "sh",
         }
     }
 }
 
 /// Detect the language from a file path's extension, or `None` if we don't highlight it
 /// (the caller then renders the line plain, exactly as before).
+///
+/// A leading-dot filename like `.bashrc` has no extension in the usual sense, but its
+/// single segment lands in `ext` all the same — which is how shell dotfiles are matched.
 pub fn lang_for(path: &str) -> Option<Lang> {
     let ext = path.rsplit('.').next().filter(|e| *e != path)?.to_ascii_lowercase();
     Some(match ext.as_str() {
@@ -51,8 +62,19 @@ pub fn lang_for(path: &str) -> Option<Lang> {
         "py" | "pyw" => Lang::Python,
         "go" => Lang::Go,
         "java" => Lang::Java,
+        // MSBuild XML rides on the C# grammar: PascalCase tags/attributes land on its
+        // `struct` rule, so elements colour as types and quoted values as strings.
+        "cs" | "csproj" | "fsproj" | "vbproj" | "props" | "targets" => Lang::CSharp,
         "json" => Lang::Json,
         "yaml" | "yml" => Lang::Yaml,
+        "toml" => Lang::Toml,
+        "md" | "markdown" => Lang::Markdown,
+        // `zsh` has no grammar of its own; the shell rules are close enough.
+        "sh" | "bash" | "zsh" => Lang::Shell,
+        // Shell dotfiles: `.bashrc` has no extension in the usual sense, but the segment
+        // after its leading dot lands in `ext` all the same, so we match on that.
+        "bashrc" | "bash_profile" | "bash_aliases" | "bash_logout" | "profile" | "zshrc"
+        | "zshenv" | "zprofile" | "zlogin" | "zlogout" => Lang::Shell,
         _ => return None,
     })
 }
@@ -67,6 +89,13 @@ pub enum HlKind {
     Number,
     Func,
     Punct,
+    /// A section title — a Markdown `#` heading or a TOML `[table]` header.
+    Heading,
+    /// A Markdown link or image target.
+    Link,
+    /// Emphasised prose: bold, italic and strikethrough all collapse here, since the
+    /// distinction costs three more kinds and reads the same at diff scale.
+    Emph,
     Plain,
 }
 
@@ -80,6 +109,13 @@ pub fn kind_for_name(name: &str) -> HlKind {
         "digit" => HlKind::Number,
         "function" | "macro" => HlKind::Func,
         "operator" | "reference" => HlKind::Punct,
+        // Markup categories (Markdown, TOML).
+        "heading" | "table" => HlKind::Heading,
+        "link" | "image" => HlKind::Link,
+        "bold" | "italic" | "strikethrough" => HlKind::Emph,
+        "block" => HlKind::Str,     // inline code / fences read like strings
+        "math" => HlKind::Number,
+        "quote" | "list" | "linebreak" => HlKind::Comment,
         _ => HlKind::Plain,
     }
 }
@@ -134,6 +170,32 @@ mod tests {
         assert_eq!(lang_for("deploy/values.yaml"), Some(Lang::Yaml));
         assert_eq!(lang_for("k8s.yml"), Some(Lang::Yaml));
         assert_eq!(lang_for("Main.JAVA"), Some(Lang::Java)); // case-insensitive
+        assert_eq!(lang_for("Controllers/SampleController.cs"), Some(Lang::CSharp));
+        assert_eq!(lang_for("src/SampleApp.csproj"), Some(Lang::CSharp));
+        assert_eq!(lang_for("Directory.Build.props"), Some(Lang::CSharp));
+        assert_eq!(lang_for("build/Common.targets"), Some(Lang::CSharp));
+        assert_eq!(lang_for("src/Lib.fsproj"), Some(Lang::CSharp));
+        assert_eq!(lang_for("src/Legacy.vbproj"), Some(Lang::CSharp));
+        assert_eq!(lang_for("Cargo.toml"), Some(Lang::Toml));
+        assert_eq!(lang_for("README.md"), Some(Lang::Markdown));
+        assert_eq!(lang_for("docs/guide.markdown"), Some(Lang::Markdown));
+        assert_eq!(lang_for("scripts/release.sh"), Some(Lang::Shell));
+        assert_eq!(lang_for("ci/setup.bash"), Some(Lang::Shell));
+        assert_eq!(lang_for("tools/env.zsh"), Some(Lang::Shell));
+    }
+
+    #[test]
+    fn detects_shell_dotfiles() {
+        // No extension in the usual sense — the segment after the leading dot is what we match.
+        assert_eq!(lang_for(".bashrc"), Some(Lang::Shell));
+        assert_eq!(lang_for(".zshrc"), Some(Lang::Shell));
+        assert_eq!(lang_for("home/.bash_profile"), Some(Lang::Shell));
+        assert_eq!(lang_for("skel/.profile"), Some(Lang::Shell));
+        // Only shell dotfiles opt in — an unknown one is still plain.
+        assert_eq!(lang_for(".gitignore"), None);
+        assert_eq!(lang_for(".editorconfig"), None);
+        // A dotless file of the same name has no extension at all → no highlighting.
+        assert_eq!(lang_for("bashrc"), None);
     }
 
     #[test]
@@ -174,6 +236,43 @@ mod tests {
     fn highlights_python_string() {
         let toks = highlight_line(Lang::Python, r#"name = "sam""#);
         assert!(has(&toks, "sam", HlKind::Str), "double-quoted string: {toks:?}");
+    }
+
+    #[test]
+    fn highlights_csharp_keyword_type_and_string() {
+        let toks = highlight_line(Lang::CSharp, r#"public class Sample { const string S = "x"; }"#);
+        // The full line is covered by the returned spans (nothing dropped).
+        let joined: String = toks.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(joined, r#"public class Sample { const string S = "x"; }"#);
+        assert!(has(&toks, "public", HlKind::Keyword), "`public` is a keyword: {toks:?}");
+        assert!(has(&toks, "Sample", HlKind::Type), "PascalCase name is a type: {toks:?}");
+        assert!(has(&toks, "x", HlKind::Str), "double-quoted string: {toks:?}");
+    }
+
+    #[test]
+    fn highlights_toml_table_and_string() {
+        let toks = highlight_line(Lang::Toml, r#"[package]"#);
+        assert!(has(&toks, "[package]", HlKind::Heading), "table header is a heading: {toks:?}");
+        let toks = highlight_line(Lang::Toml, r#"name = "forgetop" # ours"#);
+        assert!(has(&toks, "forgetop", HlKind::Str), "quoted value: {toks:?}");
+        assert!(has(&toks, "ours", HlKind::Comment), "trailing `#` comment: {toks:?}");
+    }
+
+    #[test]
+    fn highlights_markdown_heading_and_code_span() {
+        let toks = highlight_line(Lang::Markdown, "# Title");
+        assert!(has(&toks, "# Title", HlKind::Heading), "`#` heading: {toks:?}");
+        let toks = highlight_line(Lang::Markdown, "run `cargo test` now");
+        assert!(has(&toks, "cargo test", HlKind::Str), "inline code reads as a string: {toks:?}");
+    }
+
+    #[test]
+    fn highlights_shell_keyword_and_comment() {
+        let toks = highlight_line(Lang::Shell, r#"if [ -f x ]; then echo "hi"; fi # note"#);
+        let joined: String = toks.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(joined, r#"if [ -f x ]; then echo "hi"; fi # note"#);
+        assert!(has(&toks, "if", HlKind::Keyword), "`if` is a keyword: {toks:?}");
+        assert!(has(&toks, "note", HlKind::Comment), "trailing `#` comment: {toks:?}");
     }
 
     #[test]
