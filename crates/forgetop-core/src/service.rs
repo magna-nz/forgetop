@@ -302,6 +302,12 @@ impl ConfigService {
         self.persist(cfg).await
     }
 
+    pub async fn set_dismissed_launchpad_items(&self, dismissed: Vec<String>) -> Result<()> {
+        let mut cfg = self.snapshot();
+        cfg.ui.dismissed_launchpad_items = dismissed;
+        self.persist(cfg).await
+    }
+
     pub async fn set_notifications(&self, prefs: NotificationPrefs) -> Result<()> {
         let mut cfg = self.snapshot();
         cfg.ui.notifications = prefs;
