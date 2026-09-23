@@ -5,6 +5,7 @@ import { apiPost, useNotifications } from "../api";
 import { notificationMeta, relativeTime, toTime } from "../format";
 import { useNavigateSection } from "../nav";
 import type { NotifRow, SectionId } from "../types";
+import { markNotificationReadInCache } from "../optimistic";
 import { usePrOpener } from "./PrDetail";
 import { useWiOpener } from "./WiDetail";
 
@@ -48,7 +49,10 @@ export function TopBar({
     const n = row.notification;
     const conn = row.connection_id;
     if (n.unread) {
-      void apiPost("/api/notification/read", { conn, id: n.id }).then(() => {
+      // Same shared edit the Notifications page uses: the badge drops on the click, and the
+      // invalidation that follows confirms it — or, if the write failed, undoes it.
+      markNotificationReadInCache(qc, conn, n.id);
+      void apiPost("/api/notification/read", { conn, id: n.id }).finally(() => {
         qc.invalidateQueries({ queryKey: ["notifications"] });
         qc.invalidateQueries({ queryKey: ["launchpad"] });
       });

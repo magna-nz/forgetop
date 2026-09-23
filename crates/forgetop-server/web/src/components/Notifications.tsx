@@ -4,6 +4,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { apiPost, useNotifications } from "../api";
 import { notificationMeta, relativeTime, toTime } from "../format";
 import type { NotifRow } from "../types";
+import { markNotificationReadInCache } from "../optimistic";
 import { List, Skeleton, StateCard } from "./ui";
 import { ErrorState } from "./ErrorState";
 import { useListView } from "./ControlBar";
@@ -58,9 +59,16 @@ function NotifCard({ row, index }: { row: NotifRow; index: number }) {
   const conn = row.connection_id;
 
   const markReadNow = async () => {
-    await apiPost("/api/notification/read", { conn, id: n.id });
-    qc.invalidateQueries({ queryKey: ["notifications"] });
-    qc.invalidateQueries({ queryKey: ["launchpad"] });
+    // Dim the row (and drop the bell count) on the click rather than when the network answers.
+    markNotificationReadInCache(qc, conn, n.id);
+    try {
+      await apiPost("/api/notification/read", { conn, id: n.id });
+    } finally {
+      // Invalidated either way: on success the refetch confirms the local flag, on failure it is
+      // what replaces it with the server's truth.
+      qc.invalidateQueries({ queryKey: ["notifications"] });
+      qc.invalidateQueries({ queryKey: ["launchpad"] });
+    }
   };
 
   // Explicit "✓ read" button — shows a busy state.

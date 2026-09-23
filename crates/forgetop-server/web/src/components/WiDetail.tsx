@@ -4,6 +4,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { apiGet, apiPost, useWiDetail, wiDetailKey } from "../api";
 import { relativeTime, wiStateColor } from "../format";
 import type { CommentThread, User, WiRef, WorkItem } from "../types";
+import { patchWorkItem } from "../optimistic";
 import { Avatar, Chip, Pill, SlideOver, Timeline } from "./ui";
 
 // ---- opener context ----
@@ -48,10 +49,12 @@ function WiDetailPanel({ wiRef, onClose }: { wiRef: WiRef; onClose: () => void }
     try {
       await fn();
       setNote(`${label} ✓`);
-      refresh();
     } catch (e) {
       setNote(e instanceof Error ? e.message : String(e));
     } finally {
+      // Refreshed on both paths: after a success it confirms the optimistic patch the caller
+      // already applied, after a failure it is the rollback — the server's truth replaces it.
+      refresh();
       setBusy(false);
     }
   };
@@ -93,13 +96,27 @@ function WiDetailPanel({ wiRef, onClose }: { wiRef: WiRef; onClose: () => void }
               wiRef={wiRef}
               assignee={wi.assignee}
               busy={busy}
-              onPick={(assigneeId) =>
-                act(assigneeId ? "Reassigned" : "Unassigned", () =>
-                  apiPost("/api/wi/assignee", { conn: wiRef.conn, repo: wiRef.repo, id: wiRef.id, assignee_id: assigneeId }),
-                )
-              }
+              onPick={(user) => {
+                // The picker already holds the full `User` it listed, so the new assignee is
+                // knowable locally — name and avatar can change on the click.
+                patchWorkItem(qc, wiRef, { assignee: user });
+                act(user ? "Reassigned" : "Unassigned", () =>
+                  apiPost("/api/wi/assignee", { conn: wiRef.conn, repo: wiRef.repo, id: wiRef.id, assignee_id: user?.id ?? null }),
+                );
+              }}
             />
-            <MoveState wiRef={wiRef} current={wi.state} busy={busy} onMove={(state) => act(`Moved to ${state}`, () => apiPost("/api/wi/state", { conn: wiRef.conn, repo: wiRef.repo, id: wiRef.id, state }))} />
+            <MoveState
+              wiRef={wiRef}
+              current={wi.state}
+              busy={busy}
+              onMove={(state) => {
+                // Only the state *name* is knowable: /api/wi/states answers with raw names, so
+                // `state_category` — which drives the state colour and the Command Center bucket —
+                // is deliberately left as it was until the refetch supplies the real one.
+                patchWorkItem(qc, wiRef, { state });
+                act(`Moved to ${state}`, () => apiPost("/api/wi/state", { conn: wiRef.conn, repo: wiRef.repo, id: wiRef.id, state }));
+              }}
+            />
             {!editing && (
               <button onClick={() => setEditing(true)} className="rounded px-2 py-1" style={{ color: "var(--dim)", border: "1px solid var(--border)", background: "var(--panel2)" }}>
                 Edit
@@ -112,12 +129,18 @@ function WiDetailPanel({ wiRef, onClose }: { wiRef: WiRef; onClose: () => void }
               wi={wi}
               busy={busy}
               onCancel={() => setEditing(false)}
-              onSave={(title, description) =>
+              onSave={(title, description) => {
+                // `EditFields` only passes a field it actually changed; patch exactly that set, so
+                // an untouched description is never rewritten with the form's copy of it.
+                patchWorkItem(qc, wiRef, {
+                  ...(title !== undefined ? { title } : {}),
+                  ...(description !== undefined ? { description } : {}),
+                });
                 act("Saved", async () => {
                   await apiPost("/api/wi/update", { conn: wiRef.conn, repo: wiRef.repo, id: wiRef.id, title, description });
                   setEditing(false);
-                })
-              }
+                });
+              }}
             />
           ) : (
             wi.description && (
@@ -203,7 +226,10 @@ function MoveState({ wiRef, current, busy, onMove }: { wiRef: WiRef; current: st
 
 // ---- assignee picker ----
 
-function AssigneePicker({ wiRef, assignee, busy, onPick }: { wiRef: WiRef; assignee?: User | null; busy: boolean; onPick: (assigneeId: string | null) => void }) {
+// `onPick` hands back the whole `User`, not just its id: the caller needs the display name and
+// avatar to show the reassignment before the refetch, and this list is the only place that has
+// them without another fetch.
+function AssigneePicker({ wiRef, assignee, busy, onPick }: { wiRef: WiRef; assignee?: User | null; busy: boolean; onPick: (user: User | null) => void }) {
   const [open, setOpen] = useState(false);
   const [users, setUsers] = useState<User[] | null>(null);
   const [loading, setLoading] = useState(false);
@@ -219,8 +245,8 @@ function AssigneePicker({ wiRef, assignee, busy, onPick }: { wiRef: WiRef; assig
     }
   }, [open, users, loading, wiRef.conn, wiRef.id]);
 
-  const pick = (assigneeId: string | null) => {
-    onPick(assigneeId);
+  const pick = (user: User | null) => {
+    onPick(user);
     setOpen(false);
   };
 
@@ -262,7 +288,7 @@ function AssigneePicker({ wiRef, assignee, busy, onPick }: { wiRef: WiRef; assig
             <button
               key={u.id}
               disabled={busy}
-              onClick={() => pick(u.id)}
+              onClick={() => pick(u)}
               className="flex items-center gap-2 w-full text-left px-3 py-1.5"
               style={{ color: "var(--fg)" }}
               onMouseEnter={(e) => (e.currentTarget.style.background = "var(--sel)")}
