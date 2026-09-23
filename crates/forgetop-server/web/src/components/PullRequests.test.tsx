@@ -35,6 +35,38 @@ const pr = (id: string, title: string, status = "Open"): any => ({
 });
 
 describe("PullRequests", () => {
+  // Every one of these rows has green CI. Before, all three showed the same "checks passing"
+  // pill — the list reported a conflicted and a changes-requested PR as healthy.
+  it("names what stops a pull request, not just how its checks went", async () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const green = (id: string, title: string, f: (p: any) => void) => {
+      const row = pr(id, title);
+      row.needs_decoration = false;
+      row.pull_request.checks = "Passed";
+      row.pull_request.check_summary = { successful: 8, in_progress: 0, failed: 0, neutral: 0 };
+      f(row.pull_request);
+      return row;
+    };
+    mockFetch({
+      get: {
+        "view=all": [
+          green("1", "A clean PR", () => {}),
+          green("2", "A conflicted PR", (p) => (p.mergeable = "Conflicting")),
+          green("3", "A rejected PR", (p) => {
+            p.reviewers = [{ user: { id: "sam", display_name: "sam", handle: "sam", avatar_url: null }, vote: "Rejected", is_required: false }];
+          }),
+        ],
+      },
+    });
+    renderWithClient(<PullRequests />);
+
+    expect(await screen.findByText("A clean PR")).toBeInTheDocument();
+    expect(screen.getByText("conflicts")).toBeInTheDocument();
+    expect(screen.getByText("changes requested")).toBeInTheDocument();
+    // Only the genuinely clean row still reports on its checks.
+    expect(screen.getAllByText("checks passing")).toHaveLength(1);
+  });
+
   it("offers the four views and refetches when one is picked", async () => {
     mockFetch({
       get: {

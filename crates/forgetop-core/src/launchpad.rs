@@ -15,7 +15,7 @@ use chrono::{DateTime, Utc};
 
 use crate::domain::{
     CheckStatus, MergeableState, PipelineRun, PipelineRunStatus, ProviderType, PullRequest, PullRequestStatus,
-    ReviewVote, WorkItem, WorkItemStateCategory,
+    ReviewVote, User, WorkItem, WorkItemStateCategory,
 };
 
 /// The action bucket an item lands in. [`Bucket::ORDER`] is the display/urgency order — the
@@ -105,6 +105,140 @@ pub fn pr_vote_flags(pr: &PullRequest) -> (bool, bool) {
     (approved, changes)
 }
 
+/// What is standing between a pull request and its merge — the reason an authored one lands in
+/// [`Bucket::NeedsFixing`], so a row can *say* what a bucket only implies.
+///
+/// [`classify_pr`] buckets an **authored** PR on [`pr_blocker`] being `Some`, so for those the
+/// displayed reason and the bucketing reason are one judgement and cannot drift.
+///
+/// Frontends also render it for rows they did *not* bucket this way — a PR awaiting your review
+/// can carry a conflict or another reviewer's rejection, and saying so is useful even though the
+/// row sits under "Needs your review". So treat it as "what blocks this PR", not as a claim
+/// about which bucket the row is in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrBlocker {
+    /// The branch no longer merges cleanly.
+    Conflicting,
+    /// A reviewer asked for changes.
+    ChangesRequested,
+    /// Required checks came back red.
+    ChecksFailing,
+}
+
+impl PrBlocker {
+    /// A short label for the row's signal cell.
+    pub fn label(&self) -> &'static str {
+        match self {
+            PrBlocker::Conflicting => "conflicts",
+            PrBlocker::ChangesRequested => "changes",
+            PrBlocker::ChecksFailing => "checks",
+        }
+    }
+}
+
+/// What's blocking `pr`, or `None` when nothing is.
+///
+/// Precedence is most-fundamental first: a conflict blocks the merge no matter what review and
+/// CI say, and a review asking for changes outranks red checks, since addressing the review will
+/// re-run them anyway. Only the winner is shown, so the row names one thing to go and do.
+///
+/// Drafts are never blocked — they aren't asking anything of you yet.
+pub fn pr_blocker(pr: &PullRequest) -> Option<PrBlocker> {
+    if pr.is_draft {
+        return None;
+    }
+    let (_, changes) = pr_vote_flags(pr);
+    if matches!(pr.mergeable, MergeableState::Conflicting) {
+        Some(PrBlocker::Conflicting)
+    } else if changes {
+        Some(PrBlocker::ChangesRequested)
+    } else if pr.checks == CheckStatus::Failed {
+        Some(PrBlocker::ChecksFailing)
+    } else {
+        None
+    }
+}
+
+/// Where a pull request stands, as one verdict — the single thing to tell someone who just
+/// opened it.
+///
+/// Composed from [`pr_blocker`] rather than re-deriving it, so the PR list, the Command Center
+/// row and the PR screen cannot disagree about the same pull request; each renders this at a
+/// different length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrState {
+    /// Shipped.
+    Merged,
+    /// Closed without merging.
+    Closed,
+    /// Not open for review yet.
+    Draft,
+    /// Something is in the author's way — see [`PrBlocker`].
+    Blocked(PrBlocker),
+    /// CI hasn't finished: neither blocked nor clear.
+    ChecksRunning,
+    /// Nothing blocking *and* approved and mergeable — the merge button is live.
+    ReadyToMerge,
+    /// Nothing blocking, but not yet approved.
+    NothingBlocking,
+}
+
+impl PrState {
+    /// True for the states that need the author to do something.
+    pub fn is_blocked(&self) -> bool {
+        matches!(self, PrState::Blocked(_))
+    }
+}
+
+/// Where a pull request stands. See [`PrState`].
+///
+/// Lifecycle is tested before anything else: a merged or closed pull request keeps whatever
+/// `mergeable` and reviewer votes it had when it was open, so asking what blocks it gives a
+/// stale answer. A draft isn't blocked either — it isn't asking anything of anyone yet. Only
+/// then does [`pr_blocker`] get a say, and unfinished CI is reported ahead of either "clear"
+/// state so a half-green pull request never reads as done.
+pub fn pr_state(pr: &PullRequest) -> PrState {
+    match pr.status {
+        PullRequestStatus::Merged => return PrState::Merged,
+        PullRequestStatus::Closed => return PrState::Closed,
+        PullRequestStatus::Draft => return PrState::Draft,
+        PullRequestStatus::Open => {}
+    }
+    if pr.is_draft {
+        return PrState::Draft;
+    }
+    if let Some(b) = pr_blocker(pr) {
+        return PrState::Blocked(b);
+    }
+    let running = match &pr.check_summary {
+        Some(s) => s.in_progress > 0,
+        None => pr.checks == CheckStatus::Pending,
+    };
+    if running {
+        return PrState::ChecksRunning;
+    }
+    let (approved, _) = pr_vote_flags(pr);
+    if approved && matches!(pr.mergeable, MergeableState::Mergeable) {
+        PrState::ReadyToMerge
+    } else {
+        PrState::NothingBlocking
+    }
+}
+
+/// The reviewer whose rejection is holding this pull request up, when one is known — so a row can
+/// say *who* asked for changes rather than only that someone did.
+pub fn pr_changes_requested_by(pr: &PullRequest) -> Option<&User> {
+    pr.reviewers.iter().find(|r| r.vote == ReviewVote::Rejected).map(|r| &r.user)
+}
+
+/// The reviewer who approved, when one is known.
+pub fn pr_approved_by(pr: &PullRequest) -> Option<&User> {
+    pr.reviewers
+        .iter()
+        .find(|r| matches!(r.vote, ReviewVote::Approved | ReviewVote::ApprovedWithSuggestions))
+        .map(|r| &r.user)
+}
+
 /// The left-column action bucket a PR lands in, or `None` when there's nothing to act on right
 /// now (a draft, or one just waiting on others' review — those still show in your full open-PR
 /// list on the right, but not as an action item).
@@ -113,21 +247,45 @@ pub fn classify_pr(pr: &PullRequest, role: PrRole) -> Option<Bucket> {
         // If you're a requested reviewer, someone is blocked on you — top priority.
         PrRole::Reviewer => Some(Bucket::NeedsReview),
         PrRole::Author => {
+            // Not redundant with the guard inside `pr_blocker`: this one also keeps an approved,
+            // mergeable *draft* out of `ReadyToMerge` below. Removing it changes behaviour.
             if pr.is_draft {
                 return None;
             }
-            let (approved, changes) = pr_vote_flags(pr);
-            let checks_failing = pr.checks == CheckStatus::Failed;
-            let conflict = matches!(pr.mergeable, MergeableState::Conflicting);
-            if changes || checks_failing || conflict {
+            if pr_blocker(pr).is_some() {
                 Some(Bucket::NeedsFixing)
-            } else if approved && matches!(pr.mergeable, MergeableState::Mergeable) {
-                Some(Bucket::ReadyToMerge)
             } else {
-                None // open, nothing wrong, just waiting on others
+                let (approved, _) = pr_vote_flags(pr);
+                if approved && matches!(pr.mergeable, MergeableState::Mergeable) {
+                    Some(Bucket::ReadyToMerge)
+                } else {
+                    None // open, nothing wrong, just waiting on others
+                }
             }
         }
     }
+}
+
+/// The human-readable title for a pipeline run: what it was *running*, not what ran it.
+///
+/// Prefers the run's own title — the commit subject or triggering PR title, which is what
+/// GitHub's `display_title` and Bitbucket's commit message carry — since that says what
+/// changed. Falls back to [`pipe_workflow`] — the pipeline it ran under — for the providers that
+/// expose no per-run title (GitLab, Azure DevOps).
+///
+/// A blank title counts as absent: Bitbucket builds one from the first line of the commit
+/// message, which is empty when the message starts with a newline.
+pub fn pipe_title<'a>(run: &'a PipelineRun, definition_name: Option<&'a str>) -> &'a str {
+    run.title
+        .as_deref()
+        .filter(|t| !t.trim().is_empty())
+        .unwrap_or_else(|| pipe_workflow(run, definition_name))
+}
+
+/// The pipeline a run belongs to — its definition name, falling back to the run's own name and
+/// finally its definition id. Shared so both frontends label a run the same way.
+pub fn pipe_workflow<'a>(run: &'a PipelineRun, definition_name: Option<&'a str>) -> &'a str {
+    definition_name.or(run.name.as_deref()).unwrap_or(&run.definition_id)
 }
 
 /// How many entries each right-column reference list shows before a "more…" affordance. When a
@@ -214,10 +372,8 @@ impl Entry {
         match &self.item {
             EntryItem::Pr(pr) => &pr.title,
             EntryItem::Wi(wi) => &wi.title,
-            // The pipeline name (e.g. "CI Build"), falling back to the run name / id.
-            EntryItem::Pipe { run, definition_name } => {
-                definition_name.as_deref().or(run.name.as_deref()).unwrap_or(&run.definition_id)
-            }
+            // What the run was building — see [`pipe_title`].
+            EntryItem::Pipe { run, definition_name } => pipe_title(run, definition_name.as_deref()),
         }
     }
 
@@ -531,6 +687,130 @@ mod tests {
         assert_eq!(classify_pipe(PipelineRunStatus::Failed, false), Some(Bucket::NeedsFixing));
         assert_eq!(classify_pipe(PipelineRunStatus::Succeeded, false), None);
         assert_eq!(classify_pipe(PipelineRunStatus::Failed, true), Some(Bucket::ApprovalsWaiting));
+    }
+
+    /// Precedence is most-fundamental first, and only the winner shows: a conflict outranks a
+    /// changes-requested review, which outranks red checks.
+    #[test]
+    fn pr_blocker_reports_one_reason_in_precedence_order() {
+        use PrBlocker::*;
+        let case = |draft, votes: &[ReviewVote], checks, merge| pr_blocker(&authored(draft, votes, checks, merge));
+
+        assert_eq!(case(false, &[], CheckStatus::Passed, MergeableState::Mergeable), None);
+        assert_eq!(case(false, &[], CheckStatus::Failed, MergeableState::Mergeable), Some(ChecksFailing));
+        assert_eq!(case(false, &[ReviewVote::Rejected], CheckStatus::Passed, MergeableState::Mergeable), Some(ChangesRequested));
+        assert_eq!(case(false, &[], CheckStatus::Passed, MergeableState::Conflicting), Some(Conflicting));
+        // Every reason at once still names the most fundamental one.
+        assert_eq!(case(false, &[ReviewVote::Rejected], CheckStatus::Failed, MergeableState::Conflicting), Some(Conflicting));
+        assert_eq!(case(false, &[ReviewVote::Rejected], CheckStatus::Failed, MergeableState::Mergeable), Some(ChangesRequested));
+        // A draft isn't asking anything of you yet.
+        assert_eq!(case(true, &[ReviewVote::Rejected], CheckStatus::Failed, MergeableState::Conflicting), None);
+    }
+
+    /// The reason a row *displays* and the reason it was *bucketed* are the same judgement, so
+    /// they can't drift apart: an authored PR is in NeedsFixing exactly when it has a blocker.
+    #[test]
+    fn needs_fixing_agrees_with_pr_blocker() {
+        let votes: [&[ReviewVote]; 3] = [&[], &[ReviewVote::Approved], &[ReviewVote::Rejected]];
+        for draft in [true, false] {
+            for v in votes {
+                for checks in [CheckStatus::None, CheckStatus::Passed, CheckStatus::Failed] {
+                    for merge in [MergeableState::Mergeable, MergeableState::Conflicting, MergeableState::Unknown] {
+                        let pr = authored(draft, v, checks, merge);
+                        assert_eq!(
+                            classify_pr(&pr, PrRole::Author) == Some(Bucket::NeedsFixing),
+                            pr_blocker(&pr).is_some(),
+                            "draft={draft} votes={v:?} checks={checks:?} merge={merge:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The run's own title wins (it says what changed); the definition name is the fallback for
+    /// providers that expose no per-run title.
+    #[test]
+    fn pipe_title_prefers_the_run_title() {
+        let mut input = pipe(PipelineRunStatus::Succeeded, false);
+        assert_eq!(pipe_title(&input.run, input.definition_name.as_deref()), "CI Build");
+
+        input.run.title = Some("Bump axum to 0.8".into());
+        assert_eq!(pipe_title(&input.run, input.definition_name.as_deref()), "Bump axum to 0.8");
+
+        // A blank title is as good as absent.
+        input.run.title = Some("   ".into());
+        assert_eq!(pipe_title(&input.run, input.definition_name.as_deref()), "CI Build");
+
+        input.run.title = None;
+        input.definition_name = None;
+        assert_eq!(pipe_title(&input.run, None), "CI");
+        input.run.name = None;
+        assert_eq!(pipe_title(&input.run, None), "ci");
+    }
+
+    #[test]
+    fn pr_state_tests_lifecycle_before_anything_else() {
+        use PrState::*;
+        // A merged PR keeps the conflicting merge state and rejected review it had while open.
+        // Asking what blocks it would give a stale answer, so lifecycle short-circuits first.
+        let stale = |status| {
+            let mut pr = authored(false, &[ReviewVote::Rejected], CheckStatus::Failed, MergeableState::Conflicting);
+            pr.status = status;
+            pr_state(&pr)
+        };
+        assert_eq!(stale(PullRequestStatus::Merged), Merged);
+        assert_eq!(stale(PullRequestStatus::Closed), Closed);
+        assert_eq!(stale(PullRequestStatus::Draft), Draft);
+        // `is_draft` is the same short-circuit for providers that leave `status` as Open.
+        assert_eq!(pr_state(&authored(true, &[ReviewVote::Rejected], CheckStatus::Failed, MergeableState::Conflicting)), Draft);
+    }
+
+    #[test]
+    fn pr_state_reports_the_blocker_then_running_checks_then_clear() {
+        use PrState::*;
+        let case = |votes: &[ReviewVote], checks, merge| pr_state(&authored(false, votes, checks, merge));
+
+        assert_eq!(case(&[], CheckStatus::Passed, MergeableState::Conflicting), Blocked(PrBlocker::Conflicting));
+        assert_eq!(case(&[ReviewVote::Rejected], CheckStatus::Passed, MergeableState::Mergeable), Blocked(PrBlocker::ChangesRequested));
+        assert_eq!(case(&[], CheckStatus::Failed, MergeableState::Mergeable), Blocked(PrBlocker::ChecksFailing));
+        assert_eq!(case(&[], CheckStatus::Pending, MergeableState::Mergeable), ChecksRunning);
+        assert_eq!(case(&[ReviewVote::Approved], CheckStatus::Passed, MergeableState::Mergeable), ReadyToMerge);
+        // Green, as asked: nothing is in the author's way even with nobody having approved.
+        assert_eq!(case(&[], CheckStatus::Passed, MergeableState::Mergeable), NothingBlocking);
+        assert_eq!(case(&[], CheckStatus::None, MergeableState::Unknown), NothingBlocking);
+        // An approval can't outrank a blocker, and unfinished CI can't read as ready.
+        assert_eq!(case(&[ReviewVote::Approved], CheckStatus::Failed, MergeableState::Mergeable), Blocked(PrBlocker::ChecksFailing));
+        assert_eq!(case(&[ReviewVote::Approved], CheckStatus::Pending, MergeableState::Mergeable), ChecksRunning);
+    }
+
+    /// The per-check summary is the authority on whether CI is still going: `CheckStatus` alone
+    /// rounds a half-finished run to Passed or Failed.
+    #[test]
+    fn running_checks_come_from_the_summary_when_there_is_one() {
+        let with = |successful, in_progress, failed| {
+            let mut pr = authored(false, &[], CheckStatus::Passed, MergeableState::Mergeable);
+            pr.check_summary = Some(CheckSummary { successful, in_progress, failed, neutral: 0 });
+            pr_state(&pr)
+        };
+        assert_eq!(with(5, 3, 0), PrState::ChecksRunning);
+        assert_eq!(with(8, 0, 0), PrState::NothingBlocking);
+        // A summary saying "nothing running" beats a stale Pending roll-up.
+        let mut pr = authored(false, &[], CheckStatus::Pending, MergeableState::Mergeable);
+        pr.check_summary = Some(CheckSummary { successful: 8, in_progress: 0, failed: 0, neutral: 0 });
+        assert_eq!(pr_state(&pr), PrState::NothingBlocking);
+    }
+
+    #[test]
+    fn reviewer_lookups_name_the_person_behind_the_verdict() {
+        let mut pr = authored(false, &[ReviewVote::Approved, ReviewVote::Rejected], CheckStatus::Passed, MergeableState::Mergeable);
+        pr.reviewers[0].user = user("alice");
+        pr.reviewers[1].user = user("sam");
+        assert_eq!(pr_changes_requested_by(&pr).map(|u| u.display_name.as_str()), Some("sam"));
+        assert_eq!(pr_approved_by(&pr).map(|u| u.display_name.as_str()), Some("alice"));
+
+        let none = authored(false, &[], CheckStatus::Passed, MergeableState::Mergeable);
+        assert!(pr_changes_requested_by(&none).is_none() && pr_approved_by(&none).is_none());
     }
 
     #[test]

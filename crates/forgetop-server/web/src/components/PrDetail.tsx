@@ -2,10 +2,10 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useState, t
 import { AnimatePresence, motion } from "framer-motion";
 import { useQueryClient } from "@tanstack/react-query";
 import { apiPost, prDetailKey, useConnections, usePrCommitChanges, usePrDetail } from "../api";
-import { checkMeta, prStatusMeta, relativeTime, voteMeta } from "../format";
+import { checkMeta, checkSummaryOf, prStateLine, prStatusMeta, relativeTime, voteMeta } from "../format";
 import { providerSupports, unsupportedMessage } from "../capabilities";
 import { parsePatch } from "../diff";
-import type { CheckRun, CommentThread, Commit, FileChange, FileChangeKind, LineComment, PrRef, ProviderType, Reviewer, TimelineEvent } from "../types";
+import type { CheckRun, CommentThread, Commit, FileChange, FileChangeKind, LineComment, PrRef, ProviderType, PullRequest, Reviewer, TimelineEvent } from "../types";
 import { Avatar, Chip, Pill, Timeline } from "./ui";
 
 // ---- opener context ----
@@ -170,6 +170,8 @@ function PrDetailPanel({ prRef, onClose }: { prRef: PrRef; onClose: () => void }
 
         {pr && data && (
           <>
+            <StateLine pr={pr} checks={data.checks} />
+
             <MetaBar author={pr.author.display_name} reviewers={pr.reviewers} />
 
             {/* tabs */}
@@ -328,6 +330,26 @@ function ActionButton({
 }
 
 /** The header meta bar: who opened the PR + the reviewers with their vote marks (✓ / ✗ / ·). */
+/** Where this pull request stands, in one line — the same verdict the TUI shows above its tabs,
+ *  and the same one the Command Center row and the PR list abbreviate. Without it the panel made
+ *  you assemble the answer from the reviewer icons, the merge button's tooltip and the checks
+ *  badge. */
+function StateLine({ pr, checks }: { pr: PullRequest; checks: CheckRun[] }) {
+  // The detail endpoint returns the runs but not always the summary; completing it here lets the
+  // line say "1 of 8 failed" instead of just "failing". The judgement itself is unchanged.
+  const withSummary = pr.check_summary ?? (checks.length > 0 ? checkSummaryOf(checks) : null);
+  const { icon, text, color } = prStateLine({ ...pr, check_summary: withSummary });
+  return (
+    <div
+      className="flex items-center gap-2 px-5 py-2 text-sm font-medium shrink-0"
+      style={{ color, borderBottom: "1px solid var(--border)" }}
+    >
+      <span aria-hidden="true">{icon}</span>
+      <span>{text}</span>
+    </div>
+  );
+}
+
 function MetaBar({ author, reviewers }: { author: string; reviewers: Reviewer[] }) {
   return (
     <div className="flex items-center gap-x-5 gap-y-1 px-5 py-2.5 flex-wrap text-xs shrink-0" style={{ borderBottom: "1px solid var(--border)", color: "var(--dim)" }}>

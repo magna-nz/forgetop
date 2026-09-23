@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { motion } from "framer-motion";
 import { useLaunchpad } from "../api";
-import { checkMeta, pipeMeta, prStatusMeta, relativeTime, wiStateColor } from "../format";
+import { checkMeta, pipeMeta, pipeTitle, pipeWorkflow, prStatusMeta, relativeTime, wiStateColor } from "../format";
 import type { LaunchpadMore, LaunchpadRow, SectionId } from "../types";
 import { Skeleton, StateCard, StatusBadge } from "./ui";
 import { ErrorState } from "./ErrorState";
@@ -214,10 +214,14 @@ function describe(row: LaunchpadRow): { title: string; meta: string } {
     };
   }
   const run = row.run;
-  const label = run.name ?? (run.number != null ? `#${run.number}` : run.definition_id);
+  // The title is what the run was building; the workflow it ran under goes in the meta line —
+  // and is dropped there when it *is* the title, so it never reads as "Integration · Integration".
+  const title = pipeTitle(run, row.definition_name);
+  const workflow = pipeWorkflow(run, row.definition_name);
+  const age = relativeTime(run.finished_at ?? run.started_at);
   return {
-    title: row.definition_name ? `${row.definition_name} · ${label}` : label,
-    meta: `${run.branch ?? ""}${relativeTime(run.finished_at ?? run.started_at) ? " · " + relativeTime(run.finished_at ?? run.started_at) : ""}`,
+    title,
+    meta: [workflow === title ? "" : workflow, run.branch ?? "", age].filter(Boolean).join(" · "),
   };
 }
 

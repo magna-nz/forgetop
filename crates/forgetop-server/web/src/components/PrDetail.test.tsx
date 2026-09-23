@@ -61,6 +61,42 @@ describe("PrDetail action bar", () => {
     await waitFor(() => expect(posts.some((p) => p.url.includes("/api/pr/revert"))).toBe(true));
   });
 
+  // Same verdict the TUI shows above its tabs. Before this you had to assemble it yourself from
+  // the reviewer icons, the merge button's tooltip and the checks badge.
+  it("states where the pull request stands, above the meta bar", async () => {
+    const d = detail("Open");
+    d.pull_request.mergeable = "Conflicting";
+    mockFetch({ get: { "/api/pr/detail": d } });
+    renderWithClient(
+      <PrDetailProvider>
+        <Opener conn="c" id="1450" />
+      </PrDetailProvider>,
+    );
+
+    expect(await screen.findByText(/Blocked — conflicts with/)).toBeInTheDocument();
+  });
+
+  // The detail endpoint returns the check runs but not always the summary; without rolling them
+  // up the line can only say "failing" where the TUI says "1 of 3 failed".
+  it("counts the failures from the returned check runs when no summary came with the PR", async () => {
+    const d = detail("Open");
+    d.pull_request.checks = "Failed";
+    d.pull_request.check_summary = null;
+    d.checks = [
+      { name: "build", status: "Passed", url: null },
+      { name: "test", status: "Passed", url: null },
+      { name: "lint", status: "Failed", url: null },
+    ];
+    mockFetch({ get: { "/api/pr/detail": d } });
+    renderWithClient(
+      <PrDetailProvider>
+        <Opener conn="c" id="1450" />
+      </PrDetailProvider>,
+    );
+
+    expect(await screen.findByText("Blocked — 1 of 3 checks failed")).toBeInTheDocument();
+  });
+
   it("selecting an action bar verdict closes the pane", async () => {
     mockFetch({ get: { "/api/pr/detail": detail("Open") } });
     renderWithClient(

@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { usePrDecoration, usePullRequests, type PrView } from "../api";
-import { checkMeta, prStatusMeta, relativeTime, toTime, voteMeta } from "../format";
+import { prSignalMeta, prState, prStatusMeta, relativeTime, toTime, voteMeta } from "../format";
 import type { PrRow } from "../types";
 import { Avatar, Chip, List, Pill, Row, Skeleton, StateCard, StatusBadge } from "./ui";
 import { ErrorState } from "./ErrorState";
@@ -132,7 +132,10 @@ function PrCard({ row, index }: { row: PrRow; index: number }) {
   const checkStatus = decoration?.checks ?? pr.checks;
   const mergeable = decoration?.mergeable ?? pr.mergeable;
   const status = prStatusMeta(pr);
-  const checks = checkMeta(checkStatus);
+  // The decorated values, not the bare row: the list endpoint doesn't carry checks or mergeable,
+  // so asking the undecorated PR what stops it would answer from missing data.
+  const decorated = { ...pr, checks: checkStatus, mergeable };
+  const signal = prSignalMeta(decorated);
   const open = usePrOpener();
   return (
     <Row index={index} dense onClick={() => open({ conn: row.connection_id, repo: pr.repository, id: pr.id })}>
@@ -158,7 +161,10 @@ function PrCard({ row, index }: { row: PrRow; index: number }) {
               <span style={{ color: "var(--green)" }}>+{additions}</span>{" "}
               <span style={{ color: "var(--red)" }}>−{deletions}</span>
             </span>
-            {checkStatus !== "None" && <Pill icon={checks.icon} label={checks.label} color={checks.color} spin={checkStatus === "Pending"} />}
+            {/* A blocker always shows; "no checks" stays silent, since it says nothing. */}
+            {(checkStatus !== "None" || prState(decorated).kind === "blocked") && (
+              <Pill icon={signal.icon} label={signal.label} color={signal.color} spin={signal.spin} />
+            )}
             {pr.reviewers.length > 0 && <Reviewers reviewers={pr.reviewers} />}
             {pr.labels.slice(0, 3).map((l) => (
               <Chip key={l}>{l}</Chip>

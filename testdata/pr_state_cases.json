@@ -1,0 +1,62 @@
+[
+  {
+    "name": "checks failing names the failure count, not total minus passed",
+    "status": "Open", "is_draft": false, "checks": "Failed", "mergeable": "Mergeable",
+    "votes": [], "summary": { "successful": 7, "in_progress": 0, "failed": 1, "neutral": 0 },
+    "expect": "✗ Blocked — 1 of 8 checks failed"
+  },
+  {
+    "name": "a conflict outranks everything else",
+    "status": "Open", "is_draft": false, "checks": "Failed", "mergeable": "Conflicting",
+    "votes": [["sam", "Rejected"]], "summary": { "successful": 2, "in_progress": 0, "failed": 6, "neutral": 0 },
+    "expect": "⚠ Blocked — conflicts with main"
+  },
+  {
+    "name": "a changes-requested review names the reviewer",
+    "status": "Open", "is_draft": false, "checks": "Passed", "mergeable": "Mergeable",
+    "votes": [["sam", "Rejected"]], "summary": { "successful": 8, "in_progress": 0, "failed": 0, "neutral": 0 },
+    "expect": "⚠ Blocked — changes requested by sam"
+  },
+  {
+    "name": "unfinished CI is neither blocked nor clear",
+    "status": "Open", "is_draft": false, "checks": "Pending", "mergeable": "Mergeable",
+    "votes": [], "summary": { "successful": 5, "in_progress": 3, "failed": 0, "neutral": 0 },
+    "expect": "◐ Checks running — 5 of 8 done"
+  },
+  {
+    "name": "green means nothing is in your way, approval or not",
+    "status": "Open", "is_draft": false, "checks": "Passed", "mergeable": "Mergeable",
+    "votes": [], "summary": { "successful": 8, "in_progress": 0, "failed": 0, "neutral": 0 },
+    "expect": "✓ Nothing blocking — 8 of 8 checks passed, no reviews yet"
+  },
+  {
+    "name": "approved and mergeable is the stronger green",
+    "status": "Open", "is_draft": false, "checks": "Passed", "mergeable": "Mergeable",
+    "votes": [["alice", "Approved"]], "summary": { "successful": 8, "in_progress": 0, "failed": 0, "neutral": 0 },
+    "expect": "✓ Ready to merge — 8 of 8 checks passed, approved by alice"
+  },
+  {
+    "name": "a merged PR is not described by its stale merge state",
+    "status": "Merged", "is_draft": false, "checks": "Failed", "mergeable": "Conflicting",
+    "votes": [["sam", "Rejected"]], "summary": null,
+    "expect": "✦ Merged into main"
+  },
+  {
+    "name": "a draft is not blocked, whatever else is true of it",
+    "status": "Open", "is_draft": true, "checks": "Failed", "mergeable": "Conflicting",
+    "votes": [["sam", "Rejected"]], "summary": null,
+    "expect": "◌ Draft — not open for review yet"
+  },
+  {
+    "name": "no summary degrades to the word, with no invented counts",
+    "status": "Open", "is_draft": false, "checks": "Failed", "mergeable": "Mergeable",
+    "votes": [], "summary": null,
+    "expect": "✗ Blocked — checks failing"
+  },
+  {
+    "name": "no CI at all leaves checks unmentioned",
+    "status": "Open", "is_draft": false, "checks": "None", "mergeable": "Unknown",
+    "votes": [], "summary": null,
+    "expect": "✓ Nothing blocking — no reviews yet"
+  }
+]
