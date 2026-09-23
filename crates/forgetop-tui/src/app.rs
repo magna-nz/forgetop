@@ -48,7 +48,6 @@ const DIAG_PIPELINE_RUN: &str = "tui.pipeline.run";
 const DIAG_PIPELINE_APPROVALS: &str = "tui.pipeline.approvals";
 const DIAG_PIPELINE_LOGS: &str = "tui.pipeline.logs";
 const DIAG_NOTIFICATION_SCAN_FEEDS: &str = "tui.notification_scan.feeds";
-const DIAG_NOTIFICATION_SCAN_MINE: &str = "tui.notification_scan.mine";
 const DIAG_INBOX_FEEDS: &str = "tui.inbox.feeds";
 const DIAG_INBOX_PR_DETAIL: &str = "tui.inbox.pr_detail";
 const DIAG_INBOX_WI_DETAIL: &str = "tui.inbox.work_item_detail";
@@ -162,6 +161,14 @@ fn purge_cached_rows(cache: &CacheStore, conn_id: &str) {
 /// cache seeded at launch) stays. Non-empty and failed is partial live data, which is taken:
 /// with the failure already surfaced in the status line, some live rows beat stale ones. A
 /// section that answered is always taken, including an authoritative empty.
+/// Drops every pool row belonging to connections the app no longer shows, so a later local
+/// derivation cannot resurrect rows that `prs` / the Launchpad have already had pruned out.
+/// Callers prune the visible lists themselves; this keeps the pool they are derived from honest.
+fn retain_pool_rows(pool: &mut PrPool, keep: impl Fn(&PrRow) -> bool) {
+    pool.open.retain(&keep);
+    pool.completed.retain(&keep);
+}
+
 fn take_section<T>(field: &mut Vec<T>, incoming: Vec<T>, ok: bool) {
     if ok || !incoming.is_empty() {
         *field = incoming;
@@ -253,8 +260,6 @@ pub enum AppEvent {
 /// A snapshot of everything the background fetch needs from `self` at spawn time, so it
 /// can run without borrowing the app.
 struct ReloadParams {
-    pr_filter: PullRequestFilter,
-    pr_completed: bool,
     notifications: NotificationPrefs,
     review_seen: HashSet<(String, String)>,
     pr_review_seen: HashMap<(String, String), (bool, bool)>,
@@ -283,10 +288,6 @@ pub struct Reloaded {
     /// The unfiltered pool every PR view is derived from. Replaces the four separately
     /// filtered lists this used to carry.
     pr_pool: PrPool,
-    /// The cache key the *derived* list is written under. Carried rather than recomputed on
-    /// arrival: the user can change the filter while the fetch is in flight, and the rows
-    /// cached for next launch belong to the query that was showing when it was asked for.
-    prs_key: String,
     wis: Vec<WiRow>,
     pipes: Vec<PipeRow>,
     inbox: Vec<NotifRow>,
@@ -561,6 +562,9 @@ pub struct App {
     /// Every pull request the last reload fetched, unfiltered. `prs`, `lp_prs_mine` and
     /// `lp_prs_review` are all derived from it, so moving between views costs no network.
     pub pr_pool: PrPool,
+    /// Whether a fetch has ever populated `pr_pool`. An empty pool that was never filled is not
+    /// the same as one that genuinely came back empty, and only the latter may clear a list.
+    pr_pool_loaded: bool,
     /// Decorated fields fetched per row, keyed by `(connection_id, pull request id)`. Held
     /// beside the pool rather than merged into it so a reload replacing the rows keeps them:
     /// decoration rarely changes, and re-fetching it on every poll is what this avoids.
@@ -568,6 +572,11 @@ pub struct App {
     /// Rows with a decoration call already in flight, so a re-render or a flick between views
     /// doesn't queue the same fetch again.
     pr_decor_inflight: HashSet<(String, String)>,
+    /// Rows whose decoration call failed. Held until the next pool replacement, because
+    /// re-deriving is what *follows* a finished batch: without this, a row that cannot be
+    /// decorated — an expired token, or a connection the feed list no longer resolves —
+    /// requeues itself the instant its own failure lands, and spins with no await to slow it.
+    pr_decor_failed: HashSet<(String, String)>,
     /// PR statuses shown in the list (session-only). Default is Open + Draft; ticking
     /// Merged/Closed also flips the fetch to include completed PRs.
     pub pr_shown_statuses: HashSet<PullRequestStatus>,
@@ -1149,8 +1158,10 @@ impl App {
             detail_scroll_max: 0,
             pr_filter: PullRequestFilter::All,
             pr_pool: PrPool::default(),
+            pr_pool_loaded: false,
             pr_decorations: HashMap::new(),
             pr_decor_inflight: HashSet::new(),
+            pr_decor_failed: HashSet::new(),
             pr_shown_statuses: [PullRequestStatus::Open, PullRequestStatus::Draft].into_iter().collect(),
             filters: [String::new(), String::new(), String::new()],
             filtering: false,
@@ -2174,8 +2185,6 @@ impl App {
             // Discovery is a once-per-session cost, so ask for it only until it has landed.
             // It used to run inline; now it rides along with the background fetch.
             seed_catalog: self.repo_catalog.is_empty(),
-            pr_filter: self.pr_filter,
-            pr_completed: self.pr_wants_completed(),
             notifications: self.notifications,
             review_seen: self.review_req_seen.clone(),
             pr_review_seen: self.pr_review_seen.clone(),
@@ -2192,7 +2201,6 @@ impl App {
     /// the way. Safe to call from a spawned task — everything it needs is owned.
     async fn fetch_all(deps: AppDeps, p: ReloadParams) -> Reloaded {
         let mut errors = Vec::new();
-        let prs_key = prs_cache_key(p.pr_filter, p.pr_completed);
         // One unfiltered fetch. The list section, both Launchpad PR buckets and the
         // notification scan all read from it — they used to run four separate queries per
         // connection that differed only in a filter applied after the response came back.
@@ -2202,7 +2210,8 @@ impl App {
         let (inbox, inbox_ok) = fetch_notifications(&deps, &mut errors).await;
         let health = deps.health.check_all().await;
         let review = derive_pool_rows(&pr_pool, PullRequestFilter::ReviewRequested, false);
-        let scan = scan_pr_notifications(&deps, &p, &review).await;
+        let mine = derive_pool_rows(&pr_pool, PullRequestFilter::Mine, false);
+        let scan = scan_pr_notifications(&deps, &p, &review, &mine).await;
         let open_pipeline = match &p.open_pipeline {
             Some((conn_id, run_ref)) => fetch_open_pipeline(&deps, conn_id, run_ref).await,
             None => None,
@@ -2220,7 +2229,6 @@ impl App {
         };
         Reloaded {
             pr_pool,
-            prs_key,
             wis,
             pipes,
             inbox,
@@ -2247,7 +2255,6 @@ impl App {
         // response that landed late must not outrank one that was asked for later.
         let fetched_at = r.requested_at;
         let sections_ok = r.sections_ok;
-        let prs_key = r.prs_key;
         // The cache is protected from a failed section by the flags below; the screen has to be
         // protected too, or a total outage on the first refresh after launch wipes the rows the
         // cache just seeded and leaves the user staring at the blank screen this all exists to
@@ -2259,6 +2266,8 @@ impl App {
         let pool_incoming = !r.pr_pool.open.is_empty() || !r.pr_pool.completed.is_empty();
         if sections_ok.prs || pool_incoming {
             self.pr_pool = r.pr_pool;
+            self.pr_pool_loaded = true;
+            self.pr_decor_failed.clear();
             // Rows this reload no longer returns must not keep a stale decoration alive; the
             // map is only meaningful for rows the pool still holds.
             let live: HashSet<(String, String)> = self
@@ -2284,6 +2293,11 @@ impl App {
             self.inbox_sel = self.inbox.len().saturating_sub(1);
         }
         self.health = r.health;
+        // Keyed by the filter `self.prs` was just derived under, not the one this fetch was
+        // spawned with. They differ whenever the user switches view mid-flight, and the rows
+        // now follow the screen rather than the request — caching them under the requesting
+        // filter's key would paint one view's rows under another's heading on the next launch.
+        let prs_key = prs_cache_key(self.pr_filter, self.pr_wants_completed());
         self.write_through(deps, &prs_key, fetched_at, sections_ok);
         // Only once every section is live is the cached age gone; while any section is still
         // showing carried-over rows, "showing Nm old" is telling the truth and must keep saying so.
@@ -2655,10 +2669,15 @@ impl App {
     /// which rows a view should show.
     fn refresh_derived_prs(&mut self, deps: &AppDeps) {
         self.prs = self.derive_pr_rows(self.pr_filter, self.pr_wants_completed());
-        // The Launchpad's own buckets, on the same queries the dedicated fetches used to run.
-        self.lp_prs_mine = self.derive_pr_rows(PullRequestFilter::Mine, true);
-        self.lp_prs_review = self.derive_pr_rows(PullRequestFilter::ReviewRequested, false);
-        self.rebuild_launchpad();
+        // Until a fetch has actually landed there is nothing to derive the Launchpad from, and
+        // deriving anyway would blank the rows `seed_from_cache` painted — the blank landing
+        // screen the seeding exists to prevent. The list above is still cleared, because an
+        // empty list under the new heading is honest where carrying the old view's rows is not.
+        if self.pr_pool_loaded {
+            self.lp_prs_mine = self.derive_pr_rows(PullRequestFilter::Mine, true);
+            self.lp_prs_review = self.derive_pr_rows(PullRequestFilter::ReviewRequested, false);
+            self.rebuild_launchpad();
+        }
         self.request_pr_decorations(deps);
     }
 
@@ -2677,7 +2696,11 @@ impl App {
             .iter()
             .filter(|row| self.pr_pool.needs_decoration.get(&row.connection_id).copied().unwrap_or(false))
             .map(|row| (row.connection_id.clone(), row.pr.item_ref(), (row.connection_id.clone(), row.pr.id.clone())))
-            .filter(|(_, _, key)| !self.pr_decorations.contains_key(key) && !self.pr_decor_inflight.contains(key))
+            .filter(|(_, _, key)| {
+                !self.pr_decorations.contains_key(key)
+                    && !self.pr_decor_inflight.contains(key)
+                    && !self.pr_decor_failed.contains(key)
+            })
             .take(PR_DECORATE_CAP)
             .collect();
         if wanted.is_empty() {
@@ -2711,8 +2734,15 @@ impl App {
     fn apply_pr_decorations(&mut self, items: Vec<((String, String), Option<PrDecoration>)>, deps: &AppDeps) {
         for (key, decoration) in items {
             self.pr_decor_inflight.remove(&key);
-            if let Some(d) = decoration {
-                self.pr_decorations.insert(key, d);
+            match decoration {
+                Some(d) => {
+                    self.pr_decorations.insert(key, d);
+                }
+                // Not cached as a blank decoration — that would read as "this PR changes no
+                // files". Marked instead, so the next reload retries it and this one does not.
+                None => {
+                    self.pr_decor_failed.insert(key);
+                }
             }
         }
         self.refresh_derived_prs(deps);
@@ -3404,6 +3434,7 @@ impl App {
         self.prs.retain(|r| covered(&r.connection_id, r.pr.repository.as_ref()));
         self.lp_prs_mine.retain(|r| covered(&r.connection_id, r.pr.repository.as_ref()));
         self.lp_prs_review.retain(|r| covered(&r.connection_id, r.pr.repository.as_ref()));
+        retain_pool_rows(&mut self.pr_pool, |r| covered(&r.connection_id, r.pr.repository.as_ref()));
         // Azure DevOps addresses work items and pipelines by **Team Project**, so their rows
         // carry a project name where a scope entry holds "Project/Repo" — nothing here could
         // compare the two without re-deriving that addressing, and a wrong guess would empty
@@ -4572,6 +4603,7 @@ impl App {
             self.prs.retain(|r| bound.contains(&r.connection_id));
             self.lp_prs_mine.retain(|r| bound.contains(&r.connection_id));
             self.lp_prs_review.retain(|r| bound.contains(&r.connection_id));
+            retain_pool_rows(&mut self.pr_pool, |r| bound.contains(&r.connection_id));
         } else {
             self.wis.retain(|r| bound.contains(&r.connection_id));
         }
@@ -4599,6 +4631,7 @@ impl App {
     /// being the moment the user finally sees their own action take effect.
     fn purge_connection(&mut self, id: &str, deps: &AppDeps) {
         self.prs.retain(|r| r.connection_id != id);
+        retain_pool_rows(&mut self.pr_pool, |r| r.connection_id != id);
         self.wis.retain(|r| r.connection_id != id);
         self.pipes.retain(|r| r.connection_id != id);
         self.inbox.retain(|r| r.connection_id != id);
@@ -5352,9 +5385,6 @@ pub enum Key {
     None,
 }
 
-fn pr_query(filter: PullRequestFilter) -> PullRequestQuery {
-    PullRequestQuery { filter, include_completed: false, limit: Some(50), decorate: true }
-}
 
 // ---- background fetch helpers (no `&mut self`, safe to run in a spawned task) ----
 
@@ -5655,22 +5685,6 @@ fn pipeline_detail_unchanged(
 }
 
 
-/// Fetches the unfiltered pool both `include_completed` variants of every PR view derive from.
-///
-/// Two `list` calls per connection, where there used to be four, and none of them carry a filter:
-/// the rows are identical whichever view asked, so asking once and filtering locally is the same
-/// data for half the round trips.
-///
-/// `limit: None` is deliberate. Providers cap **after** filtering (`sort_and_cap`), so a pool
-/// capped at 50 here would make a derived "Mine" a subset of the newest 50 overall, rather than
-/// the newest 50 of your own — fewer rows than the per-filter fetch returned. Uncapped, the pool
-/// holds exactly what the provider filtered over, and the derived view caps it the same way.
-/// The per-repository page size is unaffected: providers use `limit.unwrap_or(50)` for that.
-///
-/// `decorate: false` for the same reason. GitHub decorates the first 25 rows it is about to
-/// return, and on an unfiltered pool those are the first 25 of *All* — so a derived "Mine" would
-/// lose its +/- and check columns past whatever overlapped. Decoration moves to a per-row pass
-/// over the rows a view actually shows; see [`App::request_pr_decorations`].
 /// The rows one PR view shows, derived from the pool — no network, no `&self`, so the
 /// background fetch can use it too.
 ///
@@ -5699,6 +5713,22 @@ fn derive_pool_rows(pool: &PrPool, filter: PullRequestFilter, completed: bool) -
     out
 }
 
+/// Fetches the unfiltered pool both `include_completed` variants of every PR view derive from.
+///
+/// Two `list` calls per connection, where there used to be four — the list section, both
+/// Launchpad buckets and the notification scan each ran their own. None of them carries a
+/// filter: the rows are identical whichever view asked for them.
+///
+/// `limit: None` is deliberate. Providers cap **after** filtering (`sort_and_cap`), so a pool
+/// capped at 50 here would make a derived "Mine" a subset of the newest 50 overall, rather than
+/// the newest 50 of your own — fewer rows than the per-filter fetch returned. Uncapped, the pool
+/// holds exactly what the provider filtered over, and the derived view caps it the same way.
+/// The per-repository page size is unaffected: providers use `limit.unwrap_or(50)` for that.
+///
+/// `decorate: false` for the same reason. GitHub decorates the first 25 rows it is about to
+/// return, and on an unfiltered pool those are the first 25 of *All* — so a derived "Mine" would
+/// lose its +/- and check columns past whatever overlapped. Decoration moves to a per-row pass
+/// over the rows a view actually shows; see [`App::request_pr_decorations`].
 async fn fetch_pr_pool(deps: &AppDeps, errors: &mut Vec<String>) -> (PrPool, bool) {
     let mut pool = PrPool::default();
     let mut ok = true;
@@ -5759,7 +5789,7 @@ async fn fetch_pr_pool(deps: &AppDeps, errors: &mut Vec<String>) -> (PrPool, boo
 /// and returning the fresh seen-sets. Mirrors the inline logic but takes a snapshot so
 /// it can run off the render loop. `review` is this reload's review-requested list, fetched
 /// once in [`App::fetch_all`] and shared with the Launchpad.
-async fn scan_pr_notifications(deps: &AppDeps, p: &ReloadParams, review: &[PrRow]) -> Option<PrScan> {
+async fn scan_pr_notifications(deps: &AppDeps, p: &ReloadParams, review: &[PrRow], mine: &[PrRow]) -> Option<PrScan> {
     let want_review = p.notifications.review_requested;
     let want_votes = p.notifications.pr_approved || p.notifications.pr_changes_requested;
     if !want_review && !want_votes {
@@ -5789,23 +5819,19 @@ async fn scan_pr_notifications(deps: &AppDeps, p: &ReloadParams, review: &[PrRow
             }
         }
         if want_votes {
-            if let Some(mine) = detail_or_none(
-                feed.source.list(&pr_query(PullRequestFilter::Mine)).await,
-                DIAG_NOTIFICATION_SCAN_MINE,
-            ) {
-                for pr in &mine {
-                    let key = (conn.clone(), pr.id.clone());
-                    if seeded {
-                        let (approved, changes) = pr_review_transitions(p.pr_review_seen.get(&key).copied(), pr);
-                        if approved && p.notifications.pr_approved {
-                            p.notifier.notify("Your PR was approved", &pr_label(pr));
-                        }
-                        if changes && p.notifications.pr_changes_requested {
-                            p.notifier.notify("Changes requested on your PR", &pr_label(pr));
-                        }
+            // Derived from the same pool as `review`, on the query this used to run itself.
+            for pr in mine.iter().filter(|row| row.connection_id == conn).map(|row| &row.pr) {
+                let key = (conn.clone(), pr.id.clone());
+                if seeded {
+                    let (approved, changes) = pr_review_transitions(p.pr_review_seen.get(&key).copied(), pr);
+                    if approved && p.notifications.pr_approved {
+                        p.notifier.notify("Your PR was approved", &pr_label(pr));
                     }
-                    votes_now.insert(key, pr_vote_flags(pr));
+                    if changes && p.notifications.pr_changes_requested {
+                        p.notifier.notify("Changes requested on your PR", &pr_label(pr));
+                    }
                 }
+                votes_now.insert(key, pr_vote_flags(pr));
             }
         }
     }
@@ -6005,7 +6031,6 @@ mod tests {
         app.apply_reloaded_with_logger(
             Reloaded {
                 pr_pool: PrPool::default(),
-                prs_key: prs_cache_key(PullRequestFilter::All, false),
                 wis: Vec::new(),
                 pipes: Vec::new(),
                 inbox: Vec::new(),
@@ -6603,7 +6628,6 @@ mod tests {
     fn reloaded_with_health(health: Vec<ConnectionHealth>) -> Reloaded {
         Reloaded {
             pr_pool: PrPool::default(),
-            prs_key: prs_cache_key(PullRequestFilter::All, false),
             wis: Vec::new(),
             pipes: Vec::new(),
             inbox: Vec::new(),
@@ -6883,6 +6907,80 @@ mod tests {
         }
     }
 
+    /// A decoration that cannot be fetched must not requeue itself. Re-deriving is what
+    /// *follows* a finished batch, so without the failure mark the row asks again the instant
+    /// its own failure lands — and the feed-not-found path does that with no I/O to slow it.
+    #[test]
+    fn a_failed_decoration_is_not_requeued_until_the_next_reload() {
+        let deps = deps_with_cache(memory_cache());
+        let mut app = App::new("slate");
+        app.pr_pool = pool_of(vec![pool_pr("c", "1", "me", &[])], Some("me"));
+        app.pr_pool.needs_decoration.insert("c".into(), true);
+        app.pr_pool_loaded = true;
+
+        let key = ("c".to_string(), "1".to_string());
+        app.apply_pr_decorations(vec![(key.clone(), None)], &deps);
+        assert!(app.pr_decor_failed.contains(&key), "the failure is remembered");
+        assert!(!app.pr_decorations.contains_key(&key), "but not cached as a blank decoration");
+
+        // The re-derivation that just ran must not have queued it again.
+        assert!(app.pr_decor_inflight.is_empty(), "a failed row does not requeue itself");
+    }
+
+    /// Before any fetch has landed there is nothing to derive the Launchpad from, and deriving
+    /// anyway would blank exactly the rows `seed_from_cache` painted.
+    #[test]
+    fn a_view_switch_before_the_first_fetch_keeps_the_seeded_launchpad() {
+        let deps = deps_with_cache(memory_cache());
+        let mut app = App::new("slate");
+        app.lp_prs_mine = vec![pr_row(pr(None))];
+        app.lp_prs_review = vec![pr_row(pr(None))];
+
+        assert!(!app.pr_pool_loaded, "sanity: nothing fetched yet");
+        app.pr_filter = PullRequestFilter::Mine;
+        app.refresh_derived_prs(&deps);
+
+        assert_eq!(app.lp_prs_mine.len(), 1, "the seeded Launchpad survives a view switch");
+        assert_eq!(app.lp_prs_review.len(), 1);
+        assert!(app.prs.is_empty(), "the list itself is empty rather than mislabelled");
+    }
+
+    /// The cache key must describe the rows actually written. They follow the screen, so a
+    /// filter changed while the fetch was in flight moves them to the new filter's key.
+    #[test]
+    fn the_pr_cache_is_keyed_by_the_filter_the_rows_were_derived_under() {
+        let cache = memory_cache();
+        let deps = deps_with_cache(cache.clone());
+        let mut app = App::new("slate");
+
+        // The fetch goes out under All; the user switches to Mine before it lands.
+        app.pr_filter = PullRequestFilter::Mine;
+        app.apply_reloaded(reloaded(vec![pool_pr("c", "1", "me", &[]), pool_pr("c", "2", "them", &[])]), &deps);
+
+        let mine = cache.get::<Vec<PrRow>>(&prs_cache_key(PullRequestFilter::Mine, false));
+        assert_eq!(mine.expect("cached under Mine").value.len(), 1, "only the user's own row");
+        assert!(
+            cache.get::<Vec<PrRow>>(&prs_cache_key(PullRequestFilter::All, false)).is_none(),
+            "and nothing is filed under the filter that merely asked"
+        );
+    }
+
+    /// Removing a connection prunes the pool too — otherwise the next local derivation puts
+    /// its rows straight back on screen.
+    #[test]
+    fn purging_a_connection_prunes_the_pool_not_just_the_lists() {
+        let deps = deps_with_cache(memory_cache());
+        let mut app = App::new("slate");
+        app.pr_pool = pool_of(vec![pool_pr("gone", "1", "me", &[]), pool_pr("kept", "2", "me", &[])], Some("me"));
+        app.pr_pool_loaded = true;
+        app.refresh_derived_prs(&deps);
+        assert_eq!(app.prs.len(), 2, "sanity");
+
+        retain_pool_rows(&mut app.pr_pool, |r| r.connection_id != "gone");
+        app.refresh_derived_prs(&deps);
+        assert_eq!(app.prs.iter().map(|r| r.connection_id.as_str()).collect::<Vec<_>>(), ["kept"]);
+    }
+
     /// The point of the whole change: `[`/`]` reads the pool the last fetch already returned.
     #[test]
     fn switching_views_derives_from_the_pool_without_refetching() {
@@ -7061,7 +7159,6 @@ mod tests {
         app.apply_reloaded(
             Reloaded {
                 pr_pool: test_pool(vec![pr_row(pr(None)), pr_row(pr(None))]),
-                prs_key: prs_cache_key(PullRequestFilter::All, false),
                 wis: vec![wi_row(wi(None))],
                 pipes: vec![],
                 inbox: vec![],
