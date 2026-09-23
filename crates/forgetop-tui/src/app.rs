@@ -109,6 +109,34 @@ fn seed_section<T: serde::de::DeserializeOwned>(
     *oldest = Some(oldest.map_or(entry.fetched_at, |prev| prev.min(entry.fetched_at)));
 }
 
+/// Rewrites one cached section without a removed connection's rows.
+///
+/// `seed_section` is deliberately unfiltered, so rows left here outlive the connection: close
+/// the app before the post-removal reload lands and the next launch seeds them straight back.
+/// Goes through [`CacheStore::rewrite`], not `put`: the entry keeps its `fetched_at`, because
+/// dropping rows from a list doesn't make the rest of it any fresher.
+fn purge_cached_section<T>(cache: &CacheStore, key: &str, conn_id: &str, connection_of: impl Fn(&T) -> &str)
+where
+    T: serde::Serialize + serde::de::DeserializeOwned,
+{
+    cache.rewrite::<Vec<T>>(key, |rows| rows.into_iter().filter(|row| connection_of(row) != conn_id).collect());
+}
+
+/// Every cached list a connection contributes rows to. The PR list is keyed by filter and
+/// completed-ness, so all six of its combinations are purged, not just the one on screen.
+fn purge_cached_rows(cache: &CacheStore, conn_id: &str) {
+    for filter in [PullRequestFilter::All, PullRequestFilter::Mine, PullRequestFilter::ReviewRequested] {
+        for completed in [false, true] {
+            purge_cached_section::<PrRow>(cache, &prs_cache_key(filter, completed), conn_id, |r| &r.connection_id);
+        }
+    }
+    purge_cached_section::<PrRow>(cache, CACHE_KEY_LAUNCHPAD_MINE, conn_id, |r| &r.connection_id);
+    purge_cached_section::<PrRow>(cache, CACHE_KEY_LAUNCHPAD_REVIEW, conn_id, |r| &r.connection_id);
+    purge_cached_section::<WiRow>(cache, CACHE_KEY_WORK_ITEMS, conn_id, |r| &r.connection_id);
+    purge_cached_section::<PipeRow>(cache, CACHE_KEY_PIPELINES, conn_id, |r| &r.connection_id);
+    purge_cached_section::<NotifRow>(cache, CACHE_KEY_INBOX, conn_id, |r| &r.connection_id);
+}
+
 /// Puts one freshly-fetched section on screen, unless doing so would replace rows with nothing.
 ///
 /// `ok` is that section's "every feed I consulted answered" flag. Empty *and* failed means the
@@ -4132,10 +4160,9 @@ impl App {
         }
     }
 
-    /// `C`: connection management happens in the web dashboard. Open it, and also show the
-    /// terminal connections list as a quick read-only glance / fallback.
+    /// `C`: the terminal connections list, which adds, binds and removes connections on its own.
+    /// It deliberately does *not* open the browser — `B` is the only key that leaves the TUI.
     async fn open_connections(&mut self, deps: &AppDeps) {
-        self.open_dashboard_at("#settings");
         self.open_config(deps).await;
     }
 
@@ -4280,11 +4307,37 @@ impl App {
         });
     }
 
+    /// Drops everything a just-removed connection contributed, without waiting for the refetch.
+    ///
+    /// The reload kicked off alongside this replaces these lists wholesale a second or two later,
+    /// so this is not about correctness — it is what makes the removal feel instant. The rows are
+    /// gone on the very next frame, and the reload then lands on an identical screen instead of
+    /// being the moment the user finally sees their own action take effect.
+    fn purge_connection(&mut self, id: &str, deps: &AppDeps) {
+        self.prs.retain(|r| r.connection_id != id);
+        self.wis.retain(|r| r.connection_id != id);
+        self.pipes.retain(|r| r.connection_id != id);
+        self.inbox.retain(|r| r.connection_id != id);
+        self.lp_prs_mine.retain(|r| r.connection_id != id);
+        self.lp_prs_review.retain(|r| r.connection_id != id);
+        self.health.retain(|h| h.connection.id != id);
+        self.repo_catalog.remove(id);
+        purge_cached_rows(&deps.cache, id);
+
+        // The views derived from those lists have to be rebuilt, or the rows stay on screen.
+        self.rebuild_launchpad();
+        self.refresh_repo_scope(deps);
+        self.inbox_sel = self.inbox_sel.min(self.inbox.len().saturating_sub(1));
+        self.fix_selection();
+    }
+
     async fn execute_config_action(&mut self, action: Action, deps: &AppDeps) {
         let Action::RemoveConnection { id, label } = action else { return };
         match deps.config.remove_connection(&id).await {
             Ok(()) => {
                 self.toast = Some(format!("Removed {label}"));
+                // Reflect the removal before the refetch, not after it.
+                self.purge_connection(&id, deps);
                 self.request_reload(deps);
                 self.rebuild_config_view(deps).await;
             }
@@ -5756,6 +5809,93 @@ mod tests {
         assert_ne!(app.toast.as_deref(), Some("Marked read"));
     }
 
+    /// Removing a connection used to leave its rows on screen until the background refetch
+    /// answered, so the user watched their own action take effect seconds late. Everything the
+    /// connection contributed must be gone by the time `purge_connection` returns.
+    #[tokio::test]
+    async fn removing_a_connection_clears_its_rows_before_the_refetch() {
+        let deps = test_deps();
+        let mut app = App::new("slate");
+
+        let row = |conn: &str| PrRow {
+            connection_id: conn.into(),
+            connection: "GH".into(),
+            provider: ProviderType::GitHub,
+            pr: pr(None),
+        };
+        let notif = |conn: &str| NotifRow {
+            connection_id: conn.into(),
+            connection: "GH".into(),
+            provider: ProviderType::GitHub,
+            notification: Notification {
+                id: conn.into(),
+                kind: NotificationKind::Mention,
+                item_type: NotificationItemType::WorkItem,
+                item_id: None,
+                repository: None,
+                title: conn.into(),
+                context: "c".into(),
+                url: None,
+                unread: true,
+                updated_at: None,
+            },
+        };
+
+        app.prs = vec![row("gone"), row("kept")];
+        app.lp_prs_mine = vec![row("gone"), row("kept")];
+        app.lp_prs_review = vec![row("gone")];
+        app.inbox = vec![notif("gone"), notif("kept")];
+        app.inbox_sel = 1;
+        app.health = vec![health("gone"), health("kept")];
+        app.repo_catalog.insert("gone".into(), RepositoryPage { repositories: vec!["a/b".into()], truncated: false });
+        app.repo_catalog.insert("kept".into(), RepositoryPage { repositories: vec!["c/d".into()], truncated: false });
+
+        app.purge_connection("gone", &deps);
+
+        let ids = |rows: &[PrRow]| rows.iter().map(|r| r.connection_id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(&app.prs), ["kept"], "list rows must go immediately");
+        assert_eq!(ids(&app.lp_prs_mine), ["kept"], "Launchpad 'mine' rows must go too");
+        assert!(app.lp_prs_review.is_empty(), "Launchpad 'review' rows must go too");
+        assert_eq!(app.inbox.len(), 1, "inbox notifications must go too");
+        assert_eq!(app.inbox.iter().map(|r| r.connection_id.clone()).collect::<Vec<_>>(), ["kept"]);
+        assert_eq!(app.health.iter().map(|h| h.connection.id.clone()).collect::<Vec<_>>(), ["kept"]);
+        assert!(!app.repo_catalog.contains_key("gone"), "the repo catalog is keyed by connection");
+        assert!(app.repo_catalog.contains_key("kept"), "other connections are untouched");
+        // A selection pointing past the shortened list would panic the table widget.
+        assert!(app.inbox_sel < app.inbox.len());
+    }
+
+    /// The on-disk cache has to be purged as well: `seed_section` is unfiltered, so rows left
+    /// behind come back on the next launch if the app closes before the reload lands.
+    #[test]
+    fn removing_a_connection_purges_its_rows_from_the_cache_too() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = CacheStore::new(dir.path().join("cache.json"));
+        let row = |conn: &str| PrRow {
+            connection_id: conn.into(),
+            connection: "GH".into(),
+            provider: ProviderType::GitHub,
+            pr: pr(None),
+        };
+        let fetched_at = Utc::now() - chrono::Duration::hours(3);
+        // The list the user is looking at, and one they are not — both are seeded at launch.
+        let on_screen = prs_cache_key(PullRequestFilter::All, false);
+        let other = prs_cache_key(PullRequestFilter::Mine, true);
+        cache.put(&on_screen, &vec![row("gone"), row("kept")], fetched_at);
+        cache.put(&other, &vec![row("gone")], fetched_at);
+
+        purge_cached_rows(&cache, "gone");
+
+        let seeded = cache.get::<Vec<PrRow>>(&on_screen).expect("entry survives the purge");
+        assert_eq!(seeded.value.len(), 1);
+        assert_eq!(seeded.value[0].connection_id, "kept");
+        assert_eq!(seeded.fetched_at, fetched_at, "dropping rows must not make the rest look fresher");
+        assert!(
+            cache.get::<Vec<PrRow>>(&other).expect("entry survives").value.is_empty(),
+            "every PR filter/completed combination is purged, not just the visible one"
+        );
+    }
+
     fn health(id: &str) -> ConnectionHealth {
         ConnectionHealth {
             connection: forgetop_core::provider::Connection {
@@ -5909,6 +6049,26 @@ mod tests {
 
         assert!(app.awaiting_browser_setup, "the browser choice must show the waiting state");
         assert!(app.wizard.is_none());
+    }
+
+    /// `C` used to open the browser as well, from when connection management lived in the
+    /// dashboard. The terminal list does the whole job now, and `B` is the only key that leaves.
+    #[tokio::test]
+    async fn c_opens_the_terminal_connections_list_and_never_the_browser() {
+        let deps = test_deps();
+        for screen in [Screen::Launchpad, Screen::List] {
+            let mut app = App::new("slate");
+            app.screen = screen;
+            app.dashboard_url = Some("http://127.0.0.1:1/".into());
+            app.on_key(Key::Char('C'), &deps).await;
+
+            assert!(matches!(app.screen, Screen::Config(_)), "C must land on the connections list");
+            assert!(
+                !app.toast.as_deref().is_some_and(|t| t.contains("dashboard")),
+                "C must not launch the dashboard: {:?}",
+                app.toast
+            );
+        }
     }
 
     #[tokio::test]

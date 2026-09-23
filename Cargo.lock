@@ -769,6 +769,7 @@ dependencies = [
  "ratatui",
  "serde",
  "synoptic",
+ "tempfile",
  "tokio",
 ]
 
