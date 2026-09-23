@@ -6,9 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use forgetop_core::cache::CacheStore;
-use forgetop_core::config::{
-    default_config_path, ConfigStore, ForgetopConfig, InMemoryConfigStore, JsonConfigStore, StartupMode,
-};
+use forgetop_core::config::{default_config_path, ConfigStore, ForgetopConfig, InMemoryConfigStore, JsonConfigStore};
 use forgetop_core::domain::ProviderType;
 use forgetop_core::provider::{Connection, ProviderRegistry};
 use forgetop_core::secret::{default_secret_store, InMemorySecretStore, SecretStore};
@@ -89,11 +87,9 @@ async fn run() -> Result<()> {
         secrets: secrets.clone(),
     };
 
-    // Dashboard-only: `forgetop --dashboard`, or the saved startup preference. Runs the web UI
-    // headless (no TUI, so no TTY needed).
-    let startup_mode = StartupMode::effective(config.snapshot().ui.startup_mode);
-    let dashboard_only = args.iter().any(|a| a == "--dashboard") || startup_mode == StartupMode::DashboardOnly;
-    if dashboard_only {
+    // Dashboard-only, and only when asked for explicitly: `forgetop --dashboard`. Runs the web UI
+    // headless (no TUI, so no TTY needed). Plain `forgetop` always launches the TUI.
+    if args.iter().any(|a| a == "--dashboard") {
         return forgetop_server::serve_blocking(server_deps, forgetop_server::DEFAULT_PORT, |url| {
             println!("forgetop dashboard: {url}\n(Ctrl-C to stop)");
             let _ = open::that(url);
@@ -109,10 +105,9 @@ async fn run() -> Result<()> {
     }
 
     // Start the dashboard server in the background — best-effort, so a bind failure never takes
-    // down the TUI. `B` opens the URL and connection setup happens here. Fall back to an ephemeral
-    // port if the default is taken (e.g. a second forgetop) so the dashboard is virtually always up.
-    // Opening the browser for the `both` startup mode is handled by `forgetop_tui::run`, which is
-    // also responsible for the first-run/empty-connections case.
+    // down the TUI. It is never opened in the browser on its own: `B` in the TUI does that, and
+    // connection setup happens here. Fall back to an ephemeral port if the default is taken
+    // (e.g. a second forgetop) so the dashboard is virtually always up.
     let dashboard_url = spawn_dashboard(server_deps).await;
 
     let theme = config.snapshot().ui.theme.clone().unwrap_or_else(|| "slate".into());
@@ -204,10 +199,6 @@ Options:
   -d, --demo          Run against built-in demo data
   -V, --version       Print version and exit
   -h, --help          Show this help and exit
-
-Environment:
-  FORGETOP_STARTUP    Override what opens on launch for this run — one of
-                      `both`, `terminal_only`, `dashboard_only` (handy with --demo).
 
 Inside the app, press `?` for every keybinding, or `B` to open the web dashboard.
 Docs: https://magna-nz.github.io/forgetop/"#,

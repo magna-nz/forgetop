@@ -375,11 +375,6 @@ export interface ConnectionRow {
   sections: string[];
 }
 
-export type StartupMode = "terminal_only" | "dashboard_only" | "both";
-export interface Preferences {
-  startup_mode: StartupMode;
-}
-
 export type SectionId = "launchpad" | "prs" | "work-items" | "pipelines" | "notifications" | "settings";
 
 /** The fields the PR *list* endpoint omits — GitHub leaves `mergeable`, `changed_files`,
