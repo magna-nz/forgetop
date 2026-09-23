@@ -484,6 +484,9 @@ impl PullRequestSource for GitLabPr {
         let filtered = apply_pull_request_filter(rows, query.filter, me.as_deref());
         Ok(sort_and_cap(filtered, scope.len(), query.limit, |pr| pr.updated_at))
     }
+    async fn current_user(&self) -> Result<Option<String>> {
+        self.0.self_username().await
+    }
     async fn get(&self, item: &ItemRef) -> Result<PullRequest> {
         let project = self.0.resolve(item)?;
         let id = &item.id;

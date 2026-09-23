@@ -599,6 +599,9 @@ impl PullRequestSource for GitHubPr {
         }
         Ok(out)
     }
+    async fn current_user(&self) -> Result<Option<String>> {
+        self.0.self_login().await
+    }
     async fn get(&self, item: &ItemRef) -> Result<PullRequest> {
         let repo = self.0.resolve(item)?;
         let id = &item.id;
