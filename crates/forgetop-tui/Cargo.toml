@@ -9,6 +9,7 @@ description = "Ratatui terminal interface for forgetop. Internal crate: no API s
 [dependencies]
 forgetop-core.workspace = true
 ratatui.workspace = true
+serde.workspace = true
 crossterm.workspace = true
 tokio.workspace = true
 chrono.workspace = true

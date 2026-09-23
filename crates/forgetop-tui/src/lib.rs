@@ -86,6 +86,13 @@ async fn event_loop(terminal: &mut Term, app: &mut App, deps: &AppDeps) -> Resul
     // so network work never blocks rendering — the header spinner keeps animating.
     let (job_tx, mut job_rx) = mpsc::unbounded_channel::<app::AppEvent>();
     app.job_tx = Some(job_tx);
+
+    // Paint the last run's data before asking the network for this run's. The fetch below still
+    // goes out unconditionally — the cache decides what is on screen *while* it runs, never
+    // whether it runs — so the only thing this removes is the blank screen, not the refresh.
+    deps.cache.load().await;
+    app.seed_from_cache(deps);
+
     app.request_reload(deps);
 
     // Connections and bindings are managed in the dashboard, which shares this process's
@@ -108,7 +115,13 @@ async fn event_loop(terminal: &mut Term, app: &mut App, deps: &AppDeps) -> Resul
             // `changed()` errors only once every sender is dropped, which cannot happen
             // while `deps` is alive; the branch then disables itself rather than spinning.
             Ok(()) = data_changed.changed() => app.request_reload(deps),
-            Some(event) = job_rx.recv() => app.on_event(event, deps),
+            Some(event) = job_rx.recv() => {
+                app.on_event(event, deps);
+                // `on_event` has just written the fresh sections through to the cache's in-memory
+                // map; persist them here, off the key path, so a crash or a kill -9 still leaves
+                // the next launch something to paint. No-ops unless something actually changed.
+                deps.cache.flush().await;
+            }
             _ = anim.tick() => app.tick_anim(),
         }
     }

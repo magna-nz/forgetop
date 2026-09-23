@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::{DateTime, Local, Utc};
+use forgetop_core::cache::{CachePut, CacheStore};
 use forgetop_core::config::{NotificationPrefs, SavedView, SortPref, StartupMode};
 use forgetop_core::domain::*;
 use forgetop_core::provider::*;
@@ -49,13 +50,77 @@ const DIAG_LAUNCHPAD_FEEDS: &str = "tui.launchpad.feeds";
 const DIAG_LAUNCHPAD_MINE: &str = "tui.launchpad.mine";
 const DIAG_LAUNCHPAD_REVIEW: &str = "tui.launchpad.review";
 const DIAG_NOTIFICATION_SCAN_FEEDS: &str = "tui.notification_scan.feeds";
-const DIAG_NOTIFICATION_SCAN_REVIEW: &str = "tui.notification_scan.review";
 const DIAG_NOTIFICATION_SCAN_MINE: &str = "tui.notification_scan.mine";
 const DIAG_INBOX_FEEDS: &str = "tui.inbox.feeds";
 const DIAG_INBOX_PR_DETAIL: &str = "tui.inbox.pr_detail";
 const DIAG_INBOX_WI_DETAIL: &str = "tui.inbox.work_item_detail";
 const DIAG_INBOX_MARK_READ: &str = "tui.inbox.mark_read";
 const DIAG_INBOX_MARK_ALL_READ: &str = "tui.inbox.mark_all_read";
+
+// ---- cache keys ----
+//
+// One entry per seeded list section. Only the PR list varies by query — the user picks a
+// filter and can ask for completed PRs — so its key carries both, or a review-requested list
+// would be painted back under the "all" heading on the next launch.
+const CACHE_KEY_WORK_ITEMS: &str = "list.work_items";
+const CACHE_KEY_PIPELINES: &str = "list.pipelines";
+const CACHE_KEY_INBOX: &str = "list.inbox";
+const CACHE_KEY_LAUNCHPAD_MINE: &str = "list.launchpad.mine";
+const CACHE_KEY_LAUNCHPAD_REVIEW: &str = "list.launchpad.review";
+
+fn prs_cache_key(filter: PullRequestFilter, completed: bool) -> String {
+    format!("list.prs.{filter:?}.{completed}")
+}
+
+/// A connection's credentials reach every repository it can see, so a bare `conn_id + id` key
+/// would let two repositories' PR #7 collide onto the same cache entry and show one repo's
+/// diff under the other's title. `item.repo` (via `PullRequest::item_ref`) is the same address
+/// every detail call is already made against, so the cache key rides along with it.
+fn pr_detail_cache_key(conn_id: &str, item: &ItemRef) -> String {
+    format!("detail.pr.{conn_id}.{}.{}", item.repo.as_deref().unwrap_or("-"), item.id)
+}
+
+/// Mirrors [`pr_detail_cache_key`]. Jira and Linear work items are project-, not
+/// repo-addressed, so `item.repo` is `None` there and `unwrap_or("-")` covers it the same way.
+fn wi_detail_cache_key(conn_id: &str, item: &ItemRef) -> String {
+    format!("detail.wi.{conn_id}.{}.{}", item.repo.as_deref().unwrap_or("-"), item.id)
+}
+
+/// Mirrors [`pr_detail_cache_key`]: a pipeline run is addressed by (connection, repo, id) the
+/// same way a PR is, and a connection's credentials reach every repository it can see.
+fn pipeline_detail_cache_key(conn_id: &str, run: &ItemRef) -> String {
+    format!("detail.pipeline.{conn_id}.{}.{}", run.repo.as_deref().unwrap_or("-"), run.id)
+}
+
+/// Reads one cached section into `field` and folds its age into `oldest`.
+///
+/// A miss — cold cache, disabled store, or an entry whose shape no longer parses — leaves the
+/// field untouched, which is the empty list the user would have seen anyway.
+fn seed_section<T: serde::de::DeserializeOwned>(
+    cache: &CacheStore,
+    key: &str,
+    field: &mut Vec<T>,
+    oldest: &mut Option<DateTime<Utc>>,
+) {
+    let Some(entry) = cache.get::<Vec<T>>(key) else { return };
+    *field = entry.value;
+    // The header reports how stale the *most stale* thing on screen is, so the oldest seeded
+    // section wins — a fresh inbox must not make a day-old PR list read as current.
+    *oldest = Some(oldest.map_or(entry.fetched_at, |prev| prev.min(entry.fetched_at)));
+}
+
+/// Puts one freshly-fetched section on screen, unless doing so would replace rows with nothing.
+///
+/// `ok` is that section's "every feed I consulted answered" flag. Empty *and* failed means the
+/// outage erased the rows, not that they are gone — so whatever is on screen (often what the
+/// cache seeded at launch) stays. Non-empty and failed is partial live data, which is taken:
+/// with the failure already surfaced in the status line, some live rows beat stale ones. A
+/// section that answered is always taken, including an authoritative empty.
+fn take_section<T>(field: &mut Vec<T>, incoming: Vec<T>, ok: bool) {
+    if ok || !incoming.is_empty() {
+        *field = incoming;
+    }
+}
 
 type FeedbackOpener = fn(&str) -> std::result::Result<(), String>;
 
@@ -92,12 +157,25 @@ pub struct AppDeps {
     pub sections: Arc<SectionService>,
     pub health: Arc<ConnectionHealthService>,
     pub config: Arc<ConfigService>,
+    /// Last-known list data, painted at startup so the first fetch doesn't run against a blank
+    /// screen. Disabled (a no-op) for `--demo` and tests.
+    pub cache: Arc<CacheStore>,
 }
 
 /// A completed background job, applied to the app on the render loop.
 pub enum AppEvent {
     /// A full refresh finished fetching.
     Reloaded(Box<Reloaded>),
+    /// A PR view's detail (threads/files/checks/commits) finished fetching. Carries the
+    /// *fetch*, not a finished [`PrDetail`]: which of the four calls failed is what decides
+    /// whether the cached value for that field survives, so it can't be flattened out here.
+    PrDetailLoaded { key: String, detail: Box<PrDetailFetch>, fetched_at: DateTime<Utc> },
+    /// A work-item view's detail (its comment thread) finished fetching. Mirrors
+    /// [`AppEvent::PrDetailLoaded`].
+    WiDetailLoaded { key: String, detail: Box<WiDetailFetch>, fetched_at: DateTime<Utc> },
+    /// A pipeline drill-in's detail (run/approvals/capabilities) finished fetching. Mirrors
+    /// [`AppEvent::PrDetailLoaded`].
+    PipelineDetailLoaded { key: String, detail: Box<PipelineDetailFetch>, fetched_at: DateTime<Utc> },
 }
 
 /// A snapshot of everything the background fetch needs from `self` at spawn time, so it
@@ -117,6 +195,9 @@ struct ReloadParams {
     /// Discover repositories during this fetch. Set only while `repo_catalog` is empty, so
     /// discovery still runs once rather than on every poll — it just no longer runs inline.
     seed_catalog: bool,
+    /// When this reload was asked for. Taken at spawn time and carried all the way to the
+    /// cache write: see [`App::reload_params`].
+    requested_at: DateTime<Utc>,
 }
 
 /// The PR-notification scan's new seen-sets (notifications are fired during the scan).
@@ -128,6 +209,10 @@ struct PrScan {
 /// The result of a full fetch, ready to be folded back into the app.
 pub struct Reloaded {
     prs: Vec<PrRow>,
+    /// The cache key `prs` was fetched under. Carried rather than recomputed on arrival: the
+    /// user can change the filter while the fetch is in flight, and the list belongs to the
+    /// query that asked for it.
+    prs_key: String,
     wis: Vec<WiRow>,
     pipes: Vec<PipeRow>,
     inbox: Vec<NotifRow>,
@@ -136,14 +221,53 @@ pub struct Reloaded {
     health: Vec<ConnectionHealth>,
     scan: Option<PrScan>,
     /// Fresh (run_id, run, approvals) for the open pipeline view, if one is open.
-    open_pipeline: Option<(String, PipelineRun, Vec<PipelineApproval>)>,
+    /// `None` approvals means the gate check failed, as distinct from `Some(vec![])` meaning
+    /// the run genuinely has none — the view must not clear real gates on a failed check.
+    open_pipeline: Option<(String, PipelineRun, Option<Vec<PipelineApproval>>)>,
     errors: Vec<String>,
     /// Repository discovery, when this fetch was asked to seed it. `None` means "not this
     /// time" and leaves the existing catalog alone.
     catalog: Option<HashMap<String, RepositoryPage>>,
+    /// Which sections came back whole, and so may be written to the cache.
+    sections_ok: SectionsOk,
+    /// When this reload was *asked for*, not when it landed. See [`App::request_reload`].
+    requested_at: DateTime<Utc>,
+}
+
+/// Per-section "every feed I consulted answered" flags for one reload.
+///
+/// One global flag can't express this: a Work Items outage says nothing about whether the PR
+/// list is whole, and a PR list that lost one connection out of three still arrives non-empty.
+#[derive(Clone, Copy)]
+struct SectionsOk {
+    prs: bool,
+    wis: bool,
+    pipes: bool,
+    inbox: bool,
+    lp_mine: bool,
+    lp_review: bool,
+}
+
+impl SectionsOk {
+    /// True only when every section came back whole. What the header's cached-age footer keys
+    /// off: while any section is still showing rows the cache seeded, "showing Nm old" is still
+    /// the truth.
+    fn all(&self) -> bool {
+        self.prs && self.wis && self.pipes && self.inbox && self.lp_mine && self.lp_review
+    }
+}
+
+/// Test-only: the live fetch sets each flag from its own section, so an all-true constructor
+/// would be dead code outside the tests that build a `Reloaded` by hand.
+#[cfg(test)]
+impl SectionsOk {
+    fn complete() -> Self {
+        Self { prs: true, wis: true, pipes: true, inbox: true, lp_mine: true, lp_review: true }
+    }
 }
 
 /// One pipeline run, tagged with the connection it came from (for the provider column).
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct PipeRow {
     pub connection_id: String,
     pub connection: String,
@@ -157,6 +281,7 @@ pub struct PipeRow {
 }
 
 /// A pull request tagged with the connection it came from (for aggregation).
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct PrRow {
     pub connection_id: String,
     pub connection: String,
@@ -165,6 +290,7 @@ pub struct PrRow {
 }
 
 /// A work item tagged with the connection it came from (for aggregation).
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct WiRow {
     pub connection_id: String,
     pub connection: String,
@@ -173,11 +299,78 @@ pub struct WiRow {
 }
 
 /// One notification tagged with the connection it came from (for the inbox).
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct NotifRow {
     pub connection_id: String,
     pub connection: String,
     pub provider: ProviderType,
     pub notification: Notification,
+}
+
+/// The four fetched sections behind a full-screen PR view (Conversation/Commits/Checks/Diff),
+/// cached as one unit under [`pr_detail_cache_key`] so opening a previously-seen PR paints
+/// immediately instead of blocking on four sequential provider round trips.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct PrDetail {
+    pub threads: Vec<CommentThread>,
+    pub files: Vec<FileChange>,
+    pub checks: Vec<CheckRun>,
+    pub commits: Vec<Commit>,
+}
+
+/// One detail fetch's outcome, before it is resolved against what is already known.
+///
+/// `None` means that call failed; `Some(vec![])` means the provider really has none. A
+/// [`PrDetail`] cannot hold that distinction, and collapsing the two is how a 502 on
+/// `changes()` used to blank a PR's file list on screen *and* in the cache.
+#[derive(Default)]
+pub struct PrDetailFetch {
+    pub threads: Option<Vec<CommentThread>>,
+    pub files: Option<Vec<FileChange>>,
+    pub checks: Option<Vec<CheckRun>>,
+    pub commits: Option<Vec<Commit>>,
+}
+
+/// The detail fetched behind a work-item view (its comment thread), cached as one unit under
+/// [`wi_detail_cache_key`]. A one-field struct today, kept in this shape rather than flattened
+/// into [`WiView`] itself — deliberately, mirroring [`PrDetail`] — because it leaves room for
+/// more work-item detail calls to land here later without reshaping the cache/patch path.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct WiDetail {
+    pub threads: Vec<CommentThread>,
+}
+
+/// `None` means that call failed; `Some(vec![])` means the provider really has none. See
+/// [`PrDetailFetch`] for why a [`WiDetail`] can't hold that distinction on its own.
+#[derive(Default)]
+pub struct WiDetailFetch {
+    pub threads: Option<Vec<CommentThread>>,
+}
+
+/// The detail fetched behind a pipeline drill-in, cached as one unit under
+/// [`pipeline_detail_cache_key`]. `supports_approvals`/`can_respond_approvals` are provider
+/// *capabilities*, not run state — stable and safe to cache alongside the live run data.
+///
+/// `approvals` is cached on the way out, so the entry stays complete for any other reader, but
+/// — see [`PipelineView`] and `open_pipeline_for` — it is deliberately never read back in on
+/// open: a cached gate that was already approved would offer the user an action that no longer
+/// exists, and [`PipelineView::actionable_approvals`] drives a real write.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct PipelineDetail {
+    pub run: PipelineRun,
+    pub approvals: Vec<PipelineApproval>,
+    pub supports_approvals: bool,
+    pub can_respond_approvals: bool,
+}
+
+/// `None` means that call failed. See [`PrDetailFetch`] for why the distinction from an
+/// authoritatively empty answer matters.
+#[derive(Default)]
+pub struct PipelineDetailFetch {
+    pub run: Option<PipelineRun>,
+    pub approvals: Option<Vec<PipelineApproval>>,
+    pub supports_approvals: Option<bool>,
+    pub can_respond_approvals: Option<bool>,
 }
 
 /// A section's repository scope, as the header indicator and empty state read it.
@@ -324,6 +517,9 @@ pub struct App {
     /// marquee (see `anim / 2` at the call site) and the running-pipeline spinner. Reset
     /// to 0 when the Launchpad selection moves so each title starts from the beginning.
     pub anim: usize,
+    /// When the data on screen was fetched, while it is the cache's rather than the network's:
+    /// the oldest section seeded at startup. Cleared as soon as a live reload lands.
+    pub data_age: Option<DateTime<Utc>>,
     pub last_refresh: DateTime<Local>,
     pub should_quit: bool,
 }
@@ -512,6 +708,12 @@ pub struct PipelineView {
     pub can_respond_approvals: bool,
     /// Gates on this run currently awaiting a decision.
     pub approvals: Vec<PipelineApproval>,
+    /// True when `run` is a cache-seeded guess, not yet confirmed by a live `get_run`. A run's
+    /// status is live in a way a PR's files/checks aren't — a cached "Running" may have failed
+    /// an hour ago — so the renderer is expected to mark it as unconfirmed until this clears.
+    /// Set on open (see `open_pipeline_for`) and cleared only in `apply_pipeline_detail`, once a
+    /// real fetch has actually answered.
+    pub stale: bool,
 }
 
 impl PipelineView {
@@ -529,6 +731,35 @@ impl PipelineView {
             supports_approvals: false,
             can_respond_approvals: false,
             approvals: Vec::new(),
+            stale: false,
+        }
+    }
+
+    /// Patches in a freshly-fetched run, preserving what the user is doing: the open log pane
+    /// and the expand/collapse tree state are untouched (this never rebuilds the view), and the
+    /// selection is clamped rather than reset, since the new run's flattened node count may be
+    /// shorter. `collapsed` is private, so this is how a caller outside the impl block patches
+    /// it without reaching in. Called only once a real `get_run` has confirmed the run, which is
+    /// also the moment `stale` clears.
+    ///
+    /// `approvals` is `None` when this fetch's `pending_approvals` call failed, and then the
+    /// gates already on screen are left exactly as they are. A gate here drives a real
+    /// approve/reject (see [`PipelineView::actionable_approvals`]), so only a call that actually
+    /// answered may set them — never a value read back out of the cache, which may name a gate
+    /// that was decided an hour ago.
+    fn apply_fresh_run(&mut self, run: PipelineRun, approvals: Option<Vec<PipelineApproval>>) {
+        self.run = run;
+        self.apply_confirmed_approvals(approvals);
+        self.stale = false;
+        self.clamp_selection();
+    }
+
+    /// Applies gates that a `pending_approvals` call confirmed. `Some(vec![])` is authoritative
+    /// — the run has no gates now, so any on screen are cleared — while `None` means the call
+    /// failed and the view keeps what it had.
+    fn apply_confirmed_approvals(&mut self, approvals: Option<Vec<PipelineApproval>>) {
+        if let Some(approvals) = approvals {
+            self.approvals = approvals;
         }
     }
 
@@ -815,6 +1046,7 @@ impl App {
             reloading: false,
             job_tx: None,
             anim: 0,
+            data_age: None,
             last_refresh: Local::now(),
             should_quit: false,
         }
@@ -1286,10 +1518,19 @@ impl App {
     pub fn on_event(&mut self, event: AppEvent, deps: &AppDeps) {
         match event {
             AppEvent::Reloaded(r) => {
-                self.apply_reloaded(*r);
+                self.apply_reloaded(*r, deps);
                 // The scope indicator's denominator depends on the catalog the fetch may have
                 // just brought back, so it is recomputed here rather than inside the fetch.
                 self.refresh_repo_scope(deps);
+            }
+            AppEvent::PrDetailLoaded { key, detail, fetched_at } => {
+                self.apply_pr_detail(deps, key, *detail, fetched_at);
+            }
+            AppEvent::WiDetailLoaded { key, detail, fetched_at } => {
+                self.apply_wi_detail(deps, key, *detail, fetched_at);
+            }
+            AppEvent::PipelineDetailLoaded { key, detail, fetched_at } => {
+                self.apply_pipeline_detail(deps, key, *detail, fetched_at);
             }
         }
     }
@@ -1461,12 +1702,12 @@ impl App {
                     .find(|r| r.connection_id == conn && r.pr.id == id)
                     .map(|r| (pr_label(&r.pr), r.pr.url.clone(), r.pr.clone()));
                 if let Some((label, url, pr)) = found {
-                    self.open_pr_view_for(deps, 0, label, url, conn, pr).await;
+                    self.open_pr_view_for(deps, 0, label, url, conn, pr);
                 }
             }
             launchpad::EntryKind::Wi => {
                 if let Some(wi) = self.wis.iter().find(|r| r.connection_id == conn && r.wi.id == id).map(|r| r.wi.clone()) {
-                    self.open_wi_view_for(deps, conn, wi).await;
+                    self.open_wi_view_for(deps, conn, wi);
                 }
             }
             launchpad::EntryKind::Pipe => {
@@ -1476,7 +1717,7 @@ impl App {
                     .find(|r| r.connection_id == conn && r.run.id == id)
                     .map(|r| (r.provider, r.run.definition_id.clone(), r.run.branch.clone(), pipe_label(r), r.run.clone()));
                 if let Some((provider, def, branch, title, fallback)) = found {
-                    self.open_pipeline_for(deps, conn, provider, id, def, branch, title, fallback).await;
+                    self.open_pipeline_for(deps, conn, provider, id, def, branch, title, fallback);
                 }
             }
         }
@@ -1506,12 +1747,12 @@ impl App {
                     .find(|r| r.connection_id == conn && r.pr.id == id)
                     .map(|r| (pr_label(&r.pr), r.pr.url.clone(), r.pr.clone()));
                 if let Some((label, url, pr)) = found {
-                    self.open_pr_view_for(deps, 0, label, url, conn, pr).await;
+                    self.open_pr_view_for(deps, 0, label, url, conn, pr);
                 }
             }
             PaletteKind::Wi => {
                 if let Some(wi) = self.wis.iter().find(|r| r.connection_id == conn && r.wi.id == id).map(|r| r.wi.clone()) {
-                    self.open_wi_view_for(deps, conn, wi).await;
+                    self.open_wi_view_for(deps, conn, wi);
                 }
             }
             PaletteKind::Pipe => {
@@ -1521,7 +1762,7 @@ impl App {
                     .find(|r| r.connection_id == conn && r.run.id == id)
                     .map(|r| (r.provider, r.run.definition_id.clone(), r.run.branch.clone(), pipe_label(r), r.run.clone()));
                 if let Some((provider, def, branch, title, fallback)) = found {
-                    self.open_pipeline_for(deps, conn, provider, id, def, branch, title, fallback).await;
+                    self.open_pipeline_for(deps, conn, provider, id, def, branch, title, fallback);
                 }
             }
         }
@@ -1646,7 +1887,7 @@ impl App {
                             self.from_inbox = true;
                             self.lp_origin = false;
                             let (label, purl) = (pr_label(&pr), pr.url.clone());
-                            self.open_pr_view_for(deps, 0, label, purl, conn, pr).await;
+                            self.open_pr_view_for(deps, 0, label, purl, conn, pr);
                             return;
                         }
                         Err(_) => log_operation_failure(DIAG_INBOX_PR_DETAIL),
@@ -1659,7 +1900,7 @@ impl App {
                         Ok(wi) => {
                             self.from_inbox = true;
                             self.lp_origin = false;
-                            self.open_wi_view_for(deps, conn, wi).await;
+                            self.open_wi_view_for(deps, conn, wi);
                             return;
                         }
                         Err(_) => log_operation_failure(DIAG_INBOX_WI_DETAIL),
@@ -1763,6 +2004,12 @@ impl App {
     /// Parameters the background fetch needs, snapshotted from `self` at spawn time.
     fn reload_params(&self) -> ReloadParams {
         ReloadParams {
+            // Stamped here — before the fetch is spawned — rather than when the answer lands.
+            // The store refuses a write that isn't newer than what it holds, which is only a
+            // real guard if the timestamp says when the request *started*: two reloads racing
+            // must be ordered by when they were sent, or the slow one (which asked first, and
+            // therefore knows less) lands last and wins.
+            requested_at: Utc::now(),
             // Discovery is a once-per-session cost, so ask for it only until it has landed.
             // It used to run inline; now it rides along with the background fetch.
             seed_catalog: self.repo_catalog.is_empty(),
@@ -1784,38 +2031,83 @@ impl App {
     /// the way. Safe to call from a spawned task — everything it needs is owned.
     async fn fetch_all(deps: AppDeps, p: ReloadParams) -> Reloaded {
         let mut errors = Vec::new();
-        let prs = fetch_pull_requests(&deps, p.pr_filter, p.pr_completed, &mut errors).await;
-        let wis = fetch_work_items(&deps, &mut errors).await;
-        let pipes = fetch_pipelines(&deps, &mut errors).await;
-        let inbox = fetch_notifications(&deps, &mut errors).await;
-        let (lp_prs_mine, lp_prs_review) = fetch_launchpad_prs(&deps).await;
+        let prs_key = prs_cache_key(p.pr_filter, p.pr_completed);
+        let (prs, prs_ok) = fetch_pull_requests(&deps, p.pr_filter, p.pr_completed, &mut errors).await;
+        let (wis, wis_ok) = fetch_work_items(&deps, &mut errors).await;
+        let (pipes, pipes_ok) = fetch_pipelines(&deps, &mut errors).await;
+        let (inbox, inbox_ok) = fetch_notifications(&deps, &mut errors).await;
+        let ((lp_prs_mine, lp_mine_ok), (lp_prs_review, lp_review_ok)) =
+            fetch_launchpad_prs(&deps, &mut errors).await;
         let health = deps.health.check_all().await;
-        let scan = scan_pr_notifications(&deps, &p).await;
+        // The Launchpad's review column and the notification scan want the same
+        // review-requested list. Fetching it twice cost a second decorated pass — up to 50
+        // serial round trips — so the scan reads the one the Launchpad already fetched.
+        let scan = scan_pr_notifications(&deps, &p, &lp_prs_review).await;
         let open_pipeline = match &p.open_pipeline {
             Some((conn_id, run_ref)) => fetch_open_pipeline(&deps, conn_id, run_ref).await,
             None => None,
         };
         let catalog = if p.seed_catalog { Some(discover_repo_catalog(&deps).await) } else { None };
-        Reloaded { prs, wis, pipes, inbox, lp_prs_mine, lp_prs_review, health, scan, open_pipeline, errors, catalog }
+        let sections_ok = SectionsOk {
+            prs: prs_ok,
+            wis: wis_ok,
+            pipes: pipes_ok,
+            inbox: inbox_ok,
+            lp_mine: lp_mine_ok,
+            lp_review: lp_review_ok,
+        };
+        Reloaded {
+            prs,
+            prs_key,
+            wis,
+            pipes,
+            inbox,
+            lp_prs_mine,
+            lp_prs_review,
+            health,
+            scan,
+            open_pipeline,
+            errors,
+            catalog,
+            sections_ok,
+            requested_at: p.requested_at,
+        }
     }
 
     /// Folds a completed fetch back into the app state: the lists, the Launchpad, the
     /// pipeline notifications (which compare against the seen-sets), and the status line.
-    fn apply_reloaded(&mut self, r: Reloaded) {
-        self.apply_reloaded_with_logger(r, forgetop_core::diag::log);
+    fn apply_reloaded(&mut self, r: Reloaded, deps: &AppDeps) {
+        self.apply_reloaded_with_logger(r, deps, forgetop_core::diag::log);
     }
 
-    fn apply_reloaded_with_logger(&mut self, r: Reloaded, mut log_failure: impl FnMut(&str, &str)) {
-        self.prs = r.prs;
-        self.wis = r.wis;
-        self.pipes = r.pipes;
-        self.inbox = r.inbox;
+    fn apply_reloaded_with_logger(&mut self, r: Reloaded, deps: &AppDeps, mut log_failure: impl FnMut(&str, &str)) {
+        // One timestamp for every section this reload writes. The store refuses a write that
+        // isn't newer than what it holds, so sharing it stops a reload's own sections from
+        // racing each other into the cache. It is the reload's *request* time, not now — a
+        // response that landed late must not outrank one that was asked for later.
+        let fetched_at = r.requested_at;
+        let sections_ok = r.sections_ok;
+        let prs_key = r.prs_key;
+        // The cache is protected from a failed section by the flags below; the screen has to be
+        // protected too, or a total outage on the first refresh after launch wipes the rows the
+        // cache just seeded and leaves the user staring at the blank screen this all exists to
+        // remove. See `take_section` for the rule.
+        take_section(&mut self.prs, r.prs, sections_ok.prs);
+        take_section(&mut self.wis, r.wis, sections_ok.wis);
+        take_section(&mut self.pipes, r.pipes, sections_ok.pipes);
+        take_section(&mut self.inbox, r.inbox, sections_ok.inbox);
         if self.inbox_sel >= self.inbox.len() {
             self.inbox_sel = self.inbox.len().saturating_sub(1);
         }
-        self.lp_prs_mine = r.lp_prs_mine;
-        self.lp_prs_review = r.lp_prs_review;
+        take_section(&mut self.lp_prs_mine, r.lp_prs_mine, sections_ok.lp_mine);
+        take_section(&mut self.lp_prs_review, r.lp_prs_review, sections_ok.lp_review);
         self.health = r.health;
+        self.write_through(deps, &prs_key, fetched_at, sections_ok);
+        // Only once every section is live is the cached age gone; while any section is still
+        // showing carried-over rows, "showing Nm old" is telling the truth and must keep saying so.
+        if sections_ok.all() {
+            self.data_age = None;
+        }
         if let Some(catalog) = r.catalog {
             self.repo_catalog = catalog;
         }
@@ -1840,9 +2132,12 @@ impl App {
         if let Some((run_id, run, approvals)) = r.open_pipeline {
             if let Screen::Pipeline(v) = &mut self.screen {
                 if v.run.id == run_id {
-                    v.run = run;
-                    v.approvals = approvals;
-                    v.clamp_selection();
+                    // This run came off the wire, so it confirms a cache-seeded view just as the
+                    // detail fetch would. Going through `apply_fresh_run` rather than assigning
+                    // the fields keeps `stale` honest: set it here and a view whose own detail
+                    // fetch failed would keep flagging an unconfirmed status that the periodic
+                    // refresh has since confirmed.
+                    v.apply_fresh_run(run, approvals);
                 }
             }
         }
@@ -1861,6 +2156,132 @@ impl App {
         };
     }
 
+    /// Writes the lists that just landed back to the cache, all under `fetched_at`.
+    ///
+    /// A section is written **only when its own fetch was complete** — every feed it consulted
+    /// answered. A provider outage doesn't fail a section: it drops that connection's rows and
+    /// pushes a line into `errors`, so a partial result is indistinguishable from a genuine one
+    /// by looking at the rows. Three connections with one down still yields a non-empty list, and
+    /// caching it would silently drop the third connection's rows from the next launch.
+    ///
+    /// So there is deliberately no "…but cache it anyway if it came back with something"
+    /// fallback, and no single global flag either — one section's outage says nothing about
+    /// whether another is whole. Leaving the previous entry alone is the right answer for a
+    /// cache: stale-but-whole beats fresh-but-missing-a-connection, and the user is told the age.
+    /// An authoritatively empty section is `ok == true` and still caches normally.
+    fn write_through(&self, deps: &AppDeps, prs_key: &str, fetched_at: DateTime<Utc>, ok: SectionsOk) {
+        let cache = &deps.cache;
+        if ok.prs {
+            cache.put(prs_key, &self.prs, fetched_at);
+        }
+        if ok.wis {
+            cache.put(CACHE_KEY_WORK_ITEMS, &self.wis, fetched_at);
+        }
+        if ok.pipes {
+            cache.put(CACHE_KEY_PIPELINES, &self.pipes, fetched_at);
+        }
+        if ok.inbox {
+            cache.put(CACHE_KEY_INBOX, &self.inbox, fetched_at);
+        }
+        if ok.lp_mine {
+            cache.put(CACHE_KEY_LAUNCHPAD_MINE, &self.lp_prs_mine, fetched_at);
+        }
+        if ok.lp_review {
+            cache.put(CACHE_KEY_LAUNCHPAD_REVIEW, &self.lp_prs_review, fetched_at);
+        }
+    }
+
+    /// Folds a completed PR-detail fetch back in.
+    ///
+    /// The fetch is resolved into a concrete [`PrDetail`] first, by overlaying what came back on
+    /// what is already cached: a call that failed keeps the value we last knew, rather than
+    /// blanking that section on screen and in the cache because one endpoint 502'd. The overlay
+    /// is against the *cached* entry, never the open view, so this behaves identically whether
+    /// or not the PR is still on screen. A fetch where every call failed is a no-op.
+    ///
+    /// The resolved detail is then written through even if the user has since navigated away —
+    /// the data is good, and a later visit should not have to re-fetch it. The view is patched
+    /// only if it is still showing the *same* PR: the key is recomputed from the view's own
+    /// connection/PR rather than trusted from the event, because the user can press Escape or
+    /// open a different PR while this fetch was in flight, and a late answer landing on whatever
+    /// happens to be on screen would show one PR's data under another's chrome.
+    fn apply_pr_detail(&mut self, deps: &AppDeps, key: String, fetch: PrDetailFetch, fetched_at: DateTime<Utc>) {
+        let PrDetailFetch { threads, files, checks, commits } = fetch;
+        if threads.is_none() && files.is_none() && checks.is_none() && commits.is_none() {
+            // Nothing was learned, so there is nothing to write and nothing to repaint. Caching
+            // four empty lists here is precisely how a total outage used to erase a good entry.
+            return;
+        }
+        let known = match deps.cache.get::<PrDetail>(&key) {
+            Some(entry) => entry.value,
+            None => PrDetail { threads: Vec::new(), files: Vec::new(), checks: Vec::new(), commits: Vec::new() },
+        };
+        let detail = PrDetail {
+            threads: threads.unwrap_or(known.threads),
+            files: files.unwrap_or(known.files),
+            checks: checks.unwrap_or(known.checks),
+            commits: commits.unwrap_or(known.commits),
+        };
+        // A refusal means the store already holds a *newer* answer than this one: repainting
+        // from this merge would leave the screen behind the cache — the out-of-order landing the
+        // recency guard exists to stop, closed on disk and left open on screen. A disabled store
+        // (`--demo`, tests) refuses nothing; it stores nothing, and the view still updates.
+        if deps.cache.put(&key, &detail, fetched_at) == CachePut::Stale {
+            return;
+        }
+        let Screen::PrView(v) = &mut self.screen else { return };
+        if pr_detail_cache_key(&v.connection_id, &v.pr.item_ref()) != key {
+            return;
+        }
+        if pr_detail_unchanged(v, &detail) {
+            return; // a revalidation that found nothing new must not cause a visible repaint
+        }
+        let PrDetail { threads, files, checks, commits } = detail;
+        v.checks = checks;
+        v.commits = commits;
+        if v.commit_sel >= v.commits.len() {
+            v.commit_sel = v.commits.len().saturating_sub(1);
+        }
+        v.pr_files = files.clone();
+        // A per-commit drill-in (`commit_label` set) is showing that commit's own file list, not
+        // the whole-PR one — overwriting `diff.files` here would silently swap the user's current
+        // diff out from under them mid-read. It picks up these fresh whole-PR files the next time
+        // they back out, via `reset_diff_scope`, which reads from `pr_files`.
+        if v.diff.commit_label.is_none() {
+            v.diff.files = files;
+            if v.diff.selected >= v.diff.files.len() {
+                v.diff.selected = v.diff.files.len().saturating_sub(1);
+            }
+        }
+        v.diff.threads = threads;
+    }
+
+    /// Paints the last known lists before the first fetch has answered, so launching the app
+    /// doesn't mean staring at an empty one for several seconds. Called once at startup, after
+    /// the cache is hydrated and before the first reload is requested.
+    ///
+    /// Deliberately unconditional on age: expiring entries here would hand the blank screen back
+    /// to exactly the people this exists for. The age is reported instead, via `data_age`.
+    pub fn seed_from_cache(&mut self, deps: &AppDeps) {
+        let cache = &deps.cache;
+        let mut oldest = None;
+        let prs_key = prs_cache_key(self.pr_filter, self.pr_wants_completed());
+        seed_section(cache, &prs_key, &mut self.prs, &mut oldest);
+        seed_section(cache, CACHE_KEY_WORK_ITEMS, &mut self.wis, &mut oldest);
+        seed_section(cache, CACHE_KEY_PIPELINES, &mut self.pipes, &mut oldest);
+        seed_section(cache, CACHE_KEY_INBOX, &mut self.inbox, &mut oldest);
+        seed_section(cache, CACHE_KEY_LAUNCHPAD_MINE, &mut self.lp_prs_mine, &mut oldest);
+        seed_section(cache, CACHE_KEY_LAUNCHPAD_REVIEW, &mut self.lp_prs_review, &mut oldest);
+        self.data_age = oldest;
+        if self.inbox_sel >= self.inbox.len() {
+            self.inbox_sel = self.inbox.len().saturating_sub(1);
+        }
+        // Seeded rows are only visible once the views derived from them are rebuilt — the
+        // Launchpad is the landing screen, so skipping this would seed into nothing.
+        self.rebuild_launchpad();
+        self.fix_selection();
+    }
+
     /// Kicks off a background refresh (periodic poll / manual `r`) without blocking the
     /// render loop, so the header spinner keeps animating. Single-flight: a refresh
     /// already in progress is left to finish.
@@ -1876,6 +2297,150 @@ impl App {
         let (deps, params) = (deps.clone(), self.reload_params());
         tokio::spawn(async move {
             let _ = tx.send(AppEvent::Reloaded(Box::new(App::fetch_all(deps, params).await)));
+        });
+    }
+
+    /// Kicks off the background fetch for a just-opened PR view's detail, without blocking the
+    /// render loop. Not single-flight the way [`request_reload`] is: opening a different PR (or
+    /// re-opening this one) while a fetch is outstanding simply spawns another one, and
+    /// `apply_pr_detail` drops whichever answer no longer matches what's on screen.
+    fn request_pr_detail(&self, deps: &AppDeps, conn_id: String, item: ItemRef, key: String) {
+        let Some(tx) = self.job_tx.clone() else {
+            return;
+        };
+        let deps = deps.clone();
+        // Stamped before the fetch goes out, not when it answers: the store's "an older write
+        // can't overwrite a newer entry" guard only means anything if the timestamp orders the
+        // requests. Stamping on completion makes whichever response is slowest also the
+        // freshest-looking, which is exactly backwards for two fetches of the same PR.
+        let fetched_at = Utc::now();
+        tokio::spawn(async move {
+            let detail = fetch_pr_detail(&deps, &conn_id, &item).await;
+            let _ = tx.send(AppEvent::PrDetailLoaded { key, detail: Box::new(detail), fetched_at });
+        });
+    }
+
+    /// Mirrors [`App::apply_pr_detail`]: merges the fetch against the *cached* entry (not the
+    /// open view), writes it through even if the user has since navigated away, and patches the
+    /// view in place — never rebuilding it, so `scroll` survives — only if it's still showing
+    /// the same item. An all-failed fetch is a no-op.
+    fn apply_wi_detail(&mut self, deps: &AppDeps, key: String, fetch: WiDetailFetch, fetched_at: DateTime<Utc>) {
+        let WiDetailFetch { threads } = fetch;
+        if threads.is_none() {
+            // Nothing was learned, so there is nothing to write and nothing to repaint.
+            return;
+        }
+        let known = match deps.cache.get::<WiDetail>(&key) {
+            Some(entry) => entry.value,
+            None => WiDetail { threads: Vec::new() },
+        };
+        let detail = WiDetail { threads: threads.unwrap_or(known.threads) };
+        if deps.cache.put(&key, &detail, fetched_at) == CachePut::Stale {
+            // See `apply_pr_detail`: a newer entry already won, so the screen must not go back.
+            return;
+        }
+        let Screen::WiView(v) = &mut self.screen else { return };
+        if wi_detail_cache_key(&v.connection_id, &v.wi.item_ref()) != key {
+            return;
+        }
+        if wi_detail_unchanged(v, &detail) {
+            return; // a revalidation that found nothing new must not cause a visible repaint
+        }
+        v.threads = detail.threads;
+    }
+
+    /// Kicks off the background fetch for a just-opened work-item view's detail, without
+    /// blocking the render loop. Mirrors [`App::request_pr_detail`], including stamping
+    /// `fetched_at` before the fetch goes out rather than when it answers.
+    fn request_wi_detail(&self, deps: &AppDeps, conn_id: String, item: ItemRef, key: String) {
+        let Some(tx) = self.job_tx.clone() else {
+            return;
+        };
+        let deps = deps.clone();
+        let fetched_at = Utc::now();
+        tokio::spawn(async move {
+            let detail = fetch_wi_detail(&deps, &conn_id, &item).await;
+            let _ = tx.send(AppEvent::WiDetailLoaded { key, detail: Box::new(detail), fetched_at });
+        });
+    }
+
+    /// Mirrors [`App::apply_pr_detail`], with one addition: a pipeline run's `status` is live in
+    /// a way a PR's files/checks aren't (a cached "Running" may have failed an hour ago), so a
+    /// cache-seeded view is `stale` (see [`PipelineView::stale`]) until a real `get_run` answers
+    /// here — even one that confirms exactly what the cache already guessed still has to clear
+    /// the flag, so the unchanged-check is skipped for it. Once confirmed, later revalidations
+    /// that find nothing new go back to causing no repaint, same as the PR path.
+    fn apply_pipeline_detail(&mut self, deps: &AppDeps, key: String, fetch: PipelineDetailFetch, fetched_at: DateTime<Utc>) {
+        let PipelineDetailFetch { run, approvals, supports_approvals, can_respond_approvals } = fetch;
+        if run.is_none() && approvals.is_none() && supports_approvals.is_none() && can_respond_approvals.is_none() {
+            // Nothing was learned, so there is nothing to write and nothing to repaint.
+            return;
+        }
+        let run_confirmed = run.is_some();
+        let known = deps.cache.get::<PipelineDetail>(&key).map(|entry| entry.value);
+        // Unlike the PR path's list fields, a `PipelineRun` has no empty value to stand in for
+        // "unknown" — if this fetch didn't confirm one and nothing was cached before, there is
+        // nothing complete enough to write.
+        let Some(resolved_run) = run.or_else(|| known.as_ref().map(|k| k.run.clone())) else {
+            return;
+        };
+        // Two different things from here on: `detail.approvals` is what the *cache* gets — the
+        // merged, complete picture a later re-open should read — while `approvals` is what the
+        // *view* may get, which is only ever gates this fetch actually confirmed.
+        let resolved_approvals = approvals
+            .clone()
+            .unwrap_or_else(|| known.as_ref().map(|k| k.approvals.clone()).unwrap_or_default());
+        let resolved_supports =
+            supports_approvals.unwrap_or_else(|| known.as_ref().map(|k| k.supports_approvals).unwrap_or(false));
+        let resolved_can_respond = can_respond_approvals
+            .unwrap_or_else(|| known.as_ref().map(|k| k.can_respond_approvals).unwrap_or(false));
+        let detail = PipelineDetail {
+            run: resolved_run,
+            approvals: resolved_approvals,
+            supports_approvals: resolved_supports,
+            can_respond_approvals: resolved_can_respond,
+        };
+        // See `apply_pr_detail`: a newer entry already won, so the screen must not go back.
+        if deps.cache.put(&key, &detail, fetched_at) == CachePut::Stale {
+            return;
+        }
+
+        let Screen::Pipeline(v) = &mut self.screen else { return };
+        if pipeline_detail_cache_key(&v.connection_id, &v.run.item_ref()) != key {
+            return;
+        }
+        // `approvals`, never `detail.approvals`: a gate the cache remembers may already have been
+        // decided, and `actionable_approvals` turns whatever is on screen into a real
+        // approve/reject against the provider. A failed `pending_approvals` therefore leaves the
+        // view's gates alone rather than substituting the cached ones. This has been
+        // reintroduced once already: the merged value is for the cache, never for the view.
+        if run_confirmed {
+            if v.stale || !pipeline_detail_unchanged(v, &detail, approvals.as_deref()) {
+                v.supports_approvals = detail.supports_approvals;
+                v.can_respond_approvals = detail.can_respond_approvals;
+                v.apply_fresh_run(detail.run, approvals);
+            }
+        } else if !pipeline_detail_unchanged(v, &detail, approvals.as_deref()) {
+            // The run itself wasn't reconfirmed this round (only approvals/capabilities
+            // answered) — patch those in place, but leave the run and `stale` exactly as they
+            // are: only a real `get_run` may confirm the run is actually live.
+            v.apply_confirmed_approvals(approvals);
+            v.supports_approvals = detail.supports_approvals;
+            v.can_respond_approvals = detail.can_respond_approvals;
+        }
+    }
+
+    /// Kicks off the background fetch for a just-opened pipeline view's detail, without blocking
+    /// the render loop. Mirrors [`App::request_pr_detail`].
+    fn request_pipeline_detail(&self, deps: &AppDeps, conn_id: String, run: ItemRef, key: String) {
+        let Some(tx) = self.job_tx.clone() else {
+            return;
+        };
+        let deps = deps.clone();
+        let fetched_at = Utc::now();
+        tokio::spawn(async move {
+            let detail = fetch_pipeline_detail(&deps, &conn_id, &run).await;
+            let _ = tx.send(AppEvent::PipelineDetailLoaded { key, detail: Box::new(detail), fetched_at });
         });
     }
 
@@ -2188,9 +2753,9 @@ impl App {
                 self.lp_origin = false; // opened from the section list, so Esc returns there
                 self.from_inbox = false;
                 match self.active {
-                    0 => self.open_pr_view(deps, 0).await,
-                    1 => self.open_wi_view(deps).await,
-                    2 => self.open_pipeline(deps).await,
+                    0 => self.open_pr_view(deps, 0),
+                    1 => self.open_wi_view(deps),
+                    2 => self.open_pipeline(deps),
                     _ => {}
                 }
             }
@@ -2216,33 +2781,36 @@ impl App {
 
     // ---- full-screen PR / work-item views ----
 
-    async fn open_pr_view(&mut self, deps: &AppDeps, tab: usize) {
+    fn open_pr_view(&mut self, deps: &AppDeps, tab: usize) {
         let (label, url, conn_id, pr) = match self.selected_pr_row() {
             Some(row) => (pr_label(&row.pr), row.pr.url.clone(), row.connection_id.clone(), row.pr.clone()),
             None => return,
         };
-        self.open_pr_view_for(deps, tab, label, url, conn_id, pr).await;
+        self.open_pr_view_for(deps, tab, label, url, conn_id, pr);
     }
 
     /// Opens the PR view for an explicit PR (used by the Launchpad, where the item
     /// isn't the section list's selected row).
+    ///
+    /// Synchronous and does no I/O: it paints whatever is cached (or nothing) immediately, so
+    /// the view is on screen before the first byte of the detail fetch goes out, then hands the
+    /// four detail calls off to [`request_pr_detail`] to run off the render loop. Awaiting them
+    /// here — as this used to — froze the whole event loop (no redraw, no spinner, no key input)
+    /// for as long as the network took (see commit 8fc2117 for the same fix on the refresh path).
     #[allow(clippy::too_many_arguments)]
-    async fn open_pr_view_for(&mut self, deps: &AppDeps, tab: usize, label: String, url: Option<String>, conn_id: String, pr: PullRequest) {
-        let source = match self.pr_source_for(&conn_id, deps).await {
-            Some(s) => s,
-            None => {
-                self.toast = Some("No pull-request provider is bound".into());
-                return;
-            }
-        };
-        // Address every detail call at the PR's own repository, not just its id: on a connection
-        // spanning several, `#7` alone names more than one pull request.
+    fn open_pr_view_for(&mut self, deps: &AppDeps, tab: usize, label: String, url: Option<String>, conn_id: String, pr: PullRequest) {
+        // Address the cache and every detail call at the PR's own repository, not just its id:
+        // on a connection spanning several, `#7` alone names more than one pull request.
         let item = pr.item_ref();
-        let threads = detail_or_default(source.threads(&item).await, DIAG_PR_THREADS);
-        let mut files = detail_or_default(source.changes(&item).await, DIAG_PR_CHANGES);
-        files.sort_by(|a, b| a.path.cmp(&b.path)); // cluster by directory for grouping
-        let checks = detail_or_default(source.checks(&item).await, DIAG_PR_CHECKS);
-        let commits = detail_or_default(source.commits(&item).await, DIAG_PR_COMMITS);
+        let key = pr_detail_cache_key(&conn_id, &item);
+        let PrDetail { threads, mut files, checks, commits } = match deps.cache.get::<PrDetail>(&key) {
+            Some(entry) => entry.value,
+            None => PrDetail { threads: Vec::new(), files: Vec::new(), checks: Vec::new(), commits: Vec::new() },
+        };
+        // Sort on the way out of the cache too, rather than trusting the order it was written
+        // in: an entry from before this sort existed (or a future change that stops sorting
+        // before caching) must not silently show the file list out of order.
+        files.sort_by(|a, b| a.path.cmp(&b.path));
         let diff = DiffView {
             pr_label: label.clone(),
             url: url.clone(),
@@ -2258,7 +2826,7 @@ impl App {
         self.screen = Screen::PrView(Box::new(PrView {
             label,
             url,
-            connection_id: conn_id,
+            connection_id: conn_id.clone(),
             pr,
             tab,
             checks,
@@ -2271,6 +2839,9 @@ impl App {
             review_draft: None,
             reply_target: None,
         }));
+        // The view is on screen now; the fetch that keeps it fresh runs in the background and
+        // patches it in place via `AppEvent::PrDetailLoaded` (see `apply_pr_detail`).
+        self.request_pr_detail(deps, conn_id, item, key);
     }
 
     /// Buffers a line comment against the cursor line in the diff patch.
@@ -2449,21 +3020,30 @@ impl App {
         v.tab = 3;
     }
 
-    async fn open_wi_view(&mut self, deps: &AppDeps) {
+    fn open_wi_view(&mut self, deps: &AppDeps) {
         let (conn_id, wi) = match self.selected_wi_row() {
             Some(row) => (row.connection_id.clone(), row.wi.clone()),
             None => return,
         };
-        self.open_wi_view_for(deps, conn_id, wi).await;
+        self.open_wi_view_for(deps, conn_id, wi);
     }
 
     /// Opens the work-item view for an explicit item (used by the Launchpad).
-    async fn open_wi_view_for(&mut self, deps: &AppDeps, conn_id: String, wi: WorkItem) {
-        let threads = match self.wi_source_for(&conn_id, deps).await {
-            Some(src) => detail_or_default(src.threads(&wi.item_ref()).await, DIAG_WI_THREADS),
+    ///
+    /// Synchronous and does no I/O: mirrors [`App::open_pr_view_for`] — paints whatever is
+    /// cached (or nothing) immediately, so the view is on screen before the first byte of the
+    /// detail fetch goes out, then hands the thread fetch off to [`App::request_wi_detail`] to
+    /// run off the render loop. Awaiting it here — as this used to — froze the whole event loop
+    /// for as long as the network took.
+    fn open_wi_view_for(&mut self, deps: &AppDeps, conn_id: String, wi: WorkItem) {
+        let item = wi.item_ref();
+        let key = wi_detail_cache_key(&conn_id, &item);
+        let threads = match deps.cache.get::<WiDetail>(&key) {
+            Some(entry) => entry.value.threads,
             None => Vec::new(),
         };
-        self.screen = Screen::WiView(Box::new(WiView { connection_id: conn_id, wi, threads, scroll: 0 }));
+        self.screen = Screen::WiView(Box::new(WiView { connection_id: conn_id.clone(), wi, threads, scroll: 0 }));
+        self.request_wi_detail(deps, conn_id, item, key);
     }
 
     /// Opens the repository-scope picker for the active section.
@@ -2866,7 +3446,7 @@ impl App {
         self.pipe_state.selected().and_then(|p| idxs.get(p)).and_then(|&i| self.pipes.get(i))
     }
 
-    async fn open_pipeline(&mut self, deps: &AppDeps) {
+    fn open_pipeline(&mut self, deps: &AppDeps) {
         let Some(pipe) = self.selected_pipe() else { return };
         let (conn_id, provider, run_id, definition_id, branch, title, fallback) = (
             pipe.connection_id.clone(),
@@ -2877,12 +3457,25 @@ impl App {
             pipe_label(pipe),
             pipe.run.clone(),
         );
-        self.open_pipeline_for(deps, conn_id, provider, run_id, definition_id, branch, title, fallback).await;
+        self.open_pipeline_for(deps, conn_id, provider, run_id, definition_id, branch, title, fallback);
     }
 
     /// Opens the pipeline drill-in for an explicit run (used by the Launchpad).
+    ///
+    /// Synchronous and does no I/O: mirrors [`App::open_pr_view_for`] — seeds from the cache,
+    /// falling back to the list row's own already-fetched `fallback` run on a miss, so the view
+    /// is on screen before the enrich/approvals fetch goes out, then hands that fetch off to
+    /// [`App::request_pipeline_detail`].
+    ///
+    /// Unlike a PR's files/checks, a run's `status` is live: a cached "Running" may have failed
+    /// an hour ago, and painting that as current is worse than showing nothing, because the user
+    /// acts on it. So the seeded run is marked [`PipelineView::stale`] until
+    /// `apply_pipeline_detail` confirms it with a real `get_run`. Approval gates are never
+    /// seeded at all — a cached gate that was already actioned would offer a decision that no
+    /// longer exists, and `actionable_approvals` drives a real write — they start empty and are
+    /// filled in only once the fetch answers.
     #[allow(clippy::too_many_arguments)]
-    async fn open_pipeline_for(
+    fn open_pipeline_for(
         &mut self,
         deps: &AppDeps,
         conn_id: String,
@@ -2893,57 +3486,62 @@ impl App {
         title: String,
         fallback: PipelineRun,
     ) {
-        // Enrich with full stages/jobs/steps via get_run (list_runs may be shallow),
-        // plus any pending approval gates.
-        let feeds = detail_or_default(deps.sections.pipeline_feeds().await, DIAG_PIPELINE_FEEDS);
-        let (run, supports_approvals, can_respond, approvals) = match feeds.iter().find(|f| f.connection.connection_id() == conn_id) {
-            Some(feed) => {
-                let run = detail_or_fallback(
-                    feed.source.get_run(&ItemRef::maybe(fallback.repository.clone(), run_id.clone())).await,
-                    DIAG_PIPELINE_RUN,
-                    fallback,
-                );
-                let supports = feed.source.supports_approvals();
-                let can_respond = feed.source.can_respond_to_approvals();
-                let approvals = if supports {
-                    detail_or_default(
-                        feed.source.pending_approvals(&run.item_ref()).await,
-                        DIAG_PIPELINE_APPROVALS,
-                    )
-                } else {
-                    Vec::new()
-                };
-                (run, supports, can_respond, approvals)
-            }
-            None => (fallback, false, false, Vec::new()),
+        let item = ItemRef::maybe(fallback.repository.clone(), run_id);
+        let key = pipeline_detail_cache_key(&conn_id, &item);
+        let (run, supports_approvals, can_respond_approvals) = match deps.cache.get::<PipelineDetail>(&key) {
+            Some(entry) => (entry.value.run, entry.value.supports_approvals, entry.value.can_respond_approvals),
+            None => (fallback, false, false),
         };
 
-        let mut view = PipelineView::new(title, run, conn_id, provider, definition_id, branch);
+        let mut view = PipelineView::new(title, run, conn_id.clone(), provider, definition_id, branch);
         view.supports_approvals = supports_approvals;
-        view.can_respond_approvals = can_respond;
-        view.approvals = approvals;
+        view.can_respond_approvals = can_respond_approvals;
+        view.stale = true;
         self.screen = Screen::Pipeline(Box::new(view));
+        // The view is on screen now; the fetch that keeps it fresh runs in the background and
+        // patches it in place via `AppEvent::PipelineDetailLoaded` (see `apply_pipeline_detail`).
+        self.request_pipeline_detail(deps, conn_id, item, key);
     }
 
-    /// Re-fetches the open pipeline drill-in's run + approvals (called on the 30s tick).
+    /// Re-fetches the open pipeline drill-in's run + approvals — used after an approval decision
+    /// changes a gate, so the drill-in reflects the decision immediately rather than waiting on
+    /// the next detail/reload fetch. Now also writes through to [`pipeline_detail_cache_key`],
+    /// so this path and `apply_pipeline_detail` agree on what a later re-open of this run sees.
     async fn refresh_open_pipeline(&mut self, deps: &AppDeps) {
         let Screen::Pipeline(v) = &self.screen else { return };
         let (conn_id, run_ref) = (v.connection_id.clone(), v.run.item_ref());
+        // Stamped before the fetch, like every other path: a timestamp taken on completion makes
+        // the slowest answer look like the freshest, which is backwards.
+        let fetched_at = Utc::now();
         let feeds = detail_or_default(deps.sections.pipeline_feeds().await, DIAG_PIPELINE_FEEDS);
         let Some(feed) = feeds.iter().find(|f| f.connection.connection_id() == conn_id) else { return };
         let Some(run) = detail_or_none(feed.source.get_run(&run_ref).await, DIAG_PIPELINE_RUN) else { return };
-        let approvals = if feed.source.supports_approvals() {
-            detail_or_default(
-                feed.source.pending_approvals(&run_ref).await,
-                DIAG_PIPELINE_APPROVALS,
-            )
+        let supports_approvals = feed.source.supports_approvals();
+        let can_respond_approvals = feed.source.can_respond_to_approvals();
+        // A failed gate check stays `None` rather than collapsing to an empty list: clearing the
+        // gates would hide one the user still has to act on, and caching that empty would
+        // propagate the wrong answer forward as if it had been confirmed.
+        let approvals = if supports_approvals {
+            detail_or_none(feed.source.pending_approvals(&run_ref).await, DIAG_PIPELINE_APPROVALS)
         } else {
-            Vec::new()
+            Some(Vec::new())
         };
+        let key = pipeline_detail_cache_key(&conn_id, &run_ref);
+        let known = deps.cache.get::<PipelineDetail>(&key).map(|e| e.value);
+        let detail = PipelineDetail {
+            run: run.clone(),
+            approvals: approvals
+                .clone()
+                .or_else(|| known.map(|k| k.approvals))
+                .unwrap_or_default(),
+            supports_approvals,
+            can_respond_approvals,
+        };
+        if deps.cache.put(&key, &detail, fetched_at) == CachePut::Stale {
+            return; // the store holds something newer — see `apply_pr_detail`
+        }
         if let Screen::Pipeline(v) = &mut self.screen {
-            v.run = run;
-            v.approvals = approvals;
-            v.clamp_selection();
+            v.apply_fresh_run(run, approvals);
         }
     }
 
@@ -4040,20 +4638,6 @@ fn detail_or_default_with_logger<T: Default, E>(
     }
 }
 
-fn detail_or_fallback<T, E>(
-    result: std::result::Result<T, E>,
-    operation: &'static str,
-    fallback: T,
-) -> T {
-    match result {
-        Ok(value) => value,
-        Err(_) => {
-            log_operation_failure(operation);
-            fallback
-        }
-    }
-}
-
 fn detail_or_none<T, E>(result: std::result::Result<T, E>, operation: &'static str) -> Option<T> {
     match result {
         Ok(value) => Some(value),
@@ -4421,8 +5005,14 @@ fn pr_query(filter: PullRequestFilter) -> PullRequestQuery {
 
 // ---- background fetch helpers (no `&mut self`, safe to run in a spawned task) ----
 
-async fn fetch_pull_requests(deps: &AppDeps, filter: PullRequestFilter, completed: bool, errors: &mut Vec<String>) -> Vec<PrRow> {
+// Each of these returns its rows plus whether *every* feed it consulted answered. A failure
+// drops that connection's rows silently — the list still arrives, just short — so the flag is
+// the only thing that can tell a partial result from a real one. `write_through` caches a
+// section on that flag alone; see its comment for why "has some rows" is not good enough.
+
+async fn fetch_pull_requests(deps: &AppDeps, filter: PullRequestFilter, completed: bool, errors: &mut Vec<String>) -> (Vec<PrRow>, bool) {
     let mut out = Vec::new();
+    let mut ok = true;
     match deps.sections.pull_request_feeds().await {
         Ok(feeds) => {
             let query = PullRequestQuery { filter, include_completed: completed, limit: Some(50), decorate: true };
@@ -4430,34 +5020,48 @@ async fn fetch_pull_requests(deps: &AppDeps, filter: PullRequestFilter, complete
                 let (provider, name, conn_id) = feed_tag(&feed.connection);
                 match feed.source.list(&query).await {
                     Ok(list) => out.extend(list.into_iter().map(|pr| PrRow { connection_id: conn_id.clone(), connection: name.clone(), provider, pr })),
-                    Err(e) => errors.push(format!("PRs ({name}): {e}")),
+                    Err(e) => {
+                        ok = false;
+                        errors.push(format!("PRs ({name}): {e}"));
+                    }
                 }
             }
         }
-        Err(e) => errors.push(format!("PRs: {e}")),
+        Err(e) => {
+            ok = false;
+            errors.push(format!("PRs: {e}"));
+        }
     }
-    out
+    (out, ok)
 }
 
-async fn fetch_work_items(deps: &AppDeps, errors: &mut Vec<String>) -> Vec<WiRow> {
+async fn fetch_work_items(deps: &AppDeps, errors: &mut Vec<String>) -> (Vec<WiRow>, bool) {
     let mut out = Vec::new();
+    let mut ok = true;
     match deps.sections.work_item_feeds().await {
         Ok(feeds) => {
             for feed in feeds {
                 let (provider, name, conn_id) = feed_tag(&feed.connection);
                 match feed.source.list(&wi_query()).await {
                     Ok(list) => out.extend(list.into_iter().map(|wi| WiRow { connection_id: conn_id.clone(), connection: name.clone(), provider, wi })),
-                    Err(e) => errors.push(format!("Work items ({name}): {e}")),
+                    Err(e) => {
+                        ok = false;
+                        errors.push(format!("Work items ({name}): {e}"));
+                    }
                 }
             }
         }
-        Err(e) => errors.push(format!("Work items: {e}")),
+        Err(e) => {
+            ok = false;
+            errors.push(format!("Work items: {e}"));
+        }
     }
-    out
+    (out, ok)
 }
 
-async fn fetch_notifications(deps: &AppDeps, errors: &mut Vec<String>) -> Vec<NotifRow> {
+async fn fetch_notifications(deps: &AppDeps, errors: &mut Vec<String>) -> (Vec<NotifRow>, bool) {
     let mut out = Vec::new();
+    let mut ok = true;
     match deps.sections.notification_feeds().await {
         Ok(feeds) => {
             for feed in feeds {
@@ -4469,25 +5073,40 @@ async fn fetch_notifications(deps: &AppDeps, errors: &mut Vec<String>) -> Vec<No
                         provider,
                         notification: n,
                     })),
-                    Err(e) => errors.push(format!("Notifications ({name}): {e}")),
+                    Err(e) => {
+                        ok = false;
+                        errors.push(format!("Notifications ({name}): {e}"));
+                    }
                 }
             }
         }
-        Err(e) => errors.push(format!("Notifications: {e}")),
+        Err(e) => {
+            ok = false;
+            errors.push(format!("Notifications: {e}"));
+        }
     }
     out.sort_by_key(|r| std::cmp::Reverse(r.notification.updated_at)); // newest first
-    out
+    (out, ok)
 }
 
-async fn fetch_pipelines(deps: &AppDeps, errors: &mut Vec<String>) -> Vec<PipeRow> {
+async fn fetch_pipelines(deps: &AppDeps, errors: &mut Vec<String>) -> (Vec<PipeRow>, bool) {
     let mut out = Vec::new();
+    let mut ok = true;
     match deps.sections.pipeline_feeds().await {
         Ok(feeds) => {
             for feed in feeds {
                 let provider = feed.connection.provider_type();
                 let name = feed.connection.display_name().to_string();
                 let conn_id = feed.connection.connection_id().to_string();
-                let defs = detail_or_default(feed.source.discover().await, DIAG_PIPELINE_DISCOVERY);
+                // Discovery failing isn't cosmetic: it decides which runs are even asked for,
+                // so the rows that come back are a subset of what a healthy fetch would return.
+                let defs = match detail_or_none(feed.source.discover().await, DIAG_PIPELINE_DISCOVERY) {
+                    Some(defs) => defs,
+                    None => {
+                        ok = false;
+                        Vec::new()
+                    }
+                };
                 let def_names: HashMap<String, String> =
                     defs.iter().map(|d| (d.id.clone(), d.name.clone())).collect();
                 for q in feed_queries(&feed.subscription, &defs) {
@@ -4495,26 +5114,48 @@ async fn fetch_pipelines(deps: &AppDeps, errors: &mut Vec<String>) -> Vec<PipeRo
                         Ok(runs) => {
                             let supports = feed.source.supports_approvals();
                             for run in runs {
-                                let awaiting_approval = supports
-                                    && is_active(run.status)
-                                    && detail_or_default(
+                                // A failed gate check is not "no gate": caching the row as clear
+                                // would hide a pending approval until the next whole reload, so
+                                // it clears the section flag like discovery's failure does.
+                                let (awaiting_approval, gate_ok) = if supports && is_active(run.status) {
+                                    gate_from_approvals(detail_or_none(
                                         feed.source.pending_approvals(&run.item_ref()).await,
                                         DIAG_PIPELINE_APPROVALS,
-                                    )
-                                    .iter()
-                                    .any(|approval| approval.can_respond);
+                                    ))
+                                } else {
+                                    (false, true)
+                                };
+                                if !gate_ok {
+                                    ok = false;
+                                }
                                 let definition_name = def_names.get(&run.definition_id).cloned();
                                 out.push(PipeRow { connection_id: conn_id.clone(), connection: name.clone(), provider, run, definition_name, awaiting_approval });
                             }
                         }
-                        Err(e) => errors.push(format!("Pipelines ({name}): {e}")),
+                        Err(e) => {
+                            ok = false;
+                            errors.push(format!("Pipelines ({name}): {e}"));
+                        }
                     }
                 }
             }
         }
-        Err(e) => errors.push(format!("Pipelines: {e}")),
+        Err(e) => {
+            ok = false;
+            errors.push(format!("Pipelines: {e}"));
+        }
     }
-    out
+    (out, ok)
+}
+
+/// A row's `awaiting_approval` plus whether the gate check that decided it actually answered.
+/// `None` in means the call failed: the row reads as "no gate pending", but the caller must not
+/// cache that guess, so the second element is what clears the section's flag.
+fn gate_from_approvals(gates: Option<Vec<PipelineApproval>>) -> (bool, bool) {
+    match gates {
+        Some(gates) => (gates.iter().any(|approval| approval.can_respond), true),
+        None => (false, false),
+    }
 }
 
 /// Re-fetches the open pipeline run + its pending approvals (mirrors
@@ -4523,53 +5164,211 @@ async fn fetch_open_pipeline(
     deps: &AppDeps,
     conn_id: &str,
     run_ref: &ItemRef,
-) -> Option<(String, PipelineRun, Vec<PipelineApproval>)> {
+) -> Option<(String, PipelineRun, Option<Vec<PipelineApproval>>)> {
     let feeds = detail_or_default(deps.sections.pipeline_feeds().await, DIAG_PIPELINE_FEEDS);
     let feed = feeds
         .iter()
         .find(|f| f.connection.connection_id() == conn_id)?;
     let run = detail_or_none(feed.source.get_run(run_ref).await, DIAG_PIPELINE_RUN)?;
+    // `detail_or_none`, not `detail_or_default`: a failed gate check must stay distinguishable
+    // from an answered "no gates", or a 502 silently clears a gate the user still has to act on.
     let approvals = if feed.source.supports_approvals() {
-        detail_or_default(
-            feed.source.pending_approvals(run_ref).await,
-            DIAG_PIPELINE_APPROVALS,
-        )
+        detail_or_none(feed.source.pending_approvals(run_ref).await, DIAG_PIPELINE_APPROVALS)
     } else {
-        Vec::new()
+        Some(Vec::new())
     };
     Some((run_ref.id.clone(), run, approvals))
 }
 
-async fn fetch_launchpad_prs(deps: &AppDeps) -> (Vec<PrRow>, Vec<PrRow>) {
+/// Fetches the four detail sections behind a PR view, off the render loop. Mirrors what
+/// `open_pr_view_for` used to await inline. Left sequential on purpose, not fanned out
+/// concurrently: that would attribute a slow/failing section's error to the wrong request and
+/// is a separate change with its own consequences (see the task note that introduced this).
+/// Each call yields `None` rather than an empty list when it fails, so the caller can keep what
+/// it already knew for that section instead of painting — and caching — a blank one.
+async fn fetch_pr_detail(deps: &AppDeps, conn_id: &str, item: &ItemRef) -> PrDetailFetch {
+    let feeds = detail_or_default(deps.sections.pull_request_feeds().await, DIAG_PR_FEEDS);
+    let Some(feed) = feeds.iter().find(|f| f.connection.connection_id() == conn_id) else {
+        // No feed answered for this connection, which is a failure to look — not a PR that
+        // genuinely has no files, checks or comments.
+        return PrDetailFetch::default();
+    };
+    let source = &feed.source;
+    let threads = detail_or_none(source.threads(item).await, DIAG_PR_THREADS);
+    let files = detail_or_none(source.changes(item).await, DIAG_PR_CHANGES).map(|mut files| {
+        files.sort_by(|a, b| a.path.cmp(&b.path)); // cluster by directory for grouping
+        files
+    });
+    let checks = detail_or_none(source.checks(item).await, DIAG_PR_CHECKS);
+    let commits = detail_or_none(source.commits(item).await, DIAG_PR_COMMITS);
+    PrDetailFetch { threads, files, checks, commits }
+}
+
+/// Fetches the detail behind a work-item view, off the render loop. Mirrors [`fetch_pr_detail`].
+async fn fetch_wi_detail(deps: &AppDeps, conn_id: &str, item: &ItemRef) -> WiDetailFetch {
+    let feeds = detail_or_default(deps.sections.work_item_feeds().await, DIAG_WI_FEEDS);
+    let Some(feed) = feeds.iter().find(|f| f.connection.connection_id() == conn_id) else {
+        // No feed answered for this connection, which is a failure to look — not a work item
+        // that genuinely has no comments.
+        return WiDetailFetch::default();
+    };
+    let threads = detail_or_none(feed.source.threads(item).await, DIAG_WI_THREADS);
+    WiDetailFetch { threads }
+}
+
+/// Fetches the run + capabilities + approvals behind a pipeline drill-in, off the render loop.
+/// Mirrors [`fetch_pr_detail`]; left sequential for the same reason. Approvals are fetched
+/// regardless of whether `get_run` itself succeeded — they're addressed by the run ref, not the
+/// fetched run object, so a failure to enrich the run needn't also blank the approvals answer.
+async fn fetch_pipeline_detail(deps: &AppDeps, conn_id: &str, run_ref: &ItemRef) -> PipelineDetailFetch {
+    let feeds = detail_or_default(deps.sections.pipeline_feeds().await, DIAG_PIPELINE_FEEDS);
+    let Some(feed) = feeds.iter().find(|f| f.connection.connection_id() == conn_id) else {
+        return PipelineDetailFetch::default();
+    };
+    let source = &feed.source;
+    let run = detail_or_none(source.get_run(run_ref).await, DIAG_PIPELINE_RUN);
+    let supports_approvals = source.supports_approvals();
+    let can_respond_approvals = source.can_respond_to_approvals();
+    let approvals = if supports_approvals {
+        detail_or_none(source.pending_approvals(run_ref).await, DIAG_PIPELINE_APPROVALS)
+    } else {
+        Some(Vec::new())
+    };
+    PipelineDetailFetch {
+        run,
+        approvals,
+        supports_approvals: Some(supports_approvals),
+        can_respond_approvals: Some(can_respond_approvals),
+    }
+}
+
+/// Cheap "did anything actually change" check for a landed [`PrDetail`] against what the open
+/// view already holds, so a revalidation that finds nothing new causes no repaint (no scroll
+/// jump, no flicker). None of `CommentThread`, `FileChange`, `CheckRun` or `Commit` derive
+/// `PartialEq` in forgetop-core, so this isn't a full structural diff — it compares the fields
+/// most likely to actually move:
+/// - threads: count, plus total comment count, plus resolved count (misses an edited comment
+///   body, or a same-size swap of which threads are resolved)
+/// - files: count, plus (path, kind, additions, deletions) per file (misses a patch-text-only
+///   change with unchanged add/delete counts — not achievable from a real diff)
+/// - checks: count, plus (name, status) per check (misses a check's URL alone changing)
+/// - commits: the sequence of shas (an amend or force-push always changes a sha, so this is
+///   exact for reordering/rewriting; misses an in-place message edit on a provider that allows it)
+fn pr_detail_unchanged(v: &PrView, d: &PrDetail) -> bool {
+    threads_match(&v.diff.threads, &d.threads)
+        && files_match(&v.pr_files, &d.files)
+        && checks_match(&v.checks, &d.checks)
+        && commits_match(&v.commits, &d.commits)
+}
+
+fn threads_match(a: &[CommentThread], b: &[CommentThread]) -> bool {
+    let counts = |ts: &[CommentThread]| -> (usize, usize) {
+        (ts.iter().map(|t| t.comments.len()).sum(), ts.iter().filter(|t| t.is_resolved).count())
+    };
+    a.len() == b.len() && counts(a) == counts(b)
+}
+
+fn files_match(a: &[FileChange], b: &[FileChange]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(x, y)| {
+            x.path == y.path && x.kind == y.kind && x.additions == y.additions && x.deletions == y.deletions
+        })
+}
+
+fn checks_match(a: &[CheckRun], b: &[CheckRun]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.name == y.name && x.status == y.status)
+}
+
+fn commits_match(a: &[Commit], b: &[Commit]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.sha == y.sha)
+}
+
+/// Mirrors [`pr_detail_unchanged`]. `WiDetail` has only the one field, so this is just
+/// `threads_match` — kept as its own named function so a second detail call landing here later
+/// (see [`WiDetail`]) has an obvious place to fold in.
+fn wi_detail_unchanged(v: &WiView, d: &WiDetail) -> bool {
+    threads_match(&v.threads, &d.threads)
+}
+
+/// The parts of a [`PipelineRun`] a revalidation is most likely to have actually moved: the
+/// run's own status, and each stage's and job's status (not step-level status, timestamps,
+/// problem text, or URLs — a job's own status already reflects its steps having changed). Misses
+/// a branch/commit/title edited in place without a new run being created, and a retried step
+/// that doesn't move its job's status.
+fn pipeline_run_matches(a: &PipelineRun, b: &PipelineRun) -> bool {
+    a.status == b.status
+        && a.stages.len() == b.stages.len()
+        && a.stages.iter().zip(&b.stages).all(|(x, y)| {
+            x.status == y.status
+                && x.jobs.len() == y.jobs.len()
+                && x.jobs.iter().zip(&y.jobs).all(|(jx, jy)| jx.status == jy.status)
+        })
+}
+
+/// Mirrors [`pr_detail_unchanged`]. `PipelineApproval` derives `PartialEq` (unlike the other
+/// domain types this file compares against a landed detail), so approvals compare exactly —
+/// order and membership both matter for a gate list. `PipelineRun` doesn't, so it goes through
+/// [`pipeline_run_matches`], which always includes `status`: a status change that fails to
+/// repaint is the one failure the stale-run design (see `open_pipeline_for`) can't afford.
+///
+/// `confirmed_approvals` is what the fetch actually answered with, not the cache-merged value:
+/// gates the cache remembers never reach the view, so their differing from it is not a change
+/// worth repainting for.
+fn pipeline_detail_unchanged(
+    v: &PipelineView,
+    d: &PipelineDetail,
+    confirmed_approvals: Option<&[PipelineApproval]>,
+) -> bool {
+    pipeline_run_matches(&v.run, &d.run)
+        && confirmed_approvals.is_none_or(|fresh| fresh == v.approvals)
+        && v.supports_approvals == d.supports_approvals
+        && v.can_respond_approvals == d.can_respond_approvals
+}
+
+/// The Launchpad's two PR lists, each with whether every feed answered for it.
+///
+/// It used to swallow its failures entirely: no `errors`, so the reload still read as clean and
+/// both lists were cached empty over good rows. The Launchpad is the landing screen, so the
+/// next launch opened on nothing. Its errors now travel with the other sections'.
+async fn fetch_launchpad_prs(
+    deps: &AppDeps,
+    errors: &mut Vec<String>,
+) -> ((Vec<PrRow>, bool), (Vec<PrRow>, bool)) {
     let (mut mine_out, mut review_out) = (Vec::new(), Vec::new());
-    let Some(feeds) = detail_or_none(
-        deps.sections.pull_request_feeds().await,
-        DIAG_LAUNCHPAD_FEEDS,
-    ) else {
-        return (mine_out, review_out);
+    let (mut mine_ok, mut review_ok) = (true, true);
+    let feeds = match deps.sections.pull_request_feeds().await {
+        Ok(feeds) => feeds,
+        Err(e) => {
+            push_reload_error(errors, format!("Launchpad: {e}"), DIAG_LAUNCHPAD_FEEDS);
+            return ((mine_out, false), (review_out, false));
+        }
     };
     for feed in feeds {
         let (provider, name, conn_id) = feed_tag(&feed.connection);
         let mine_q = PullRequestQuery { filter: PullRequestFilter::Mine, include_completed: true, limit: Some(50), decorate: true };
-        if let Some(list) = detail_or_none(feed.source.list(&mine_q).await, DIAG_LAUNCHPAD_MINE) {
-            mine_out.extend(list.into_iter().map(|pr| PrRow { connection_id: conn_id.clone(), connection: name.clone(), provider, pr }));
+        match feed.source.list(&mine_q).await {
+            Ok(list) => mine_out.extend(list.into_iter().map(|pr| PrRow { connection_id: conn_id.clone(), connection: name.clone(), provider, pr })),
+            Err(e) => {
+                mine_ok = false;
+                push_reload_error(errors, format!("My PRs ({name}): {e}"), DIAG_LAUNCHPAD_MINE);
+            }
         }
-        if let Some(list) = detail_or_none(
-            feed.source
-                .list(&pr_query(PullRequestFilter::ReviewRequested))
-                .await,
-            DIAG_LAUNCHPAD_REVIEW,
-        ) {
-            review_out.extend(list.into_iter().map(|pr| PrRow { connection_id: conn_id.clone(), connection: name.clone(), provider, pr }));
+        match feed.source.list(&pr_query(PullRequestFilter::ReviewRequested)).await {
+            Ok(list) => review_out.extend(list.into_iter().map(|pr| PrRow { connection_id: conn_id.clone(), connection: name.clone(), provider, pr })),
+            Err(e) => {
+                review_ok = false;
+                push_reload_error(errors, format!("Review requests ({name}): {e}"), DIAG_LAUNCHPAD_REVIEW);
+            }
         }
     }
-    (mine_out, review_out)
+    ((mine_out, mine_ok), (review_out, review_ok))
 }
 
 /// The PR-notification scan, firing pings for newly-seen review requests / vote changes
 /// and returning the fresh seen-sets. Mirrors the inline logic but takes a snapshot so
-/// it can run off the render loop.
-async fn scan_pr_notifications(deps: &AppDeps, p: &ReloadParams) -> Option<PrScan> {
+/// it can run off the render loop. `review` is this reload's review-requested list, fetched
+/// once in [`App::fetch_all`] and shared with the Launchpad.
+async fn scan_pr_notifications(deps: &AppDeps, p: &ReloadParams, review: &[PrRow]) -> Option<PrScan> {
     let want_review = p.notifications.review_requested;
     let want_votes = p.notifications.pr_approved || p.notifications.pr_changes_requested;
     if !want_review && !want_votes {
@@ -4588,19 +5387,14 @@ async fn scan_pr_notifications(deps: &AppDeps, p: &ReloadParams) -> Option<PrSca
     for feed in &feeds {
         let conn = feed.connection.connection_id().to_string();
         if want_review {
-            if let Some(review) = detail_or_none(
-                feed.source
-                    .list(&pr_query(PullRequestFilter::ReviewRequested))
-                    .await,
-                DIAG_NOTIFICATION_SCAN_REVIEW,
-            ) {
-                for pr in &review {
-                    let key = (conn.clone(), pr.id.clone());
-                    if seeded && !p.review_seen.contains(&key) {
-                        p.notifier.notify("Review requested", &pr_label(pr));
-                    }
-                    review_now.insert(key);
+            // `review` is the review-requested list `fetch_all` already fetched for the
+            // Launchpad. This used to issue that identical query a second time.
+            for row in review.iter().filter(|row| row.connection_id == conn) {
+                let key = (conn.clone(), row.pr.id.clone());
+                if seeded && !p.review_seen.contains(&key) {
+                    p.notifier.notify("Review requested", &pr_label(&row.pr));
                 }
+                review_now.insert(key);
             }
         }
         if want_votes {
@@ -4734,7 +5528,19 @@ mod tests {
             sections: Arc::new(SectionService::new(config.clone(), resolver.clone())),
             health: Arc::new(ConnectionHealthService::new(config.clone(), resolver)),
             config,
+            // Never the user's real cache file: a test run must not read or rewrite it.
+            cache: Arc::new(CacheStore::disabled()),
         }
+    }
+
+    /// A live store that still never touches the disk — `get`/`put` work purely in memory, and
+    /// only `load`/`flush` (which these tests don't call) would open the path.
+    fn memory_cache() -> Arc<CacheStore> {
+        Arc::new(CacheStore::new(std::env::temp_dir().join("forgetop-tui-tests-never-written.json")))
+    }
+
+    fn deps_with_cache(cache: Arc<CacheStore>) -> AppDeps {
+        AppDeps { cache, ..test_deps() }
     }
 
     #[test]
@@ -4808,6 +5614,7 @@ mod tests {
         app.apply_reloaded_with_logger(
             Reloaded {
                 prs: Vec::new(),
+                prs_key: prs_cache_key(PullRequestFilter::All, false),
                 wis: Vec::new(),
                 pipes: Vec::new(),
                 inbox: Vec::new(),
@@ -4818,7 +5625,10 @@ mod tests {
                 open_pipeline: None,
                 errors: vec![private_error.into()],
                 catalog: None,
+                sections_ok: SectionsOk::complete(),
+                requested_at: Utc::now(),
             },
+            &test_deps(),
             |context, message| refresh_logs.push((context.to_owned(), message.to_owned())),
         );
         assert!(
@@ -4965,11 +5775,37 @@ mod tests {
         }
     }
 
+    fn notif_row(id: &str) -> NotifRow {
+        NotifRow {
+            connection_id: "c".into(),
+            connection: "GitHub".into(),
+            provider: ProviderType::GitHub,
+            notification: Notification {
+                repository: None,
+                id: id.into(),
+                kind: NotificationKind::Mention,
+                item_type: NotificationItemType::WorkItem,
+                item_id: None,
+                title: "t".into(),
+                context: "c".into(),
+                url: None,
+                unread: true,
+                updated_at: None,
+            },
+        }
+    }
+
+    /// A reload carrying just the PR list, keyed as the live fetch would have keyed it.
+    fn reloaded(prs: Vec<PrRow>) -> Reloaded {
+        Reloaded { prs, ..reloaded_with_health(Vec::new()) }
+    }
+
     /// An otherwise-empty reload carrying just the connection health, which is the
     /// signal the waiting card and the first-run hint both key off.
     fn reloaded_with_health(health: Vec<ConnectionHealth>) -> Reloaded {
         Reloaded {
             prs: Vec::new(),
+            prs_key: prs_cache_key(PullRequestFilter::All, false),
             wis: Vec::new(),
             pipes: Vec::new(),
             inbox: Vec::new(),
@@ -4980,6 +5816,8 @@ mod tests {
             open_pipeline: None,
             errors: Vec::new(),
             catalog: None,
+            sections_ok: SectionsOk::complete(),
+            requested_at: Utc::now(),
         }
     }
 
@@ -4996,18 +5834,19 @@ mod tests {
 
     #[test]
     fn a_fetch_that_carried_discovery_replaces_the_catalog() {
+        let deps = test_deps();
         let mut app = App::new("slate");
         let mut catalog = HashMap::new();
         catalog.insert("gh-1".into(), RepositoryPage::default());
 
         let mut r = reloaded_with_health(Vec::new());
         r.catalog = Some(catalog);
-        app.apply_reloaded(r);
+        app.apply_reloaded(r, &deps);
         assert_eq!(app.repo_catalog.len(), 1, "discovery from the background fetch must land");
 
         // A later poll carries no catalog; that must leave the existing one alone rather
         // than wiping the scope indicator's denominator.
-        app.apply_reloaded(reloaded_with_health(Vec::new()));
+        app.apply_reloaded(reloaded_with_health(Vec::new()), &deps);
         assert_eq!(app.repo_catalog.len(), 1, "a catalog-less refresh must not clear it");
     }
 
@@ -5075,15 +5914,16 @@ mod tests {
 
     #[tokio::test]
     async fn waiting_state_clears_once_a_connection_lands() {
+        let deps = test_deps();
         let mut app = App::new("slate");
         app.awaiting_browser_setup = true;
 
         // A reload that still finds nothing configured must keep waiting, or the card
         // would vanish the moment the periodic tick fired and leave a blank screen.
-        app.apply_reloaded(reloaded_with_health(Vec::new()));
+        app.apply_reloaded(reloaded_with_health(Vec::new()), &deps);
         assert!(app.awaiting_browser_setup, "an empty reload must not clear the waiting state");
 
-        app.apply_reloaded(reloaded_with_health(vec![health("gh-1")]));
+        app.apply_reloaded(reloaded_with_health(vec![health("gh-1")]), &deps);
         assert!(!app.awaiting_browser_setup, "a connection landing must clear it");
         assert!(app.toast.as_deref().unwrap_or_default().contains("all set"));
     }
@@ -5287,23 +6127,250 @@ mod tests {
         let mut app = App::new("slate");
         app.reloading = true;
         app.loading = true;
-        app.apply_reloaded(Reloaded {
-            prs: vec![pr_row(pr(None)), pr_row(pr(None))],
-            wis: vec![wi_row(wi(None))],
-            pipes: vec![],
-            inbox: vec![],
-            lp_prs_mine: vec![],
-            lp_prs_review: vec![],
-            health: vec![],
-            scan: None,
-            catalog: None,
-            open_pipeline: None,
-            errors: vec![],
-        });
+        app.apply_reloaded(
+            Reloaded {
+                prs: vec![pr_row(pr(None)), pr_row(pr(None))],
+                prs_key: prs_cache_key(PullRequestFilter::All, false),
+                wis: vec![wi_row(wi(None))],
+                pipes: vec![],
+                inbox: vec![],
+                lp_prs_mine: vec![],
+                lp_prs_review: vec![],
+                health: vec![],
+                scan: None,
+                catalog: None,
+                open_pipeline: None,
+                errors: vec![],
+                sections_ok: SectionsOk::complete(),
+                requested_at: Utc::now(),
+            },
+            &test_deps(),
+        );
         assert_eq!(app.prs.len(), 2);
         assert_eq!(app.wis.len(), 1);
         assert!(!app.reloading && !app.loading, "refresh flags cleared");
         assert!(app.status.contains("2 PRs") && app.status.contains("1 work items"), "status summarises");
+    }
+
+    /// A provider outage doesn't fail its section — it returns an empty list and an error — so
+    /// writing that empty list through would wipe the good rows and open the app blank next time.
+    #[test]
+    fn an_errored_reload_never_caches_an_empty_list_over_good_rows() {
+        let cache = memory_cache();
+        let deps = deps_with_cache(cache.clone());
+        let key = prs_cache_key(PullRequestFilter::All, false);
+        let first = Utc::now();
+        let mut app = App::new("slate");
+
+        app.prs = vec![pr_row(pr(None))];
+        app.write_through(&deps, &key, first, SectionsOk::complete());
+        assert_eq!(cache.get::<Vec<PrRow>>(&key).expect("cached").value.len(), 1);
+
+        // Empty *with* an error: the rows already cached must survive it.
+        app.prs = Vec::new();
+        let failed = SectionsOk { prs: false, ..SectionsOk::complete() };
+        app.write_through(&deps, &key, first + chrono::TimeDelta::seconds(30), failed);
+        assert_eq!(cache.get::<Vec<PrRow>>(&key).expect("still cached").value.len(), 1, "an outage must not wipe the cache");
+
+        // Empty with no errors is a genuine "you have none", and does replace them.
+        app.write_through(&deps, &key, first + chrono::TimeDelta::seconds(60), SectionsOk::complete());
+        assert!(cache.get::<Vec<PrRow>>(&key).expect("cached").value.is_empty(), "a clean empty reload is cacheable");
+    }
+
+    /// The failure the old whole-list guard let through: three connections, one down. The PR
+    /// list still arrives non-empty, so `!prs.is_empty()` passed and a two-connection list was
+    /// written over the cached three-connection one, losing the third's rows until it recovered.
+    #[test]
+    fn a_partial_section_never_overwrites_a_complete_cached_one() {
+        let cache = memory_cache();
+        let deps = deps_with_cache(cache.clone());
+        let key = prs_cache_key(PullRequestFilter::All, false);
+        let first = Utc::now();
+        let mut app = App::new("slate");
+
+        app.prs = vec![pr_row(pr(None)), pr_row(pr(None)), pr_row(pr(None))];
+        app.write_through(&deps, &key, first, SectionsOk::complete());
+
+        // One connection 500s: fewer rows, still rows. That must not be cached.
+        app.prs = vec![pr_row(pr(None)), pr_row(pr(None))];
+        app.wis = vec![wi_row(wi(None))];
+        app.write_through(
+            &deps,
+            &key,
+            first + chrono::TimeDelta::seconds(30),
+            SectionsOk { prs: false, ..SectionsOk::complete() },
+        );
+
+        assert_eq!(
+            cache.get::<Vec<PrRow>>(&key).expect("still cached").value.len(),
+            3,
+            "a short list must leave the complete cached one alone"
+        );
+        // One section's outage says nothing about the others, which still cache.
+        assert_eq!(
+            cache.get::<Vec<WiRow>>(CACHE_KEY_WORK_ITEMS).expect("work items cached").value.len(),
+            1,
+            "a PR outage must not stop a complete work-item list being cached"
+        );
+    }
+
+    /// Defect found in review: `fetch_launchpad_prs` swallowed every failure, so a Launchpad
+    /// outage looked like a clean fetch and cached two empty lists over the landing screen's
+    /// rows. The flags it now returns are what keep those rows.
+    #[test]
+    fn a_failed_launchpad_fetch_never_caches_empties_over_good_rows() {
+        let cache = memory_cache();
+        let deps = deps_with_cache(cache.clone());
+        let first = Utc::now();
+        let mut app = App::new("slate");
+        let key = prs_cache_key(PullRequestFilter::All, false);
+
+        app.lp_prs_mine = vec![pr_row(pr(None))];
+        app.lp_prs_review = vec![pr_row(pr(None))];
+        app.write_through(&deps, &key, first, SectionsOk::complete());
+
+        // Both Launchpad queries failed: empty lists, and now flags that say so.
+        app.lp_prs_mine = Vec::new();
+        app.lp_prs_review = Vec::new();
+        app.write_through(
+            &deps,
+            &key,
+            first + chrono::TimeDelta::seconds(30),
+            SectionsOk { lp_mine: false, lp_review: false, ..SectionsOk::complete() },
+        );
+
+        assert_eq!(
+            cache.get::<Vec<PrRow>>(CACHE_KEY_LAUNCHPAD_MINE).expect("still cached").value.len(),
+            1,
+            "a Launchpad outage must not open the landing screen empty next launch"
+        );
+        assert_eq!(
+            cache.get::<Vec<PrRow>>(CACHE_KEY_LAUNCHPAD_REVIEW).expect("still cached").value.len(),
+            1
+        );
+    }
+
+    /// The store refuses a write that isn't newer than what it holds, which only orders two
+    /// reloads if the timestamp says when each was *asked for*. Stamped on arrival, the slow
+    /// reload — the one that knows least — always looked freshest and always won.
+    #[test]
+    fn a_reload_caches_under_its_request_time_not_its_arrival_time() {
+        let cache = memory_cache();
+        let deps = deps_with_cache(cache.clone());
+        let key = prs_cache_key(PullRequestFilter::All, false);
+        let mut app = App::new("slate");
+
+        // Sent first, lands second: its rows must not displace the later request's.
+        let mut slow = reloaded(vec![pr_row(pr(None))]);
+        slow.requested_at = Utc::now() - chrono::TimeDelta::seconds(30);
+        let fast = reloaded(vec![pr_row(pr(None)), pr_row(pr(None))]);
+        let fast_at = fast.requested_at;
+
+        app.apply_reloaded(fast, &deps);
+        app.apply_reloaded(slow, &deps);
+
+        let cached = cache.get::<Vec<PrRow>>(&key).expect("cached");
+        assert_eq!(cached.fetched_at, fast_at, "the later-requested reload owns the entry");
+        assert_eq!(cached.value.len(), 2, "a late answer to an older request must not win");
+    }
+
+    #[test]
+    fn one_reload_caches_every_section_under_a_single_timestamp() {
+        let cache = memory_cache();
+        let deps = deps_with_cache(cache.clone());
+        let mut app = App::new("slate");
+        app.data_age = Some(Utc::now() - chrono::TimeDelta::hours(2));
+
+        app.apply_reloaded(reloaded(vec![pr_row(pr(None))]), &deps);
+
+        let prs = cache.get::<Vec<PrRow>>(&prs_cache_key(PullRequestFilter::All, false)).expect("PRs cached");
+        let wis = cache.get::<Vec<WiRow>>(CACHE_KEY_WORK_ITEMS).expect("work items cached");
+        assert_eq!(prs.value.len(), 1);
+        assert_eq!(prs.fetched_at, wis.fetched_at, "one reload's sections share a fetched_at");
+        assert!(app.data_age.is_none(), "live data stops the header reporting a cached age");
+    }
+
+    /// Defect found in review: the *cache* was protected from a failed section by its flag, the
+    /// *screen* wasn't. A total outage on the first refresh after launch therefore replaced the
+    /// cache-seeded lists with empty live ones and dropped the "showing Nm old" footer with them.
+    #[test]
+    fn a_wholly_failed_reload_keeps_the_seeded_rows_and_their_age() {
+        let cache = memory_cache();
+        let deps = deps_with_cache(cache.clone());
+        let seeded = Utc::now() - chrono::TimeDelta::minutes(20);
+        cache.put(&prs_cache_key(PullRequestFilter::All, false), &[pr_row(pr(None))], seeded);
+        cache.put(CACHE_KEY_WORK_ITEMS, &[wi_row(wi(None))], seeded);
+
+        let mut app = App::new("slate");
+        app.seed_from_cache(&deps);
+        assert_eq!(app.prs.len(), 1, "sanity: seeded before any fetch");
+        assert_eq!(app.data_age, Some(seeded));
+        app.inbox = vec![notif_row("a"), notif_row("b")];
+        app.inbox_sel = 1;
+
+        // Every feed is down: each section comes back empty, and says so.
+        let mut r = reloaded(Vec::new());
+        r.sections_ok =
+            SectionsOk { prs: false, wis: false, pipes: false, inbox: false, lp_mine: false, lp_review: false };
+        app.apply_reloaded(r, &deps);
+
+        assert_eq!(app.prs.len(), 1, "an outage must not blank what the cache seeded");
+        assert_eq!(app.wis.len(), 1);
+        assert_eq!(app.inbox.len(), 2, "the inbox is kept too");
+        assert_eq!(app.inbox_sel, 1, "and the selection still points into the list that stayed");
+        assert_eq!(app.data_age, Some(seeded), "rows are still cached, so the footer keeps saying so");
+    }
+
+    /// The three-way rule, on the two cases the outage test doesn't cover: a failed section that
+    /// still returned rows is partial *live* data (and the error is in the status line), so it is
+    /// taken; a section that answered is always taken, empty included.
+    #[test]
+    fn a_short_live_section_is_taken_but_only_a_clean_reload_clears_the_age() {
+        let deps = deps_with_cache(memory_cache());
+        let mut app = App::new("slate");
+        app.prs = vec![pr_row(pr(None)), pr_row(pr(None)), pr_row(pr(None))];
+        app.data_age = Some(Utc::now() - chrono::TimeDelta::hours(1));
+
+        // One connection of three is down: fewer rows, still rows.
+        let mut partial = reloaded(vec![pr_row(pr(None))]);
+        partial.sections_ok = SectionsOk { prs: false, ..SectionsOk::complete() };
+        app.apply_reloaded(partial, &deps);
+        assert_eq!(app.prs.len(), 1, "partial live rows beat stale ones on screen");
+        assert!(app.data_age.is_some(), "but one section short still means the age is real");
+
+        // Everything answers, and answers empty: that is authoritative.
+        app.apply_reloaded(reloaded(Vec::new()), &deps);
+        assert!(app.prs.is_empty(), "an answered empty section does clear the list");
+        assert!(app.data_age.is_none(), "nothing on screen is cached any more");
+    }
+
+    #[test]
+    fn seeding_paints_cached_rows_and_reports_the_most_stale_section() {
+        let cache = memory_cache();
+        let deps = deps_with_cache(cache.clone());
+        let newest = Utc::now();
+        let oldest = newest - chrono::TimeDelta::hours(6);
+        cache.put(&prs_cache_key(PullRequestFilter::All, false), &[pr_row(pr(None))], newest);
+        cache.put(CACHE_KEY_WORK_ITEMS, &[wi_row(wi(None))], oldest);
+
+        let mut app = App::new("slate");
+        app.seed_from_cache(&deps);
+
+        assert_eq!(app.prs.len(), 1, "the PR list is painted before any fetch");
+        assert_eq!(app.wis.len(), 1);
+        assert!(app.pipes.is_empty(), "a miss leaves its section empty");
+        assert_eq!(app.data_age, Some(oldest), "the age shown is the most stale section's, not the freshest");
+    }
+
+    #[test]
+    fn a_disabled_cache_seeds_nothing_and_claims_no_age() {
+        let deps = test_deps();
+        let mut app = App::new("slate");
+
+        app.seed_from_cache(&deps);
+
+        assert!(app.prs.is_empty() && app.wis.is_empty() && app.inbox.is_empty());
+        assert!(app.data_age.is_none(), "nothing was painted, so nothing is stale");
     }
 
     #[test]
@@ -5490,6 +6557,43 @@ mod tests {
         app.on_pipeline_logs_key(Key::Escape);
         let Screen::Pipeline(v) = &app.screen else { panic!() };
         assert!(v.logs.is_none(), "Esc closes the log pane");
+    }
+
+    /// A gate check that failed must leave the gates alone. Collapsing it to an empty list would
+    /// drop a gate the user still has to approve, and the picker would then say there is nothing
+    /// awaiting them on a run that is blocked.
+    #[test]
+    fn a_failed_gate_check_on_the_periodic_reload_keeps_the_gates() {
+        let mut app = App::new("slate");
+        let mut view = PipelineView::new("CI".into(), failed_run(), "c".into(), ProviderType::GitHub, "ci".into(), None);
+        view.supports_approvals = true;
+        view.approvals = vec![PipelineApproval { id: "prod".into(), name: "production".into(), can_respond: true }];
+        app.screen = Screen::Pipeline(Box::new(view));
+
+        let mut r = reloaded_with_health(Vec::new());
+        r.open_pipeline = Some(("r1".into(), failed_run(), None)); // the gate check failed
+        app.apply_reloaded(r, &test_deps());
+
+        let Screen::Pipeline(v) = &app.screen else { panic!("still on the pipeline view") };
+        assert_eq!(v.approvals.len(), 1, "an unanswered gate check never clears a known gate");
+    }
+
+    /// The periodic reload refreshes an open pipeline through `open_pipeline`, not through the
+    /// detail fetch. It is still a live answer, so it has to clear staleness too — otherwise a
+    /// view whose own detail fetch failed once keeps flagging an unconfirmed status forever.
+    #[test]
+    fn the_periodic_reload_confirms_a_cache_seeded_pipeline() {
+        let mut app = App::new("slate");
+        let mut view = PipelineView::new("CI".into(), failed_run(), "c".into(), ProviderType::GitHub, "ci".into(), None);
+        view.stale = true;
+        app.screen = Screen::Pipeline(Box::new(view));
+
+        let mut r = reloaded_with_health(Vec::new());
+        r.open_pipeline = Some(("r1".into(), failed_run(), Some(Vec::new())));
+        app.apply_reloaded(r, &test_deps());
+
+        let Screen::Pipeline(v) = &app.screen else { panic!("still on the pipeline view") };
+        assert!(!v.stale, "a run off the wire confirms the view, whichever path fetched it");
     }
 
     #[test]
@@ -6076,6 +7180,924 @@ mod tests {
         assert_eq!(v.diff.files[0].path, "a.rs", "whole-PR files restored");
         assert_eq!(v.diff.selected, 0);
         assert_eq!(v.diff.focus, DiffFocus::FileList);
+    }
+
+    #[test]
+    fn pr_detail_cache_key_distinguishes_the_same_id_in_different_repos() {
+        // A connection's credentials reach every repository it can see, so on a connection
+        // spanning several, `#7` alone names more than one pull request — the key must too.
+        let a = pr_detail_cache_key("c", &ItemRef::in_repo("acme/pay", "7"));
+        let b = pr_detail_cache_key("c", &ItemRef::in_repo("acme/other", "7"));
+        assert_ne!(a, b, "same connection and id, different repo, must not collide");
+    }
+
+    fn commit(sha: &str) -> Commit {
+        Commit { sha: sha.into(), message: "m".into(), author: "a".into(), date: None, url: None }
+    }
+
+    /// A detail fetch in which all four calls answered — what the provider returns on a good day.
+    fn all_answered(d: PrDetail) -> Box<PrDetailFetch> {
+        Box::new(PrDetailFetch {
+            threads: Some(d.threads),
+            files: Some(d.files),
+            checks: Some(d.checks),
+            commits: Some(d.commits),
+        })
+    }
+
+    #[test]
+    fn pr_detail_for_a_different_pr_than_the_open_one_is_not_applied() {
+        let deps = deps_with_cache(memory_cache());
+        let mut app = App::new("slate");
+        app.screen = Screen::PrView(Box::new(PrView {
+            label: "PR".into(),
+            connection_id: "c".into(),
+            url: None,
+            pr: pr(None), // id "1"
+            tab: 0,
+            checks: vec![],
+            commits: vec![],
+            commit_sel: 0,
+            pr_files: vec![],
+            scroll: 0,
+            diff: diff(vec![]),
+            pending: vec![],
+            review_draft: None,
+            reply_target: None,
+        }));
+
+        // A detail landing for a different PR (id "2") on the same connection.
+        let other_key = pr_detail_cache_key("c", &ItemRef::new("2"));
+        let detail = PrDetail {
+            threads: vec![],
+            files: vec![changed("x.rs", None)],
+            checks: vec![CheckRun { name: "ci".into(), status: CheckStatus::Failed, url: None }],
+            commits: vec![commit("deadbeef")],
+        };
+        app.on_event(
+            AppEvent::PrDetailLoaded { key: other_key.clone(), detail: all_answered(detail), fetched_at: Utc::now() },
+            &deps,
+        );
+
+        let Screen::PrView(v) = &app.screen else { panic!("expected PrView") };
+        assert!(v.checks.is_empty(), "detail for a different PR must not land on this view");
+        assert!(v.pr_files.is_empty());
+        // It is still good data — just not for what's on screen — so it must be write-through cached.
+        assert!(deps.cache.get::<PrDetail>(&other_key).is_some(), "still written through to the cache");
+    }
+
+    #[test]
+    fn fresh_pr_detail_preserves_user_state_while_patching_the_data() {
+        let deps = deps_with_cache(memory_cache());
+        let mut app = App::new("slate");
+        let p = pr(None); // id "1", repository None
+        let key = pr_detail_cache_key("c", &p.item_ref());
+        let mut d = diff(vec![changed("a.rs", Some("@@ -1 +1 @@\n-x\n+y"))]);
+        d.scroll = 4;
+        d.cursor = 1;
+        d.focus = DiffFocus::Patch;
+        app.screen = Screen::PrView(Box::new(PrView {
+            label: "PR".into(),
+            connection_id: "c".into(),
+            url: None,
+            pr: p,
+            tab: 3,
+            checks: vec![],
+            commits: vec![],
+            commit_sel: 0,
+            pr_files: vec![changed("a.rs", None)],
+            scroll: 7,
+            diff: d,
+            pending: vec![LineComment { path: "a.rs".into(), line: 3, side: DiffSide::New, body: "wip".into() }],
+            review_draft: Some(DraftComment { path: "a.rs".into(), line: 3, side: DiffSide::New }),
+            reply_target: Some("t1".into()),
+        }));
+
+        let fresh = PrDetail {
+            threads: vec![],
+            files: vec![changed("a.rs", Some("@@ -1 +1 @@\n-x\n+y")), changed("b.rs", None)],
+            checks: vec![CheckRun { name: "ci".into(), status: CheckStatus::Passed, url: None }],
+            commits: vec![commit("abc123")],
+        };
+        app.on_event(AppEvent::PrDetailLoaded { key, detail: all_answered(fresh), fetched_at: Utc::now() }, &deps);
+
+        let Screen::PrView(v) = &app.screen else { panic!("expected PrView") };
+        assert_eq!(v.scroll, 7, "tab scroll preserved");
+        assert_eq!(v.diff.scroll, 4, "diff scroll preserved");
+        assert_eq!(v.diff.cursor, 1, "diff cursor preserved");
+        assert_eq!(v.diff.focus, DiffFocus::Patch, "diff focus preserved");
+        assert_eq!(v.pending.len(), 1, "buffered line comment preserved");
+        assert!(v.review_draft.is_some(), "in-progress draft preserved");
+        assert_eq!(v.reply_target.as_deref(), Some("t1"), "reply target preserved");
+        assert_eq!(v.checks.len(), 1, "fresh checks applied");
+        assert_eq!(v.commits.len(), 1, "fresh commits applied");
+        assert_eq!(v.diff.files.len(), 2, "fresh files applied");
+        assert_eq!(v.pr_files.len(), 2, "fresh files applied to pr_files too");
+    }
+
+    #[test]
+    fn fresh_pr_detail_clamps_selection_when_the_new_lists_are_shorter() {
+        let deps = deps_with_cache(memory_cache());
+        let mut app = App::new("slate");
+        let p = pr(None);
+        let key = pr_detail_cache_key("c", &p.item_ref());
+        let mut d = diff(vec![changed("a.rs", None), changed("b.rs", None), changed("c.rs", None)]);
+        d.selected = 2;
+        app.screen = Screen::PrView(Box::new(PrView {
+            label: "PR".into(),
+            connection_id: "c".into(),
+            url: None,
+            pr: p,
+            tab: 3,
+            checks: vec![],
+            commits: vec![commit("a"), commit("b")],
+            commit_sel: 1,
+            pr_files: vec![changed("a.rs", None), changed("b.rs", None), changed("c.rs", None)],
+            scroll: 0,
+            diff: d,
+            pending: vec![],
+            review_draft: None,
+            reply_target: None,
+        }));
+
+        let fresh = PrDetail {
+            threads: vec![],
+            files: vec![changed("a.rs", None)], // shrank from 3 to 1
+            checks: vec![],
+            commits: vec![commit("a")], // shrank from 2 to 1
+        };
+        app.on_event(AppEvent::PrDetailLoaded { key, detail: all_answered(fresh), fetched_at: Utc::now() }, &deps);
+
+        let Screen::PrView(v) = &app.screen else { panic!("expected PrView") };
+        assert_eq!(v.commit_sel, 0, "clamped into the new, shorter commit list");
+        assert_eq!(v.diff.selected, 0, "clamped into the new, shorter file list");
+    }
+
+    fn thread(id: &str) -> CommentThread {
+        CommentThread { id: id.into(), comments: vec![], file_path: Some("a.rs".into()), line: Some(21), is_resolved: false }
+    }
+
+    fn check(name: &str, status: CheckStatus) -> CheckRun {
+        CheckRun { name: name.into(), status, url: None }
+    }
+
+    /// A PR view painted from a detail, the way `open_pr_view_for` paints one from the cache.
+    fn pr_view_showing(p: PullRequest, d: &PrDetail) -> Screen {
+        let mut dv = diff(d.files.clone());
+        dv.threads = d.threads.clone();
+        Screen::PrView(Box::new(PrView {
+            label: "PR".into(),
+            connection_id: "c".into(),
+            url: None,
+            pr: p,
+            tab: 0,
+            checks: d.checks.clone(),
+            commits: d.commits.clone(),
+            commit_sel: 0,
+            pr_files: d.files.clone(),
+            scroll: 0,
+            diff: dv,
+            pending: vec![],
+            review_draft: None,
+            reply_target: None,
+        }))
+    }
+
+    /// A detail as it was last known: two files, a thread, a check and a commit.
+    fn known_detail() -> PrDetail {
+        PrDetail {
+            threads: vec![thread("t1")],
+            files: vec![changed("a.rs", None), changed("b.rs", None)],
+            checks: vec![check("ci", CheckStatus::Passed)],
+            commits: vec![commit("abc123")],
+        }
+    }
+
+    /// The review's defect 1: `changes()` and `threads()` 502 while the other two answer. The
+    /// empty vectors that used to stand in for those failures blanked the open view mid-read and
+    /// overwrote the cached entry, so re-opening the PR showed nothing either.
+    #[test]
+    fn a_partly_failed_detail_fetch_keeps_what_was_already_known() {
+        let cache = memory_cache();
+        let deps = deps_with_cache(cache.clone());
+        let p = pr(None);
+        let key = pr_detail_cache_key("c", &p.item_ref());
+        let seeded = Utc::now() - chrono::TimeDelta::seconds(30);
+        cache.put(&key, &known_detail(), seeded);
+
+        let mut app = App::new("slate");
+        app.screen = pr_view_showing(p, &known_detail());
+
+        // threads() and changes() failed; checks() and commits() answered.
+        app.on_event(
+            AppEvent::PrDetailLoaded {
+                key: key.clone(),
+                detail: Box::new(PrDetailFetch {
+                    threads: None,
+                    files: None,
+                    checks: Some(vec![check("ci", CheckStatus::Failed)]),
+                    commits: Some(vec![commit("abc123"), commit("def456")]),
+                }),
+                fetched_at: Utc::now(),
+            },
+            &deps,
+        );
+
+        let Screen::PrView(v) = &app.screen else { panic!("expected PrView") };
+        assert_eq!(v.pr_files.len(), 2, "a failed changes() must not blank the file list");
+        assert_eq!(v.diff.files.len(), 2);
+        assert_eq!(v.diff.threads.len(), 1, "a failed threads() must not blank the conversation");
+        assert_eq!(v.checks[0].status, CheckStatus::Failed, "the calls that answered are applied");
+        assert_eq!(v.commits.len(), 2);
+
+        let cached = cache.get::<PrDetail>(&key).expect("still cached");
+        assert_eq!(cached.value.files.len(), 2, "the cached files survive the failed call");
+        assert_eq!(cached.value.threads.len(), 1);
+        assert_eq!(cached.value.checks[0].status, CheckStatus::Failed, "the fresh fields are cached");
+        assert_eq!(cached.value.commits.len(), 2);
+    }
+
+    /// A fetch that achieved nothing must be a no-op — not four empty lists written over a good
+    /// entry. Nothing is learned, so there is nothing to write and nothing to repaint.
+    #[test]
+    fn a_wholly_failed_detail_fetch_writes_nothing_and_touches_no_view() {
+        let cache = memory_cache();
+        let deps = deps_with_cache(cache.clone());
+        let p = pr(None);
+        let key = pr_detail_cache_key("c", &p.item_ref());
+        let seeded = Utc::now() - chrono::TimeDelta::seconds(30);
+        cache.put(&key, &known_detail(), seeded);
+
+        let mut app = App::new("slate");
+        app.screen = pr_view_showing(p, &known_detail());
+
+        app.on_event(
+            AppEvent::PrDetailLoaded {
+                key: key.clone(),
+                detail: Box::new(PrDetailFetch::default()),
+                fetched_at: Utc::now(),
+            },
+            &deps,
+        );
+
+        let Screen::PrView(v) = &app.screen else { panic!("expected PrView") };
+        assert_eq!(v.pr_files.len(), 2, "the view is left exactly as it was");
+        assert_eq!(v.diff.threads.len(), 1);
+        assert_eq!(v.checks.len(), 1);
+        assert_eq!(v.commits.len(), 1);
+
+        let cached = cache.get::<PrDetail>(&key).expect("still cached");
+        assert_eq!(cached.fetched_at, seeded, "a total failure must not even restamp the entry");
+        assert_eq!(cached.value.files.len(), 2);
+    }
+
+    /// The other half of the distinction: an *answered* empty list is authoritative — the PR
+    /// really has no checks now — and must clear both the view and the cache.
+    #[test]
+    fn an_answered_empty_detail_section_does_clear_the_previous_one() {
+        let cache = memory_cache();
+        let deps = deps_with_cache(cache.clone());
+        let p = pr(None);
+        let key = pr_detail_cache_key("c", &p.item_ref());
+        cache.put(&key, &known_detail(), Utc::now() - chrono::TimeDelta::seconds(30));
+
+        let mut app = App::new("slate");
+        app.screen = pr_view_showing(p, &known_detail());
+
+        app.on_event(
+            AppEvent::PrDetailLoaded {
+                key: key.clone(),
+                detail: Box::new(PrDetailFetch { checks: Some(Vec::new()), ..PrDetailFetch::default() }),
+                fetched_at: Utc::now(),
+            },
+            &deps,
+        );
+
+        let Screen::PrView(v) = &app.screen else { panic!("expected PrView") };
+        assert!(v.checks.is_empty(), "the provider says there are none, so there are none");
+        assert_eq!(v.pr_files.len(), 2, "the sections that weren't fetched are untouched");
+
+        let cached = cache.get::<PrDetail>(&key).expect("cached");
+        assert!(cached.value.checks.is_empty());
+        assert_eq!(cached.value.files.len(), 2);
+    }
+
+    /// The store refuses a write it already has something newer than. Carrying on and painting
+    /// the older merge anyway left the screen behind the cache — the same out-of-order landing
+    /// the recency guard exists to stop, just on screen instead of on disk.
+    #[test]
+    fn a_put_the_store_refused_as_stale_never_repaints_the_view() {
+        let cache = memory_cache();
+        let deps = deps_with_cache(cache.clone());
+        let p = pr(None);
+        let key = pr_detail_cache_key("c", &p.item_ref());
+        let newer = Utc::now();
+        cache.put(&key, &known_detail(), newer);
+
+        let mut app = App::new("slate");
+        app.screen = pr_view_showing(p, &known_detail());
+
+        // Asked for before the entry the store holds, so it lands knowing less.
+        app.on_event(
+            AppEvent::PrDetailLoaded {
+                key: key.clone(),
+                detail: Box::new(PrDetailFetch {
+                    checks: Some(vec![check("ci", CheckStatus::Failed)]),
+                    ..PrDetailFetch::default()
+                }),
+                fetched_at: newer - chrono::TimeDelta::seconds(30),
+            },
+            &deps,
+        );
+
+        let Screen::PrView(v) = &app.screen else { panic!("expected PrView") };
+        assert_eq!(v.checks[0].status, CheckStatus::Passed, "the refused write must not reach the screen either");
+        let cached = cache.get::<PrDetail>(&key).expect("cached");
+        assert_eq!(cached.fetched_at, newer, "and the store keeps what it had");
+    }
+
+    /// A disabled store (`--demo`, and every test) stores nothing, but that is not a refusal:
+    /// early-returning on it would mean the view never updated at all.
+    #[test]
+    fn a_disabled_store_still_repaints_the_view() {
+        let deps = test_deps(); // cache is `CacheStore::disabled()`
+        let p = pr(None);
+        let key = pr_detail_cache_key("c", &p.item_ref());
+
+        let mut app = App::new("slate");
+        app.screen = pr_view_showing(p, &known_detail());
+
+        app.on_event(
+            AppEvent::PrDetailLoaded {
+                key,
+                detail: Box::new(PrDetailFetch {
+                    checks: Some(vec![check("ci", CheckStatus::Failed)]),
+                    ..PrDetailFetch::default()
+                }),
+                fetched_at: Utc::now(),
+            },
+            &deps,
+        );
+
+        let Screen::PrView(v) = &app.screen else { panic!("expected PrView") };
+        assert_eq!(v.checks[0].status, CheckStatus::Failed, "demo and tests must still paint what landed");
+    }
+
+    /// The merge reads the cache, not the screen, so a detail that lands after the user has
+    /// navigated away caches the same value it would have cached with the view still open.
+    #[test]
+    fn a_detail_landing_with_no_view_open_still_merges_against_the_cache() {
+        let cache = memory_cache();
+        let deps = deps_with_cache(cache.clone());
+        let p = pr(None);
+        let key = pr_detail_cache_key("c", &p.item_ref());
+        cache.put(&key, &known_detail(), Utc::now() - chrono::TimeDelta::seconds(30));
+
+        let mut app = App::new("slate"); // no PR view open
+
+        app.on_event(
+            AppEvent::PrDetailLoaded {
+                key: key.clone(),
+                detail: Box::new(PrDetailFetch {
+                    commits: Some(vec![commit("zzz999")]),
+                    ..PrDetailFetch::default()
+                }),
+                fetched_at: Utc::now(),
+            },
+            &deps,
+        );
+
+        let cached = cache.get::<PrDetail>(&key).expect("cached");
+        assert_eq!(cached.value.commits[0].sha, "zzz999", "the answered call is stored");
+        assert_eq!(cached.value.files.len(), 2, "the unanswered ones keep their cached values");
+        assert_eq!(cached.value.threads.len(), 1);
+    }
+
+    // ---- work-item detail caching ----
+
+    #[test]
+    fn wi_detail_cache_key_distinguishes_the_same_id_in_different_repos() {
+        let a = wi_detail_cache_key("c", &ItemRef::in_repo("acme/pay", "7"));
+        let b = wi_detail_cache_key("c", &ItemRef::in_repo("acme/other", "7"));
+        assert_ne!(a, b, "same connection and id, different repo, must not collide");
+    }
+
+    #[test]
+    fn wi_detail_for_a_different_item_than_the_open_one_is_not_applied() {
+        let deps = deps_with_cache(memory_cache());
+        let mut app = App::new("slate");
+        app.screen = Screen::WiView(Box::new(WiView {
+            connection_id: "c".into(),
+            wi: wi(None), // id "w"
+            threads: vec![],
+            scroll: 0,
+        }));
+
+        let other_key = wi_detail_cache_key("c", &ItemRef::new("other"));
+        app.on_event(
+            AppEvent::WiDetailLoaded {
+                key: other_key.clone(),
+                detail: Box::new(WiDetailFetch { threads: Some(vec![thread("t1")]) }),
+                fetched_at: Utc::now(),
+            },
+            &deps,
+        );
+
+        let Screen::WiView(v) = &app.screen else { panic!("expected WiView") };
+        assert!(v.threads.is_empty(), "detail for a different item must not land on this view");
+        // It is still good data — just not for what's on screen — so it must be write-through cached.
+        assert!(deps.cache.get::<WiDetail>(&other_key).is_some(), "still written through to the cache");
+    }
+
+    #[test]
+    fn a_wholly_failed_wi_detail_fetch_writes_nothing_and_touches_no_view() {
+        let cache = memory_cache();
+        let deps = deps_with_cache(cache.clone());
+        let w = wi(None);
+        let key = wi_detail_cache_key("c", &w.item_ref());
+        let seeded = Utc::now() - chrono::TimeDelta::seconds(30);
+        cache.put(&key, &WiDetail { threads: vec![thread("t1")] }, seeded);
+
+        let mut app = App::new("slate");
+        app.screen =
+            Screen::WiView(Box::new(WiView { connection_id: "c".into(), wi: w, threads: vec![thread("t1")], scroll: 5 }));
+
+        app.on_event(
+            AppEvent::WiDetailLoaded { key: key.clone(), detail: Box::new(WiDetailFetch::default()), fetched_at: Utc::now() },
+            &deps,
+        );
+
+        let Screen::WiView(v) = &app.screen else { panic!("expected WiView") };
+        assert_eq!(v.threads.len(), 1, "the view is left exactly as it was");
+        assert_eq!(v.scroll, 5, "scroll untouched");
+
+        let cached = cache.get::<WiDetail>(&key).expect("still cached");
+        assert_eq!(cached.fetched_at, seeded, "a total failure must not even restamp the entry");
+    }
+
+    #[test]
+    fn fresh_wi_detail_preserves_scroll_while_patching_threads() {
+        let deps = deps_with_cache(memory_cache());
+        let mut app = App::new("slate");
+        let w = wi(None);
+        let key = wi_detail_cache_key("c", &w.item_ref());
+        app.screen = Screen::WiView(Box::new(WiView { connection_id: "c".into(), wi: w, threads: vec![], scroll: 9 }));
+
+        app.on_event(
+            AppEvent::WiDetailLoaded {
+                key,
+                detail: Box::new(WiDetailFetch { threads: Some(vec![thread("t1"), thread("t2")]) }),
+                fetched_at: Utc::now(),
+            },
+            &deps,
+        );
+
+        let Screen::WiView(v) = &app.screen else { panic!("expected WiView") };
+        assert_eq!(v.scroll, 9, "scroll preserved — the view is patched in place, not rebuilt");
+        assert_eq!(v.threads.len(), 2, "fresh threads applied");
+    }
+
+    // ---- pipeline detail caching ----
+
+    fn pipeline_run(id: &str, status: PipelineRunStatus, stages: Vec<PipelineStage>) -> PipelineRun {
+        PipelineRun {
+            repository: None,
+            id: id.into(),
+            definition_id: "ci".into(),
+            number: Some(1),
+            name: Some("CI".into()),
+            title: None,
+            status,
+            triggered_by: None,
+            branch: Some("main".into()),
+            commit_sha: None,
+            started_at: None,
+            finished_at: None,
+            url: None,
+            stages,
+        }
+    }
+
+    fn pipeline_stage(name: &str, status: PipelineRunStatus, jobs: Vec<PipelineJob>) -> PipelineStage {
+        PipelineStage { name: name.into(), status, jobs }
+    }
+
+    fn pipeline_job(id: &str, status: PipelineRunStatus) -> PipelineJob {
+        PipelineJob {
+            id: id.into(),
+            name: id.into(),
+            status,
+            started_at: None,
+            finished_at: None,
+            steps: vec![],
+            url: None,
+            problem: None,
+        }
+    }
+
+    fn approval(id: &str, can_respond: bool) -> PipelineApproval {
+        PipelineApproval { id: id.into(), name: format!("gate-{id}"), can_respond }
+    }
+
+    #[test]
+    fn pipeline_detail_cache_key_distinguishes_the_same_id_in_different_repos() {
+        let a = pipeline_detail_cache_key("c", &ItemRef::in_repo("acme/pay", "7"));
+        let b = pipeline_detail_cache_key("c", &ItemRef::in_repo("acme/other", "7"));
+        assert_ne!(a, b, "same connection and id, different repo, must not collide");
+    }
+
+    #[test]
+    fn pipeline_detail_for_a_different_run_than_the_open_one_is_not_applied() {
+        let deps = deps_with_cache(memory_cache());
+        let mut app = App::new("slate");
+        let run = pipeline_run("1", PipelineRunStatus::Running, vec![]);
+        app.screen =
+            Screen::Pipeline(Box::new(PipelineView::new("CI".into(), run, "c".into(), ProviderType::GitHub, "ci".into(), None)));
+
+        let other = pipeline_run("2", PipelineRunStatus::Succeeded, vec![]);
+        let other_key = pipeline_detail_cache_key("c", &ItemRef::new("2"));
+        app.on_event(
+            AppEvent::PipelineDetailLoaded {
+                key: other_key.clone(),
+                detail: Box::new(PipelineDetailFetch {
+                    run: Some(other),
+                    approvals: Some(vec![]),
+                    supports_approvals: Some(true),
+                    can_respond_approvals: Some(true),
+                }),
+                fetched_at: Utc::now(),
+            },
+            &deps,
+        );
+
+        let Screen::Pipeline(v) = &app.screen else { panic!("expected Pipeline") };
+        assert_eq!(v.run.status, PipelineRunStatus::Running, "detail for a different run must not land on this view");
+        assert!(deps.cache.get::<PipelineDetail>(&other_key).is_some(), "still written through to the cache");
+    }
+
+    /// A revalidation where `get_run` answers but `pending_approvals` 502s: the empty approvals
+    /// list that would have stood in for that failure must not blank a real gate — the same
+    /// defect the PR path's `changes()`/`threads()` review caught, extended here.
+    #[test]
+    fn a_partly_failed_pipeline_detail_fetch_keeps_what_was_already_known() {
+        let cache = memory_cache();
+        let deps = deps_with_cache(cache.clone());
+        let seeded_run = pipeline_run("1", PipelineRunStatus::Running, vec![]);
+        let key = pipeline_detail_cache_key("c", &seeded_run.item_ref());
+        let known = PipelineDetail {
+            run: seeded_run.clone(),
+            approvals: vec![approval("g1", true)],
+            supports_approvals: true,
+            can_respond_approvals: true,
+        };
+        cache.put(&key, &known, Utc::now() - chrono::TimeDelta::seconds(30));
+
+        let mut app = App::new("slate");
+        let mut view =
+            PipelineView::new("CI".into(), seeded_run.clone(), "c".into(), ProviderType::GitHub, "ci".into(), None);
+        view.supports_approvals = true;
+        view.can_respond_approvals = true;
+        view.approvals = vec![approval("g1", true)];
+        view.stale = false; // already confirmed by an earlier fetch
+        app.screen = Screen::Pipeline(Box::new(view));
+
+        // get_run answers with a status change; pending_approvals and the capability calls fail.
+        let fresh_run = pipeline_run("1", PipelineRunStatus::Failed, vec![]);
+        app.on_event(
+            AppEvent::PipelineDetailLoaded {
+                key: key.clone(),
+                detail: Box::new(PipelineDetailFetch {
+                    run: Some(fresh_run),
+                    approvals: None,
+                    supports_approvals: None,
+                    can_respond_approvals: None,
+                }),
+                fetched_at: Utc::now(),
+            },
+            &deps,
+        );
+
+        let Screen::Pipeline(v) = &app.screen else { panic!("expected Pipeline") };
+        assert_eq!(v.run.status, PipelineRunStatus::Failed, "the call that answered is applied");
+        assert_eq!(v.approvals.len(), 1, "a failed approvals call must not blank what was known");
+        assert!(v.supports_approvals, "capabilities survive the failed call");
+
+        let cached = cache.get::<PipelineDetail>(&key).expect("still cached");
+        assert_eq!(cached.value.run.status, PipelineRunStatus::Failed);
+        assert_eq!(cached.value.approvals.len(), 1, "the cached approvals survive the failed call");
+    }
+
+    /// The hazard `open_pipeline_for` already guards and this path kept re-opening: the cached
+    /// entry's gates standing in for a failed `pending_approvals`. A gate on screen drives a real
+    /// approve/reject, so one that may already have been decided must never get there — while the
+    /// cached entry itself stays complete for a later re-open.
+    #[test]
+    fn a_failed_approvals_call_never_paints_a_cached_gate_into_the_view() {
+        let cache = memory_cache();
+        let deps = deps_with_cache(cache.clone());
+        let run = pipeline_run("1", PipelineRunStatus::Running, vec![]);
+        let key = pipeline_detail_cache_key("c", &run.item_ref());
+        cache.put(
+            &key,
+            &PipelineDetail {
+                run: run.clone(),
+                approvals: vec![approval("g1", true)],
+                supports_approvals: true,
+                can_respond_approvals: true,
+            },
+            Utc::now() - chrono::TimeDelta::seconds(30),
+        );
+
+        // Opened from the cache: the run seeds, the gates deliberately do not.
+        let mut app = App::new("slate");
+        let mut view = PipelineView::new("CI".into(), run.clone(), "c".into(), ProviderType::GitHub, "ci".into(), None);
+        view.stale = true;
+        app.screen = Screen::Pipeline(Box::new(view));
+
+        // get_run answers, pending_approvals 502s.
+        app.on_event(
+            AppEvent::PipelineDetailLoaded {
+                key: key.clone(),
+                detail: Box::new(PipelineDetailFetch {
+                    run: Some(pipeline_run("1", PipelineRunStatus::Failed, vec![])),
+                    approvals: None,
+                    supports_approvals: Some(true),
+                    can_respond_approvals: Some(true),
+                }),
+                fetched_at: Utc::now(),
+            },
+            &deps,
+        );
+
+        let Screen::Pipeline(v) = &app.screen else { panic!("expected Pipeline") };
+        assert!(v.approvals.is_empty(), "a cached gate must never reach an open view");
+        assert!(v.actionable_approvals().is_empty(), "so nothing can be approved off it");
+        assert_eq!(v.run.status, PipelineRunStatus::Failed, "the call that answered still applies");
+        assert!(!v.stale, "a confirmed run still clears staleness");
+
+        let cached = cache.get::<PipelineDetail>(&key).expect("cached");
+        assert_eq!(cached.value.approvals.len(), 1, "the cached entry stays complete");
+        assert_eq!(cached.value.run.status, PipelineRunStatus::Failed);
+    }
+
+    /// The other half: an *answered* empty list is authoritative — the gate was decided — and
+    /// must clear it from the view rather than being mistaken for a failure.
+    #[test]
+    fn an_answered_empty_approvals_list_clears_the_views_gates() {
+        let cache = memory_cache();
+        let deps = deps_with_cache(cache.clone());
+        let run = pipeline_run("1", PipelineRunStatus::Running, vec![]);
+        let key = pipeline_detail_cache_key("c", &run.item_ref());
+
+        let mut app = App::new("slate");
+        let mut view = PipelineView::new("CI".into(), run.clone(), "c".into(), ProviderType::GitHub, "ci".into(), None);
+        view.supports_approvals = true;
+        view.can_respond_approvals = true;
+        view.approvals = vec![approval("g1", true)];
+        view.stale = false;
+        app.screen = Screen::Pipeline(Box::new(view));
+
+        app.on_event(
+            AppEvent::PipelineDetailLoaded {
+                key: key.clone(),
+                detail: Box::new(PipelineDetailFetch {
+                    run: Some(run),
+                    approvals: Some(Vec::new()),
+                    supports_approvals: Some(true),
+                    can_respond_approvals: Some(true),
+                }),
+                fetched_at: Utc::now(),
+            },
+            &deps,
+        );
+
+        let Screen::Pipeline(v) = &app.screen else { panic!("expected Pipeline") };
+        assert!(v.approvals.is_empty(), "the provider says there are no gates, so there are none");
+        assert!(cache.get::<PipelineDetail>(&key).expect("cached").value.approvals.is_empty());
+    }
+
+    /// Capabilities/approvals answered but `get_run` didn't: the same rule applies on the branch
+    /// that patches without confirming the run.
+    #[test]
+    fn an_unconfirmed_run_also_refuses_the_cached_gates() {
+        let cache = memory_cache();
+        let deps = deps_with_cache(cache.clone());
+        let run = pipeline_run("1", PipelineRunStatus::Running, vec![]);
+        let key = pipeline_detail_cache_key("c", &run.item_ref());
+        cache.put(
+            &key,
+            &PipelineDetail {
+                run: run.clone(),
+                approvals: vec![approval("g1", true)],
+                supports_approvals: true,
+                can_respond_approvals: false,
+            },
+            Utc::now() - chrono::TimeDelta::seconds(30),
+        );
+
+        let mut app = App::new("slate");
+        let mut view = PipelineView::new("CI".into(), run, "c".into(), ProviderType::GitHub, "ci".into(), None);
+        view.stale = true;
+        app.screen = Screen::Pipeline(Box::new(view));
+
+        app.on_event(
+            AppEvent::PipelineDetailLoaded {
+                key,
+                detail: Box::new(PipelineDetailFetch {
+                    run: None,
+                    approvals: None,
+                    supports_approvals: Some(true),
+                    can_respond_approvals: Some(true),
+                }),
+                fetched_at: Utc::now(),
+            },
+            &deps,
+        );
+
+        let Screen::Pipeline(v) = &app.screen else { panic!("expected Pipeline") };
+        assert!(v.approvals.is_empty(), "still no cached gate on screen");
+        assert!(v.can_respond_approvals, "the capability that answered is applied");
+        assert!(v.stale, "only a real get_run may clear staleness");
+    }
+
+    /// Defect 4: the per-run gate check used to fall back to an empty list, so a failure cached
+    /// the row as "no approval pending" when one may have been waiting.
+    #[test]
+    fn a_failed_gate_check_clears_the_pipelines_flag_instead_of_reading_as_no_gate() {
+        assert_eq!(gate_from_approvals(Some(vec![approval("g1", true)])), (true, true));
+        assert_eq!(gate_from_approvals(Some(vec![approval("g1", false)])), (false, true));
+        assert_eq!(gate_from_approvals(Some(Vec::new())), (false, true));
+        assert_eq!(gate_from_approvals(None), (false, false), "a failed check must not be cached as clear");
+    }
+
+    #[test]
+    fn a_wholly_failed_pipeline_detail_fetch_writes_nothing_and_touches_no_view() {
+        let cache = memory_cache();
+        let deps = deps_with_cache(cache.clone());
+        let run = pipeline_run("1", PipelineRunStatus::Running, vec![]);
+        let key = pipeline_detail_cache_key("c", &run.item_ref());
+        let known =
+            PipelineDetail { run: run.clone(), approvals: vec![], supports_approvals: false, can_respond_approvals: false };
+        let seeded = Utc::now() - chrono::TimeDelta::seconds(30);
+        cache.put(&key, &known, seeded);
+
+        let mut app = App::new("slate");
+        let mut view = PipelineView::new("CI".into(), run, "c".into(), ProviderType::GitHub, "ci".into(), None);
+        view.stale = false;
+        app.screen = Screen::Pipeline(Box::new(view));
+
+        app.on_event(
+            AppEvent::PipelineDetailLoaded {
+                key: key.clone(),
+                detail: Box::new(PipelineDetailFetch::default()),
+                fetched_at: Utc::now(),
+            },
+            &deps,
+        );
+
+        let Screen::Pipeline(v) = &app.screen else { panic!("expected Pipeline") };
+        assert_eq!(v.run.status, PipelineRunStatus::Running, "the view is left exactly as it was");
+        assert!(!v.stale, "an all-failed fetch must not touch stale either");
+
+        let cached = cache.get::<PipelineDetail>(&key).expect("still cached");
+        assert_eq!(cached.fetched_at, seeded, "a total failure must not even restamp the entry");
+    }
+
+    #[test]
+    fn open_pipeline_for_seeds_the_run_from_cache_but_never_seeds_approvals() {
+        let cache = memory_cache();
+        let deps = deps_with_cache(cache.clone());
+        let cached_run = pipeline_run("1", PipelineRunStatus::Succeeded, vec![]);
+        let key = pipeline_detail_cache_key("c", &cached_run.item_ref());
+        cache.put(
+            &key,
+            &PipelineDetail {
+                run: cached_run,
+                // Already-actioned in this scenario — must never be painted into a fresh open.
+                approvals: vec![approval("g1", true)],
+                supports_approvals: true,
+                can_respond_approvals: true,
+            },
+            Utc::now(),
+        );
+
+        let mut app = App::new("slate");
+        let fallback = pipeline_run("1", PipelineRunStatus::Running, vec![]); // unused on a cache hit
+        app.open_pipeline_for(&deps, "c".into(), ProviderType::GitHub, "1".into(), "ci".into(), None, "CI".into(), fallback);
+
+        let Screen::Pipeline(v) = &app.screen else { panic!("expected Pipeline") };
+        assert_eq!(v.run.status, PipelineRunStatus::Succeeded, "seeded from the cache, not the fallback");
+        assert!(v.approvals.is_empty(), "a cached gate must never be painted into a newly opened view");
+        assert!(v.stale, "a cache-seeded run is unconfirmed until the refetch lands");
+        assert!(v.supports_approvals && v.can_respond_approvals, "capabilities do seed from the cache");
+    }
+
+    #[test]
+    fn pipeline_stale_flips_to_false_once_a_confirmed_run_lands() {
+        let deps = deps_with_cache(memory_cache());
+        let mut app = App::new("slate");
+        let run = pipeline_run("1", PipelineRunStatus::Running, vec![]);
+        let key = pipeline_detail_cache_key("c", &run.item_ref());
+        let mut view = PipelineView::new("CI".into(), run.clone(), "c".into(), ProviderType::GitHub, "ci".into(), None);
+        view.stale = true;
+        app.screen = Screen::Pipeline(Box::new(view));
+
+        // The fetch confirms exactly the status the cache already guessed — still has to clear
+        // `stale`, since nothing had actually confirmed it live until now.
+        app.on_event(
+            AppEvent::PipelineDetailLoaded {
+                key,
+                detail: Box::new(PipelineDetailFetch {
+                    run: Some(run),
+                    approvals: Some(vec![]),
+                    supports_approvals: Some(false),
+                    can_respond_approvals: Some(false),
+                }),
+                fetched_at: Utc::now(),
+            },
+            &deps,
+        );
+
+        let Screen::Pipeline(v) = &app.screen else { panic!("expected Pipeline") };
+        assert!(!v.stale, "a real get_run answering clears staleness even if nothing else changed");
+    }
+
+    #[test]
+    fn fresh_pipeline_detail_preserves_logs_and_collapsed_while_patching() {
+        let deps = deps_with_cache(memory_cache());
+        let mut app = App::new("slate");
+        let run = pipeline_run(
+            "1",
+            PipelineRunStatus::Running,
+            vec![pipeline_stage("build", PipelineRunStatus::Running, vec![pipeline_job("j1", PipelineRunStatus::Running)])],
+        );
+        let key = pipeline_detail_cache_key("c", &run.item_ref());
+        let mut view = PipelineView::new("CI".into(), run.clone(), "c".into(), ProviderType::GitHub, "ci".into(), None);
+        view.logs = Some(LogView { title: "Logs · j1".into(), lines: vec!["hello".into()], scroll: 3 });
+        view.toggle_selected(); // collapses the "build" stage row (selected starts at 0)
+        assert!(view.collapsed.contains("s0"), "sanity: the stage collapsed");
+        app.screen = Screen::Pipeline(Box::new(view));
+
+        let fresh = pipeline_run(
+            "1",
+            PipelineRunStatus::Succeeded,
+            vec![pipeline_stage("build", PipelineRunStatus::Succeeded, vec![pipeline_job("j1", PipelineRunStatus::Succeeded)])],
+        );
+        app.on_event(
+            AppEvent::PipelineDetailLoaded {
+                key,
+                detail: Box::new(PipelineDetailFetch {
+                    run: Some(fresh),
+                    approvals: Some(vec![]),
+                    supports_approvals: Some(false),
+                    can_respond_approvals: Some(false),
+                }),
+                fetched_at: Utc::now(),
+            },
+            &deps,
+        );
+
+        let Screen::Pipeline(v) = &app.screen else { panic!("expected Pipeline") };
+        assert!(v.logs.is_some(), "an open log pane must not be torn down by a background refresh");
+        assert!(v.collapsed.contains("s0"), "the expand/collapse tree state survives the patch");
+        assert_eq!(v.run.status, PipelineRunStatus::Succeeded, "fresh run applied");
+    }
+
+    #[test]
+    fn fresh_pipeline_detail_clamps_selection_when_the_new_run_is_shorter() {
+        let deps = deps_with_cache(memory_cache());
+        let mut app = App::new("slate");
+        let run = pipeline_run(
+            "1",
+            PipelineRunStatus::Running,
+            vec![
+                pipeline_stage("build", PipelineRunStatus::Running, vec![pipeline_job("j1", PipelineRunStatus::Running)]),
+                pipeline_stage("deploy", PipelineRunStatus::Queued, vec![pipeline_job("j2", PipelineRunStatus::Queued)]),
+            ],
+        );
+        let key = pipeline_detail_cache_key("c", &run.item_ref());
+        let mut view = PipelineView::new("CI".into(), run.clone(), "c".into(), ProviderType::GitHub, "ci".into(), None);
+        view.selected = 3; // the "deploy" stage row, in the four-row flattened tree
+        app.screen = Screen::Pipeline(Box::new(view));
+
+        // Shrinks to one stage with no jobs — a much shorter flattened tree.
+        let fresh = pipeline_run("1", PipelineRunStatus::Succeeded, vec![pipeline_stage("build", PipelineRunStatus::Succeeded, vec![])]);
+        app.on_event(
+            AppEvent::PipelineDetailLoaded {
+                key,
+                detail: Box::new(PipelineDetailFetch {
+                    run: Some(fresh),
+                    approvals: Some(vec![]),
+                    supports_approvals: Some(false),
+                    can_respond_approvals: Some(false),
+                }),
+                fetched_at: Utc::now(),
+            },
+            &deps,
+        );
+
+        let Screen::Pipeline(v) = &app.screen else { panic!("expected Pipeline") };
+        assert_eq!(v.selected, 0, "clamped into the new, shorter flattened tree");
     }
 
     #[test]

@@ -1368,7 +1368,18 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     } else if app.reloading {
         // Dots appear one at a time; padded to a constant width so nothing jitters.
         let n = (app.anim / 2) % 4;
-        (format!("Refreshing{}{} ", ".".repeat(n), " ".repeat(3 - n)), bar.fg(theme.dim))
+        // While a refresh runs over cache-seeded rows, say how old they are. Without this the
+        // list looks live when it is in fact the last run's data, and a user acts on a merged
+        // PR or a finished pipeline believing it current. `data_age` is cleared the moment
+        // live data lands, so this disappears on its own.
+        // `rel_age` says "now" under a minute, which reads wrong in a "… old" sentence, so the
+        // sub-minute case gets its own wording rather than "showing now old".
+        let age = match app.data_age.map(|ts| rel_age(Some(ts))) {
+            Some(age) if age == "now" => " · showing cached".to_string(),
+            Some(age) => format!(" · showing {age} old"),
+            None => String::new(),
+        };
+        (format!("Refreshing{}{}{age} ", ".".repeat(n), " ".repeat(3 - n)), bar.fg(theme.dim))
     } else {
         (format!("{} ", app.status), bar.fg(theme.dim))
     };
@@ -1772,11 +1783,19 @@ fn render_pipeline(frame: &mut Frame, area: Rect, theme: &Theme, view: &Pipeline
     // Header: run identity + status + branch/trigger.
     let branch = view.branch.clone().unwrap_or_else(|| "—".into());
     let who = view.run.triggered_by.as_ref().map(|u| u.display_name.clone()).unwrap_or_else(|| "—".into());
-    let header = Line::from(vec![
+    // A cache-seeded run's status is whatever it was when the view was last open — it may have
+    // gone red since. Say so until the refetch confirms it, rather than painting remembered
+    // status identically to live status: the user acts on this (waits on a run, approves a
+    // gate), so an unmarked stale "Running" is worse than a slower honest one.
+    let mut header = vec![
         Span::styled(format!("{} ", pipeline_glyph(view.run.status, anim)), Style::default().fg(theme.pipeline_color(view.run.status))),
         Span::styled(format!("{:?}", view.run.status), Style::default().fg(theme.pipeline_color(view.run.status)).add_modifier(Modifier::BOLD)),
-        Span::styled(format!("   branch {branch}   triggered by {who}"), Style::default().fg(theme.dim)),
-    ]);
+    ];
+    if view.stale {
+        header.push(Span::styled(" (unconfirmed)", Style::default().fg(theme.yellow)));
+    }
+    header.push(Span::styled(format!("   branch {branch}   triggered by {who}"), Style::default().fg(theme.dim)));
+    let header = Line::from(header);
     let header_block = section_block(theme, &view.title);
     frame.render_widget(Paragraph::new(header).block(header_block), rows[0]);
 
@@ -2866,6 +2885,43 @@ mod tests {
         assert_eq!(flat[2].depth, 2);
     }
 
+    /// A cache-seeded run must not present remembered status as live — the user waits on runs
+    /// and approves gates off this header.
+    #[test]
+    fn a_cache_seeded_run_marks_its_status_unconfirmed() {
+        use crate::app::Screen;
+        let mut app = App::new("slate");
+        let mut view = PipelineView::new(
+            "CI #101".into(),
+            sample_run(),
+            "demo".into(),
+            ProviderType::GitHub,
+            "ci".into(),
+            Some("main".into()),
+        );
+        view.stale = true;
+        app.screen = Screen::Pipeline(Box::new(view));
+        let out = render_to_string(&mut app, 120, 30);
+        assert!(out.contains("(unconfirmed)"), "a cache-seeded run says its status is unconfirmed");
+    }
+
+    #[test]
+    fn a_confirmed_run_carries_no_unconfirmed_marker() {
+        use crate::app::Screen;
+        let mut app = App::new("slate");
+        let view = PipelineView::new(
+            "CI #101".into(),
+            sample_run(),
+            "demo".into(),
+            ProviderType::GitHub,
+            "ci".into(),
+            Some("main".into()),
+        );
+        app.screen = Screen::Pipeline(Box::new(view));
+        let out = render_to_string(&mut app, 120, 30);
+        assert!(!out.contains("unconfirmed"), "a live run is not marked");
+    }
+
     #[test]
     fn pipeline_drill_in_renders_tree_and_keys() {
         use crate::app::Screen;
@@ -3289,6 +3345,38 @@ mod tests {
         app.toast = Some("Filter: mine (1 PRs)".into());
         let out = render_to_string(&mut app, 100, 24);
         assert!(out.contains("Filter: mine"), "toast should appear in the footer");
+    }
+
+    #[test]
+    fn a_refresh_over_seeded_rows_says_how_old_they_are() {
+        let mut app = App::new("slate");
+        app.reloading = true;
+        app.data_age = Some(Utc::now() - chrono::Duration::minutes(15));
+        let out = render_to_string(&mut app, 120, 24);
+        assert!(out.contains("showing 15m old"), "a refresh over cached rows reports their age");
+    }
+
+    /// Sub-minute ages must not read "showing now old".
+    #[test]
+    fn a_just_cached_age_reads_as_prose() {
+        let mut app = App::new("slate");
+        app.reloading = true;
+        app.data_age = Some(Utc::now());
+        let out = render_to_string(&mut app, 120, 24);
+        assert!(out.contains("showing cached"), "sub-minute ages get their own wording");
+        assert!(!out.contains("now old"), "never 'showing now old'");
+    }
+
+    /// The indicator is a statement about cache-seeded rows, so it must vanish the moment
+    /// live data lands — otherwise it keeps claiming staleness that no longer exists.
+    #[test]
+    fn the_age_indicator_disappears_once_live_data_lands() {
+        let mut app = App::new("slate");
+        app.reloading = true;
+        app.data_age = None;
+        let out = render_to_string(&mut app, 120, 24);
+        assert!(out.contains("Refreshing"), "still refreshing");
+        assert!(!out.contains("showing"), "no age once data_age is cleared");
     }
 
     #[test]

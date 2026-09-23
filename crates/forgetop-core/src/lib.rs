@@ -1,6 +1,7 @@
 //! forgetop core: provider-neutral domain model, capability-scoped provider traits,
 //! config + bindings, secret store, and the runtime services.
 
+pub mod cache;
 pub mod config;
 pub mod diag;
 pub mod domain;
