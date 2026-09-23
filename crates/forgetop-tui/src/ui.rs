@@ -1189,7 +1189,7 @@ fn base_footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
         return overlay.hint();
     }
     if matches!(app.screen, Screen::Launchpad) {
-        return vec![("↑↓", "move"), ("←→", "columns"), ("↵", "open"), ("Tab", "sections"), ("r", "refresh"), (",", "settings"), ("?", "help"), ("q", "quit")];
+        return vec![("↑↓", "move"), ("←→", "columns"), ("↵", "open"), ("D", "dismiss"), ("Tab", "sections"), ("r", "refresh"), (",", "settings"), ("?", "help"), ("q", "quit")];
     }
     if let Screen::PrView(v) = &app.screen {
         // A merged PR only offers Revert; an open one offers approve / (reject) / merge.

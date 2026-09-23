@@ -113,6 +113,10 @@ pub struct UiState {
     /// (provider-specific strings, e.g. "Done"). Anything not listed is shown.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hidden_work_item_states: Vec<String>,
+    /// Launchpad items the user has explicitly dismissed from Command Center's
+    /// "Needs you" list ("connection_id:item_id" keys, see launchpad::Entry::key).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dismissed_launchpad_items: Vec<String>,
     /// Per-view sort column + direction. `None` = provider order.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr_sort: Option<SortPref>,

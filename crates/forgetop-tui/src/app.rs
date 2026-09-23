@@ -503,6 +503,9 @@ pub struct App {
     /// Items dismissed from the Launchpad once acted on (e.g. a PR you've reviewed), so
     /// they drop off immediately without waiting for the provider's feed to catch up.
     lp_dismissed: HashSet<String>,
+    /// Items the user explicitly dismissed from Command Center via the `D` key.
+    /// Persisted to config so they stay hidden across restarts.
+    lp_dismissed_persisted: HashSet<String>,
     /// True when the currently-open item view was opened from the Launchpad, so Esc
     /// returns there (with the same row still selected) instead of to the section list.
     lp_origin: bool,
@@ -1041,6 +1044,7 @@ impl App {
             lp_prs_mine: Vec::new(),
             lp_prs_review: Vec::new(),
             lp_dismissed: HashSet::new(),
+            lp_dismissed_persisted: HashSet::new(),
             lp_origin: false,
             from_inbox: false,
             reloading: false,
@@ -1273,6 +1277,12 @@ impl App {
     /// Applies persisted hidden work-item-state preferences at startup.
     pub fn apply_hidden_work_item_states(&mut self, hidden: &[String]) {
         self.wi_hidden_states = hidden.iter().cloned().collect();
+    }
+
+    /// Applies persisted Command Center dismissals at startup (seeds the in-memory set;
+    /// `rebuild_launchpad` applies the actual filtering on the initial reload).
+    pub fn apply_dismissed_launchpad_items(&mut self, ids: &[String]) {
+        self.lp_dismissed_persisted = ids.iter().cloned().collect();
     }
 
     /// Applies persisted per-view sort preferences at startup.
@@ -1541,8 +1551,12 @@ impl App {
         let built = launchpad::build(&self.lp_prs_review, &self.lp_prs_mine, &self.wis, &self.pipes);
         self.lp = built.entries;
         self.lp_overflow = built.overflow;
-        // Drop anything already acted on this session (e.g. a PR you've reviewed).
-        self.lp.retain(|e| !self.lp_dismissed.contains(&launchpad::Entry::key(&e.connection_id, e.item_id())));
+        // Drop anything already acted on this session (e.g. a PR you've reviewed), or
+        // explicitly dismissed by the user via the `D` key.
+        self.lp.retain(|e| {
+            let key = launchpad::Entry::key(&e.connection_id, e.item_id());
+            !self.lp_dismissed.contains(&key) && !self.lp_dismissed_persisted.contains(&key)
+        });
         for side in 0..2 {
             let len = self.lp_slots(side).len();
             if self.lp_sel[side] >= len {
@@ -1556,6 +1570,22 @@ impl App {
     fn dismiss_from_launchpad(&mut self, connection_id: &str, item_id: &str) {
         self.lp_dismissed.insert(launchpad::Entry::key(connection_id, item_id));
         self.rebuild_launchpad();
+    }
+
+    /// Permanently dismisses the selected Command Center item (the `D` key), persisting
+    /// the choice to config so it stays hidden across restarts. Only affects the Launchpad
+    /// view (`self.lp`); the Pull Requests / Work Items / Pipelines tabs are untouched.
+    async fn dismiss_selected_lp_item(&mut self, deps: &AppDeps) {
+        let Some(LpSlot::Entry(i)) = self.lp_selected_slot() else { return };
+        let Some(entry) = self.lp.get(i) else { return };
+        let key = launchpad::Entry::key(&entry.connection_id, entry.item_id());
+        self.lp_dismissed_persisted.insert(key);
+        self.rebuild_launchpad();
+
+        let ids: Vec<String> = self.lp_dismissed_persisted.iter().cloned().collect();
+        if let Err(e) = deps.config.set_dismissed_launchpad_items(ids).await {
+            self.toast = Some(format!("Couldn't save: {e}"));
+        }
     }
 
     /// Indices into `self.lp` for a column (0 = left, 1 = right), in display order.
@@ -1628,6 +1658,7 @@ impl App {
             Key::Tab => self.switch_tab(1),
             Key::Char(c @ '1'..='4') => self.set_tab(c as usize - '1' as usize),
             Key::Enter => self.open_launchpad_selected(deps).await,
+            Key::Char('D') => self.dismiss_selected_lp_item(deps).await,
             Key::Char('r') => self.request_reload(deps),
             Key::Char('C') => self.open_connections(deps).await,
             Key::Char(',') => self.open_startup_picker(deps),
@@ -6387,6 +6418,39 @@ mod tests {
         assert!(app.lp.is_empty(), "reviewed PR is dismissed");
         app.rebuild_launchpad();
         assert!(app.lp.is_empty(), "still gone until the provider feed catches up");
+    }
+
+    #[tokio::test]
+    async fn pressing_shift_d_dismisses_the_selected_item_and_persists_it() {
+        let deps = test_deps();
+        let mut app = App::new("slate");
+        let mut p = pr(None);
+        p.id = "pr1".into();
+        app.lp_prs_review = vec![pr_row(p)];
+        app.rebuild_launchpad();
+        assert_eq!(app.lp.len(), 1, "the PR shows in the review bucket before dismissal");
+        assert_eq!(app.prs.len(), 0, "the separate Pull Requests tab list is untouched by setup");
+
+        app.on_key(Key::Char('D'), &deps).await;
+
+        assert!(app.lp.is_empty(), "dismissing hides it from Command Center");
+        assert!(
+            app.prs.is_empty(),
+            "dismissal must not reach the Pull Requests tab's own list"
+        );
+
+        // The choice is persisted, not just held in memory: a fresh App seeded from
+        // config keeps the item hidden even before any dismissal happens again.
+        let saved = deps.config.snapshot().ui.dismissed_launchpad_items;
+        assert_eq!(saved.len(), 1, "the dismissal is written to config");
+
+        let mut fresh = App::new("slate");
+        fresh.apply_dismissed_launchpad_items(&saved);
+        let mut p2 = pr(None);
+        p2.id = "pr1".into();
+        fresh.lp_prs_review = vec![pr_row(p2)];
+        fresh.rebuild_launchpad();
+        assert!(fresh.lp.is_empty(), "a restarted app keeps the dismissal");
     }
 
     #[test]
