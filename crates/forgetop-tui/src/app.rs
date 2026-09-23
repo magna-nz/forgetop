@@ -1459,8 +1459,13 @@ impl App {
         let view = self.current_view_snapshot(name.clone());
         self.views[section].push(view);
         self.view_idx[section] = self.views[section].len() - 1;
-        let _ = deps.config.set_views(section_of(section), self.views[section].clone()).await;
-        self.toast = Some(format!("Saved view: {name}"));
+        // Local state first, like every other write here — but a persist that failed must not be
+        // reported as "Saved": the view is on screen and will be gone on the next launch, and the
+        // toast is the only chance the user gets to know that.
+        match deps.config.set_views(section_of(section), self.views[section].clone()).await {
+            Err(e) => self.toast_error(format!("Couldn't save view: {e}")),
+            Ok(()) => self.toast = Some(format!("Saved view: {name}")),
+        }
     }
 
     /// Confirms deleting the active section's current view (never the last one).
@@ -1487,10 +1492,15 @@ impl App {
         let idx = self.view_idx[section].min(self.views[section].len() - 1);
         let removed = self.views[section].remove(idx);
         self.view_idx[section] = idx.min(self.views[section].len() - 1);
-        let _ = deps.config.set_views(section_of(section), self.views[section].clone()).await;
+        let saved = deps.config.set_views(section_of(section), self.views[section].clone()).await;
         let target = self.view_idx[section];
         self.apply_view(section, target, deps).await;
-        self.toast = Some(format!("Deleted view: {}", removed.name));
+        // Reported after `apply_view`, which toasts a "View: …" of its own — a failed delete has
+        // to outrank it, or the only sign the view is coming back is that it comes back.
+        match saved {
+            Err(e) => self.toast_error(format!("Couldn't delete view: {e}")),
+            Ok(()) => self.toast = Some(format!("Deleted view: {}", removed.name)),
+        }
     }
 
     /// The active sort for a section, if any.
@@ -6305,6 +6315,74 @@ mod tests {
 
         let entry = cache.get::<Vec<NotifRow>>(CACHE_KEY_INBOX).expect("entry survives");
         assert!(entry.value.iter().all(|r| !r.notification.unread), "mark-all reaches the cache too");
+    }
+
+    /// A config store that loads fine and refuses every write, for the persist-failure paths.
+    /// Nothing else in the crate can produce one: `InMemoryConfigStore` always succeeds.
+    struct RefusingConfigStore;
+
+    #[async_trait::async_trait]
+    impl forgetop_core::config::ConfigStore for RefusingConfigStore {
+        async fn load(&self) -> forgetop_core::Result<forgetop_core::config::ForgetopConfig> {
+            Ok(forgetop_core::config::ForgetopConfig::default())
+        }
+        async fn save(&self, _config: &forgetop_core::config::ForgetopConfig) -> forgetop_core::Result<()> {
+            Err(forgetop_core::Error::Config("config directory is read-only".into()))
+        }
+    }
+
+    /// `test_deps`, but every config write fails.
+    fn deps_that_cannot_persist() -> AppDeps {
+        use forgetop_core::secret::InMemorySecretStore;
+        use forgetop_core::service::ConnectionResolver;
+
+        let registry = Arc::new(ProviderRegistry::new(Vec::new()));
+        let secrets = Arc::new(InMemorySecretStore::default());
+        let config = Arc::new(ConfigService::new(Arc::new(RefusingConfigStore), secrets.clone(), registry.clone()));
+        let resolver = Arc::new(ConnectionResolver::new(config.clone(), registry, secrets));
+        AppDeps {
+            sections: Arc::new(SectionService::new(config.clone(), resolver.clone())),
+            health: Arc::new(ConnectionHealthService::new(config.clone(), resolver)),
+            config,
+            cache: Arc::new(CacheStore::disabled()),
+        }
+    }
+
+    fn saved_view(name: &str) -> SavedView {
+        SavedView { name: name.into(), filter: None, query: String::new(), sort: None, hidden_states: Vec::new() }
+    }
+
+    /// The view stays on screen — writing local state first is deliberate and matches the rest of
+    /// the app — but "Saved view" would be a lie the user only finds out about on the next launch,
+    /// when the view they think they saved is gone.
+    #[tokio::test]
+    async fn a_view_that_could_not_be_persisted_says_so_instead_of_reporting_success() {
+        let deps = deps_that_cannot_persist();
+        let mut app = App::new("slate");
+
+        app.save_view("Mine only".into(), &deps).await;
+
+        assert_eq!(app.views[0].len(), 1, "the optimistic local write still stands");
+        let toast = app.toast.as_deref().expect("a failed save has to say something");
+        assert!(toast.contains("Couldn't save view"), "{toast}");
+        assert!(!toast.contains("Saved view"), "a refused write must not report success: {toast}");
+    }
+
+    /// Same for the other direction, and the toast has to survive `apply_view` — which sets a
+    /// "View: …" toast of its own after the persist has already been attempted.
+    #[tokio::test]
+    async fn a_view_that_could_not_be_deleted_says_so_rather_than_announcing_the_delete() {
+        let deps = deps_that_cannot_persist();
+        let mut app = App::new("slate");
+        app.views[0] = vec![saved_view("All"), saved_view("Mine")];
+        app.view_idx[0] = 1;
+
+        app.delete_view(&deps).await;
+
+        let toast = app.toast.as_deref().expect("a failed delete has to say something");
+        assert!(toast.contains("Couldn't delete view"), "{toast}");
+        assert!(!toast.contains("Deleted view"), "a refused write must not report success: {toast}");
+        assert!(!toast.starts_with("View:"), "apply_view's toast must not bury the failure: {toast}");
     }
 
     fn health(id: &str) -> ConnectionHealth {
