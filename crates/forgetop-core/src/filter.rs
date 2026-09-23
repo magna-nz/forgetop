@@ -4,13 +4,26 @@ use crate::domain::{PullRequest, User};
 use crate::provider::PullRequestFilter;
 
 pub fn apply_pull_request_filter(prs: Vec<PullRequest>, filter: PullRequestFilter, me: Option<&str>) -> Vec<PullRequest> {
-    match (filter, me) {
-        (PullRequestFilter::All, _) => prs,
-        (_, None) => prs,
-        (PullRequestFilter::Mine, Some(me)) => prs.into_iter().filter(|p| is_user(&p.author, me)).collect(),
-        (PullRequestFilter::ReviewRequested, Some(me)) => {
-            prs.into_iter().filter(|p| p.reviewers.iter().any(|r| is_user(&r.user, me))).collect()
-        }
+    prs.into_iter().filter(|pr| pull_request_matches(pr, filter, me)).collect()
+}
+
+/// Whether one pull request belongs in `filter` for `me` — the row-at-a-time form of
+/// [`apply_pull_request_filter`], which is written in terms of it.
+///
+/// Exposed so a caller holding one unfiltered pool can derive the same views the providers would
+/// have returned, without reimplementing the matching rules. That equivalence is the whole point:
+/// two copies of "is this mine" that disagree would show a different list depending on whether the
+/// rows arrived pre-filtered or were filtered locally.
+///
+/// `me` of `None` means the identity could not be established, and every pull request matches —
+/// an unfiltered list under a "Mine" heading is wrong, but silently showing none of your pull
+/// requests is worse. See [`PullRequestSource::current_user`](crate::provider::PullRequestSource::current_user).
+pub fn pull_request_matches(pr: &PullRequest, filter: PullRequestFilter, me: Option<&str>) -> bool {
+    let Some(me) = me else { return true };
+    match filter {
+        PullRequestFilter::All => true,
+        PullRequestFilter::Mine => is_user(&pr.author, me),
+        PullRequestFilter::ReviewRequested => pr.reviewers.iter().any(|r| is_user(&r.user, me)),
     }
 }
 

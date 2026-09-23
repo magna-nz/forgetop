@@ -226,6 +226,18 @@ impl PrDecoration {
             check_summary: pr.check_summary.clone(),
         }
     }
+
+    /// Writes these fields back onto a pull request whose list payload omitted them — the
+    /// inverse of [`from_pull_request`](Self::from_pull_request), for a caller that listed
+    /// without decoration and fetched it per row afterwards.
+    pub fn apply_to(&self, pr: &mut PullRequest) {
+        pr.mergeable = self.mergeable;
+        pr.changed_files = self.changed_files;
+        pr.additions = self.additions;
+        pr.deletions = self.deletions;
+        pr.checks = self.checks;
+        pr.check_summary = self.check_summary.clone();
+    }
 }
 
 #[derive(Debug, Clone, Default)]
