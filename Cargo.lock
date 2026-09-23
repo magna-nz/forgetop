@@ -769,6 +769,7 @@ dependencies = [
  "open",
  "ratatui",
  "serde",
+ "serde_json",
  "synoptic",
  "tempfile",
  "tokio",

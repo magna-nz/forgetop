@@ -2763,6 +2763,43 @@ mod tests {
         assert!(line(&|p| p.is_draft = true).contains("Draft — not open for review yet"));
     }
 
+    /// The verdict *sentence* is built twice — here and in the web dashboard's `format.ts` —
+    /// because the two frontends share no runtime. AGENTS.md forbids a logic fork between them,
+    /// so both suites read `testdata/pr_state_cases.json` and must produce the same string.
+    /// Change the wording on one side and the other side's tests fail.
+    #[test]
+    fn pr_state_sentences_match_the_shared_fixture() {
+        let cases: serde_json::Value = serde_json::from_str(include_str!("../../../testdata/pr_state_cases.json")).expect("fixture parses");
+        let theme = Theme::by_name("slate");
+        for case in cases.as_array().expect("fixture is a list") {
+            let g = |k: &str| case[k].as_str().unwrap_or_default().to_string();
+            let mut pr = sample_pr();
+            pr.target_ref = Some("main".into());
+            pr.updated_at = None; // keeps "Merged into main" free of a drifting age
+            pr.status = serde_json::from_value(case["status"].clone()).expect("status");
+            pr.is_draft = case["is_draft"].as_bool().expect("is_draft");
+            pr.checks = serde_json::from_value(case["checks"].clone()).expect("checks");
+            pr.mergeable = serde_json::from_value(case["mergeable"].clone()).expect("mergeable");
+            pr.check_summary = serde_json::from_value(case["summary"].clone()).expect("summary");
+            pr.reviewers = case["votes"]
+                .as_array()
+                .expect("votes")
+                .iter()
+                .map(|v| {
+                    let name = v[0].as_str().expect("reviewer name");
+                    reviewer(name, serde_json::from_value(v[1].clone()).expect("vote"))
+                })
+                .collect();
+
+            // Compare wording, not spacing: the terminal pads the glyph with two columns while
+            // the dashboard uses a CSS gap. Both are right for their medium.
+            let line = pr_state_line(&theme, &pr);
+            let raw: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            let rendered = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert_eq!(rendered, g("expect"), "case: {}", g("name"));
+        }
+    }
+
     /// The two gates on a merge are now both in the field list, and both say which way they fell.
     #[test]
     fn pr_screen_lists_both_merge_gates() {
