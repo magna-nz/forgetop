@@ -5,6 +5,7 @@
 import type {
   CheckStatus,
   NotificationKind,
+  PipelineRun,
   PipelineRunStatus,
   ProviderType,
   PullRequest,
@@ -106,6 +107,20 @@ export function pipeMeta(status: PipelineRunStatus): Meta & { running: boolean }
     case "Canceled":
       return { label: "canceled", icon, color: V("dim"), running: false };
   }
+}
+
+/** What a pipeline run was *building*, not what ran it — mirrors `launchpad::pipe_title` in
+ *  forgetop-core. Prefers the run's own title (GitHub's `display_title`, Bitbucket's commit
+ *  subject), falling back to the workflow for providers that expose none (GitLab, Azure DevOps).
+ *  A blank title counts as absent. Keep in step with the Rust side: the two frontends must not
+ *  label the same run differently. */
+export function pipeTitle(run: PipelineRun, definitionName?: string | null): string {
+  return run.title?.trim() ? run.title : pipeWorkflow(run, definitionName);
+}
+
+/** The pipeline a run belongs to — mirrors `launchpad::pipe_workflow` in forgetop-core. */
+export function pipeWorkflow(run: PipelineRun, definitionName?: string | null): string {
+  return definitionName || run.name || run.definition_id;
 }
 
 // Work-item colour: "blocked" always reds out; otherwise the category drives it.

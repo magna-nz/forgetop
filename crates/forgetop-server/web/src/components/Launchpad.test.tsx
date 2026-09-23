@@ -76,6 +76,35 @@ const prRow = (bucket: string, title: string, id: string): any => ({
   },
 });
 
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const pipeRow = (title: string | null, definitionName: string | null): any => ({
+  bucket: "recent_pipelines",
+  bucket_title: "Recent pipelines",
+  column: 1,
+  muted: true,
+  connection_id: "c",
+  connection: "GH",
+  provider: "GitHub",
+  kind: "pipe",
+  definition_name: definitionName,
+  run: {
+    id: "r1",
+    repository: "acme/payments",
+    definition_id: "ci",
+    number: 1,
+    name: null,
+    title,
+    status: "Succeeded",
+    triggered_by: null,
+    branch: "main",
+    commit_sha: null,
+    started_at: null,
+    finished_at: null,
+    url: null,
+    stages: [],
+  },
+});
+
 const noOverflow = { needs_review: false, your_work: false, your_open_prs: false, recently_merged: false, recent_pipelines: false };
 
 describe("Launchpad", () => {
@@ -138,5 +167,30 @@ describe("Launchpad", () => {
 
     expect(await screen.findByText("Rotate the KMS signing keys")).toBeInTheDocument();
     expect(screen.getByText(/checks failing/i)).toBeInTheDocument();
+  });
+
+  // The TUI titles pipeline rows from `run.title` via `launchpad::pipe_title`. If this drifts,
+  // the same run reads differently in the two frontends — the logic fork AGENTS.md forbids.
+  it("titles a pipeline row by what it built, naming the workflow only once", async () => {
+    mockFetch({
+      get: { "/api/launchpad": { rows: [pipeRow("Bump axum to 0.8", "Integration")], more: noOverflow } },
+    });
+    renderWithClient(<Launchpad />);
+
+    expect(await screen.findByText("Bump axum to 0.8")).toBeInTheDocument();
+    expect(screen.getByText(/Integration · main/)).toBeInTheDocument();
+  });
+
+  // GitLab and Azure DevOps expose no per-run title: the workflow becomes the title, and must not
+  // also be repeated as its own qualifier.
+  it("falls back to the workflow name when a run has no title of its own", async () => {
+    mockFetch({
+      get: { "/api/launchpad": { rows: [pipeRow(null, "Integration")], more: noOverflow } },
+    });
+    renderWithClient(<Launchpad />);
+
+    expect(await screen.findByText("Integration")).toBeInTheDocument();
+    expect(screen.queryByText(/Integration · Integration/)).not.toBeInTheDocument();
+    expect(screen.getByText(/^main/)).toBeInTheDocument();
   });
 });

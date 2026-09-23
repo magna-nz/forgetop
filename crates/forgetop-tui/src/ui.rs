@@ -2,6 +2,7 @@
 
 use chrono::{DateTime, Utc};
 use forgetop_core::domain::*;
+use forgetop_core::launchpad::{pr_approved_by, pr_changes_requested_by, pr_state, PrBlocker, PrState};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -286,7 +287,7 @@ fn render_lp_column(frame: &mut Frame, area: Rect, app: &App, side: usize, title
     let entry_cells: Vec<Vec<Vec<Span>>> = slots
         .iter()
         .filter_map(|s| match s {
-            LpSlot::Entry(i) => Some(lp_cells(theme, &app.lp[*i], app.anim)),
+            LpSlot::Entry(i) => Some(lp_cells(theme, &app.lp[*i], app.anim, side == 0)),
             LpSlot::More(_) => None,
         })
         .collect();
@@ -320,10 +321,11 @@ fn render_lp_column(frame: &mut Frame, area: Rect, app: &App, side: usize, title
                 }
                 let cells = &entry_cells[cell_i];
                 cell_i += 1;
-                // On the focused row, any overflowing column (title, person) scrolls so it's readable.
+                // On the focused row, any overflowing column (where, title, person) scrolls so
+                // it's readable.
                 let line = if selected && focused {
                     let mut c = cells.clone();
-                    for col in [LP_TITLE_COL, LP_PERSON_COL] {
+                    for col in [LP_WHERE_COL, LP_TITLE_COL, LP_PERSON_COL] {
                         if cell_width(&c[col]) > widths[col] {
                             let text: String = c[col].iter().map(|s| s.content.as_ref()).collect();
                             let style = c[col].first().map(|s| s.style).unwrap_or_default();
@@ -359,6 +361,11 @@ fn render_lp_column(frame: &mut Frame, area: Rect, app: &App, side: usize, title
 const LP_NCOL: usize = 7;
 /// The flexible title column in a Launchpad row (the one that marquee-scrolls).
 const LP_TITLE_COL: usize = 3;
+/// The "where" column (repo + PR number / workflow / work-item key); capped, and scrolls when
+/// selected, so a long `repo · workflow` can't crowd out the title.
+const LP_WHERE_COL: usize = 2;
+/// Max width for the "where" column before it truncates (and marquees on the focused row).
+const LP_WHERE_MAX: usize = 24;
 /// The person column (author / who-ran / assignee); capped, and scrolls when selected.
 const LP_PERSON_COL: usize = 5;
 /// Max width for the person column before it truncates (and marquees on the focused row).
@@ -366,49 +373,112 @@ const LP_PERSON_MAX: usize = 16;
 /// Gap between Launchpad columns — tighter than the nav lists since a column is half-width.
 const LP_GAP: usize = 2;
 
+/// Joins a repository with the qualifier that identifies an item inside it — a PR number, a
+/// workflow name, a work-item key. Either half may be missing (Jira and Linear aren't
+/// repo-addressed; some runs have no definition), and a qualifier that merely repeats the row's
+/// title is dropped rather than shown twice.
+fn lp_where(repo: Option<&str>, qualifier: Option<&str>, sep: &str, title: &str) -> String {
+    let repo = short_repo(repo);
+    match qualifier.filter(|q| !q.is_empty() && *q != title) {
+        Some(q) if repo.is_empty() => q.to_string(),
+        Some(q) => format!("{repo}{sep}{q}"),
+        None => repo,
+    }
+}
+
+/// A pipeline run's outcome, lowercased to sit alongside the PR statuses ("open", "merged").
+fn pipe_status_label(status: PipelineRunStatus) -> &'static str {
+    match status {
+        PipelineRunStatus::Queued => "queued",
+        PipelineRunStatus::Running => "running",
+        PipelineRunStatus::Succeeded => "passed",
+        PipelineRunStatus::PartiallySucceeded => "partial",
+        PipelineRunStatus::Failed => "failed",
+        PipelineRunStatus::Canceled => "canceled",
+    }
+}
+
 /// The aligned cells for one Launchpad row. Every item type fills the *same* seven
-/// slots — type · status · #ref · title · detail · person · age — so rows read as
+/// slots — type · status · where · title · signal · person · age — so rows read as
 /// siblings and line up vertically, even though PRs, pipelines and work items differ.
-/// The "person" is the PR author / who ran the pipeline / the work-item assignee.
-fn lp_cells(theme: &Theme, e: &crate::launchpad::Entry, anim: usize) -> Vec<Vec<Span<'static>>> {
+///
+/// The three middle slots are what make a row legible, and each is type-appropriate:
+/// **where** locates the item (`forgetop #161`, `forgetop · CI`), **title** says what it is,
+/// and **signal** answers *why it is in front of you* — the blocker or check roll-up for a PR,
+/// the branch for a run. The "person" is the PR author / who ran the pipeline / the work-item
+/// assignee; `show_person` is false in the right-hand column, where every row is yours anyway
+/// and the name would just repeat down the pane (the empty cell collapses to zero width).
+fn lp_cells(theme: &Theme, e: &crate::launchpad::Entry, anim: usize, show_person: bool) -> Vec<Vec<Span<'static>>> {
     use crate::launchpad::EntryItem;
     let dim = Style::default().fg(theme.dim);
     let fg = Style::default().fg(theme.fg);
-    // Kept calm: type badge, ref, person and age are all grey; only the status and the
-    // git-diff +/- carry colour.
+    // Kept calm: type badge, where, person and age are all grey; only the status, the blocker
+    // and the git-diff +/- carry colour.
     let cell = |s: String, st: Style| vec![Span::styled(s, st)];
-    let person = |u: Option<&forgetop_core::domain::User>| cell(u.map(|u| u.display_name.clone()).unwrap_or_else(|| "—".into()), dim);
+    let person = |u: Option<&forgetop_core::domain::User>| {
+        if show_person {
+            cell(u.map(|u| u.display_name.clone()).unwrap_or_else(|| "—".into()), dim)
+        } else {
+            Vec::new()
+        }
+    };
     let age = |t| cell(rel_age(t), dim);
+    let diffstat = |add, del| {
+        vec![
+            Span::styled(format!("+{add}"), Style::default().fg(theme.green)),
+            Span::raw(" "),
+            Span::styled(format!("-{del}"), Style::default().fg(theme.red)),
+        ]
+    };
     match &e.item {
         EntryItem::Pr(pr) => {
             // Status is the PR's lifecycle state (Open / Draft / Merged / Closed).
             let (st, stc) = pr_status(theme, pr);
+            let number = pr.number.map(|n| format!("#{n}"));
+            // Why this row is here. A conflict or a changes-requested review is named in words —
+            // neither is visible anywhere else on the row — while failing checks are already
+            // legible as the red roll-up, so that case keeps the roll-up and the diffstat.
+            let signal = match pr.status {
+                // Nothing is blocking a finished PR; its size is the only thing still worth saying.
+                PullRequestStatus::Merged | PullRequestStatus::Closed => diffstat(pr.additions, pr.deletions),
+                _ => {
+                    let (sig, sigc) = pr_signal(theme, pr);
+                    let mut s = cell(sig, Style::default().fg(sigc));
+                    // A worded blocker fills the cell on its own; a check roll-up is short enough
+                    // to leave room for the size beside it.
+                    let worded = matches!(pr_state(pr), PrState::Blocked(PrBlocker::Conflicting | PrBlocker::ChangesRequested));
+                    if !worded {
+                        s.push(Span::raw("  "));
+                        s.extend(diffstat(pr.additions, pr.deletions));
+                    }
+                    s
+                }
+            };
             vec![
                 cell("PR".into(), dim),
                 cell(st.to_string(), Style::default().fg(stc)),
-                cell(pr.number.map(|n| format!("#{n}")).unwrap_or_default(), dim),
+                cell(lp_where(pr.repository.as_deref(), number.as_deref(), " ", &pr.title), dim),
                 cell(pr.title.clone(), fg),
-                vec![
-                    Span::styled(format!("+{}", pr.additions), Style::default().fg(theme.green)),
-                    Span::raw(" "),
-                    Span::styled(format!("-{}", pr.deletions), Style::default().fg(theme.red)),
-                ],
+                signal,
                 person(Some(&pr.author)),
                 age(pr.updated_at),
             ]
         }
         EntryItem::Pipe { run, definition_name } => {
-            let num = || run.number.map(|n| format!("#{n}")).unwrap_or_default();
-            let (title, reference) = match definition_name {
-                Some(def) => (def.clone(), run.name.clone().unwrap_or_else(num)),
-                None => (run.name.clone().unwrap_or_else(|| run.definition_id.clone()), num()),
-            };
+            // The title is what the run was *building* (commit subject / triggering PR), so the
+            // workflow it ran under belongs beside the repository instead.
+            let title = forgetop_core::launchpad::pipe_title(run, definition_name.as_deref());
+            let workflow = forgetop_core::launchpad::pipe_workflow(run, definition_name.as_deref());
+            let branch = run.branch.clone().map(|b| format!("⑂ {b}")).unwrap_or_default();
             vec![
                 cell("CI".into(), dim),
-                cell(format!("{} {:?}", pipeline_glyph(run.status, anim), run.status), Style::default().fg(theme.pipeline_color(run.status))),
-                cell(reference, dim),
-                cell(title, fg),
-                cell(run.branch.clone().unwrap_or_default(), dim),
+                cell(
+                    format!("{} {}", pipeline_glyph(run.status, anim), pipe_status_label(run.status)),
+                    Style::default().fg(theme.pipeline_color(run.status)),
+                ),
+                cell(lp_where(run.repository.as_deref(), Some(workflow), " · ", title), dim),
+                cell(title.to_string(), fg),
+                cell(branch, dim),
                 person(run.triggered_by.as_ref()),
                 age(run.finished_at.or(run.started_at)),
             ]
@@ -416,7 +486,7 @@ fn lp_cells(theme: &Theme, e: &crate::launchpad::Entry, anim: usize) -> Vec<Vec<
         EntryItem::Wi(wi) => vec![
             cell("WI".into(), dim),
             cell(format!("● {}", wi.state), Style::default().fg(wi_state_color(theme, &wi.state, wi.state_category))),
-            cell(wi.identifier.clone().unwrap_or_default(), dim),
+            cell(lp_where(wi.repository.as_deref(), wi.identifier.as_deref(), " ", &wi.title), dim),
             cell(wi.title.clone(), fg),
             cell(wi.work_item_type.clone().unwrap_or_default(), dim),
             person(wi.assignee.as_ref()),
@@ -439,8 +509,10 @@ fn lp_widths(rows: &[Vec<Vec<Span>>], flex: usize, inner_w: usize) -> Vec<usize>
             w[i] = w[i].max(cell_width(cell));
         }
     }
-    // Cap the person column so a long name doesn't crowd out the title (it scrolls instead).
+    // Cap the person and "where" columns so a long name or `repo · workflow` doesn't crowd out
+    // the title (they scroll instead).
     w[LP_PERSON_COL] = w[LP_PERSON_COL].min(LP_PERSON_MAX);
+    w[LP_WHERE_COL] = w[LP_WHERE_COL].min(LP_WHERE_MAX);
     let padding = COL_LEAD + LP_GAP * (LP_NCOL - 1);
     let fixed: usize = (0..LP_NCOL).filter(|&i| i != flex).map(|i| w[i]).sum::<usize>() + padding;
     w[flex] = w[flex].min(inner_w.saturating_sub(fixed)).max(3);
@@ -726,12 +798,111 @@ fn pr_status(theme: &Theme, pr: &PullRequest) -> (&'static str, ratatui::style::
     }
 }
 
+/// A `2/8`-style check roll-up behind `glyph`, or `glyph —` when the provider gave no per-check
+/// summary. The glyph is passed in because the *state* decides it, not `pr.checks`: a run that is
+/// half finished rounds to Passed or Failed there while the summary still shows work in flight.
+fn check_rollup(glyph: &str, pr: &PullRequest) -> String {
+    match &pr.check_summary {
+        Some(s) => format!("{glyph} {}/{}", s.successful, s.total()),
+        None => format!("{glyph} —"),
+    }
+}
+
 fn pr_checks(theme: &Theme, pr: &PullRequest) -> (String, ratatui::style::Color) {
-    let text = match &pr.check_summary {
-        Some(s) => format!("{} {}/{}", check_icon(pr.checks), s.successful, s.successful + s.failed + s.in_progress + s.neutral),
-        None => format!("{} —", check_icon(pr.checks)),
+    (check_rollup(check_icon(pr.checks), pr), theme.check_color(pr.checks))
+}
+
+/// The compact "what is stopping this" cell: the blocker when there is one, otherwise the check
+/// roll-up. Shared by the PR list's State column and the Command Center rows so the same pull
+/// request never reads as healthy in one place and blocked in another.
+fn pr_signal(theme: &Theme, pr: &PullRequest) -> (String, ratatui::style::Color) {
+    match pr_state(pr) {
+        PrState::Blocked(PrBlocker::Conflicting) => ("⚠ conflicts".into(), theme.yellow),
+        PrState::Blocked(PrBlocker::ChangesRequested) => ("⚠ changes".into(), theme.yellow),
+        PrState::Blocked(PrBlocker::ChecksFailing) => (check_rollup("✗", pr), theme.red),
+        PrState::ChecksRunning => (check_rollup("◐", pr), theme.blue),
+        _ => pr_checks(theme, pr),
+    }
+}
+
+/// How a pull request's merge state reads: a glyph and a word, coloured, rather than the raw
+/// enum name — only one of the four is good news, and a flat string doesn't say which.
+fn mergeable_meta(theme: &Theme, state: MergeableState) -> (&'static str, ratatui::style::Color) {
+    match state {
+        MergeableState::Mergeable => ("✓ clean", theme.green),
+        MergeableState::Conflicting => ("✗ conflicts", theme.red),
+        MergeableState::Blocked => ("⚠ blocked", theme.yellow),
+        // Not bad news — the forge just hasn't computed the merge yet. Colouring it would cry wolf.
+        MergeableState::Unknown => ("· unknown", theme.dim),
+    }
+}
+
+/// "5 of 8 checks passed", or `None` when the pull request has no CI to speak of.
+fn checks_clause(pr: &PullRequest) -> Option<String> {
+    match &pr.check_summary {
+        Some(s) if s.total() > 0 => Some(format!("{} of {} checks passed", s.successful, s.total())),
+        // No per-check numbers: fall back to the roll-up's word, and say nothing at all when
+        // there are no checks configured.
+        _ => match pr.checks {
+            CheckStatus::None => None,
+            CheckStatus::Passed => Some("checks passed".into()),
+            CheckStatus::Failed => Some("checks failing".into()),
+            CheckStatus::Pending => Some("checks running".into()),
+        },
+    }
+}
+
+/// The one-line verdict shown under the PR header: where this pull request stands, and why.
+/// Rendered from [`pr_state`], so it agrees with the list's State column and the Command Center.
+fn pr_state_line(theme: &Theme, pr: &PullRequest) -> Line<'static> {
+    let target = || pr.target_ref.clone().unwrap_or_else(|| "the target branch".into());
+    let who = |u: Option<&forgetop_core::domain::User>| u.map(|u| format!(" by {}", u.display_name)).unwrap_or_default();
+    let (glyph, text, color) = match pr_state(pr) {
+        PrState::Merged => {
+            let age = rel_age(pr.updated_at);
+            let when = if age == "—" { String::new() } else { format!(" {age} ago") };
+            ("✦", format!("Merged into {}{when}", target()), theme.magenta)
+        }
+        PrState::Closed => ("✗", "Closed without merging".into(), theme.red),
+        PrState::Draft => ("◌", "Draft — not open for review yet".into(), theme.dim),
+        PrState::Blocked(PrBlocker::Conflicting) => ("⚠", format!("Blocked — conflicts with {}", target()), theme.yellow),
+        PrState::Blocked(PrBlocker::ChangesRequested) => (
+            "⚠",
+            format!("Blocked — changes requested{}", who(pr_changes_requested_by(pr))),
+            theme.yellow,
+        ),
+        PrState::Blocked(PrBlocker::ChecksFailing) => {
+            // The count of failures, never total minus passed: with checks still in flight that
+            // subtraction reports work-in-progress as failed.
+            let detail = match &pr.check_summary {
+                Some(s) if s.failed > 0 => format!("{} of {} checks failed", s.failed, s.total()),
+                _ => "checks failing".into(),
+            };
+            ("✗", format!("Blocked — {detail}"), theme.red)
+        }
+        PrState::ChecksRunning => {
+            let detail = match &pr.check_summary {
+                Some(s) => format!("{} of {} done", s.total() - s.in_progress, s.total()),
+                None => "still running".into(),
+            };
+            ("◐", format!("Checks running — {detail}"), theme.blue)
+        }
+        PrState::ReadyToMerge => {
+            let mut parts: Vec<String> = checks_clause(pr).into_iter().collect();
+            parts.push(format!("approved{}", who(pr_approved_by(pr))));
+            ("✓", format!("Ready to merge — {}", parts.join(", ")), theme.green)
+        }
+        PrState::NothingBlocking => {
+            let mut parts: Vec<String> = checks_clause(pr).into_iter().collect();
+            if pr.reviewers.is_empty() {
+                parts.push("no reviews yet".into());
+            }
+            let detail = if parts.is_empty() { String::new() } else { format!(" — {}", parts.join(", ")) };
+            ("✓", format!("Nothing blocking{detail}"), theme.green)
+        }
     };
-    (text, theme.check_color(pr.checks))
+    let style = Style::default().fg(color).add_modifier(Modifier::BOLD);
+    Line::from(vec![Span::raw("  "), Span::styled(glyph.to_string(), style), Span::styled(format!("  {text}"), style)])
 }
 
 fn render_prs(frame: &mut Frame, area: Rect, app: &mut App) {
@@ -759,14 +930,16 @@ fn render_prs(frame: &mut Frame, area: Rect, app: &mut App) {
     let dim = Style::default().fg(theme.dim).add_modifier(Modifier::BOLD);
     // With one connection spanning an account, the provider/connection column no longer tells
     // rows apart — the repository is what does.
-    let headers = ["", "Provider", "Repository", "#", "Title", "Author", "Checks", "±", "Updated"];
+    // "State", not "Checks": a conflict or a changes-requested review stops a pull request just
+    // as dead as red CI, and a list that shows only checks reports both of those as healthy.
+    let headers = ["", "Provider", "Repository", "#", "Title", "Author", "State", "±", "Updated"];
     let cells: Vec<Vec<(String, Style)>> = idxs
         .iter()
         .map(|&i| &app.prs[i])
         .map(|row| {
             let pr = &row.pr;
             let (st, stc) = pr_status(theme, pr);
-            let (ck, ckc) = pr_checks(theme, pr);
+            let (ck, ckc) = pr_signal(theme, pr);
             vec![
                 (st.to_string(), Style::default().fg(stc)),
                 (provider_tag(row.provider, &row.connection), Style::default().fg(theme.cyan)),
@@ -915,9 +1088,15 @@ fn render_pipes(frame: &mut Frame, area: Rect, app: &mut App) {
 // ---- full-screen PR / work-item views ----
 
 fn field(theme: &Theme, label: &str, value: String) -> Line<'static> {
+    field_styled(theme, label, value, theme.fg)
+}
+
+/// A field whose value carries meaning in its colour — the merge gates, where a flat string
+/// leaves you unable to tell good news from bad.
+fn field_styled(theme: &Theme, label: &str, value: String, color: ratatui::style::Color) -> Line<'static> {
     Line::from(vec![
         Span::styled(format!("{label:<12}"), Style::default().fg(theme.dim)),
-        Span::styled(value, Style::default().fg(theme.fg)),
+        Span::styled(value, Style::default().fg(color)),
     ])
 }
 
@@ -977,7 +1156,14 @@ fn pr_conversation_lines(theme: &Theme, pr: &PullRequest, threads: &[CommentThre
     let mut lines = vec![
         field(theme, "Author", pr.author.display_name.clone()),
         field(theme, "Branch", format!("{} → {}", pr.source_ref.clone().unwrap_or_default(), pr.target_ref.clone().unwrap_or_default())),
-        field(theme, "Mergeable", format!("{:?}", pr.mergeable)),
+        {
+            let (ck, ckc) = pr_signal(theme, pr);
+            field_styled(theme, "Checks", ck, ckc)
+        },
+        {
+            let (mg, mgc) = mergeable_meta(theme, pr.mergeable);
+            field_styled(theme, "Mergeable", mg.to_string(), mgc)
+        },
         field(theme, "Changes", format!("{} files  +{} -{}", pr.changed_files, pr.additions, pr.deletions)),
     ];
     if !pr.reviewers.is_empty() {
@@ -1018,10 +1204,16 @@ fn pr_commit_lines(theme: &Theme, commits: &[Commit], sel: usize) -> Vec<Line<'s
         .iter()
         .enumerate()
         .map(|(i, c)| {
+            // Explicit gaps: `cell` pads *to* its width, so a value that exactly fills its
+            // column (a 9-character sha, say) would otherwise run straight into the next one.
+            let gap = || Span::raw(" ".repeat(COL_GAP));
             let mut line = Line::from(vec![
                 Span::styled(cell(&c.sha, 9), Style::default().fg(theme.yellow)),
+                gap(),
                 Span::styled(cell(&c.message, 56), Style::default().fg(theme.fg)),
+                gap(),
                 Span::styled(cell(&c.author, 16), Style::default().fg(theme.blue)),
+                gap(),
                 Span::styled(rel_age(c.date), Style::default().fg(theme.dim)),
             ]);
             if i == sel {
@@ -1052,9 +1244,11 @@ fn pr_checks_lines(theme: &Theme, checks: &[CheckRun]) -> Vec<Line<'static>> {
 
 /// Renders the PR view and returns the maximum scroll offset for the current tab.
 fn render_pr_view(frame: &mut Frame, area: Rect, theme: &Theme, view: &PrView) -> u16 {
+    // Header, the one-line verdict, the sub-tab bar, then the content. The verdict gets two rows
+    // and paints the first, so the blank one separates it from the tab bar below.
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Length(1), Constraint::Min(3)])
+        .constraints([Constraint::Length(3), Constraint::Length(2), Constraint::Length(1), Constraint::Min(3)])
         .split(area);
 
     // Header: title + status + branch + author.
@@ -1069,32 +1263,35 @@ fn render_pr_view(frame: &mut Frame, area: Rect, theme: &Theme, view: &PrView) -
     ]);
     frame.render_widget(Paragraph::new(header).block(section_block(theme, &view.label)), rows[0]);
 
+    // Where this pull request stands — visible from every tab, not just the Checks one.
+    frame.render_widget(Paragraph::new(pr_state_line(theme, &view.pr)), rows[1]);
+
     // Sub-tab bar.
-    frame.render_widget(Paragraph::new(pr_tabs_line(theme, view)), rows[1]);
+    frame.render_widget(Paragraph::new(pr_tabs_line(theme, view)), rows[2]);
 
     // Content.
     if view.tab == 3 {
-        render_diff(frame, rows[2], theme, &view.diff, &view.pending);
+        render_diff(frame, rows[3], theme, &view.diff, &view.pending);
         return 0; // the Diff tab manages its own scrolling
     }
     // Commits: a row cursor (Enter drills into that commit's diff), scroll follows it.
     if view.tab == 1 {
         let lines = pr_commit_lines(theme, &view.commits, view.commit_sel);
-        let inner_h = rows[2].height.saturating_sub(2) as usize;
+        let inner_h = rows[3].height.saturating_sub(2) as usize;
         let total = view.commits.len();
         let scroll = view.commit_sel.saturating_sub(inner_h / 2).min(total.saturating_sub(inner_h.max(1))) as u16;
-        frame.render_widget(Paragraph::new(lines).block(section_block(theme, "Commits")).scroll((scroll, 0)), rows[2]);
+        frame.render_widget(Paragraph::new(lines).block(section_block(theme, "Commits")).scroll((scroll, 0)), rows[3]);
         return 0;
     }
     let (title, lines) = match view.tab {
         0 => ("Conversation", pr_conversation_lines(theme, &view.pr, &view.diff.threads)),
         _ => ("Checks", pr_checks_lines(theme, &view.checks)),
     };
-    let inner_h = rows[2].height.saturating_sub(2);
+    let inner_h = rows[3].height.saturating_sub(2);
     let max = (lines.len() as u16).saturating_sub(inner_h);
     frame.render_widget(
         Paragraph::new(lines).block(section_block(theme, title)).scroll((view.scroll.min(max), 0)).wrap(Wrap { trim: false }),
-        rows[2],
+        rows[3],
     );
     max
 }
@@ -2379,6 +2576,15 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
+    /// A Launchpad entry in `bucket`, from a stub GitHub connection.
+    fn lp_entry(bucket: crate::launchpad::Bucket, item: crate::launchpad::EntryItem) -> crate::launchpad::Entry {
+        crate::launchpad::Entry { bucket, connection_id: "c".into(), connection: "GH".into(), provider: ProviderType::GitHub, item }
+    }
+
+    fn reviewer(name: &str, vote: ReviewVote) -> Reviewer {
+        Reviewer { user: User { id: name.into(), display_name: name.into(), handle: None, avatar_url: None }, vote, is_required: false }
+    }
+
     fn sample_pr() -> PullRequest {
         PullRequest {
             repository: None,
@@ -2499,6 +2705,113 @@ mod tests {
         assert!(out.contains("Add the widget"), "PR label in header");
         assert!(out.contains("Conversation") && out.contains("Checks") && out.contains("Diff"), "sub-tab bar");
         assert!(out.contains("Alice Ng"), "Conversation shows the author");
+    }
+
+    /// The PR screen has to answer "where does this stand" without you reading a field list or
+    /// opening the Checks tab. One line, from `pr_state`, above the sub-tabs.
+    #[test]
+    fn pr_screen_states_where_the_pull_request_stands() {
+        use crate::app::Screen;
+        let line = |f: &dyn Fn(&mut PullRequest)| {
+            let mut app = App::new("slate");
+            let mut v = pr_view(0, vec![], vec![]);
+            v.pr.check_summary = Some(CheckSummary { successful: 2, in_progress: 0, failed: 6, neutral: 0 });
+            v.pr.checks = CheckStatus::Failed;
+            f(&mut v.pr);
+            app.screen = Screen::PrView(Box::new(v));
+            render_to_string(&mut app, 92, 14)
+        };
+        let green = |p: &mut PullRequest| {
+            p.checks = CheckStatus::Passed;
+            p.check_summary = Some(CheckSummary { successful: 8, in_progress: 0, failed: 0, neutral: 0 });
+        };
+
+        // The count is the failures, not total-minus-passed.
+        assert!(line(&|_p| {}).contains("Blocked — 6 of 8 checks failed"));
+        assert!(line(&|p| {
+            green(p);
+            p.mergeable = MergeableState::Conflicting;
+        })
+        .contains("Blocked — conflicts with main"));
+        assert!(line(&|p| {
+            green(p);
+            p.reviewers = vec![reviewer("sam", ReviewVote::Rejected)];
+        })
+        .contains("Blocked — changes requested by sam"));
+        assert!(line(&|p| {
+            p.checks = CheckStatus::Pending;
+            p.check_summary = Some(CheckSummary { successful: 5, in_progress: 3, failed: 0, neutral: 0 });
+        })
+        .contains("Checks running — 5 of 8 done"));
+        // Green means nothing is in your way — approval or not.
+        assert!(line(&green).contains("Nothing blocking — 8 of 8 checks passed, no reviews yet"));
+        assert!(line(&|p| {
+            green(p);
+            p.reviewers = vec![reviewer("alice", ReviewVote::Approved)];
+        })
+        .contains("Ready to merge — 8 of 8 checks passed, approved by alice"));
+        // Lifecycle short-circuits: a merged PR keeps stale votes and merge state, and must not
+        // be described by them.
+        assert!(line(&|p| {
+            p.status = PullRequestStatus::Merged;
+            p.mergeable = MergeableState::Conflicting;
+        })
+        .contains("Merged into main"));
+        assert!(line(&|p| p.is_draft = true).contains("Draft — not open for review yet"));
+    }
+
+    /// The two gates on a merge are now both in the field list, and both say which way they fell.
+    #[test]
+    fn pr_screen_lists_both_merge_gates() {
+        use crate::app::Screen;
+        let mut app = App::new("slate");
+        let mut v = pr_view(0, vec![], vec![]);
+        v.pr.check_summary = Some(CheckSummary { successful: 8, in_progress: 0, failed: 0, neutral: 0 });
+        v.pr.mergeable = MergeableState::Unknown;
+        app.screen = Screen::PrView(Box::new(v));
+        let out = render_to_string(&mut app, 92, 20);
+        assert!(out.contains("Checks") && out.contains("✓ 8/8"), "checks field with its roll-up");
+        assert!(out.contains("Mergeable") && out.contains("· unknown"), "merge state as a word, not the raw enum");
+        assert!(!out.contains("Unknown"), "the raw enum name is gone");
+    }
+
+    /// `cell` pads *to* a width, so a value that exactly fills its column touches the next one —
+    /// a 9-character short sha ran straight into the commit subject.
+    #[test]
+    fn commit_rows_keep_a_gap_between_every_column() {
+        use crate::app::Screen;
+        let mut app = App::new("slate");
+        let mut v = pr_view(1, vec![], vec![]);
+        v.commits = vec![Commit {
+            sha: "497854a95".into(), // exactly the column width
+            message: "testing more and more".into(),
+            author: "magna-nz".into(),
+            date: None,
+            url: None,
+        }];
+        app.screen = Screen::PrView(Box::new(v));
+        let out = render_to_string(&mut app, 120, 20);
+        assert!(!out.contains("497854a95testing"), "sha must not run into the subject");
+        assert!(out.contains("497854a95   testing more and more"), "one gap between them");
+    }
+
+    /// The verdict needs air between it and the tab bar, so it reads as its own statement rather
+    /// than a label on the tabs.
+    #[test]
+    fn a_blank_row_separates_the_verdict_from_the_tab_bar() {
+        use crate::app::Screen;
+        let mut app = App::new("slate");
+        let mut v = pr_view(0, vec![], vec![]);
+        v.pr.checks = CheckStatus::Failed;
+        v.pr.check_summary = Some(CheckSummary { successful: 7, in_progress: 0, failed: 1, neutral: 0 });
+        app.screen = Screen::PrView(Box::new(v));
+        let width = 74usize;
+        let out = render_to_string(&mut app, width as u16, 15);
+        let chars: Vec<char> = out.chars().collect();
+        let rows: Vec<String> = chars.chunks(width).map(|r| r.iter().collect()).collect();
+        let verdict = rows.iter().position(|r| r.contains("Blocked — 1 of 8 checks failed")).expect("verdict row");
+        assert!(rows[verdict + 1].trim().is_empty(), "blank row under the verdict");
+        assert!(rows[verdict + 2].contains("Conversation"), "tab bar follows the blank row");
     }
 
     #[test]
@@ -2763,6 +3076,44 @@ mod tests {
         let out = render_to_string(&mut app, 160, 24);
         assert!(out.contains("Repository"), "repository header present");
         assert!(out.contains("payments"), "row names the repository it lives in");
+    }
+
+    /// The old Checks column reported a conflicted or changes-requested pull request as ✓ 8/8 —
+    /// identical to a genuinely clean one. The State column names whatever is actually stopping it.
+    #[test]
+    fn pr_list_state_column_names_the_blocker_not_just_the_checks() {
+        let row = |repo: &str, f: &dyn Fn(&mut PullRequest)| {
+            let mut pr = sample_pr();
+            pr.repository = Some(repo.into());
+            pr.checks = CheckStatus::Passed;
+            pr.check_summary = Some(CheckSummary { successful: 8, in_progress: 0, failed: 0, neutral: 0 });
+            f(&mut pr);
+            crate::app::PrRow { connection_id: "c".into(), connection: "GH".into(), provider: ProviderType::GitHub, pr }
+        };
+        let mut app = App::new("slate");
+        app.screen = Screen::List;
+        app.prs = vec![
+            row("acme/clean", &|_p| {}),
+            row("acme/conflicted", &|p| p.mergeable = MergeableState::Conflicting),
+            row("acme/rejected", &|p| p.reviewers = vec![reviewer("sam", ReviewVote::Rejected)]),
+            row("acme/failing", &|p| {
+                p.checks = CheckStatus::Failed;
+                p.check_summary = Some(CheckSummary { successful: 2, in_progress: 0, failed: 6, neutral: 0 });
+            }),
+            row("acme/running", &|p| {
+                p.checks = CheckStatus::Pending;
+                p.check_summary = Some(CheckSummary { successful: 5, in_progress: 3, failed: 0, neutral: 0 });
+            }),
+        ];
+        app.pr_state.select(Some(0));
+        let out = render_to_string(&mut app, 180, 24);
+
+        assert!(out.contains("State") && !out.contains("Checks"), "the column is State now");
+        assert!(out.contains("⚠ conflicts"), "a conflict is named, not hidden behind green checks");
+        assert!(out.contains("⚠ changes"), "a changes-requested review is named");
+        assert!(out.contains("✗ 2/8"), "failing checks keep their roll-up");
+        assert!(out.contains("◐ 5/8"), "in-flight checks read as running, not passed");
+        assert!(out.contains("✓ 8/8"), "the genuinely clean row still says so");
     }
 
     #[test]
@@ -3086,6 +3437,7 @@ mod tests {
         assert!(out.contains("add a connection"), "health bar should prompt to add a connection");
     }
 
+
     #[test]
     fn launchpad_renders_two_columns_with_typed_rows() {
         use crate::launchpad::{Bucket, Entry, EntryItem};
@@ -3099,11 +3451,13 @@ mod tests {
         let pr = {
             let mut p = sample_pr();
             p.title = "Add retry policy".into();
+            p.repository = Some("acme/payments".into());
             p
         };
         let run = {
             let mut r = sample_run();
             r.name = Some("nightly".into());
+            r.repository = Some("acme/payments".into());
             r
         };
         let wi = WorkItem {
@@ -3136,9 +3490,147 @@ mod tests {
         // … and nav-style detail: PR number + change stats, WI id/state/type, pipeline branch.
         assert!(out.contains("#42") && out.contains("+10 -2"), "PR row shows number and change stats");
         assert!(out.contains("FOR-1") && out.contains("Todo") && out.contains("Bug"), "work-item row shows id, state, type");
-        assert!(out.contains("CI Build") && out.contains("main"), "pipeline row shows pipeline name + branch");
+        assert!(out.contains("CI Build") && out.contains("⑂ main"), "pipeline row shows pipeline name + branch");
         // The person column shows the PR author (not the provider).
         assert!(out.contains("Alice Ng"), "PR row shows the author");
+    }
+
+    /// One connection now spans an account, so the row has to say which repository it came from —
+    /// the same reason the PR list grew a Repository column. The owner is dropped: it repeats.
+    #[test]
+    fn launchpad_rows_name_the_repository_they_came_from() {
+        let mut app = App::new("slate");
+        let pr = {
+            let mut p = sample_pr();
+            p.repository = Some("acme/payments".into());
+            p
+        };
+        let run = {
+            let mut r = sample_run();
+            r.repository = Some("acme/billing".into());
+            r.title = Some("Bump axum to 0.8".into());
+            r
+        };
+        app.lp = vec![
+            lp_entry(crate::launchpad::Bucket::NeedsReview, crate::launchpad::EntryItem::Pr(pr)),
+            lp_entry(
+                crate::launchpad::Bucket::NeedsFixing,
+                crate::launchpad::EntryItem::Pipe { run, definition_name: Some("CI Build".into()) },
+            ),
+        ];
+        let out = render_to_string(&mut app, 140, 24);
+        assert!(out.contains("payments #42"), "PR row pairs the repository with its number");
+        assert!(out.contains("billing · CI Build"), "pipeline row pairs the repository with its workflow");
+        assert!(!out.contains("acme/"), "the owner repeats on every row, so it is dropped");
+    }
+
+    /// The run title (GitHub's `display_title`) says what was *built*; the workflow name moves
+    /// beside the repository. Providers that expose no run title fall back to the workflow name,
+    /// and it is then shown once rather than in both slots.
+    #[test]
+    fn pipeline_rows_title_the_commit_not_the_workflow() {
+        let render = |title: Option<&str>| {
+            let mut app = App::new("slate");
+            let mut run = sample_run();
+            run.repository = Some("acme/billing".into());
+            run.name = None;
+            run.title = title.map(Into::into);
+            app.lp = vec![lp_entry(
+                crate::launchpad::Bucket::RecentPipelines,
+                crate::launchpad::EntryItem::Pipe { run, definition_name: Some("Integration".into()) },
+            )];
+            render_to_string(&mut app, 200, 24)
+        };
+
+        let out = render(Some("Bump axum to 0.8"));
+        assert!(out.contains("Bump axum to 0.8"), "the run's own title is the row title");
+        assert!(out.contains("billing · Integration"), "the workflow sits beside the repository");
+
+        // GitLab and Azure DevOps expose no per-run title: the workflow becomes the title, and
+        // must not also appear as its own qualifier (the "Integration | Integration" wart).
+        let out = render(None);
+        assert!(out.contains("Integration"), "falls back to the workflow name for the title");
+        assert!(!out.contains("Integration · Integration") && !out.contains("· Integration"), "never shown twice");
+    }
+
+    /// "Needs fixing" asserts something the row has to be able to evidence. A conflict or a
+    /// changes-requested review is named in words; failing checks read as the red roll-up.
+    #[test]
+    fn needs_fixing_rows_say_what_is_blocking_them() {
+        let render = |checks, mergeable, votes: &[ReviewVote]| {
+            let mut app = App::new("slate");
+            let mut pr = sample_pr();
+            pr.checks = checks;
+            pr.mergeable = mergeable;
+            pr.check_summary = Some(CheckSummary { successful: 2, failed: 3, in_progress: 0, neutral: 0 });
+            pr.reviewers = votes
+                .iter()
+                .map(|&vote| Reviewer { user: User { id: "r".into(), display_name: "Rae".into(), handle: None, avatar_url: None }, vote, is_required: false })
+                .collect();
+            app.lp = vec![lp_entry(crate::launchpad::Bucket::NeedsFixing, crate::launchpad::EntryItem::Pr(pr))];
+            render_to_string(&mut app, 140, 24)
+        };
+
+        assert!(render(CheckStatus::Passed, MergeableState::Conflicting, &[]).contains("⚠ conflicts"), "a conflict is named");
+        assert!(
+            render(CheckStatus::Passed, MergeableState::Mergeable, &[ReviewVote::Rejected]).contains("⚠ changes"),
+            "a changes-requested review is named"
+        );
+        // Red checks are already legible as the roll-up, so that case keeps the counts + diffstat.
+        let out = render(CheckStatus::Failed, MergeableState::Mergeable, &[]);
+        assert!(out.contains("✗ 2/5") && out.contains("+10 -2"), "failing checks show the roll-up and the size");
+        // A conflict outranks the rest, so only one reason is ever shown.
+        let both = render(CheckStatus::Failed, MergeableState::Conflicting, &[ReviewVote::Rejected]);
+        assert!(both.contains("⚠ conflicts") && !both.contains("⚠ changes") && !both.contains("✗ 2/5"), "one reason wins");
+    }
+
+    /// A merged pull request keeps whatever `mergeable` and reviewer votes it had when it was
+    /// open, so asking what blocks it gives a stale answer. Nothing blocks a merged PR — the row
+    /// must show its size, never a blocker.
+    #[test]
+    fn merged_and_closed_rows_never_claim_to_be_blocked() {
+        let render = |status| {
+            let mut app = App::new("slate");
+            let mut pr = sample_pr();
+            pr.status = status;
+            pr.repository = Some("acme/payments".into());
+            // Exactly the state that would read as blocked while the PR was still open.
+            pr.mergeable = MergeableState::Conflicting;
+            pr.checks = CheckStatus::Failed;
+            pr.reviewers = vec![Reviewer {
+                user: User { id: "r".into(), display_name: "Rae".into(), handle: None, avatar_url: None },
+                vote: ReviewVote::Rejected,
+                is_required: false,
+            }];
+            app.lp = vec![lp_entry(crate::launchpad::Bucket::RecentlyMerged, crate::launchpad::EntryItem::Pr(pr))];
+            render_to_string(&mut app, 140, 24)
+        };
+
+        for status in [PullRequestStatus::Merged, PullRequestStatus::Closed] {
+            let out = render(status);
+            assert!(out.contains("+10 -2"), "{status:?} row shows its size");
+            assert!(!out.contains("⚠"), "{status:?} row claims no blocker");
+            assert!(!out.contains("✗ 2/5") && !out.contains("· —"), "{status:?} row shows no check roll-up");
+        }
+    }
+
+    /// Every row in the right-hand column is yours by construction, so the author name would just
+    /// repeat down the pane. The width goes to the title instead.
+    #[test]
+    fn your_work_column_drops_the_author() {
+        let mut app = App::new("slate");
+        let pr = {
+            let mut p = sample_pr();
+            p.repository = Some("acme/payments".into());
+            p
+        };
+        app.lp = vec![lp_entry(crate::launchpad::Bucket::YourOpenPrs, crate::launchpad::EntryItem::Pr(pr.clone()))];
+        assert!(!render_to_string(&mut app, 140, 24).contains("Alice Ng"), "no author in Your work");
+
+        // The left column still names who is asking something of you.
+        let mut app = App::new("slate");
+        app.lp = vec![lp_entry(crate::launchpad::Bucket::NeedsReview, crate::launchpad::EntryItem::Pr(pr))];
+        assert!(render_to_string(&mut app, 140, 24).contains("Alice Ng"), "author kept in Needs you");
     }
 
     #[test]
