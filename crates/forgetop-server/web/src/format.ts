@@ -201,6 +201,24 @@ function checksClause(pr: PullRequest): string | null {
   }
 }
 
+/** What is stopping this pull request, as a pill: the blocker when there is one, otherwise the
+ *  check roll-up. Mirrors the TUI's `pr_signal`, which fills its list's State column and its
+ *  Command Center rows — a conflicted or changes-requested PR must not read as healthy just
+ *  because CI is green. `spin` marks in-flight checks. */
+export function prSignalMeta(pr: PullRequest): Meta & { spin: boolean } {
+  const st = prState(pr);
+  if (st.kind === "blocked" && st.blocker === "conflicting") {
+    return { label: "conflicts", icon: "⚠", color: V("yellow"), spin: false };
+  }
+  if (st.kind === "blocked" && st.blocker === "changes_requested") {
+    return { label: "changes requested", icon: "⚠", color: V("yellow"), spin: false };
+  }
+  if (st.kind === "checks_running") {
+    return { ...checkMeta("Pending"), spin: true };
+  }
+  return { ...checkMeta(pr.checks), spin: false };
+}
+
 /** The one-line verdict: where this pull request stands, and why. Same sentences as the TUI's
  *  `pr_state_line`, from the same `prState`. */
 export function prStateLine(pr: PullRequest): { icon: string; text: string; color: string } {
