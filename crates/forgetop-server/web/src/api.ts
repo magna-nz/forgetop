@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import type { ConnectionRow, FileChange, HealthRow, LaunchpadResponse, NotifRow, PipeRef, PipelineDetail, PipeRow, Preferences, PrDecoration, PrDetail, PrRef, ProviderInfo, PrRow, RepositoryPage, WiDetail, WiRef, WiRow } from "./types";
+import type { ConnectionRow, FileChange, HealthRow, LaunchpadResponse, NotifRow, PipeRef, PipelineDetail, PipeRow, PrDecoration, PrDetail, PrRef, ProviderInfo, PrRow, RepositoryPage, WiDetail, WiRef, WiRow } from "./types";
 
 // The session token arrives once in the URL (`/?t=…`). We stash it in sessionStorage (so a
 // refresh keeps working) and strip it from the visible URL, then replay it on every API call.
@@ -170,7 +170,6 @@ export const useHealth = () => useQuery({ queryKey: ["health"], queryFn: () => a
 export const useProviders = () =>
   useQuery({ queryKey: ["providers"], queryFn: () => api<ProviderInfo[]>("/api/providers"), staleTime: Infinity });
 export const useConnections = () => useQuery({ queryKey: ["connections"], queryFn: () => api<ConnectionRow[]>("/api/connections") });
-export const usePreferences = () => useQuery({ queryKey: ["preferences"], queryFn: () => api<Preferences>("/api/preferences") });
 /** Which slice of pull requests the PR page shows; maps to the backend `?view=` param. */
 export type PrView = "all" | "yours" | "merged" | "review_requested";
 export const usePullRequests = (view: PrView = "all") =>

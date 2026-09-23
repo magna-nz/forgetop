@@ -61,7 +61,6 @@
 <li><a href="#web-dashboard">Web dashboard</a>
 <ul class="sub-nav">
 <li><a href="#opening-it">Opening it</a></li>
-<li><a href="#when-forgetop-starts">When forgetop starts</a></li>
 <li><a href="#connections-settings">Connections &amp; settings</a></li>
 <li><a href="#security-1">Security</a></li>
 </ul>
@@ -252,14 +251,13 @@
 <div class="table-wrap"><table>
 <thead><tr><th>Command</th><th>What it does</th></tr></thead>
 <tbody>
-<tr><td><code>forgetop</code></td><td>Launch — the terminal UI and the web dashboard together (default)</td></tr>
+<tr><td><code>forgetop</code></td><td>Launch the terminal UI (the web dashboard is served in the background — press <code>B</code>)</td></tr>
 <tr><td><code>forgetop --dashboard</code></td><td>Serve <strong>only</strong> the web dashboard (headless — no TUI)</td></tr>
 <tr><td><code>forgetop --demo</code> (<code>-d</code>)</td><td>Launch with built-in demo data (no setup)</td></tr>
 <tr><td><code>forgetop doctor</code></td><td>Diagnose config, keychain access, and connection health</td></tr>
 <tr><td><code>forgetop --version</code> (<code>-V</code>)</td><td>Print the version and exit</td></tr>
 <tr><td><code>forgetop --help</code> (<code>-h</code>)</td><td>Show usage and exit</td></tr>
 </tbody></table></div>
-<p>Set <strong><code>FORGETOP_STARTUP</code></strong> = <code>both</code> / <code>terminal_only</code> / <code>dashboard_only</code> to override what launches for a single run (handy with <code>--demo</code>, whose config is in-memory).</p>
 </div>
 <div class="rail"></div>
 </div>
@@ -280,19 +278,7 @@
 </li>
 <li><strong>Headless:</strong> <code>forgetop --dashboard</code> serves it and opens your browser — no TTY, so it's handy over SSH with a forwarded port.
 </li>
-<li>By default, running <code>forgetop</code> opens <strong>both</strong> at once.
-</li>
 </ul>
-<h3 id="when-forgetop-starts">When forgetop starts <a class="anchor" href="#when-forgetop-starts" aria-label="Link to this section">#</a></h3>
-<p>A shared preference decides what launches — set it in the dashboard under <strong>Settings → When forgetop starts</strong>, or press <strong><code>,</code></strong> in the TUI:</p>
-<div class="table-wrap"><table>
-<thead><tr><th>Option</th><th>Behaviour</th></tr></thead>
-<tbody>
-<tr><td><strong>Dashboard + terminal</strong> (default)</td><td>Opens both together</td></tr>
-<tr><td><strong>Terminal only</strong></td><td>Just the TUI (the server still runs in the background, so <code>B</code> works)</td></tr>
-<tr><td><strong>Dashboard only</strong></td><td>Just the browser dashboard — same as <code>forgetop --dashboard</code></td></tr>
-</tbody></table></div>
-<p>The choice is stored in your config and shared between the two. For a one-off override (without changing the saved setting) use the <code>FORGETOP_STARTUP</code> env var above.</p>
 <h3 id="connections-settings">Connections &amp; settings <a class="anchor" href="#connections-settings" aria-label="Link to this section">#</a></h3>
 <p>Connection setup lives in the dashboard's <strong>Settings</strong> page: add a provider from a form tailored to it, paste a token (stored in the OS keychain), tick which sections it feeds, and <strong>Test</strong> / <strong>Edit</strong> / <strong>Delete</strong> it. First launch with nothing set up opens this automatically. Pressing <strong><code>C</code></strong> in the TUI jumps straight here.</p>
 <h3 id="security-1">Security <a class="anchor" href="#security-1" aria-label="Link to this section">#</a></h3>
@@ -740,7 +726,6 @@
 <tr><td><code>o</code></td><td>Open selected item in browser</td></tr>
 <tr><td><code>B</code></td><td>Open the web dashboard in your browser</td></tr>
 <tr><td><code>F</code></td><td>Open the public GitHub feedback issue form</td></tr>
-<tr><td><code>,</code></td><td>Settings — what forgetop opens on launch</td></tr>
 <tr><td><code>v</code></td><td>Choose which tabs are visible</td></tr>
 <tr><td><code>C</code></td><td>Open the connections page (in the web dashboard)</td></tr>
 <tr><td><code>r</code></td><td>Refresh · <code>t</code> cycle theme</td></tr>

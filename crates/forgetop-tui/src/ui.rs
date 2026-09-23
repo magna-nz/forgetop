@@ -1189,7 +1189,7 @@ fn base_footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
         return overlay.hint();
     }
     if matches!(app.screen, Screen::Launchpad) {
-        return vec![("↑↓", "move"), ("←→", "columns"), ("↵", "open"), ("D", "dismiss"), ("Tab", "sections"), ("r", "refresh"), (",", "settings"), ("?", "help"), ("q", "quit")];
+        return vec![("↑↓", "move"), ("←→", "columns"), ("↵", "open"), ("D", "dismiss"), ("Tab", "sections"), ("r", "refresh"), ("?", "help"), ("q", "quit")];
     }
     if let Screen::PrView(v) = &app.screen {
         // A merged PR only offers Revert; an open one offers approve / (reject) / merge.
@@ -1267,7 +1267,7 @@ fn base_footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
         keys.push(("g", "repos"));
     }
     keys.push(("/", "find"));
-    keys.extend([(",", "settings"), ("v", "tabs"), ("C", "connections"), ("r", "refresh"), ("t", "theme"), ("?", "help"), ("q", "quit")]);
+    keys.extend([("v", "tabs"), ("C", "connections"), ("r", "refresh"), ("t", "theme"), ("?", "help"), ("q", "quit")]);
     keys
 }
 
@@ -2140,7 +2140,6 @@ fn help_sections() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
                 ("S", "Sort by column (re-pick flips direction)"),
                 ("g", "Repositories — which ones this section fetches from"),
                 ("o", "Open selected in browser"),
-                (",", "Settings — what forgetop opens on launch"),
                 ("v", "Choose which tabs are visible"),
                 ("C", "Connections (opens the dashboard)"),
                 ("r", "Refresh    t  cycle theme"),

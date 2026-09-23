@@ -140,7 +140,8 @@ Then run it for real:
 forgetop
 ```
 
-This opens the **terminal UI and the dashboard together** (the default).
+This opens the **terminal UI**. The web dashboard runs in the background — press `B` to
+open it in your browser, or run `forgetop --dashboard` for the dashboard on its own.
 
 ## Documentation
 

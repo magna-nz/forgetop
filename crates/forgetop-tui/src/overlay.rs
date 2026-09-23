@@ -2,7 +2,6 @@
 //! When an overlay is open, the app routes every key to it via [`Overlay::handle`]
 //! instead of the table, so there's no ambiguity between typing and navigation.
 
-use forgetop_core::config::StartupMode;
 use forgetop_core::domain::ReviewVote;
 use forgetop_core::provider::MergeStrategy;
 
@@ -51,8 +50,6 @@ pub enum Action {
     OpenReviewMenu,
     /// From the unsubmitted-comments prompt: leave the PR view, discarding pending comments.
     LeavePrView,
-    /// Set the startup preference (what `forgetop` opens on launch).
-    SetStartupMode(StartupMode),
     /// First run: add the first connection here, in the terminal wizard.
     SetupInTerminal,
     /// First run: hand setup to the browser dashboard and wait for it to land.
@@ -102,8 +99,6 @@ pub enum PickerKind {
     RepoScopeConnection,
     /// Shown on Esc when line comments are buffered but unsubmitted: submit or leave.
     PendingExit,
-    /// Choose what `forgetop` opens on launch (a shared preference).
-    StartupMode,
     /// First run: set up the first connection in the terminal, or in the browser.
     SetupLocation,
 }
@@ -363,14 +358,6 @@ fn resolve_picker(kind: PickerKind, selected: usize, items: &[String]) -> Action
             0 => Action::OpenReviewMenu,
             _ => Action::LeavePrView,
         },
-        PickerKind::StartupMode => {
-            let mode = match selected {
-                1 => StartupMode::TerminalOnly,
-                2 => StartupMode::DashboardOnly,
-                _ => StartupMode::Both,
-            };
-            Action::SetStartupMode(mode)
-        }
         // The terminal is the default and sits first: forgetop is a TUI that happens to
         // serve a dashboard, and the first screen should say so.
         PickerKind::SetupLocation => match selected {
@@ -554,14 +541,6 @@ mod tests {
         assert!(matches!(resolve_picker(PickerKind::SetupLocation, 0, &items), Action::SetupInTerminal));
         assert!(matches!(resolve_picker(PickerKind::SetupLocation, 1, &items), Action::SetupInBrowser));
         assert!(matches!(resolve_picker(PickerKind::SetupLocation, 99, &items), Action::SetupInTerminal));
-    }
-
-    #[test]
-    fn startup_picker_maps_each_mode() {
-        use forgetop_core::config::StartupMode::*;
-        assert!(matches!(resolve_picker(PickerKind::StartupMode, 0, &[]), Action::SetStartupMode(Both)));
-        assert!(matches!(resolve_picker(PickerKind::StartupMode, 1, &[]), Action::SetStartupMode(TerminalOnly)));
-        assert!(matches!(resolve_picker(PickerKind::StartupMode, 2, &[]), Action::SetStartupMode(DashboardOnly)));
     }
 
     #[test]

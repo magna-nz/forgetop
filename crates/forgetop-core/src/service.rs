@@ -284,12 +284,6 @@ impl ConfigService {
         self.persist(cfg).await
     }
 
-    pub async fn set_startup_mode(&self, mode: crate::config::StartupMode) -> Result<()> {
-        let mut cfg = self.snapshot();
-        cfg.ui.startup_mode = mode;
-        self.persist(cfg).await
-    }
-
     pub async fn set_hidden_sections(&self, hidden: Vec<Section>) -> Result<()> {
         let mut cfg = self.snapshot();
         cfg.ui.hidden_sections = hidden;
@@ -672,7 +666,6 @@ mod tests {
         // None of these change what gets fetched, so none should cost a round of
         // network calls. This is the half of the behaviour that regresses silently.
         svc.set_theme(Some("slate".into())).await.unwrap();
-        svc.set_startup_mode(crate::config::StartupMode::TerminalOnly).await.unwrap();
         svc.set_hidden_sections(vec![Section::Pipelines]).await.unwrap();
         svc.set_notifications(NotificationPrefs::default()).await.unwrap();
 
