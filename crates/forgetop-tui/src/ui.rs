@@ -1672,16 +1672,21 @@ fn patch_line(theme: &Theme, line: &str) -> Line<'static> {
     Line::from(Span::styled(line.to_string(), Style::default().fg(patch_fg(theme, line))))
 }
 
-/// Semantic token kind → an indexed theme colour (never truecolor RGB).
-fn hl_color(theme: &Theme, kind: HlKind) -> ratatui::style::Color {
+/// Semantic token kind → an indexed theme colour (never truecolor RGB), plus the text
+/// modifiers the markup kinds need (a heading is bold, a link underlined).
+fn hl_style(theme: &Theme, kind: HlKind) -> Style {
+    let base = Style::default();
     match kind {
-        HlKind::Keyword => theme.magenta,
-        HlKind::Type => theme.cyan,
-        HlKind::Str => theme.green,
-        HlKind::Comment => theme.dim,
-        HlKind::Number => theme.yellow,
-        HlKind::Func => theme.blue,
-        HlKind::Punct | HlKind::Plain => theme.fg,
+        HlKind::Keyword => base.fg(theme.magenta),
+        HlKind::Type => base.fg(theme.cyan),
+        HlKind::Str => base.fg(theme.green),
+        HlKind::Comment => base.fg(theme.dim),
+        HlKind::Number => base.fg(theme.yellow),
+        HlKind::Func => base.fg(theme.blue),
+        HlKind::Heading => base.fg(theme.magenta).add_modifier(Modifier::BOLD),
+        HlKind::Link => base.fg(theme.blue).add_modifier(Modifier::UNDERLINED),
+        HlKind::Emph => base.fg(theme.fg).add_modifier(Modifier::BOLD),
+        HlKind::Punct | HlKind::Plain => base.fg(theme.fg),
     }
 }
 
@@ -1702,7 +1707,7 @@ fn patch_line_hl(theme: &Theme, line: &str, hl: Option<&mut LineHighlighter>) ->
     };
     let mut spans = vec![Span::styled(marker.to_string(), Style::default().fg(marker_color))];
     for (text, kind) in hl.line(source) {
-        spans.push(Span::styled(text, Style::default().fg(hl_color(theme, kind))));
+        spans.push(Span::styled(text, hl_style(theme, kind)));
     }
     Line::from(spans)
 }
@@ -3406,6 +3411,22 @@ mod tests {
             line.spans.iter().any(|s| s.content.contains('5') && s.style.fg == Some(theme.yellow)),
             "number is yellow"
         );
+    }
+
+    #[test]
+    fn patch_line_styles_markup_kinds_with_modifiers() {
+        use crate::highlight::{Lang, LineHighlighter};
+        let theme = Theme::by_name("slate");
+        let mut hl = LineHighlighter::new(Lang::Markdown).unwrap();
+        let line = patch_line_hl(&theme, "+# Title", Some(&mut hl));
+
+        // The add marker still keeps its own green, unbolded.
+        assert_eq!(line.spans[0].content, "+");
+        assert!(!line.spans[0].style.add_modifier.contains(Modifier::BOLD));
+        // The heading itself is magenta *and* bold — the modifier a plain colour can't carry.
+        let head = line.spans.iter().find(|s| s.content.contains("Title")).expect("a heading span");
+        assert_eq!(head.style.fg, Some(theme.magenta));
+        assert!(head.style.add_modifier.contains(Modifier::BOLD), "heading is bold");
     }
 
     #[test]
