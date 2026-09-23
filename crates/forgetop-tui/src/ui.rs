@@ -372,6 +372,9 @@ const LP_PERSON_COL: usize = 5;
 const LP_PERSON_MAX: usize = 16;
 /// Gap between Launchpad columns — tighter than the nav lists since a column is half-width.
 const LP_GAP: usize = 2;
+/// Blank columns kept at the end of a row. The title column is elastic and would otherwise eat
+/// every spare column, leaving the age hard up against the pane border.
+const LP_TRAIL: usize = 3;
 
 /// Joins a repository with the qualifier that identifies an item inside it — a PR number, a
 /// workflow name, a work-item key. Either half may be missing (Jira and Linear aren't
@@ -500,8 +503,8 @@ fn cell_width(cell: &[Span]) -> usize {
     cell.iter().map(|s| s.content.chars().count()).sum()
 }
 
-/// Sizes each Launchpad column to its widest cell, clamping the flexible title column
-/// so the row still fits `inner_w`.
+/// Sizes each Launchpad column to its widest cell, clamping the flexible title column so the row
+/// fits `inner_w` with [`LP_TRAIL`] columns to spare.
 fn lp_widths(rows: &[Vec<Vec<Span>>], flex: usize, inner_w: usize) -> Vec<usize> {
     let mut w = vec![0usize; LP_NCOL];
     for row in rows {
@@ -513,7 +516,7 @@ fn lp_widths(rows: &[Vec<Vec<Span>>], flex: usize, inner_w: usize) -> Vec<usize>
     // the title (they scroll instead).
     w[LP_PERSON_COL] = w[LP_PERSON_COL].min(LP_PERSON_MAX);
     w[LP_WHERE_COL] = w[LP_WHERE_COL].min(LP_WHERE_MAX);
-    let padding = COL_LEAD + LP_GAP * (LP_NCOL - 1);
+    let padding = COL_LEAD + LP_GAP * (LP_NCOL - 1) + LP_TRAIL;
     let fixed: usize = (0..LP_NCOL).filter(|&i| i != flex).map(|i| w[i]).sum::<usize>() + padding;
     w[flex] = w[flex].min(inner_w.saturating_sub(fixed)).max(3);
     w
@@ -3438,6 +3441,32 @@ mod tests {
     }
 
 
+    /// The title column is elastic and would otherwise absorb every spare column, leaving the age
+    /// pressed against the pane border.
+    #[test]
+    fn launchpad_rows_keep_a_gutter_before_the_pane_border() {
+        use crate::launchpad::{Bucket, EntryItem};
+        let mut app = App::new("slate");
+        let mut pr = sample_pr();
+        pr.repository = Some("magna-nz/forgetop".into());
+        pr.title = "a title long enough that the flexible column wants every spare column".into();
+        pr.updated_at = Some(Utc::now() - chrono::Duration::hours(4));
+        app.lp = vec![lp_entry(Bucket::NeedsFixing, EntryItem::Pr(pr))];
+
+        // The gutter holds across widths, since it is reserved before the title column is sized
+        // rather than being whatever happens to be left over. (Below roughly 130 the fixed
+        // columns alone overflow a half-width pane and the row truncates regardless — that is
+        // pre-existing, and not what this pins.)
+        for width in [140usize, 170, 200] {
+            let out = render_to_string(&mut app, width as u16, 12);
+            let chars: Vec<char> = out.chars().collect();
+            let row: String = chars.chunks(width).nth(5).expect("row").iter().collect();
+            let left: String = row.chars().skip(1).take_while(|&c| c != '│').collect();
+            assert!(left.contains("4h"), "the row reaches its age column at width {width}");
+            assert_eq!(left.len() - left.trim_end().len(), LP_TRAIL, "gutter kept at width {width}");
+        }
+    }
+
     #[test]
     fn launchpad_renders_two_columns_with_typed_rows() {
         use crate::launchpad::{Bucket, Entry, EntryItem};
@@ -3480,7 +3509,7 @@ mod tests {
             entry(Bucket::NeedsFixing, EntryItem::Pipe { run, definition_name: Some("CI Build".into()) }),
             entry(Bucket::YourWork, EntryItem::Wi(wi)),
         ];
-        let out = render_to_string(&mut app, 140, 24);
+        let out = render_to_string(&mut app, 170, 24);
         // Two named columns.
         assert!(out.contains("Needs you") && out.contains("Your work"), "two columns");
         // Buckets land in the right columns.
