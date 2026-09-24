@@ -9,6 +9,22 @@ Adding a release: one `## <version> — <date>` section, a line per user-visible
 and the pull request each one came from. `git log v<previous>..HEAD --merges` lists the
 candidates.
 
+## 1.1.3 — 2026-09-24
+
+Fixed
+
+- `Esc` and `q` step back instead of quitting. `Esc` on a section list used to quit forgetop
+  outright, and `q` quit from every screen it was bound on — both against the contract the
+  help panel already stated ("Esc back / close"), and neither advertised in the list footer,
+  so the only way to find them was to lose a session to one. Both keys now close what is open
+  and return to where it was opened from, and do nothing at the Command Center, which is the
+  root. **Ctrl-C is the only key that leaves the app.** The footers, the help panel and the
+  docs keymap all say so. ([#190](https://github.com/magna-nz/forgetop/pull/190))
+
+Release
+
+- 1.1.3 version bump. ([#190](https://github.com/magna-nz/forgetop/pull/190))
+
 ## 1.1.2 — 2026-09-24
 
 Added
