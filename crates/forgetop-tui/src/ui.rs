@@ -11,7 +11,10 @@ use ratatui::widgets::{
 };
 use ratatui::Frame;
 
-use crate::app::{dashboard_target, App, ConfigView, DiffFocus, DiffView, LpSlot, PipelineView, PrView, Screen, WiView, PR_TABS, TABS};
+use crate::app::{
+    dashboard_target, pipe_definition_name, App, ConfigView, DiffFocus, DiffView, LpSlot, PipeGroup, PipeHead, PipeLine,
+    PipeRow, PipelineView, PrView, Screen, WiView, PR_TABS, TABS,
+};
 use crate::diff::{cursor_line_label, pending_marks};
 use crate::highlight::{lang_for, HlKind, LineHighlighter};
 use crate::overlay::Overlay;
@@ -1088,10 +1091,208 @@ fn render_wis(frame: &mut Frame, area: Rect, app: &mut App) {
 
 // ---- Pipelines ----
 
+/// One column of the Pipelines table.
+///
+/// The set is not fixed: a column is shown when the lines on screen can actually fill it.
+/// That single rule covers everything below — a Provider column saying "GitHub" on every row
+/// is nine characters of nothing, and a Branch column is meaningless above a group that spans
+/// four of them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PipeCol {
+    /// Expand arrow on a header, tree glyph on a child. Nothing when ungrouped.
+    Tree,
+    Status,
+    Provider,
+    /// The group's name on a header; on a run, whatever varies inside its group.
+    Subject,
+    /// "5 runs · 3 failed" on a header, the run's own number on a run.
+    Runs,
+    /// Only when ungrouped. Every grouped mode carries the branch in Subject instead —
+    /// on the header when it is the key, on the child when it is what varies.
+    Branch,
+    Commit,
+    Started,
+    Repository,
+    Approval,
+}
+
+impl PipeCol {
+    fn heading(self, app: &App, any_open: bool) -> String {
+        match self {
+            PipeCol::Tree | PipeCol::Status => String::new(),
+            PipeCol::Provider => "Provider".into(),
+            PipeCol::Subject => app.pipe_subject_heading(any_open).into(),
+            // Ungrouped, the cell is one run's number, not a count of them.
+            PipeCol::Runs => if app.pipe_group == PipeGroup::Off { "Run" } else { "Runs" }.into(),
+            PipeCol::Branch => "Branch".into(),
+            PipeCol::Commit => "Commit".into(),
+            PipeCol::Started => "Started".into(),
+            PipeCol::Repository => "Repository".into(),
+            PipeCol::Approval => "Approval".into(),
+        }
+    }
+}
+
+/// Picks the columns for what is currently on screen.
+fn pipe_columns(app: &App, lines: &[PipeLine], multi_provider: bool) -> Vec<PipeCol> {
+    let grouped = app.pipe_group != PipeGroup::Off;
+    let approvals = lines.iter().any(|l| match l {
+        PipeLine::Head(h) => h.approval,
+        PipeLine::Run(i) => app.pipes[*i].awaiting_approval,
+    });
+
+    let mut cols = Vec::new();
+    if grouped {
+        cols.push(PipeCol::Tree);
+    }
+    cols.push(PipeCol::Status);
+    if multi_provider {
+        cols.push(PipeCol::Provider);
+    }
+    cols.push(PipeCol::Subject);
+    cols.push(PipeCol::Runs);
+    // Ungrouped there is no header to carry the branch and no child to put it in Subject,
+    // so it needs its own column — this mode must stay the list the tab had before grouping.
+    if !grouped {
+        cols.push(PipeCol::Branch);
+    }
+    if app.pipe_group == PipeGroup::Trigger {
+        cols.push(PipeCol::Commit);
+    }
+    cols.push(PipeCol::Started);
+    cols.push(PipeCol::Repository);
+    if approvals {
+        cols.push(PipeCol::Approval);
+    }
+    cols
+}
+
+/// Which live column the active sort marks.
+///
+/// The Pipelines columns are chosen per render, so a fixed key-to-index table (the way the
+/// other two sections do it) points at whatever column happens to sit at that index — the
+/// arrow ends up over Repository while the list is sorted by start time. Resolving through
+/// the column itself also means a sort on a column that is not currently shown draws no
+/// arrow at all, rather than a wrong one.
+fn pipe_sort_marker(app: &App, cols: &[PipeCol]) -> Option<(usize, bool)> {
+    let sort = app.sort_for(2)?;
+    let col = match sort.key.as_str() {
+        "status" => PipeCol::Status,
+        "provider" => PipeCol::Provider,
+        "repository" => PipeCol::Repository,
+        "started" => PipeCol::Started,
+        // Grouped, both of these are rendered in Subject — the header carries one and the
+        // child the other. Ungrouped they are separate columns again.
+        "pipeline" => PipeCol::Subject,
+        "branch" => {
+            if app.pipe_group == PipeGroup::Off {
+                PipeCol::Branch
+            } else {
+                PipeCol::Subject
+            }
+        }
+        _ => return None,
+    };
+    Some((cols.iter().position(|c| *c == col)?, sort.desc))
+}
+
+/// Drops the least important columns until the table fits the pane.
+///
+/// `columnize` clamps only its flexible column and never drops one, so an unusually wide set
+/// — two providers, a commit and a waiting gate all at once — pushes the rightmost columns
+/// off the edge. Approval is the one column that is only ever present *because* something
+/// needs attention, so it must not be the thing that falls off; Repository, Commit and
+/// Provider are context and give way first.
+fn fit_columns(cols: &mut Vec<PipeCol>, cells: &mut [Vec<(String, Style)>], headings: &[String], inner_w: usize) {
+    let natural = |cols: &[PipeCol], cells: &[Vec<(String, Style)>]| -> usize {
+        let mut w: Vec<usize> = headings.iter().map(|h| h.chars().count()).collect();
+        for row in cells.iter() {
+            for (i, (text, _)) in row.iter().enumerate() {
+                w[i] = w[i].max(text.chars().count());
+            }
+        }
+        w.iter().sum::<usize>() + COL_LEAD + COL_GAP * cols.len().saturating_sub(1)
+    };
+
+    for droppable in [PipeCol::Repository, PipeCol::Commit, PipeCol::Provider] {
+        if natural(cols, cells) <= inner_w {
+            return;
+        }
+        if let Some(at) = cols.iter().position(|c| *c == droppable) {
+            cols.remove(at);
+            for row in cells.iter_mut() {
+                row.remove(at);
+            }
+        }
+    }
+}
+
+/// The owner prefix every repository on screen shares, if they all share one.
+///
+/// With a single owner the prefix is pure repetition down the column, so it is elided and
+/// `magna-nz/forgetop` reads as `forgetop`. Two owners and it stays, because then it matters.
+fn shared_owner(app: &App, idxs: &[usize]) -> Option<String> {
+    let mut owner: Option<String> = None;
+    for &i in idxs {
+        let repo = app.pipes[i].run.repository.clone().unwrap_or_default();
+        let (o, rest) = repo.split_once('/')?;
+        if rest.is_empty() {
+            return None;
+        }
+        match &owner {
+            Some(prev) if prev != o => return None,
+            Some(_) => {}
+            None => owner = Some(o.to_string()),
+        }
+    }
+    owner
+}
+
+fn strip_owner(repo: &str, owner: Option<&String>) -> String {
+    match owner {
+        Some(o) => repo.strip_prefix(&format!("{o}/")).unwrap_or(repo).to_string(),
+        None => repo.to_string(),
+    }
+}
+
+/// A short, capitalised outcome for the status column — `PartiallySucceeded` spelled in full
+/// is eighteen characters of column for a state nobody scans for.
+fn pipe_status_word(status: PipelineRunStatus) -> &'static str {
+    match status {
+        PipelineRunStatus::Queued => "Queued",
+        PipelineRunStatus::Running => "Running",
+        PipelineRunStatus::PartiallySucceeded => "Partial",
+        PipelineRunStatus::Canceled => "Canceled",
+        PipelineRunStatus::Succeeded => "Passed",
+        PipelineRunStatus::Failed => "Failed",
+    }
+}
+
+/// A run's outcome as a cell. The glyph and its colour carry pass and fail on their own — the
+/// word is nine characters repeating down every row — so it is kept only for the states a tick
+/// or a cross cannot make obvious.
+fn pipe_status_cell(status: PipelineRunStatus, anim: usize) -> String {
+    let glyph = pipeline_glyph(status, anim);
+    match status {
+        PipelineRunStatus::Succeeded | PipelineRunStatus::Failed => glyph.to_string(),
+        other => format!("{glyph} {}", pipe_status_word(other)),
+    }
+}
+
 fn render_pipes(frame: &mut Frame, area: Rect, app: &mut App) {
     let theme = &app.theme;
     let idxs = app.filtered_pipe_indices();
-    let title = list_title(with_scope("Pipelines".to_string(), app, 2), &app.filters[2]);
+    let mut base = with_scope("Pipelines".to_string(), app, 2);
+    if app.pipe_group != PipeGroup::Off && !idxs.is_empty() {
+        // The column arrow means "runs sort by this", within each group. Group order is a
+        // separate fact, so it is stated — but only while it is the whole story: with an
+        // explicit sort the runs inside a group no longer follow it.
+        base.push_str(&format!(" · by {}", app.pipe_group.as_str()));
+        if app.pipe_sort.is_none() {
+            base.push_str(" (newest first)");
+        }
+    }
+    let title = list_title(base, &app.filters[2]);
     if idxs.is_empty() {
         let msg = if !app.filters[2].is_empty() {
             "No matches. Esc clears the filter.".to_string()
@@ -1110,39 +1311,130 @@ fn render_pipes(frame: &mut Frame, area: Rect, app: &mut App) {
 
     let inner_w = area.width.saturating_sub(2) as usize;
     let dim = Style::default().fg(theme.dim).add_modifier(Modifier::BOLD);
-    let headers = ["", "Provider", "Pipeline", "Run", "Branch", "Started", "Approval"];
-    let cells: Vec<Vec<(String, Style)>> = idxs
+    let lines = app.pipe_lines();
+    let any_open = lines.iter().any(|l| matches!(l, PipeLine::Head(h) if h.expanded));
+
+    let mut providers: Vec<String> = idxs.iter().map(|&i| provider_tag(app.pipes[i].provider, &app.pipes[i].connection)).collect();
+    providers.sort();
+    providers.dedup();
+    let cols = pipe_columns(app, &lines, providers.len() > 1);
+    let owner = shared_owner(app, &idxs);
+
+    // Headers and runs are the same shape now, so they go through `columnize` together and
+    // every column is measured across both. Laying headers out separately was what let the
+    // roll-up drift to the right edge, under no heading at all.
+    let cells: Vec<Vec<(String, Style)>> = lines
         .iter()
-        .map(|&i| &app.pipes[i])
-        .map(|p| {
-            let color = theme.pipeline_color(p.run.status);
-            let approval = if p.awaiting_approval {
-                ("approval needed".to_string(), Style::default().fg(theme.red).add_modifier(Modifier::BOLD))
-            } else {
-                (String::new(), Style::default().fg(theme.dim))
-            };
-            // Pipeline = definition name ("CI Build"); Run = the run/release ("10.1.100"),
-            // or the run number when it has no name.
-            let num = || p.run.number.map(|n| format!("#{n}")).unwrap_or_default();
-            let pipeline = p.definition_name.clone().or_else(|| p.run.name.clone()).unwrap_or_else(|| p.run.definition_id.clone());
-            let run = match &p.definition_name {
-                Some(_) => p.run.name.clone().unwrap_or_else(num),
-                None => num(),
-            };
-            vec![
-                (format!("{} {:?}", pipeline_glyph(p.run.status, app.anim), p.run.status), Style::default().fg(color)),
-                (provider_tag(p.provider, &p.connection), Style::default().fg(theme.cyan)),
-                (pipeline, Style::default().fg(theme.fg)),
-                (run, Style::default().fg(theme.dim)),
-                (p.run.branch.clone().unwrap_or_default(), Style::default().fg(theme.dim)),
-                (rel_age(p.run.started_at), Style::default().fg(theme.dim)),
-                approval,
-            ]
+        .enumerate()
+        .map(|(n, line)| match line {
+            PipeLine::Head(h) => cols.iter().map(|c| head_cell(*c, h, theme, app.anim, owner.as_ref())).collect(),
+            PipeLine::Run(i) => {
+                let p = &app.pipes[*i];
+                let child = app.pipe_group != PipeGroup::Off;
+                let subject = if child { format!("─ {}", app.pipe_child_subject(p)) } else { pipe_definition_name(p) };
+                // The next line tells us whether this run closes its group, so `└` costs a
+                // peek rather than a scan back through the list for every row.
+                let last = !matches!(lines.get(n + 1), Some(PipeLine::Run(_)));
+                cols.iter().map(|c| run_cell(*c, p, &subject, last, child, theme, app.anim, owner.as_ref())).collect()
+            }
         })
         .collect();
 
-    let (header, rows) = columnize(dim, &headers, &cells, 2, inner_w, sort_marker(app, 2));
+    let mut cols = cols;
+    let mut cells = cells;
+    let headings: Vec<String> = cols.iter().map(|c| c.heading(app, any_open)).collect();
+    fit_columns(&mut cols, &mut cells, &headings, inner_w);
+
+    let headings: Vec<String> = cols.iter().map(|c| c.heading(app, any_open)).collect();
+    let heading_refs: Vec<&str> = headings.iter().map(String::as_str).collect();
+    let flex = cols.iter().position(|c| *c == PipeCol::Subject).unwrap_or(0);
+    let (header, rows) = columnize(dim, &heading_refs, &cells, flex, inner_w, pipe_sort_marker(app, &cols));
     render_inline_list(frame, area, app, &title, header, rows);
+}
+
+fn head_cell(col: PipeCol, h: &PipeHead, theme: &Theme, anim: usize, owner: Option<&String>) -> (String, Style) {
+    let dim = Style::default().fg(theme.dim);
+    match col {
+        PipeCol::Tree => (if h.expanded { "▾" } else { "▸" }.to_string(), Style::default().fg(theme.dim)),
+        PipeCol::Status => (
+            pipe_status_cell(h.status, anim),
+            Style::default().fg(theme.pipeline_color(h.status)),
+        ),
+        PipeCol::Provider => (provider_tag(h.provider, &h.connection), Style::default().fg(theme.cyan)),
+        PipeCol::Subject => (h.subject.clone(), Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+        PipeCol::Runs => {
+            let text = format!(
+                "{} {}{}",
+                h.runs,
+                if h.runs == 1 { "run" } else { "runs" },
+                if h.failed > 0 { format!(" · {} failed", h.failed) } else { String::new() }
+            );
+            let style = if h.failed > 0 { Style::default().fg(theme.red) } else { dim };
+            (text, style)
+        }
+        // Only ever present when ungrouped, where there are no headers — kept total so the
+        // cell count can never disagree with the heading count.
+        PipeCol::Branch => (String::new(), dim),
+        PipeCol::Commit => (h.commit.clone(), dim),
+        PipeCol::Started => (rel_age(h.started), dim),
+        PipeCol::Repository => (strip_owner(&h.repo, owner), dim),
+        PipeCol::Approval => {
+            if h.approval {
+                ("approval needed".to_string(), Style::default().fg(theme.red).add_modifier(Modifier::BOLD))
+            } else {
+                (String::new(), dim)
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_cell(
+    col: PipeCol,
+    p: &PipeRow,
+    subject: &str,
+    last: bool,
+    child: bool,
+    theme: &Theme,
+    anim: usize,
+    owner: Option<&String>,
+) -> (String, Style) {
+    let dim = Style::default().fg(theme.dim);
+    match col {
+        // Tree is only in the set when grouped, and every run is then a child.
+        PipeCol::Tree => ((if last { "└" } else { "├" }).to_string(), Style::default().fg(theme.dim)),
+        PipeCol::Status => (
+            pipe_status_cell(p.run.status, anim),
+            Style::default().fg(theme.pipeline_color(p.run.status)),
+        ),
+        PipeCol::Provider => (provider_tag(p.provider, &p.connection), Style::default().fg(theme.cyan)),
+        PipeCol::Subject => (subject.to_string(), Style::default().fg(theme.fg)),
+        PipeCol::Runs => {
+            // Run = the run/release name ("10.1.100"), or the run number when it has no name.
+            let num = || p.run.number.map(|n| format!("#{n}")).unwrap_or_default();
+            let text = match &p.definition_name {
+                Some(_) => p.run.name.clone().unwrap_or_else(num),
+                None => num(),
+            };
+            (text, dim)
+        }
+        PipeCol::Branch => (p.run.branch.clone().unwrap_or_default(), dim),
+        PipeCol::Commit => (p.run.commit_sha.as_deref().unwrap_or_default().chars().take(7).collect(), dim),
+        PipeCol::Started => (rel_age(p.run.started_at), dim),
+        // A child's repository is its group's, already on the header; repeating it is the
+        // noise grouping exists to remove.
+        PipeCol::Repository => (
+            if child { String::new() } else { strip_owner(&p.run.repository.clone().unwrap_or_default(), owner) },
+            dim,
+        ),
+        PipeCol::Approval => {
+            if p.awaiting_approval {
+                ("approval needed".to_string(), Style::default().fg(theme.red).add_modifier(Modifier::BOLD))
+            } else {
+                (String::new(), dim)
+            }
+        }
+    }
 }
 
 // ---- full-screen PR / work-item views ----
@@ -1513,7 +1805,7 @@ fn base_footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
     match app.active {
         0 => keys.extend([("↵", "open"), ("f", "status"), ("S", "sort"), ("o", "browser")]),
         1 => keys.extend([("↵", "open"), ("f", "states"), ("S", "sort"), ("o", "browser")]),
-        2 => keys.extend([("↵", "drill-in"), ("S", "sort"), ("T", "trigger"), ("o", "open")]),
+        2 => keys.extend([("↵", "expand / drill-in"), ("G", "group"), ("S", "sort"), ("T", "trigger"), ("o", "open")]),
         _ => {}
     }
     if app.views[app.active].len() > 1 {
@@ -2453,6 +2745,9 @@ fn help_sections() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
         (
             "Pipelines",
             vec![
+                ("G", "Group by pipeline / trigger / branch / off"),
+                ("Enter or Space (on a group)", "Expand / collapse"),
+                ("z  Z", "Collapse / expand every group"),
                 ("Enter", "Drill in (stages → jobs → steps)"),
                 ("Enter (in drill-in)", "Expand / collapse a node"),
                 ("L", "View the selected job's logs"),
@@ -3446,9 +3741,348 @@ mod tests {
             run: sample_run(),
         });
         app.pipe_state.select(Some(0));
+
+        // Collapsed, the group header carries the flag — otherwise a gate waiting inside a
+        // closed group would be invisible.
+        // The tree glyph `└` closes a group, so it appears on a child row and nowhere else —
+        // the precise test for whether the run itself is on screen.
         let out = render_to_string(&mut app, 150, 24);
         assert!(out.contains("Approval"), "approval column header present");
-        assert!(out.contains("approval needed"), "the awaiting row is flagged");
+        assert!(out.contains("approval needed"), "the collapsed group announces the gate");
+        assert!(!out.contains('└'), "and the run row is put away");
+
+        // Expanded, the run's own Approval cell carries it. This is the assertion the test
+        // was making before grouping existed; grouping moved it behind an expand.
+        let key = match &app.pipe_lines()[0] {
+            crate::app::PipeLine::Head(h) => h.key.clone(),
+            crate::app::PipeLine::Run(_) => panic!("header"),
+        };
+        app.pipe_expanded.insert(key);
+        let out = render_to_string(&mut app, 150, 24);
+        assert!(out.contains('└'), "the run row itself is rendered, hanging off the group");
+        assert!(out.contains("approval needed"), "and the row's Approval cell is flagged");
+
+        // Ungrouped, the row stands alone and must still be flagged.
+        app.pipe_group = crate::app::PipeGroup::Off;
+        let out = render_to_string(&mut app, 150, 24);
+        assert!(!out.contains('└') && !out.contains('▸'), "no tree glyphs when grouping is off");
+        assert!(out.contains("approval needed"), "and the run is still flagged");
+    }
+
+    /// The default landing for the tab: one line per pipeline, carrying the repository the
+    /// flat table has no column for, and the runs put away until asked for.
+    #[test]
+    fn pipelines_list_groups_by_pipeline_and_lands_collapsed() {
+        use crate::app::{PipeGroup, PipeRow};
+        let row = |def: &str, sha: &str, status: PipelineRunStatus| {
+            let mut run = sample_run();
+            run.id = format!("{def}-{sha}");
+            run.definition_id = def.to_lowercase();
+            run.repository = Some("nz/app".into());
+            run.commit_sha = Some(sha.into());
+            run.status = status;
+            PipeRow {
+                connection_id: "c".into(),
+                connection: "GH".into(),
+                provider: ProviderType::GitHub,
+                definition_name: Some(def.into()),
+                awaiting_approval: false,
+                run,
+            }
+        };
+        let mut app = App::new("slate");
+        app.screen = Screen::List;
+        app.active = 2;
+        app.pipes = vec![
+            row("CI", "aaa", PipelineRunStatus::Succeeded),
+            row("CI", "bbb", PipelineRunStatus::Failed),
+            row("Integration", "aaa", PipelineRunStatus::Succeeded),
+        ];
+        app.pipe_state.select(Some(0));
+
+        let out = render_to_string(&mut app, 150, 24);
+        assert!(out.contains("by pipeline"), "the title says how the list is arranged");
+        assert!(out.contains("2 runs"), "the CI header counts what is underneath it");
+        assert!(out.contains("1 failed"), "a failure inside a collapsed group is still announced");
+        // The owner prefix is shared by every row, so it is elided: `nz/app` reads as `app`.
+        // Asserting on "app" alone would pass either way — it is a substring of "nz/app".
+        assert!(out.contains("Repository"), "the repository has a column of its own");
+        assert!(!out.contains("nz/app"), "shared owner prefix elided");
+        assert!(out.contains("app"), "but the repository itself is still named");
+        assert!(out.contains("▸"), "groups are collapsed");
+
+        // Expanding the first group brings its runs onto the screen.
+        let key = match &app.pipe_lines()[0] {
+            crate::app::PipeLine::Head(h) => h.key.clone(),
+            crate::app::PipeLine::Run(_) => panic!("header"),
+        };
+        app.pipe_expanded.insert(key);
+        let out = render_to_string(&mut app, 150, 24);
+        assert!(out.contains("▾"), "the opened group is marked open");
+
+        // Grouping off is the list the tab had before grouping existed.
+        app.pipe_group = PipeGroup::Off;
+        let out = render_to_string(&mut app, 150, 24);
+        assert!(!out.contains("▸") && !out.contains("▾"), "no headers when grouping is off");
+        assert!(!out.contains("by pipeline"), "and the title drops the arrangement note");
+    }
+
+    /// Builds a pipelines list from (definition, repo, branch, sha, minutes-ago, status).
+    fn pipe_list(rows: &[(&str, &str, &str, &str, i64, PipelineRunStatus)]) -> App {
+        use crate::app::PipeRow;
+        let mut app = App::new("slate");
+        app.screen = Screen::List;
+        app.active = 2;
+        app.pipes = rows
+            .iter()
+            .enumerate()
+            .map(|(n, (def, repo, branch, sha, mins, st))| {
+                let mut run = sample_run();
+                run.id = format!("{def}-{sha}");
+                run.definition_id = def.to_lowercase();
+                run.repository = Some((*repo).into());
+                run.branch = Some((*branch).into());
+                run.commit_sha = Some((*sha).into());
+                run.number = Some(n as i64 + 1);
+                run.name = None;
+                run.started_at = Some(Utc::now() - chrono::Duration::minutes(*mins));
+                run.status = *st;
+                PipeRow {
+                    connection_id: "c".into(),
+                    connection: "GH".into(),
+                    provider: ProviderType::GitHub,
+                    definition_name: Some((*def).into()),
+                    awaiting_approval: false,
+                    run,
+                }
+            })
+            .collect();
+        app.pipe_state.select(Some(0));
+        app
+    }
+
+    /// A column every row fills identically is nine characters of nothing. Provider only
+    /// earns its place once there is more than one provider to tell apart.
+    #[test]
+    fn the_provider_column_appears_only_when_providers_differ() {
+        use PipelineRunStatus::Succeeded as S;
+        let mut app = pipe_list(&[
+            ("CI", "nz/app", "main", "aaa", 10, S),
+            ("Integration", "nz/app", "main", "aaa", 12, S),
+        ]);
+        let out = render_to_string(&mut app, 150, 16);
+        assert!(!out.contains("Provider"), "one provider, so no Provider column");
+
+        app.pipes[1].provider = ProviderType::GitLab;
+        app.pipes[1].connection = "GL".into();
+        let out = render_to_string(&mut app, 150, 16);
+        assert!(out.contains("Provider"), "two providers, so the column is worth its width");
+    }
+
+    /// The owner prefix repeats down the whole column when there is only one owner.
+    #[test]
+    fn a_shared_repository_owner_is_elided() {
+        use PipelineRunStatus::Succeeded as S;
+        let mut app = pipe_list(&[
+            ("CI", "magna-nz/forgetop", "main", "aaa", 10, S),
+            ("Release", "magna-nz/test-pg", "main", "bbb", 12, S),
+        ]);
+        let out = render_to_string(&mut app, 150, 16);
+        assert!(out.contains("forgetop") && out.contains("test-pg"), "both repositories named");
+        assert!(!out.contains("magna-nz/"), "the owner every row shares is dropped");
+
+        // A second owner makes the prefix meaningful again.
+        app.pipes[1].run.repository = Some("other-org/test-pg".into());
+        let out = render_to_string(&mut app, 150, 16);
+        assert!(out.contains("magna-nz/") && out.contains("other-org/"), "two owners, both kept");
+    }
+
+    /// Expanded, a run puts its own branch where the group's name sits — so every row has a
+    /// value right after the tree gutter instead of a run of empty columns.
+    #[test]
+    fn a_child_run_takes_the_subject_slot_with_what_varies() {
+        use PipelineRunStatus::Succeeded as S;
+        let mut app = pipe_list(&[
+            ("CI", "nz/app", "main", "aaa", 10, S),
+            ("CI", "nz/app", "v2.0", "bbb", 20, S),
+        ]);
+        // "Pipelines" is the section title, so `contains("Pipeline")` proves nothing on its
+        // own — the heading is checked exactly, and Branch by its absence.
+        let out = render_to_string(&mut app, 150, 16);
+        assert!(!out.contains("Branch"), "collapsed: no Branch column");
+        assert!(!out.contains("main") && !out.contains("v2.0"), "the group spans branches, so names none");
+
+        let key = match &app.pipe_lines()[0] {
+            crate::app::PipeLine::Head(h) => h.key.clone(),
+            crate::app::PipeLine::Run(_) => panic!("header"),
+        };
+        app.pipe_expanded.insert(key);
+        let out = render_to_string(&mut app, 150, 16);
+        assert!(out.contains("Pipeline / Branch"), "the heading names both kinds of value");
+        assert!(out.contains("─ main") && out.contains("─ v2.0"), "each run names its own branch");
+        assert!(out.contains('├') && out.contains('└'), "and hangs off the tree gutter");
+    }
+
+    /// Grouped by branch the relationship inverts: the header names the branch, and the runs
+    /// under it name their pipelines.
+    #[test]
+    fn grouping_by_branch_inverts_what_the_subject_column_holds() {
+        use PipelineRunStatus::Succeeded as S;
+        let mut app = pipe_list(&[
+            ("CI", "nz/app", "main", "aaa", 10, S),
+            ("Integration", "nz/app", "main", "aaa", 12, S),
+        ]);
+        app.pipe_group = crate::app::PipeGroup::Branch;
+        let key = match &app.pipe_lines()[0] {
+            crate::app::PipeLine::Head(h) => h.key.clone(),
+            crate::app::PipeLine::Run(_) => panic!("header"),
+        };
+        app.pipe_expanded.insert(key);
+        let out = render_to_string(&mut app, 150, 16);
+        assert!(out.contains("Branch / Pipeline"), "heading reads the other way round");
+        assert!(out.contains("─ CI") && out.contains("─ Integration"), "runs name their pipelines");
+    }
+
+    /// The word repeats down every row for the two states a glyph already makes obvious.
+    #[test]
+    fn the_status_column_spells_out_only_the_states_a_glyph_cannot() {
+        use PipelineRunStatus::{Running, Succeeded};
+        let mut app = pipe_list(&[("CI", "nz/app", "main", "aaa", 10, Succeeded)]);
+        let out = render_to_string(&mut app, 150, 16);
+        assert!(!out.contains("Passed") && !out.contains("Succeeded"), "a tick says it");
+
+        app.pipes[0].run.status = Running;
+        let out = render_to_string(&mut app, 150, 16);
+        assert!(out.contains("Running"), "a spinner does not, so the word stays");
+
+        // The same rule has to hold for a run rendered as a child, not just for a header.
+        let key = match &app.pipe_lines()[0] {
+            crate::app::PipeLine::Head(h) => h.key.clone(),
+            crate::app::PipeLine::Run(_) => panic!("header"),
+        };
+        app.pipe_expanded.insert(key);
+        app.pipes[0].run.status = Succeeded;
+        let out = render_to_string(&mut app, 150, 16);
+        assert!(out.contains('└'), "the child is on screen");
+        assert!(!out.contains("Passed") && !out.contains("Succeeded"), "and spells nothing out either");
+    }
+
+    /// Approval is the rarest column of all — it should not hold the table open when nothing
+    /// anywhere is waiting.
+    #[test]
+    fn the_approval_column_appears_only_when_a_gate_is_waiting() {
+        use PipelineRunStatus::Succeeded as S;
+        let mut app = pipe_list(&[("CI", "nz/app", "main", "aaa", 10, S)]);
+        let out = render_to_string(&mut app, 150, 16);
+        assert!(!out.contains("Approval"), "nothing waiting, so no column");
+
+        app.pipes[0].awaiting_approval = true;
+        let out = render_to_string(&mut app, 150, 16);
+        assert!(out.contains("Approval") && out.contains("approval needed"), "a gate brings it back");
+    }
+
+    /// The arrow has to mark the column the sort actually applies to. The columns are picked
+    /// per render, so a fixed key-to-index table points at whatever now sits at that index —
+    /// it marked Repository while the list was sorted by start time.
+    #[test]
+    fn the_sort_arrow_follows_the_live_column_set() {
+        use forgetop_core::config::SortPref;
+        use PipelineRunStatus::Succeeded as S;
+        let mut app = pipe_list(&[
+            ("CI", "nz/app", "main", "aaa", 10, S),
+            ("Integration", "nz/app", "v2.0", "bbb", 20, S),
+        ]);
+
+        // The heading that carries the arrow, whatever it is.
+        let marked = |out: &str| -> String {
+            out.lines()
+                .find(|l| l.contains('▼') || l.contains('▲'))
+                .and_then(|l| {
+                    let cut = l.find(['▼', '▲'])?;
+                    Some(l[..cut].split("   ").last().unwrap_or("").trim().to_string())
+                })
+                .unwrap_or_default()
+        };
+
+        app.pipe_sort = Some(SortPref { key: "started".into(), desc: true });
+        assert_eq!(marked(&render_to_string(&mut app, 150, 16)), "Started", "grouped by pipeline");
+
+        app.pipe_group = crate::app::PipeGroup::Trigger;
+        assert_eq!(marked(&render_to_string(&mut app, 150, 16)), "Started", "and by trigger");
+
+        app.pipe_group = crate::app::PipeGroup::Off;
+        assert_eq!(marked(&render_to_string(&mut app, 150, 16)), "Started", "and ungrouped");
+
+        app.pipe_sort = Some(SortPref { key: "pipeline".into(), desc: false });
+        assert_eq!(marked(&render_to_string(&mut app, 150, 16)), "Pipeline", "the subject column");
+
+        // Sorting by a column this arrangement does not show draws no arrow — better than
+        // drawing one over the wrong heading.
+        app.pipe_group = crate::app::PipeGroup::Pipeline;
+        app.pipe_sort = Some(SortPref { key: "provider".into(), desc: false });
+        let out = render_to_string(&mut app, 150, 16);
+        assert!(!out.contains('▼') && !out.contains('▲'), "one provider, so no column and no arrow");
+    }
+
+    /// Grouping off must be the list the tab had before grouping existed — which means the
+    /// branch is on screen, since there is no header or child row to carry it.
+    #[test]
+    fn the_ungrouped_list_still_has_a_branch_column() {
+        use PipelineRunStatus::Succeeded as S;
+        let mut app = pipe_list(&[("CI", "nz/app", "release/2.0", "aaa", 10, S)]);
+        app.pipe_group = crate::app::PipeGroup::Off;
+        let out = render_to_string(&mut app, 150, 16);
+        assert!(out.contains("Branch"), "the column is there");
+        assert!(out.contains("release/2.0"), "and the run's branch is in it");
+        assert!(out.contains("Run ") || out.contains("Run\n"), "one run's number, so the heading is singular");
+    }
+
+    /// Approval is only ever in the set because something needs attention, so it must not be
+    /// the column that falls off a narrow pane.
+    #[test]
+    fn a_narrow_pane_drops_context_columns_before_the_waiting_gate() {
+        use PipelineRunStatus::Succeeded as S;
+        let mut app = pipe_list(&[
+            ("Integration", "magna-nz/forgetop", "claude/changelog-release-notes", "aaa", 10, S),
+            ("CI", "other-org/forgetop", "main", "bbb", 20, S),
+        ]);
+        app.pipes[0].awaiting_approval = true;
+        app.pipes[1].provider = ProviderType::GitLab;
+        app.pipes[1].connection = "GL".into();
+        app.pipe_group = crate::app::PipeGroup::Trigger;
+
+        let wide = render_to_string(&mut app, 150, 16);
+        assert!(wide.contains("Repository") && wide.contains("approval needed"), "everything fits");
+
+        let narrow = render_to_string(&mut app, 74, 16);
+        assert!(narrow.contains("approval needed"), "the gate survives the squeeze");
+        assert!(!narrow.contains("Repository"), "context gives way first");
+    }
+
+    /// A group is titled by its definition, never by one member's run name — on Azure that is
+    /// a build number, so the title would change with the sort.
+    #[test]
+    fn a_group_title_does_not_depend_on_which_run_comes_first() {
+        use PipelineRunStatus::Succeeded as S;
+        let mut app = pipe_list(&[
+            ("build", "nz/app", "main", "aaa", 10, S),
+            ("build", "nz/app", "main", "bbb", 20, S),
+            ("build", "nz/app", "main", "ccc", 30, S),
+        ]);
+        // Discovery failed, so no definition name; Azure fills run.name with a build number.
+        for (n, p) in app.pipes.iter_mut().enumerate() {
+            p.definition_name = None;
+            p.run.name = Some(format!("20260924.{}", n + 1));
+        }
+        let title = |app: &App| match &app.pipe_lines()[0] {
+            crate::app::PipeLine::Head(h) => h.subject.clone(),
+            crate::app::PipeLine::Run(_) => panic!("header"),
+        };
+        let before = title(&app);
+        app.pipes.reverse();
+        assert_eq!(title(&app), before, "the title is stable under reordering");
+        assert!(!before.starts_with("20260924"), "and is not a build number: {before}");
+        assert_eq!(before, "build", "it is the definition the group is keyed on");
     }
 
     #[test]
