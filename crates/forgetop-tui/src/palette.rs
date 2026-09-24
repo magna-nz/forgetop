@@ -571,16 +571,11 @@ pub fn setting_items(themes: &[&str], current_theme: &str) -> Vec<PaletteItem> {
 }
 
 /// The keybinding reference: one entry per `(keys, description)` row of each help section.
-/// Help rows the palette leaves out: moving the cursor, walking the tabs, focusing the
-/// preview and the feedback form are what the footer already shows on every screen, and
-/// searching for them only crowds out the entries worth finding.
-const UNSEARCHED_KEYS: [&str; 5] = ["↑/↓  k/j", "↑/↓ (line cursor)", "Tab  Shift-Tab", "↵  p", "F"];
-
 pub fn key_items(sections: &[(&str, Vec<(&str, &str)>)]) -> Vec<PaletteItem> {
     sections
         .iter()
         .flat_map(|(section, rows)| {
-            rows.iter().filter(|(keys, _)| !UNSEARCHED_KEYS.contains(keys)).map(move |&(keys, desc)| {
+            rows.iter().map(move |&(keys, desc)| {
                 let target = PaletteTarget::HelpKey {
                     keys: keys.to_string(),
                     section: section.to_string(),
@@ -1015,22 +1010,6 @@ mod tests {
                 section: "Global".into()
             }
         );
-    }
-
-    #[test]
-    fn footer_keys_are_left_out_of_the_palette() {
-        let sections = vec![(
-            "Global",
-            vec![
-                ("F", "Give feedback"),
-                ("↑/↓  k/j", "Move selection"),
-                ("Tab  Shift-Tab", "Next / previous tab"),
-                ("↵  p", "Focus the preview pane"),
-                ("?", "This help"),
-            ],
-        )];
-        let titles: Vec<String> = key_items(&sections).into_iter().map(|i| i.title).collect();
-        assert_eq!(titles, vec!["This help"]);
     }
 
     #[test]

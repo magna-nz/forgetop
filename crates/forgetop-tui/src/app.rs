@@ -3121,6 +3121,9 @@ impl App {
                 if self.selected().is_some() {
                     out.push(("Open selected in browser", c('o')));
                 }
+                if self.preview.is_some() {
+                    out.push(("Focus the preview pane", c('p')));
+                }
                 out.extend([
                     ("Preview pane on / off", c('P')),
                     ("Choose visible tabs", c('v')),
