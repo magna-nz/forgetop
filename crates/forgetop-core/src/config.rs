@@ -76,6 +76,10 @@ pub struct UiState {
     /// Sections the user has hidden from the tab bar.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hidden_sections: Vec<Section>,
+    /// Sections whose list has the terminal preview pane switched off. The pane is on by
+    /// default (wide terminals only), so an empty list means "on everywhere".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub preview_hidden: Vec<Section>,
     /// Work-item state names the user has hidden from the Work Items list
     /// (provider-specific strings, e.g. "Done"). Anything not listed is shown.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

@@ -290,6 +290,12 @@ impl ConfigService {
         self.persist(cfg).await
     }
 
+    pub async fn set_preview_hidden(&self, hidden: Vec<Section>) -> Result<()> {
+        let mut cfg = self.snapshot();
+        cfg.ui.preview_hidden = hidden;
+        self.persist(cfg).await
+    }
+
     pub async fn set_hidden_work_item_states(&self, hidden: Vec<String>) -> Result<()> {
         let mut cfg = self.snapshot();
         cfg.ui.hidden_work_item_states = hidden;

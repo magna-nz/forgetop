@@ -412,6 +412,9 @@ impl PipeGroup {
 /// are measured and laid out together and each value lands under the heading describing it.
 #[derive(Debug, Clone)]
 pub struct PipeHead {
+    /// Index into `App::pipes` of the group's most recent run — the one its status and start
+    /// time describe, and the one the preview pane shows.
+    pub latest: usize,
     /// Stable identity, used as the expand/collapse key. Survives a refresh so a group the
     /// user opened stays open when the rows are re-fetched.
     pub key: String,
@@ -799,6 +802,14 @@ pub struct App {
     pub data_age: Option<DateTime<Utc>>,
     pub last_refresh: DateTime<Local>,
     pub should_quit: bool,
+    /// The preview pane beside the section list, while the list is the screen.
+    pub preview: Option<Preview>,
+    /// Per section, whether the user switched the preview off (`P`). On by default.
+    pub preview_hidden: [bool; 3],
+    /// True while the preview is focused: its view is `screen`, drawn beside the list.
+    pub preview_focus: bool,
+    /// Width of the content area in the last frame, which decides whether the split fits.
+    pub content_w: u16,
 }
 
 /// Full-screen views layered above the list. The large views are boxed so the
@@ -809,6 +820,72 @@ pub struct App {
 pub enum LpSlot {
     Entry(usize),
     More(launchpad::Bucket),
+}
+
+/// A detail fetch a view needs to stay fresh, built alongside the view and sent separately so
+/// the preview pane can hold it back until the cursor settles.
+#[derive(Clone)]
+pub enum DetailRequest {
+    Pr { conn_id: String, item: ItemRef, key: String },
+    Wi { conn_id: String, item: ItemRef, key: String },
+    Pipeline { conn_id: String, item: ItemRef, key: String },
+}
+
+impl DetailRequest {
+    /// The detail cache key, which is also the identity of the previewed item.
+    pub fn key(&self) -> &str {
+        match self {
+            DetailRequest::Pr { key, .. } | DetailRequest::Wi { key, .. } | DetailRequest::Pipeline { key, .. } => key,
+        }
+    }
+
+    /// The request that keeps an already-built item view fresh — how a focused preview hands
+    /// itself back to the pane without being rebuilt (and losing its tab, scroll or drafts).
+    fn for_view(screen: &Screen) -> Option<DetailRequest> {
+        match screen {
+            Screen::PrView(v) => {
+                let item = v.pr.item_ref();
+                let key = pr_detail_cache_key(&v.connection_id, &item);
+                Some(DetailRequest::Pr { conn_id: v.connection_id.clone(), item, key })
+            }
+            Screen::WiView(v) => {
+                let item = v.wi.item_ref();
+                let key = wi_detail_cache_key(&v.connection_id, &item);
+                Some(DetailRequest::Wi { conn_id: v.connection_id.clone(), item, key })
+            }
+            Screen::Pipeline(v) => {
+                let item = v.run.item_ref();
+                let key = pipeline_detail_cache_key(&v.connection_id, &item);
+                Some(DetailRequest::Pipeline { conn_id: v.connection_id.clone(), item, key })
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Anim ticks (150ms each) the cursor has to rest on a row before the preview fetches its
+/// detail, so holding ↓ through a list doesn't fire four provider calls per row passed.
+pub const PREVIEW_SETTLE_TICKS: u8 = 2;
+
+/// The narrowest content area that gets the split. Below it the list keeps the full width —
+/// both halves would be too cramped to read.
+pub const PREVIEW_MIN_WIDTH: u16 = 140;
+
+/// The unfocused preview beside a section list: the very view `Enter` would open (a
+/// [`Screen::PrView`], [`Screen::WiView`] or [`Screen::Pipeline`]), built from the row and the
+/// cache. Focusing it (`p`) makes that view the active screen, drawn in the same place, so every
+/// action the full view has works there unchanged.
+pub struct Preview {
+    /// The section the previewed row belongs to (0 PRs, 1 work items, 2 pipelines).
+    pub section: usize,
+    pub key: String,
+    pub view: Screen,
+    /// The fetch that keeps `view` fresh.
+    request: DetailRequest,
+    /// Whether `request` has gone out since the preview was built (or last marked for resend).
+    sent: bool,
+    /// Anim ticks since the cursor landed on this row.
+    ticks: u8,
 }
 
 pub enum Screen {
@@ -1334,6 +1411,10 @@ impl App {
             data_age: None,
             last_refresh: Local::now(),
             should_quit: false,
+            preview: None,
+            preview_hidden: [false; 3],
+            preview_focus: false,
+            content_w: 0,
         }
     }
 
@@ -1515,12 +1596,10 @@ impl App {
             let first = &self.pipes[members[0]];
             // Status and Started both come from this one run, so the pair reads as "where
             // this stands now" rather than pairing the worst outcome with the newest time.
-            let latest = members
-                .iter()
-                .max_by_key(|&&i| self.pipes[i].run.started_at)
-                .map(|&i| &self.pipes[i])
-                .unwrap_or(first);
+            let latest_idx = members.iter().copied().max_by_key(|&i| self.pipes[i].run.started_at).unwrap_or(members[0]);
+            let latest = &self.pipes[latest_idx];
             let head = PipeHead {
+                latest: latest_idx,
                 expanded: self.pipe_expanded.contains(&key),
                 subject: self.pipe_group_subject(members),
                 repo: first.run.repository.clone().unwrap_or_default(),
@@ -2049,18 +2128,19 @@ impl App {
         match event {
             AppEvent::Reloaded(r) => {
                 self.apply_reloaded(*r, deps);
+                self.refresh_preview_row();
                 // The scope indicator's denominator depends on the catalog the fetch may have
                 // just brought back, so it is recomputed here rather than inside the fetch.
                 self.refresh_repo_scope(deps);
             }
             AppEvent::PrDetailLoaded { key, detail, fetched_at } => {
-                self.apply_pr_detail(deps, key, *detail, fetched_at);
+                self.with_preview_screen(&key.clone(), |app| app.apply_pr_detail(deps, key, *detail, fetched_at));
             }
             AppEvent::WiDetailLoaded { key, detail, fetched_at } => {
-                self.apply_wi_detail(deps, key, *detail, fetched_at);
+                self.with_preview_screen(&key.clone(), |app| app.apply_wi_detail(deps, key, *detail, fetched_at));
             }
             AppEvent::PipelineDetailLoaded { key, detail, fetched_at } => {
-                self.apply_pipeline_detail(deps, key, *detail, fetched_at);
+                self.with_preview_screen(&key.clone(), |app| app.apply_pipeline_detail(deps, key, *detail, fetched_at));
             }
             AppEvent::PrDecorationsLoaded { items } => {
                 self.apply_pr_decorations(items, deps);
@@ -2168,6 +2248,243 @@ impl App {
     /// selected-row title marquee and the running-pipeline spinner.
     pub fn tick_anim(&mut self) {
         self.anim = self.anim.wrapping_add(1);
+    }
+
+    // ---- preview pane ----
+
+    /// Whether the section list shows the preview pane: on unless switched off for this
+    /// section, and only when the terminal is wide enough for both halves.
+    pub fn preview_shown(&self) -> bool {
+        self.active < 3 && !self.preview_hidden[self.active] && self.content_w >= PREVIEW_MIN_WIDTH
+    }
+
+    /// Applies the persisted per-section preview switches at startup.
+    pub fn apply_preview_hidden(&mut self, hidden: &[Section]) {
+        self.preview_hidden = [false; 3];
+        for section in hidden {
+            self.preview_hidden[index_of(*section)] = true;
+        }
+    }
+
+    /// The pipeline run the preview shows for the selected line: the run itself, or a
+    /// group's most recent run — the one its header describes.
+    fn preview_pipe(&self) -> Option<&PipeRow> {
+        if self.active != 2 {
+            return None;
+        }
+        let sel = self.pipe_state.selected()?;
+        match self.pipe_lines().get(sel)? {
+            PipeLine::Run(i) => self.pipes.get(*i),
+            PipeLine::Head(h) => self.pipes.get(h.latest),
+        }
+    }
+
+    /// The detail key of the item the selected row would preview — cheap enough to compare on
+    /// every tick, so the view itself is only built when the selection actually moves.
+    fn preview_key(&self) -> Option<String> {
+        match self.active {
+            0 => self.selected_pr_row().map(|r| pr_detail_cache_key(&r.connection_id, &r.pr.item_ref())),
+            1 => self.selected_wi_row().map(|r| wi_detail_cache_key(&r.connection_id, &r.wi.item_ref())),
+            _ => self.preview_pipe().map(|p| pipeline_detail_cache_key(&p.connection_id, &p.run.item_ref())),
+        }
+    }
+
+    fn build_selected_preview(&self, deps: &AppDeps) -> Option<(Screen, DetailRequest)> {
+        match self.active {
+            0 => {
+                let row = self.selected_pr_row()?;
+                Some(Self::build_pr_view(deps, 0, pr_label(&row.pr), row.pr.url.clone(), row.connection_id.clone(), row.pr.clone()))
+            }
+            1 => {
+                let row = self.selected_wi_row()?;
+                Some(Self::build_wi_view(deps, row.connection_id.clone(), row.wi.clone()))
+            }
+            _ => {
+                let pipe = self.preview_pipe()?;
+                Some(Self::build_pipeline_view(
+                    deps,
+                    pipe.connection_id.clone(),
+                    pipe.provider,
+                    pipe.run.id.clone(),
+                    pipe.run.definition_id.clone(),
+                    pipe.run.branch.clone(),
+                    pipe_label(pipe),
+                    pipe.run.clone(),
+                ))
+            }
+        }
+    }
+
+    /// Brings the preview in line with the screen: dropped anywhere but the section list (and
+    /// when the pane is off or doesn't fit), rebuilt from the row and cache when the selection
+    /// moved. Rebuilding does no I/O; the fetch waits for [`App::tick_preview`].
+    fn settle_preview(&mut self, deps: &AppDeps) {
+        // Focus lasts only as long as the focused view: Esc, Tab or an action that closes the
+        // view all land somewhere else, and the list gets its preview back from there.
+        if self.preview_focus && !matches!(self.screen, Screen::PrView(_) | Screen::WiView(_) | Screen::Pipeline(_)) {
+            self.preview_focus = false;
+        }
+        if !matches!(self.screen, Screen::List) || !self.preview_shown() {
+            self.preview = None;
+            return;
+        }
+        let Some(key) = self.preview_key() else {
+            self.preview = None;
+            return;
+        };
+        if matches!(&self.preview, Some(p) if p.section == self.active && p.key == key) {
+            return;
+        }
+        self.preview = self.build_selected_preview(deps).map(|(view, request)| Preview {
+            section: self.active,
+            key: request.key().to_owned(),
+            view,
+            request,
+            sent: false,
+            ticks: 0,
+        });
+    }
+
+    /// Driven by the anim timer: keeps the preview in step with the selection and the terminal
+    /// width, and sends its detail fetch once the cursor has rested for
+    /// [`PREVIEW_SETTLE_TICKS`].
+    pub fn tick_preview(&mut self, deps: &AppDeps) {
+        self.settle_preview(deps);
+        let request = match self.preview.as_mut() {
+            Some(p) if !p.sent => {
+                p.ticks = p.ticks.saturating_add(1);
+                if p.ticks < PREVIEW_SETTLE_TICKS {
+                    return;
+                }
+                p.sent = true;
+                p.request.clone()
+            }
+            _ => return,
+        };
+        self.send_detail_request(deps, request);
+    }
+
+    /// After a refresh, carries the fresh list row into the preview (a PR's status, reviewers
+    /// or checks may have moved) and re-asks for a pipeline run's detail — a run's state is
+    /// live, and the list row alone has no stages. A different selection is left to
+    /// [`App::settle_preview`], which rebuilds.
+    fn refresh_preview_row(&mut self) {
+        if self.preview.as_ref().map(|p| p.key.clone()) != self.preview_key() {
+            return;
+        }
+        let pr = self.selected_pr_row().map(|r| r.pr.clone());
+        let wi = self.selected_wi_row().map(|r| r.wi.clone());
+        let Some(p) = self.preview.as_mut() else { return };
+        match &mut p.view {
+            Screen::PrView(v) => {
+                if let Some(pr) = pr {
+                    v.pr = pr;
+                }
+            }
+            Screen::WiView(v) => {
+                if let Some(wi) = wi {
+                    v.wi = wi;
+                }
+            }
+            Screen::Pipeline(_) => {
+                p.sent = false;
+                p.ticks = PREVIEW_SETTLE_TICKS;
+            }
+            _ => {}
+        }
+    }
+
+    fn send_detail_request(&self, deps: &AppDeps, request: DetailRequest) {
+        match request {
+            DetailRequest::Pr { conn_id, item, key } => self.request_pr_detail(deps, conn_id, item, key),
+            DetailRequest::Wi { conn_id, item, key } => self.request_wi_detail(deps, conn_id, item, key),
+            DetailRequest::Pipeline { conn_id, item, key } => self.request_pipeline_detail(deps, conn_id, item, key),
+        }
+    }
+
+    /// Runs `f` with the preview's view standing in as the screen when the preview holds the
+    /// item `key` names, so a detail answer patches the pane through the same `apply_*` path
+    /// the full view uses. The preview only exists while the list is the screen, so nothing
+    /// else can be showing that item.
+    fn with_preview_screen(&mut self, key: &str, f: impl FnOnce(&mut Self)) {
+        let Some(mut p) = self.preview.take_if(|p| p.key == key) else {
+            f(self);
+            return;
+        };
+        std::mem::swap(&mut self.screen, &mut p.view);
+        f(self);
+        std::mem::swap(&mut self.screen, &mut p.view);
+        self.preview = Some(p);
+    }
+
+    /// The preview's own keys. From the list, Enter (or `p`) focuses the pane — its view becomes
+    /// the screen, drawn in the same place, and the footer turns to that item's keys. With no
+    /// preview showing, Enter keeps opening the full-screen view. From a focused pane `p` hands
+    /// focus back, keeping the view (tab, scroll, buffered comments) as it was. `P` switches the
+    /// pane off or on for the section; pressed while focused, the view stays open full screen.
+    /// Whether the Pipelines list cursor is on a group header rather than a run.
+    pub fn pipe_head_selected(&self) -> bool {
+        self.active == 2
+            && self.pipe_state.selected().is_some_and(|sel| matches!(self.pipe_lines().get(sel), Some(PipeLine::Head(_))))
+    }
+
+    /// Moves the preview's view into the screen, still drawn beside the list.
+    fn focus_preview(&mut self, deps: &AppDeps) {
+        let Some(mut p) = self.preview.take() else { return };
+        if !p.sent {
+            self.send_detail_request(deps, p.request.clone());
+        }
+        self.screen = std::mem::replace(&mut p.view, Screen::List);
+        self.preview_focus = true;
+        // Esc from the focused pane returns to this list.
+        self.lp_origin = false;
+        self.from_inbox = false;
+    }
+
+    async fn on_preview_key(&mut self, key: Key, deps: &AppDeps) -> bool {
+        let on_list = matches!(self.screen, Screen::List);
+        let focused = self.preview_focus && matches!(self.screen, Screen::PrView(_) | Screen::WiView(_) | Screen::Pipeline(_));
+        match key {
+            // On a pipeline group header Enter keeps expanding / collapsing the group; it is a
+            // run row that Enter moves into the pane.
+            Key::Enter if on_list && self.preview.is_some() && !self.pipe_head_selected() => {
+                self.focus_preview(deps);
+                true
+            }
+            Key::Char('p') if on_list => {
+                if self.preview.is_some() {
+                    self.focus_preview(deps);
+                } else if self.preview_hidden[self.active] {
+                    self.toast = Some("The preview is off here. P turns it on.".into());
+                } else if self.content_w < PREVIEW_MIN_WIDTH {
+                    self.toast = Some(format!("The preview needs a terminal at least {PREVIEW_MIN_WIDTH} columns wide."));
+                }
+                true
+            }
+            Key::Char('p') if focused => {
+                let view = std::mem::replace(&mut self.screen, Screen::List);
+                self.preview_focus = false;
+                self.preview = DetailRequest::for_view(&view).map(|request| Preview {
+                    section: self.active,
+                    key: request.key().to_owned(),
+                    view,
+                    request,
+                    sent: true,
+                    ticks: 0,
+                });
+                true
+            }
+            Key::Char('P') if on_list || focused => {
+                let section = self.active;
+                self.preview_hidden[section] = !self.preview_hidden[section];
+                self.preview_focus = false;
+                let hidden: Vec<Section> = (0..3).filter(|&i| self.preview_hidden[i]).map(section_of).collect();
+                let _ = deps.config.set_preview_hidden(hidden).await;
+                self.toast = Some(if self.preview_hidden[section] { "Preview off. P turns it back on." } else { "Preview on." }.into());
+                true
+            }
+            _ => false,
+        }
     }
 
     async fn on_launchpad_key(&mut self, key: Key, deps: &AppDeps) {
@@ -3260,6 +3577,11 @@ impl App {
 
     /// Applies a key. `deps` is used for async refresh / actions / theme persistence.
     pub async fn on_key(&mut self, key: Key, deps: &AppDeps) {
+        self.on_key_inner(key, deps).await;
+        self.settle_preview(deps);
+    }
+
+    async fn on_key_inner(&mut self, key: Key, deps: &AppDeps) {
         // Ctrl-C hard-quits from any mode.
         if key == Key::Quit {
             self.should_quit = true;
@@ -3340,6 +3662,10 @@ impl App {
             return;
         }
 
+        if self.on_preview_key(key, deps).await {
+            return;
+        }
+
         // Full-screen sub-views handle their own keys.
         match self.screen {
             Screen::Pipeline(_) => {
@@ -3393,8 +3719,8 @@ impl App {
 
         match key {
             Key::Escape => self.leave_section_list(),
-            Key::Left => self.switch_tab(-1),
-            Key::Right => self.switch_tab(1),
+            // The top nav moves only on Tab (or a number key); the arrows switch nothing here.
+            Key::Left | Key::Right => {}
             Key::Up => {
                 self.move_up();
                 self.ensure_visible();
@@ -3456,6 +3782,17 @@ impl App {
     /// for as long as the network took (see commit 8fc2117 for the same fix on the refresh path).
     #[allow(clippy::too_many_arguments)]
     fn open_pr_view_for(&mut self, deps: &AppDeps, tab: usize, label: String, url: Option<String>, conn_id: String, pr: PullRequest) {
+        let (view, fetch) = Self::build_pr_view(deps, tab, label, url, conn_id, pr);
+        self.screen = view;
+        // The view is on screen now; the fetch that keeps it fresh runs in the background and
+        // patches it in place via `AppEvent::PrDetailLoaded` (see `apply_pr_detail`).
+        self.send_detail_request(deps, fetch);
+    }
+
+    /// Builds the PR view from the row plus whatever the cache holds, without any I/O. The
+    /// returned request is what keeps it fresh; [`open_pr_view_for`] sends it at once, the
+    /// preview pane only once the cursor has settled.
+    fn build_pr_view(deps: &AppDeps, tab: usize, label: String, url: Option<String>, conn_id: String, pr: PullRequest) -> (Screen, DetailRequest) {
         // Address the cache and every detail call at the PR's own repository, not just its id:
         // on a connection spanning several, `#7` alone names more than one pull request.
         let item = pr.item_ref();
@@ -3480,7 +3817,7 @@ impl App {
             commit_label: None,
             viewed: HashSet::new(),
         };
-        self.screen = Screen::PrView(Box::new(PrView {
+        let view = Screen::PrView(Box::new(PrView {
             label,
             url,
             connection_id: conn_id.clone(),
@@ -3496,9 +3833,7 @@ impl App {
             review_draft: None,
             reply_target: None,
         }));
-        // The view is on screen now; the fetch that keeps it fresh runs in the background and
-        // patches it in place via `AppEvent::PrDetailLoaded` (see `apply_pr_detail`).
-        self.request_pr_detail(deps, conn_id, item, key);
+        (view, DetailRequest::Pr { conn_id, item, key })
     }
 
     /// Buffers a line comment against the cursor line in the diff patch.
@@ -3693,14 +4028,21 @@ impl App {
     /// run off the render loop. Awaiting it here — as this used to — froze the whole event loop
     /// for as long as the network took.
     fn open_wi_view_for(&mut self, deps: &AppDeps, conn_id: String, wi: WorkItem) {
+        let (view, fetch) = Self::build_wi_view(deps, conn_id, wi);
+        self.screen = view;
+        self.send_detail_request(deps, fetch);
+    }
+
+    /// Mirrors [`App::build_pr_view`]: the view from the row and the cache, no I/O.
+    fn build_wi_view(deps: &AppDeps, conn_id: String, wi: WorkItem) -> (Screen, DetailRequest) {
         let item = wi.item_ref();
         let key = wi_detail_cache_key(&conn_id, &item);
         let threads = match deps.cache.get::<WiDetail>(&key) {
             Some(entry) => entry.value.threads,
             None => Vec::new(),
         };
-        self.screen = Screen::WiView(Box::new(WiView { connection_id: conn_id.clone(), wi, threads, scroll: 0 }));
-        self.request_wi_detail(deps, conn_id, item, key);
+        let view = Screen::WiView(Box::new(WiView { connection_id: conn_id.clone(), wi, threads, scroll: 0 }));
+        (view, DetailRequest::Wi { conn_id, item, key })
     }
 
     /// Opens the repository-scope picker for the active section.
@@ -4077,8 +4419,6 @@ impl App {
                 self.move_up();
                 self.ensure_visible();
             }
-            'h' => self.switch_tab(-1),
-            'l' => self.switch_tab(1),
             // 1 = Launchpad, then the sections.
             '1'..='4' => self.set_tab(c as usize - '1' as usize),
             'r' => self.request_reload(deps),
@@ -4213,6 +4553,26 @@ impl App {
         title: String,
         fallback: PipelineRun,
     ) {
+        let (view, fetch) = Self::build_pipeline_view(deps, conn_id, provider, run_id, definition_id, branch, title, fallback);
+        self.screen = view;
+        // The view is on screen now; the fetch that keeps it fresh runs in the background and
+        // patches it in place via `AppEvent::PipelineDetailLoaded` (see `apply_pipeline_detail`).
+        self.send_detail_request(deps, fetch);
+    }
+
+    /// Mirrors [`App::build_pr_view`]: the drill-in seeded from the cache (or the list row's
+    /// own run), marked stale until a live fetch confirms it, with no I/O.
+    #[allow(clippy::too_many_arguments)]
+    fn build_pipeline_view(
+        deps: &AppDeps,
+        conn_id: String,
+        provider: ProviderType,
+        run_id: String,
+        definition_id: String,
+        branch: Option<String>,
+        title: String,
+        fallback: PipelineRun,
+    ) -> (Screen, DetailRequest) {
         let item = ItemRef::maybe(fallback.repository.clone(), run_id);
         let key = pipeline_detail_cache_key(&conn_id, &item);
         let (run, supports_approvals, can_respond_approvals) = match deps.cache.get::<PipelineDetail>(&key) {
@@ -4224,10 +4584,7 @@ impl App {
         view.supports_approvals = supports_approvals;
         view.can_respond_approvals = can_respond_approvals;
         view.stale = true;
-        self.screen = Screen::Pipeline(Box::new(view));
-        // The view is on screen now; the fetch that keeps it fresh runs in the background and
-        // patches it in place via `AppEvent::PipelineDetailLoaded` (see `apply_pipeline_detail`).
-        self.request_pipeline_detail(deps, conn_id, item, key);
+        (Screen::Pipeline(Box::new(view)), DetailRequest::Pipeline { conn_id, item, key })
     }
 
     /// Re-fetches the open pipeline drill-in's run + approvals — used after an approval decision
@@ -10415,5 +10772,252 @@ mod tests {
         // Release's header run is on `main`, CI's is on `zulu`: main sorts first, so Release
         // leads despite CI being nothing to do with recency here.
         assert_eq!(subjects, vec!["Release", "main", "CI", "alpha", "zulu"]);
+    }
+
+    // ---- preview pane ----
+
+    /// A Pull Requests list, wide enough for the preview, with `ids` as its rows and the first
+    /// one selected.
+    fn preview_app(ids: &[&str]) -> App {
+        let mut app = App::new("slate");
+        app.prs = ids
+            .iter()
+            .map(|id| {
+                let mut p = pr(None);
+                p.id = (*id).into();
+                p.title = format!("PR {id}");
+                pr_row(p)
+            })
+            .collect();
+        app.active = 0;
+        app.screen = Screen::List;
+        app.pr_state.select(Some(0));
+        app.content_w = 150;
+        app
+    }
+
+    fn preview_pr_id(app: &App) -> Option<String> {
+        match app.preview.as_ref().map(|p| &p.view) {
+            Some(Screen::PrView(v)) => Some(v.pr.id.clone()),
+            _ => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn preview_is_built_for_the_selected_row_only_when_it_fits_and_is_on() {
+        let deps = test_deps();
+        let mut app = preview_app(&["1"]);
+        app.settle_preview(&deps);
+        assert_eq!(preview_pr_id(&app).as_deref(), Some("1"), "wide list previews its selected row");
+        assert!(!app.preview.as_ref().unwrap().sent, "building does no I/O");
+
+        app.content_w = PREVIEW_MIN_WIDTH - 1;
+        app.settle_preview(&deps);
+        assert!(app.preview.is_none(), "a narrow terminal keeps the full-width list");
+
+        app.content_w = 150;
+        app.preview_hidden[0] = true;
+        app.settle_preview(&deps);
+        assert!(app.preview.is_none(), "switched off for the section");
+    }
+
+    #[tokio::test]
+    async fn preview_fetches_only_once_the_cursor_has_settled() {
+        let deps = test_deps();
+        let mut app = preview_app(&["1"]);
+        for _ in 1..PREVIEW_SETTLE_TICKS {
+            app.tick_preview(&deps);
+            assert!(!app.preview.as_ref().unwrap().sent, "still settling");
+        }
+        app.tick_preview(&deps);
+        assert!(app.preview.as_ref().unwrap().sent, "sent after the settle ticks");
+    }
+
+    #[tokio::test]
+    async fn moving_the_cursor_rebuilds_the_preview_for_the_new_row() {
+        let deps = test_deps();
+        let mut app = preview_app(&["1", "2"]);
+        app.settle_preview(&deps);
+        app.on_key(Key::Down, &deps).await;
+        assert_eq!(preview_pr_id(&app).as_deref(), Some("2"));
+        assert!(!app.preview.as_ref().unwrap().sent, "the new row waits for its own settle");
+    }
+
+    #[tokio::test]
+    async fn p_focuses_the_preview_and_p_hands_it_back_unchanged() {
+        let deps = test_deps();
+        let mut app = preview_app(&["1"]);
+        app.settle_preview(&deps);
+
+        app.on_key(Key::Char('p'), &deps).await;
+        assert!(app.preview_focus);
+        assert!(app.preview.is_none(), "the view moved into the screen, not copied");
+        let Screen::PrView(v) = &mut app.screen else { panic!("focused preview is the PR view") };
+        assert_eq!(v.pr.id, "1");
+        v.tab = 2; // the user switched to Checks while focused
+
+        app.on_key(Key::Char('p'), &deps).await;
+        assert!(!app.preview_focus);
+        assert!(matches!(app.screen, Screen::List));
+        match app.preview.as_ref().map(|p| &p.view) {
+            Some(Screen::PrView(v)) => assert_eq!(v.tab, 2, "handed back as it was, not rebuilt"),
+            _ => panic!("the view returns to the pane"),
+        }
+    }
+
+    #[tokio::test]
+    async fn enter_focuses_the_preview_when_it_is_showing_and_opens_full_screen_when_not() {
+        let deps = test_deps();
+        let mut app = preview_app(&["1"]);
+        app.settle_preview(&deps);
+        app.on_key(Key::Enter, &deps).await;
+        assert!(app.preview_focus, "Enter moves context into the pane");
+        assert!(matches!(app.screen, Screen::PrView(_)));
+
+        let mut app = preview_app(&["1"]);
+        app.preview_hidden[0] = true;
+        app.on_key(Key::Enter, &deps).await;
+        assert!(!app.preview_focus, "no pane, so Enter opens the full view as before");
+        assert!(matches!(app.screen, Screen::PrView(_)));
+    }
+
+    #[tokio::test]
+    async fn enter_on_a_pipeline_group_expands_it_and_enter_on_a_run_focuses_the_pane() {
+        let deps = test_deps();
+        let mut app = App::new("slate");
+        app.pipes = vec![pipe_row("r1", PipelineRunStatus::Failed, false), pipe_row("r2", PipelineRunStatus::Running, false)];
+        app.active = 2;
+        app.screen = Screen::List;
+        app.pipe_state.select(Some(0));
+        app.content_w = 150;
+        app.settle_preview(&deps);
+
+        app.on_key(Key::Enter, &deps).await;
+        assert!(matches!(app.pipe_lines().first(), Some(PipeLine::Head(h)) if h.expanded), "Enter expands the group");
+        assert!(matches!(app.screen, Screen::List));
+        assert!(!app.preview_focus);
+
+        app.on_key(Key::Down, &deps).await; // onto the group's first run
+        app.on_key(Key::Enter, &deps).await;
+        assert!(app.preview_focus, "Enter on a run moves into the pane");
+        assert!(matches!(app.screen, Screen::Pipeline(_)));
+    }
+
+    #[tokio::test]
+    async fn only_tab_moves_the_top_nav_from_a_section_list() {
+        let deps = test_deps();
+        let mut app = preview_app(&["1"]);
+        for key in [Key::Left, Key::Right, Key::Char('h'), Key::Char('l')] {
+            app.on_key(key, &deps).await;
+            assert_eq!(app.active, 0, "{key:?} must not switch sections");
+            assert!(matches!(app.screen, Screen::List));
+        }
+        app.on_key(Key::Tab, &deps).await;
+        assert_eq!(app.active, 1, "Tab moves to the next section");
+    }
+
+    #[tokio::test]
+    async fn a_focused_preview_offers_the_full_views_approve_prompt() {
+        let deps = test_deps();
+        let mut app = preview_app(&["1"]);
+        app.settle_preview(&deps);
+        app.on_key(Key::Char('p'), &deps).await;
+        app.on_key(Key::Char('a'), &deps).await;
+        match &app.overlay {
+            Some(Overlay::Confirm { action, .. }) => assert!(matches!(action, Action::PrVote(ReviewVote::Approved))),
+            _ => panic!("expected the approve confirm dialog"),
+        }
+    }
+
+    #[tokio::test]
+    async fn esc_from_a_focused_preview_returns_to_the_list_with_a_preview() {
+        let deps = test_deps();
+        let mut app = preview_app(&["1"]);
+        app.settle_preview(&deps);
+        app.on_key(Key::Char('p'), &deps).await;
+        app.on_key(Key::Escape, &deps).await;
+        assert!(matches!(app.screen, Screen::List));
+        assert!(!app.preview_focus);
+        assert_eq!(preview_pr_id(&app).as_deref(), Some("1"));
+    }
+
+    #[tokio::test]
+    async fn tab_out_of_a_focused_preview_drops_focus() {
+        let deps = test_deps();
+        let mut app = preview_app(&["1"]);
+        app.settle_preview(&deps);
+        app.on_key(Key::Char('p'), &deps).await;
+        app.on_key(Key::Tab, &deps).await;
+        assert!(!app.preview_focus, "focus never outlives the focused view");
+    }
+
+    #[tokio::test]
+    async fn capital_p_switches_the_preview_off_for_the_section_and_saves_it() {
+        let deps = test_deps();
+        let mut app = preview_app(&["1"]);
+        app.settle_preview(&deps);
+        app.on_key(Key::Char('P'), &deps).await;
+        assert!(app.preview_hidden[0]);
+        assert!(app.preview.is_none());
+        assert_eq!(deps.config.snapshot().ui.preview_hidden, vec![Section::PullRequests]);
+
+        app.on_key(Key::Char('P'), &deps).await;
+        assert!(!app.preview_hidden[0]);
+        assert!(deps.config.snapshot().ui.preview_hidden.is_empty());
+        assert!(app.preview.is_some(), "back on, and rebuilt straight away");
+    }
+
+    #[tokio::test]
+    async fn a_detail_answer_for_the_previewed_item_patches_the_pane() {
+        let deps = test_deps();
+        let mut app = preview_app(&["1"]);
+        app.settle_preview(&deps);
+        let key = app.preview.as_ref().unwrap().key.clone();
+        let check = CheckRun { name: "build".into(), status: CheckStatus::Passed, url: None };
+        let detail = PrDetail { threads: vec![], files: vec![], checks: vec![check], commits: vec![] };
+        app.on_event(AppEvent::PrDetailLoaded { key, detail: all_answered(detail), fetched_at: Utc::now() }, &deps);
+        match app.preview.as_ref().map(|p| &p.view) {
+            Some(Screen::PrView(v)) => assert_eq!(v.checks.len(), 1, "the answer landed in the preview"),
+            _ => panic!("preview kept"),
+        }
+        assert!(matches!(app.screen, Screen::List), "the list stays the screen");
+    }
+
+    #[tokio::test]
+    async fn a_pipeline_group_row_previews_its_most_recent_run() {
+        let deps = test_deps();
+        let mut app = App::new("slate");
+        let mut old = pipe_row("r1", PipelineRunStatus::Failed, false);
+        old.run.started_at = Some(Utc::now() - chrono::Duration::hours(2));
+        let mut new = pipe_row("r2", PipelineRunStatus::Running, false);
+        new.run.started_at = Some(Utc::now());
+        app.pipes = vec![old, new];
+        app.active = 2;
+        app.screen = Screen::List;
+        app.pipe_state.select(Some(0));
+        app.content_w = 150;
+        assert!(matches!(app.pipe_lines().first(), Some(PipeLine::Head(_))), "grouped: row 0 is the header");
+        app.settle_preview(&deps);
+        match app.preview.as_ref().map(|p| &p.view) {
+            Some(Screen::Pipeline(v)) => assert_eq!(v.run.id, "r2"),
+            _ => panic!("expected a pipeline preview"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_list_and_its_preview_render_side_by_side() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let deps = test_deps();
+        let mut app = preview_app(&["1"]);
+        app.prs[0].pr.title = "Rotate the signing keys".into();
+        let mut terminal = Terminal::new(TestBackend::new(160, 24)).unwrap();
+        terminal.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        app.settle_preview(&deps);
+        terminal.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let row = |y: u16| (0..160).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>();
+        let screen: Vec<String> = (0..24).map(row).collect();
+        let title_row = screen.iter().find(|r| r.contains("Pull Requests ·")).expect("list title");
+        assert!(title_row.contains("PR #1"), "the preview's header sits beside the list's: {title_row}");
     }
 }

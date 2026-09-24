@@ -47,8 +47,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         .split(area);
 
     render_tabs(frame, rows[0], app);
-    // A saved-views bar sits above the list when the section has more than one view.
-    if matches!(app.screen, Screen::List) && app.views[app.active].len() > 1 {
+    // A saved-views bar sits above the list when the section has more than one view. A focused
+    // preview still has the list beside it, so the bar stays and the layout doesn't jump.
+    if (matches!(app.screen, Screen::List) || app.preview_focus) && app.views[app.active].len() > 1 {
         let split = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(1), Constraint::Min(3)])
@@ -154,6 +155,24 @@ fn render_tabs(frame: &mut Frame, area: Rect, app: &App) {
         .block(block);
 
     frame.render_widget(tabs, area);
+
+    // How to move along the strip, just past its last tab — dim, and only where it can't run
+    // into the right-hand chrome (Refreshing…, Notifications).
+    let strip_w: usize = tab_titles(app).iter().map(|t| t.chars().count()).sum::<usize>() + 2 * vis.len();
+    // Drawn as a key chip, like the footer's, so it reads as "press this" rather than a label.
+    let hint = Line::from(vec![
+        Span::styled("   ", Style::default().bg(theme.bg)),
+        Span::styled(" Tab ", Style::default().fg(theme.bg).bg(theme.accent).add_modifier(Modifier::BOLD)),
+        Span::styled(" next section", Style::default().fg(theme.dim).bg(theme.bg)),
+    ]);
+    let hint_w = hint.width();
+    let right_w = notifications_label(app).chars().count()
+        + refreshing_in_tab_row(app, area.width).map_or(0, |t| t.chars().count());
+    let inner = area.width.saturating_sub(2) as usize;
+    if strip_w + hint_w + 2 + right_w <= inner {
+        let rect = Rect { x: area.x + 1 + strip_w as u16, y: area.y + 1, width: hint_w as u16, height: 1 };
+        frame.render_widget(Paragraph::new(hint), rect);
+    }
 
     // Notifications is a nav item pinned to the far right of the tab row — highlighted when
     // its screen is open, but *not* part of the Tab cycle. Dim grey at (0), bold yellow
@@ -264,6 +283,18 @@ fn render_view_bar(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_content(frame: &mut Frame, area: Rect, app: &mut App) {
+    // Recorded before anything decides on the split, so the key handler and the anim tick
+    // agree with this frame about whether the preview fits.
+    app.content_w = area.width;
+    let focused = app.preview_focus
+        && area.width >= crate::app::PREVIEW_MIN_WIDTH
+        && matches!(app.screen, Screen::PrView(_) | Screen::WiView(_) | Screen::Pipeline(_));
+    // Unfocused, the split waits for a built preview (the anim tick builds it within a frame):
+    // an empty list, or one whose row can't be previewed, keeps the full width.
+    if focused || (matches!(app.screen, Screen::List) && app.preview_shown() && app.preview.is_some()) {
+        render_split(frame, area, app, focused);
+        return;
+    }
     match &app.screen {
         Screen::Launchpad => {
             render_launchpad(frame, area, app);
@@ -295,6 +326,85 @@ fn render_content(frame: &mut Frame, area: Rect, app: &mut App) {
         return;
     }
     render_table(frame, area, app);
+}
+
+/// The section list beside its preview. Unfocused, the right half is the preview built for the
+/// selected row; focused, it is the live view that is the screen, with every key it has. Which
+/// half has focus has to read at a glance: it gets heavy borders, the other goes dim.
+fn render_split(frame: &mut Frame, area: Rect, app: &mut App, focused: bool) {
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+        .split(area);
+    render_table(frame, cols[0], app);
+    if focused {
+        app.detail_scroll_max = render_item_view(frame, cols[1], &app.theme, &app.screen, app.anim);
+    } else if let Some(p) = app.preview.as_ref() {
+        render_item_view(frame, cols[1], &app.theme, &p.view, app.anim);
+    }
+    let (active, idle) = if focused { (cols[1], cols[0]) } else { (cols[0], cols[1]) };
+    mark_focus(frame, active, &app.theme);
+    mark_idle(frame, idle, &app.theme);
+}
+
+/// Draws a PR, work-item or pipeline view into `area`, returning how far it can scroll (the
+/// key handler clamps against it). Anything else draws nothing.
+fn render_item_view(frame: &mut Frame, area: Rect, theme: &Theme, view: &Screen, anim: usize) -> u16 {
+    match view {
+        Screen::PrView(v) => render_pr_view(frame, area, theme, v),
+        Screen::WiView(v) => render_wi_view(frame, area, theme, v),
+        Screen::Pipeline(v) => {
+            render_pipeline(frame, area, theme, v, anim);
+            0
+        }
+        _ => 0,
+    }
+}
+
+/// The accent-coloured frame glyphs and their heavy counterparts.
+const FRAME_LIGHT: [&str; 6] = ["╭", "╮", "╰", "╯", "─", "│"];
+const FRAME_HEAVY: [&str; 6] = ["┏", "┓", "┗", "┛", "━", "┃"];
+
+/// The focused half: its accent frames are redrawn heavy, and its title on the top edge becomes
+/// a solid accent chip, like the active tab. Only accent-coloured frame glyphs change, so inline
+/// comment boxes and other deliberately coloured frames keep their shape.
+fn mark_focus(frame: &mut Frame, area: Rect, theme: &Theme) {
+    let buf = frame.buffer_mut();
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            let cell = &mut buf[(x, y)];
+            if cell.fg != theme.accent {
+                continue;
+            }
+            if let Some(i) = FRAME_LIGHT.iter().position(|g| *g == cell.symbol()) {
+                cell.set_symbol(FRAME_HEAVY[i]);
+            } else if y == area.top() && cell.modifier.contains(Modifier::BOLD) {
+                cell.set_fg(theme.bg).set_bg(theme.accent);
+            }
+        }
+    }
+}
+
+/// The half without focus, on a background a step away from the focused one: its chrome — frames, bold accent titles and headings, the active
+/// sub-tab chip — drops to the dim colour. Body text keeps its colour (author names included:
+/// most themes draw them in the accent hue, but never bold), so the preview still reads; it
+/// just stops competing with the side that takes the keys.
+fn mark_idle(frame: &mut Frame, area: Rect, theme: &Theme) {
+    let buf = frame.buffer_mut();
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            let cell = &mut buf[(x, y)];
+            let chrome = FRAME_LIGHT.contains(&cell.symbol()) || cell.modifier.contains(Modifier::BOLD);
+            if cell.fg == theme.accent && chrome {
+                cell.set_fg(theme.dim);
+            }
+            if cell.bg == theme.accent {
+                cell.set_bg(theme.dim);
+            } else if cell.bg == theme.bg {
+                cell.set_bg(theme.idle_bg);
+            }
+        }
+    }
 }
 
 fn render_table(frame: &mut Frame, area: Rect, app: &mut App) {
@@ -676,6 +786,14 @@ fn mark_selected(line: &mut Line, theme: &Theme) {
     }
 }
 
+/// The selected row of a list that has handed focus to its preview: a dim `▌` in the lead
+/// column, no bar.
+fn mark_selected_idle(line: &mut Line, theme: &Theme) {
+    if let Some(lead) = line.spans.first_mut() {
+        *lead = Span::styled("▌", Style::default().fg(theme.dim));
+    }
+}
+
 /// Renders a section as a fixed column header + a scrollable body of rows, with the
 /// selected row highlighted. Enter opens a full-screen view for the row.
 fn render_inline_list(frame: &mut Frame, area: Rect, app: &mut App, title: &str, header: Line<'static>, rows: Vec<Line<'static>>) {
@@ -697,7 +815,13 @@ fn render_inline_list(frame: &mut Frame, area: Rect, app: &mut App, title: &str,
         .enumerate()
         .map(|(i, mut row)| {
             if i == selected {
-                mark_selected(&mut row, &app.theme);
+                // While the preview beside it has focus, the list keeps only a quiet marker: the
+                // bright bar belongs in the pane that takes the keys.
+                if app.preview_focus {
+                    mark_selected_idle(&mut row, &app.theme);
+                } else {
+                    mark_selected(&mut row, &app.theme);
+                }
             }
             row
         })
@@ -765,16 +889,71 @@ fn columnize(
     (header, lines)
 }
 
+/// The Title column of the Pull Requests list — the one that flexes.
+const PR_TITLE_COL: usize = 4;
+
+/// A title narrower than this reads as noise, so columns are shed to keep at least this much.
+const MIN_TITLE_W: usize = 28;
+
+/// Drops columns, in `drop_order`, until the `flex` column can show [`MIN_TITLE_W`] characters
+/// (or all of its widest value, if shorter). A wide list is returned untouched; a narrow one —
+/// beside the preview pane — keeps its identifying columns and loses the ones the preview
+/// repeats. The sort arrow follows its column, and disappears with it if that one is shed.
+#[allow(clippy::type_complexity)]
+fn shed_columns(
+    headers: &[&'static str],
+    mut cells: Vec<Vec<(String, Style)>>,
+    flex: usize,
+    sort: Option<(usize, bool)>,
+    inner_w: usize,
+    drop_order: &[usize],
+) -> (Vec<&'static str>, Vec<Vec<(String, Style)>>, Option<(usize, bool)>) {
+    let natural = |i: usize| -> usize {
+        let body = cells.iter().filter_map(|r| r.get(i)).map(|(t, _)| t.chars().count()).max().unwrap_or(0);
+        body.max(headers[i].chars().count() + 2) // room for a sort arrow
+    };
+    let widths: Vec<usize> = (0..headers.len()).map(natural).collect();
+    let want = widths[flex].min(MIN_TITLE_W);
+    let mut keep: Vec<bool> = vec![true; headers.len()];
+    let room = |keep: &[bool]| -> usize {
+        let kept: Vec<usize> = (0..headers.len()).filter(|&i| keep[i]).collect();
+        let fixed: usize = kept.iter().filter(|&&i| i != flex).map(|&i| widths[i]).sum();
+        let padding = COL_LEAD + COL_GAP * kept.len().saturating_sub(1);
+        inner_w.saturating_sub(fixed + padding)
+    };
+    for &col in drop_order {
+        if room(&keep) >= want {
+            break;
+        }
+        keep[col] = false;
+    }
+    if keep.iter().all(|k| *k) {
+        return (headers.to_vec(), cells, sort);
+    }
+    let new_index = |old: usize| -> Option<usize> { keep[old].then(|| keep[..old].iter().filter(|k| **k).count()) };
+    let headers = headers.iter().enumerate().filter(|(i, _)| keep[*i]).map(|(_, h)| *h).collect();
+    for row in &mut cells {
+        let mut i = 0;
+        row.retain(|_| {
+            i += 1;
+            keep[i - 1]
+        });
+    }
+    let sort = sort.and_then(|(col, desc)| new_index(col).map(|c| (c, desc)));
+    (headers, cells, sort)
+}
+
 /// Maps a section's active sort to the header column index that gets the arrow.
 fn sort_header_col(section: usize, key: &str) -> Option<usize> {
     match section {
+        // Pull Requests: "", Provider, Repository, #, Title, Author, State, ±, Updated.
         0 => match key {
             "status" => Some(0),
-            "number" => Some(2),
-            "title" => Some(3),
-            "author" => Some(4),
-            "checks" => Some(5),
-            "updated" => Some(7),
+            "number" => Some(3),
+            "title" => Some(4),
+            "author" => Some(5),
+            "checks" => Some(6),
+            "updated" => Some(8),
             _ => None,
         },
         1 => match key {
@@ -1017,7 +1196,11 @@ fn render_prs(frame: &mut Frame, area: Rect, app: &mut App) {
         })
         .collect();
 
-    let (header, rows) = columnize(dim, &headers, &cells, 3, inner_w, sort_marker(app, 0));
+    // Beside the preview the list is narrow: shed the columns the preview repeats, least
+    // useful first — Provider, ±, Author, Updated — before the title gets squeezed.
+    let (headers, cells, sort) = shed_columns(&headers, cells, PR_TITLE_COL, sort_marker(app, 0), inner_w, &[1, 7, 5, 8]);
+    let flex = headers.iter().position(|h| *h == "Title").unwrap_or(0);
+    let (header, rows) = columnize(dim, &headers, &cells, flex, inner_w, sort);
     render_inline_list(frame, area, app, &title, header, rows);
 }
 
@@ -1085,7 +1268,10 @@ fn render_wis(frame: &mut Frame, area: Rect, app: &mut App) {
         })
         .collect();
 
-    let (header, rows) = columnize(dim, &headers, &cells, 3, inner_w, sort_marker(app, 1));
+    // Provider, Type, Assignee, Updated go first when the list sits beside the preview.
+    let (headers, cells, sort) = shed_columns(&headers, cells, 3, sort_marker(app, 1), inner_w, &[1, 4, 5, 6]);
+    let flex = headers.iter().position(|h| *h == "Title").unwrap_or(0);
+    let (header, rows) = columnize(dim, &headers, &cells, flex, inner_w, sort);
     render_inline_list(frame, area, app, &title, header, rows);
 }
 
@@ -1216,7 +1402,9 @@ fn fit_columns(cols: &mut Vec<PipeCol>, cells: &mut [Vec<(String, Style)>], head
         w.iter().sum::<usize>() + COL_LEAD + COL_GAP * cols.len().saturating_sub(1)
     };
 
-    for droppable in [PipeCol::Repository, PipeCol::Commit, PipeCol::Provider] {
+    // The repository goes last: it is the column the list leads with, and beside the preview
+    // pane (the default on a wide terminal) this narrow case is the everyday one.
+    for droppable in [PipeCol::Provider, PipeCol::Commit, PipeCol::Repository] {
         if natural(cols, cells) <= inner_w {
             return;
         }
@@ -1337,16 +1525,7 @@ fn render_pipes(frame: &mut Frame, area: Rect, app: &mut App) {
                 // The next line tells us whether this run closes its group, so `└` costs a
                 // peek rather than a scan back through the list for every row.
                 let last = !matches!(lines.get(n + 1), Some(PipeLine::Run(_)));
-                // Whether the line above already named this state. Only ever true inside a
-                // group: ungrouped, two neighbouring runs have nothing to do with each other
-                // and an elided word would read as a missing one.
-                let ditto = child
-                    && n > 0
-                    && match &lines[n - 1] {
-                        PipeLine::Head(h) => h.status == p.run.status,
-                        PipeLine::Run(j) => app.pipes[*j].run.status == p.run.status,
-                    };
-                cols.iter().map(|c| run_cell(*c, p, &subject, last, child, ditto, theme, app.anim, owner.as_ref())).collect()
+                cols.iter().map(|c| run_cell(*c, p, &subject, last, child, theme, app.anim, owner.as_ref())).collect()
             }
         })
         .collect();
@@ -1410,7 +1589,6 @@ fn run_cell(
     subject: &str,
     last: bool,
     child: bool,
-    ditto: bool,
     theme: &Theme,
     anim: usize,
     owner: Option<&String>,
@@ -1419,11 +1597,11 @@ fn run_cell(
     match col {
         // Tree is only in the set when grouped, and every run is then a child.
         PipeCol::Tree => ((if last { "└" } else { "├" }).to_string(), Style::default().fg(theme.dim)),
-        // Inside a group the word is written where the state *changes*. Four runs that all
-        // passed are one fact, and spelling it out four times buries the fifth that did not
-        // — the glyph still marks every row, so nothing is missing, only the repetition.
+        // Inside a group a run is only its glyph: the header already says in words where the
+        // pipeline stands, and ✓ / ✗ down the children is what the eye scans for. Ungrouped,
+        // with no header above, each run keeps its word.
         PipeCol::Status => (
-            if ditto { pipeline_glyph(p.run.status, anim).to_string() } else { pipe_status_cell(p.run.status, anim) },
+            if child { pipeline_glyph(p.run.status, anim).to_string() } else { pipe_status_cell(p.run.status, anim) },
             Style::default().fg(theme.pipeline_color(p.run.status)),
         ),
         PipeCol::Provider => (provider_tag(p.provider, &p.connection), Style::default().fg(theme.cyan)),
@@ -1508,7 +1686,7 @@ fn pr_tabs_line(theme: &Theme, view: &PrView) -> Line<'static> {
         spans.push(Span::styled(label, style));
         spans.push(Span::raw(" "));
     }
-    spans.push(Span::styled("  ←/→ tabs · Tab sections · Esc close", Style::default().fg(theme.dim)));
+    spans.push(Span::styled("  ←/→ tabs · Esc close", Style::default().fg(theme.dim)));
     Line::from(spans)
 }
 
@@ -1730,6 +1908,10 @@ fn render_health(frame: &mut Frame, area: Rect, app: &App) {
 /// capturing input. Feedback is always available; the local dashboard shortcut is conditional.
 fn footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
     let mut keys = base_footer_keys(app);
+    // A focused preview is the item view itself, so its own keys lead; `p` is how back.
+    if app.preview_focus && app.wizard.is_none() && app.overlay.is_none() {
+        keys.insert(0, ("p", "back to list"));
+    }
     // Prepend (not append) so it survives the footer being clipped on narrow terminals — the
     // whole point is that people always see the dashboard and feedback entry points exist.
     if app.wizard.is_none() && app.overlay.is_none() && !app.filtering {
@@ -1819,11 +2001,20 @@ fn base_footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
             ("Esc/q", "back"),
         ];
     }
-    let mut keys = vec![("↑↓", "move"), ("←→", "tabs")];
+    let mut keys = vec![("↑↓", "move"), ("Tab", "sections")];
+    // With the preview showing, Enter moves into it rather than opening a full-screen view.
+    // A pipeline group header still expands on Enter; only a run row focuses the pane.
+    let preview = app.preview_shown() && app.preview.is_some();
+    keys.push(match app.active {
+        2 if app.pipe_head_selected() => ("↵", "expand"),
+        _ if preview => ("↵", "focus preview"),
+        2 => ("↵", "expand / drill-in"),
+        _ => ("↵", "open"),
+    });
     match app.active {
-        0 => keys.extend([("↵", "open"), ("f", "status"), ("S", "sort"), ("o", "browser")]),
-        1 => keys.extend([("↵", "open"), ("f", "states"), ("S", "sort"), ("o", "browser")]),
-        2 => keys.extend([("↵", "expand / drill-in"), ("G", "group"), ("S", "sort"), ("T", "trigger"), ("o", "open")]),
+        0 => keys.extend([("f", "status"), ("S", "sort"), ("o", "browser")]),
+        1 => keys.extend([("f", "states"), ("S", "sort"), ("o", "browser")]),
+        2 => keys.extend([("G", "group"), ("S", "sort"), ("T", "trigger"), ("o", "open")]),
         _ => {}
     }
     if app.views[app.active].len() > 1 {
@@ -1930,8 +2121,14 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     }
 
     let mut spans = vec![Span::styled(" ", bar)];
+    // Inside an open item, the keys that change it (approve, merge, comment…) get yellow chips,
+    // apart from the blue ones that only move around.
+    let item_open = matches!(app.screen, Screen::PrView(_) | Screen::WiView(_) | Screen::Pipeline(_))
+        && app.overlay.is_none()
+        && app.wizard.is_none();
     for (key, label) in footer_keys(app) {
-        spans.push(Span::styled(format!(" {key} "), bar.fg(theme.bg).bg(theme.accent).add_modifier(Modifier::BOLD)));
+        let chip = if item_open && is_write_action(label) { theme.yellow } else { theme.accent };
+        spans.push(Span::styled(format!(" {key} "), bar.fg(theme.bg).bg(chip).add_modifier(Modifier::BOLD)));
         spans.push(Span::styled(format!(" {label}  "), bar.fg(theme.fg)));
     }
 
@@ -1961,6 +2158,14 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         Paragraph::new(Line::from(Span::styled(right, right_style)).right_aligned()).style(bar),
         cols[1],
     );
+}
+
+/// Footer labels for the keys that write to the provider, as the item views name them.
+fn is_write_action(label: &str) -> bool {
+    matches!(
+        label,
+        "approve" | "reject" | "merge" | "revert" | "comment" | "reply" | "submit review" | "update state" | "trigger"
+    )
 }
 
 // ---- diff view ----
@@ -2701,13 +2906,15 @@ fn help_sections() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
         (
             "Global",
             vec![
-                ("←/→  h/l  1–3", "Switch tab"),
+                ("1–4", "Jump to a tab"),
                 ("Tab", "Next tab — from anywhere, an open item included"),
                 ("↑/↓  k/j", "Move selection"),
                 ("Ctrl-P", "Jump to any item (command palette)"),
                 ("i", "Notification inbox (mentions, reviews, CI, assignments)"),
                 ("B", "Open the web dashboard in your browser"),
                 ("F", "Give feedback through the GitHub issue form"),
+                ("↵  p", "Focus the preview pane (140+ cols); its keys then work, p returns"),
+                ("P", "Preview pane off / on for this section"),
                 ("/", "Quick-filter the list"),
                 ("S", "Sort by column (re-pick flips direction)"),
                 ("g", "Repositories — which ones this section fetches from"),
@@ -3993,14 +4200,14 @@ mod tests {
         let out = render_to_string(&mut app, 150, 16);
         assert!(out.contains('└'), "the child is on screen");
         // Its header says "Failed" one line up, so the child shows the glyph alone — see
-        // `a_group_writes_the_state_only_where_it_changes`.
+        // `a_groups_runs_carry_only_their_glyph`.
         assert_eq!(out.matches("Failed").count(), 1, "the state is named once for the group");
     }
 
-    /// Four runs that all passed are one fact. Spelling it out on every line buries the fifth
-    /// that did not — which is the line you opened the group to find.
+    /// The header names where the pipeline stands; beneath it, ✓ / ✗ is what the eye scans
+    /// for, so a group's runs carry only their glyph — no word, even where the state changes.
     #[test]
-    fn a_group_writes_the_state_only_where_it_changes() {
+    fn a_groups_runs_carry_only_their_glyph() {
         use PipelineRunStatus::{Failed, Succeeded};
         let mut app = pipe_list(&[
             ("CI", "nz/app", "main", "aaa", 10, Succeeded),
@@ -4014,9 +4221,11 @@ mod tests {
         app.pipe_expanded.insert(key);
 
         let out = render_to_string(&mut app, 150, 16);
-        assert_eq!(out.matches("Succeeded").count(), 1, "the header says it; its matching runs do not repeat it");
-        assert_eq!(out.matches("Failed").count(), 1, "and the run that broke the streak says so");
-        assert_eq!(out.matches('✓').count(), 3, "every row still carries its own glyph");
+        // The newest run passed, so the header reads "Succeeded"; nothing beneath it has a word.
+        assert_eq!(out.matches("Succeeded").count(), 1, "only the header names the state");
+        assert_eq!(out.matches("Failed").count(), 0, "not even the run that broke the streak");
+        assert_eq!(out.matches('✓').count(), 3, "header plus the two passing runs, glyph each");
+        assert_eq!(out.matches('✗').count(), 1, "the failed run is marked by its glyph");
 
         // Ungrouped, neighbouring runs are unrelated — an elided word would read as a missing
         // one, so every row spells its state out.
@@ -4131,6 +4340,7 @@ mod tests {
         use crate::app::PipeHead;
         let theme = Theme::by_name("slate");
         let head = PipeHead {
+            latest: 0,
             key: "k".into(),
             subject: "CI".into(),
             repo: "nz/app".into(),
@@ -4940,5 +5150,67 @@ mod tests {
                 assert!(matches!(c, ratatui::style::Color::Indexed(_)), "{name}: {c:?} must be indexed");
             }
         }
+    }
+
+    #[test]
+    fn shed_columns_leaves_a_wide_list_alone() {
+        let headers = ["", "Provider", "Title"];
+        let cells = vec![vec![("●".into(), Style::default()), ("GitHub".into(), Style::default()), ("A title".into(), Style::default())]];
+        let (h, c, sort) = shed_columns(&headers, cells, 2, Some((1, false)), 200, &[1]);
+        assert_eq!(h, headers.to_vec());
+        assert_eq!(c[0].len(), 3);
+        assert_eq!(sort, Some((1, false)));
+    }
+
+    #[test]
+    fn shed_columns_drops_in_order_until_the_title_fits_and_moves_the_sort_arrow() {
+        let headers = ["", "Provider", "Repository", "Title", "Updated"];
+        let long = "x".repeat(40);
+        let cells = vec![vec![
+            ("●".into(), Style::default()),
+            ("GitHub Enterprise".into(), Style::default()),
+            ("payments".into(), Style::default()),
+            (long, Style::default()),
+            ("3h".into(), Style::default()),
+        ]];
+        // Room for the title only once Provider is gone.
+        let (h, c, sort) = shed_columns(&headers, cells, 3, Some((4, true)), 62, &[1, 4, 2]);
+        assert_eq!(h, vec!["", "Repository", "Title", "Updated"], "Provider shed first, and only it");
+        assert_eq!(c[0].len(), 4);
+        assert_eq!(sort, Some((3, true)), "the arrow follows Updated to its new index");
+
+        let cells = vec![vec![("●".into(), Style::default()); 5]];
+        let (_, _, sort) = shed_columns(&headers, cells, 3, Some((1, false)), 10, &[1]);
+        assert_eq!(sort, None, "a shed column takes its arrow with it");
+    }
+
+    #[test]
+    fn pr_sort_arrow_sits_on_the_sorted_column() {
+        // The list gained a Repository column at index 2; the key → column table has to follow.
+        for (key, header) in [("number", "#"), ("title", "Title"), ("author", "Author"), ("checks", "State"), ("updated", "Updated")] {
+            let headers = ["", "Provider", "Repository", "#", "Title", "Author", "State", "±", "Updated"];
+            assert_eq!(sort_header_col(0, key).map(|i| headers[i]), Some(header), "sort key {key}");
+        }
+    }
+
+    #[test]
+    fn an_open_prs_write_actions_get_yellow_chips_and_navigation_stays_blue() {
+        let mut app = App::new("slate");
+        app.screen = Screen::PrView(Box::new(pr_view(0, vec![], vec![])));
+        let (w, h) = (200, 24);
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let footer: String = (0..w).map(|x| buf[(x, h - 1)].symbol().to_string()).collect();
+        let chip_bg = |label: &str| {
+            let at = footer.find(&format!("  {label}")).unwrap_or_else(|| panic!("footer has {label}: {footer}"));
+            let x = footer[..at].chars().count() as u16 - 2; // the key letter inside its chip
+            buf[(x, h - 1)].bg
+        };
+        let theme = Theme::by_name("slate");
+        for label in ["approve", "reject", "merge", "comment"] {
+            assert_eq!(chip_bg(label), theme.yellow, "{label} is a write action");
+        }
+        assert_eq!(chip_bg("tabs"), theme.accent, "navigation keeps the blue chip");
     }
 }
