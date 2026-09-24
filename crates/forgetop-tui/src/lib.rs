@@ -52,6 +52,8 @@ pub async fn run(deps: AppDeps, theme_name: &str, dashboard_url: Option<String>)
         app.apply_pipe_group(ui.pipeline_group);
         app.apply_views(ui.pr_views, ui.work_item_views, ui.pipeline_views);
         app.notifications = ui.notifications;
+        // Zero would paint every request red; treat it as unset.
+        app.review_sla_hours = ui.review_sla_hours.filter(|&h| h > 0).unwrap_or(forgetop_core::config::DEFAULT_REVIEW_SLA_HOURS);
     }
 
     // First run — nothing configured, or no connection has a token yet. forgetop is a terminal

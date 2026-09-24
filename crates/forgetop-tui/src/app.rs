@@ -745,6 +745,8 @@ pub struct App {
     pub view_idx: [usize; 3],
     /// Which desktop notifications are enabled. Persisted.
     pub notifications: NotificationPrefs,
+    /// Hours a review request may wait before its Command Center age turns yellow (red at 3×).
+    pub review_sla_hours: u32,
     /// Where desktop notifications are sent. Real OS notifier by default; tests
     /// swap in a recorder.
     notifier: Arc<dyn Notifier>,
@@ -1846,6 +1848,7 @@ impl App {
             views: [Vec::new(), Vec::new(), Vec::new()],
             view_idx: [0, 0, 0],
             notifications: NotificationPrefs::default(),
+            review_sla_hours: forgetop_core::config::DEFAULT_REVIEW_SLA_HOURS,
             notifier: Arc::new(SystemNotifier),
             pipe_seen: HashMap::new(),
             approval_seen: HashSet::new(),

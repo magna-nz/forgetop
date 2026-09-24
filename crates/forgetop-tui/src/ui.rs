@@ -458,7 +458,7 @@ fn render_lp_column(frame: &mut Frame, area: Rect, app: &App, side: usize, title
     let entry_cells: Vec<Vec<Vec<Span>>> = slots
         .iter()
         .filter_map(|s| match s {
-            LpSlot::Entry(i) => Some(lp_cells(theme, &app.lp[*i], app.anim, side == 0)),
+            LpSlot::Entry(i) => Some(lp_cells(theme, &app.lp[*i], app.anim, side == 0, app.review_sla_hours)),
             LpSlot::More(_) => None,
         })
         .collect();
@@ -582,11 +582,15 @@ fn pipe_status_label(status: PipelineRunStatus) -> &'static str {
 /// the branch for a run. The "person" is the PR author / who ran the pipeline / the work-item
 /// assignee; `show_person` is false in the right-hand column, where every row is yours anyway
 /// and the name would just repeat down the pane (the empty cell collapses to zero width).
-fn lp_cells(theme: &Theme, e: &crate::launchpad::Entry, anim: usize, show_person: bool) -> Vec<Vec<Span<'static>>> {
+///
+/// A review request's age is how long it has waited (`created_at`, not the last activity a bot
+/// push or a comment would reset), coloured against `sla_hours` so stale asks stand out.
+fn lp_cells(theme: &Theme, e: &crate::launchpad::Entry, anim: usize, show_person: bool, sla_hours: u32) -> Vec<Vec<Span<'static>>> {
     use crate::launchpad::EntryItem;
     let dim = Style::default().fg(theme.dim);
     let fg = Style::default().fg(theme.fg);
-    // Kept calm: type badge, where, person and age are all grey; only the status, the blocker
+    // Kept calm: type badge, where, person and age are all grey (bar a late review request);
+    // only the status, the blocker
     // and the git-diff +/- carry colour.
     let cell = |s: String, st: Style| vec![Span::styled(s, st)];
     let person = |u: Option<&forgetop_core::domain::User>| {
@@ -628,6 +632,12 @@ fn lp_cells(theme: &Theme, e: &crate::launchpad::Entry, anim: usize, show_person
                     s
                 }
             };
+            let age_cell = if e.bucket == crate::launchpad::Bucket::NeedsReview {
+                let waited = pr.created_at.or(pr.updated_at);
+                cell(rel_age(waited), Style::default().fg(sla_color(theme, waited, sla_hours, Utc::now())))
+            } else {
+                age(pr.updated_at)
+            };
             vec![
                 cell("PR".into(), dim),
                 cell(st.to_string(), Style::default().fg(stc)),
@@ -635,7 +645,7 @@ fn lp_cells(theme: &Theme, e: &crate::launchpad::Entry, anim: usize, show_person
                 cell(pr.title.clone(), fg),
                 signal,
                 person(Some(&pr.author)),
-                age(pr.updated_at),
+                age_cell,
             ]
         }
         EntryItem::Pipe { run, definition_name } => {
@@ -666,6 +676,21 @@ fn lp_cells(theme: &Theme, e: &crate::launchpad::Entry, anim: usize, show_person
             person(wi.assignee.as_ref()),
             age(wi.updated_at),
         ],
+    }
+}
+
+/// The colour of a review request's age: grey inside `sla_hours`, yellow past it, red past three
+/// times it. An unknown timestamp stays grey — there is nothing to be late against.
+fn sla_color(theme: &Theme, since: Option<DateTime<Utc>>, sla_hours: u32, now: DateTime<Utc>) -> ratatui::style::Color {
+    let Some(since) = since else { return theme.dim };
+    let waited = (now - since).num_minutes().max(0);
+    let sla = i64::from(sla_hours.max(1)) * 60;
+    if waited >= sla * 3 {
+        theme.red
+    } else if waited >= sla {
+        theme.yellow
+    } else {
+        theme.dim
     }
 }
 
@@ -3476,6 +3501,33 @@ mod tests {
     /// A Launchpad entry in `bucket`, from a stub GitHub connection.
     fn lp_entry(bucket: crate::launchpad::Bucket, item: crate::launchpad::EntryItem) -> crate::launchpad::Entry {
         crate::launchpad::Entry { bucket, connection_id: "c".into(), connection: "GH".into(), provider: ProviderType::GitHub, item }
+    }
+
+    #[test]
+    fn sla_color_bands_grey_yellow_red() {
+        let theme = Theme::by_name("slate");
+        let now = Utc::now();
+        let ago = |h: i64| Some(now - chrono::Duration::hours(h));
+        assert_eq!(sla_color(&theme, ago(23), 24, now), theme.dim, "inside the SLA stays grey");
+        assert_eq!(sla_color(&theme, ago(24), 24, now), theme.yellow, "at the SLA turns yellow");
+        assert_eq!(sla_color(&theme, ago(71), 24, now), theme.yellow);
+        assert_eq!(sla_color(&theme, ago(72), 24, now), theme.red, "at three times it turns red");
+        assert_eq!(sla_color(&theme, None, 24, now), theme.dim, "no timestamp, nothing to be late against");
+        assert_eq!(sla_color(&theme, ago(3), 0, now), theme.red, "a zero SLA is clamped to an hour, not a divide-by-zero");
+    }
+
+    #[test]
+    fn review_request_age_is_time_waited_and_coloured() {
+        use crate::launchpad::{Bucket, EntryItem};
+        let theme = Theme::by_name("slate");
+        let mut pr = sample_pr();
+        pr.created_at = Some(Utc::now() - chrono::Duration::hours(30));
+        pr.updated_at = Some(Utc::now() - chrono::Duration::minutes(5));
+        let age = |bucket| lp_cells(&theme, &lp_entry(bucket, EntryItem::Pr(pr.clone())), 0, true, 24)[6][0].clone();
+        let review = age(Bucket::NeedsReview);
+        assert_eq!((review.content.as_ref(), review.style.fg), ("1d", Some(theme.yellow)), "waited since opened, past the SLA");
+        let mine = age(Bucket::YourOpenPrs);
+        assert_eq!((mine.content.as_ref(), mine.style.fg), ("5m", Some(theme.dim)), "other buckets keep last-activity grey");
     }
 
     fn reviewer(name: &str, vote: ReviewVote) -> Reviewer {
