@@ -8,7 +8,8 @@ description = "Ratatui terminal interface for forgetop. Internal crate: no API s
 
 [dependencies]
 forgetop-core.workspace = true
-ratatui.workspace = true
+# `line_count` sizes the scroll range of wrapped detail panes by the rows they actually take.
+ratatui = { workspace = true, features = ["unstable-rendered-line-info"] }
 serde.workspace = true
 crossterm.workspace = true
 tokio.workspace = true

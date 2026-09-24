@@ -27,7 +27,8 @@ pub fn pull_request_matches(pr: &PullRequest, filter: PullRequestFilter, me: Opt
     }
 }
 
-fn is_user(user: &User, me: &str) -> bool {
+/// Whether `user` is the signed-in user `me` (a handle, display name or id, case-insensitive).
+pub fn is_user(user: &User, me: &str) -> bool {
     user.handle.as_deref().is_some_and(|h| h.eq_ignore_ascii_case(me))
         || user.display_name.eq_ignore_ascii_case(me)
         || user.id.eq_ignore_ascii_case(me)

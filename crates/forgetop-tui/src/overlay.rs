@@ -3,7 +3,7 @@
 //! instead of the table, so there's no ambiguity between typing and navigation.
 
 use forgetop_core::domain::ReviewVote;
-use forgetop_core::provider::MergeStrategy;
+use forgetop_core::provider::{ItemRef, MergeStrategy};
 
 use crate::app::Key;
 use crate::palette::{complete, mode_title, rank, PaletteItem, PaletteKind, PaletteTarget};
@@ -19,6 +19,16 @@ pub enum Action {
     PrReply(String),
     WiSetState(String),
     WiComment(String),
+    /// Assign the open work item to the user with this id (`None` = unassign). `label` is the
+    /// name to show for it, so the change can be reflected before the provider answers.
+    WiAssign { id: Option<String>, label: String },
+    /// From the edit picker: start editing this field of the open work item.
+    WiEdit(WiField),
+    WiSetTitle(String),
+    /// The description as it came back from `$EDITOR`.
+    WiSetDescription(String),
+    /// Confirmed: cancel this pipeline run. `run` carries its repository — see `PipelineTrigger`.
+    PipelineCancel { connection_id: String, run: ItemRef, label: String },
     /// `repo` is the definition's **connection-relative** repository — a connection spanning
     /// several has no single "own" one to fall back on, so the target must be carried explicitly.
     PipelineTrigger { connection_id: String, repo: Option<String>, definition_id: String, branch: Option<String>, label: String },
@@ -59,6 +69,29 @@ pub enum Action {
     SetupInBrowser,
 }
 
+/// A work-item field the edit picker (`e`) can open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WiField {
+    Title,
+    Description,
+}
+
+/// One row of a [`Overlay::Search`] picker: the id it submits (`None` for a "nobody" row such
+/// as *Unassigned*) and what it shows.
+#[derive(Debug, Clone)]
+pub struct SearchItem {
+    pub id: Option<String>,
+    pub label: String,
+}
+
+/// What a [`Overlay::Search`] picker is choosing.
+#[derive(Debug, Clone)]
+pub enum SearchKind {
+    /// The open work item's assignee. `me` indexes the signed-in user's row, when this
+    /// connection can say who that is, so `@` assigns you without typing.
+    Assignee { me: Option<usize> },
+}
+
 /// What a [`Overlay::Toggle`] checklist is choosing.
 #[derive(Debug, Clone)]
 pub enum ToggleKind {
@@ -91,6 +124,8 @@ pub struct ToggleItem {
 pub enum PickerKind {
     PrMergeStrategy,
     WorkItemState,
+    /// Which field of the open work item to edit (Title / Description).
+    WorkItemEdit,
     /// The verdict for submitting a batch of pending line comments.
     ReviewSubmit,
     /// Choose the sort column for a section (0=PR, 1=WI, 2=Pipelines).
@@ -110,6 +145,8 @@ pub enum PickerKind {
 pub enum InputKind {
     PrComment,
     WorkItemComment,
+    /// The open work item's new title (prefilled with the current one).
+    WorkItemTitle,
     /// The body of a pending inline line comment.
     PrLineComment,
     /// A reply to the thread stashed on the PR view (`reply_target`).
@@ -126,6 +163,9 @@ pub enum Overlay {
     /// `selected` indexes the *visible* rows), `None` keeps the plain j/k behaviour. A scope
     /// picker over a few hundred repositories needs the search; a three-row list doesn't.
     Toggle { title: String, kind: ToggleKind, min_one: bool, items: Vec<ToggleItem>, selected: usize, filter: Option<String> },
+    /// A searchable single-choice list: typing narrows it, Enter picks the highlighted row.
+    /// `selected` indexes the *visible* rows (see [`visible_search_indices`]).
+    Search { title: String, query: String, items: Vec<SearchItem>, selected: usize, kind: SearchKind },
     /// A scrollable, context-agnostic reference of every keybinding.
     Help { scroll: u16 },
     /// The command palette: "search everything" — the screen's actions, every already-fetched
@@ -150,7 +190,8 @@ impl Overlay {
             Overlay::Confirm { title, .. }
             | Overlay::Picker { title, .. }
             | Overlay::Input { title, .. }
-            | Overlay::Toggle { title, .. } => title,
+            | Overlay::Toggle { title, .. }
+            | Overlay::Search { title, .. } => title,
             Overlay::Help { .. } => "Keybindings",
             Overlay::Palette { query, .. } => mode_title(query),
         }
@@ -166,6 +207,14 @@ impl Overlay {
                 vec![("type", "search"), ("↑↓", "move"), ("space", "toggle"), ("↵", "apply")]
             }
             Overlay::Toggle { .. } => vec![("↑↓", "move"), ("space", "toggle"), ("↵", "apply")],
+            Overlay::Search { kind: SearchKind::Assignee { me }, .. } => {
+                let mut keys = vec![("type", "search"), ("↑↓", "choose"), ("↵", "assign")];
+                if me.is_some() {
+                    keys.push(("@", "assign me"));
+                }
+                keys.push(("Esc", "cancel"));
+                keys
+            }
             Overlay::Help { .. } => vec![("↑↓", "scroll"), ("Esc", "close")],
             Overlay::Palette { .. } => {
                 vec![("↑↓", "move"), ("↵", "run/open"), ("Tab", "complete"), ("^K", "close"), ("Esc", "cancel")]
@@ -276,6 +325,47 @@ impl Overlay {
                     _ => Outcome::Keep,
                 }
             }
+            Overlay::Search { query, items, selected, kind, .. } => {
+                let visible = visible_search_indices(items, query);
+                match key {
+                    // `@` never appears in a display name, so it is free to mean "me".
+                    Key::Char('@') => match kind {
+                        SearchKind::Assignee { me: Some(i) } => match items.get(*i) {
+                            Some(item) => Outcome::Submit(resolve_search(kind, item)),
+                            None => Outcome::Keep,
+                        },
+                        SearchKind::Assignee { me: None } => Outcome::Keep,
+                    },
+                    Key::Char(c) => {
+                        query.push(c);
+                        *selected = 0;
+                        Outcome::Keep
+                    }
+                    Key::Backspace => {
+                        query.pop();
+                        *selected = 0;
+                        Outcome::Keep
+                    }
+                    Key::Up => {
+                        if !visible.is_empty() {
+                            *selected = (*selected + visible.len() - 1) % visible.len();
+                        }
+                        Outcome::Keep
+                    }
+                    Key::Down => {
+                        if !visible.is_empty() {
+                            *selected = (*selected + 1) % visible.len();
+                        }
+                        Outcome::Keep
+                    }
+                    Key::Enter => match visible.get(*selected).and_then(|&i| items.get(i)) {
+                        Some(item) => Outcome::Submit(resolve_search(kind, item)),
+                        None => Outcome::Keep, // nothing matches — swallow Enter
+                    },
+                    Key::Escape => Outcome::Cancel,
+                    _ => Outcome::Keep,
+                }
+            }
             Overlay::Help { scroll } => match key {
                 Key::Up | Key::Char('k') => {
                     *scroll = scroll.saturating_sub(1);
@@ -357,6 +447,10 @@ fn resolve_picker(kind: PickerKind, selected: usize, items: &[String]) -> Action
             Action::PrMerge(strategy)
         }
         PickerKind::WorkItemState => Action::WiSetState(items.get(selected).cloned().unwrap_or_default()),
+        PickerKind::WorkItemEdit => match selected {
+            1 => Action::WiEdit(WiField::Description),
+            _ => Action::WiEdit(WiField::Title),
+        },
         PickerKind::ReviewSubmit => {
             let event = match selected {
                 1 => ReviewVote::Approved,
@@ -385,10 +479,29 @@ fn resolve_input(kind: InputKind, text: String) -> Action {
     match kind {
         InputKind::PrComment => Action::PrComment(text),
         InputKind::WorkItemComment => Action::WiComment(text),
+        InputKind::WorkItemTitle => Action::WiSetTitle(text),
         InputKind::PrLineComment => Action::AddLineComment(text),
         InputKind::PrThreadReply => Action::PrReply(text),
         InputKind::SaveView => Action::SaveView(text),
     }
+}
+
+fn resolve_search(kind: &SearchKind, item: &SearchItem) -> Action {
+    match kind {
+        SearchKind::Assignee { .. } => Action::WiAssign { id: item.id.clone(), label: item.label.clone() },
+    }
+}
+
+/// The rows a search picker currently shows: everything, or what matches its query.
+/// `Overlay::Search::selected` indexes into this, not into `items`.
+pub fn visible_search_indices(items: &[SearchItem], query: &str) -> Vec<usize> {
+    let q = query.trim().to_lowercase();
+    items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| q.is_empty() || item.label.to_lowercase().contains(&q))
+        .map(|(i, _)| i)
+        .collect()
 }
 
 /// The rows a checklist currently shows: everything, or what matches its search query.
@@ -412,6 +525,60 @@ mod tests {
             .iter()
             .map(|n| ToggleItem { id: (*n).into(), label: (*n).into(), on: on.contains(n) })
             .collect()
+    }
+
+    fn assignees() -> Overlay {
+        let item = |id: Option<&str>, label: &str| SearchItem { id: id.map(str::to_string), label: label.into() };
+        Overlay::Search {
+            title: "Assign".into(),
+            query: String::new(),
+            items: vec![item(None, "Unassigned"), item(Some("u1"), "Priya Nair"), item(Some("u9"), "Priyanka Shah"), item(Some("me"), "Sam Rivera")],
+            selected: 0,
+            kind: SearchKind::Assignee { me: Some(3) },
+        }
+    }
+
+    #[test]
+    fn the_assignee_picker_narrows_as_you_type_and_assigns_the_highlighted_row() {
+        let mut o = assignees();
+        for c in "pri".chars() {
+            assert!(matches!(o.handle(Key::Char(c)), Outcome::Keep));
+        }
+        assert!(matches!(o.handle(Key::Down), Outcome::Keep));
+        match o.handle(Key::Enter) {
+            Outcome::Submit(Action::WiAssign { id, label }) => {
+                assert_eq!(id.as_deref(), Some("u9"));
+                assert_eq!(label, "Priyanka Shah");
+            }
+            _ => panic!("Enter should assign the second match"),
+        }
+    }
+
+    #[test]
+    fn at_assigns_you_and_the_unassigned_row_clears_the_assignee() {
+        match assignees().handle(Key::Char('@')) {
+            Outcome::Submit(Action::WiAssign { id, .. }) => assert_eq!(id.as_deref(), Some("me")),
+            _ => panic!("@ should assign the signed-in user"),
+        }
+        match assignees().handle(Key::Enter) {
+            Outcome::Submit(Action::WiAssign { id, label }) => {
+                assert_eq!(id, None);
+                assert_eq!(label, "Unassigned");
+            }
+            _ => panic!("the first row unassigns"),
+        }
+        // With no known identity, `@` does nothing rather than being typed into the query.
+        let mut o = assignees();
+        if let Overlay::Search { kind, .. } = &mut o {
+            *kind = SearchKind::Assignee { me: None };
+        }
+        assert!(matches!(o.handle(Key::Char('@')), Outcome::Keep));
+        assert!(matches!(&o, Overlay::Search { query, .. } if query.is_empty()));
+        // A query that matches nothing swallows Enter instead of assigning someone unseen.
+        for c in "zzz".chars() {
+            o.handle(Key::Char(c));
+        }
+        assert!(matches!(o.handle(Key::Enter), Outcome::Keep));
     }
 
     #[test]

@@ -1652,13 +1652,11 @@ fn field_styled(theme: &Theme, label: &str, value: String, color: ratatui::style
 
 fn comment_lines(theme: &Theme, threads: &[CommentThread]) -> Vec<Line<'static>> {
     let total: usize = threads.iter().map(|t| t.comments.len()).sum();
-    let mut lines = vec![
-        Line::from(""),
-        Line::from(Span::styled(format!("Comments ({total})"), Style::default().fg(theme.accent).add_modifier(Modifier::BOLD))),
-    ];
+    let mut heading = vec![Span::styled(format!("Comments ({total})"), Style::default().fg(theme.accent).add_modifier(Modifier::BOLD))];
     if total == 0 {
-        lines.push(Line::from(Span::styled("No comments.", Style::default().fg(theme.dim))));
+        heading.push(Span::styled("   No comments.", Style::default().fg(theme.dim)));
     }
+    let mut lines = vec![Line::from(""), Line::from(heading)];
     for thread in threads {
         for c in &thread.comments {
             lines.push(Line::from(Span::styled(format!("{}:", c.author.display_name), Style::default().fg(theme.blue))));
@@ -1666,6 +1664,89 @@ fn comment_lines(theme: &Theme, threads: &[CommentThread]) -> Vec<Line<'static>>
                 lines.push(Line::from(Span::styled(format!("  {l}"), Style::default().fg(theme.fg))));
             }
         }
+    }
+    lines
+}
+
+/// The widest the actor column may grow before a name is truncated, so one long name can't
+/// push every event's detail off the right edge.
+const ACTIVITY_ACTOR_MAX: usize = 20;
+
+/// Splits a timeline event into a short verb and, where the event names one, the thing it moved
+/// to — `state` / `→ In Progress`, `assigned` / `→ Sam Rivera` — for the Activity columns.
+///
+/// Every provider's mapper writes the summary the same way (`changed status to X`,
+/// `assigned this to X`, `added the X label`), so the target is read back out of that sentence.
+/// A summary that doesn't follow the pattern is shown whole rather than guessed at.
+pub fn activity_parts(kind: TimelineEventKind, summary: &str) -> (String, Option<String>) {
+    use TimelineEventKind as K;
+    let after_to = |s: &str| s.split_once(" to ").map(|(_, t)| t.trim().to_string()).filter(|t| !t.is_empty());
+    let verb = |v: &str| (v.to_string(), None);
+    match kind {
+        // An empty target (Jira reports some transitions without a name) is still a state change.
+        K::StateChanged => ("state".into(), after_to(summary)),
+        K::Assigned if summary.starts_with("unassigned") => verb("unassigned"),
+        K::Assigned => ("assigned".into(), after_to(summary)),
+        K::Labeled => {
+            let label = summary.strip_prefix("added the ").and_then(|l| l.strip_suffix(" label")).map(str::to_string);
+            ("labeled".into(), label)
+        }
+        K::Approved => verb("approved"),
+        K::Reviewed => verb(summary.trim()),
+        K::ChangesRequested => verb("changes requested"),
+        K::Commented => verb("commented"),
+        K::Committed => verb("committed"),
+        // The forge's own word, not a generic one: Azure "completed" / "abandoned", Bitbucket
+        // "declined", and the rest ("created this", "opened this pull request", …).
+        K::Merged | K::Closed | K::Reopened | K::Other => {
+            let s = summary.trim();
+            // Jira's "set resolution to Done" reads as `resolution → Done`.
+            if let Some((field, to)) = s.strip_prefix("set ").and_then(|r| r.split_once(" to ")) {
+                return (field.to_string(), Some(to.trim().to_string()));
+            }
+            let s = s.strip_suffix(" this pull request").or_else(|| s.strip_suffix(" this")).unwrap_or(s);
+            verb(s)
+        }
+    }
+}
+
+/// The Activity section — one aligned row per timeline event (age · actor · verb · → target),
+/// shared by the work-item view and the PR Conversation tab. Empty when the provider reports no
+/// timeline, so a forge without one shows no heading rather than an empty section.
+fn activity_lines(theme: &Theme, events: &[TimelineEvent]) -> Vec<Line<'static>> {
+    if events.is_empty() {
+        return Vec::new();
+    }
+    let actor = |e: &TimelineEvent| truncate(e.actor.as_ref().map(|a| a.display_name.as_str()).unwrap_or("—"), ACTIVITY_ACTOR_MAX);
+    let rows: Vec<(String, String, String, Option<String>)> = events
+        .iter()
+        .map(|e| {
+            let (verb, target) = activity_parts(e.kind, &e.summary);
+            (rel_age(e.at), actor(e), verb, target)
+        })
+        .collect();
+    let age_w = rows.iter().map(|r| r.0.chars().count()).max().unwrap_or(0);
+    let actor_w = rows.iter().map(|r| r.1.chars().count()).max().unwrap_or(0);
+    // Only the verbs that carry a target need to line up; a bare verb ends the row.
+    let verb_w = rows.iter().filter(|r| r.3.is_some()).map(|r| r.2.chars().count()).max().unwrap_or(0);
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(Span::styled("Activity", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD))),
+    ];
+    for (age, who, verb, target) in rows {
+        let mut spans = vec![
+            Span::styled(format!("  {age:>age_w$}  "), Style::default().fg(theme.dim)),
+            Span::styled(format!("{who:<actor_w$}  "), Style::default().fg(theme.blue)),
+        ];
+        match target {
+            Some(t) => {
+                spans.push(Span::styled(format!("{verb:<verb_w$} "), Style::default().fg(theme.fg)));
+                spans.push(Span::styled("→ ", Style::default().fg(theme.dim)));
+                spans.push(Span::styled(t, Style::default().fg(theme.fg)));
+            }
+            None => spans.push(Span::styled(verb, Style::default().fg(theme.fg))),
+        }
+        lines.push(Line::from(spans));
     }
     lines
 }
@@ -1702,7 +1783,7 @@ fn review_glyph(theme: &Theme, vote: ReviewVote) -> (&'static str, ratatui::styl
     }
 }
 
-fn pr_conversation_lines(theme: &Theme, pr: &PullRequest, threads: &[CommentThread]) -> Vec<Line<'static>> {
+fn pr_conversation_lines(theme: &Theme, pr: &PullRequest, threads: &[CommentThread], timeline: &[TimelineEvent]) -> Vec<Line<'static>> {
     let mut lines = vec![
         field(theme, "Author", pr.author.display_name.clone()),
         field(theme, "Branch", format!("{} → {}", pr.source_ref.clone().unwrap_or_default(), pr.target_ref.clone().unwrap_or_default())),
@@ -1742,6 +1823,7 @@ fn pr_conversation_lines(theme: &Theme, pr: &PullRequest, threads: &[CommentThre
         }
     }
     lines.extend(comment_lines(theme, threads));
+    lines.extend(activity_lines(theme, timeline));
     lines
 }
 
@@ -1834,16 +1916,23 @@ fn render_pr_view(frame: &mut Frame, area: Rect, theme: &Theme, view: &PrView) -
         return 0;
     }
     let (title, lines) = match view.tab {
-        0 => ("Conversation", pr_conversation_lines(theme, &view.pr, &view.diff.threads)),
+        0 => ("Conversation", pr_conversation_lines(theme, &view.pr, &view.diff.threads, &view.timeline)),
         _ => ("Checks", pr_checks_lines(theme, &view.checks)),
     };
-    let inner_h = rows[3].height.saturating_sub(2);
-    let max = (lines.len() as u16).saturating_sub(inner_h);
-    frame.render_widget(
-        Paragraph::new(lines).block(section_block(theme, title)).scroll((view.scroll.min(max), 0)).wrap(Wrap { trim: false }),
-        rows[3],
-    );
+    let para = Paragraph::new(lines).block(section_block(theme, title)).wrap(Wrap { trim: false });
+    let max = wrapped_scroll_max(&para, rows[3]);
+    frame.render_widget(para.scroll((view.scroll.min(max), 0)), rows[3]);
     max
+}
+
+/// How far a wrapped, bordered pane can scroll: the rows its lines take once wrapped to the
+/// pane's width, less the rows it has. Counting logical lines instead stops the scroll short
+/// of the end whenever a long line wraps, hiding whatever sits at the bottom (the Activity).
+fn wrapped_scroll_max(para: &Paragraph, area: Rect) -> u16 {
+    // `line_count` adds the block's top and bottom rows but wraps at the width it is given, not
+    // inside the block's side borders — so it is handed the inner width of the bordered pane.
+    let rows = u16::try_from(para.line_count(area.width.saturating_sub(2))).unwrap_or(u16::MAX);
+    rows.saturating_sub(area.height)
 }
 
 fn render_wi_view(frame: &mut Frame, area: Rect, theme: &Theme, view: &WiView) -> u16 {
@@ -1879,12 +1968,10 @@ fn render_wi_view(frame: &mut Frame, area: Rect, theme: &Theme, view: &WiView) -
         }
     }
     lines.extend(comment_lines(theme, &view.threads));
-    let inner_h = rows[1].height.saturating_sub(2);
-    let max = (lines.len() as u16).saturating_sub(inner_h);
-    frame.render_widget(
-        Paragraph::new(lines).block(section_block(theme, "Work Item")).scroll((view.scroll.min(max), 0)).wrap(Wrap { trim: false }),
-        rows[1],
-    );
+    lines.extend(activity_lines(theme, &view.timeline));
+    let para = Paragraph::new(lines).block(section_block(theme, "Work Item")).wrap(Wrap { trim: false });
+    let max = wrapped_scroll_max(&para, rows[1]);
+    frame.render_widget(para.scroll((view.scroll.min(max), 0)), rows[1]);
     max
 }
 
@@ -1980,7 +2067,15 @@ fn base_footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
         };
     }
     if matches!(app.screen, Screen::WiView(_)) {
-        return vec![("PgUp/Dn", "scroll"), ("u", "update state"), ("c", "comment"), ("o", "open"), ("Esc/q", "back")];
+        // Scrolling is left to `?` help: the view's own actions need the room.
+        return vec![
+            ("u", "update state"),
+            ("@", "assign"),
+            ("e", "edit"),
+            ("c", "comment"),
+            ("o", "open"),
+            ("Esc/q", "back"),
+        ];
     }
     if matches!(app.screen, Screen::Inbox) {
         return vec![("↵", "open item"), ("o", "browser"), ("x", "mark read"), ("A", "all read"), ("Esc", "back")];
@@ -2006,6 +2101,9 @@ fn base_footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
         let mut keys = vec![("↵", "expand"), ("L", "logs")];
         if v.can_respond_approvals && !v.actionable_approvals().is_empty() {
             keys.push(("A", "approve"));
+        }
+        if matches!(v.run.status, PipelineRunStatus::Queued | PipelineRunStatus::Running) {
+            keys.push(("X", "cancel"));
         }
         keys.extend([("T", "trigger"), ("o", "open job"), ("Esc/q", "back")]);
         return keys;
@@ -2151,12 +2249,21 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     };
     let (right, right_style) = if let Some(t) = &app.toast {
         (format!("{t} "), bar.fg(theme.yellow).add_modifier(Modifier::BOLD))
-    } else if let Some(text) = narrow_refresh {
+    } else if let Some(text) = &narrow_refresh {
         (format!("{text} "), bar.fg(theme.dim))
     } else {
         (format!("{} ", app.status), bar.fg(theme.dim))
     };
-    let right_w = right.chars().count().min(70) as u16 + 1;
+    let mut right_w = right.chars().count().min(70) as u16 + 1;
+    // Inside an open item the standing counts give way to its keys when both don't fit — the
+    // counts describe the lists behind it. A toast (what just happened) and "Refreshing…"
+    // keep their place.
+    if item_open && app.toast.is_none() && narrow_refresh.is_none() {
+        let keys_w: u16 = spans.iter().map(|s| s.content.chars().count() as u16).sum();
+        if keys_w.saturating_add(right_w) > area.width {
+            right_w = 0;
+        }
+    }
 
     let cols = Layout::default()
         .direction(Direction::Horizontal)
@@ -2174,7 +2281,8 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
 fn is_write_action(label: &str) -> bool {
     matches!(
         label,
-        "approve" | "reject" | "merge" | "revert" | "comment" | "reply" | "submit review" | "update state" | "trigger"
+        "approve" | "reject" | "merge" | "revert" | "comment" | "reply" | "submit review" | "update state" | "assign" | "edit"
+            | "trigger" | "cancel"
     )
 }
 
@@ -2872,6 +2980,33 @@ fn render_overlay(frame: &mut Frame, area: Rect, app: &App) {
                 ),
             theme.green,
         ),
+        Overlay::Search { query, items, selected, .. } => {
+            let visible = crate::overlay::visible_search_indices(items, query);
+            let mut body = vec![
+                Line::from(vec![
+                    Span::styled(query.clone(), Style::default().fg(theme.fg).add_modifier(Modifier::BOLD)),
+                    Span::styled("▏", Style::default().fg(theme.accent)),
+                ]),
+                Line::from(""),
+            ];
+            if visible.is_empty() {
+                body.push(Line::from(Span::styled("   No one matches.", Style::default().fg(theme.dim))));
+            }
+            for (i, idx) in visible.into_iter().enumerate() {
+                let item = &items[idx];
+                // The "nobody" row (Unassigned) reads as an option, not as a person.
+                let plain = if item.id.is_none() { theme.dim } else { theme.fg };
+                body.push(if i == *selected {
+                    Line::from(vec![
+                        Span::styled(" ▐ ", Style::default().fg(theme.accent)),
+                        Span::styled(item.label.clone(), Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+                    ])
+                } else {
+                    Line::from(Span::styled(format!("   {}", item.label), Style::default().fg(plain)))
+                });
+            }
+            (body, theme.accent)
+        }
         Overlay::Help { .. } | Overlay::Palette { .. } => return, // handled above
     };
 
@@ -3145,6 +3280,8 @@ pub(crate) fn help_sections() -> Vec<(&'static str, Vec<(&'static str, &'static 
             "Work Item view (after Enter)",
             vec![
                 ("u", "Update state (pulled from the provider)"),
+                ("@", "Assign (type to search; @ again assigns you)"),
+                ("e", "Edit the title, or the description in $EDITOR"),
                 ("c", "Comment"),
                 ("o", "Open in browser"),
             ],
@@ -3165,6 +3302,7 @@ pub(crate) fn help_sections() -> Vec<(&'static str, Vec<(&'static str, &'static 
                 ("A", "Approve / reject a waiting gate (GitHub, GitLab; Azure is view-only)"),
                 ("o", "Open the selected job in the browser"),
                 ("T", "Trigger a run"),
+                ("X (in drill-in)", "Cancel a queued or running run"),
             ],
         ),
         (
@@ -3412,6 +3550,7 @@ mod tests {
     fn pr_view(tab: usize, checks: Vec<CheckRun>, files: Vec<FileChange>) -> crate::app::PrView {
         use crate::app::DiffView;
         crate::app::PrView {
+            timeline: Vec::new(),
             label: "PR #42 — Add the widget".into(),
             connection_id: "c".into(),
             url: Some("http://x".into()),
@@ -3740,7 +3879,7 @@ mod tests {
             Reviewer { user: who("Priya Nair"), vote: ReviewVote::Approved, is_required: true },
             Reviewer { user: who("Marcus Lee"), vote: ReviewVote::Rejected, is_required: false },
         ];
-        let lines = pr_conversation_lines(&theme, &pr, &[]);
+        let lines = pr_conversation_lines(&theme, &pr, &[], &[]);
 
         let green_tick = lines.iter().any(|l| l.spans.iter().any(|s| s.content.as_ref() == "✓" && s.style.fg == Some(theme.green)));
         let red_cross = lines.iter().any(|l| l.spans.iter().any(|s| s.content.as_ref() == "✗" && s.style.fg == Some(theme.red)));
@@ -5067,6 +5206,7 @@ mod tests {
         // pane showing the raw `<div>`/`<br>` markup instead, on one unbroken line.
         let mut app = App::new("slate");
         app.screen = Screen::WiView(Box::new(crate::app::WiView {
+            timeline: Vec::new(),
             connection_id: "azure".into(),
             wi: WorkItem {
                 repository: Some("Payments".into()),
@@ -5108,6 +5248,7 @@ mod tests {
 
         // Opening the item surfaces update-state + comment in its footer.
         app.screen = Screen::WiView(Box::new(crate::app::WiView {
+            timeline: Vec::new(),
             connection_id: "c".into(),
             wi: WorkItem {
                 repository: None,
@@ -5443,5 +5584,138 @@ mod tests {
             assert_eq!(chip_bg(label), theme.yellow, "{label} is a write action");
         }
         assert_eq!(chip_bg("tabs"), theme.accent, "navigation keeps the blue chip");
+    }
+
+    fn event(who: &str, kind: TimelineEventKind, summary: &str, hours_ago: i64) -> TimelineEvent {
+        TimelineEvent {
+            actor: Some(User { id: who.into(), display_name: who.into(), handle: None, avatar_url: None }),
+            kind,
+            summary: summary.into(),
+            at: Some(Utc::now() - chrono::Duration::hours(hours_ago)),
+        }
+    }
+
+    #[test]
+    fn activity_reads_each_providers_summary_as_a_verb_and_a_target() {
+        use TimelineEventKind as K;
+        let parts = |k, s: &str| activity_parts(k, s);
+        assert_eq!(parts(K::StateChanged, "changed status to In Progress"), ("state".into(), Some("In Progress".into())));
+        // A state whose own name contains " to " keeps it whole.
+        assert_eq!(parts(K::StateChanged, "changed status to Ready to Deploy"), ("state".into(), Some("Ready to Deploy".into())));
+        assert_eq!(parts(K::Assigned, "assigned this to Sam Rivera"), ("assigned".into(), Some("Sam Rivera".into())));
+        assert_eq!(parts(K::Assigned, "unassigned this"), ("unassigned".into(), None));
+        assert_eq!(parts(K::Labeled, "added the bug label"), ("labeled".into(), Some("bug".into())));
+        assert_eq!(parts(K::Other, "created this"), ("created".into(), None));
+        assert_eq!(parts(K::Other, "opened this pull request"), ("opened".into(), None));
+        assert_eq!(parts(K::Approved, "approved these changes"), ("approved".into(), None));
+        assert_eq!(parts(K::Merged, "completed this pull request"), ("completed".into(), None));
+        assert_eq!(parts(K::Closed, "declined this"), ("declined".into(), None));
+        assert_eq!(parts(K::Other, "set resolution to Won't Do"), ("resolution".into(), Some("Won't Do".into())));
+        assert_eq!(parts(K::StateChanged, "changed status to "), ("state".into(), None));
+        // Azure's "waiting for author" vote keeps its words rather than a generic "reviewed".
+        assert_eq!(parts(K::Reviewed, "is waiting for the author"), ("is waiting for the author".into(), None));
+    }
+
+    #[test]
+    fn the_work_item_view_lists_its_activity_under_the_comments() {
+        use crate::app::Screen;
+        let mut app = App::new("slate");
+        app.screen = Screen::WiView(Box::new(crate::app::WiView {
+            connection_id: "c".into(),
+            wi: WorkItem {
+                repository: None,
+                id: "77".into(),
+                identifier: Some("#77".into()),
+                title: "Right-size the staging cluster".into(),
+                description: None,
+                state: "In Progress".into(),
+                state_category: WorkItemStateCategory::Started,
+                work_item_type: Some("Task".into()),
+                assignee: None,
+                created_at: None,
+                updated_at: None,
+                url: None,
+            },
+            threads: vec![],
+            timeline: vec![
+                event("Sam Rivera", TimelineEventKind::Other, "created this", 48),
+                event("Sam Rivera", TimelineEventKind::StateChanged, "changed status to In Progress", 24),
+                event("Priya Nair", TimelineEventKind::Assigned, "assigned this to Sam Rivera", 5),
+            ],
+            scroll: 0,
+        }));
+        let rows = render_to_rows(&mut app, 120, 30);
+        let find = |needle: &str| rows.iter().position(|r| r.contains(needle)).unwrap_or_else(|| panic!("{needle:?} is on screen"));
+        assert!(rows[find("Comments (0)")].contains("No comments."), "an empty thread is one line");
+        assert!(find("Activity") > find("Comments (0)"), "activity sits under the comments");
+        assert!(rows[find("created")].contains("2d") && rows[find("created")].contains("Sam Rivera"));
+        assert!(rows[find("state")].contains("→ In Progress"), "a state change names where it went");
+        assert!(rows[find("assigned")].contains("Priya Nair") && rows[find("assigned")].contains("→ Sam Rivera"));
+        // Actors and verbs line up in columns.
+        let col = |needle: &str, of: &str| rows[find(needle)].find(of).unwrap();
+        assert_eq!(col("state", "→"), col("assigned", "→"), "targets start in one column");
+    }
+
+    #[test]
+    fn the_pr_conversation_ends_with_activity_and_hides_it_when_there_is_none() {
+        use crate::app::Screen;
+        let mut app = App::new("slate");
+        app.screen = Screen::PrView(Box::new(pr_view(0, vec![], vec![])));
+        assert!(!render_to_string(&mut app, 120, 40).contains("Activity"), "no timeline, no heading");
+        if let Screen::PrView(v) = &mut app.screen {
+            v.timeline = vec![event("Marcus Lee", TimelineEventKind::Approved, "approved these changes", 2)];
+        }
+        let rows = render_to_rows(&mut app, 120, 40);
+        let activity = rows.iter().position(|r| r.contains("Activity")).expect("Activity heading");
+        let comments = rows.iter().position(|r| r.contains("Comments (")).expect("Comments heading");
+        assert!(activity > comments, "activity follows the comments");
+        assert!(rows[activity + 1].contains("Marcus Lee") && rows[activity + 1].contains("approved"));
+    }
+
+    #[test]
+    fn scrolling_to_the_end_reaches_the_activity_even_when_lines_wrap() {
+        use crate::app::Screen;
+        let mut app = App::new("slate");
+        app.screen = Screen::PrView(Box::new(pr_view(0, vec![], vec![])));
+        if let Screen::PrView(v) = &mut app.screen {
+            // One paragraph that wraps over many rows at this width.
+            v.pr.description = Some("word ".repeat(400));
+            v.timeline = vec![event("Marcus Lee", TimelineEventKind::Merged, "merged this", 1)];
+            v.scroll = u16::MAX; // "as far as it goes"
+        }
+        let out = render_to_string(&mut app, 80, 30);
+        assert!(out.contains("Marcus Lee") && out.contains("merged"), "the last activity row is reachable");
+    }
+
+    #[test]
+    fn an_open_work_items_footer_keeps_every_key_over_the_counts() {
+        use crate::app::Screen;
+        let mut app = App::new("slate");
+        app.status = "9 PRs · 10 work items · 8 runs".into();
+        app.screen = Screen::WiView(Box::new(crate::app::WiView {
+            connection_id: "c".into(),
+            wi: WorkItem {
+                repository: None,
+                id: "77".into(),
+                identifier: Some("#77".into()),
+                title: "t".into(),
+                description: None,
+                state: "Todo".into(),
+                state_category: WorkItemStateCategory::Unstarted,
+                work_item_type: None,
+                assignee: None,
+                created_at: None,
+                updated_at: None,
+                url: None,
+            },
+            threads: vec![],
+            timeline: vec![],
+            scroll: 0,
+        }));
+        let rows = render_to_rows(&mut app, 120, 20);
+        let footer = rows.last().unwrap();
+        for key in ["update state", "assign", "edit", "comment", "back"] {
+            assert!(footer.contains(key), "{key:?} is in the footer: {footer}");
+        }
     }
 }
