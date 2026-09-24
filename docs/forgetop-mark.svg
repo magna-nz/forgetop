@@ -1,4 +1,6 @@
 <svg width="256" height="256" viewBox="0 0 256 256" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
-  <title id="title">forgetop logo</title><desc id="desc">A command prompt chevron beside two queue rows, marking one command center for work across every forge.</desc>
-  <rect width="256" height="256" rx="56" fill="#2A1E5C"/><path d="M67 93L102 128L67 163" stroke="#B9A8FF" stroke-width="21" stroke-linecap="round" stroke-linejoin="round"/><rect x="125" y="101" width="74" height="21" rx="6" fill="#E9E2FF"/><rect x="125" y="135" width="51" height="21" rx="6" fill="#8A79E0"/>
+  <title id="title">forgetop logo</title><desc id="desc">Four forges linked to a single core, marking one command center for work across every forge.</desc>
+  <g stroke="#8A79E0" stroke-width="14" stroke-linecap="round"><path d="M128 56V88"/><path d="M200 128H168"/><path d="M128 200V168"/><path d="M56 128H88"/></g>
+  <g fill="#8A79E0"><circle cx="128" cy="36" r="20"/><circle cx="220" cy="128" r="20"/><circle cx="128" cy="220" r="20"/><circle cx="36" cy="128" r="20"/></g>
+  <rect x="88" y="88" width="80" height="80" rx="20" fill="#6C5BD4"/>
 </svg>
