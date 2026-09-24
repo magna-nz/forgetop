@@ -1337,7 +1337,16 @@ fn render_pipes(frame: &mut Frame, area: Rect, app: &mut App) {
                 // The next line tells us whether this run closes its group, so `└` costs a
                 // peek rather than a scan back through the list for every row.
                 let last = !matches!(lines.get(n + 1), Some(PipeLine::Run(_)));
-                cols.iter().map(|c| run_cell(*c, p, &subject, last, child, theme, app.anim, owner.as_ref())).collect()
+                // Whether the line above already named this state. Only ever true inside a
+                // group: ungrouped, two neighbouring runs have nothing to do with each other
+                // and an elided word would read as a missing one.
+                let ditto = child
+                    && n > 0
+                    && match &lines[n - 1] {
+                        PipeLine::Head(h) => h.status == p.run.status,
+                        PipeLine::Run(j) => app.pipes[*j].run.status == p.run.status,
+                    };
+                cols.iter().map(|c| run_cell(*c, p, &subject, last, child, ditto, theme, app.anim, owner.as_ref())).collect()
             }
         })
         .collect();
@@ -1401,6 +1410,7 @@ fn run_cell(
     subject: &str,
     last: bool,
     child: bool,
+    ditto: bool,
     theme: &Theme,
     anim: usize,
     owner: Option<&String>,
@@ -1409,8 +1419,11 @@ fn run_cell(
     match col {
         // Tree is only in the set when grouped, and every run is then a child.
         PipeCol::Tree => ((if last { "└" } else { "├" }).to_string(), Style::default().fg(theme.dim)),
+        // Inside a group the word is written where the state *changes*. Four runs that all
+        // passed are one fact, and spelling it out four times buries the fifth that did not
+        // — the glyph still marks every row, so nothing is missing, only the repetition.
         PipeCol::Status => (
-            pipe_status_cell(p.run.status, anim),
+            if ditto { pipeline_glyph(p.run.status, anim).to_string() } else { pipe_status_cell(p.run.status, anim) },
             Style::default().fg(theme.pipeline_color(p.run.status)),
         ),
         PipeCol::Provider => (provider_tag(p.provider, &p.connection), Style::default().fg(theme.cyan)),
@@ -3976,10 +3989,40 @@ mod tests {
             crate::app::PipeLine::Run(_) => panic!("header"),
         };
         app.pipe_expanded.insert(key);
-        app.pipes[0].run.status = Succeeded;
+        app.pipes[0].run.status = Failed;
         let out = render_to_string(&mut app, 150, 16);
         assert!(out.contains('└'), "the child is on screen");
-        assert!(out.matches("Succeeded").count() >= 2, "the child names its state too");
+        // Its header says "Failed" one line up, so the child shows the glyph alone — see
+        // `a_group_writes_the_state_only_where_it_changes`.
+        assert_eq!(out.matches("Failed").count(), 1, "the state is named once for the group");
+    }
+
+    /// Four runs that all passed are one fact. Spelling it out on every line buries the fifth
+    /// that did not — which is the line you opened the group to find.
+    #[test]
+    fn a_group_writes_the_state_only_where_it_changes() {
+        use PipelineRunStatus::{Failed, Succeeded};
+        let mut app = pipe_list(&[
+            ("CI", "nz/app", "main", "aaa", 10, Succeeded),
+            ("CI", "nz/app", "main", "bbb", 20, Succeeded),
+            ("CI", "nz/app", "main", "ccc", 30, Failed),
+        ]);
+        let key = match &app.pipe_lines()[0] {
+            crate::app::PipeLine::Head(h) => h.key.clone(),
+            crate::app::PipeLine::Run(_) => panic!("header"),
+        };
+        app.pipe_expanded.insert(key);
+
+        let out = render_to_string(&mut app, 150, 16);
+        assert_eq!(out.matches("Succeeded").count(), 1, "the header says it; its matching runs do not repeat it");
+        assert_eq!(out.matches("Failed").count(), 1, "and the run that broke the streak says so");
+        assert_eq!(out.matches('✓').count(), 3, "every row still carries its own glyph");
+
+        // Ungrouped, neighbouring runs are unrelated — an elided word would read as a missing
+        // one, so every row spells its state out.
+        app.pipe_group = crate::app::PipeGroup::Off;
+        let out = render_to_string(&mut app, 150, 16);
+        assert_eq!(out.matches("Succeeded").count(), 2, "a flat list repeats");
     }
 
     /// Approval is the rarest column of all — it should not hold the table open when nothing
