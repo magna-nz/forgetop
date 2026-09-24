@@ -91,6 +91,10 @@ pub struct UiState {
     pub work_item_sort: Option<SortPref>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pipeline_sort: Option<SortPref>,
+    /// How the Pipelines list is grouped: "pipeline" (default), "trigger", "branch",
+    /// or "off" for the ungrouped list. Unknown values fall back to the default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipeline_group: Option<String>,
     /// Which desktop notifications are enabled. Defaults to all on.
     #[serde(default)]
     pub notifications: NotificationPrefs,

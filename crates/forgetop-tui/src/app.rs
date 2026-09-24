@@ -1,6 +1,6 @@
 //! Application state and the (async) update logic driven by the event loop.
 
-use std::cmp::Ordering;
+use std::cmp::{Ordering, Reverse};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -353,6 +353,132 @@ pub struct PipeRow {
     pub awaiting_approval: bool,
 }
 
+/// How the Pipelines list groups its runs.
+///
+/// Grouping is a *view* over the same filtered rows, not a different query: every mode
+/// below renders the identical set of runs, only arranged differently. [`PipeGroup::Off`]
+/// is the ungrouped list the tab had before grouping existed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PipeGroup {
+    /// One header per pipeline definition — the default. Answers "is a workflow failing
+    /// repeatedly", which is the question the tab is usually open for and the one the flat
+    /// list cannot answer without counting rows by eye.
+    #[default]
+    Pipeline,
+    /// One header per trigger: the runs a single push or tag started together.
+    Trigger,
+    /// One header per branch.
+    Branch,
+    /// No grouping — one line per run.
+    Off,
+}
+
+impl PipeGroup {
+    /// The persisted spelling. Kept stable: it lands in the user's config file.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PipeGroup::Pipeline => "pipeline",
+            PipeGroup::Trigger => "trigger",
+            PipeGroup::Branch => "branch",
+            PipeGroup::Off => "off",
+        }
+    }
+
+    /// Parses a persisted spelling. Anything unrecognised falls back to the default rather
+    /// than erroring — a config written by a newer build must not break an older one.
+    pub fn parse(s: &str) -> PipeGroup {
+        match s {
+            "trigger" => PipeGroup::Trigger,
+            "branch" => PipeGroup::Branch,
+            "off" => PipeGroup::Off,
+            _ => PipeGroup::Pipeline,
+        }
+    }
+
+    /// The `G` cycle: the default first, the ungrouped list last.
+    pub fn next(self) -> PipeGroup {
+        match self {
+            PipeGroup::Pipeline => PipeGroup::Trigger,
+            PipeGroup::Trigger => PipeGroup::Branch,
+            PipeGroup::Branch => PipeGroup::Off,
+            PipeGroup::Off => PipeGroup::Pipeline,
+        }
+    }
+}
+
+/// A group header in the Pipelines list: the roll-up of the runs beneath it.
+///
+/// Every field is one table cell. A header is column-shaped exactly like a run row, so the two
+/// are measured and laid out together and each value lands under the heading describing it.
+#[derive(Debug, Clone)]
+pub struct PipeHead {
+    /// Stable identity, used as the expand/collapse key. Survives a refresh so a group the
+    /// user opened stays open when the rows are re-fetched.
+    pub key: String,
+    /// What names the group: the pipeline under [`PipeGroup::Pipeline`], the branch otherwise.
+    pub subject: String,
+    /// The repository every run beneath belongs to.
+    pub repo: String,
+    /// Short commit, for the trigger grouping whose key includes one. Empty otherwise.
+    pub commit: String,
+    pub runs: usize,
+    pub failed: usize,
+    /// The status of the **most recent** run beneath — where the pipeline stands now, not the
+    /// worst thing that ever happened to it. The failed count beside it carries the history,
+    /// so an older failure is still announced without colouring the present.
+    pub status: PipelineRunStatus,
+    /// Start of that same most recent run: Status and Started describe one run, not two.
+    pub started: Option<DateTime<Utc>>,
+    /// True when any run beneath has a gate this user can answer.
+    pub approval: bool,
+    pub expanded: bool,
+    pub provider: ProviderType,
+    pub connection: String,
+}
+
+/// One rendered line of the Pipelines list.
+///
+/// Introduced because the list used to be a 1:1 map from selection index to `pipes[i]`;
+/// a header is a line that is not a run, so selection, scrolling and Enter all have to
+/// address lines rather than rows. Mirrors the drill-in tree's `flatten()`.
+#[derive(Debug, Clone)]
+pub enum PipeLine {
+    Head(PipeHead),
+    /// Index into `App::pipes`.
+    Run(usize),
+}
+
+/// The pipeline (definition) name for a row — "CI Build", not the run's own name.
+/// Shared with the renderer so the list and the grouping can never disagree on identity.
+pub fn pipe_definition_name(p: &PipeRow) -> String {
+    p.definition_name
+        .clone()
+        .or_else(|| p.run.name.clone())
+        .unwrap_or_else(|| p.run.definition_id.clone())
+}
+
+/// A run's branch, or a marker when the provider gives none — never an empty cell, which
+/// reads as missing data rather than as "this run has no branch".
+fn pipe_branch_label(p: &PipeRow) -> String {
+    match p.run.branch.as_deref().filter(|b| !b.is_empty()) {
+        Some(b) => b.to_string(),
+        None => "(no branch)".to_string(),
+    }
+}
+
+/// What identifies the trigger that started a run: the commit where the provider gives one,
+/// otherwise the start time rounded to the minute. Without the fallback, providers that
+/// leave `commit_sha` empty would put every run in a group of its own.
+fn pipe_trigger_token(p: &PipeRow) -> String {
+    if let Some(sha) = p.run.commit_sha.as_deref().filter(|s| !s.is_empty()) {
+        return sha.to_string();
+    }
+    match p.run.started_at {
+        Some(t) => t.format("%Y-%m-%dT%H:%M").to_string(),
+        None => p.run.id.clone(),
+    }
+}
+
 /// A pull request tagged with the connection it came from (for aggregation).
 ///
 /// `Clone` so views can be derived from the held pool without consuming it — the pool outlives
@@ -591,6 +717,12 @@ pub struct App {
     pub pr_sort: Option<SortPref>,
     pub wi_sort: Option<SortPref>,
     pub pipe_sort: Option<SortPref>,
+    /// How the Pipelines list is grouped. Persisted.
+    pub pipe_group: PipeGroup,
+    /// The group keys currently *expanded*. Stored as the open set rather than the closed
+    /// one so a newly-arrived group lands collapsed — the roll-up is the point of the view,
+    /// and a group that opens itself on refresh would undo it.
+    pub pipe_expanded: HashSet<String>,
     /// Saved views per section (0=PR, 1=WI, 2=Pipelines) and the active index.
     pub views: [Vec<SavedView>; 3],
     pub view_idx: [usize; 3],
@@ -1169,6 +1301,8 @@ impl App {
             pr_sort: None,
             wi_sort: None,
             pipe_sort: None,
+            pipe_group: PipeGroup::default(),
+            pipe_expanded: HashSet::new(),
             views: [Vec::new(), Vec::new(), Vec::new()],
             view_idx: [0, 0, 0],
             notifications: NotificationPrefs::default(),
@@ -1265,11 +1399,224 @@ impl App {
         idx
     }
 
+    /// The group key a run falls under, for the active mode. Connection-qualified so two
+    /// forges with a same-named pipeline never merge, and repo-qualified so `main` in one
+    /// repository is not `main` in another.
+    fn pipe_group_key(&self, p: &PipeRow) -> String {
+        let repo = p.run.repository.clone().unwrap_or_default();
+        let branch = p.run.branch.clone().unwrap_or_default();
+        // \u{1} cannot occur in a name, so the parts can't collide across the separator.
+        match self.pipe_group {
+            // Keyed on `definition_id`, never on the displayed name: the name falls back to
+            // the run's own name, which is per-run on Azure (a build number), and two distinct
+            // workflows are allowed to share a display name on GitHub. Either way the name is
+            // the wrong identity — it would split one pipeline apart or merge two together.
+            PipeGroup::Pipeline => format!("{}\u{1}{}\u{1}{}", p.connection_id, repo, p.run.definition_id),
+            PipeGroup::Trigger => {
+                format!("{}\u{1}{}\u{1}{}\u{1}{}", p.connection_id, repo, branch, pipe_trigger_token(p))
+            }
+            PipeGroup::Branch => format!("{}\u{1}{}\u{1}{}", p.connection_id, repo, branch),
+            PipeGroup::Off => String::new(),
+        }
+    }
+
+    /// What names a group, for the active mode — the value in the subject column.
+    ///
+    /// A run beneath the header fills that same column with whatever *varies* inside the group
+    /// (see [`App::pipe_child_subject`]), so the column reads top-to-bottom as "the group, then
+    /// what tells its runs apart", and no row leaves it blank. Blanking it instead put the tree
+    /// marker at the far left with the run's first real value forty characters away.
+    fn pipe_group_subject(&self, members: &[usize]) -> String {
+        let first = &self.pipes[members[0]];
+        match self.pipe_group {
+            // Never `pipe_definition_name` here: its last fallback is the run's own name,
+            // which on Azure is a build number. Titling a group from one arbitrary member
+            // would then relabel it whenever a sort changed which member came first. The
+            // group is keyed on `definition_id`, so that is the stable name to fall back to,
+            // and `min` keeps the choice independent of order.
+            PipeGroup::Pipeline | PipeGroup::Off => members
+                .iter()
+                .filter_map(|&i| self.pipes[i].definition_name.clone())
+                .min()
+                .unwrap_or_else(|| first.run.definition_id.clone()),
+            PipeGroup::Trigger | PipeGroup::Branch => pipe_branch_label(first),
+        }
+    }
+
+    /// What a run puts in the subject column when it sits under a header: the thing that varies
+    /// within the group. Grouped by pipeline that is its branch; grouped by branch or trigger it
+    /// is its pipeline.
+    pub fn pipe_child_subject(&self, p: &PipeRow) -> String {
+        match self.pipe_group {
+            PipeGroup::Pipeline => pipe_branch_label(p),
+            _ => pipe_definition_name(p),
+        }
+    }
+
+    /// The heading for the subject column. Once a group is open that column carries both kinds
+    /// of value, so the heading says so rather than naming only half of what sits under it.
+    pub fn pipe_subject_heading(&self, any_open: bool) -> &'static str {
+        match (self.pipe_group, any_open) {
+            (PipeGroup::Off, _) | (PipeGroup::Pipeline, false) => "Pipeline",
+            (PipeGroup::Pipeline, true) => "Pipeline / Branch",
+            (_, false) => "Branch",
+            (_, true) => "Branch / Pipeline",
+        }
+    }
+
+    /// The Pipelines list as rendered lines: group headers plus the runs of expanded groups.
+    ///
+    /// Groups are ordered by their most recent run, newest first — the same "what changed
+    /// last" ordering the flat list has, lifted to the group. Runs *within* a group keep the
+    /// order [`App::filtered_pipe_indices`] produced, so an explicit sort still applies; it
+    /// just applies inside each group rather than across the whole list.
+    pub fn pipe_lines(&self) -> Vec<PipeLine> {
+        let idxs = self.filtered_pipe_indices();
+        if self.pipe_group == PipeGroup::Off {
+            return idxs.into_iter().map(PipeLine::Run).collect();
+        }
+
+        let mut order: Vec<String> = Vec::new();
+        let mut buckets: HashMap<String, Vec<usize>> = HashMap::new();
+        for i in idxs {
+            let key = self.pipe_group_key(&self.pipes[i]);
+            if !buckets.contains_key(&key) {
+                order.push(key.clone());
+            }
+            buckets.entry(key).or_default().push(i);
+        }
+
+        let newest = |k: &str| -> Option<DateTime<Utc>> {
+            buckets[k].iter().filter_map(|&i| self.pipes[i].run.started_at).max()
+        };
+        // A sort orders the **groups**, not the runs inside them. Grouped lists land
+        // collapsed, so only headers are on screen — a sort applied inside a group would move
+        // nothing the user can see. Each group is compared by the run its header displays (its
+        // most recent), so the order always matches the cells being sorted on.
+        let reps: HashMap<&str, usize> = buckets
+            .iter()
+            .map(|(k, members)| {
+                let rep = members.iter().copied().max_by_key(|&i| self.pipes[i].run.started_at).unwrap_or(members[0]);
+                (k.as_str(), rep)
+            })
+            .collect();
+        match &self.pipe_sort {
+            Some(sort) => order.sort_by(|a, b| {
+                ordered(pipe_cmp(&self.pipes[reps[a.as_str()]], &self.pipes[reps[b.as_str()]], &sort.key), sort.desc)
+            }),
+            // Newest first. `None` (no start time) is the smallest, so reversing puts it last,
+            // and the sort is stable, so ties keep the order the filter already produced.
+            None => order.sort_by_key(|k| Reverse(newest(k))),
+        }
+
+        let mut out = Vec::new();
+        for key in order {
+            let members = &buckets[&key];
+            let first = &self.pipes[members[0]];
+            // Status and Started both come from this one run, so the pair reads as "where
+            // this stands now" rather than pairing the worst outcome with the newest time.
+            let latest = members
+                .iter()
+                .max_by_key(|&&i| self.pipes[i].run.started_at)
+                .map(|&i| &self.pipes[i])
+                .unwrap_or(first);
+            let head = PipeHead {
+                expanded: self.pipe_expanded.contains(&key),
+                subject: self.pipe_group_subject(members),
+                repo: first.run.repository.clone().unwrap_or_default(),
+                // The trigger key falls back to the start minute when a provider gives no
+                // commit, so the cell has to as well, or two separate pushes to one branch
+                // render as two identical headers. `~` marks it as a time, not a sha.
+                commit: match self.pipe_group {
+                    PipeGroup::Trigger => match first.run.commit_sha.as_deref().filter(|c| !c.is_empty()) {
+                        Some(sha) => sha.chars().take(7).collect(),
+                        // The key falls back the same way — start minute, then run id — so the
+                        // cell has to follow it all the way down, or two distinct triggers
+                        // render as two identical rows.
+                        None => match first.run.started_at {
+                            Some(t) => format!("~{}", t.with_timezone(&Local).format("%H:%M")),
+                            None => format!("#{}", first.run.id.chars().take(7).collect::<String>()),
+                        },
+                    },
+                    _ => String::new(),
+                },
+                runs: members.len(),
+                failed: members.iter().filter(|&&i| self.pipes[i].run.status == PipelineRunStatus::Failed).count(),
+                status: latest.run.status,
+                started: latest.run.started_at,
+                approval: members.iter().any(|&i| self.pipes[i].awaiting_approval),
+                provider: first.provider,
+                connection: first.connection.clone(),
+                key,
+            };
+            let expanded = head.expanded;
+            out.push(PipeLine::Head(head));
+            if expanded {
+                out.extend(members.iter().map(|&i| PipeLine::Run(i)));
+            }
+        }
+        out
+    }
+
+    /// Drops expand state for groups that no longer exist.
+    ///
+    /// Without this a group that disappears and comes back — a repository leaving and
+    /// re-entering scope, a provider erroring once — returns *expanded*, because its key was
+    /// still in the set. Groups are meant to arrive collapsed however they arrive.
+    fn prune_pipe_expanded(&mut self) {
+        if self.pipe_expanded.is_empty() {
+            return;
+        }
+        let live: HashSet<String> = self.pipes.iter().map(|p| self.pipe_group_key(p)).collect();
+        self.pipe_expanded.retain(|k| live.contains(k));
+    }
+
+    /// Expands or collapses one group, keeping the cursor on its header.
+    fn toggle_pipe_group(&mut self, key: &str) {
+        if !self.pipe_expanded.remove(key) {
+            self.pipe_expanded.insert(key.to_string());
+        }
+        self.fix_selection();
+        self.ensure_visible();
+    }
+
+    /// Expands or collapses every group at once.
+    fn set_all_pipe_groups(&mut self, expand: bool) {
+        if self.pipe_group == PipeGroup::Off {
+            return;
+        }
+        self.pipe_expanded.clear();
+        if expand {
+            for line in self.pipe_lines() {
+                if let PipeLine::Head(h) = line {
+                    self.pipe_expanded.insert(h.key);
+                }
+            }
+        }
+        self.fix_selection();
+        self.ensure_visible();
+    }
+
+    /// Cycles the grouping mode and persists the choice. Resets the cursor to the top: the
+    /// line the cursor was on does not exist in the new arrangement.
+    async fn cycle_pipe_group(&mut self, deps: &AppDeps) {
+        self.pipe_group = self.pipe_group.next();
+        self.pipe_expanded.clear();
+        self.pipe_state.select(Some(0));
+        self.list_scroll = 0;
+        self.fix_selection();
+        self.toast = Some(match self.pipe_group {
+            PipeGroup::Off => "Grouping off".to_string(),
+            g => format!("Grouped by {}", g.as_str()),
+        });
+        let _ = deps.config.set_pipeline_group(Some(self.pipe_group.as_str().to_string())).await;
+    }
+
     fn filtered_len(&self, section: usize) -> usize {
         match section {
             0 => self.filtered_pr_indices().len(),
             1 => self.filtered_wi_indices().len(),
-            _ => self.filtered_pipe_indices().len(),
+            _ => self.pipe_lines().len(),
         }
     }
 
@@ -1443,6 +1790,13 @@ impl App {
     /// `rebuild_launchpad` applies the actual filtering on the initial reload).
     pub fn apply_dismissed_launchpad_items(&mut self, ids: &[String]) {
         self.lp_dismissed_persisted = ids.iter().cloned().collect();
+    }
+
+    /// Applies the persisted Pipelines grouping at startup. `None` keeps the default.
+    pub fn apply_pipe_group(&mut self, group: Option<String>) {
+        if let Some(g) = group {
+            self.pipe_group = PipeGroup::parse(&g);
+        }
     }
 
     /// Applies persisted per-view sort preferences at startup.
@@ -2301,6 +2655,7 @@ impl App {
         self.request_pr_decorations(deps);
         take_section(&mut self.wis, r.wis, sections_ok.wis);
         take_section(&mut self.pipes, r.pipes, sections_ok.pipes);
+        self.prune_pipe_expanded();
         take_section(&mut self.inbox, r.inbox, sections_ok.inbox);
         if self.inbox_sel >= self.inbox.len() {
             self.inbox_sel = self.inbox.len().saturating_sub(1);
@@ -3051,7 +3406,7 @@ impl App {
                 match self.active {
                     0 => self.open_pr_view(deps, 0),
                     1 => self.open_wi_view(deps),
-                    2 => self.open_pipeline(deps),
+                    2 => self.enter_pipeline_line(deps),
                     _ => {}
                 }
             }
@@ -3755,6 +4110,13 @@ impl App {
             'f' if self.active == 1 => self.open_wi_states_toggle(),
             // Pipeline trigger (Pipelines tab).
             'T' if self.active == 2 => self.open_pipeline_trigger(),
+            // `G` cycles how the Pipelines list is **G**rouped. Lowercase `g` is taken by the
+            // repo scope picker below, which is a different axis (what is fetched, not how
+            // what was fetched is arranged).
+            'G' if self.active == 2 => self.cycle_pipe_group(deps).await,
+            ' ' if self.active == 2 => self.enter_pipeline_line(deps),
+            'z' if self.active == 2 => self.set_all_pipe_groups(false),
+            'Z' if self.active == 2 => self.set_all_pipe_groups(true),
             // `g` = which **g**it repositories this section's connections fetch from. Unlike the
             // `f` filter, this gates what is *fetched*, not what is shown from what was fetched.
             'g' => self.open_repo_scope(deps).await,
@@ -3766,12 +4128,57 @@ impl App {
 
     // ---- pipeline drill-in + trigger ----
 
+    /// The run under the cursor, or `None` when the cursor is on a group header.
     fn selected_pipe(&self) -> Option<&PipeRow> {
         if self.active != 2 {
             return None;
         }
-        let idxs = self.filtered_pipe_indices();
-        self.pipe_state.selected().and_then(|p| idxs.get(p)).and_then(|&i| self.pipes.get(i))
+        let sel = self.pipe_state.selected()?;
+        match self.pipe_lines().get(sel)? {
+            PipeLine::Run(i) => self.pipes.get(*i),
+            PipeLine::Head(_) => None,
+        }
+    }
+
+    /// The run an *action* key should act on: the selected run, or — when the cursor is on a
+    /// group header — that group's most recent run, the one the header's age already refers to.
+    ///
+    /// Separate from [`App::selected_pipe`], which stays strict: Enter on a header expands it
+    /// rather than drilling into something the user did not point at. Without this, `T` and `o`
+    /// were dead keys on the default view, where the cursor starts on a header.
+    fn pipe_for_action(&self) -> Option<&PipeRow> {
+        if self.active != 2 {
+            return None;
+        }
+        let sel = self.pipe_state.selected()?;
+        match self.pipe_lines().get(sel)? {
+            PipeLine::Run(i) => self.pipes.get(*i),
+            PipeLine::Head(h) => {
+                let key = h.key.clone();
+                self.filtered_pipe_indices()
+                    .into_iter()
+                    .map(|i| &self.pipes[i])
+                    .filter(|p| self.pipe_group_key(p) == key)
+                    .max_by_key(|p| p.run.started_at)
+            }
+        }
+    }
+
+    /// Enter on the Pipelines list: a header expands or collapses, a run opens its drill-in.
+    fn enter_pipeline_line(&mut self, deps: &AppDeps) {
+        // Matches the `Key::Enter` arm, which clears these before dispatching — Space reaches
+        // here too, and a stale origin sends Esc back to the Launchpad instead of the list.
+        self.lp_origin = false;
+        self.from_inbox = false;
+        let Some(sel) = self.pipe_state.selected() else { return };
+        match self.pipe_lines().get(sel) {
+            Some(PipeLine::Head(h)) => {
+                let key = h.key.clone();
+                self.toggle_pipe_group(&key);
+            }
+            Some(PipeLine::Run(_)) => self.open_pipeline(deps),
+            None => {}
+        }
     }
 
     fn open_pipeline(&mut self, deps: &AppDeps) {
@@ -4068,7 +4475,7 @@ impl App {
         if let Screen::Pipeline(v) = &self.screen {
             return Some((v.connection_id.clone(), v.run.repository.clone(), v.definition_id.clone(), v.branch.clone(), v.title.clone()));
         }
-        let pipe = self.selected_pipe()?;
+        let pipe = self.pipe_for_action()?;
         Some((
             pipe.connection_id.clone(),
             pipe.run.repository.clone(),
@@ -4154,7 +4561,7 @@ impl App {
         match self.active {
             0 => self.selected_pr().and_then(|p| p.url.clone()),
             1 => self.selected_wi().and_then(|w| w.url.clone()),
-            2 => self.selected_pipe().and_then(|p| p.run.url.clone()),
+            2 => self.pipe_for_action().and_then(|p| p.run.url.clone()),
             _ => None,
         }
     }
@@ -5219,9 +5626,13 @@ fn pipe_matches(p: &PipeRow, q: &str) -> bool {
     if q.is_empty() {
         return true;
     }
+    // Everything the row can show, so `/forgetop` finds what the Repository column displays
+    // and `/integration` finds what the Pipeline column displays.
     let hay = format!(
-        "{} {} {} {} {:?}",
+        "{} {} {} {} {} {} {:?}",
         p.run.name.clone().unwrap_or_else(|| p.run.definition_id.clone()),
+        p.definition_name.clone().unwrap_or_default(),
+        p.run.repository.clone().unwrap_or_default(),
         p.provider.as_str(),
         p.connection,
         p.run.branch.clone().unwrap_or_default(),
@@ -5258,6 +5669,7 @@ const PIPE_SORTS: &[SortCol] = &[
     SortCol { key: "started", label: "Started" },
     SortCol { key: "status", label: "Status" },
     SortCol { key: "pipeline", label: "Pipeline" },
+    SortCol { key: "repository", label: "Repository" },
     SortCol { key: "provider", label: "Provider" },
     SortCol { key: "branch", label: "Branch" },
 ];
@@ -5355,12 +5767,9 @@ fn pipe_cmp(a: &PipeRow, b: &PipeRow, key: &str) -> Ordering {
     match key {
         "started" => a.run.started_at.cmp(&b.run.started_at),
         "status" => pipe_status_rank(a.run.status).cmp(&pipe_status_rank(b.run.status)),
-        "pipeline" => {
-            // Sort by the pipeline (definition) name shown in the column, falling back to
-            // the run name / id when it's unknown.
-            let name = |r: &PipeRow| r.definition_name.clone().or_else(|| r.run.name.clone()).unwrap_or_else(|| r.run.definition_id.clone());
-            ci(&name(a)).cmp(&ci(&name(b)))
-        }
+        // Sorts by the same string the column shows, via the one helper that defines it.
+        "pipeline" => ci(&pipe_definition_name(a)).cmp(&ci(&pipe_definition_name(b))),
+        "repository" => ci(a.run.repository.as_deref().unwrap_or("")).cmp(&ci(b.run.repository.as_deref().unwrap_or(""))),
         "provider" => ci(a.provider.as_str()).cmp(&ci(b.provider.as_str())).then_with(|| ci(&a.connection).cmp(&ci(&b.connection))),
         "branch" => ci(a.run.branch.as_deref().unwrap_or("")).cmp(&ci(b.run.branch.as_deref().unwrap_or(""))),
         _ => Ordering::Equal,
@@ -9519,5 +9928,427 @@ mod tests {
         app.apply_hidden_sections(&[Section::WorkItems]);
         assert!(!app.visible[1]);
         assert_eq!(app.active, 0);
+    }
+
+    // ---- Pipelines list grouping ----
+
+    /// A run with everything the grouping keys read: repo, branch, commit, start time.
+    fn grouped_row(def: &str, repo: &str, branch: &str, sha: &str, at: &str, status: PipelineRunStatus) -> PipeRow {
+        PipeRow {
+            connection_id: "c".into(),
+            connection: "GH".into(),
+            provider: ProviderType::GitHub,
+            definition_name: Some(def.into()),
+            awaiting_approval: false,
+            run: PipelineRun {
+                repository: Some(repo.into()),
+                id: format!("{def}-{sha}"),
+                definition_id: def.into(),
+                number: Some(1),
+                name: None,
+                title: None,
+                status,
+                triggered_by: None,
+                branch: Some(branch.into()),
+                commit_sha: (!sha.is_empty()).then(|| sha.to_string()),
+                started_at: (!at.is_empty()).then(|| at.parse::<DateTime<Utc>>().unwrap()),
+                finished_at: None,
+                url: None,
+                stages: vec![],
+            },
+        }
+    }
+
+    /// The screenshot's shape in miniature: one push fans out to several workflows, and the
+    /// same workflow runs again on a later push.
+    fn fanned_out() -> Vec<PipeRow> {
+        use PipelineRunStatus::{Failed, Succeeded};
+        vec![
+            grouped_row("CI", "nz/app", "main", "aaa", "2026-09-24T10:00:00Z", Succeeded),
+            grouped_row("Integration", "nz/app", "main", "aaa", "2026-09-24T10:00:00Z", Failed),
+            grouped_row("Release", "nz/app", "v1.0", "bbb", "2026-09-24T09:00:00Z", Succeeded),
+            grouped_row("CI", "nz/app", "v1.0", "bbb", "2026-09-24T09:00:00Z", Succeeded),
+        ]
+    }
+
+    /// (subject, commit, runs, failed) — the header cells the grouping decides.
+    fn head_cells(app: &App) -> Vec<(String, String, usize, usize)> {
+        app.pipe_lines()
+            .into_iter()
+            .filter_map(|l| match l {
+                PipeLine::Head(h) => Some((h.subject, h.commit, h.runs, h.failed)),
+                PipeLine::Run(_) => None,
+            })
+            .collect()
+    }
+
+    fn heads(app: &App) -> Vec<(String, usize, usize)> {
+        app.pipe_lines()
+            .into_iter()
+            .filter_map(|l| match l {
+                PipeLine::Head(h) => Some((h.subject, h.runs, h.failed)),
+                PipeLine::Run(_) => None,
+            })
+            .collect()
+    }
+
+    /// The default view. Groups are ordered by their most recent run, newest first — the
+    /// flat list's "what changed last" ordering, lifted to the group.
+    #[test]
+    fn pipe_lines_group_by_pipeline_ordered_by_most_recent_run() {
+        let mut app = App::new("slate");
+        app.active = 2;
+        app.pipes = fanned_out();
+        assert_eq!(app.pipe_group, PipeGroup::Pipeline, "grouped by pipeline out of the box");
+
+        // CI last ran 10:00, Integration 10:00 (ties keep list order), Release 09:00.
+        assert_eq!(
+            heads(&app),
+            vec![("CI".to_string(), 2, 0), ("Integration".to_string(), 1, 1), ("Release".to_string(), 1, 0)]
+        );
+    }
+
+    /// Nothing is expanded until asked: the roll-up is the view, so four runs render as
+    /// three lines, not seven.
+    #[test]
+    fn groups_land_collapsed_and_expand_one_at_a_time() {
+        let mut app = App::new("slate");
+        app.active = 2;
+        app.pipes = fanned_out();
+        assert_eq!(app.pipe_lines().len(), 3, "three headers, no runs");
+
+        let key = match &app.pipe_lines()[0] {
+            PipeLine::Head(h) => h.key.clone(),
+            PipeLine::Run(_) => panic!("first line is a header"),
+        };
+        app.toggle_pipe_group(&key);
+        // CI's header plus its two runs, then the other two headers.
+        assert_eq!(app.pipe_lines().len(), 5);
+        assert!(matches!(app.pipe_lines()[1], PipeLine::Run(_)), "the group's runs follow its header");
+
+        app.toggle_pipe_group(&key);
+        assert_eq!(app.pipe_lines().len(), 3, "collapsing puts them away again");
+    }
+
+    /// A header reports where the pipeline stands *now* — its latest run — with the failures
+    /// beneath it carried by the count instead. Status and Started describe the same run.
+    #[test]
+    fn group_header_shows_the_latest_runs_status_not_the_worst() {
+        let mut app = App::new("slate");
+        app.active = 2;
+        app.pipes = vec![
+            grouped_row("CI", "nz/app", "main", "aaa", "2026-09-24T10:00:00Z", PipelineRunStatus::Succeeded),
+            grouped_row("CI", "nz/app", "main", "bbb", "2026-09-24T09:00:00Z", PipelineRunStatus::Failed),
+        ];
+        let PipeLine::Head(h) = app.pipe_lines().remove(0) else { panic!("header") };
+        assert_eq!(h.status, PipelineRunStatus::Succeeded, "the latest run passed, so the header reads passed");
+        assert_eq!((h.runs, h.failed), (2, 1), "the older failure is still announced, as a count");
+        assert_eq!(
+            h.started,
+            Some("2026-09-24T10:00:00Z".parse::<DateTime<Utc>>().unwrap()),
+            "Started is that same latest run, not a different one"
+        );
+    }
+
+    /// Grouping by trigger puts the runs one push started together under one header.
+    #[test]
+    fn trigger_grouping_collects_one_push_fan_out() {
+        let mut app = App::new("slate");
+        app.active = 2;
+        app.pipe_group = PipeGroup::Trigger;
+        app.pipes = fanned_out();
+        let h = head_cells(&app);
+        assert_eq!(h.len(), 2, "two pushes");
+        assert_eq!(h[0].2, 2, "the newest push started two workflows");
+        assert_eq!(h[0].0, "main", "the subject column names the branch");
+        assert_eq!(h[0].1, "aaa", "and the commit column the commit");
+    }
+
+    /// Providers that leave `commit_sha` empty must still group: the start minute stands in,
+    /// or every run would land in a group of its own.
+    #[test]
+    fn trigger_grouping_falls_back_to_the_start_minute_without_a_commit() {
+        let mut app = App::new("slate");
+        app.active = 2;
+        app.pipe_group = PipeGroup::Trigger;
+        app.pipes = vec![
+            grouped_row("CI", "nz/app", "main", "", "2026-09-24T10:00:30Z", PipelineRunStatus::Succeeded),
+            grouped_row("Integration", "nz/app", "main", "", "2026-09-24T10:00:45Z", PipelineRunStatus::Succeeded),
+            grouped_row("CI", "nz/app", "main", "", "2026-09-24T10:02:00Z", PipelineRunStatus::Succeeded),
+        ];
+        let h = heads(&app);
+        assert_eq!(h.len(), 2, "same minute groups together, a later minute does not");
+        assert_eq!(h[0].1, 1, "10:02 is its own trigger and is newest");
+        assert_eq!(h[1].1, 2, "the two runs from 10:00 share a header");
+    }
+
+    /// The same branch name in two repositories is two different branches.
+    #[test]
+    fn branch_grouping_does_not_merge_across_repositories() {
+        let mut app = App::new("slate");
+        app.active = 2;
+        app.pipe_group = PipeGroup::Branch;
+        app.pipes = vec![
+            grouped_row("CI", "nz/app", "main", "aaa", "2026-09-24T10:00:00Z", PipelineRunStatus::Succeeded),
+            grouped_row("CI", "nz/other", "main", "bbb", "2026-09-24T09:00:00Z", PipelineRunStatus::Succeeded),
+        ];
+        assert_eq!(heads(&app).len(), 2, "two repositories, two groups");
+    }
+
+    /// Turning grouping off restores exactly the list the tab had before grouping existed.
+    #[test]
+    fn grouping_off_renders_one_line_per_run() {
+        let mut app = App::new("slate");
+        app.active = 2;
+        app.pipe_group = PipeGroup::Off;
+        app.pipes = fanned_out();
+        let lines = app.pipe_lines();
+        assert_eq!(lines.len(), 4);
+        assert!(lines.iter().all(|l| matches!(l, PipeLine::Run(_))), "no headers");
+    }
+
+    /// Enter on a header must not open a drill-in — there is no single run to open.
+    #[test]
+    fn the_cursor_on_a_header_selects_no_run() {
+        let mut app = App::new("slate");
+        app.active = 2;
+        app.pipes = fanned_out();
+        app.pipe_state.select(Some(0));
+        assert!(app.selected_pipe().is_none(), "a header is not a run");
+
+        let key = match &app.pipe_lines()[0] {
+            PipeLine::Head(h) => h.key.clone(),
+            PipeLine::Run(_) => panic!("header"),
+        };
+        app.toggle_pipe_group(&key);
+        app.pipe_state.select(Some(1));
+        assert!(app.selected_pipe().is_some(), "the first child is a run");
+    }
+
+    /// Collapsing every group while the cursor sits deep in the list must not leave the
+    /// cursor pointing past the end — the bug the display-line model exists to prevent.
+    #[test]
+    fn collapsing_everything_pulls_the_cursor_back_into_range() {
+        let mut app = App::new("slate");
+        app.active = 2;
+        app.pipes = fanned_out();
+        app.set_all_pipe_groups(true);
+        let expanded = app.pipe_lines().len();
+        assert_eq!(expanded, 7, "three headers + four runs");
+        app.pipe_state.select(Some(expanded - 1));
+
+        app.set_all_pipe_groups(false);
+        assert_eq!(app.pipe_lines().len(), 3);
+        assert_eq!(app.pipe_state.selected(), Some(2), "cursor clamped to the last header");
+    }
+
+    /// `G` cycles the mode, persists it, and does not leave the cursor on a line that the
+    /// new arrangement no longer has.
+    #[tokio::test]
+    async fn g_cycles_the_grouping_and_persists_it() {
+        let deps = test_deps();
+        let mut app = App::new("slate");
+        app.screen = Screen::List;
+        app.active = 2;
+        app.pipes = fanned_out();
+        app.set_all_pipe_groups(true);
+        app.pipe_state.select(Some(6));
+
+        app.on_key(Key::Char('G'), &deps).await;
+        assert_eq!(app.pipe_group, PipeGroup::Trigger);
+        assert_eq!(app.pipe_state.selected(), Some(0), "cursor returns to the top");
+        assert_eq!(deps.config.snapshot().ui.pipeline_group.as_deref(), Some("trigger"), "persisted");
+
+        app.on_key(Key::Char('G'), &deps).await;
+        app.on_key(Key::Char('G'), &deps).await;
+        assert_eq!(app.pipe_group, PipeGroup::Off, "pipeline → trigger → branch → off");
+        app.on_key(Key::Char('G'), &deps).await;
+        assert_eq!(app.pipe_group, PipeGroup::Pipeline, "and back round");
+    }
+
+    /// A config written by a newer build must not break an older one.
+    #[test]
+    fn an_unknown_persisted_grouping_falls_back_to_the_default() {
+        let mut app = App::new("slate");
+        app.apply_pipe_group(Some("by-phase-of-moon".into()));
+        assert_eq!(app.pipe_group, PipeGroup::Pipeline);
+        app.apply_pipe_group(Some("branch".into()));
+        assert_eq!(app.pipe_group, PipeGroup::Branch);
+        app.apply_pipe_group(None);
+        assert_eq!(app.pipe_group, PipeGroup::Branch, "None keeps what is already set");
+    }
+
+    /// Identity is the definition id, not the name shown in the column. Azure gives every run
+    /// its own `name` (a build number) and leaves `definition_name` empty when discovery
+    /// fails — keying on the display string would put each run in a group of its own.
+    #[test]
+    fn pipeline_grouping_keys_on_the_definition_not_its_display_name() {
+        let mut app = App::new("slate");
+        app.active = 2;
+        let mut rows: Vec<PipeRow> = (1..=3)
+            .map(|n| {
+                let mut r = grouped_row("build", "nz/app", "main", &format!("sha{n}"), "2026-09-24T10:00:00Z", PipelineRunStatus::Succeeded);
+                r.definition_name = None;
+                r.run.name = Some(format!("20260924.{n}"));
+                r
+            })
+            .collect();
+        app.pipes = std::mem::take(&mut rows);
+        assert_eq!(heads(&app).len(), 1, "three runs of one definition are one group");
+        assert_eq!(heads(&app)[0].1, 3);
+    }
+
+    /// The converse: two different workflows are allowed to share a display name, and must
+    /// not be merged because of it.
+    #[test]
+    fn two_definitions_sharing_a_name_stay_apart() {
+        let mut app = App::new("slate");
+        app.active = 2;
+        let mut a = grouped_row("CI", "nz/app", "main", "aaa", "2026-09-24T10:00:00Z", PipelineRunStatus::Succeeded);
+        let mut b = grouped_row("CI", "nz/app", "main", "bbb", "2026-09-24T09:00:00Z", PipelineRunStatus::Succeeded);
+        a.run.definition_id = "111".into();
+        b.run.definition_id = "222".into();
+        app.pipes = vec![a, b];
+        assert_eq!(heads(&app).len(), 2, "same name, different workflows");
+    }
+
+    /// A provider that supplies no commit still has to produce headers you can tell apart.
+    #[test]
+    fn trigger_headers_stay_distinct_without_a_commit() {
+        let mut app = App::new("slate");
+        app.active = 2;
+        app.pipe_group = PipeGroup::Trigger;
+        app.pipes = vec![
+            grouped_row("CI", "nz/app", "main", "", "2026-09-24T10:00:00Z", PipelineRunStatus::Succeeded),
+            grouped_row("CI", "nz/app", "main", "", "2026-09-24T12:00:00Z", PipelineRunStatus::Succeeded),
+        ];
+        // Same branch, no commit: the commit cell falls back to the start time, or the two
+        // headers would be identical text.
+        let cells: Vec<(String, String)> = head_cells(&app).into_iter().map(|(s, c, _, _)| (s, c)).collect();
+        assert_eq!(cells.len(), 2, "two triggers");
+        assert_eq!(cells[0].0, cells[1].0, "same branch, so the same subject");
+        assert_ne!(cells[0].1, cells[1].1, "told apart by the commit cell: {cells:?}");
+        assert!(cells[0].1.starts_with('~'), "marked as a time, not a sha: {:?}", cells[0].1);
+    }
+
+    /// `T` and `o` were dead keys on the default view, where the cursor starts on a header.
+    /// They now act on the group's most recent run — the one the header's age refers to.
+    #[test]
+    fn action_keys_on_a_header_act_on_the_groups_newest_run() {
+        let mut app = App::new("slate");
+        app.screen = Screen::List;
+        app.active = 2;
+        let mut old = grouped_row("CI", "nz/app", "main", "old", "2026-09-24T09:00:00Z", PipelineRunStatus::Succeeded);
+        let mut new = grouped_row("CI", "nz/app", "main", "new", "2026-09-24T11:00:00Z", PipelineRunStatus::Succeeded);
+        old.run.url = Some("http://old".into());
+        new.run.url = Some("http://new".into());
+        app.pipes = vec![old, new];
+        app.pipe_state.select(Some(0));
+
+        assert!(app.selected_pipe().is_none(), "Enter still treats a header as a header");
+        assert_eq!(app.pipe_for_action().map(|p| p.run.id.clone()), Some("CI-new".into()), "newest run");
+        assert_eq!(app.selected_url().as_deref(), Some("http://new"), "`o` opens it instead of complaining");
+        assert!(app.pipeline_target().is_some(), "`T` has something to trigger");
+    }
+
+    /// Space reaches the same handler as Enter, so it has to clear the same origin — or Esc
+    /// out of the run it opened lands on the Launchpad instead of the list.
+    #[test]
+    fn space_clears_the_launchpad_origin_exactly_as_enter_does() {
+        let deps = test_deps();
+        let mut app = App::new("slate");
+        app.screen = Screen::List;
+        app.active = 2;
+        app.pipes = fanned_out();
+        app.set_all_pipe_groups(true);
+        app.pipe_state.select(Some(1)); // a run, under the first header
+        app.lp_origin = true;
+
+        app.enter_pipeline_line(&deps);
+        assert!(!app.lp_origin, "Space must not leave a stale Launchpad origin behind");
+    }
+
+    /// A group that disappears and comes back arrives collapsed, like any other new group.
+    #[test]
+    fn a_group_that_returns_after_a_refresh_is_collapsed_again() {
+        let mut app = App::new("slate");
+        app.active = 2;
+        app.pipes = fanned_out();
+        app.set_all_pipe_groups(true);
+        assert!(app.pipe_lines().len() > 3, "expanded");
+
+        // The section comes back empty (a provider error, or the repo left scope), then returns.
+        app.pipes = Vec::new();
+        app.prune_pipe_expanded();
+        app.pipes = fanned_out();
+        assert!(app.pipe_expanded.is_empty(), "stale keys dropped");
+        assert_eq!(app.pipe_lines().len(), 3, "the returning groups are closed");
+    }
+
+    /// Sorting by repository has to move something. Within a pipeline group every run shares
+    /// one repository, so the sort applies to the groups instead.
+    #[test]
+    fn sorting_by_repository_orders_the_groups_alphabetically() {
+        use forgetop_core::config::SortPref;
+        use PipelineRunStatus::Succeeded as S;
+        let mut app = App::new("slate");
+        app.active = 2;
+        // Deliberately not in alphabetical order, and not in time order either.
+        app.pipes = vec![
+            grouped_row("CI", "nz/zebra", "main", "aaa", "2026-09-24T12:00:00Z", S),
+            grouped_row("CI", "nz/apple", "main", "bbb", "2026-09-24T11:00:00Z", S),
+            grouped_row("Release", "nz/mango", "main", "ccc", "2026-09-24T10:00:00Z", S),
+        ];
+
+        // Default: newest first.
+        assert_eq!(
+            heads(&app).into_iter().map(|(s, _, _)| s).collect::<Vec<_>>(),
+            vec!["CI", "CI", "Release"],
+            "ungrouped-by-repo default is by recency"
+        );
+        let repos = |app: &App| {
+            app.pipe_lines()
+                .into_iter()
+                .filter_map(|l| match l {
+                    PipeLine::Head(h) => Some(h.repo),
+                    PipeLine::Run(_) => None,
+                })
+                .collect::<Vec<_>>()
+        };
+
+        app.pipe_sort = Some(SortPref { key: "repository".into(), desc: false });
+        assert_eq!(repos(&app), vec!["nz/apple", "nz/mango", "nz/zebra"], "A→Z");
+
+        app.pipe_sort = Some(SortPref { key: "repository".into(), desc: true });
+        assert_eq!(repos(&app), vec!["nz/zebra", "nz/mango", "nz/apple"], "and Z→A");
+    }
+
+    /// A key that varies inside a group orders the groups by the run each header displays —
+    /// its most recent — so the order always matches the cells being sorted on.
+    #[test]
+    fn a_sort_orders_the_groups_by_what_their_headers_show() {
+        use forgetop_core::config::SortPref;
+        use PipelineRunStatus::Succeeded as S;
+        let mut app = App::new("slate");
+        app.active = 2;
+        app.pipes = vec![
+            grouped_row("CI", "nz/app", "zulu", "aaa", "2026-09-24T10:00:00Z", S),
+            grouped_row("CI", "nz/app", "alpha", "bbb", "2026-09-24T09:00:00Z", S),
+            grouped_row("Release", "nz/app", "main", "ccc", "2026-09-24T12:00:00Z", S),
+        ];
+        app.pipe_sort = Some(SortPref { key: "branch".into(), desc: false });
+        app.set_all_pipe_groups(true);
+
+        let subjects: Vec<String> = app
+            .pipe_lines()
+            .into_iter()
+            .map(|l| match l {
+                PipeLine::Head(h) => h.subject,
+                PipeLine::Run(i) => app.pipe_child_subject(&app.pipes[i]),
+            })
+            .collect();
+        // Release's header run is on `main`, CI's is on `zulu`: main sorts first, so Release
+        // leads despite CI being nothing to do with recency here.
+        assert_eq!(subjects, vec!["Release", "main", "CI", "alpha", "zulu"]);
     }
 }
