@@ -179,6 +179,9 @@ fn map_key(code: KeyCode, mods: KeyModifiers) -> Key {
         KeyCode::Down => Key::Down,
         KeyCode::Left => Key::Left,
         KeyCode::Right => Key::Right,
+        // Shift-Tab arrives as BackTab on most terminals, but some report Tab + SHIFT.
+        KeyCode::BackTab => Key::BackTab,
+        KeyCode::Tab if mods.contains(KeyModifiers::SHIFT) => Key::BackTab,
         KeyCode::Tab => Key::Tab,
         KeyCode::Enter => Key::Enter,
         KeyCode::Esc => Key::Escape,
