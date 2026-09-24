@@ -9,7 +9,7 @@ Adding a release: one `## <version> — <date>` section, a line per user-visible
 and the pull request each one came from. `git log v<previous>..HEAD --merges` lists the
 candidates.
 
-## Unreleased
+## 1.2.1 — 2026-09-24
 
 Added
 
@@ -22,9 +22,14 @@ Added
 
 Changed
 
-- The footer is shorter and leads with `Ctrl-K palette` (and `B dashboard` while the dashboard
-  runs). Moving, tab walking, Enter hints on lists, feedback, saved views, repos, find and visible tabs are
-  left to `?` help and the palette. ([#195](https://github.com/magna-nz/forgetop/pull/195))
+- The footer is shorter. Moving, tab walking, Enter hints on lists, feedback, saved views,
+  repos, find and visible tabs are left to `?` help and the palette. ([#195](https://github.com/magna-nz/forgetop/pull/195))
+- Every footer leads with a yellow `Ctrl-K search anywhere`. `B browser dashboard` is now
+  `B dashboard`. ([#195](https://github.com/magna-nz/forgetop/pull/195))
+
+Release
+
+- 1.2.1 version bump. ([#195](https://github.com/magna-nz/forgetop/pull/195))
 
 ## 1.2.0 — 2026-09-24
 
