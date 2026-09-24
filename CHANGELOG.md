@@ -23,7 +23,7 @@ Added
 Changed
 
 - The footer is shorter and leads with `Ctrl-K palette` (and `B dashboard` while the dashboard
-  runs). Moving, tab walking, Enter hints on lists, feedback, saved views, repos and find are
+  runs). Moving, tab walking, Enter hints on lists, feedback, saved views, repos, find and visible tabs are
   left to `?` help and the palette. ([#195](https://github.com/magna-nz/forgetop/pull/195))
 
 ## 1.2.0 — 2026-09-24

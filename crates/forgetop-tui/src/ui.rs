@@ -2032,7 +2032,6 @@ fn base_footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
         _ => {}
     }
     keys.extend([
-        ("v", "tabs"),
         ("C", "connections"),
         ("r", "refresh"),
         ("t", "theme"),
@@ -4637,7 +4636,7 @@ mod tests {
         let out = render_to_string(&mut app, 160, 24);
         assert!(out.contains("Ctrl-K") && out.contains("palette"), "footer advertises the palette");
         assert!(out.contains(" B ") && out.contains("dashboard"), "footer advertises the running dashboard");
-        for gone in ["browser dashboard", "feedback", "save view", "find", "sections"] {
+        for gone in ["browser dashboard", "feedback", "save view", "find", "tabs", "sections"] {
             assert!(!out.contains(gone), "{gone} is found through the palette and ? help, not the footer");
         }
     }
