@@ -19,7 +19,7 @@ use crate::app::{
 use crate::diff::{cursor_line_label, pending_marks};
 use crate::highlight::{lang_for, HlKind, LineHighlighter};
 use crate::overlay::Overlay;
-use crate::palette::{PaletteItem, PaletteKind, Tone};
+use crate::palette::{parse_query, PaletteItem, Tone};
 use crate::theme::{check_icon, pipeline_glyph, Theme};
 use crate::wizard::{Prompt, PromptKind};
 
@@ -2800,7 +2800,7 @@ fn render_overlay(frame: &mut Frame, area: Rect, app: &App) {
 
     // The palette is a taller search panel (query line + windowed result list).
     if let Overlay::Palette { query, candidates, results, selected } = overlay {
-        render_palette(frame, area, theme, query, candidates, results, *selected);
+        render_palette(frame, area, theme, overlay, query, candidates, results, *selected);
         return;
     }
 
@@ -2909,15 +2909,6 @@ fn render_overlay(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(lines).block(block).wrap(Wrap { trim: false }), rect);
 }
 
-/// Short type tag shown at the head of each palette row.
-fn kind_tag(kind: PaletteKind) -> &'static str {
-    match kind {
-        PaletteKind::Pr => "PR",
-        PaletteKind::Wi => "WI",
-        PaletteKind::Pipe => "CI",
-    }
-}
-
 /// The status dot's colour, following the shared green/blue/yellow/red/grey model.
 fn tone_color(theme: &Theme, tone: Tone) -> ratatui::style::Color {
     match tone {
@@ -2939,39 +2930,90 @@ fn truncate(s: &str, max: usize) -> String {
     format!("{head}…")
 }
 
-/// The command palette panel: a query line above a windowed, ranked result list.
+/// One display line of the palette's result list: a group header, or a result (by its
+/// position in `results`).
+enum PaletteLine {
+    Header(&'static str),
+    Row(usize),
+}
+
+/// The palette's result lines: each result, with a header above the first of every group
+/// (results arrive contiguous per group — see `palette::rank`).
+fn palette_lines(candidates: &[PaletteItem], results: &[usize]) -> Vec<PaletteLine> {
+    let mut lines = Vec::new();
+    let mut group = None;
+    for (pos, &i) in results.iter().enumerate() {
+        let g = candidates[i].group;
+        if group != Some(g) {
+            lines.push(PaletteLine::Header(g.label()));
+            group = Some(g);
+        }
+        lines.push(PaletteLine::Row(pos));
+    }
+    lines
+}
+
+/// Prefix legend shown under the results.
+const PALETTE_PREFIXES: &str = "> actions  : commands  @ people  # ids  ? keys";
+
+/// The command palette panel: a query line above a windowed, grouped, ranked result list.
+#[allow(clippy::too_many_arguments)]
 fn render_palette(
     frame: &mut Frame,
     area: Rect,
     theme: &Theme,
+    overlay: &Overlay,
     query: &str,
     candidates: &[PaletteItem],
     results: &[usize],
     selected: usize,
 ) {
-    const MAX_ROWS: usize = 12;
-    // Scroll the window so the selected row stays visible.
-    let start = if selected >= MAX_ROWS { selected - MAX_ROWS + 1 } else { 0 };
-    let end = (start + MAX_ROWS).min(results.len());
+    // Up to 16 result lines (headers included), fewer on a short terminal: the rest of the
+    // panel (borders, query, spacing, legend, hints) takes 7, plus a line of margin each side.
+    let max_rows = (area.height.saturating_sub(9) as usize).clamp(1, 16);
+    let width = 76.min(area.width.saturating_sub(6));
+    let inner = width.saturating_sub(2) as usize;
 
     let mut lines: Vec<Line> = Vec::new();
 
     let count = results.len();
-    lines.push(Line::from(vec![
-        Span::styled("> ", Style::default().fg(theme.accent)),
+    let mut query_line = vec![
+        Span::styled("❯ ", Style::default().fg(theme.accent)),
         Span::styled(query.to_string(), Style::default().fg(theme.fg)),
         Span::styled("█", Style::default().fg(theme.accent)),
-        Span::styled(
+    ];
+    if !query.is_empty() {
+        query_line.push(Span::styled(
             format!("    {count} match{}", if count == 1 { "" } else { "es" }),
             Style::default().fg(theme.dim),
-        ),
-    ]));
+        ));
+    }
+    lines.push(Line::from(query_line));
     lines.push(Line::from(""));
 
     if results.is_empty() {
-        lines.push(Line::from(Span::styled("  No matches", Style::default().fg(theme.dim))));
+        let msg = match parse_query(query) {
+            (Some(g), _) => format!("  No {} match", g.label().to_lowercase()),
+            (None, _) => "  No matches".to_string(),
+        };
+        lines.push(Line::from(Span::styled(msg, Style::default().fg(theme.dim))));
     } else {
-        for pos in start..end {
+        let all = palette_lines(candidates, results);
+        // Scroll the window so the selected row stays visible.
+        let sel_line = all.iter().position(|l| matches!(l, PaletteLine::Row(p) if *p == selected)).unwrap_or(0);
+        let start = if sel_line >= max_rows { sel_line + 1 - max_rows } else { 0 };
+        let end = (start + max_rows).min(all.len());
+        for line in &all[start..end] {
+            let pos = match line {
+                PaletteLine::Header(label) => {
+                    lines.push(Line::from(Span::styled(
+                        format!("   {}", label.to_uppercase()),
+                        Style::default().fg(theme.dim).add_modifier(Modifier::BOLD),
+                    )));
+                    continue;
+                }
+                PaletteLine::Row(pos) => *pos,
+            };
             let item = &candidates[results[pos]];
             let is_sel = pos == selected;
             let (cursor, title_style) = if is_sel {
@@ -2979,33 +3021,50 @@ fn render_palette(
             } else {
                 ("   ", Style::default().fg(theme.fg))
             };
-            let mut spans = vec![
-                Span::styled(cursor, Style::default().fg(theme.accent)),
-                Span::styled("● ", Style::default().fg(tone_color(theme, item.tone))),
-                Span::styled(format!("{} ", kind_tag(item.kind)), Style::default().fg(theme.dim)),
-                Span::styled(truncate(&item.title, 40), title_style),
-            ];
-            if !item.subtitle.is_empty() {
-                spans.push(Span::styled(format!("  {}", truncate(&item.subtitle, 24)), Style::default().fg(theme.dim)));
+            let mut spans = vec![Span::styled(cursor, Style::default().fg(theme.accent))];
+            // Items lead with their status dot; everything else with a blank of the same width.
+            match item.tone {
+                Some(tone) => spans.push(Span::styled("● ", Style::default().fg(tone_color(theme, tone)))),
+                None => spans.push(Span::raw("  ")),
+            }
+            spans.push(Span::styled(format!("{:<5}", item.tag()), Style::default().fg(theme.dim)));
+            // Right-aligned key badge: " k " plus a space before it.
+            let badge = item.key_hint.as_deref().map(|k| format!(" {k} "));
+            let badge_w = badge.as_ref().map_or(0, |b| b.chars().count() + 1);
+            let avail = inner.saturating_sub(3 + 2 + 5 + badge_w);
+            let title_max = if item.subtitle.is_empty() { avail } else { (avail * 3 / 5).max(12).min(avail) };
+            let title = truncate(&item.title, title_max);
+            let mut used = title.chars().count();
+            spans.push(Span::styled(title, title_style));
+            let sub_room = avail.saturating_sub(used + 2);
+            if !item.subtitle.is_empty() && sub_room >= 4 {
+                let sub = truncate(&item.subtitle, sub_room);
+                used += 2 + sub.chars().count();
+                spans.push(Span::styled(format!("  {sub}"), Style::default().fg(theme.dim)));
+            }
+            if let Some(badge) = badge {
+                spans.push(Span::raw(" ".repeat(avail.saturating_sub(used) + 1)));
+                spans.push(Span::styled(badge, Style::default().fg(theme.yellow).bg(theme.bg)));
             }
             lines.push(Line::from(spans));
         }
     }
 
-    let hint = [("↑↓", "move"), ("↵", "open"), ("Esc", "cancel")]
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(format!(" {PALETTE_PREFIXES}"), Style::default().fg(theme.dim))));
+    let hint = overlay
+        .hint()
         .into_iter()
         .flat_map(|(k, l)| {
             [
                 Span::styled(format!(" {k} "), Style::default().fg(theme.bg).bg(theme.accent).add_modifier(Modifier::BOLD)),
-                Span::styled(format!(" {l}   "), Style::default().fg(theme.dim)),
+                Span::styled(format!(" {l}  "), Style::default().fg(theme.dim)),
             ]
         })
         .collect::<Vec<_>>();
-    lines.push(Line::from(""));
     lines.push(Line::from(hint));
 
     let height = lines.len() as u16 + 2;
-    let width = 76.min(area.width.saturating_sub(6));
     let rect = centered_rect(width, height, area);
 
     let block = Block::default()
@@ -3013,14 +3072,15 @@ fn render_palette(
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(theme.accent))
         .style(Style::default().bg(theme.panel))
-        .title(Span::styled(" Jump to ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)));
+        .title(Span::styled(format!(" {} ", overlay.title()), Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)));
 
     frame.render_widget(Clear, rect);
     frame.render_widget(Paragraph::new(lines).block(block), rect);
 }
 
-/// Every keybinding, grouped by context — the content of the `?` help panel.
-fn help_sections() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
+/// Every keybinding, grouped by context — the content of the `?` help panel, and the
+/// command palette's Keys group.
+pub(crate) fn help_sections() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
     vec![
         (
             "Global",
@@ -3028,7 +3088,7 @@ fn help_sections() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
                 ("1–4", "Jump to a tab"),
                 ("Tab  Shift-Tab", "Next / previous tab — from anywhere, an open item included"),
                 ("↑/↓  k/j", "Move selection"),
-                ("Ctrl-P", "Jump to any item (command palette)"),
+                ("Ctrl-K  Ctrl-P", "Command palette: search items, actions, views, settings, keys"),
                 ("i", "Notification inbox (mentions, reviews, CI, assignments)"),
                 ("B", "Open the web dashboard in your browser"),
                 ("F", "Give feedback through the GitHub issue form"),
@@ -5209,26 +5269,17 @@ mod tests {
     #[test]
     fn palette_renders_query_results_and_status_dots() {
         use crate::overlay::Overlay;
-        use crate::palette::{self, PaletteItem, PaletteKind, Tone};
+        use crate::palette::{self, Group, PaletteItem, PaletteKind, PaletteTarget, Tone};
 
+        let target = |kind, id: &str| PaletteTarget::Item { kind, id: id.into(), connection_id: "c".into() };
         let items = vec![
             PaletteItem {
-                kind: PaletteKind::Pr,
-                id: "1".into(),
-                connection_id: "c".into(),
-                title: "Add the widget".into(),
-                subtitle: "alice · GitHub".into(),
-                tone: Tone::Good,
-                sort_ts: None,
+                tone: Some(Tone::Good),
+                ..PaletteItem::new(Group::Item, target(PaletteKind::Pr, "1"), "Add the widget").with_subtitle("alice · GitHub")
             },
             PaletteItem {
-                kind: PaletteKind::Pipe,
-                id: "2".into(),
-                connection_id: "c".into(),
-                title: "CI Build".into(),
-                subtitle: "main".into(),
-                tone: Tone::Bad,
-                sort_ts: None,
+                tone: Some(Tone::Bad),
+                ..PaletteItem::new(Group::Item, target(PaletteKind::Pipe, "2"), "CI Build").with_subtitle("main")
             },
         ];
         let results = palette::rank("", &items);
@@ -5236,12 +5287,40 @@ mod tests {
         app.overlay = Some(Overlay::Palette { query: "a".into(), candidates: items, results, selected: 0 });
 
         let out = render_to_string(&mut app, 100, 30);
-        assert!(out.contains("Jump to"), "panel title");
+        assert!(out.contains("Search everything"), "panel title");
         assert!(out.contains("Add the widget"), "a result title is shown");
         assert!(out.contains("CI Build"), "results from every type are shown");
         assert!(out.contains("match"), "the match count is shown");
         assert!(out.contains("● "), "status dots are rendered");
         assert!(out.contains("PR") && out.contains("CI"), "type badges are shown");
+    }
+
+    #[test]
+    fn palette_shows_group_headers_key_badges_and_keeps_the_selection_visible_at_80_columns() {
+        use crate::overlay::Overlay;
+        use crate::palette::{self, GoTo, Group, PaletteItem, PaletteTarget};
+
+        let mut items = vec![PaletteItem::new(Group::Action, PaletteTarget::Key(crate::app::Key::Char('a')), "Approve")
+            .with_subtitle("PR view")
+            .with_key("a")];
+        // Enough go-to rows that the last one sits beyond the window.
+        for i in 0..30 {
+            items.push(PaletteItem::new(Group::GoTo, PaletteTarget::GoTo(GoTo::Help), format!("Destination {i}")));
+        }
+        let results = palette::rank("", &items);
+        let last = results.len() - 1;
+        let mut app = App::new("slate");
+        app.overlay = Some(Overlay::Palette { query: String::new(), candidates: items.clone(), results: results.clone(), selected: 0 });
+        let out = render_to_string(&mut app, 80, 30);
+        assert!(out.contains("ACTIONS") && out.contains("GO TO"), "group headers are shown");
+        assert!(out.contains(" a "), "the key badge is shown");
+        assert!(out.contains("> actions  : commands  @ people  # ids  ? keys"), "the prefix legend is shown");
+        assert!(out.contains("^K"), "the close hint is shown");
+
+        app.overlay = Some(Overlay::Palette { query: String::new(), candidates: items, results, selected: last });
+        let out = render_to_string(&mut app, 80, 30);
+        assert!(out.contains("Destination 29"), "the selected row is scrolled into view");
+        assert!(!out.contains("Destination 0 "), "rows above the window are dropped");
     }
 
     fn notif_row(id: &str, kind: NotificationKind, title: &str, unread: bool) -> crate::app::NotifRow {

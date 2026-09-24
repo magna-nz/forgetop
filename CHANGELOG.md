@@ -9,6 +9,16 @@ Adding a release: one `## <version> — <date>` section, a line per user-visible
 and the pull request each one came from. `git log v<previous>..HEAD --merges` lists the
 candidates.
 
+## Unreleased
+
+Added
+
+- **Ctrl-K command palette** in the terminal UI, from every screen (Ctrl-P still works).
+  It searches everything already loaded: the current screen's actions (each shows its key),
+  PRs, work items and runs, destinations, saved views, people, pipeline repositories,
+  themes and settings, and every keybinding from `?` help. Prefixes narrow it: `>` actions,
+  `:` commands (`:theme`, `:view`, `:go`, `:merge`), `@` people, `#` ids, `?` keys.
+
 ## 1.2.0 — 2026-09-24
 
 Added

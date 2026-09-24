@@ -6,7 +6,7 @@ use forgetop_core::domain::ReviewVote;
 use forgetop_core::provider::MergeStrategy;
 
 use crate::app::Key;
-use crate::palette::{rank, PaletteItem, PaletteKind};
+use crate::palette::{complete, mode_title, rank, PaletteItem, PaletteKind, PaletteTarget};
 
 /// A write action to run against the selected item once an overlay is submitted.
 #[derive(Debug, Clone)]
@@ -46,6 +46,9 @@ pub enum Action {
     /// Jump to an item chosen in the command palette. The app re-resolves the full
     /// PR / work item / pipeline from its lists by `(kind, id)` and opens its view.
     OpenItem { kind: PaletteKind, id: String, connection_id: String },
+    /// Run any other palette entry (an action's key, a destination, a view, a filter, a
+    /// theme, a keybinding, a command). Interpreted by the app.
+    Palette(PaletteTarget),
     /// From the unsubmitted-comments prompt: open the submit-review verdict picker.
     OpenReviewMenu,
     /// From the unsubmitted-comments prompt: leave the PR view, discarding pending comments.
@@ -125,9 +128,9 @@ pub enum Overlay {
     Toggle { title: String, kind: ToggleKind, min_one: bool, items: Vec<ToggleItem>, selected: usize, filter: Option<String> },
     /// A scrollable, context-agnostic reference of every keybinding.
     Help { scroll: u16 },
-    /// The command palette: fuzzy-jump across every already-fetched item. `results` are
-    /// indices into `candidates`, ranked for the current `query`; `selected` indexes into
-    /// `results`.
+    /// The command palette: "search everything" — the screen's actions, every already-fetched
+    /// item, destinations, views, settings and keys. `results` are indices into `candidates`,
+    /// ranked (and grouped) for the current `query`; `selected` indexes into `results`.
     Palette { query: String, candidates: Vec<PaletteItem>, results: Vec<usize>, selected: usize },
 }
 
@@ -149,7 +152,7 @@ impl Overlay {
             | Overlay::Input { title, .. }
             | Overlay::Toggle { title, .. } => title,
             Overlay::Help { .. } => "Keybindings",
-            Overlay::Palette { .. } => "Jump to",
+            Overlay::Palette { query, .. } => mode_title(query),
         }
     }
 
@@ -164,7 +167,9 @@ impl Overlay {
             }
             Overlay::Toggle { .. } => vec![("↑↓", "move"), ("space", "toggle"), ("↵", "apply")],
             Overlay::Help { .. } => vec![("↑↓", "scroll"), ("Esc", "close")],
-            Overlay::Palette { .. } => vec![("↑↓", "move"), ("↵", "open"), ("Esc", "cancel")],
+            Overlay::Palette { .. } => {
+                vec![("↑↓", "move"), ("↵", "run/open"), ("Tab", "complete"), ("^K", "close"), ("Esc", "cancel")]
+            }
         }
     }
 
@@ -317,15 +322,24 @@ impl Overlay {
                     }
                     Outcome::Keep
                 }
-                Key::Enter => match results.get(*selected).map(|&i| &candidates[i]) {
-                    Some(item) => Outcome::Submit(Action::OpenItem {
-                        kind: item.kind,
-                        id: item.id.clone(),
-                        connection_id: item.connection_id.clone(),
-                    }),
+                // Tab completes the query to the selected entry's text (keeping the mode prefix).
+                Key::Tab => {
+                    if let Some(item) = results.get(*selected).map(|&i| &candidates[i]) {
+                        *query = complete(query, item);
+                        *results = rank(query, candidates);
+                        *selected = 0;
+                    }
+                    Outcome::Keep
+                }
+                Key::Enter => match results.get(*selected).map(|&i| &candidates[i].target) {
+                    Some(PaletteTarget::Item { kind, id, connection_id }) => {
+                        Outcome::Submit(Action::OpenItem { kind: *kind, id: id.clone(), connection_id: connection_id.clone() })
+                    }
+                    Some(target) => Outcome::Submit(Action::Palette(target.clone())),
                     None => Outcome::Keep, // no matches — swallow Enter
                 },
-                Key::Escape => Outcome::Cancel,
+                // Ctrl-K toggles: the key that opened the palette closes it again.
+                Key::Escape | Key::Ctrl('k') => Outcome::Cancel,
                 _ => Outcome::Keep,
             },
         }
@@ -465,15 +479,8 @@ mod tests {
     }
 
     fn pitem(kind: PaletteKind, id: &str, title: &str) -> PaletteItem {
-        PaletteItem {
-            kind,
-            id: id.into(),
-            connection_id: "c".into(),
-            title: title.into(),
-            subtitle: String::new(),
-            tone: crate::palette::Tone::Neutral,
-            sort_ts: None,
-        }
+        let target = PaletteTarget::Item { kind, id: id.into(), connection_id: "c".into() };
+        PaletteItem::new(crate::palette::Group::Item, target, title)
     }
 
     fn palette(items: Vec<PaletteItem>) -> Overlay {
@@ -525,6 +532,61 @@ mod tests {
     fn palette_esc_cancels() {
         let mut o = palette(vec![pitem(PaletteKind::Pr, "1", "a")]);
         assert!(matches!(o.handle(Key::Escape), Outcome::Cancel));
+    }
+
+    #[test]
+    fn palette_ctrl_k_closes_and_ctrl_p_still_moves() {
+        let mut o = palette(vec![pitem(PaletteKind::Pr, "1", "a"), pitem(PaletteKind::Pr, "2", "b")]);
+        assert!(matches!(o.handle(Key::Ctrl('n')), Outcome::Keep));
+        assert!(matches!(o.handle(Key::Ctrl('p')), Outcome::Keep), "Ctrl-P moves inside the palette");
+        let Overlay::Palette { selected, .. } = &o else { panic!() };
+        assert_eq!(*selected, 0);
+        assert!(matches!(o.handle(Key::Ctrl('k')), Outcome::Cancel), "Ctrl-K closes");
+    }
+
+    #[test]
+    fn palette_tab_completes_the_query_to_the_selected_entry() {
+        use crate::palette::{Group, GoTo};
+        let cmd = |t: &str| PaletteItem::new(Group::Command, PaletteTarget::GoTo(GoTo::Help), t);
+        let mut o = palette(vec![cmd(":theme matrix"), cmd(":go help")]);
+        for c in ":thm".chars() {
+            o.handle(Key::Char(c));
+        }
+        assert!(matches!(o.handle(Key::Tab), Outcome::Keep));
+        let Overlay::Palette { query, results, candidates, selected } = &o else { panic!() };
+        assert_eq!(query, ":theme matrix");
+        assert_eq!(candidates[results[*selected]].title, ":theme matrix", "the completed entry stays selected");
+    }
+
+    #[test]
+    fn palette_enter_emits_the_selected_targets_action() {
+        use crate::palette::{GoTo, Group};
+        let targets = [
+            (Group::Action, PaletteTarget::Key(Key::Char('a'))),
+            (Group::GoTo, PaletteTarget::GoTo(GoTo::Inbox)),
+            (Group::View, PaletteTarget::View { section: 1, idx: 2 }),
+            (Group::Person, PaletteTarget::Filter { section: 0, text: "Ada".into() }),
+            (Group::Repo, PaletteTarget::Filter { section: 2, text: "acme/pay".into() }),
+            (Group::Setting, PaletteTarget::Theme("matrix".into())),
+            (Group::Key, PaletteTarget::HelpKey { keys: "u".into(), section: "Work Item view".into() }),
+            (Group::Command, PaletteTarget::MergePicker { selected: 1 }),
+        ];
+        for (group, target) in targets {
+            // Typing reaches every group (an empty query shows only actions / items / go to);
+            // commands only show in `:` mode.
+            let mut o = palette(vec![PaletteItem::new(group, target.clone(), "entry")]);
+            let query = if group == Group::Command { ":entry" } else { "entry" };
+            for c in query.chars() {
+                o.handle(Key::Char(c));
+            }
+            match o.handle(Key::Enter) {
+                Outcome::Submit(Action::Palette(got)) => assert_eq!(got, target),
+                _ => panic!("expected Action::Palette for {target:?}"),
+            }
+        }
+        // Items keep their own open action.
+        let mut o = palette(vec![pitem(PaletteKind::Wi, "w1", "a work item")]);
+        assert!(matches!(o.handle(Key::Enter), Outcome::Submit(Action::OpenItem { kind: PaletteKind::Wi, .. })));
     }
 
     #[test]

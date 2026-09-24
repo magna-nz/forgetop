@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 
 use crate::launchpad;
 use crate::overlay::{Action, InputKind, Outcome, Overlay, PickerKind, ToggleItem, ToggleKind};
-use crate::palette::{self, PaletteKind};
+use crate::palette::{self, CommandContext, GoTo, PaletteItem, PaletteKind, PaletteTarget};
 use crate::theme::Theme;
 use crate::wizard::{provider_sections, section_label, Wizard, WizardOutcome};
 
@@ -3034,20 +3034,350 @@ impl App {
 
     // ---- command palette ----
 
-    /// Open the command palette over the current screen, seeded with every already-fetched
-    /// PR / work item / pipeline. Empty query → all, most-recent first.
+    /// Open the command palette over the current screen. Empty query → this screen's actions,
+    /// then every already-fetched item (most-recent first), then the go-to destinations.
     fn open_palette(&mut self) {
-        let candidates = palette::build_candidates(&self.prs, &self.wis, &self.pipes);
+        let candidates = self.palette_candidates();
         let results = palette::rank("", &candidates);
         self.overlay = Some(Overlay::Palette { query: String::new(), candidates, results, selected: 0 });
+    }
+
+    /// Everything the palette can search, built from what's already in memory — no provider
+    /// calls. Commands are included but only surface in `:` mode (see `palette::rank`).
+    fn palette_candidates(&self) -> Vec<PaletteItem> {
+        let mut c = palette::action_items(&self.context_actions(), self.screen_name());
+        c.extend(palette::build_candidates(&self.prs, &self.wis, &self.pipes));
+        c.extend(palette::goto_items(&self.visible));
+        c.extend(palette::view_items(&self.views, &self.view_idx, &self.visible));
+        c.extend(palette::repo_items(&self.pipes, self.visible[2]));
+        c.extend(palette::people_items(&self.prs, &self.wis, &self.visible));
+        c.extend(palette::setting_items(&crate::theme::THEMES, self.theme.name));
+        c.extend(palette::key_items(&crate::ui::help_sections()));
+        c.extend(palette::command_items(&CommandContext {
+            themes: &crate::theme::THEMES,
+            views: &self.views,
+            visible: &self.visible,
+            // Exactly when `m` / `u` would open their pickers.
+            can_merge: matches!(&self.screen, Screen::PrView(v) if v.pr.status != PullRequestStatus::Merged),
+            can_set_state: matches!(self.screen, Screen::WiView(_)),
+        }));
+        c
+    }
+
+    /// The current screen's name, for the subtitle of its palette actions.
+    fn screen_name(&self) -> &'static str {
+        match self.screen {
+            Screen::Launchpad => "Command Center",
+            Screen::List => TABS[self.active],
+            Screen::PrView(_) => "PR view",
+            Screen::WiView(_) => "Work item view",
+            Screen::Pipeline(_) => "Pipeline run",
+            Screen::Inbox => "Inbox",
+            Screen::Config(_) => "Connections",
+        }
+    }
+
+    /// The actions the palette offers on the current screen, each paired with the key that
+    /// performs it. Mirrors the per-screen key handlers' own conditions — an entry is listed
+    /// only when its key would do something here — and running one replays that key (see
+    /// [`App::replay_key`]), so the palette and the keyboard can't drift. Pure navigation
+    /// (j/k, tab switching, back) is left out.
+    pub fn context_actions(&self) -> Vec<(&'static str, Key)> {
+        let c = Key::Char;
+        let mut out: Vec<(&'static str, Key)> = Vec::new();
+        match &self.screen {
+            // `on_launchpad_key`.
+            Screen::Launchpad => {
+                if matches!(self.lp_selected_slot(), Some(LpSlot::Entry(_))) {
+                    out.push(("Dismiss from Command Center", c('D')));
+                }
+                out.extend([("Refresh", c('r')), ("Connections", c('C')), ("Cycle theme", c('t'))]);
+            }
+            // `on_preview_key`, the list arm of `on_key_inner`, and `on_char`.
+            Screen::List => {
+                let s = self.active;
+                if !self.filters[s].is_empty() {
+                    out.push(("Clear quick filter", Key::Escape));
+                }
+                out.push(("Quick filter", c('/')));
+                match s {
+                    0 => out.push(("Filter by status", c('f'))),
+                    1 => out.push(("Choose which states to show", c('f'))),
+                    _ => out.extend([
+                        ("Trigger a run", c('T')),
+                        ("Cycle grouping", c('G')),
+                        ("Collapse every group", c('z')),
+                        ("Expand every group", c('Z')),
+                    ]),
+                }
+                out.extend([("Sort by column", c('S')), ("Repositories to fetch", c('g'))]);
+                if self.views[s].len() > 1 {
+                    out.extend([("Previous saved view", c('[')), ("Next saved view", c(']'))]);
+                }
+                out.push(("Save current view", c('V')));
+                if self.views[s].len() > 1 {
+                    out.push(("Delete current view", c('X')));
+                }
+                if self.selected().is_some() {
+                    out.push(("Open selected in browser", c('o')));
+                }
+                if self.preview.is_some() {
+                    out.push(("Focus the preview pane", c('p')));
+                }
+                out.extend([
+                    ("Preview pane on / off", c('P')),
+                    ("Choose visible tabs", c('v')),
+                    ("Refresh", c('r')),
+                    ("Cycle theme", c('t')),
+                    ("Connections", c('C')),
+                ]);
+            }
+            // The PR arm of `on_key_inner` and `on_pr_view_key`.
+            Screen::PrView(v) => {
+                if v.pr.status == PullRequestStatus::Merged {
+                    out.push(("Revert", c('R')));
+                } else {
+                    out.extend([("Approve", c('a')), ("Request changes", c('x')), ("Merge…", c('m'))]);
+                }
+                let on_line = v.tab == 3 && v.diff.focus == DiffFocus::Patch;
+                out.push((if on_line { "Comment on this line" } else { "Comment" }, c('c')));
+                // `r` replies from the Conversation and Diff tabs; elsewhere it only explains that.
+                if matches!(v.tab, 0 | 3) {
+                    out.push(("Reply to thread", c('r')));
+                }
+                if !v.pending.is_empty() {
+                    out.push(("Submit review", c('s')));
+                }
+                if v.tab == 1 && !v.commits.is_empty() {
+                    out.push(("Open the commit's diff", Key::Enter));
+                }
+                if v.tab == 3 {
+                    if v.diff.focus == DiffFocus::FileList {
+                        out.push(("Line cursor in the patch", Key::Enter));
+                    }
+                    out.extend([
+                        ("Mark file viewed", c('v')),
+                        ("Next comment thread", c(']')),
+                        ("Previous comment thread", c('[')),
+                    ]);
+                }
+                if v.url.is_some() {
+                    out.push(("Open in browser", c('o')));
+                }
+            }
+            // The WI arm of `on_key_inner` and `on_wi_view_key`.
+            Screen::WiView(v) => {
+                out.extend([("Update state", c('u')), ("Comment", c('c'))]);
+                if v.wi.url.is_some() {
+                    out.push(("Open in browser", c('o')));
+                }
+            }
+            // `on_pipeline_screen_key`, `on_pipeline_logs_key` and `on_pipeline_key`.
+            Screen::Pipeline(v) => {
+                let split = v.log_split.get();
+                match &v.logs {
+                    Some(log) if v.logs_have_keys() => {
+                        if split {
+                            out.push(("Move the keys to the tree", c('w')));
+                        }
+                        out.push(("Search the log", c('/')));
+                        if log.query.is_some() {
+                            out.extend([("Next match", c('n')), ("Previous match", c('N'))]);
+                        }
+                        out.extend([("Toggle follow", c('f')), ("Jump to the first error", c('E')), ("Close logs", Key::Escape)]);
+                    }
+                    logs => {
+                        if logs.is_some() {
+                            if split {
+                                out.push(("Move the keys to the logs", c('w')));
+                            }
+                            out.push(("Close logs", c('L')));
+                        } else {
+                            out.push(("View the job's logs", c('L')));
+                        }
+                        out.push(("Trigger a run", c('T')));
+                        if v.can_respond_approvals && !v.actionable_approvals().is_empty() {
+                            out.push(("Approve / reject a gate", c('A')));
+                        }
+                        if self.selected_url().is_some() {
+                            out.push(("Open the job in browser", c('o')));
+                        }
+                    }
+                }
+            }
+            // `on_inbox_key`.
+            Screen::Inbox => {
+                if let Some(row) = self.inbox.get(self.inbox_sel) {
+                    if row.notification.url.is_some() {
+                        out.push(("Open in browser", c('o')));
+                    }
+                    out.extend([("Mark read", c('x')), ("Mark all read", c('A'))]);
+                }
+                out.push(("Refresh", c('r')));
+            }
+            // `on_config_key`.
+            Screen::Config(v) => {
+                out.extend([
+                    ("Add a connection", c('a')),
+                    ("Bind Pull Requests", c('p')),
+                    ("Bind Work Items", c('w')),
+                    ("Pipeline subscriptions", c('s')),
+                ]);
+                if v.selected_conn().is_some() {
+                    out.push(("Remove connection", c('x')));
+                }
+            }
+        }
+        // A view focused from the list's preview pane: `on_preview_key` answers `p` / `P` first.
+        if self.preview_focus && matches!(self.screen, Screen::PrView(_) | Screen::WiView(_) | Screen::Pipeline(_)) {
+            out.extend([("Back to the list", c('p')), ("Preview pane on / off", c('P'))]);
+        }
+        out
+    }
+
+    /// Keys an entry from help section `section` may run from the palette. The same letter
+    /// means different things on different screens (`r` refreshes a list but replies in a PR
+    /// view), so a section's keys run only on the screen that section describes. "Global" adds
+    /// the keys `on_key_inner` answers everywhere (the log pane keeps `n` / `N` for itself).
+    fn runnable_keys(&self, section: &str) -> Vec<Key> {
+        let list = |tab: Option<usize>| matches!(self.screen, Screen::List) && tab.is_none_or(|t| t == self.active);
+        let applies = match section {
+            "Global" => matches!(self.screen, Screen::List | Screen::Launchpad),
+            "Saved views" => list(None),
+            "Pull Requests (list)" => list(Some(0)),
+            "Work Items (list)" => list(Some(1)),
+            "Pipelines" => list(Some(2)) || matches!(self.screen, Screen::Pipeline(_)),
+            "PR view (after Enter)" => matches!(self.screen, Screen::PrView(_)),
+            "Work Item view (after Enter)" => matches!(self.screen, Screen::WiView(_)),
+            "Config / connections" => matches!(self.screen, Screen::Config(_)),
+            _ => false,
+        };
+        let mut keys: Vec<Key> =
+            if applies { self.context_actions().into_iter().map(|(_, k)| k).collect() } else { Vec::new() };
+        if section == "Global" {
+            keys.extend([Key::Ctrl('k'), Key::Char('?'), Key::Char('B'), Key::Char('F')]);
+            if !matches!(&self.screen, Screen::Pipeline(v) if v.logs_have_keys()) {
+                keys.extend([Key::Char('n'), Key::Char('N')]);
+            }
+            if matches!(self.screen, Screen::List | Screen::Launchpad) {
+                keys.push(Key::Char('i'));
+            }
+        }
+        keys
+    }
+
+    /// Runs a palette entry other than an item (items go through [`Action::OpenItem`]).
+    async fn run_palette_target(&mut self, target: PaletteTarget, deps: &AppDeps) {
+        match target {
+            PaletteTarget::Item { kind, id, connection_id } => {
+                if !self.leave_blocked() {
+                    self.open_palette_item(kind, id, connection_id, deps).await;
+                }
+            }
+            PaletteTarget::Key(key) => self.replay_key(key, deps).await,
+            PaletteTarget::GoTo(dest) => self.palette_go_to(dest, deps).await,
+            PaletteTarget::View { section, idx } => {
+                if !self.leave_blocked() {
+                    self.goto_section(section_of(section));
+                    self.apply_view(section, idx, deps).await;
+                }
+            }
+            PaletteTarget::Filter { section, text } => {
+                if !self.leave_blocked() {
+                    self.goto_section(section_of(section));
+                    self.filters[section] = text;
+                    self.reset_filter_selection();
+                }
+            }
+            // Same as the `t` key, with the theme chosen rather than cycled to.
+            PaletteTarget::Theme(name) => {
+                self.theme = Theme::by_name(&name);
+                let _ = deps.config.set_theme(Some(name)).await;
+            }
+            PaletteTarget::HelpKey { keys, section } => {
+                // Only a row naming one key runs it: a row listing several ("/  n  N") describes
+                // them together, and its first key alone can mean something else here. Ctrl
+                // aliases ("Ctrl-K  Ctrl-P") are the exception — they're the same action.
+                let tokens: Vec<&str> = keys.split_whitespace().collect();
+                let ctrl = |t: &str| {
+                    t.strip_prefix("Ctrl-")
+                        .filter(|rest| rest.chars().count() == 1)
+                        .and_then(|rest| rest.chars().next())
+                        .map(|ch| Key::Ctrl(ch.to_ascii_lowercase()))
+                };
+                let key = match tokens.as_slice() {
+                    [one] if one.chars().count() == 1 => one.chars().next().map(Key::Char),
+                    [first, ..] if tokens.iter().all(|t| ctrl(t).is_some()) => ctrl(first),
+                    _ => None,
+                };
+                match key.filter(|k| self.runnable_keys(&section).contains(k)) {
+                    Some(key) => self.replay_key(key, deps).await,
+                    None => self.toast = Some(format!("Press {keys} in {section}")),
+                }
+            }
+            // `:merge <strategy>` — the `m` picker, with the strategy preselected.
+            PaletteTarget::MergePicker { selected } => {
+                if matches!(self.screen, Screen::PrView(_)) && !self.active_pr_is_merged() {
+                    self.open_pr_merge();
+                    if let Some(Overlay::Picker { selected: sel, .. }) = &mut self.overlay {
+                        *sel = selected;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Runs a palette action by replaying its key through the normal key path — the very code
+    /// the keyboard reaches, so the two can't drift. The palette overlay has already been taken
+    /// (see `on_overlay_key`), so the key reaches the screen rather than the palette. Boxed
+    /// because it recurses into `on_key_inner`.
+    async fn replay_key(&mut self, key: Key, deps: &AppDeps) {
+        Box::pin(self.on_key_inner(key, deps)).await;
+    }
+
+    /// A palette destination: the same functions the tab strip and the global keys call.
+    async fn palette_go_to(&mut self, dest: GoTo, deps: &AppDeps) {
+        let leaves = matches!(dest, GoTo::CommandCenter | GoTo::Section(_) | GoTo::Inbox | GoTo::Connections);
+        if leaves && self.leave_blocked() {
+            return;
+        }
+        match dest {
+            GoTo::CommandCenter => self.set_tab(0),
+            GoTo::Section(i) => self.goto_section(section_of(i)),
+            GoTo::Inbox => self.open_inbox(),
+            GoTo::Connections => self.open_connections(deps).await,
+            GoTo::Help => self.overlay = Some(Overlay::Help { scroll: 0 }),
+            GoTo::Dashboard => self.open_dashboard(),
+            GoTo::AddConnection => self.open_setup_picker(),
+            GoTo::Notifications => self.open_notifications_toggle(),
+            GoTo::Refresh => self.request_reload(deps),
+        }
+    }
+
+    /// Leaving a PR view with unsubmitted line comments asks first — the same prompt Esc and
+    /// Tab raise. True when that prompt was opened instead of leaving.
+    fn leave_blocked(&mut self) -> bool {
+        if matches!(&self.screen, Screen::PrView(v) if !v.pending.is_empty()) {
+            self.open_pending_exit_prompt();
+            return true;
+        }
+        false
     }
 
     /// Open the item chosen in the palette, re-resolving the full struct from the section
     /// lists by `(kind, id)` and reusing the same open path as selecting it on its screen.
     async fn open_palette_item(&mut self, kind: PaletteKind, id: String, conn: String, deps: &AppDeps) {
-        // Esc from the opened view should return to wherever the palette was invoked from.
-        self.lp_origin = matches!(self.screen, Screen::Launchpad);
-        self.from_inbox = false;
+        // Esc from the opened view should return to wherever the palette was invoked from; from
+        // an open view, that's where that view itself came from, so its origin is kept.
+        match self.screen {
+            Screen::PrView(_) | Screen::WiView(_) | Screen::Pipeline(_) => {}
+            _ => {
+                self.lp_origin = matches!(self.screen, Screen::Launchpad);
+                self.from_inbox = matches!(self.screen, Screen::Inbox);
+            }
+        }
+        // A full view, not the list's preview: the opened item has no list row beside it.
+        self.preview_focus = false;
         match kind {
             PaletteKind::Pr => {
                 let found = self
@@ -3078,6 +3408,12 @@ impl App {
     }
 
     // ---- notification inbox ----
+
+    /// Show the notification inbox, keeping its selection in range.
+    fn open_inbox(&mut self) {
+        self.inbox_sel = self.inbox_sel.min(self.inbox.len().saturating_sub(1));
+        self.screen = Screen::Inbox;
+    }
 
     /// Open the web dashboard in the browser, if its server is running.
     pub fn open_dashboard(&mut self) {
@@ -4060,6 +4396,12 @@ impl App {
                 return;
             }
         }
+        // Ctrl-K opens the command palette from every screen; Ctrl-P is its alias. Checked
+        // after the input-capturing modes above, so it never steals a key from them.
+        if matches!(key, Key::Ctrl('k') | Key::Ctrl('p')) {
+            self.open_palette();
+            return;
+        }
         // Help and the notifications chooser are available anywhere.
         if key == Key::Char('?') {
             self.overlay = Some(Overlay::Help { scroll: 0 });
@@ -4069,15 +4411,9 @@ impl App {
             self.open_notifications_toggle();
             return;
         }
-        // Ctrl-P opens the command palette from the list screens and the Launchpad.
-        if key == Key::Ctrl('p') && matches!(self.screen, Screen::List | Screen::Launchpad) {
-            self.open_palette();
-            return;
-        }
         // `i` opens the notification inbox from the list screens and the Launchpad.
         if key == Key::Char('i') && matches!(self.screen, Screen::List | Screen::Launchpad) {
-            self.inbox_sel = self.inbox_sel.min(self.inbox.len().saturating_sub(1));
-            self.screen = Screen::Inbox;
+            self.open_inbox();
             return;
         }
         // `B` opens the web dashboard in the browser (available from anywhere).
@@ -6109,7 +6445,10 @@ impl App {
                     self.open_repo_scope_for(id, deps).await;
                 }
             }
-            Action::OpenItem { kind, id, connection_id } => self.open_palette_item(kind, id, connection_id, deps).await,
+            Action::OpenItem { kind, id, connection_id } => {
+                self.run_palette_target(PaletteTarget::Item { kind, id, connection_id }, deps).await
+            }
+            Action::Palette(target) => self.run_palette_target(target, deps).await,
             Action::OpenReviewMenu => self.open_review_submit(),
             Action::LeavePrView => self.screen = self.view_origin(),
             Action::SetupInTerminal => self.start_add_connection(),
@@ -8504,14 +8843,12 @@ mod tests {
         let cands = palette::build_candidates(&[pr_row(p)], &[wi_row(w)], &[]);
         assert_eq!(cands.len(), 2);
         // PR: routes by (kind,id), title is the PR title, subtitle carries author + branch.
-        assert_eq!(cands[0].kind, PaletteKind::Pr);
-        assert_eq!(cands[0].id, "pr1");
+        assert!(matches!(&cands[0].target, PaletteTarget::Item { kind: PaletteKind::Pr, id, .. } if id == "pr1"));
         assert_eq!(cands[0].title, "Migrate billing");
         assert!(cands[0].subtitle.contains("priya"), "subtitle has author: {}", cands[0].subtitle);
         assert!(cands[0].subtitle.contains("feat/pay-412"), "subtitle has branch: {}", cands[0].subtitle);
         // WI: identifier is searchable via the subtitle.
-        assert_eq!(cands[1].kind, PaletteKind::Wi);
-        assert_eq!(cands[1].id, "wi1");
+        assert!(matches!(&cands[1].target, PaletteTarget::Item { kind: PaletteKind::Wi, id, .. } if id == "wi1"));
         assert!(cands[1].subtitle.contains("PAY-412"), "subtitle has identifier: {}", cands[1].subtitle);
     }
 
@@ -11904,4 +12241,245 @@ mod tests {
         assert!(v.log_focus);
     }
 
+
+    // ---- command palette (Ctrl-K) ----
+
+    async fn type_keys(app: &mut App, text: &str, deps: &AppDeps) {
+        for ch in text.chars() {
+            app.on_key(Key::Char(ch), deps).await;
+        }
+    }
+
+    /// Open the palette, type `query` and run the top result.
+    async fn palette_run(app: &mut App, query: &str, deps: &AppDeps) {
+        app.on_key(Key::Ctrl('k'), deps).await;
+        type_keys(app, query, deps).await;
+        app.on_key(Key::Enter, deps).await;
+    }
+
+    fn open_pr_screen(status: PullRequestStatus) -> Screen {
+        let mut p = pr(Some("https://example.test/pr/1"));
+        p.status = status;
+        let mut screen = pr_view_showing(p, &known_detail());
+        if let Screen::PrView(v) = &mut screen {
+            v.url = v.pr.url.clone();
+        }
+        screen
+    }
+
+    fn user(name: &str, handle: &str) -> User {
+        User { id: handle.into(), display_name: name.into(), handle: Some(handle.into()), avatar_url: None }
+    }
+
+    #[tokio::test]
+    async fn ctrl_k_and_ctrl_p_open_the_palette_from_every_screen() {
+        let deps = test_deps();
+        type MakeScreen = Box<dyn Fn(&App) -> Screen>;
+        let screens: Vec<(&str, MakeScreen)> = vec![
+            ("Launchpad", Box::new(|_| Screen::Launchpad)),
+            ("List", Box::new(|_| Screen::List)),
+            ("PrView", Box::new(|_| open_pr_screen(PullRequestStatus::Open))),
+            ("WiView", Box::new(|_| Screen::WiView(Box::new(WiView { connection_id: "c".into(), wi: wi(None), threads: vec![], scroll: 0 })))),
+            (
+                "Pipeline",
+                Box::new(|_| {
+                    Screen::Pipeline(Box::new(PipelineView::new("CI".into(), failed_run(), "c".into(), ProviderType::GitHub, "ci".into(), None)))
+                }),
+            ),
+            ("Inbox", Box::new(|_| Screen::Inbox)),
+            ("Config", Box::new(|app: &App| Screen::Config(Box::new(app.build_config_view(&test_deps()))))),
+        ];
+        for (name, make) in &screens {
+            for key in [Key::Ctrl('k'), Key::Ctrl('p')] {
+                let mut app = App::new("slate");
+                app.screen = make(&app);
+                app.on_key(key, &deps).await;
+                assert!(matches!(app.overlay, Some(Overlay::Palette { .. })), "{key:?} opens the palette on {name}");
+                // Ctrl-K closes it again, quietly.
+                app.on_key(Key::Ctrl('k'), &deps).await;
+                assert!(app.overlay.is_none(), "Ctrl-K closes the palette on {name}");
+                assert!(app.toast.is_none(), "closing the palette is not a cancelled action");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_palette_does_not_steal_ctrl_k_from_the_quick_filter() {
+        let deps = test_deps();
+        let mut app = App::new("slate");
+        app.screen = Screen::List;
+        app.filtering = true;
+        app.on_key(Key::Ctrl('k'), &deps).await;
+        assert!(app.overlay.is_none(), "the quick filter keeps its keys");
+    }
+
+    #[tokio::test]
+    async fn running_approve_from_the_palette_equals_pressing_a() {
+        let deps = test_deps();
+        let mut keyed = App::new("slate");
+        keyed.screen = open_pr_screen(PullRequestStatus::Open);
+        keyed.on_key(Key::Char('a'), &deps).await;
+
+        let mut palette = App::new("slate");
+        palette.screen = open_pr_screen(PullRequestStatus::Open);
+        palette.on_key(Key::Ctrl('k'), &deps).await;
+        type_keys(&mut palette, "approve", &deps).await;
+        let Some(Overlay::Palette { candidates, results, selected, .. }) = &palette.overlay else { panic!("palette open") };
+        let top = &candidates[results[*selected]];
+        assert_eq!((top.title.as_str(), &top.target), ("Approve", &PaletteTarget::Key(Key::Char('a'))), "the context action ranks first");
+        palette.on_key(Key::Enter, &deps).await;
+
+        match (&keyed.overlay, &palette.overlay) {
+            (
+                Some(Overlay::Confirm { title: t1, message: m1, action: Action::PrVote(ReviewVote::Approved) }),
+                Some(Overlay::Confirm { title: t2, message: m2, action: Action::PrVote(ReviewVote::Approved) }),
+            ) => assert_eq!((t1, m1), (t2, m2), "same confirm either way"),
+            _ => panic!("both paths should end on the approve confirm"),
+        }
+    }
+
+    #[test]
+    fn context_actions_follow_the_pr_views_own_conditions() {
+        let mut app = App::new("slate");
+        app.screen = open_pr_screen(PullRequestStatus::Open);
+        let keys: Vec<Key> = app.context_actions().into_iter().map(|(_, k)| k).collect();
+        for k in ['a', 'x', 'm', 'c', 'r', 'o'] {
+            assert!(keys.contains(&Key::Char(k)), "open PR offers {k}");
+        }
+        assert!(!keys.contains(&Key::Char('R')), "no revert on an open PR");
+        assert!(!keys.contains(&Key::Char('s')), "no submit without pending comments");
+        assert!(!keys.contains(&Key::Char('v')), "diff-only keys only on the Diff tab");
+
+        app.screen = open_pr_screen(PullRequestStatus::Merged);
+        let keys: Vec<Key> = app.context_actions().into_iter().map(|(_, k)| k).collect();
+        assert!(keys.contains(&Key::Char('R')));
+        assert!(!keys.contains(&Key::Char('a')) && !keys.contains(&Key::Char('m')), "a merged PR can't be approved or merged");
+    }
+
+    #[tokio::test]
+    async fn the_palette_sets_and_persists_a_theme() {
+        let deps = test_deps();
+        let mut app = App::new("slate");
+        palette_run(&mut app, "theme: matrix", &deps).await;
+        assert_eq!(app.theme.name, "matrix");
+        assert_eq!(deps.config.snapshot().ui.theme.as_deref(), Some("matrix"), "persisted like `t`");
+
+        palette_run(&mut app, ":theme light", &deps).await;
+        assert_eq!(app.theme.name, "light", "the :theme command does the same");
+    }
+
+    #[tokio::test]
+    async fn a_view_entry_switches_section_and_applies_the_view() {
+        let deps = test_deps();
+        let mut app = App::new("slate");
+        let view = |name: &str, query: &str| SavedView { name: name.into(), filter: None, query: query.into(), sort: None, hidden_states: vec![] };
+        app.views[1] = vec![view("Everything", ""), view("Blocked on review", "blocked")];
+        app.screen = Screen::Launchpad;
+        palette_run(&mut app, "blocked on review", &deps).await;
+        assert!(matches!(app.screen, Screen::List));
+        assert_eq!(app.active, 1);
+        assert_eq!(app.view_idx[1], 1);
+        assert_eq!(app.filters[1], "blocked", "the view's quick filter is applied");
+    }
+
+    #[tokio::test]
+    async fn a_person_entry_filters_the_section_they_appear_in() {
+        let deps = test_deps();
+        let mut app = App::new("slate");
+        let mut p = pr(None);
+        p.author = user("Ada Lovelace", "ada");
+        let mut w = wi(None);
+        w.assignee = Some(user("Grace Hopper", "grace"));
+        app.prs = vec![pr_row(p)];
+        app.wis = vec![wi_row(w)];
+
+        palette_run(&mut app, "@grace", &deps).await;
+        assert!(matches!(app.screen, Screen::List));
+        assert_eq!(app.active, 1, "an assignee with no PRs lands on Work Items");
+        assert_eq!(app.filters[1], "Grace Hopper");
+        assert_eq!(app.filtered_wi_indices(), vec![0], "the filter matches their items");
+
+        palette_run(&mut app, "@ada", &deps).await;
+        assert_eq!(app.active, 0, "a PR author lands on Pull Requests");
+        assert_eq!(app.filters[0], "Ada Lovelace");
+        assert_eq!(app.filtered_pr_indices(), vec![0]);
+    }
+
+    #[tokio::test]
+    async fn a_help_key_runs_when_the_screen_answers_it_and_explains_otherwise() {
+        let deps = test_deps();
+        let mut app = App::new("slate");
+        app.screen = Screen::List;
+        // `u` only works in a work-item view, so from a list the palette says where to press it.
+        palette_run(&mut app, "?update state", &deps).await;
+        assert!(app.overlay.is_none());
+        assert_eq!(app.toast.as_deref(), Some("Press u in Work Item view (after Enter)"));
+
+        app.screen = Screen::Launchpad;
+        palette_run(&mut app, "?choose which tabs", &deps).await;
+        assert!(app.toast.as_deref().is_some_and(|t| t.starts_with("Press v")), "v isn't a Launchpad key");
+        app.screen = Screen::List;
+        palette_run(&mut app, "?choose which tabs", &deps).await;
+        assert!(matches!(app.overlay, Some(Overlay::Toggle { kind: ToggleKind::Sections, .. })), "v runs on a list");
+    }
+
+    #[tokio::test]
+    async fn an_item_opened_from_the_inbox_palette_returns_to_the_inbox() {
+        let deps = test_deps();
+        let mut app = App::new("slate");
+        let mut p = pr(None);
+        p.title = "Rotate the signing keys".into();
+        app.prs.push(pr_row(p));
+        app.screen = Screen::Inbox;
+        app.preview_focus = true;
+        palette_run(&mut app, "#rotate", &deps).await;
+        assert!(matches!(app.screen, Screen::PrView(_)));
+        assert!(!app.preview_focus, "a palette-opened item is a full view, not the preview");
+        assert!(matches!(app.view_origin(), Screen::Inbox), "Esc goes back to where the palette was opened");
+    }
+
+    #[tokio::test]
+    async fn a_help_key_runs_only_on_the_screen_its_section_describes() {
+        let deps = test_deps();
+        let mut app = App::new("slate");
+        // Global `r` refreshes a list; in a PR view `r` replies. The Refresh row must not reply.
+        app.screen = open_pr_screen(PullRequestStatus::Open);
+        palette_run(&mut app, "?cycle theme", &deps).await;
+        assert!(app.overlay.is_none(), "Refresh from a PR view must not open the reply input");
+        assert!(app.toast.as_deref().is_some_and(|t| t.starts_with("Press r")));
+
+        // The palette's own row runs its first key, reopening the palette.
+        app.screen = Screen::List;
+        palette_run(&mut app, "?command palette", &deps).await;
+        assert!(matches!(app.overlay, Some(Overlay::Palette { .. })));
+    }
+
+    #[tokio::test]
+    async fn merge_command_preselects_the_strategy() {
+        let deps = test_deps();
+        let mut app = App::new("slate");
+        app.screen = open_pr_screen(PullRequestStatus::Open);
+        palette_run(&mut app, ":merge rebase", &deps).await;
+        match &app.overlay {
+            Some(Overlay::Picker { kind: PickerKind::PrMergeStrategy, selected, .. }) => assert_eq!(*selected, 2),
+            _ => panic!("expected the merge picker"),
+        }
+    }
+
+    #[tokio::test]
+    async fn go_to_help_opens_the_help_panel() {
+        let deps = test_deps();
+        let mut app = App::new("slate");
+        palette_run(&mut app, "help", &deps).await;
+        assert!(matches!(app.overlay, Some(Overlay::Help { .. })));
+    }
+
+    #[test]
+    fn help_lists_the_command_palette_on_ctrl_k() {
+        let sections = crate::ui::help_sections();
+        let global = &sections.iter().find(|(name, _)| *name == "Global").expect("global section").1;
+        let (keys, desc) = global.iter().find(|(k, _)| k.contains("Ctrl-K")).expect("Ctrl-K listed");
+        assert!(keys.contains("Ctrl-P"), "Ctrl-P stays listed as the alias");
+        assert!(desc.starts_with("Command palette"));
+    }
 }
