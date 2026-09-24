@@ -122,7 +122,6 @@ fn render_awaiting_setup(frame: &mut Frame, area: Rect, app: &App) {
 
 fn render_tabs(frame: &mut Frame, area: Rect, app: &App) {
     let theme = &app.theme;
-    // Refresh state now shows as an animated "Refreshing…" in the footer, not up here.
     let clock = app.last_refresh.format("%H:%M:%S");
     let right = format!("{} · {} ", theme.name, clock);
 
@@ -135,18 +134,7 @@ fn render_tabs(frame: &mut Frame, area: Rect, app: &App) {
         .title_top(Line::from(Span::styled(right, Style::default().fg(theme.dim))).right_aligned());
 
     let vis = app.visible_indices();
-    // Launchpad is tab 0; its badge is the count of items that actually need you.
-    // "Command Center" is the user-facing name for the launchpad (code keeps `launchpad`/`lp`).
-    let lp_count = app.lp.iter().filter(|e| !e.bucket.muted()).count();
-    let mut titles: Vec<Line> = vec![Line::from(format!(" Command Center ({lp_count}) "))];
-    titles.extend(vis.iter().map(|&i| {
-        let count = match i {
-            0 => app.prs.len(),
-            1 => app.wis.len(),
-            _ => app.pipes.len(),
-        };
-        Line::from(format!(" {} ({count}) ", TABS[i]))
-    }));
+    let titles: Vec<Line> = tab_titles(app).into_iter().map(Line::from).collect();
     let selected = if matches!(app.screen, Screen::Inbox) {
         titles.len() // Inbox isn't a section tab — highlight none of them
     } else if matches!(app.screen, Screen::Launchpad) {
@@ -171,7 +159,7 @@ fn render_tabs(frame: &mut Frame, area: Rect, app: &App) {
     // its screen is open, but *not* part of the Tab cycle. Dim grey at (0), bold yellow
     // when there's something, accent when active.
     let unread = app.unread_count();
-    let label = format!(" Notifications ({unread}) [i] ");
+    let label = notifications_label(app);
     let style = if matches!(app.screen, Screen::Inbox) {
         Style::default().fg(theme.bg).bg(theme.accent).add_modifier(Modifier::BOLD)
     } else if unread == 0 {
@@ -184,7 +172,74 @@ fn render_tabs(frame: &mut Frame, area: Rect, app: &App) {
     if inner_w > w + 1 {
         let rect = Rect { x: area.x + 1 + inner_w - w, y: area.y + 1, width: w, height: 1 };
         frame.render_widget(Paragraph::new(Line::from(Span::styled(label, style))), rect);
+
+        // "Refreshing…" rides immediately to the left of Notifications, so the fetch state
+        // sits with the rest of the top-right chrome. The Notifications label carries its
+        // own leading space, which is the gap between the two.
+        if let Some(text) = refreshing_in_tab_row(app, area.width) {
+            let rw = text.chars().count() as u16;
+            let rect = Rect { x: area.x + 1 + inner_w - w - rw, y: area.y + 1, width: rw, height: 1 };
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(text, Style::default().fg(theme.dim).bg(theme.bg)))),
+                rect,
+            );
+        }
     }
+}
+
+/// The tab strip's labels, in render order. Shared with the width arithmetic that decides
+/// whether the right-hand chrome fits beside them.
+fn tab_titles(app: &App) -> Vec<String> {
+    // Launchpad is tab 0; its badge is the count of items that actually need you.
+    // "Command Center" is the user-facing name for the launchpad (code keeps `launchpad`/`lp`).
+    let lp_count = app.lp.iter().filter(|e| !e.bucket.muted()).count();
+    let mut titles = vec![format!(" Command Center ({lp_count}) ")];
+    titles.extend(app.visible_indices().iter().map(|&i| {
+        let count = match i {
+            0 => app.prs.len(),
+            1 => app.wis.len(),
+            _ => app.pipes.len(),
+        };
+        format!(" {} ({count}) ", TABS[i])
+    }));
+    titles
+}
+
+fn notifications_label(app: &App) -> String {
+    format!(" Notifications ({}) [i] ", app.unread_count())
+}
+
+/// The animated "Refreshing…" text, or `None` when no refresh is in flight.
+fn refreshing_label(app: &App) -> Option<String> {
+    if !app.reloading {
+        return None;
+    }
+    // Dots appear one at a time; padded to a constant width so nothing jitters.
+    let n = (app.anim / 2) % 4;
+    // While a refresh runs over cache-seeded rows, say how old they are. Without this the
+    // list looks live when it is in fact the last run's data, and a user acts on a merged
+    // PR or a finished pipeline believing it current. `data_age` is cleared the moment
+    // live data lands, so this disappears on its own.
+    // `rel_age` says "now" under a minute, which reads wrong in a "… old" sentence, so the
+    // sub-minute case gets its own wording rather than "showing now old".
+    let age = match app.data_age.map(|ts| rel_age(Some(ts))) {
+        Some(age) if age == "now" => " · showing cached".to_string(),
+        Some(age) => format!(" · showing {age} old"),
+        None => String::new(),
+    };
+    Some(format!("Refreshing{}{}", ".".repeat(n), " ".repeat(3 - n)) + &age)
+}
+
+/// "Refreshing…" belongs beside Notifications in the tab row — but only when the row has
+/// room for it. In a narrow terminal it would overprint the tabs, so there it falls back
+/// to the footer instead; `render_footer` asks the same question.
+fn refreshing_in_tab_row(app: &App, width: u16) -> Option<String> {
+    let text = refreshing_label(app)?;
+    let titles = tab_titles(app);
+    let tabs_w: usize = titles.iter().map(|t| t.chars().count()).sum::<usize>()
+        + 2 * titles.len().saturating_sub(1); // the "  " divider between tabs
+    let needed = tabs_w + notifications_label(app).chars().count() + text.chars().count();
+    (usize::from(width.saturating_sub(2)) >= needed).then_some(text)
 }
 
 /// A horizontal strip of the active section's saved views, the current one lit.
@@ -1855,25 +1910,17 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         spans.push(Span::styled(format!(" {label}  "), bar.fg(theme.fg)));
     }
 
-    // Right side: a transient toast, an animated "Refreshing…" while a refresh is in
-    // flight, else the standing status line.
+    // Right side: a transient toast, else the standing status line. "Refreshing…" normally
+    // lives up in the tab row beside Notifications; it only lands here when that row is too
+    // narrow to hold it.
+    let narrow_refresh = match refreshing_in_tab_row(app, area.width) {
+        Some(_) => None,
+        None => refreshing_label(app),
+    };
     let (right, right_style) = if let Some(t) = &app.toast {
         (format!("{t} "), bar.fg(theme.yellow).add_modifier(Modifier::BOLD))
-    } else if app.reloading {
-        // Dots appear one at a time; padded to a constant width so nothing jitters.
-        let n = (app.anim / 2) % 4;
-        // While a refresh runs over cache-seeded rows, say how old they are. Without this the
-        // list looks live when it is in fact the last run's data, and a user acts on a merged
-        // PR or a finished pipeline believing it current. `data_age` is cleared the moment
-        // live data lands, so this disappears on its own.
-        // `rel_age` says "now" under a minute, which reads wrong in a "… old" sentence, so the
-        // sub-minute case gets its own wording rather than "showing now old".
-        let age = match app.data_age.map(|ts| rel_age(Some(ts))) {
-            Some(age) if age == "now" => " · showing cached".to_string(),
-            Some(age) => format!(" · showing {age} old"),
-            None => String::new(),
-        };
-        (format!("Refreshing{}{}{age} ", ".".repeat(n), " ".repeat(3 - n)), bar.fg(theme.dim))
+    } else if let Some(text) = narrow_refresh {
+        (format!("{text} "), bar.fg(theme.dim))
     } else {
         (format!("{} ", app.status), bar.fg(theme.dim))
     };
@@ -2941,6 +2988,14 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect()
+    }
+
+    /// The frame as rows, for assertions about *where* on screen something sits.
+    fn render_to_rows(app: &mut App, w: u16, h: u16) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal.draw(|f| render(f, app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        (0..h).map(|y| (0..w).map(|x| buf[(x, y)].symbol()).collect()).collect()
     }
 
     fn pr_view(tab: usize, checks: Vec<CheckRun>, files: Vec<FileChange>) -> crate::app::PrView {
@@ -4578,15 +4633,38 @@ mod tests {
         assert!(!out.contains("showing"), "no age once data_age is cleared");
     }
 
+    /// Its home is the tab row, immediately left of Notifications.
     #[test]
-    fn refreshing_shows_in_the_footer_not_the_header() {
+    fn refreshing_sits_next_to_notifications_in_the_tab_row() {
         let mut app = App::new("slate");
         app.status = "9 PRs · 10 work items · 8 runs".into();
         app.reloading = true;
-        let out = render_to_string(&mut app, 100, 24);
-        assert!(out.contains("Refreshing"), "a refresh shows 'Refreshing…' in the footer");
-        // The header keeps just the theme + clock — no refresh glyph up there.
-        assert!(!out.contains("⟳"), "no spinner in the top-right");
+        let rows = render_to_rows(&mut app, 160, 24);
+
+        let tab_row = &rows[1];
+        let r = tab_row.find("Refreshing").expect("'Refreshing…' is on the tab row");
+        let n = tab_row.find("Notifications").expect("Notifications is on the tab row");
+        assert!(r < n, "it sits to the left of Notifications: {tab_row}");
+        // The footer gives its right side back to the standing status line.
+        let footer = rows.last().expect("the footer");
+        assert!(footer.contains("9 PRs"), "the footer shows the status again: {footer}");
+        assert!(!footer.contains("Refreshing"), "not in the footer as well: {footer}");
+        // No refresh glyph anywhere — the animated word is the whole indicator.
+        assert!(!rows.concat().contains("⟳"), "no spinner");
+    }
+
+    /// A terminal too narrow for tabs + Notifications + the indicator keeps it in the
+    /// footer rather than overprinting the tabs.
+    #[test]
+    fn a_narrow_terminal_keeps_refreshing_in_the_footer() {
+        let mut app = App::new("slate");
+        app.reloading = true;
+        let rows = render_to_rows(&mut app, 100, 24);
+
+        let tab_row = &rows[1];
+        assert!(!tab_row.contains("Refreshing"), "no room up there: {tab_row}");
+        let footer = rows.last().expect("the footer");
+        assert!(footer.contains("Refreshing"), "so the footer carries it: {footer}");
     }
 
     #[test]
