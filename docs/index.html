@@ -411,7 +411,7 @@
 </ul>
 <p><strong>Inside the PR view</strong> (four sub-tabs, switch with <code>←</code>/<code>→</code>):</p>
 <ul>
-<li><strong>Conversation</strong> — description, reviewers, labels, and comment threads.
+<li><strong>Conversation</strong> — description, reviewers, labels, comment threads, and an <strong>Activity</strong> section under them (approvals, change requests, merges, state changes — from the provider's timeline; hidden when the provider reports none).
 </li>
 <li><strong>Commits</strong> — one row per commit; <code>Enter</code> drills into <em>that commit's</em> diff.
 </li>
@@ -480,11 +480,16 @@
 <ul>
 <li><code>u</code> — <strong>update state.</strong> The choices are pulled from the provider itself: Jira's workflow transitions, Linear's team states, Azure's work-item-type states, or open/closed for GitHub/GitLab issues. (Falls back to the states seen across the list if a provider can't report them.)
 </li>
+<li><code>@</code> — <strong>assign.</strong> A searchable list of the people the provider says can take it, with <em>Unassigned</em> first; type to narrow, <code>Enter</code> to assign. <code>@</code> again assigns you, where the connection knows who you are.
+</li>
+<li><code>e</code> — <strong>edit</strong> the title (in place, prefilled) or the description (opens <code>$VISUAL</code> / <code>$EDITOR</code>; saving it unchanged sends nothing).
+</li>
 <li><code>c</code> — comment (works on every work-item provider).
 </li>
 <li><code>o</code> — open in browser.
 </li>
 </ul>
+<p>Below the comments, an <strong>Activity</strong> section lists the item's history — who created it, state changes, assignments — from the provider's history API (Jira changelog, Linear issue history, Azure revisions, GitHub/GitLab issue events).</p>
 </div>
 </div>
 <div class="rail"></div>
@@ -523,6 +528,8 @@
 <li><code>L</code> — open a scrollable <strong>logs</strong> pane for the selected job (<code>Esc</code> closes).
 </li>
 <li><code>A</code> — approve / reject a waiting gate (see below).
+</li>
+<li><code>X</code> — cancel a queued or running run (asks first).
 </li>
 <li><code>o</code> — open the selected job in the browser.
 </li>
@@ -780,6 +787,8 @@
 <tr><td><code>Enter</code></td><td>Open the item</td></tr>
 <tr><td><code>f</code></td><td>Choose which states to show</td></tr>
 <tr><td><code>u</code> (in the item view)</td><td>Update state (choices pulled from the provider)</td></tr>
+<tr><td><code>@</code> (in the item view)</td><td>Assign (searchable; <code>@</code> again assigns you)</td></tr>
+<tr><td><code>e</code> (in the item view)</td><td>Edit the title, or the description in <code>$EDITOR</code></td></tr>
 <tr><td><code>c</code> (in the item view)</td><td>Comment</td></tr>
 </tbody></table></div>
 <h3 id="pipelines-1">Pipelines <a class="anchor" href="#pipelines-1" aria-label="Link to this section">#</a></h3>
@@ -792,6 +801,7 @@
 <tr><td><code>A</code> (in drill-in)</td><td>Approve / reject a waiting gate (GitHub, GitLab; Azure view-only)</td></tr>
 <tr><td><code>o</code></td><td>Open the selected job in the browser</td></tr>
 <tr><td><code>T</code></td><td>Trigger a run</td></tr>
+<tr><td><code>X</code> (in drill-in)</td><td>Cancel a queued or running run</td></tr>
 </tbody></table></div>
 <h3 id="connections-terminal-fallback">Connections (terminal fallback) <a class="anchor" href="#connections-terminal-fallback" aria-label="Link to this section">#</a></h3>
 <p>Connection management lives in the <a href="#web-dashboard">web dashboard</a> — <code>C</code> opens it and also shows a connections list in the terminal. That list still supports the original keys as a fallback:</p>

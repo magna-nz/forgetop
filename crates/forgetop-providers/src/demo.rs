@@ -520,6 +520,57 @@ struct WiOverride {
     assignee: Option<Option<User>>,
     title: Option<String>,
     description: Option<String>,
+    state: Option<String>,
+}
+
+/// Work-item writes made this run, keyed by item id, appended to the item's history so the
+/// activity timeline shows what you just did — like a real provider's history API would.
+fn wi_events() -> &'static Mutex<HashMap<String, Vec<TimelineEvent>>> {
+    static STORE: OnceLock<Mutex<HashMap<String, Vec<TimelineEvent>>>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The category a demo state name falls in — what a real provider's mapper decides — so a
+/// state change moves the item between buckets (a "Done" item leaves the open list).
+fn demo_state_category(state: &str) -> WorkItemStateCategory {
+    use WorkItemStateCategory as C;
+    match state.to_ascii_lowercase().as_str() {
+        "done" | "closed" | "resolved" => C::Completed,
+        "canceled" | "cancelled" | "won't do" => C::Canceled,
+        "backlog" => C::Backlog,
+        "todo" | "to do" | "new" => C::Unstarted,
+        "triage" => C::Triage,
+        _ => C::Started,
+    }
+}
+
+fn record_wi_event(id: &str, kind: TimelineEventKind, summary: String) {
+    let event = TimelineEvent { actor: Some(me()), kind, summary, at: Some(base()) };
+    wi_events().lock().unwrap().entry(id.to_string()).or_default().push(event);
+}
+
+/// A believable history for a demo work item, derived from the item itself so it agrees with
+/// the fields on screen: someone filed it, it moved to its current state if it has left the
+/// backlog, and it was assigned to whoever holds it. Oldest → newest, like every provider.
+fn wi_history(wi: &WorkItem) -> Vec<TimelineEvent> {
+    use TimelineEventKind as K;
+    let created = wi.created_at.unwrap_or_else(base);
+    let updated = wi.updated_at.unwrap_or_else(base).max(created);
+    let mid = created + (updated - created) / 2;
+    let mut events = vec![TimelineEvent { actor: Some(bob()), kind: K::Other, summary: "created this".into(), at: Some(created) }];
+    if !matches!(wi.state_category, WorkItemStateCategory::Triage | WorkItemStateCategory::Backlog | WorkItemStateCategory::Unstarted) {
+        let actor = wi.assignee.clone().unwrap_or_else(alice);
+        events.push(TimelineEvent { actor: Some(actor), kind: K::StateChanged, summary: format!("changed status to {}", wi.state), at: Some(mid) });
+    }
+    if let Some(a) = &wi.assignee {
+        events.push(TimelineEvent {
+            actor: Some(alice()),
+            kind: K::Assigned,
+            summary: format!("assigned this to {}", a.display_name),
+            at: Some(updated),
+        });
+    }
+    events
 }
 
 fn wi_overrides() -> &'static Mutex<HashMap<String, WiOverride>> {
@@ -543,6 +594,10 @@ fn apply_wi_override(mut wi: WorkItem) -> WorkItem {
         }
         if let Some(d) = &ov.description {
             wi.description = Some(d.clone());
+        }
+        if let Some(st) = &ov.state {
+            wi.state = st.clone();
+            wi.state_category = demo_state_category(st);
         }
     }
     wi
@@ -686,6 +741,12 @@ impl PullRequestSource for DemoPr {
         // Derive review events from the PR's actual reviewers, so the timeline matches the
         // Reviewers panel exactly (comment events are added from the threads by the server).
         if let Some(pr) = prs_for(&self.conn).into_iter().find(|p| p.id == id) {
+            events.push(TimelineEvent {
+                actor: Some(pr.author.clone()),
+                kind: K::Other,
+                summary: "opened this pull request".into(),
+                at: pr.created_at,
+            });
             for (i, r) in pr.reviewers.iter().enumerate() {
                 let at = Some(base() - chrono::Duration::hours(6 - i as i64));
                 match r.vote {
@@ -937,20 +998,18 @@ impl WorkItemSource for DemoWi {
         // Comments submitted this session persist and come back, like a real provider.
         Ok(submitted_threads().lock().unwrap().get(id).cloned().unwrap_or_default())
     }
-    async fn timeline(&self, _item: &ItemRef) -> Result<Vec<TimelineEvent>> {
-        use TimelineEventKind as K;
-        let ev = |actor: User, kind: K, summary: &str, hrs: i64| TimelineEvent {
-            actor: Some(actor),
-            kind,
-            summary: summary.into(),
-            at: Some(base() - chrono::Duration::hours(hrs)),
-        };
-        Ok(vec![
-            ev(bob(), K::Assigned, "assigned this to Priya Nair", 30),
-            ev(alice(), K::StateChanged, "moved this to In Progress", 26),
-        ])
+    async fn timeline(&self, item: &ItemRef) -> Result<Vec<TimelineEvent>> {
+        let id: &str = &item.id;
+        // The history of the item as first built (before this run's edits), then what was done
+        // to it this run — so an assignment made here reads as a new event, not a rewritten one.
+        let mut events = wis_for(&self.conn).iter().find(|w| w.id == id).map(wi_history).unwrap_or_default();
+        events.extend(wi_events().lock().unwrap().get(id).cloned().unwrap_or_default());
+        Ok(events)
     }
-    async fn set_state(&self, _item: &ItemRef, _state: &str) -> Result<()> {
+    async fn set_state(&self, item: &ItemRef, state: &str) -> Result<()> {
+        let id: &str = &item.id;
+        wi_overrides().lock().unwrap().entry(id.to_string()).or_default().state = Some(state.to_string());
+        record_wi_event(id, TimelineEventKind::StateChanged, format!("changed status to {state}"));
         Ok(())
     }
     async fn add_comment(&self, item: &ItemRef, body: &str) -> Result<()> {
@@ -976,7 +1035,12 @@ impl WorkItemSource for DemoWi {
     async fn set_assignee(&self, item: &ItemRef, assignee_id: Option<&str>) -> Result<()> {
         let id: &str = &item.id;
         let user = assignee_id.and_then(|aid| demo_assignable().into_iter().find(|u| u.id == aid));
+        let summary = match &user {
+            Some(u) => format!("assigned this to {}", u.display_name),
+            None => "unassigned this".into(),
+        };
         wi_overrides().lock().unwrap().entry(id.to_string()).or_default().assignee = Some(user);
+        record_wi_event(id, TimelineEventKind::Assigned, summary);
         Ok(())
     }
     async fn update_fields(&self, item: &ItemRef, title: Option<&str>, description: Option<&str>) -> Result<()> {
@@ -989,6 +1053,13 @@ impl WorkItemSource for DemoWi {
         if let Some(d) = description {
             ov.description = Some(d.to_string());
         }
+        drop(store);
+        let what = match (title.is_some(), description.is_some()) {
+            (true, true) => "edited the title and description",
+            (true, false) => "edited the title",
+            _ => "edited the description",
+        };
+        record_wi_event(id, TimelineEventKind::Other, what.into());
         Ok(())
     }
 }

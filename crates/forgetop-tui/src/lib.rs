@@ -12,6 +12,7 @@ pub mod ui;
 pub mod wizard;
 
 use std::io::{self, Stdout};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -30,6 +31,9 @@ const REFRESH_SECS: u64 = 30;
 const ANIM_MS: u64 = 150;
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
+
+/// Set while `$EDITOR` owns the terminal, so the input thread stops reading keys meant for it.
+static INPUT_PAUSED: AtomicBool = AtomicBool::new(false);
 
 /// Set up the terminal, run the loop against `deps`, and always restore the terminal.
 pub async fn run(deps: AppDeps, theme_name: &str, dashboard_url: Option<String>) -> Result<()> {
@@ -113,7 +117,14 @@ async fn event_loop(terminal: &mut Term, app: &mut App, deps: &AppDeps) -> Resul
 
         tokio::select! {
             key = rx.recv() => match key {
-                Some(key) => app.on_key(key, deps).await,
+                Some(key) => {
+                    app.on_key(key, deps).await;
+                    // A handler asked for `$EDITOR`: hand it the terminal, then the text back.
+                    if let Some(request) = app.editor_request.take() {
+                        let result = edit_in_editor(terminal, &request.initial).await;
+                        app.finish_editor(request, result, deps).await;
+                    }
+                }
                 None => break, // reader thread gone
             },
             _ = ticker.tick() => app.request_reload(deps),
@@ -141,6 +152,13 @@ async fn event_loop(terminal: &mut Term, app: &mut App, deps: &AppDeps) -> Resul
 /// Runs on a dedicated thread: blocks on crossterm, maps events to [`Key`], sends them on.
 fn input_reader(tx: mpsc::UnboundedSender<Key>) {
     loop {
+        if INPUT_PAUSED.load(Ordering::SeqCst) {
+            if tx.is_closed() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+            continue;
+        }
         // Poll so the thread can notice a closed channel even without input.
         match event::poll(Duration::from_millis(200)) {
             Ok(true) => {}
@@ -193,6 +211,56 @@ fn map_key(code: KeyCode, mods: KeyModifiers) -> Key {
         KeyCode::Char(c) => Key::Char(c),
         _ => Key::None,
     }
+}
+
+/// How long the input thread may still be inside one `event::poll` after being paused.
+const INPUT_POLL_MS: u64 = 200;
+
+/// Suspends the TUI, opens `initial` in the user's editor, and returns what they saved.
+///
+/// The input thread is paused first and given longer than one poll to notice, or it would read
+/// the keystrokes typed into the editor. The terminal is always put back, whatever the editor did.
+async fn edit_in_editor(terminal: &mut Term, initial: &str) -> std::result::Result<String, String> {
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    let path = std::env::temp_dir().join(format!("forgetop-edit-{}-{stamp}.md", std::process::id()));
+    // `create_new` refuses a path that already exists (a planted symlink included).
+    {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&path).map_err(|e| e.to_string())?;
+        file.write_all(initial.as_bytes()).map_err(|e| e.to_string())?;
+    }
+
+    INPUT_PAUSED.store(true, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(INPUT_POLL_MS + 50)).await;
+    let _ = restore_terminal(terminal);
+
+    let (program, args) = editor_command();
+    let file = path.clone();
+    let status = tokio::task::spawn_blocking(move || std::process::Command::new(&program).args(&args).arg(&file).status()).await;
+
+    let resumed = enable_raw_mode().and_then(|()| execute!(io::stdout(), EnterAlternateScreen)).and_then(|()| terminal.clear());
+    INPUT_PAUSED.store(false, Ordering::SeqCst);
+
+    let text = std::fs::read_to_string(&path);
+    let _ = std::fs::remove_file(&path);
+    resumed.map_err(|e| e.to_string())?;
+    match status {
+        Ok(Ok(s)) if s.success() => text.map_err(|e| e.to_string()),
+        Ok(Ok(s)) => Err(format!("the editor exited with {s}")),
+        Ok(Err(e)) => Err(format!("couldn't start the editor ({e}) — set $EDITOR")),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// `$VISUAL`, else `$EDITOR`, else the platform's stock editor. Split on whitespace so a value
+/// such as `code --wait` works.
+fn editor_command() -> (String, Vec<String>) {
+    let configured = ["VISUAL", "EDITOR"].iter().find_map(|v| std::env::var(v).ok().filter(|s| !s.trim().is_empty()));
+    let fallback = if cfg!(windows) { "notepad" } else { "vi" };
+    let line = configured.unwrap_or_else(|| fallback.to_string());
+    let mut parts = line.split_whitespace().map(str::to_string);
+    let program = parts.next().unwrap_or_else(|| fallback.to_string());
+    (program, parts.collect())
 }
 
 /// On panic, leave the alternate screen + raw mode so the message is readable (not a

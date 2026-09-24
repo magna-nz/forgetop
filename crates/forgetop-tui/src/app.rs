@@ -16,7 +16,7 @@ use ratatui::widgets::TableState;
 use tokio::sync::mpsc;
 
 use crate::launchpad;
-use crate::overlay::{Action, InputKind, Outcome, Overlay, PickerKind, ToggleItem, ToggleKind};
+use crate::overlay::{Action, InputKind, Outcome, Overlay, PickerKind, SearchItem, SearchKind, ToggleItem, ToggleKind, WiField};
 use crate::palette::{self, CommandContext, GoTo, PaletteItem, PaletteKind, PaletteTarget};
 use crate::theme::Theme;
 use crate::wizard::{provider_sections, section_label, Wizard, WizardOutcome};
@@ -40,9 +40,12 @@ const DIAG_PR_CHANGES: &str = "tui.pr.changes";
 const DIAG_PR_CHECKS: &str = "tui.pr.checks";
 const DIAG_PR_COMMITS: &str = "tui.pr.commits";
 const DIAG_PR_COMMIT_CHANGES: &str = "tui.pr.commit_changes";
+const DIAG_PR_TIMELINE: &str = "tui.pr.timeline";
 const DIAG_WI_FEEDS: &str = "tui.work_item.feeds";
 const DIAG_WI_THREADS: &str = "tui.work_item.threads";
 const DIAG_WI_STATES: &str = "tui.work_item.states";
+const DIAG_WI_TIMELINE: &str = "tui.work_item.timeline";
+const DIAG_WI_ASSIGNABLE: &str = "tui.work_item.assignable_users";
 const DIAG_PIPELINE_FEEDS: &str = "tui.pipeline.feeds";
 const DIAG_PIPELINE_DISCOVERY: &str = "tui.pipeline.discovery";
 const DIAG_PIPELINE_RUN: &str = "tui.pipeline.run";
@@ -573,6 +576,10 @@ pub struct PrDetail {
     pub files: Vec<FileChange>,
     pub checks: Vec<CheckRun>,
     pub commits: Vec<Commit>,
+    /// The activity timeline under the Conversation tab. Defaulted so an entry cached before
+    /// the timeline was fetched still reads back (as "none yet") instead of failing to decode.
+    #[serde(default)]
+    pub timeline: Vec<TimelineEvent>,
 }
 
 /// One detail fetch's outcome, before it is resolved against what is already known.
@@ -586,15 +593,17 @@ pub struct PrDetailFetch {
     pub files: Option<Vec<FileChange>>,
     pub checks: Option<Vec<CheckRun>>,
     pub commits: Option<Vec<Commit>>,
+    pub timeline: Option<Vec<TimelineEvent>>,
 }
 
-/// The detail fetched behind a work-item view (its comment thread), cached as one unit under
-/// [`wi_detail_cache_key`]. A one-field struct today, kept in this shape rather than flattened
-/// into [`WiView`] itself — deliberately, mirroring [`PrDetail`] — because it leaves room for
-/// more work-item detail calls to land here later without reshaping the cache/patch path.
+/// The detail fetched behind a work-item view (its comment thread and activity timeline),
+/// cached as one unit under [`wi_detail_cache_key`], mirroring [`PrDetail`].
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct WiDetail {
     pub threads: Vec<CommentThread>,
+    /// Defaulted so an entry cached before the timeline was fetched still decodes.
+    #[serde(default)]
+    pub timeline: Vec<TimelineEvent>,
 }
 
 /// `None` means that call failed; `Some(vec![])` means the provider really has none. See
@@ -602,6 +611,7 @@ pub struct WiDetail {
 #[derive(Default)]
 pub struct WiDetailFetch {
     pub threads: Option<Vec<CommentThread>>,
+    pub timeline: Option<Vec<TimelineEvent>>,
 }
 
 /// The detail fetched behind a pipeline drill-in, cached as one unit under
@@ -756,6 +766,10 @@ pub struct App {
     pr_scan_seeded: bool,
     /// Transient one-shot message shown in the footer until the next keypress.
     pub toast: Option<String>,
+    /// Text waiting to be edited in `$EDITOR`. The event loop owns the terminal, so a handler
+    /// can't suspend it itself: it leaves the request here, and the loop hands the terminal
+    /// over, then returns the result through [`App::finish_editor`].
+    pub editor_request: Option<EditorRequest>,
     /// Pending-approval gates offered by the current approval picker, indexed by
     /// the picker selection. Rebuilt each time the picker opens.
     approval_choices: Vec<ApprovalChoice>,
@@ -934,6 +948,8 @@ pub struct PrView {
     pub review_draft: Option<DraftComment>,
     /// Thread id a reply is being typed against (`r`); the input body is posted to it on submit.
     pub reply_target: Option<String>,
+    /// Reviews, merges, state changes, … shown as Activity under the Conversation tab.
+    pub timeline: Vec<TimelineEvent>,
 }
 
 /// The file line a pending comment is being written against.
@@ -956,11 +972,21 @@ impl PrView {
     }
 }
 
+/// A pending `$EDITOR` round trip (see [`App::editor_request`]).
+#[derive(Debug, Clone)]
+pub struct EditorRequest {
+    /// What the editor opens with.
+    pub initial: String,
+    pub field: WiField,
+}
+
 /// State for the full-screen work-item view.
 pub struct WiView {
     pub connection_id: String,
     pub wi: WorkItem,
     pub threads: Vec<CommentThread>,
+    /// State changes, assignments, … shown as the Activity section.
+    pub timeline: Vec<TimelineEvent>,
     pub scroll: u16,
 }
 
@@ -1829,6 +1855,7 @@ impl App {
             review_req_seen: HashSet::new(),
             pr_scan_seeded: false,
             toast: None,
+            editor_request: None,
             approval_choices: Vec::new(),
             overlay: None,
             wizard: None,
@@ -3167,7 +3194,12 @@ impl App {
             }
             // The WI arm of `on_key_inner` and `on_wi_view_key`.
             Screen::WiView(v) => {
-                out.extend([("Update state", c('u')), ("Comment", c('c'))]);
+                out.extend([
+                    ("Update state", c('u')),
+                    ("Assign…", c('@')),
+                    ("Edit title / description", c('e')),
+                    ("Comment", c('c')),
+                ]);
                 if v.wi.url.is_some() {
                     out.push(("Open in browser", c('o')));
                 }
@@ -3196,6 +3228,9 @@ impl App {
                             out.push(("View the job's logs", c('L')));
                         }
                         out.push(("Trigger a run", c('T')));
+                        if is_active(v.run.status) {
+                            out.push(("Cancel the run", c('X')));
+                        }
                         if v.can_respond_approvals && !v.actionable_approvals().is_empty() {
                             out.push(("Approve / reject a gate", c('A')));
                         }
@@ -3878,21 +3913,22 @@ impl App {
     /// open a different PR while this fetch was in flight, and a late answer landing on whatever
     /// happens to be on screen would show one PR's data under another's chrome.
     fn apply_pr_detail(&mut self, deps: &AppDeps, key: String, fetch: PrDetailFetch, fetched_at: DateTime<Utc>) {
-        let PrDetailFetch { threads, files, checks, commits } = fetch;
-        if threads.is_none() && files.is_none() && checks.is_none() && commits.is_none() {
+        let PrDetailFetch { threads, files, checks, commits, timeline } = fetch;
+        if threads.is_none() && files.is_none() && checks.is_none() && commits.is_none() && timeline.is_none() {
             // Nothing was learned, so there is nothing to write and nothing to repaint. Caching
             // four empty lists here is precisely how a total outage used to erase a good entry.
             return;
         }
         let known = match deps.cache.get::<PrDetail>(&key) {
             Some(entry) => entry.value,
-            None => PrDetail { threads: Vec::new(), files: Vec::new(), checks: Vec::new(), commits: Vec::new() },
+            None => PrDetail { threads: Vec::new(), files: Vec::new(), checks: Vec::new(), commits: Vec::new(), timeline: Vec::new() },
         };
         let detail = PrDetail {
             threads: threads.unwrap_or(known.threads),
             files: files.unwrap_or(known.files),
             checks: checks.unwrap_or(known.checks),
             commits: commits.unwrap_or(known.commits),
+            timeline: timeline.unwrap_or(known.timeline),
         };
         // A refusal means the store already holds a *newer* answer than this one: repainting
         // from this merge would leave the screen behind the cache — the out-of-order landing the
@@ -3908,7 +3944,8 @@ impl App {
         if pr_detail_unchanged(v, &detail) {
             return; // a revalidation that found nothing new must not cause a visible repaint
         }
-        let PrDetail { threads, files, checks, commits } = detail;
+        let PrDetail { threads, files, checks, commits, timeline } = detail;
+        v.timeline = timeline;
         v.checks = checks;
         v.commits = commits;
         if v.commit_sel >= v.commits.len() {
@@ -3997,16 +4034,16 @@ impl App {
     /// view in place — never rebuilding it, so `scroll` survives — only if it's still showing
     /// the same item. An all-failed fetch is a no-op.
     fn apply_wi_detail(&mut self, deps: &AppDeps, key: String, fetch: WiDetailFetch, fetched_at: DateTime<Utc>) {
-        let WiDetailFetch { threads } = fetch;
-        if threads.is_none() {
+        let WiDetailFetch { threads, timeline } = fetch;
+        if threads.is_none() && timeline.is_none() {
             // Nothing was learned, so there is nothing to write and nothing to repaint.
             return;
         }
         let known = match deps.cache.get::<WiDetail>(&key) {
             Some(entry) => entry.value,
-            None => WiDetail { threads: Vec::new() },
+            None => WiDetail { threads: Vec::new(), timeline: Vec::new() },
         };
-        let detail = WiDetail { threads: threads.unwrap_or(known.threads) };
+        let detail = WiDetail { threads: threads.unwrap_or(known.threads), timeline: timeline.unwrap_or(known.timeline) };
         if deps.cache.put(&key, &detail, fetched_at) == CachePut::Stale {
             // See `apply_pr_detail`: a newer entry already won, so the screen must not go back.
             return;
@@ -4019,6 +4056,7 @@ impl App {
             return; // a revalidation that found nothing new must not cause a visible repaint
         }
         v.threads = detail.threads;
+        v.timeline = detail.timeline;
     }
 
     /// Kicks off the background fetch for a just-opened work-item view's detail, without
@@ -4484,6 +4522,11 @@ impl App {
                     self.open_wi_state(deps).await;
                     return;
                 }
+                // `@` (assign) pulls the provider's assignable users — needs async too.
+                if key == Key::Char('@') {
+                    self.open_wi_assign(deps).await;
+                    return;
+                }
                 self.on_wi_view_key(key);
                 return;
             }
@@ -4578,9 +4621,9 @@ impl App {
         // on a connection spanning several, `#7` alone names more than one pull request.
         let item = pr.item_ref();
         let key = pr_detail_cache_key(&conn_id, &item);
-        let PrDetail { threads, mut files, checks, commits } = match deps.cache.get::<PrDetail>(&key) {
+        let PrDetail { threads, mut files, checks, commits, timeline } = match deps.cache.get::<PrDetail>(&key) {
             Some(entry) => entry.value,
-            None => PrDetail { threads: Vec::new(), files: Vec::new(), checks: Vec::new(), commits: Vec::new() },
+            None => PrDetail { threads: Vec::new(), files: Vec::new(), checks: Vec::new(), commits: Vec::new(), timeline: Vec::new() },
         };
         // Sort on the way out of the cache too, rather than trusting the order it was written
         // in: an entry from before this sort existed (or a future change that stops sorting
@@ -4613,6 +4656,7 @@ impl App {
             pending: Vec::new(),
             review_draft: None,
             reply_target: None,
+            timeline,
         }));
         (view, DetailRequest::Pr { conn_id, item, key })
     }
@@ -4818,11 +4862,11 @@ impl App {
     fn build_wi_view(deps: &AppDeps, conn_id: String, wi: WorkItem) -> (Screen, DetailRequest) {
         let item = wi.item_ref();
         let key = wi_detail_cache_key(&conn_id, &item);
-        let threads = match deps.cache.get::<WiDetail>(&key) {
-            Some(entry) => entry.value.threads,
-            None => Vec::new(),
+        let WiDetail { threads, timeline } = match deps.cache.get::<WiDetail>(&key) {
+            Some(entry) => entry.value,
+            None => WiDetail { threads: Vec::new(), timeline: Vec::new() },
         };
-        let view = Screen::WiView(Box::new(WiView { connection_id: conn_id.clone(), wi, threads, scroll: 0 }));
+        let view = Screen::WiView(Box::new(WiView { connection_id: conn_id.clone(), wi, threads, timeline, scroll: 0 }));
         (view, DetailRequest::Wi { conn_id, item, key })
     }
 
@@ -5173,6 +5217,10 @@ impl App {
             }
             Key::Char('c') => {
                 self.open_wi_comment();
+                return;
+            }
+            Key::Char('e') => {
+                self.open_wi_edit();
                 return;
             }
             _ => {}
@@ -5531,6 +5579,7 @@ impl App {
             Key::Escape | Key::Char('q') => self.screen = self.view_origin(),
             Key::Char('T') => self.open_pipeline_trigger(),
             Key::Char('A') => self.open_approval_picker(),
+            Key::Char('X') => self.open_pipeline_cancel(),
             Key::Char('o') => self.open_selected(),
             other => {
                 if let Screen::Pipeline(view) = &mut self.screen {
@@ -5753,6 +5802,55 @@ impl App {
             message,
             action: Action::PipelineTrigger { connection_id, repo, definition_id, branch, label },
         });
+    }
+
+    /// `X` in the drill-in: confirm, then cancel the open run. Only a queued or running run can
+    /// be cancelled; a finished one says so instead of asking.
+    fn open_pipeline_cancel(&mut self) {
+        let Screen::Pipeline(v) = &self.screen else { return };
+        if !is_active(v.run.status) {
+            self.toast = Some("Only a queued or running run can be cancelled".into());
+            return;
+        }
+        let label = run_label(&v.run);
+        self.overlay = Some(Overlay::Confirm {
+            title: "Cancel run".into(),
+            message: format!("Cancel {label}? Its running jobs stop."),
+            action: Action::PipelineCancel { connection_id: v.connection_id.clone(), run: v.run.item_ref(), label },
+        });
+    }
+
+    /// Cancels a run, then re-reads it. The run's status is left for the provider to report —
+    /// a cancel is a request that can take a while to land (or be refused), not a state the
+    /// client can assume — so the drill-in and the list are refetched rather than patched.
+    async fn cancel_pipeline(&mut self, connection_id: String, run: ItemRef, label: String, deps: &AppDeps) {
+        let feeds = match deps.sections.pipeline_feeds().await {
+            Ok(f) => f,
+            Err(e) => {
+                self.toast_error(format!("Cancel failed: {e}"));
+                return;
+            }
+        };
+        let Some(feed) = feeds.iter().find(|f| f.connection.connection_id() == connection_id) else {
+            self.toast = Some("Pipeline connection not found".into());
+            return;
+        };
+        match feed.source.cancel_run(&run).await {
+            Ok(()) => {
+                self.toast = Some(format!("Cancel requested for {label}"));
+                if matches!(&self.screen, Screen::Pipeline(v) if v.connection_id == connection_id && v.run.item_ref() == run) {
+                    let key = pipeline_detail_cache_key(&connection_id, &run);
+                    self.request_pipeline_detail(deps, connection_id, run, key);
+                }
+                let mut errors = Vec::new();
+                self.reload_pipelines(deps, &mut errors).await;
+                self.fix_selection();
+                if let Some(e) = errors.first() {
+                    self.toast = Some(e.clone());
+                }
+            }
+            Err(e) => self.toast_error(format!("Cancel failed: {e}")),
+        }
     }
 
     async fn execute_pipeline_action(&mut self, action: Action, deps: &AppDeps) {
@@ -6429,8 +6527,14 @@ impl App {
             Action::PrVote(_) | Action::PrMerge(_) | Action::PrRevert | Action::PrComment(_) | Action::PrReply(_) => {
                 self.execute_pr_action(action, deps).await
             }
-            Action::WiSetState(_) | Action::WiComment(_) => self.execute_wi_action(action, deps).await,
+            Action::WiSetState(_)
+            | Action::WiComment(_)
+            | Action::WiAssign { .. }
+            | Action::WiSetTitle(_)
+            | Action::WiSetDescription(_) => self.execute_wi_action(action, deps).await,
+            Action::WiEdit(field) => self.start_wi_edit(field),
             Action::PipelineTrigger { .. } => self.execute_pipeline_action(action, deps).await,
+            Action::PipelineCancel { connection_id, run, label } => self.cancel_pipeline(connection_id, run, label, deps).await,
             Action::RemoveConnection { .. } => self.execute_config_action(action, deps).await,
             Action::ApplyToggle { kind, ids } => self.apply_toggle(kind, ids, deps).await,
             Action::AddLineComment(body) => self.add_line_comment(body),
@@ -6521,12 +6625,16 @@ impl App {
                 if matches!(&self.screen, Screen::PrView(v) if v.pr.id == id) {
                     let fresh = detail_or_none(source.get(&item).await, DIAG_PR_DETAIL);
                     let threads = detail_or_default(source.threads(&item).await, DIAG_PR_THREADS);
+                    let timeline = detail_or_none(source.timeline(&item).await, DIAG_PR_TIMELINE);
                     if let Screen::PrView(v) = &mut self.screen {
                         if let Some(pr) = fresh {
                             v.pr = pr;
                         }
                         v.diff.threads = threads;
                         v.reply_target = None;
+                        if let Some(timeline) = timeline {
+                            v.timeline = timeline;
+                        }
                     }
                 }
                 let mut errors = Vec::new();
@@ -6620,6 +6728,95 @@ impl App {
         self.overlay = Some(Overlay::Input { title, buffer: String::new(), kind: InputKind::WorkItemComment });
     }
 
+    /// `@` in the work-item view: a searchable picker over the provider's assignable users,
+    /// with *Unassigned* first and the current assignee preselected. `@` again assigns you, when
+    /// this connection can say who you are.
+    async fn open_wi_assign(&mut self, deps: &AppDeps) {
+        let (item, conn_id, current, title) = match &self.screen {
+            Screen::WiView(v) => (
+                v.wi.item_ref(),
+                v.connection_id.clone(),
+                v.wi.assignee.clone(),
+                format!("Assign {}", wi_label(&v.wi)),
+            ),
+            _ => return,
+        };
+        let users = match self.wi_source_for(&conn_id, deps).await {
+            Some(src) => detail_or_default(src.assignable_users(&item).await, DIAG_WI_ASSIGNABLE),
+            None => Vec::new(),
+        };
+        if users.is_empty() {
+            self.toast = Some("This provider offers no one to assign — assign it in the browser (o)".into());
+            return;
+        }
+        let me = self.pr_pool.me.get(&conn_id).cloned().flatten();
+        self.overlay = Some(assignee_picker(title, &users, current.as_ref(), me.as_deref()));
+    }
+
+    /// `e` in the work-item view: which field to edit.
+    fn open_wi_edit(&mut self) {
+        let Screen::WiView(v) = &self.screen else { return };
+        self.overlay = Some(Overlay::Picker {
+            title: format!("Edit {}", wi_label(&v.wi)),
+            items: vec!["Title".into(), "Description (in $EDITOR)".into()],
+            selected: 0,
+            kind: PickerKind::WorkItemEdit,
+        });
+    }
+
+    /// The field picked from [`App::open_wi_edit`]: the title in the one-line input, prefilled;
+    /// the description handed to `$EDITOR` via [`App::editor_request`].
+    fn start_wi_edit(&mut self, field: WiField) {
+        let Screen::WiView(v) = &self.screen else { return };
+        match field {
+            WiField::Title => {
+                self.overlay = Some(Overlay::Input {
+                    title: format!("Title of {}", v.wi.identifier.clone().unwrap_or_else(|| "this item".into())),
+                    buffer: v.wi.title.clone(),
+                    kind: InputKind::WorkItemTitle,
+                });
+            }
+            WiField::Description => {
+                self.editor_request = Some(EditorRequest { initial: v.wi.description.clone().unwrap_or_default(), field });
+            }
+        }
+    }
+
+    /// Takes the text back from `$EDITOR` (see [`App::editor_request`]). Saving it unchanged,
+    /// or quitting without saving, sends nothing.
+    pub async fn finish_editor(&mut self, request: EditorRequest, result: std::result::Result<String, String>, deps: &AppDeps) {
+        let text = match result {
+            Ok(text) => text,
+            Err(e) => {
+                self.toast_error(format!("Editor failed: {e}"));
+                return;
+            }
+        };
+        let text = text.trim_end().to_string();
+        if text == request.initial.trim_end() {
+            self.toast = Some("Description unchanged — nothing sent".into());
+            return;
+        }
+        match request.field {
+            WiField::Description => self.execute_wi_action(Action::WiSetDescription(text), deps).await,
+            WiField::Title => self.execute_wi_action(Action::WiSetTitle(text), deps).await,
+        }
+    }
+
+    /// Reflects an accepted edit on the open work item and on the list row behind it, like
+    /// [`App::apply_wi_state`] does for a state change.
+    fn patch_wi(&mut self, conn_id: &str, item: &ItemRef, edit: impl Fn(&mut WorkItem)) {
+        if let Screen::WiView(v) = &mut self.screen {
+            if v.connection_id == conn_id && &v.wi.item_ref() == item {
+                edit(&mut v.wi);
+            }
+        }
+        for row in self.wis.iter_mut().filter(|r| r.connection_id == conn_id && &r.wi.item_ref() == item) {
+            edit(&mut row.wi);
+        }
+        self.rebuild_launchpad();
+    }
+
     async fn execute_wi_action(&mut self, action: Action, deps: &AppDeps) {
         let target = match &self.screen {
             Screen::WiView(v) => Some((v.wi.item_ref(), v.connection_id.clone())),
@@ -6646,19 +6843,56 @@ impl App {
                 }
                 source.add_comment(&item, text).await.map(|_| "Comment added".to_string())
             }
+            Action::WiAssign { id, label } => source.set_assignee(&item, id.as_deref()).await.map(|_| match id {
+                Some(_) => format!("Assigned to {label}"),
+                None => "Unassigned".to_string(),
+            }),
+            Action::WiSetTitle(title) => {
+                let title = title.trim();
+                if title.is_empty() {
+                    self.toast = Some("A title can't be empty — nothing sent".into());
+                    return;
+                }
+                source.update_fields(&item, Some(title), None).await.map(|_| "Title updated".to_string())
+            }
+            Action::WiSetDescription(text) => {
+                source.update_fields(&item, None, Some(text)).await.map(|_| "Description updated".to_string())
+            }
             _ => return,
         };
 
         match result {
             Ok(msg) => {
                 self.toast = Some(msg);
-                if let Action::WiSetState(state) = &action {
-                    self.apply_wi_state(&conn_id, &item, state);
+                match &action {
+                    Action::WiSetState(state) => self.apply_wi_state(&conn_id, &item, state),
+                    Action::WiAssign { id, label } => {
+                        let assignee = id.as_ref().map(|id| User {
+                            id: id.clone(),
+                            display_name: label.clone(),
+                            handle: None,
+                            avatar_url: None,
+                        });
+                        self.patch_wi(&conn_id, &item, |wi| wi.assignee = assignee.clone());
+                    }
+                    Action::WiSetTitle(title) => {
+                        let title = title.trim().to_string();
+                        self.patch_wi(&conn_id, &item, |wi| wi.title = title.clone());
+                    }
+                    Action::WiSetDescription(text) => self.patch_wi(&conn_id, &item, |wi| wi.description = Some(text.clone())),
+                    _ => {}
                 }
                 if matches!(action, Action::WiComment(_)) {
                     let threads = detail_or_default(source.threads(&item).await, DIAG_WI_THREADS);
                     if let Screen::WiView(v) = &mut self.screen {
                         v.threads = threads;
+                    }
+                }
+                // Every write lands in the item's history, so the Activity section is re-read too.
+                // A failed read keeps what is on screen rather than blanking it.
+                if let Some(timeline) = detail_or_none(source.timeline(&item).await, DIAG_WI_TIMELINE) {
+                    if let Screen::WiView(v) = &mut self.screen {
+                        v.timeline = timeline;
                     }
                 }
                 let mut errors = Vec::new();
@@ -6671,6 +6905,20 @@ impl App {
             Err(e) => self.toast_error(format!("Failed: {e}")),
         }
     }
+}
+
+/// The assignee picker: *Unassigned* first, then the provider's users; the current assignee is
+/// preselected — matched by id, handle or name, because a provider's item mapper and its
+/// assignable-users mapper needn't use the same id (GitHub: numeric id vs login) — and `me` (the signed-in user's handle on this connection, when known) is found
+/// among them so `@` can assign you.
+fn assignee_picker(title: String, users: &[User], current: Option<&User>, me: Option<&str>) -> Overlay {
+    let mut items = vec![SearchItem { id: None, label: "Unassigned".into() }];
+    items.extend(users.iter().map(|u| SearchItem { id: Some(u.id.clone()), label: u.display_name.clone() }));
+    let is = forgetop_core::filter::is_user;
+    let same = |u: &User, c: &User| u.id == c.id || c.handle.as_deref().is_some_and(|h| is(u, h)) || is(u, &c.display_name);
+    let selected = current.and_then(|c| users.iter().position(|u| same(u, c))).map_or(0, |i| i + 1);
+    let me = me.and_then(|me| users.iter().position(|u| forgetop_core::filter::is_user(u, me))).map(|i| i + 1);
+    Overlay::Search { title, query: String::new(), items, selected, kind: SearchKind::Assignee { me } }
 }
 
 fn wi_label(wi: &WorkItem) -> String {
@@ -6789,6 +7037,19 @@ fn pipe_label(pipe: &PipeRow) -> String {
     match pipe.run.number {
         Some(n) => format!("{name} #{n}"),
         None => name,
+    }
+}
+
+/// A run as one short name for a message: its name and number, without saying the number twice
+/// when the name already is the number (`#9902`, not `#9902 #9902`).
+fn run_label(run: &PipelineRun) -> String {
+    let number = run.number.map(|n| format!("#{n}"));
+    match (run.name.as_deref().filter(|n| !n.trim().is_empty()), number) {
+        (Some(name), Some(num)) if name.contains(&num) => name.to_string(),
+        (Some(name), Some(num)) => format!("{name} {num}"),
+        (Some(name), None) => name.to_string(),
+        (None, Some(num)) => num,
+        (None, None) => format!("run {}", run.id),
     }
 }
 
@@ -7263,7 +7524,8 @@ async fn fetch_pr_detail(deps: &AppDeps, conn_id: &str, item: &ItemRef) -> PrDet
     });
     let checks = detail_or_none(source.checks(item).await, DIAG_PR_CHECKS);
     let commits = detail_or_none(source.commits(item).await, DIAG_PR_COMMITS);
-    PrDetailFetch { threads, files, checks, commits }
+    let timeline = detail_or_none(source.timeline(item).await, DIAG_PR_TIMELINE);
+    PrDetailFetch { threads, files, checks, commits, timeline }
 }
 
 /// Fetches the detail behind a work-item view, off the render loop. Mirrors [`fetch_pr_detail`].
@@ -7275,7 +7537,8 @@ async fn fetch_wi_detail(deps: &AppDeps, conn_id: &str, item: &ItemRef) -> WiDet
         return WiDetailFetch::default();
     };
     let threads = detail_or_none(feed.source.threads(item).await, DIAG_WI_THREADS);
-    WiDetailFetch { threads }
+    let timeline = detail_or_none(feed.source.timeline(item).await, DIAG_WI_TIMELINE);
+    WiDetailFetch { threads, timeline }
 }
 
 /// Fetches the run + capabilities + approvals behind a pipeline drill-in, off the render loop.
@@ -7321,6 +7584,7 @@ fn pr_detail_unchanged(v: &PrView, d: &PrDetail) -> bool {
         && files_match(&v.pr_files, &d.files)
         && checks_match(&v.checks, &d.checks)
         && commits_match(&v.commits, &d.commits)
+        && timeline_match(&v.timeline, &d.timeline)
 }
 
 fn threads_match(a: &[CommentThread], b: &[CommentThread]) -> bool {
@@ -7345,11 +7609,13 @@ fn commits_match(a: &[Commit], b: &[Commit]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.sha == y.sha)
 }
 
-/// Mirrors [`pr_detail_unchanged`]. `WiDetail` has only the one field, so this is just
-/// `threads_match` — kept as its own named function so a second detail call landing here later
-/// (see [`WiDetail`]) has an obvious place to fold in.
+fn timeline_match(a: &[TimelineEvent], b: &[TimelineEvent]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.summary == y.summary && x.at == y.at)
+}
+
+/// Mirrors [`pr_detail_unchanged`].
 fn wi_detail_unchanged(v: &WiView, d: &WiDetail) -> bool {
-    threads_match(&v.threads, &d.threads)
+    threads_match(&v.threads, &d.threads) && timeline_match(&v.timeline, &d.timeline)
 }
 
 /// The parts of a [`PipelineRun`] a revalidation is most likely to have actually moved: the
@@ -8095,6 +8361,7 @@ mod tests {
         let item = wi(None);
         app.wis = vec![wi_row(wi(None)), wi_row(WorkItem { id: "other".into(), ..wi(None) })];
         app.screen = Screen::WiView(Box::new(WiView {
+            timeline: Vec::new(),
             connection_id: "c".into(),
             wi: item.clone(),
             threads: Vec::new(),
@@ -9152,7 +9419,7 @@ mod tests {
     #[test]
     fn escape_returns_to_the_launchpad_when_opened_from_it() {
         let mut app = App::new("slate");
-        let view = || Screen::WiView(Box::new(WiView { connection_id: "c".into(), wi: wi(None), threads: vec![], scroll: 0 }));
+        let view = || Screen::WiView(Box::new(WiView { connection_id: "c".into(), wi: wi(None), threads: vec![], scroll: 0, timeline: Vec::new() }));
 
         // Opened from the Launchpad → Esc goes back to the Launchpad (row still selected).
         app.lp_origin = true;
@@ -9918,6 +10185,7 @@ mod tests {
         d.cursor = 2;
         d.commit_label = Some("abc1234 msg".into());
         let mut v = PrView {
+            timeline: Vec::new(),
             label: "PR".into(),
             connection_id: "c".into(),
             url: None,
@@ -9958,6 +10226,7 @@ mod tests {
     /// A detail fetch in which all four calls answered — what the provider returns on a good day.
     fn all_answered(d: PrDetail) -> Box<PrDetailFetch> {
         Box::new(PrDetailFetch {
+            timeline: None,
             threads: Some(d.threads),
             files: Some(d.files),
             checks: Some(d.checks),
@@ -9970,6 +10239,7 @@ mod tests {
         let deps = deps_with_cache(memory_cache());
         let mut app = App::new("slate");
         app.screen = Screen::PrView(Box::new(PrView {
+            timeline: Vec::new(),
             label: "PR".into(),
             connection_id: "c".into(),
             url: None,
@@ -9989,6 +10259,7 @@ mod tests {
         // A detail landing for a different PR (id "2") on the same connection.
         let other_key = pr_detail_cache_key("c", &ItemRef::new("2"));
         let detail = PrDetail {
+            timeline: Vec::new(),
             threads: vec![],
             files: vec![changed("x.rs", None)],
             checks: vec![CheckRun { name: "ci".into(), status: CheckStatus::Failed, url: None }],
@@ -10017,6 +10288,7 @@ mod tests {
         d.cursor = 1;
         d.focus = DiffFocus::Patch;
         app.screen = Screen::PrView(Box::new(PrView {
+            timeline: Vec::new(),
             label: "PR".into(),
             connection_id: "c".into(),
             url: None,
@@ -10034,6 +10306,7 @@ mod tests {
         }));
 
         let fresh = PrDetail {
+            timeline: Vec::new(),
             threads: vec![],
             files: vec![changed("a.rs", Some("@@ -1 +1 @@\n-x\n+y")), changed("b.rs", None)],
             checks: vec![CheckRun { name: "ci".into(), status: CheckStatus::Passed, url: None }],
@@ -10064,6 +10337,7 @@ mod tests {
         let mut d = diff(vec![changed("a.rs", None), changed("b.rs", None), changed("c.rs", None)]);
         d.selected = 2;
         app.screen = Screen::PrView(Box::new(PrView {
+            timeline: Vec::new(),
             label: "PR".into(),
             connection_id: "c".into(),
             url: None,
@@ -10081,6 +10355,7 @@ mod tests {
         }));
 
         let fresh = PrDetail {
+            timeline: Vec::new(),
             threads: vec![],
             files: vec![changed("a.rs", None)], // shrank from 3 to 1
             checks: vec![],
@@ -10106,6 +10381,7 @@ mod tests {
         let mut dv = diff(d.files.clone());
         dv.threads = d.threads.clone();
         Screen::PrView(Box::new(PrView {
+            timeline: Vec::new(),
             label: "PR".into(),
             connection_id: "c".into(),
             url: None,
@@ -10126,6 +10402,7 @@ mod tests {
     /// A detail as it was last known: two files, a thread, a check and a commit.
     fn known_detail() -> PrDetail {
         PrDetail {
+            timeline: Vec::new(),
             threads: vec![thread("t1")],
             files: vec![changed("a.rs", None), changed("b.rs", None)],
             checks: vec![check("ci", CheckStatus::Passed)],
@@ -10153,6 +10430,7 @@ mod tests {
             AppEvent::PrDetailLoaded {
                 key: key.clone(),
                 detail: Box::new(PrDetailFetch {
+                    timeline: None,
                     threads: None,
                     files: None,
                     checks: Some(vec![check("ci", CheckStatus::Failed)]),
@@ -10347,6 +10625,7 @@ mod tests {
         let deps = deps_with_cache(memory_cache());
         let mut app = App::new("slate");
         app.screen = Screen::WiView(Box::new(WiView {
+            timeline: Vec::new(),
             connection_id: "c".into(),
             wi: wi(None), // id "w"
             threads: vec![],
@@ -10357,7 +10636,7 @@ mod tests {
         app.on_event(
             AppEvent::WiDetailLoaded {
                 key: other_key.clone(),
-                detail: Box::new(WiDetailFetch { threads: Some(vec![thread("t1")]) }),
+                detail: Box::new(WiDetailFetch { threads: Some(vec![thread("t1")]), timeline: None }),
                 fetched_at: Utc::now(),
             },
             &deps,
@@ -10376,11 +10655,11 @@ mod tests {
         let w = wi(None);
         let key = wi_detail_cache_key("c", &w.item_ref());
         let seeded = Utc::now() - chrono::TimeDelta::seconds(30);
-        cache.put(&key, &WiDetail { threads: vec![thread("t1")] }, seeded);
+        cache.put(&key, &WiDetail { threads: vec![thread("t1")], timeline: Vec::new() }, seeded);
 
         let mut app = App::new("slate");
         app.screen =
-            Screen::WiView(Box::new(WiView { connection_id: "c".into(), wi: w, threads: vec![thread("t1")], scroll: 5 }));
+            Screen::WiView(Box::new(WiView { connection_id: "c".into(), wi: w, threads: vec![thread("t1")], scroll: 5, timeline: Vec::new() }));
 
         app.on_event(
             AppEvent::WiDetailLoaded { key: key.clone(), detail: Box::new(WiDetailFetch::default()), fetched_at: Utc::now() },
@@ -10401,12 +10680,12 @@ mod tests {
         let mut app = App::new("slate");
         let w = wi(None);
         let key = wi_detail_cache_key("c", &w.item_ref());
-        app.screen = Screen::WiView(Box::new(WiView { connection_id: "c".into(), wi: w, threads: vec![], scroll: 9 }));
+        app.screen = Screen::WiView(Box::new(WiView { connection_id: "c".into(), wi: w, threads: vec![], scroll: 9, timeline: Vec::new() }));
 
         app.on_event(
             AppEvent::WiDetailLoaded {
                 key,
-                detail: Box::new(WiDetailFetch { threads: Some(vec![thread("t1"), thread("t2")]) }),
+                detail: Box::new(WiDetailFetch { threads: Some(vec![thread("t1"), thread("t2")]), timeline: None }),
                 fetched_at: Utc::now(),
             },
             &deps,
@@ -10867,6 +11146,7 @@ mod tests {
             let mut p = pr(None);
             p.status = status;
             Screen::PrView(Box::new(PrView {
+                timeline: Vec::new(),
                 label: "PR".into(),
                 connection_id: "c".into(),
                 url: None,
@@ -10922,6 +11202,7 @@ mod tests {
     fn add_line_comment_buffers_against_draft() {
         let mut app = App::new("slate");
         app.screen = Screen::PrView(Box::new(PrView {
+            timeline: Vec::new(),
             label: "PR".into(),
             connection_id: "c".into(),
             url: None,
@@ -10961,6 +11242,7 @@ mod tests {
         let mut p = pr(None);
         p.title = "Wire up retries".into();
         app.screen = Screen::PrView(Box::new(PrView {
+            timeline: Vec::new(),
             label: "PR".into(),
             connection_id: "c".into(),
             url: None,
@@ -10989,6 +11271,7 @@ mod tests {
 
     fn pr_view_with_pending(pending: Vec<LineComment>) -> Screen {
         Screen::PrView(Box::new(PrView {
+            timeline: Vec::new(),
             label: "PR".into(),
             connection_id: "c".into(),
             url: None,
@@ -11073,6 +11356,7 @@ mod tests {
 
         // An open sub-view takes precedence over the active tab.
         app.screen = Screen::PrView(Box::new(PrView {
+            timeline: Vec::new(),
             label: "x".into(),
             connection_id: "c".into(),
             url: Some("http://prview".into()),
@@ -11158,7 +11442,7 @@ mod tests {
             assert!(matches!(app.screen, Screen::Launchpad));
 
             let mut app = App::new("slate");
-            app.screen = Screen::WiView(Box::new(WiView { connection_id: "c".into(), wi: wi(None), threads: vec![], scroll: 0 }));
+            app.screen = Screen::WiView(Box::new(WiView { connection_id: "c".into(), wi: wi(None), threads: vec![], scroll: 0, timeline: Vec::new() }));
             app.on_key(key, &deps).await;
             assert!(!app.should_quit, "{key:?} doesn't quit from a work item view");
             assert!(matches!(app.screen, Screen::List));
@@ -11222,7 +11506,7 @@ mod tests {
         assert_eq!(app.active, index_of(Section::WorkItems), "the tab after Pull Requests");
 
         let mut app = App::new("slate");
-        app.screen = Screen::WiView(Box::new(WiView { connection_id: "c".into(), wi: wi(None), threads: vec![], scroll: 0 }));
+        app.screen = Screen::WiView(Box::new(WiView { connection_id: "c".into(), wi: wi(None), threads: vec![], scroll: 0, timeline: Vec::new() }));
         app.on_key(Key::Tab, &deps).await;
         assert!(matches!(app.screen, Screen::List));
         assert_eq!(app.active, index_of(Section::Pipelines), "the tab after Work Items");
@@ -11910,7 +12194,7 @@ mod tests {
         app.settle_preview(&deps);
         let key = app.preview.as_ref().unwrap().key.clone();
         let check = CheckRun { name: "build".into(), status: CheckStatus::Passed, url: None };
-        let detail = PrDetail { threads: vec![], files: vec![], checks: vec![check], commits: vec![] };
+        let detail = PrDetail { threads: vec![], files: vec![], checks: vec![check], commits: vec![], timeline: Vec::new() };
         app.on_event(AppEvent::PrDetailLoaded { key, detail: all_answered(detail), fetched_at: Utc::now() }, &deps);
         match app.preview.as_ref().map(|p| &p.view) {
             Some(Screen::PrView(v)) => assert_eq!(v.checks.len(), 1, "the answer landed in the preview"),
@@ -12279,7 +12563,7 @@ mod tests {
             ("Launchpad", Box::new(|_| Screen::Launchpad)),
             ("List", Box::new(|_| Screen::List)),
             ("PrView", Box::new(|_| open_pr_screen(PullRequestStatus::Open))),
-            ("WiView", Box::new(|_| Screen::WiView(Box::new(WiView { connection_id: "c".into(), wi: wi(None), threads: vec![], scroll: 0 })))),
+            ("WiView", Box::new(|_| Screen::WiView(Box::new(WiView { connection_id: "c".into(), wi: wi(None), threads: vec![], scroll: 0, timeline: Vec::new() })))),
             (
                 "Pipeline",
                 Box::new(|_| {
@@ -12481,5 +12765,140 @@ mod tests {
         let (keys, desc) = global.iter().find(|(k, _)| k.contains("Ctrl-K")).expect("Ctrl-K listed");
         assert!(keys.contains("Ctrl-P"), "Ctrl-P stays listed as the alias");
         assert!(desc.starts_with("Command palette"));
+    }
+
+    fn wi_view_of(w: WorkItem) -> Screen {
+        Screen::WiView(Box::new(WiView { connection_id: "c".into(), wi: w, threads: vec![], timeline: vec![], scroll: 0 }))
+    }
+
+    fn person(id: &str, name: &str, handle: &str) -> User {
+        User { id: id.into(), display_name: name.into(), handle: Some(handle.into()), avatar_url: None }
+    }
+
+    #[test]
+    fn the_assignee_picker_leads_with_unassigned_and_preselects_the_current_assignee() {
+        let users = vec![person("u1", "Priya Nair", "priya"), person("me", "Sam Rivera", "sam")];
+        // The item's assignee carries a different id than the picker's row (GitHub: numeric id
+        // on the item, login in assignable_users) — it is still found, by handle.
+        let current = User { id: "4242".into(), ..person("x", "sam", "sam") };
+        let Overlay::Search { items, selected, kind: SearchKind::Assignee { me }, .. } =
+            assignee_picker("Assign".into(), &users, Some(&current), Some("SAM"))
+        else {
+            panic!("expected the search picker")
+        };
+        assert_eq!(items[0].label, "Unassigned");
+        assert_eq!(items[0].id, None, "the first row clears the assignee");
+        assert_eq!(items[selected].label, "Sam Rivera", "the current assignee is highlighted");
+        assert_eq!(me, Some(2), "the signed-in user is found by handle, case-insensitively");
+        let Overlay::Search { selected, kind: SearchKind::Assignee { me }, .. } = assignee_picker("Assign".into(), &users, None, None)
+        else {
+            panic!("expected the search picker")
+        };
+        assert_eq!(selected, 0, "an unassigned item starts on Unassigned");
+        assert_eq!(me, None, "no identity, no @ shortcut");
+    }
+
+    #[test]
+    fn an_accepted_edit_lands_on_the_open_view_and_the_row_behind_it() {
+        let mut app = App::new("slate");
+        let item = wi(None);
+        app.wis = vec![wi_row(wi(None)), wi_row(WorkItem { id: "other".into(), ..wi(None) })];
+        app.screen = wi_view_of(item.clone());
+        let priya = person("u1", "Priya Nair", "priya");
+        app.patch_wi("c", &item.item_ref(), |w| {
+            w.assignee = Some(priya.clone());
+            w.title = "Renamed".into();
+        });
+        let Screen::WiView(v) = &app.screen else { panic!("expected WiView") };
+        assert_eq!(v.wi.assignee.as_ref().map(|a| a.display_name.as_str()), Some("Priya Nair"));
+        assert_eq!(v.wi.title, "Renamed");
+        assert_eq!(app.wis[0].wi.title, "Renamed", "the list row moves with the view");
+        assert_eq!(app.wis[1].wi.title, "t", "another item is untouched");
+    }
+
+    #[tokio::test]
+    async fn e_edits_the_title_in_a_prefilled_input_and_the_description_in_the_editor() {
+        let deps = test_deps();
+        let mut app = App::new("slate");
+        app.screen = wi_view_of(WorkItem { title: "Old title".into(), description: Some("Body".into()), ..wi(None) });
+
+        app.on_key(Key::Char('e'), &deps).await;
+        assert!(matches!(app.overlay, Some(Overlay::Picker { kind: PickerKind::WorkItemEdit, .. })), "e asks which field");
+        app.on_key(Key::Enter, &deps).await; // Title is first
+        match &app.overlay {
+            Some(Overlay::Input { buffer, kind: InputKind::WorkItemTitle, .. }) => assert_eq!(buffer, "Old title"),
+            _ => panic!("the title opens prefilled"),
+        }
+
+        app.overlay = None;
+        app.on_key(Key::Char('e'), &deps).await;
+        app.on_key(Key::Down, &deps).await;
+        app.on_key(Key::Enter, &deps).await;
+        assert!(app.overlay.is_none(), "the description goes to $EDITOR, not an overlay");
+        let request = app.editor_request.take().expect("an editor round trip is requested");
+        assert_eq!(request.initial, "Body");
+        assert_eq!(request.field, WiField::Description);
+
+        // Saving it unchanged (an editor's trailing newline aside) sends nothing.
+        app.finish_editor(request, Ok("Body\n".into()), &deps).await;
+        assert_eq!(app.toast.as_deref(), Some("Description unchanged — nothing sent"));
+    }
+
+    #[tokio::test]
+    async fn x_cancels_only_a_run_that_is_still_going_and_asks_first() {
+        let deps = test_deps();
+        let mut app = App::new("slate");
+        let open = |status| {
+            Screen::Pipeline(Box::new(PipelineView::new(
+                "CI #1".into(),
+                pipeline_run("r1", status, vec![]),
+                "c".into(),
+                ProviderType::GitHub,
+                "ci".into(),
+                None,
+            )))
+        };
+        app.screen = open(PipelineRunStatus::Succeeded);
+        app.on_key(Key::Char('X'), &deps).await;
+        assert!(app.overlay.is_none(), "a finished run has nothing to cancel");
+        assert_eq!(app.toast.as_deref(), Some("Only a queued or running run can be cancelled"));
+
+        app.screen = open(PipelineRunStatus::Running);
+        app.on_key(Key::Char('X'), &deps).await;
+        match &app.overlay {
+            Some(Overlay::Confirm { message, action: Action::PipelineCancel { connection_id, run, .. }, .. }) => {
+                assert_eq!(connection_id, "c");
+                assert_eq!(run.id, "r1");
+                assert_eq!(message, "Cancel CI #1? Its running jobs stop.");
+            }
+            _ => panic!("a running run asks before cancelling"),
+        }
+    }
+
+    #[test]
+    fn a_work_item_detail_fetch_carries_the_timeline_and_old_cache_entries_still_decode() {
+        let cache = memory_cache();
+        let deps = deps_with_cache(cache.clone());
+        let mut app = App::new("slate");
+        let w = wi(None);
+        let key = wi_detail_cache_key("c", &w.item_ref());
+        app.screen = wi_view_of(w);
+        let ev = TimelineEvent { actor: None, kind: TimelineEventKind::StateChanged, summary: "changed status to Done".into(), at: None };
+        app.on_event(
+            AppEvent::WiDetailLoaded {
+                key: key.clone(),
+                detail: Box::new(WiDetailFetch { threads: None, timeline: Some(vec![ev]) }),
+                fetched_at: Utc::now(),
+            },
+            &deps,
+        );
+        let Screen::WiView(v) = &app.screen else { panic!("expected WiView") };
+        assert_eq!(v.timeline.len(), 1, "a timeline alone is worth repainting for");
+
+        // An entry written before the timeline existed has no `timeline` key at all.
+        let old: WiDetail = serde_json::from_str(r#"{"threads":[]}"#).expect("an old entry still decodes");
+        assert!(old.timeline.is_empty());
+        let old: PrDetail = serde_json::from_str(r#"{"threads":[],"files":[],"checks":[],"commits":[]}"#).expect("an old PR entry decodes");
+        assert!(old.timeline.is_empty());
     }
 }
