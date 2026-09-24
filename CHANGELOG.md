@@ -18,6 +18,7 @@ Added
   PRs, work items and runs, destinations, saved views, people, pipeline repositories,
   themes and settings, and every keybinding from `?` help. Prefixes narrow it: `>` actions,
   `:` commands (`:theme`, `:view`, `:go`, `:merge`), `@` people, `#` ids, `?` keys.
+  ([#195](https://github.com/magna-nz/forgetop/pull/195))
 
 ## 1.2.0 — 2026-09-24
 
