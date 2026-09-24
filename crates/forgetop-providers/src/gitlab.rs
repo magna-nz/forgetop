@@ -199,6 +199,70 @@ fn worst_status(jobs: &[PipelineJob]) -> PipelineRunStatus {
     }
 }
 
+/// Strips ANSI CSI escape sequences (`\x1b[...<final-byte>`) from a job trace, which GitLab
+/// uses for colour and cursor control.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            // Only CSI (`ESC [ ... final-byte`) sequences are expected in job traces; drop a
+            // lone escape byte too so we never leak a raw control char into the pane.
+            let mut lookahead = chars.clone();
+            if lookahead.next() == Some('[') {
+                chars = lookahead;
+                for c2 in chars.by_ref() {
+                    if ('@'..='~').contains(&c2) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Removes GitLab's collapsible-section markers (`section_start:<ts>:<name>[...]` /
+/// `section_end:<ts>:<name>[...]`), each of which is terminated by the `\r` that used to
+/// precede the (already-ANSI-stripped) cursor-reset control code.
+fn strip_section_markers(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    loop {
+        let next = match (rest.find("section_start:"), rest.find("section_end:")) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) | (None, Some(a)) => Some(a),
+            (None, None) => None,
+        };
+        let Some(idx) = next else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..idx]);
+        let after = &rest[idx..];
+        rest = match after.find('\r') {
+            Some(r) => &after[r + 1..],
+            None => match after.find('\n') {
+                Some(n) => &after[n..],
+                None => "",
+            },
+        };
+    }
+    out
+}
+
+/// Cleans a GitLab job trace for display in the TUI's log pane: drops ANSI escape codes,
+/// collapsible-section markers, and any stray `\r` left over from terminal carriage-return
+/// tricks. Plain text passes through untouched.
+fn strip_ci_log(raw: &str) -> String {
+    let normalized = raw.replace("\r\n", "\n");
+    let no_ansi = strip_ansi(&normalized);
+    let no_sections = strip_section_markers(&no_ansi);
+    no_sections.replace('\r', "")
+}
+
 fn count_diff(diff: &str) -> (i64, i64) {
     let (mut adds, mut dels) = (0, 0);
     for line in diff.lines() {
@@ -412,6 +476,15 @@ impl GitLabClient {
             return Err(Error::Provider(format!("GET {url} -> {}", resp.status())));
         }
         resp.json().await.map_err(prov)
+    }
+
+    /// Like `get_json`, but for a plain-text endpoint (a job's `/trace`).
+    async fn get_text(&self, url: &str) -> Result<String> {
+        let resp = self.http.get(url).send().await.map_err(prov)?;
+        if !resp.status().is_success() {
+            return Err(Error::Provider(format!("GET {url} -> {}", resp.status())));
+        }
+        resp.text().await.map_err(prov)
     }
 
     async fn send(&self, req: reqwest::RequestBuilder, what: &str) -> Result<()> {
@@ -777,16 +850,39 @@ impl PipelineSource for GitLabPipe {
         }
         Ok(mapped)
     }
-    async fn logs(&self, run: &ItemRef, _job_id: Option<&str>) -> Result<String> {
+    async fn logs(&self, run: &ItemRef, job_id: Option<&str>) -> Result<String> {
         let project = self.0.resolve(run)?;
+        // A specific job: its raw trace, cleaned up for display. GitLab serves this live
+        // (growing text, 200 with an empty/partial body) while the job is still running.
+        if let Some(job_id) = job_id {
+            let trace = self.0.get_text(&self.0.project_path(&project, &format!("/jobs/{job_id}/trace"))).await?;
+            let cleaned = strip_ci_log(&trace);
+            return Ok(if cleaned.trim().is_empty() { "(no output yet)".into() } else { cleaned });
+        }
+        // No job specified: concatenate each job's trace under a stage/name header. Bounded so a
+        // pipeline with many jobs doesn't fan out into dozens of trace requests per poll.
+        const MAX_JOBS: usize = 20;
         let jobs_v = self.0.get_json(&self.0.project_path(&project, &format!("/pipelines/{}/jobs?per_page=100", run.id))).await?;
-        let lines: Vec<String> = jobs_v
-            .as_array()
-            .unwrap_or(&vec![])
-            .iter()
-            .map(|j| format!("{} [{}]: {}", get_str(j, "stage").unwrap_or_default(), get_str(j, "name").unwrap_or_default(), get_str(j, "status").unwrap_or_default()))
-            .collect();
-        Ok(lines.join("\n"))
+        let jobs: Vec<&Value> = jobs_v.as_array().map(|a| a.iter().take(MAX_JOBS).collect()).unwrap_or_default();
+        if jobs.is_empty() {
+            return Ok("(no output yet)".into());
+        }
+        let mut out = String::new();
+        for j in jobs {
+            let stage = get_str(j, "stage").unwrap_or_default();
+            let name = get_str(j, "name").unwrap_or_default();
+            let id = get_i64(j, "id").map(|n| n.to_string()).unwrap_or_default();
+            out.push_str(&format!("=== {stage} [{name}] ===\n"));
+            match self.0.get_text(&self.0.project_path(&project, &format!("/jobs/{id}/trace"))).await {
+                Ok(trace) => {
+                    let cleaned = strip_ci_log(&trace);
+                    out.push_str(if cleaned.trim().is_empty() { "(no output yet)" } else { &cleaned });
+                }
+                Err(e) => out.push_str(&format!("(log unavailable: {e})")),
+            }
+            out.push('\n');
+        }
+        Ok(out)
     }
     async fn trigger(&self, definition: &ItemRef, branch: Option<&str>) -> Result<()> {
         let project = self.0.resolve(definition)?;
@@ -1098,5 +1194,39 @@ mod tests {
         // "opened" isn't surfaced.
         let opened: Value = serde_json::from_str(r#"{ "state": "opened", "user": { "name": "Amy" } }"#).unwrap();
         assert!(map_gl_state_event(&opened).is_none());
+    }
+
+    #[test]
+    fn strip_ci_log_removes_ansi_colour_codes() {
+        let raw = "\x1b[31mERROR\x1b[0m: build failed\x1b[1;32mOK\x1b[0m";
+        assert_eq!(strip_ci_log(raw), "ERROR: build failedOK");
+    }
+
+    #[test]
+    fn strip_ci_log_removes_gitlab_section_markers() {
+        let raw = "section_start:1700000000:step_script\r\x1b[0Kexecuting step\n$ echo hi\nhi\nsection_end:1700000000:step_script\r\x1b[0K\n";
+        let cleaned = strip_ci_log(raw);
+        assert!(!cleaned.contains("section_start"), "section_start marker removed: {cleaned:?}");
+        assert!(!cleaned.contains("section_end"), "section_end marker removed: {cleaned:?}");
+        assert!(cleaned.contains("executing step"));
+        assert!(cleaned.contains("$ echo hi"));
+        assert!(cleaned.contains("hi"));
+    }
+
+    #[test]
+    fn strip_ci_log_handles_crlf_and_bare_cr() {
+        let raw = "line1\r\nline2\rstill line2\r\nline3";
+        let cleaned = strip_ci_log(raw);
+        assert!(!cleaned.contains('\r'), "no stray CR left: {cleaned:?}");
+        assert!(cleaned.contains("line1"));
+        assert!(cleaned.contains("line2"));
+        assert!(cleaned.contains("still line2"));
+        assert!(cleaned.contains("line3"));
+    }
+
+    #[test]
+    fn strip_ci_log_leaves_plain_text_untouched() {
+        let raw = "hello world\nsecond line\nthird line";
+        assert_eq!(strip_ci_log(raw), raw);
     }
 }

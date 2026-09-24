@@ -8,7 +8,7 @@ use forgetop_core::domain::*;
 use forgetop_core::filter::apply_pull_request_filter;
 use forgetop_core::provider::*;
 use forgetop_core::{Error, Result};
-use reqwest::header::AUTHORIZATION;
+use reqwest::header::{ACCEPT, AUTHORIZATION};
 use serde_json::{json, Value};
 use similar::{ChangeTag, TextDiff};
 
@@ -264,6 +264,96 @@ fn az_problem(v: &Value) -> Option<String> {
     }
 }
 
+/// The `log.id` of a timeline record (Job or Task), if it has one yet — a running record
+/// usually doesn't.
+fn az_log_id(v: &Value) -> Option<String> {
+    get_obj(v, "log").and_then(|l| get_i64(l, "id")).map(|n| n.to_string())
+}
+
+/// A Job record's child Task records, in execution order.
+fn az_child_tasks<'a>(records: &'a [Value], job_id: &str) -> Vec<&'a Value> {
+    let mut tasks: Vec<&Value> =
+        records.iter().filter(|r| get_str(r, "type").as_deref() == Some("Task") && get_str(r, "parentId").as_deref() == Some(job_id)).collect();
+    tasks.sort_by_key(|t| get_i64(t, "order").unwrap_or(0));
+    tasks
+}
+
+/// A one-line placeholder for a record with no log yet.
+fn az_task_placeholder_line(v: &Value) -> String {
+    format!("{}: {} — no log yet", get_str(v, "name").unwrap_or_else(|| "task".into()), get_str(v, "state").unwrap_or_default())
+}
+
+/// GitHub/Azure log lines start with a full ISO-8601 timestamp
+/// (`2024-05-01T12:34:56.1234567Z `, fractional seconds optional). Shortened to `HH:MM:SS  `
+/// for readability; a line that doesn't start with one is returned unchanged. Duplicated from
+/// `github.rs` rather than shared — see AGENTS.md on keeping provider modules independent.
+fn shorten_log_timestamp(line: &str) -> String {
+    let b = line.as_bytes();
+    if b.len() < 20 {
+        return line.to_string();
+    }
+    let digit = |i: usize| b.get(i).is_some_and(u8::is_ascii_digit);
+    let date_ok = (0..4).all(digit) && b[4] == b'-' && (5..7).all(digit) && b[7] == b'-' && (8..10).all(digit) && b[10] == b'T';
+    if !date_ok {
+        return line.to_string();
+    }
+    let time_ok = (11..13).all(digit) && b[13] == b':' && (14..16).all(digit) && b[16] == b':' && (17..19).all(digit);
+    if !time_ok {
+        return line.to_string();
+    }
+    let mut i = 19;
+    if b.get(i) == Some(&b'.') {
+        i += 1;
+        while b.get(i).is_some_and(u8::is_ascii_digit) {
+            i += 1;
+        }
+    }
+    if b.get(i) != Some(&b'Z') {
+        return line.to_string();
+    }
+    i += 1;
+    let time = &line[11..19];
+    match b.get(i) {
+        Some(b' ') => format!("{time}  {}", &line[i + 1..]),
+        None => format!("{time}  "),
+        _ => line.to_string(), // 'Z' not followed by a space or end of line — not our prefix
+    }
+}
+
+/// Strips ANSI CSI escape sequences (`\x1b[...<final byte>`), leaving markers like
+/// `##[error]`/`##[warning]` untouched — the TUI keys off those.
+fn strip_ansi(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for c2 in chars.by_ref() {
+                if c2.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
+fn clean_log_line(line: &str) -> String {
+    strip_ansi(&shorten_log_timestamp(line))
+}
+
+/// Cleans a whole log body line-by-line (timestamp shortening + ANSI stripping), or a short
+/// placeholder if the body came back empty.
+fn az_log_body_or_placeholder(text: &str) -> String {
+    if text.trim().is_empty() {
+        "(no output yet)\n".into()
+    } else {
+        text.lines().map(clean_log_line).collect::<Vec<_>>().join("\n")
+    }
+}
+
 /// Build a `+`/`-`/space line diff (ADO doesn't return patch text).
 pub fn unified_diff(old: &str, new: &str) -> (String, i64, i64) {
     let diff = TextDiff::from_lines(old, new);
@@ -338,6 +428,51 @@ impl AzureClient {
             return Err(Error::Provider(format!("POST {url} -> {}", resp.status())));
         }
         resp.json().await.map_err(prov)
+    }
+
+    /// Fetches a build log as plain text (`Accept: text/plain` — the client's default headers
+    /// don't force JSON, but a build log endpoint without it can still send a JSON envelope).
+    /// Returns `Ok(None)` on a 404, e.g. a job-level log that doesn't exist yet.
+    async fn get_text_opt(&self, url: &str) -> Result<Option<String>> {
+        let resp = self.http.get(url).header(ACCEPT, "text/plain").send().await.map_err(prov)?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            return Err(Error::Provider(format!("GET {url} -> {}", resp.status())));
+        }
+        Ok(Some(resp.text().await.map_err(prov)?))
+    }
+
+    /// The log text for one Job timeline record. A finished job has its own `log.id`; a running
+    /// one usually doesn't yet, so its text is built from its child Task records' logs instead.
+    async fn job_log_text(&self, project: &str, build_id: &str, records: &[Value], job: &Value) -> Result<String> {
+        if let Some(log_id) = az_log_id(job) {
+            let url = format!("{}/{project}/_apis/build/builds/{build_id}/logs/{log_id}?{API}", self.base);
+            if let Some(text) = self.get_text_opt(&url).await? {
+                return Ok(az_log_body_or_placeholder(&text));
+            }
+        }
+        let job_id = get_str(job, "id").unwrap_or_default();
+        let tasks = az_child_tasks(records, &job_id);
+        if tasks.is_empty() {
+            return Ok(format!("{}\n", az_task_placeholder_line(job)));
+        }
+        let mut out = String::new();
+        for t in tasks {
+            let name = get_str(t, "name").unwrap_or_else(|| "task".into());
+            out.push_str(&format!("--- {name} ---\n"));
+            match az_log_id(t) {
+                Some(log_id) => {
+                    let url = format!("{}/{project}/_apis/build/builds/{build_id}/logs/{log_id}?{API}", self.base);
+                    let text = self.get_text_opt(&url).await?.unwrap_or_default();
+                    out.push_str(&az_log_body_or_placeholder(&text));
+                }
+                None => out.push_str(&az_task_placeholder_line(t)),
+            }
+            out.push('\n');
+        }
+        Ok(out)
     }
 
     /// `repo` is the connection-relative `project/repo` scope entry.
@@ -954,12 +1089,25 @@ impl PipelineSource for AzurePipe {
         let project = self.0.resolve_project(run)?;
         let url = format!("{}/{project}/_apis/build/builds/{}/timeline?{API}", self.0.base, run.id);
         let v = self.0.get_json(&url).await?;
-        let lines: Vec<String> = get_arr(&v, "records")
-            .iter()
-            .filter(|r| job_id.is_none() || get_str(r, "id").as_deref() == job_id)
-            .map(|r| format!("[{}] {}: {}/{}", get_str(r, "type").unwrap_or_default(), get_str(r, "name").unwrap_or_default(), get_str(r, "state").unwrap_or_default(), get_str(r, "result").unwrap_or_else(|| "-".into())))
-            .collect();
-        Ok(lines.join("\n"))
+        let records = get_arr(&v, "records");
+        match job_id {
+            Some(id) => {
+                let job = records.iter().find(|r| get_str(r, "type").as_deref() == Some("Job") && get_str(r, "id").as_deref() == Some(id));
+                let job = job.ok_or_else(|| Error::NotFound(id.into()))?;
+                self.0.job_log_text(&project, &run.id, records, job).await
+            }
+            None => {
+                let jobs: Vec<&Value> = records.iter().filter(|r| get_str(r, "type").as_deref() == Some("Job")).take(20).collect();
+                let mut out = String::new();
+                for job in jobs {
+                    let name = get_str(job, "name").unwrap_or_else(|| "job".into());
+                    out.push_str(&format!("=== {name} ===\n"));
+                    out.push_str(&self.0.job_log_text(&project, &run.id, records, job).await?);
+                    out.push('\n');
+                }
+                Ok(out)
+            }
+        }
     }
     async fn trigger(&self, definition: &ItemRef, branch: Option<&str>) -> Result<()> {
         let project = self.0.resolve_project(definition)?;
@@ -1259,5 +1407,53 @@ mod tests {
         let s = map_az_status(&status);
         assert_eq!(s.name, "Build validation");
         assert_eq!(s.status, CheckStatus::Failed);
+    }
+
+    #[test]
+    fn shortens_log_timestamps() {
+        assert_eq!(shorten_log_timestamp("2024-05-01T12:34:56.1234567Z hello world"), "12:34:56  hello world");
+        assert_eq!(shorten_log_timestamp("2024-05-01T12:34:56Z hello"), "12:34:56  hello"); // no fractional seconds
+        assert_eq!(shorten_log_timestamp("2024-05-01T12:34:56.1Z"), "12:34:56  "); // timestamp with nothing after
+        assert_eq!(shorten_log_timestamp("hello world"), "hello world"); // no timestamp prefix at all
+        assert_eq!(shorten_log_timestamp("not-a-date but long enough to pass the length check"), "not-a-date but long enough to pass the length check");
+    }
+
+    #[test]
+    fn strips_ansi_escapes_but_keeps_markers() {
+        assert_eq!(strip_ansi("\u{1b}[31merror\u{1b}[0m: build failed"), "error: build failed");
+        assert_eq!(strip_ansi("##[error]Process completed with exit code 1."), "##[error]Process completed with exit code 1.");
+        assert_eq!(strip_ansi("no escapes here"), "no escapes here");
+    }
+
+    #[test]
+    fn az_log_id_reads_the_log_object_when_present() {
+        let with_log: Value = serde_json::from_str(r#"{ "id": "j1", "log": { "id": 7, "url": "http://x" } }"#).unwrap();
+        assert_eq!(az_log_id(&with_log), Some("7".to_string()));
+        let without_log: Value = serde_json::from_str(r#"{ "id": "j1" }"#).unwrap();
+        assert_eq!(az_log_id(&without_log), None);
+    }
+
+    #[test]
+    fn az_child_tasks_picks_this_jobs_tasks_in_order() {
+        let records: Value = serde_json::from_str(
+            r#"[
+                { "id": "job1", "type": "Job", "name": "build", "parentId": "stage1" },
+                { "id": "task2", "type": "Task", "name": "compile", "parentId": "job1", "order": 2 },
+                { "id": "task1", "type": "Task", "name": "checkout", "parentId": "job1", "order": 1 },
+                { "id": "task3", "type": "Task", "name": "other job's task", "parentId": "job2", "order": 1 }
+            ]"#,
+        )
+        .unwrap();
+        let recs = records.as_array().unwrap();
+        let tasks = az_child_tasks(recs, "job1");
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(get_str(tasks[0], "name").as_deref(), Some("checkout")); // order 1 before order 2
+        assert_eq!(get_str(tasks[1], "name").as_deref(), Some("compile"));
+    }
+
+    #[test]
+    fn az_task_placeholder_line_reports_state_with_no_log() {
+        let t: Value = serde_json::from_str(r#"{ "name": "compile", "state": "inProgress" }"#).unwrap();
+        assert_eq!(az_task_placeholder_line(&t), "compile: inProgress — no log yet");
     }
 }
