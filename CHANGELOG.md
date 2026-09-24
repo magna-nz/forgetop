@@ -20,6 +20,12 @@ Added
   `:` commands (`:theme`, `:view`, `:go`, `:merge`), `@` people, `#` ids, `?` keys.
   ([#195](https://github.com/magna-nz/forgetop/pull/195))
 
+Changed
+
+- The footer is shorter and leads with `Ctrl-K palette` (and `B dashboard` while the dashboard
+  runs). Moving, tab walking, Enter hints on lists, feedback, saved views, repos and find are
+  left to `?` help and the palette. ([#195](https://github.com/magna-nz/forgetop/pull/195))
+
 ## 1.2.0 — 2026-09-24
 
 Added

@@ -1904,21 +1904,22 @@ fn render_health(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-/// Context-aware key glossary for the active tab (azdo-style bar along the bottom). Appends the
-/// global browser shortcuts except while the wizard, an overlay, or the quick-filter is
-/// capturing input. Feedback is always available; the local dashboard shortcut is conditional.
+/// Context-aware key glossary for the active tab (azdo-style bar along the bottom). Leads with
+/// the dashboard shortcut (when its server runs) and the Ctrl-K palette, except while the
+/// wizard, an overlay, or the quick-filter is capturing input.
 fn footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
     let mut keys = base_footer_keys(app);
     // A focused preview is the item view itself, so its own keys lead; `p` is how back.
     if app.preview_focus && app.wizard.is_none() && app.overlay.is_none() {
         keys.insert(0, ("p", "back to list"));
     }
-    // Prepend (not append) so it survives the footer being clipped on narrow terminals — the
-    // whole point is that people always see the dashboard and feedback entry points exist.
+    // Prepend (not append) so they survive the footer being clipped on narrow terminals: the
+    // palette is where everything the footer leaves out (feedback, views, find, …) is found,
+    // and the dashboard shortcut shows whenever its server is running.
     if app.wizard.is_none() && app.overlay.is_none() && !app.filtering {
-        keys.insert(0, ("F", "feedback"));
+        keys.insert(0, ("Ctrl-K", "palette"));
         if app.dashboard_url.is_some() {
-            keys.insert(0, ("B", "browser dashboard"));
+            keys.insert(0, ("B", "dashboard"));
         }
     }
     keys
@@ -1940,7 +1941,7 @@ fn base_footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
         return overlay.hint();
     }
     if matches!(app.screen, Screen::Launchpad) {
-        return vec![("↑↓", "move"), ("←→", "columns"), ("↵", "open"), ("D", "dismiss"), ("Tab", "sections"), ("r", "refresh"), ("?", "help"), ("Ctrl-C", "quit")];
+        return vec![("←→", "columns"), ("↵", "open"), ("D", "dismiss"), ("r", "refresh"), ("?", "help"), ("Ctrl-C", "quit")];
     }
     if let Screen::PrView(v) = &app.screen {
         // A merged PR only offers Revert; an open one offers approve / (reject) / merge.
@@ -1959,26 +1960,26 @@ fn base_footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
             } else {
                 let mut keys = vec![("←→", "tabs"), ("↑↓", "file"), ("↵", "open file"), ("PgUp/Dn", "scroll")];
                 keys.extend(acts);
-                keys.extend([("o", "open"), ("Tab", "sections"), ("Esc", "back")]);
+                keys.extend([("o", "open"), ("Esc", "back")]);
                 keys
             }
         } else if v.tab == 1 {
             let mut keys = vec![("←→", "tabs"), ("↑↓", "commit"), ("↵", "commit diff")];
             keys.extend(acts);
-            keys.extend([("o", "open"), ("Tab", "sections"), ("Esc", "back")]);
+            keys.extend([("o", "open"), ("Esc", "back")]);
             keys
         } else {
             let mut keys = vec![("←→", "tabs"), ("PgUp/Dn", "scroll")];
             keys.extend(acts_full);
-            keys.extend([("c", "comment"), ("r", "reply"), ("o", "open"), ("Tab", "sections"), ("Esc", "back")]);
+            keys.extend([("c", "comment"), ("r", "reply"), ("o", "open"), ("Esc", "back")]);
             keys
         };
     }
     if matches!(app.screen, Screen::WiView(_)) {
-        return vec![("PgUp/Dn", "scroll"), ("u", "update state"), ("c", "comment"), ("o", "open"), ("Tab", "sections"), ("Esc/q", "back")];
+        return vec![("PgUp/Dn", "scroll"), ("u", "update state"), ("c", "comment"), ("o", "open"), ("Esc/q", "back")];
     }
     if matches!(app.screen, Screen::Inbox) {
-        return vec![("↑↓", "move"), ("↵", "open item"), ("o", "browser"), ("x", "mark read"), ("A", "all read"), ("Tab", "sections"), ("Esc", "back")];
+        return vec![("↵", "open item"), ("o", "browser"), ("x", "mark read"), ("A", "all read"), ("Esc", "back")];
     }
     if let Screen::Pipeline(v) = &app.screen {
         if let Some(log) = &v.logs {
@@ -1996,18 +1997,17 @@ fn base_footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
                 keys.push(("Esc", "close logs"));
                 return keys;
             }
-            return vec![("↑↓", "move"), ("↵", "expand"), ("w", "logs"), ("Esc/L", "close logs"), ("q", "back")];
+            return vec![("↵", "expand"), ("w", "logs"), ("Esc/L", "close logs"), ("q", "back")];
         }
-        let mut keys = vec![("↑↓", "move"), ("↵", "expand"), ("L", "logs")];
+        let mut keys = vec![("↵", "expand"), ("L", "logs")];
         if v.can_respond_approvals && !v.actionable_approvals().is_empty() {
             keys.push(("A", "approve"));
         }
-        keys.extend([("T", "trigger"), ("o", "open job"), ("Tab", "sections"), ("Esc/q", "back")]);
+        keys.extend([("T", "trigger"), ("o", "open job"), ("Esc/q", "back")]);
         return keys;
     }
     if matches!(app.screen, Screen::Config(_)) {
         return vec![
-            ("↑↓", "move"),
             ("a", "add"),
             ("p", "bind-PR"),
             ("w", "bind-WI"),
@@ -2016,30 +2016,21 @@ fn base_footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
             ("Esc/q", "back"),
         ];
     }
-    let mut keys = vec![("↑↓", "move"), ("Tab", "sections")];
-    // With the preview showing, Enter moves into it rather than opening a full-screen view.
-    // A pipeline group header still expands on Enter; only a run row focuses the pane.
+    // Moving, tab walking, focusing the preview, saved views, repos and find are left to `?`
+    // help and the Ctrl-K palette, so the footer keeps the section's own actions.
+    let mut keys = Vec::new();
+    // Enter's hint only where it opens the row: focusing the preview and expanding or drilling
+    // into a pipeline are left out like the others.
     let preview = app.preview_shown() && app.preview.is_some();
-    keys.push(match app.active {
-        2 if app.pipe_head_selected() => ("↵", "expand"),
-        _ if preview => ("↵", "focus preview"),
-        2 => ("↵", "expand / drill-in"),
-        _ => ("↵", "open"),
-    });
+    if app.active != 2 && !preview {
+        keys.push(("↵", "open"));
+    }
     match app.active {
         0 => keys.extend([("f", "status"), ("S", "sort"), ("o", "browser")]),
         1 => keys.extend([("f", "states"), ("S", "sort"), ("o", "browser")]),
         2 => keys.extend([("G", "group"), ("S", "sort"), ("T", "trigger"), ("o", "open")]),
         _ => {}
     }
-    if app.views[app.active].len() > 1 {
-        keys.push(("[ ]", "views"));
-    }
-    keys.push(("V", "save view"));
-    if app.repo_scope[app.active].is_some() {
-        keys.push(("g", "repos"));
-    }
-    keys.push(("/", "find"));
     keys.extend([
         ("v", "tabs"),
         ("C", "connections"),
@@ -4629,27 +4620,26 @@ mod tests {
     }
 
     #[test]
-    fn pipelines_footer_lists_drillin_and_trigger() {
+    fn pipelines_footer_lists_trigger_without_navigation_hints() {
         let mut app = App::new("slate");
         app.screen = Screen::List;
         app.active = 2;
         let out = render_to_string(&mut app, 120, 24);
-        assert!(out.contains("drill-in") && out.contains("trigger"), "pipelines footer");
+        assert!(out.contains("trigger"), "pipelines footer");
+        assert!(!out.contains("drill-in") && !out.contains("sections"), "navigation is left to ? and Ctrl-K");
     }
 
     #[test]
-    fn footer_always_advertises_feedback_and_adds_the_dashboard_when_available() {
+    fn footer_leads_with_the_palette_and_leaves_the_rest_to_it() {
         let mut app = App::new("slate");
         app.screen = Screen::List;
-        // GitHub feedback does not depend on the local dashboard.
-        let without_dashboard = render_to_string(&mut app, 120, 24);
-        assert!(!without_dashboard.contains("browser dashboard"));
-        assert!(without_dashboard.contains("feedback") && without_dashboard.contains("F"));
-        // Dashboard running → both browser shortcuts show.
         app.dashboard_url = Some("http://127.0.0.1:8177/?t=x".into());
-        let out = render_to_string(&mut app, 120, 24);
-        assert!(out.contains("browser dashboard") && out.contains("B"), "footer advertises the dashboard");
-        assert!(out.contains("feedback") && out.contains("F"), "footer advertises feedback");
+        let out = render_to_string(&mut app, 160, 24);
+        assert!(out.contains("Ctrl-K") && out.contains("palette"), "footer advertises the palette");
+        assert!(out.contains(" B ") && out.contains("dashboard"), "footer advertises the running dashboard");
+        for gone in ["browser dashboard", "feedback", "save view", "find", "sections"] {
+            assert!(!out.contains(gone), "{gone} is found through the palette and ? help, not the footer");
+        }
     }
 
     #[test]
@@ -4673,8 +4663,8 @@ mod tests {
         app.filtering = true;
 
         let out = render_to_string(&mut app, 120, 24);
-        assert!(!out.contains("browser dashboard"));
-        assert!(!out.contains("feedback"));
+        assert!(!out.contains("dashboard"));
+        assert!(!out.contains("palette"));
     }
 
     #[test]
