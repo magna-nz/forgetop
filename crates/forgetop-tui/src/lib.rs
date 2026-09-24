@@ -40,6 +40,7 @@ pub async fn run(deps: AppDeps, theme_name: &str, dashboard_url: Option<String>)
     app.dashboard_url = dashboard_url;
     app.apply_hidden_sections(&deps.config.snapshot().ui.hidden_sections);
     app.apply_hidden_work_item_states(&deps.config.snapshot().ui.hidden_work_item_states);
+    app.apply_preview_hidden(&deps.config.snapshot().ui.preview_hidden);
     app.apply_dismissed_launchpad_items(&deps.config.snapshot().ui.dismissed_launchpad_items);
     {
         let ui = deps.config.snapshot().ui;
@@ -126,7 +127,10 @@ async fn event_loop(terminal: &mut Term, app: &mut App, deps: &AppDeps) -> Resul
                 // the next launch something to paint. No-ops unless something actually changed.
                 deps.cache.flush().await;
             }
-            _ = anim.tick() => app.tick_anim(),
+            _ = anim.tick() => {
+                app.tick_anim();
+                app.tick_preview(deps);
+            }
         }
     }
     Ok(())
