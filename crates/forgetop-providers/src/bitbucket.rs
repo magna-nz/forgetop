@@ -248,6 +248,9 @@ pub fn bb_status(state: Option<&Value>) -> PipelineRunStatus {
 pub fn map_pipeline(v: &Value, repo: &str) -> PipelineRun {
     let number = get_i64(v, "build_number");
     PipelineRun {
+        event: None,
+        attempt: None,
+        pull_request: None,
         repository: Some(repo.to_string()),
         id: get_str(v, "uuid").unwrap_or_else(|| number.map(|n| n.to_string()).unwrap_or_else(|| "0".into())),
         definition_id: "pipelines".into(),

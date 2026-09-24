@@ -9774,6 +9774,9 @@ mod tests {
 
     fn failed_run() -> PipelineRun {
         PipelineRun {
+            event: None,
+            attempt: None,
+            pull_request: None,
             repository: None,
             id: "r1".into(),
             definition_id: "ci".into(),
@@ -9938,6 +9941,9 @@ mod tests {
             definition_name: None,
             awaiting_approval: awaiting,
             run: PipelineRun {
+                event: None,
+                attempt: None,
+                pull_request: None,
                 repository: None,
                 id: id.into(),
                 definition_id: "ci".into(),
@@ -10030,6 +10036,9 @@ mod tests {
             definition_name: None,
             awaiting_approval: false,
             run: PipelineRun {
+                event: None,
+                attempt: None,
+                pull_request: None,
                 repository: None,
                 id: id.into(),
                 definition_id: "ci".into(),
@@ -10069,6 +10078,9 @@ mod tests {
             definition_name: None,
             awaiting_approval: awaiting,
             run: PipelineRun {
+                event: None,
+                attempt: None,
+                pull_request: None,
                 repository: None,
                 id: id.into(),
                 definition_id: "ci".into(),
@@ -10944,6 +10956,9 @@ mod tests {
 
     fn pipeline_run(id: &str, status: PipelineRunStatus, stages: Vec<PipelineStage>) -> PipelineRun {
         PipelineRun {
+            event: None,
+            attempt: None,
+            pull_request: None,
             repository: None,
             id: id.into(),
             definition_id: "ci".into(),
@@ -11810,6 +11825,9 @@ mod tests {
             definition_name: Some(def.into()),
             awaiting_approval: false,
             run: PipelineRun {
+                event: None,
+                attempt: None,
+                pull_request: None,
                 repository: Some(repo.into()),
                 id: format!("{def}-{sha}"),
                 definition_id: def.into(),

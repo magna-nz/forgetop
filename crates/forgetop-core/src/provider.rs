@@ -403,6 +403,34 @@ pub trait PipelineSource: Send + Sync {
     async fn cancel_run(&self, _run: &ItemRef) -> Result<()> {
         Err(Error::Provider("cancel_run not supported by this provider".into()))
     }
+    /// Whether [`rerun_run`](Self::rerun_run) can re-run a whole run. `false` by default.
+    fn supports_rerun(&self) -> bool {
+        false
+    }
+    /// Whether [`rerun_run`](Self::rerun_run) can re-run only a run's failed jobs. `false` by
+    /// default; a provider may re-run whole runs but not failed jobs alone.
+    fn supports_rerun_failed(&self) -> bool {
+        false
+    }
+    /// Re-run a finished run — every job, or with `failed_only` just the ones that failed.
+    /// Unsupported by default.
+    async fn rerun_run(&self, _run: &ItemRef, _failed_only: bool) -> Result<()> {
+        Err(Error::Provider("rerun not supported by this provider".into()))
+    }
+    /// Whether [`artifacts`](Self::artifacts) is implemented. `false` by default — the UI says
+    /// so rather than showing an empty list as if the run published nothing.
+    fn supports_artifacts(&self) -> bool {
+        false
+    }
+    /// The files a run published. Empty by default.
+    async fn artifacts(&self, _run: &ItemRef) -> Result<Vec<PipelineArtifact>> {
+        Ok(Vec::new())
+    }
+    /// Problems the run reported (annotations, failed test cases, timeline issues), most severe
+    /// first. Empty by default — callers fall back to scanning the log.
+    async fn annotations(&self, _run: &ItemRef) -> Result<Vec<PipelineAnnotation>> {
+        Ok(Vec::new())
+    }
     /// Whether this provider can surface and act on pending run approvals/gates.
     /// `false` by default — the UI shows the section as unsupported.
     fn supports_approvals(&self) -> bool {

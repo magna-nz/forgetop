@@ -4304,6 +4304,9 @@ mod tests {
 
     fn sample_run() -> PipelineRun {
         PipelineRun {
+            event: None,
+            attempt: None,
+            pull_request: None,
             repository: None,
             id: "r1".into(),
             definition_id: "ci".into(),

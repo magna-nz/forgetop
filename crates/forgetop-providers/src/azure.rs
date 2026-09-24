@@ -172,6 +172,9 @@ pub fn map_build(v: &Value, project: Option<&str>) -> PipelineRun {
         _ => PipelineRunStatus::Queued,
     };
     PipelineRun {
+        event: None,
+        attempt: None,
+        pull_request: None,
         repository: get_obj(v, "project").and_then(|p| get_str(p, "name")).or_else(|| project.map(str::to_string)),
         id: get_i64(v, "id").map(|n| n.to_string()).unwrap_or_else(|| "0".into()),
         definition_id: get_obj(v, "definition").and_then(|d| get_i64(d, "id")).map(|n| n.to_string()).unwrap_or_else(|| "0".into()),

@@ -136,6 +136,9 @@ pub fn gl_pipeline_status(status: Option<&str>) -> PipelineRunStatus {
 
 pub fn map_pipeline(v: &Value, repo: Option<&str>) -> PipelineRun {
     PipelineRun {
+        event: None,
+        attempt: None,
+        pull_request: None,
         repository: repo.map(str::to_string),
         id: get_i64(v, "id").map(|n| n.to_string()).unwrap_or_else(|| "0".into()),
         definition_id: "pipelines".into(),

@@ -327,6 +327,9 @@ fn run(id: &str, def: &str, num: i64, name: &str, title: &str, status: PipelineR
     let now = base();
     let started = now - chrono::Duration::hours(updated_h);
     PipelineRun {
+        event: None,
+        attempt: None,
+        pull_request: None,
         repository: None,
         id: id.into(),
         definition_id: def.into(),
@@ -385,6 +388,9 @@ fn pipeline_runs() -> Vec<PipelineRun> {
     let now = base();
     vec![
         PipelineRun {
+            event: None,
+            attempt: None,
+            pull_request: None,
             repository: None,
             id: "r501".into(),
             definition_id: "ci".into(),
@@ -419,6 +425,9 @@ fn pipeline_runs() -> Vec<PipelineRun> {
             ],
         },
         PipelineRun {
+            event: None,
+            attempt: None,
+            pull_request: None,
             repository: None,
             id: "r500".into(),
             definition_id: "ci".into(),
@@ -466,6 +475,9 @@ fn pipeline_runs() -> Vec<PipelineRun> {
             ],
         },
         PipelineRun {
+            event: None,
+            attempt: None,
+            pull_request: None,
             repository: None,
             id: "r207".into(),
             definition_id: "release".into(),
@@ -493,6 +505,9 @@ fn pipeline_runs() -> Vec<PipelineRun> {
             }],
         },
         PipelineRun {
+            event: None,
+            attempt: None,
+            pull_request: None,
             repository: None,
             id: "r502".into(),
             definition_id: "ci".into(),

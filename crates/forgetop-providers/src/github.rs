@@ -201,6 +201,9 @@ fn status_of(v: &Value) -> PipelineRunStatus {
 pub fn map_run(v: &Value, repo: Option<&str>) -> PipelineRun {
     let completed = get_str(v, "status").as_deref() == Some("completed");
     PipelineRun {
+        event: None,
+        attempt: None,
+        pull_request: None,
         repository: get_obj(v, "repository").and_then(|r| get_str(r, "full_name")).or_else(|| repo.map(str::to_string)),
         id: get_i64(v, "id").map(|n| n.to_string()).unwrap_or_else(|| "0".into()),
         definition_id: get_i64(v, "workflow_id").map(|n| n.to_string()).unwrap_or_else(|| "0".into()),
