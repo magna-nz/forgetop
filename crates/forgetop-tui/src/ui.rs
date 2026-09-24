@@ -1103,6 +1103,7 @@ enum PipeCol {
     Tree,
     Status,
     Provider,
+    Repository,
     /// The group's name on a header; on a run, whatever varies inside its group.
     Subject,
     /// "5 runs · 3 failed" on a header, the run's own number on a run.
@@ -1112,7 +1113,6 @@ enum PipeCol {
     Branch,
     Commit,
     Started,
-    Repository,
     Approval,
 }
 
@@ -1121,13 +1121,13 @@ impl PipeCol {
         match self {
             PipeCol::Tree | PipeCol::Status => String::new(),
             PipeCol::Provider => "Provider".into(),
+            PipeCol::Repository => "Repository".into(),
             PipeCol::Subject => app.pipe_subject_heading(any_open).into(),
             // Ungrouped, the cell is one run's number, not a count of them.
             PipeCol::Runs => if app.pipe_group == PipeGroup::Off { "Run" } else { "Runs" }.into(),
             PipeCol::Branch => "Branch".into(),
             PipeCol::Commit => "Commit".into(),
             PipeCol::Started => "Started".into(),
-            PipeCol::Repository => "Repository".into(),
             PipeCol::Approval => "Approval".into(),
         }
     }
@@ -1149,6 +1149,9 @@ fn pipe_columns(app: &App, lines: &[PipeLine], multi_provider: bool) -> Vec<Pipe
     if multi_provider {
         cols.push(PipeCol::Provider);
     }
+    // The repository leads: it is what a run is read against, and trailing it behind the
+    // timings left the one fact that says *where* this is happening at the far edge.
+    cols.push(PipeCol::Repository);
     cols.push(PipeCol::Subject);
     cols.push(PipeCol::Runs);
     // Ungrouped there is no header to carry the branch and no child to put it in Subject,
@@ -1160,7 +1163,6 @@ fn pipe_columns(app: &App, lines: &[PipeLine], multi_provider: bool) -> Vec<Pipe
         cols.push(PipeCol::Commit);
     }
     cols.push(PipeCol::Started);
-    cols.push(PipeCol::Repository);
     if approvals {
         cols.push(PipeCol::Approval);
     }
@@ -1263,20 +1265,20 @@ fn pipe_status_word(status: PipelineRunStatus) -> &'static str {
         PipelineRunStatus::Running => "Running",
         PipelineRunStatus::PartiallySucceeded => "Partial",
         PipelineRunStatus::Canceled => "Canceled",
-        PipelineRunStatus::Succeeded => "Passed",
+        PipelineRunStatus::Succeeded => "Succeeded",
         PipelineRunStatus::Failed => "Failed",
     }
 }
 
-/// A run's outcome as a cell. The glyph and its colour carry pass and fail on their own — the
-/// word is nine characters repeating down every row — so it is kept only for the states a tick
-/// or a cross cannot make obvious.
+/// A run's outcome as a cell: the glyph and the word, on every row.
+///
+/// Pass and fail used to be the bare tick and cross, on the grounds that the word repeats.
+/// But a column that spells out four of its six states and draws the other two leaves you
+/// decoding a symbol in the one place the answer matters most — and a tick alone is no help
+/// at all where colour is lost (a monochrome terminal, a pasted screenshot, a colour-blind
+/// reader). The glyph stays because it is what makes the column scannable at a glance.
 fn pipe_status_cell(status: PipelineRunStatus, anim: usize) -> String {
-    let glyph = pipeline_glyph(status, anim);
-    match status {
-        PipelineRunStatus::Succeeded | PipelineRunStatus::Failed => glyph.to_string(),
-        other => format!("{glyph} {}", pipe_status_word(other)),
-    }
+    format!("{} {}", pipeline_glyph(status, anim), pipe_status_word(status))
 }
 
 fn render_pipes(frame: &mut Frame, area: Rect, app: &mut App) {
@@ -1361,7 +1363,11 @@ fn head_cell(col: PipeCol, h: &PipeHead, theme: &Theme, anim: usize, owner: Opti
             Style::default().fg(theme.pipeline_color(h.status)),
         ),
         PipeCol::Provider => (provider_tag(h.provider, &h.connection), Style::default().fg(theme.cyan)),
-        PipeCol::Subject => (h.subject.clone(), Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+        // Plain foreground, like the Title column on Pull Requests and Work Items — accent is
+        // this theme's chrome colour (borders, pane titles, the live tab), and spending it on
+        // row content made the Pipelines table read as a different application. Bold is what
+        // keeps a roll-up apart from the runs underneath it; the colour was never doing that.
+        PipeCol::Subject => (h.subject.clone(), Style::default().fg(theme.fg).add_modifier(Modifier::BOLD)),
         PipeCol::Runs => {
             let text = format!(
                 "{} {}{}",
@@ -3950,17 +3956,19 @@ mod tests {
         assert!(out.contains("─ CI") && out.contains("─ Integration"), "runs name their pipelines");
     }
 
-    /// The word repeats down every row for the two states a glyph already makes obvious.
+    /// Every state is named. A tick and a cross were left to speak for themselves, which asked
+    /// you to decode a symbol for the two outcomes that matter most — and said nothing at all
+    /// once colour is gone.
     #[test]
-    fn the_status_column_spells_out_only_the_states_a_glyph_cannot() {
-        use PipelineRunStatus::{Running, Succeeded};
+    fn the_status_column_names_every_state() {
+        use PipelineRunStatus::{Canceled, Failed, Running, Succeeded};
         let mut app = pipe_list(&[("CI", "nz/app", "main", "aaa", 10, Succeeded)]);
-        let out = render_to_string(&mut app, 150, 16);
-        assert!(!out.contains("Passed") && !out.contains("Succeeded"), "a tick says it");
 
-        app.pipes[0].run.status = Running;
-        let out = render_to_string(&mut app, 150, 16);
-        assert!(out.contains("Running"), "a spinner does not, so the word stays");
+        for (status, word) in [(Succeeded, "Succeeded"), (Failed, "Failed"), (Canceled, "Canceled"), (Running, "Running")] {
+            app.pipes[0].run.status = status;
+            let out = render_to_string(&mut app, 150, 16);
+            assert!(out.contains(word), "the header says {word}");
+        }
 
         // The same rule has to hold for a run rendered as a child, not just for a header.
         let key = match &app.pipe_lines()[0] {
@@ -3971,7 +3979,7 @@ mod tests {
         app.pipes[0].run.status = Succeeded;
         let out = render_to_string(&mut app, 150, 16);
         assert!(out.contains('└'), "the child is on screen");
-        assert!(!out.contains("Passed") && !out.contains("Succeeded"), "and spells nothing out either");
+        assert!(out.matches("Succeeded").count() >= 2, "the child names its state too");
     }
 
     /// Approval is the rarest column of all — it should not hold the table open when nothing
@@ -4042,6 +4050,63 @@ mod tests {
         assert!(out.contains("Branch"), "the column is there");
         assert!(out.contains("release/2.0"), "and the run's branch is in it");
         assert!(out.contains("Run ") || out.contains("Run\n"), "one run's number, so the heading is singular");
+    }
+
+    /// The repository reads first, immediately left of the pipeline/branch column — it was
+    /// sitting out past Started, the far edge of the row, which is the last place you look
+    /// for the one field that says where a run happened.
+    #[test]
+    fn the_repository_column_leads_the_row() {
+        use PipelineRunStatus::Succeeded as S;
+        let mut app = pipe_list(&[
+            ("CI", "nz/app", "main", "aaa", 10, S),
+            ("Integration", "nz/other", "v2.0", "bbb", 20, S),
+        ]);
+
+        // The whole screen comes back as one string, so the heading row is picked out by
+        // splitting on the pane's own border — "Pipelines" in the tab bar is not a column.
+        let heading = |out: &str| -> String {
+            out.split('\u{2502}').find(|seg| seg.contains("Repository")).unwrap_or_default().to_string()
+        };
+
+        for group in [crate::app::PipeGroup::Pipeline, crate::app::PipeGroup::Trigger, crate::app::PipeGroup::Off] {
+            app.pipe_group = group;
+            let out = render_to_string(&mut app, 150, 16);
+            let row = heading(&out);
+            let repo = row.find("Repository").expect("the column is on screen");
+            let subject = row.find(app.pipe_subject_heading(false)).expect("the subject column is on screen");
+            assert!(repo < subject, "repository leads the subject column ({group:?}): {row:?}");
+            assert!(repo < row.find("Started").expect("Started is on screen"), "and the timings ({group:?})");
+        }
+    }
+
+    /// A group header is a row of the list, not chrome. Accent is what the borders, the pane
+    /// titles and the live tab are painted in, so a Pipelines table using it for the subject
+    /// read as a different application next to the Title column on the other two tabs.
+    #[test]
+    fn a_group_header_is_the_same_colour_as_every_other_list_title() {
+        use crate::app::PipeHead;
+        let theme = Theme::by_name("slate");
+        let head = PipeHead {
+            key: "k".into(),
+            subject: "CI".into(),
+            repo: "nz/app".into(),
+            commit: String::new(),
+            runs: 2,
+            failed: 0,
+            status: PipelineRunStatus::Succeeded,
+            started: Some(Utc::now()),
+            approval: false,
+            expanded: false,
+            provider: ProviderType::GitHub,
+            connection: "GH".into(),
+        };
+
+        let (text, style) = head_cell(PipeCol::Subject, &head, &theme, 0, None);
+        assert_eq!(text, "CI");
+        assert_eq!(style.fg, Some(theme.fg), "plain foreground, as Pull Requests and Work Items title their rows");
+        assert_ne!(style.fg, Some(theme.accent), "accent is chrome, not row content");
+        assert!(style.add_modifier.contains(Modifier::BOLD), "bold is what still sets a roll-up apart from its runs");
     }
 
     /// Approval is only ever in the set because something needs attention, so it must not be
