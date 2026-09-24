@@ -1,5 +1,6 @@
 //! Application state and the (async) update logic driven by the event loop.
 
+use std::cell::Cell;
 use std::cmp::{Ordering, Reverse};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -255,6 +256,9 @@ pub enum AppEvent {
     /// A batch of per-row PR decorations finished fetching. `None` for a row means that call
     /// failed; it is not cached, so the row stays undecorated and may be retried.
     PrDecorationsLoaded { items: Vec<((String, String), Option<PrDecoration>)> },
+    /// A pipeline job's log finished fetching (the whole log — providers don't send deltas).
+    /// Applied only if the drill-in still shows that job's log pane.
+    PipelineLogsLoaded { conn_id: String, run_id: String, job_id: String, text: std::result::Result<String, String> },
 }
 
 /// A snapshot of everything the background fetch needs from `self` at spawn time, so it
@@ -810,6 +814,9 @@ pub struct App {
     pub preview_focus: bool,
     /// Width of the content area in the last frame, which decides whether the split fits.
     pub content_w: u16,
+    /// The log fetch in flight — `(conn, run, job)` key and anim ticks waited — so at most
+    /// one goes out at a time and a poll never piles on top of a slow one.
+    log_inflight: Option<(String, u16)>,
 }
 
 /// Full-screen views layered above the list. The large views are boxed so the
@@ -1012,11 +1019,341 @@ struct ApprovalChoice {
     label: String,
 }
 
-/// A scrollable log view over one job, shown within the pipeline drill-in.
+/// Most log lines a pane keeps; a longer log keeps its tail, which is where a live job writes
+/// and where a failed one usually says why.
+pub const LOG_MAX_LINES: usize = 10_000;
+/// Anim ticks between polls of a live job's log (the anim timer runs at ~150ms, so ≈4s).
+const LOG_POLL_TICKS: u16 = 27;
+/// Anim ticks after which an unanswered log fetch is given up on, so a lost answer can't stall
+/// every later poll (≈60s).
+const LOG_INFLIGHT_TIMEOUT_TICKS: u16 = 400;
+/// Below this width the drill-in shows the log pane alone rather than beside the tree.
+pub const LOG_SPLIT_MIN_WIDTH: u16 = 90;
+/// Width of the stages/jobs/steps tree beside an open log pane.
+pub const LOG_TREE_WIDTH: u16 = 38;
+
+/// A scrollable log view over one job, shown beside the pipeline drill-in's tree.
+///
+/// The provider hands back the whole log on every call, so a poll simply replaces `lines`;
+/// what the user is doing (scroll, follow, search) is carried across the replacement.
 pub struct LogView {
+    /// Pane title, e.g. `Logs · dotnet test` (live state is appended by the renderer).
     pub title: String,
+    /// The job these lines belong to — answers for any other job are dropped.
+    pub job_id: String,
     pub lines: Vec<String>,
+    /// Top visible line while not following.
     pub scroll: u16,
+    /// Pinned to the bottom as lines arrive. On by default for a live job.
+    pub follow: bool,
+    /// The job was still running at the last check, so the pane is polling.
+    pub live: bool,
+    /// Visible line count of the last frame, written by the renderer so scrolling can clamp.
+    pub viewport: Cell<u16>,
+    /// The `/` prompt's text while it is open.
+    pub search_input: Option<String>,
+    /// The committed search, and the lines that match it.
+    pub query: Option<String>,
+    pub matches: Vec<usize>,
+    pub match_idx: Option<usize>,
+    /// A one-line status note, e.g. `first error at line 12`.
+    pub note: Option<String>,
+    /// The last poll failed; the lines on screen are the last good ones.
+    pub fetch_failed: bool,
+    /// At least one fetch has answered for this job.
+    pub loaded: bool,
+    /// A fetch is wanted; [`App::pump_logs`] sends it once nothing else is in flight.
+    want_fetch: bool,
+    poll_ticks: u16,
+}
+
+impl LogView {
+    /// A pane that has asked for its first fetch. `live` decides follow's default.
+    pub fn new(title: String, job_id: String, live: bool) -> Self {
+        Self {
+            title,
+            job_id,
+            lines: vec!["Loading logs…".into()],
+            scroll: 0,
+            follow: live,
+            live,
+            viewport: Cell::new(0),
+            search_input: None,
+            query: None,
+            matches: Vec::new(),
+            match_idx: None,
+            note: None,
+            fetch_failed: false,
+            loaded: false,
+            want_fetch: true,
+            poll_ticks: 0,
+        }
+    }
+
+    /// A finished pane already holding `lines` (tests and fixtures).
+    #[cfg(test)]
+    pub fn with_lines(title: &str, job_id: &str, lines: Vec<String>) -> Self {
+        let mut log = Self::new(title.into(), job_id.into(), false);
+        log.lines = lines;
+        log.loaded = true;
+        log.want_fetch = false;
+        log
+    }
+
+    /// The last line the top of the viewport can sit on. Before the first frame the viewport is
+    /// unknown, so a single line is assumed.
+    pub fn max_scroll(&self) -> u16 {
+        let vp = self.viewport.get().max(1) as usize;
+        self.lines.len().saturating_sub(vp).min(u16::MAX as usize) as u16
+    }
+
+    /// Top visible line: the bottom while following, else `scroll` clamped.
+    pub fn effective_scroll(&self) -> u16 {
+        if self.follow {
+            self.max_scroll()
+        } else {
+            self.scroll.min(self.max_scroll())
+        }
+    }
+
+    /// Scrolls by `delta` lines. Scrolling up breaks follow; scrolling down never re-arms it
+    /// (only `G`/End does).
+    fn scroll_by(&mut self, delta: i32) {
+        let cur = self.effective_scroll() as i32;
+        self.scroll = (cur + delta).clamp(0, self.max_scroll() as i32) as u16;
+        if delta < 0 {
+            self.follow = false;
+        }
+    }
+
+    fn scroll_top(&mut self) {
+        self.scroll = 0;
+        self.follow = false;
+    }
+
+    fn scroll_bottom(&mut self) {
+        self.scroll = self.max_scroll();
+        self.follow = true;
+    }
+
+    /// Brings `line` into view with a couple of lines of context above it, and stops following.
+    fn jump_to(&mut self, line: usize) {
+        self.follow = false;
+        self.scroll = line.saturating_sub(2).min(self.max_scroll() as usize) as u16;
+    }
+
+    /// Replaces the lines with a fresh fetch, keeping the tail past [`LOG_MAX_LINES`], the view
+    /// on the same content, and the current search match where it still exists.
+    pub fn set_text(&mut self, text: &str) {
+        let lines: Vec<String> =
+            if text.trim().is_empty() { vec!["(no logs returned)".into()] } else { text.lines().map(str::to_owned).collect() };
+        let (lines, dropped) = cap_tail(lines, LOG_MAX_LINES);
+        let prev_match = self.match_idx.and_then(|i| self.matches.get(i).copied());
+        self.lines = lines;
+        if !self.follow {
+            self.scroll = self.scroll.saturating_sub(dropped.min(u16::MAX as usize) as u16);
+        }
+        self.recompute_matches();
+        self.match_idx = match prev_match {
+            Some(line) if !self.matches.is_empty() => {
+                let target = line.saturating_sub(dropped);
+                Some(self.matches.iter().position(|&m| m >= target).unwrap_or(self.matches.len() - 1))
+            }
+            _ => None,
+        };
+    }
+
+    fn recompute_matches(&mut self) {
+        self.matches = match &self.query {
+            Some(q) => find_matches(&self.lines, q),
+            None => Vec::new(),
+        };
+        if self.match_idx.is_some_and(|i| i >= self.matches.len()) {
+            self.match_idx = self.matches.len().checked_sub(1);
+        }
+    }
+
+    /// Commits the `/` prompt and jumps to the first match at or below the top of the view.
+    fn commit_search(&mut self) {
+        let Some(input) = self.search_input.take() else { return };
+        self.query = (!input.is_empty()).then_some(input);
+        self.match_idx = None;
+        self.recompute_matches();
+        if self.matches.is_empty() {
+            return;
+        }
+        let top = self.effective_scroll() as usize;
+        let idx = self.matches.iter().position(|&m| m >= top).unwrap_or(0);
+        self.match_idx = Some(idx);
+        self.jump_to(self.matches[idx]);
+    }
+
+    /// `n` / `N`: the next / previous match, wrapping around.
+    fn step_match(&mut self, forward: bool) {
+        let Some(idx) = next_match_index(self.matches.len(), self.match_idx, forward) else { return };
+        self.match_idx = Some(idx);
+        self.jump_to(self.matches[idx]);
+    }
+
+    /// `E`: scrolls to the first error line and says where it was.
+    fn jump_first_error(&mut self) {
+        match first_error_line(&self.lines) {
+            Some(i) => {
+                self.jump_to(i);
+                self.note = Some(format!("first error at line {}", i + 1));
+            }
+            None => {
+                self.follow = false;
+                self.note = Some("no errors found".into());
+            }
+        }
+    }
+
+    /// One anim tick of the poll schedule; true when a fetch should go out. A live job polls
+    /// every [`LOG_POLL_TICKS`]; the tick it is first seen finished asks once more, so the tail
+    /// is complete, and after that nothing is polled.
+    pub fn poll_step(&mut self, active: bool) -> bool {
+        if !self.loaded {
+            return false; // the first fetch is still on its way
+        }
+        if active {
+            self.live = true;
+            self.poll_ticks = self.poll_ticks.saturating_add(1);
+            if self.poll_ticks >= LOG_POLL_TICKS {
+                self.poll_ticks = 0;
+                return true;
+            }
+            false
+        } else if self.live {
+            self.live = false;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Keeps the last `max` lines; returns them and how many were dropped from the front.
+pub fn cap_tail(mut lines: Vec<String>, max: usize) -> (Vec<String>, usize) {
+    let dropped = lines.len().saturating_sub(max);
+    if dropped > 0 {
+        lines.drain(..dropped);
+    }
+    (lines, dropped)
+}
+
+/// Whether a log line reports a failure: CI annotations (`##[error]`), test-runner verdicts
+/// (`[FAIL]`, `FAILED`), compiler diagnostics (`error:`, `error[E…]`, `ERROR`, `Error:`),
+/// `npm ERR!`, and a non-zero exit code. Summary lines that count zero failures (`0 errors`,
+/// `Failed: 0`, `exit code 0`) don't qualify.
+pub fn is_error_line(line: &str) -> bool {
+    if line.contains("##[error]") || line.contains("[FAIL]") || line.contains("npm ERR!") {
+        return true;
+    }
+    if has_token(line, "FAILED", |_| true) || has_token(line, "FAIL", |_| true) || has_token(line, "ERROR", |_| true) {
+        return true;
+    }
+    // Title-case verdicts (`Failed!`, `Tests Failed: 3`) — but not prose like `Failed to retry`.
+    if has_token(line, "Failed", |next| matches!(next, Some('!' | ':'))) {
+        return true;
+    }
+    if has_token(line, "error", |next| matches!(next, Some(':' | '['))) || has_token(line, "Error", |next| next == Some(':')) {
+        return true;
+    }
+    nonzero_exit_code(line)
+}
+
+/// `word` as a whole token (not inside a longer identifier) whose following character passes
+/// `next_ok`, and which isn't a zero count (`0 FAILED`, `ERROR: 0`).
+fn has_token(line: &str, word: &str, next_ok: impl Fn(Option<char>) -> bool) -> bool {
+    let is_word = |c: char| c.is_alphanumeric() || c == '_';
+    line.match_indices(word).any(|(i, _)| {
+        let before = line[..i].chars().next_back();
+        let rest = &line[i + word.len()..];
+        let after = rest.chars().next();
+        !before.is_some_and(is_word)
+            && !after.is_some_and(is_word)
+            && next_ok(after)
+            && !ends_with_zero(&line[..i])
+            && !starts_with_zero(rest)
+    })
+}
+
+/// `text` ends in the number 0 (ignoring trailing spaces), e.g. the `0 ` of `0 FAILED`.
+fn ends_with_zero(text: &str) -> bool {
+    let t = text.trim_end();
+    t.ends_with('0') && !t[..t.len() - 1].ends_with(|c: char| c.is_ascii_digit())
+}
+
+/// `text` is a count of 0 after optional `:`/`=`/spaces, e.g. the `: 0` of `ERROR: 0`.
+fn starts_with_zero(text: &str) -> bool {
+    let t = text.trim_start_matches([':', '=', ' ']);
+    t.starts_with('0') && !t[1..].starts_with(|c: char| c.is_ascii_digit())
+}
+
+/// `exit code N` / `exited with code N` (any case) with N other than 0.
+fn nonzero_exit_code(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    ["exit code", "exited with code"].iter().any(|pat| {
+        lower.match_indices(pat).any(|(i, _)| {
+            let rest = lower[i + pat.len()..].trim_start_matches([':', ' ']);
+            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            !digits.is_empty() && !digits.trim_start_matches('0').is_empty()
+        })
+    })
+}
+
+/// Index of the first line [`is_error_line`] matches.
+pub fn first_error_line(lines: &[String]) -> Option<usize> {
+    lines.iter().position(|l| is_error_line(l))
+}
+
+/// Lines containing `query`, compared ASCII-case-insensitively (so byte offsets line up with
+/// the original text for highlighting).
+pub fn find_matches(lines: &[String], query: &str) -> Vec<usize> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let q = query.to_ascii_lowercase();
+    lines.iter().enumerate().filter(|(_, l)| l.to_ascii_lowercase().contains(&q)).map(|(i, _)| i).collect()
+}
+
+/// Byte ranges of every occurrence of `query` in `line`, ASCII-case-insensitively.
+pub fn match_ranges(line: &str, query: &str) -> Vec<(usize, usize)> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let (hay, q) = (line.to_ascii_lowercase(), query.to_ascii_lowercase());
+    hay.match_indices(&q).map(|(i, m)| (i, i + m.len())).collect()
+}
+
+/// The match after (or before) `cur`, wrapping around; the first (or last) when none is current.
+pub fn next_match_index(len: usize, cur: Option<usize>, forward: bool) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    Some(match (cur, forward) {
+        (None, true) => 0,
+        (None, false) => len - 1,
+        (Some(i), true) => (i + 1) % len,
+        (Some(i), false) => (i + len - 1) % len,
+    })
+}
+
+/// The first failed node of a run as `(stage, job, step)`: a failed step when a job has one
+/// (its log names the failure most precisely), else a failed job.
+fn first_failed_node(run: &PipelineRun) -> Option<(usize, usize, Option<usize>)> {
+    for (si, stage) in run.stages.iter().enumerate() {
+        for (ji, job) in stage.jobs.iter().enumerate() {
+            if let Some(k) = job.steps.iter().position(|s| s.status == PipelineRunStatus::Failed) {
+                return Some((si, ji, Some(k)));
+            }
+            if job.status == PipelineRunStatus::Failed {
+                return Some((si, ji, None));
+            }
+        }
+    }
+    None
 }
 
 /// Formats the elapsed time between two instants (only when both are known).
@@ -1055,6 +1392,18 @@ pub struct PipelineView {
     pub selected: usize,
     /// Open log pane over a selected job, if any.
     pub logs: Option<LogView>,
+    /// Whether keys drive the log pane (true) or the tree beside it, while logs are open.
+    pub log_focus: bool,
+    /// Whether the last frame had room to draw the tree beside the logs. Written by the
+    /// renderer; when false the logs fill the pane and always have the keys.
+    pub log_split: Cell<bool>,
+    /// The user has moved the tree cursor, so no automatic selection may override it.
+    user_moved: bool,
+    /// The first-load jump to a failed node has been decided (made, or found unnecessary).
+    auto_checked: bool,
+    /// The first load selected a failed node whose logs should open once this view is the
+    /// screen (never while it only sits in the preview).
+    pub auto_logs: bool,
     /// Whether this run's provider can surface pending approvals.
     pub supports_approvals: bool,
     /// Whether the app can actually submit an approve/reject here (false = view-only,
@@ -1082,6 +1431,11 @@ impl PipelineView {
             collapsed: HashSet::new(),
             selected: 0,
             logs: None,
+            log_focus: true,
+            log_split: Cell::new(true),
+            user_moved: false,
+            auto_checked: false,
+            auto_logs: false,
             supports_approvals: false,
             can_respond_approvals: false,
             approvals: Vec::new(),
@@ -1106,6 +1460,88 @@ impl PipelineView {
         self.apply_confirmed_approvals(approvals);
         self.stale = false;
         self.clamp_selection();
+        self.auto_select_failed();
+    }
+
+    /// First load of a failed run: selects its first failed step (or, lacking one, its first
+    /// failed job), expanding the parents, and asks for its logs to open. Runs until the first
+    /// load has decided — a cache-seeded run with no stages yet waits for the live one — and
+    /// never once the user has moved the cursor.
+    fn auto_select_failed(&mut self) {
+        if self.auto_checked || self.user_moved {
+            return;
+        }
+        if self.run.status == PipelineRunStatus::Failed {
+            if let Some((si, ji, step)) = first_failed_node(&self.run) {
+                self.collapsed.remove(&format!("s{si}"));
+                if step.is_some() {
+                    self.collapsed.remove(&format!("s{si}.j{ji}"));
+                }
+                self.selected = self.node_index(si, ji, step);
+                self.auto_logs = true;
+                self.auto_checked = true;
+                return;
+            }
+        }
+        if !self.stale {
+            self.auto_checked = true;
+        }
+    }
+
+    /// Row of a job (or one of its steps) in [`PipelineView::flatten`]'s order, assuming its
+    /// stage (and, for a step, the job) is expanded.
+    fn node_index(&self, si: usize, ji: usize, step: Option<usize>) -> usize {
+        let mut idx = 0;
+        for (s, stage) in self.run.stages.iter().enumerate() {
+            idx += 1; // the stage row
+            if s < si && self.collapsed.contains(&format!("s{s}")) {
+                continue;
+            }
+            for (j, job) in stage.jobs.iter().enumerate() {
+                if s == si && j == ji {
+                    return idx + step.map_or(0, |k| k + 1);
+                }
+                idx += 1;
+                if !self.collapsed.contains(&format!("s{s}.j{j}")) {
+                    idx += job.steps.len();
+                }
+            }
+        }
+        idx
+    }
+
+    /// Whether the job the log pane follows is still running — the run's own status when the
+    /// job isn't in the tree (yet).
+    pub fn log_target_active(&self) -> bool {
+        let Some(log) = &self.logs else { return false };
+        let job = self.run.stages.iter().flat_map(|s| &s.jobs).find(|j| j.id == log.job_id);
+        is_active(job.map_or(self.run.status, |j| j.status))
+    }
+
+    /// Opens (or re-targets) the log pane on the selected node's job. Steps share their job's
+    /// log, so moving between a job and its steps keeps the pane as it is. Returns false when
+    /// the node has no job (a stage).
+    fn open_logs_for_selection(&mut self) -> bool {
+        let nodes = self.flatten();
+        let Some(node) = nodes.get(self.selected) else { return false };
+        let Some(job_id) = node.job_id.clone() else { return false };
+        if self.logs.as_ref().is_some_and(|l| l.job_id == job_id) {
+            return true;
+        }
+        let job = self.run.stages.iter().flat_map(|s| &s.jobs).find(|j| j.id == job_id);
+        let label = job.map_or_else(|| node.label.clone(), |j| j.name.clone());
+        let live = is_active(job.map_or(self.run.status, |j| j.status));
+        // A search carries over to the next job: it is usually the same question.
+        let query = self.logs.as_mut().and_then(|l| l.query.take());
+        let mut log = LogView::new(format!("Logs · {label}"), job_id, live);
+        log.query = query;
+        self.logs = Some(log);
+        true
+    }
+
+    /// Whether keys go to the log pane: it is open, and either focused or alone on screen.
+    pub fn logs_have_keys(&self) -> bool {
+        self.logs.is_some() && (self.log_focus || !self.log_split.get())
     }
 
     /// Applies gates that a `pending_approvals` call confirmed. `Some(vec![])` is authoritative
@@ -1183,6 +1619,7 @@ impl PipelineView {
         }
         let n = len as isize;
         self.selected = (((self.selected as isize + delta) % n + n) % n) as usize;
+        self.user_moved = true;
     }
 
     /// Keeps the cursor in range after the tree is refreshed.
@@ -1415,6 +1852,7 @@ impl App {
             preview_hidden: [false; 3],
             preview_focus: false,
             content_w: 0,
+            log_inflight: None,
         }
     }
 
@@ -2145,7 +2583,11 @@ impl App {
             AppEvent::PrDecorationsLoaded { items } => {
                 self.apply_pr_decorations(items, deps);
             }
+            AppEvent::PipelineLogsLoaded { conn_id, run_id, job_id, text } => {
+                self.apply_pipeline_logs(&conn_id, &run_id, &job_id, text);
+            }
         }
+        self.drive_logs(deps);
     }
 
 
@@ -3579,6 +4021,7 @@ impl App {
     pub async fn on_key(&mut self, key: Key, deps: &AppDeps) {
         self.on_key_inner(key, deps).await;
         self.settle_preview(deps);
+        self.drive_logs(deps);
     }
 
     async fn on_key_inner(&mut self, key: Key, deps: &AppDeps) {
@@ -3607,6 +4050,15 @@ impl App {
         if self.filtering {
             self.on_filter_key(key);
             return;
+        }
+        // So does the log pane's `/` prompt; and with the pane holding the keys, its `n` / `N`
+        // (next / previous match) win over the global add-connection / notifications keys.
+        if let Screen::Pipeline(v) = &self.screen {
+            let searching = v.logs.as_ref().is_some_and(|l| l.search_input.is_some());
+            if searching || (v.logs_have_keys() && matches!(key, Key::Char('n' | 'N'))) {
+                self.on_pipeline_logs_key(key);
+                return;
+            }
         }
         // Help and the notifications chooser are available anywhere.
         if key == Key::Char('?') {
@@ -3669,15 +4121,7 @@ impl App {
         // Full-screen sub-views handle their own keys.
         match self.screen {
             Screen::Pipeline(_) => {
-                // An open log pane captures scroll/close; `L` fetches logs (async).
-                let logs_open = matches!(&self.screen, Screen::Pipeline(v) if v.logs.is_some());
-                if logs_open {
-                    self.on_pipeline_logs_key(key);
-                } else if key == Key::Char('L') {
-                    self.open_pipeline_logs(deps).await;
-                } else {
-                    self.on_pipeline_key(key);
-                }
+                self.on_pipeline_screen_key(key);
                 return;
             }
             Screen::Config(_) => {
@@ -3743,7 +4187,7 @@ impl App {
             }
             Key::Char(c) => self.on_char(c, deps).await,
             // Tab is answered globally, before any screen sees it.
-            Key::Tab | Key::Backspace | Key::Ctrl(_) | Key::Quit | Key::Redraw | Key::None => {}
+            Key::Tab | Key::Backspace | Key::Ctrl(_) | Key::Quit | Key::Redraw | Key::Home | Key::End | Key::None => {}
         }
     }
 
@@ -4584,6 +5028,7 @@ impl App {
         view.supports_approvals = supports_approvals;
         view.can_respond_approvals = can_respond_approvals;
         view.stale = true;
+        view.auto_select_failed();
         (Screen::Pipeline(Box::new(view)), DetailRequest::Pipeline { conn_id, item, key })
     }
 
@@ -4763,57 +5208,184 @@ impl App {
         }
     }
 
-    /// Fetches the selected job's logs and opens the scrollable log pane.
-    async fn open_pipeline_logs(&mut self, deps: &AppDeps) {
-        let (conn_id, run_ref, job_id, title) = {
-            let Screen::Pipeline(v) = &self.screen else { return };
-            let nodes = v.flatten();
-            let node = nodes.get(v.selected);
-            let Some(job_id) = node.and_then(|n| n.job_id.clone()) else {
-                self.toast = Some("Select a job or step to view its logs".into());
-                return;
-            };
-            let label = node.map(|n| n.label.clone()).unwrap_or_default();
-            (v.connection_id.clone(), v.run.item_ref(), job_id, format!("Logs · {label}"))
-        };
-
-        self.toast = Some("Fetching logs…".into());
-        let feeds = detail_or_default(deps.sections.pipeline_feeds().await, DIAG_PIPELINE_FEEDS);
-        let text = match feeds.iter().find(|f| f.connection.connection_id() == conn_id) {
-            Some(feed) => match feed.source.logs(&run_ref, Some(&job_id)).await {
-                Ok(t) => t,
-                Err(e) => {
-                    log_operation_failure(DIAG_PIPELINE_LOGS);
-                    self.toast = Some(format!("Couldn't fetch logs: {e}"));
-                    return;
-                }
-            },
-            None => {
-                self.toast = Some("Pipeline connection not found".into());
-                return;
+    /// Keys on the drill-in. With logs open, `w` moves the keys between the tree and the log
+    /// pane; the tree keeps its own keys and re-targets the pane as the cursor crosses jobs.
+    fn on_pipeline_screen_key(&mut self, key: Key) {
+        let Screen::Pipeline(v) = &mut self.screen else { return };
+        let logs_open = v.logs.is_some();
+        if logs_open && key == Key::Char('w') {
+            if v.log_split.get() {
+                v.log_focus = !v.log_focus;
+            } else {
+                self.toast = Some(format!("Widen the terminal to {LOG_SPLIT_MIN_WIDTH}+ columns to see the tree beside the logs"));
             }
-        };
-        let lines: Vec<String> =
-            if text.trim().is_empty() { vec!["(no logs returned)".into()] } else { text.lines().map(|l| l.to_string()).collect() };
-        if let Screen::Pipeline(v) = &mut self.screen {
-            v.logs = Some(LogView { title, lines, scroll: 0 });
+            return;
         }
-        self.toast = None;
+        if v.logs_have_keys() {
+            self.on_pipeline_logs_key(key);
+            return;
+        }
+        match key {
+            Key::Char('L') if logs_open => v.logs = None,
+            Key::Escape if logs_open => v.logs = None,
+            Key::Char('L') => self.open_pipeline_logs(),
+            _ => {
+                self.on_pipeline_key(key);
+                // Moving across jobs points the open pane at the new job's log.
+                if let Screen::Pipeline(v) = &mut self.screen {
+                    if v.logs.is_some() {
+                        v.open_logs_for_selection();
+                    }
+                }
+            }
+        }
     }
 
-    /// Scroll / close keys while the log pane is open.
+    /// Opens the log pane on the selected job, focused. The fetch goes out in the background
+    /// (see [`App::pump_logs`]); the pane shows a placeholder until it answers.
+    fn open_pipeline_logs(&mut self) {
+        let Screen::Pipeline(v) = &mut self.screen else { return };
+        if !v.open_logs_for_selection() {
+            self.toast = Some("Select a job or step to view its logs".into());
+            return;
+        }
+        v.log_focus = true;
+    }
+
+    /// Keys while the log pane holds them: scroll, follow, search, jump to the first error.
     fn on_pipeline_logs_key(&mut self, key: Key) {
-        if let Screen::Pipeline(v) = &mut self.screen {
-            if let Some(log) = &mut v.logs {
-                match key {
-                    Key::Up | Key::Char('k') => log.scroll = log.scroll.saturating_sub(1),
-                    Key::Down | Key::Char('j') => log.scroll = log.scroll.saturating_add(1),
-                    Key::PageUp | Key::Char('b') => log.scroll = log.scroll.saturating_sub(15),
-                    Key::PageDown | Key::Char(' ') => log.scroll = log.scroll.saturating_add(15),
-                    Key::Escape | Key::Char('q') | Key::Char('L') => v.logs = None,
-                    _ => {}
+        let Screen::Pipeline(v) = &mut self.screen else { return };
+        let Some(log) = &mut v.logs else { return };
+        if let Some(input) = &mut log.search_input {
+            match key {
+                Key::Escape => log.search_input = None,
+                Key::Enter => log.commit_search(),
+                Key::Backspace => {
+                    input.pop();
+                }
+                Key::Char(c) => input.push(c),
+                _ => {}
+            }
+            return;
+        }
+        match key {
+            Key::Up | Key::Char('k') => log.scroll_by(-1),
+            Key::Down | Key::Char('j') => log.scroll_by(1),
+            Key::PageUp | Key::Char('b') => log.scroll_by(-15),
+            Key::PageDown | Key::Char(' ') => log.scroll_by(15),
+            Key::Home | Key::Char('g') => log.scroll_top(),
+            Key::End | Key::Char('G') => log.scroll_bottom(),
+            Key::Char('f') => {
+                if log.follow {
+                    log.follow = false;
+                    log.scroll = log.max_scroll();
+                } else {
+                    log.scroll_bottom();
                 }
             }
+            Key::Char('E') => log.jump_first_error(),
+            Key::Char('/') => log.search_input = Some(String::new()),
+            Key::Char('n' | 'N') => {
+                if log.query.is_none() {
+                    self.toast = Some("No search yet — press / to search the log".into());
+                } else if log.matches.is_empty() {
+                    self.toast = Some("No matches".into());
+                } else {
+                    log.step_match(key == Key::Char('n'));
+                }
+            }
+            Key::Escape | Key::Char('q') | Key::Char('L') => {
+                v.logs = None;
+                v.log_focus = true;
+            }
+            _ => {}
+        }
+    }
+
+    /// Keeps the drill-in's log pane fed: opens the pane a failed run's first load asked for,
+    /// and sends the fetch the pane wants once nothing else is in flight. Runs after every key,
+    /// event and anim tick; does no I/O itself.
+    fn drive_logs(&mut self, deps: &AppDeps) {
+        if let Screen::Pipeline(v) = &mut self.screen {
+            if v.auto_logs {
+                v.auto_logs = false;
+                if v.logs.is_none() && v.open_logs_for_selection() {
+                    v.log_focus = true;
+                }
+            }
+        }
+        self.pump_logs(deps);
+    }
+
+    /// Driven by the anim timer: advances the open pane's poll schedule (only while the drill-in
+    /// is the screen and its job is live), then sends whatever that asked for.
+    pub fn tick_logs(&mut self, deps: &AppDeps) {
+        if let Some((_, ticks)) = &mut self.log_inflight {
+            *ticks = ticks.saturating_add(1);
+            if *ticks >= LOG_INFLIGHT_TIMEOUT_TICKS {
+                self.log_inflight = None;
+            }
+        }
+        if let Screen::Pipeline(v) = &mut self.screen {
+            let active = v.log_target_active();
+            if let Some(log) = &mut v.logs {
+                if log.poll_step(active) {
+                    log.want_fetch = true;
+                }
+            }
+        }
+        self.drive_logs(deps);
+    }
+
+    /// Sends the log pane's wanted fetch, unless one is already in flight.
+    fn pump_logs(&mut self, deps: &AppDeps) {
+        if self.log_inflight.is_some() {
+            return;
+        }
+        let Some(tx) = self.job_tx.clone() else { return };
+        let Screen::Pipeline(v) = &mut self.screen else { return };
+        let (conn_id, run) = (v.connection_id.clone(), v.run.item_ref());
+        let Some(log) = v.logs.as_mut().filter(|l| l.want_fetch) else { return };
+        log.want_fetch = false;
+        let job_id = log.job_id.clone();
+        self.log_inflight = Some((log_fetch_key(&conn_id, &run.id, &job_id), 0));
+        let deps = deps.clone();
+        tokio::spawn(async move {
+            let feeds = detail_or_default(deps.sections.pipeline_feeds().await, DIAG_PIPELINE_FEEDS);
+            let text = match feeds.iter().find(|f| f.connection.connection_id() == conn_id) {
+                Some(feed) => feed.source.logs(&run, Some(&job_id)).await.map_err(|e| {
+                    log_operation_failure(DIAG_PIPELINE_LOGS);
+                    e.to_string()
+                }),
+                None => Err("pipeline connection not found".into()),
+            };
+            let _ = tx.send(AppEvent::PipelineLogsLoaded { conn_id, run_id: run.id, job_id, text });
+        });
+    }
+
+    /// Folds a log answer into the pane, if the pane still shows that job of that run. A first
+    /// fetch that fails closes the pane with a toast, as opening used to; a failed poll keeps the
+    /// last good lines and only marks the title, so a flaky connection doesn't spam toasts.
+    fn apply_pipeline_logs(&mut self, conn_id: &str, run_id: &str, job_id: &str, text: std::result::Result<String, String>) {
+        if self.log_inflight.as_ref().is_some_and(|(k, _)| *k == log_fetch_key(conn_id, run_id, job_id)) {
+            self.log_inflight = None;
+        }
+        let Screen::Pipeline(v) = &mut self.screen else { return };
+        if v.connection_id != conn_id || v.run.id != run_id {
+            return;
+        }
+        let Some(log) = v.logs.as_mut().filter(|l| l.job_id == job_id) else { return };
+        match text {
+            Ok(text) => {
+                log.set_text(&text);
+                log.loaded = true;
+                log.fetch_failed = false;
+            }
+            Err(e) if !log.loaded => {
+                v.logs = None;
+                self.toast = Some(format!("Couldn't fetch logs: {e}"));
+            }
+            Err(_) => log.fetch_failed = true,
         }
     }
 
@@ -5890,6 +6462,11 @@ fn new_pipeline_failures<'a>(prev: &HashMap<String, PipelineRunStatus>, pipes: &
         .collect()
 }
 
+/// Identifies one job's log fetch, to match an answer to the fetch that is in flight.
+fn log_fetch_key(conn_id: &str, run_id: &str, job_id: &str) -> String {
+    format!("{conn_id}\u{1f}{run_id}\u{1f}{job_id}")
+}
+
 /// Whether a run is still in flight (only these can be waiting on an approval gate).
 fn is_active(status: PipelineRunStatus) -> bool {
     matches!(status, PipelineRunStatus::Queued | PipelineRunStatus::Running)
@@ -6157,6 +6734,8 @@ pub enum Key {
     Backspace,
     PageUp,
     PageDown,
+    Home,
+    End,
     Char(char),
     /// A Ctrl-modified letter (lowercased), e.g. Ctrl-P. Ctrl-C is mapped to [`Key::Quit`].
     Ctrl(char),
@@ -8389,7 +8968,7 @@ mod tests {
 
         // The log pane scrolls and closes on Esc.
         if let Screen::Pipeline(v) = &mut app.screen {
-            v.logs = Some(LogView { title: "Logs".into(), lines: vec!["x".into(); 50], scroll: 0 });
+            v.logs = Some(LogView::with_lines("Logs", "j1", vec!["x".into(); 50]));
         }
         app.on_pipeline_logs_key(Key::Down);
         app.on_pipeline_logs_key(Key::Down);
@@ -9874,7 +10453,7 @@ mod tests {
         );
         let key = pipeline_detail_cache_key("c", &run.item_ref());
         let mut view = PipelineView::new("CI".into(), run.clone(), "c".into(), ProviderType::GitHub, "ci".into(), None);
-        view.logs = Some(LogView { title: "Logs · j1".into(), lines: vec!["hello".into()], scroll: 3 });
+        view.logs = Some(LogView::with_lines("Logs · j1", "j1", vec!["hello".into()]));
         view.toggle_selected(); // collapses the "build" stage row (selected starts at 0)
         assert!(view.collapsed.contains("s0"), "sanity: the stage collapsed");
         app.screen = Screen::Pipeline(Box::new(view));
@@ -11020,4 +11599,289 @@ mod tests {
         let title_row = screen.iter().find(|r| r.contains("Pull Requests ·")).expect("list title");
         assert!(title_row.contains("PR #1"), "the preview's header sits beside the list's: {title_row}");
     }
+
+    // ---- live logs ----
+
+    fn lines(v: &[&str]) -> Vec<String> {
+        v.iter().map(|l| l.to_string()).collect()
+    }
+
+    fn log_app(log: LogView, status: PipelineRunStatus) -> App {
+        let mut app = App::new("slate");
+        let run = pipeline_run("1", status, vec![pipeline_stage("build", status, vec![pipeline_job("j1", status)])]);
+        let mut view = PipelineView::new("CI".into(), run, "c".into(), ProviderType::GitHub, "ci".into(), None);
+        view.logs = Some(log);
+        app.screen = Screen::Pipeline(Box::new(view));
+        app
+    }
+
+    fn open_log(app: &App) -> &LogView {
+        let Screen::Pipeline(v) = &app.screen else { panic!("expected Pipeline") };
+        v.logs.as_ref().expect("log pane open")
+    }
+
+    #[test]
+    fn error_line_matcher_catches_failures_and_skips_zero_counts() {
+        for line in [
+            "##[error]Process completed with exit code 1.",
+            "  [FAIL] MyTests.Adds",
+            "Build FAILED.",
+            "error: could not compile `app`",
+            "error[E0308]: mismatched types",
+            "[ERROR] Failed to execute goal",
+            "Error: Cannot find module 'x'",
+            "Process completed with exit code 2.",
+            "container exited with code 137",
+            "npm ERR! code ELIFECYCLE",
+            "Failed!  - Failed: 1, Passed: 97, Skipped: 0",
+            "Tests Failed: 3",
+            "FAIL src/cart.test.ts",
+        ] {
+            assert!(is_error_line(line), "should match: {line}");
+        }
+        for line in [
+            "Build succeeded. 0 errors, 0 warnings",
+            "Failed: 0, Passed: 12, Skipped: 0",
+            "Process completed with exit code 0.",
+            "exited with code 0",
+            "0 FAILED",
+            "ERROR: 0",
+            "handle_error(x)",
+            "TERRORS",
+            "no errors here",
+            "Passed!  - Failed: 0, Passed: 212, Skipped: 0",
+            "Retrying: Failed to reach host, attempt 2",
+            "PASS src/cart.test.ts",
+        ] {
+            assert!(!is_error_line(line), "should not match: {line}");
+        }
+    }
+
+    #[test]
+    fn first_error_line_finds_the_first_match_or_none() {
+        assert_eq!(first_error_line(&lines(&["ok", "0 errors", "error: boom", "FAILED"])), Some(2));
+        assert_eq!(first_error_line(&lines(&["ok", "fine"])), None);
+        assert_eq!(first_error_line(&[]), None);
+    }
+
+    #[test]
+    fn search_steps_through_matches_with_wraparound() {
+        assert_eq!(next_match_index(0, None, true), None);
+        assert_eq!(next_match_index(3, None, true), Some(0));
+        assert_eq!(next_match_index(3, None, false), Some(2));
+        assert_eq!(next_match_index(3, Some(2), true), Some(0), "wraps forward");
+        assert_eq!(next_match_index(3, Some(0), false), Some(2), "wraps backward");
+
+        let mut log = LogView::with_lines("Logs", "j1", lines(&["a", "Failed one", "b", "FAILED two", "c", "failed three"]));
+        log.search_input = Some("failed".into());
+        log.commit_search();
+        assert_eq!(log.matches, vec![1, 3, 5], "case-insensitive");
+        assert_eq!(log.match_idx, Some(0));
+        log.step_match(true);
+        log.step_match(true);
+        assert_eq!(log.match_idx, Some(2));
+        log.step_match(true);
+        assert_eq!(log.match_idx, Some(0), "n wraps to the first match");
+        log.step_match(false);
+        assert_eq!(log.match_idx, Some(2), "N wraps to the last match");
+        assert_eq!(match_ranges("a FaIlEd b failed", "failed"), vec![(2, 8), (11, 17)]);
+    }
+
+    #[test]
+    fn new_lines_keep_the_current_match_and_the_line_cap_keeps_the_tail() {
+        let (kept, dropped) = cap_tail((0..12).map(|i| i.to_string()).collect(), 10);
+        assert_eq!(dropped, 2);
+        assert_eq!(kept.first().map(String::as_str), Some("2"), "the head is dropped");
+        assert_eq!(kept.last().map(String::as_str), Some("11"), "the tail is kept");
+
+        let mut log = LogView::with_lines("Logs", "j1", lines(&["x hit", "y", "z hit"]));
+        log.query = Some("hit".into());
+        log.recompute_matches();
+        log.step_match(true);
+        log.step_match(true);
+        assert_eq!(log.match_idx, Some(1));
+        log.set_text("x hit\ny\nz hit\nw hit");
+        assert_eq!(log.matches, vec![0, 2, 3]);
+        assert_eq!(log.match_idx, Some(1), "still on `z hit` after new lines arrive");
+
+        let big: String = (0..LOG_MAX_LINES + 5).map(|i| format!("line {i}\n")).collect();
+        log.set_text(&big);
+        assert_eq!(log.lines.len(), LOG_MAX_LINES);
+        assert_eq!(log.lines.last().map(String::as_str), Some(format!("line {}", LOG_MAX_LINES + 4).as_str()));
+    }
+
+    #[test]
+    fn scrolling_up_or_jumping_turns_follow_off_and_end_turns_it_on() {
+        let many: Vec<String> = (0..100).map(|i| if i == 40 { "error: boom".into() } else { format!("l{i}") }).collect();
+        let mut app = log_app(LogView::with_lines("Logs", "j1", many), PipelineRunStatus::Running);
+        let follow = |app: &App| open_log(app).follow;
+        if let Screen::Pipeline(v) = &mut app.screen {
+            let log = v.logs.as_mut().unwrap();
+            log.viewport.set(10);
+            log.follow = true;
+        }
+        assert_eq!(open_log(&app).effective_scroll(), 90, "following pins the view to the bottom");
+        app.on_pipeline_logs_key(Key::Up);
+        assert!(!follow(&app), "scrolling up stops following");
+        assert_eq!(open_log(&app).effective_scroll(), 89);
+        app.on_pipeline_logs_key(Key::Char('G'));
+        assert!(follow(&app), "G follows again");
+        app.on_pipeline_logs_key(Key::Char('E'));
+        assert!(!follow(&app), "E stops following");
+        assert_eq!(open_log(&app).effective_scroll(), 38, "the error line with two lines of context above");
+        assert_eq!(open_log(&app).note.as_deref(), Some("first error at line 41"));
+        app.on_pipeline_logs_key(Key::End);
+        app.on_pipeline_logs_key(Key::Char('/'));
+        for c in "l7".chars() {
+            app.on_pipeline_logs_key(Key::Char(c));
+        }
+        app.on_pipeline_logs_key(Key::Enter);
+        assert!(!follow(&app), "a search jump stops following");
+        app.on_pipeline_logs_key(Key::Char('f'));
+        assert!(follow(&app), "f toggles follow back on");
+        app.on_pipeline_logs_key(Key::Char('n'));
+        assert!(!follow(&app), "n stops following");
+        app.on_pipeline_logs_key(Key::Home);
+        assert_eq!(open_log(&app).effective_scroll(), 0);
+
+        // Nothing to scroll must not panic.
+        let mut log = LogView::with_lines("Logs", "j1", vec![]);
+        log.scroll_by(-5);
+        log.scroll_by(5);
+        log.jump_first_error();
+        log.step_match(true);
+        assert_eq!(log.effective_scroll(), 0);
+        assert_eq!(log.note.as_deref(), Some("no errors found"));
+    }
+
+    #[test]
+    fn polling_is_requested_only_while_the_job_is_active() {
+        let mut live = LogView::with_lines("Logs", "j1", vec![]);
+        live.live = true;
+        let polls = (0..LOG_POLL_TICKS * 2).filter(|_| live.poll_step(true)).count();
+        assert_eq!(polls, 2, "one poll per interval while live");
+        assert!(live.poll_step(false), "one final fetch once the job finishes, for the full tail");
+        assert!(!(0..LOG_POLL_TICKS * 3).any(|_| live.poll_step(false)), "then never again");
+
+        let mut done = LogView::with_lines("Logs", "j1", vec![]);
+        assert!(!(0..LOG_POLL_TICKS * 3).any(|_| done.poll_step(false)), "a finished job is never polled");
+
+        let mut loading = LogView::new("Logs".into(), "j1".into(), true);
+        assert!(!(0..LOG_POLL_TICKS * 3).any(|_| loading.poll_step(true)), "no poll before the first fetch lands");
+
+        // The drill-in's job status drives it.
+        let app = log_app(LogView::with_lines("Logs", "j1", vec![]), PipelineRunStatus::Running);
+        let Screen::Pipeline(v) = &app.screen else { panic!() };
+        assert!(v.log_target_active());
+        let app = log_app(LogView::with_lines("Logs", "j1", vec![]), PipelineRunStatus::Failed);
+        let Screen::Pipeline(v) = &app.screen else { panic!() };
+        assert!(!v.log_target_active());
+    }
+
+    #[test]
+    fn a_log_answer_for_another_job_or_run_is_dropped() {
+        let mut app = log_app(LogView::new("Logs".into(), "j1".into(), true), PipelineRunStatus::Running);
+        app.apply_pipeline_logs("c", "1", "j2", Ok("other job".into()));
+        app.apply_pipeline_logs("c", "2", "j1", Ok("other run".into()));
+        app.apply_pipeline_logs("other", "1", "j1", Ok("other connection".into()));
+        assert!(!open_log(&app).loaded, "no stale answer lands");
+        app.apply_pipeline_logs("c", "1", "j1", Ok("mine".into()));
+        assert_eq!(open_log(&app).lines, lines(&["mine"]));
+
+        // A failed poll keeps the last good lines and says so quietly.
+        app.apply_pipeline_logs("c", "1", "j1", Err("timeout".into()));
+        assert_eq!(open_log(&app).lines, lines(&["mine"]));
+        assert!(open_log(&app).fetch_failed);
+        assert!(app.toast.is_none(), "a failed poll doesn't toast");
+
+        // A failed first fetch closes the pane with a toast, as opening always did.
+        let mut app = log_app(LogView::new("Logs".into(), "j1".into(), true), PipelineRunStatus::Running);
+        app.apply_pipeline_logs("c", "1", "j1", Err("nope".into()));
+        let Screen::Pipeline(v) = &app.screen else { panic!() };
+        assert!(v.logs.is_none());
+        assert!(app.toast.as_deref().is_some_and(|t| t.contains("nope")));
+    }
+
+    #[test]
+    fn tree_moves_retarget_the_log_pane_only_across_jobs() {
+        let mut job1 = pipeline_job("j1", PipelineRunStatus::Succeeded);
+        job1.steps = vec![PipelineStep { name: "s".into(), status: PipelineRunStatus::Succeeded, started_at: None, finished_at: None }];
+        let job2 = pipeline_job("j2", PipelineRunStatus::Running);
+        let run = pipeline_run("1", PipelineRunStatus::Running, vec![pipeline_stage("build", PipelineRunStatus::Running, vec![job1, job2])]);
+        let mut app = App::new("slate");
+        app.screen = Screen::Pipeline(Box::new(PipelineView::new("CI".into(), run, "c".into(), ProviderType::GitHub, "ci".into(), None)));
+        app.on_pipeline_screen_key(Key::Down); // → job j1
+        app.on_pipeline_screen_key(Key::Char('L'));
+        assert_eq!(open_log(&app).job_id, "j1");
+        assert!(!open_log(&app).follow, "a finished job doesn't follow");
+        app.on_pipeline_screen_key(Key::Char('w')); // keys to the tree
+        if let Screen::Pipeline(v) = &mut app.screen {
+            v.logs.as_mut().unwrap().loaded = true;
+        }
+        app.on_pipeline_screen_key(Key::Down); // → j1's step: same job, pane untouched
+        assert!(open_log(&app).loaded, "a step of the same job doesn't refetch");
+        app.on_pipeline_screen_key(Key::Down); // → job j2
+        assert_eq!(open_log(&app).job_id, "j2");
+        assert!(!open_log(&app).loaded && open_log(&app).follow, "a new, live job loads and follows");
+        app.on_pipeline_screen_key(Key::Escape);
+        let Screen::Pipeline(v) = &app.screen else { panic!("Esc from the tree closes the logs, not the view") };
+        assert!(v.logs.is_none());
+    }
+
+    #[test]
+    fn a_failed_run_selects_its_failed_step_on_first_load_only() {
+        let mut job = pipeline_job("j2", PipelineRunStatus::Failed);
+        job.steps = vec![
+            PipelineStep { name: "restore".into(), status: PipelineRunStatus::Succeeded, started_at: None, finished_at: None },
+            PipelineStep { name: "test".into(), status: PipelineRunStatus::Failed, started_at: None, finished_at: None },
+        ];
+        let run = pipeline_run(
+            "1",
+            PipelineRunStatus::Failed,
+            vec![
+                pipeline_stage("build", PipelineRunStatus::Succeeded, vec![pipeline_job("j1", PipelineRunStatus::Succeeded)]),
+                pipeline_stage("test", PipelineRunStatus::Failed, vec![job]),
+            ],
+        );
+        let mut view = PipelineView::new("CI".into(), run.clone(), "c".into(), ProviderType::GitHub, "ci".into(), None);
+        view.collapsed.insert("s1".into());
+        view.collapsed.insert("s1.j0".into());
+        view.stale = true;
+        view.auto_select_failed();
+        let nodes = view.flatten();
+        assert_eq!(nodes[view.selected].label, "test", "the failed step, parents expanded");
+        assert_eq!(nodes[view.selected].depth, 2);
+        assert!(view.auto_logs, "its logs are asked to open");
+
+        // Later loads leave the user's cursor alone.
+        view.move_sel(-1);
+        let moved = view.selected;
+        view.apply_fresh_run(run.clone(), None);
+        assert_eq!(view.selected, moved);
+
+        // A run confirmed running at first load isn't jumped when it fails later.
+        let mut running = run.clone();
+        running.status = PipelineRunStatus::Running;
+        let mut view = PipelineView::new("CI".into(), running.clone(), "c".into(), ProviderType::GitHub, "ci".into(), None);
+        view.stale = true;
+        view.auto_select_failed(); // the cache-seeded open
+        view.apply_fresh_run(running, None); // the first live load
+        view.apply_fresh_run(run, None); // a later refresh finds it failed
+        assert_eq!(view.selected, 0);
+        assert!(!view.auto_logs);
+    }
+
+    #[tokio::test]
+    async fn opening_a_failed_run_opens_the_failed_jobs_logs() {
+        let deps = deps_with_cache(memory_cache());
+        let mut app = App::new("slate");
+        let fallback = failed_run();
+        app.open_pipeline_for(&deps, "c".into(), ProviderType::GitHub, "r1".into(), "ci".into(), None, "CI".into(), fallback);
+        app.drive_logs(&deps);
+        let Screen::Pipeline(v) = &app.screen else { panic!() };
+        assert_eq!(v.flatten()[v.selected].label, "unit");
+        assert_eq!(v.logs.as_ref().map(|l| l.job_id.as_str()), Some("j1"));
+        assert!(v.log_focus);
+    }
+
 }

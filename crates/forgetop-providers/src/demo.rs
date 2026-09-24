@@ -993,6 +993,195 @@ impl WorkItemSource for DemoWi {
     }
 }
 
+/// Believable per-job demo logs, keyed by job id (`j1`/`j10` compile, `j2` the live-running
+/// `dotnet test`, `j11` a finished `dotnet test`, `j12` the failing integration suite, `j20`
+/// a deploy) so a "live logs" feature (follow mode, jump-to-first-error, search) has something
+/// real to demonstrate. Fixed timestamps keep everything deterministic except [`unit_log_growing`].
+fn job_log(job_id: &str) -> String {
+    match job_id {
+        "j1" | "j10" => compile_log(),
+        "j2" => unit_log_growing(),
+        "j11" => unit_log_succeeded(),
+        "j12" => integration_log_failed(),
+        "j20" => deploy_log(),
+        other => generic_log(other),
+    }
+}
+
+fn compile_log() -> String {
+    concat!(
+        "09:36:40  Restoring NuGet packages...\n",
+        "09:36:44  Restored /src/Northwind.sln (in 3.6s)\n",
+        "09:36:45  Northwind.Domain -> bin/Debug/net8.0/Northwind.Domain.dll\n",
+        "09:36:52  Northwind.Infrastructure -> bin/Debug/net8.0/Northwind.Infrastructure.dll\n",
+        "09:37:01  Northwind.Api -> bin/Debug/net8.0/Northwind.Api.dll\n",
+        "09:37:01  Build succeeded.\n",
+        "09:37:01      0 Warning(s)\n",
+        "09:37:01      0 Error(s)\n",
+        "09:37:01  Time Elapsed 00:00:21.44\n",
+    )
+    .to_string()
+}
+
+fn unit_log_succeeded() -> String {
+    concat!(
+        "09:41:40  Restoring NuGet packages...\n",
+        "09:41:41  Restore complete (0.8s)\n",
+        "09:41:41  Northwind.Orders.Tests -> bin/Debug/net8.0/Northwind.Orders.Tests.dll\n",
+        "09:41:42  Starting test execution, please wait...\n",
+        "09:41:42  A total of 1 test files matched the specified pattern.\n",
+        "09:41:43  [xUnit.net 00:00:00.91]   Discovering: Northwind.Orders.Tests\n",
+        "09:41:43  [xUnit.net 00:00:00.98]   Discovered:  Northwind.Orders.Tests\n",
+        "09:41:43  [xUnit.net 00:00:00.99]   Starting:    Northwind.Orders.Tests\n",
+        "09:41:45    Passed OrderServiceTests.CreatesOrder_WithValidItems [12 ms]\n",
+        "09:41:45    Passed OrderServiceTests.RejectsOrder_WithNoItems [3 ms]\n",
+        "09:41:46    Passed OrderServiceTests.AppliesDiscountCode [9 ms]\n",
+        "09:41:47    Passed OrderServiceTests.RecalculatesTotals_OnLineItemChange [14 ms]\n",
+        "09:41:48  [xUnit.net 00:00:05.60]   Finished:    Northwind.Orders.Tests\n",
+        "09:41:48  Passed!  - Failed: 0, Passed: 64, Skipped: 0, Total: 64, Duration: 6 s - Northwind.Orders.Tests.dll\n",
+    )
+    .to_string()
+}
+
+/// The failing job (j12, run r500) — a realistic xUnit failure a matcher can find: a `[FAIL]`
+/// line with `Assert.InRange` detail and a stack line, a `Failed!` summary, and a final
+/// `##[error]` line. Also includes lines that look error-ish but aren't (a clean `Passed!`
+/// summary and a "0 errors" build line) to exercise the false-positive side of the matcher.
+fn integration_log_failed() -> String {
+    concat!(
+        "09:41:10  Restoring NuGet packages...\n",
+        "09:41:12  Restore complete (1.8s)\n",
+        "09:41:12  Building Northwind.Integration.Tests -> bin/Debug/net8.0/Northwind.Integration.Tests.dll\n",
+        "09:41:18  Build succeeded. 0 errors, 2 warnings\n",
+        "09:41:19  Starting test execution, please wait...\n",
+        "09:41:19  A total of 2 test files matched the specified pattern.\n",
+        "09:41:20  [xUnit.net 00:00:00.87]   Discovering: Northwind.Cart.Tests\n",
+        "09:41:20  [xUnit.net 00:00:00.95]   Discovered:  Northwind.Cart.Tests\n",
+        "09:41:20  [xUnit.net 00:00:00.96]   Starting:    Northwind.Cart.Tests\n",
+        "09:41:22    Passed CartTests.test_add_item [41 ms]\n",
+        "09:41:22    Passed CartTests.test_remove_item [18 ms]\n",
+        "09:41:24    Passed InventoryTests.test_reserve_stock [55 ms]\n",
+        "09:41:24    Passed InventoryTests.test_release_stock [22 ms]\n",
+        "09:41:28  [xUnit.net 00:00:08.10]   Finished:    Northwind.Cart.Tests\n",
+        "09:41:28  Passed!  - Failed: 0, Passed: 212, Skipped: 0, Total: 212, Duration: 8 s - Northwind.Cart.Tests.dll\n",
+        "09:41:29  [xUnit.net 00:00:09.00]   Starting:    Northwind.Integration.Tests\n",
+        "09:41:31    Passed RefundTests.test_partial_refund [19 ms]\n",
+        "09:41:31    Passed CheckoutFlowTests.test_apply_discount [30 ms]\n",
+        "09:41:33  [FAIL] CheckoutFlowTests.test_checkout_flow [812 ms]\n",
+        "09:41:33    Assert.InRange() Failure: Value not in range\n",
+        "09:41:33    Expected: value in range (200, 299]\n",
+        "09:41:33    Actual: 503\n",
+        "09:41:33       at Northwind.Integration.Tests.CheckoutFlowTests.test_checkout_flow() in /src/tests/Northwind.Integration.Tests/CheckoutFlowTests.cs:line 47\n",
+        "09:41:33    ----- Inner Stack Trace -----\n",
+        "09:41:33       at System.Net.Http.HttpClient.SendAsync(HttpRequestMessage request)\n",
+        "09:41:35    Passed RefundTests.test_refund [19 ms]\n",
+        "09:41:36  [xUnit.net 00:00:16.40]   Finished:    Northwind.Integration.Tests\n",
+        "09:41:36  Failed!  - Failed: 1, Passed: 97, Skipped: 0, Total: 98, Duration: 16 s - Northwind.Integration.Tests.dll\n",
+        "09:41:36  ##[error]Process completed with exit code 1.\n",
+    )
+    .to_string()
+}
+
+fn deploy_log() -> String {
+    concat!(
+        "09:50:01  Initializing the backend...\n",
+        "09:50:02  Initializing provider plugins...\n",
+        "09:50:04  Terraform has been successfully initialized!\n",
+        "09:50:05  terraform plan -out=tfplan\n",
+        "09:50:09  Plan: 3 to add, 1 to change, 0 to destroy.\n",
+        "09:50:10  terraform apply tfplan\n",
+        "09:50:22  aws_ecs_service.api: Modifying...\n",
+        "09:50:40  aws_ecs_service.api: Modifications complete after 18s\n",
+        "09:50:41  Apply complete! Resources: 3 added, 1 changed, 0 destroyed.\n",
+        "09:50:42  kubectl rollout status deployment/api -n production\n",
+        "09:50:55  deployment \"api\" successfully rolled out\n",
+    )
+    .to_string()
+}
+
+/// A plausible-but-generic log for a job id/name we don't have a scripted log for.
+fn generic_log(job_id: &str) -> String {
+    let mut out = format!("09:30:00  Starting job {job_id}...\n");
+    for i in 1..=18 {
+        out.push_str(&format!("09:30:{i:02}  step output line {i}\n"));
+    }
+    out.push_str("09:30:19  Done. All steps completed successfully.\n");
+    out
+}
+
+/// Process-wide start instant for the demo's one "live" job (r501/j2's `dotnet test` step,
+/// which stays Running for the life of the `--demo` session) — [`unit_log_growing`] measures
+/// elapsed time against this so the log starts short and grows the longer `--demo` runs.
+fn demo_start() -> std::time::Instant {
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    *START.get_or_init(std::time::Instant::now)
+}
+
+/// Scripted lines revealed one at a time as the growing `dotnet test` log (job j2, run r501)
+/// plays out — roughly one every 2 seconds of elapsed demo time (see [`growth_line_count`]).
+fn dotnet_test_script() -> &'static [&'static str] {
+    &[
+        "09:38:02  Restoring NuGet packages...",
+        "09:38:03  Restore complete (0.9s)",
+        "09:38:03  Northwind.Orders.Tests -> bin/Debug/net8.0/Northwind.Orders.Tests.dll",
+        "09:38:04  Starting test execution, please wait...",
+        "09:38:04  A total of 3 test files matched the specified pattern.",
+        "09:38:05  [xUnit.net 00:00:01.02]   Discovering: Northwind.Orders.Tests",
+        "09:38:05  [xUnit.net 00:00:01.10]   Discovered:  Northwind.Orders.Tests",
+        "09:38:05  [xUnit.net 00:00:01.11]   Starting:    Northwind.Orders.Tests",
+        "09:38:07    Passed OrderServiceTests.CreatesOrder_WithValidItems [12 ms]",
+        "09:38:07    Passed OrderServiceTests.RejectsOrder_WithNoItems [3 ms]",
+        "09:38:09    Passed OrderServiceTests.AppliesDiscountCode [9 ms]",
+        "09:38:09  [xUnit.net 00:00:05.40]   Finished:    Northwind.Orders.Tests",
+        "09:38:10  [xUnit.net 00:00:05.90]   Starting:    Northwind.Payments.Tests",
+        "09:38:12    Passed PaymentGatewayTests.ChargesCard_WithValidToken [22 ms]",
+        "09:38:12    Passed PaymentGatewayTests.RefundsFullAmount [15 ms]",
+        "09:38:14    Passed PaymentGatewayTests.HandlesGatewayTimeout [201 ms]",
+        "09:38:14  [xUnit.net 00:00:09.70]   Finished:    Northwind.Payments.Tests",
+        "09:38:15  [xUnit.net 00:00:10.10]   Starting:    Northwind.Webhooks.Tests",
+        "09:38:17    Passed WebhookRetryQueueTests.Enqueues_OnTransientFailure [8 ms]",
+        "09:38:17    Passed WebhookRetryQueueTests.DropsAfter_MaxAttempts [4 ms]",
+        "09:38:19    Passed WebhookRetryQueueTests.BackoffIsExponential [61 ms]",
+        "09:38:19    Passed WebhookRetryQueueTests.PersistsDeadLetterOnFinalFailure [11 ms]",
+    ]
+}
+
+/// Pure elapsed-seconds -> revealed-line-count for the growing log, so growth is testable
+/// without sleeping: about one new line every 2 seconds, capped so a long-lived `--demo`
+/// session can't grow the log unboundedly.
+fn growth_line_count(elapsed_secs: u64) -> usize {
+    const CAP: usize = 300;
+    ((1 + elapsed_secs / 2) as usize).min(CAP)
+}
+
+/// Builds the growing log for `elapsed_secs` of elapsed time — the scripted lines first, then
+/// (once the script is exhausted) periodic "still running" progress lines, so the log keeps
+/// growing for as long as the job stays Running.
+fn unit_log_growing_at(elapsed_secs: u64) -> String {
+    let script = dotnet_test_script();
+    let n = growth_line_count(elapsed_secs);
+    let mut out = String::new();
+    for line in script.iter().take(n) {
+        out.push_str(line);
+        out.push('\n');
+    }
+    if n > script.len() {
+        let mut completed: u32 = 22; // tests completed by the end of the scripted portion
+        for k in 0..(n - script.len()) {
+            completed += 1;
+            let sec = 20 + (k % 40);
+            out.push_str(&format!("09:39:{sec:02}  Still running… {completed} tests completed\n"));
+        }
+    }
+    out
+}
+
+/// The growing log for the running job (j2, run r501) — grows with real elapsed time since
+/// `--demo` started (see [`demo_start`]), so a "follow mode" feature has something to follow.
+fn unit_log_growing() -> String {
+    unit_log_growing_at(demo_start().elapsed().as_secs())
+}
+
 struct DemoPipe {
     conn: String,
 }
@@ -1019,17 +1208,28 @@ impl PipelineSource for DemoPipe {
     }
     async fn logs(&self, run: &ItemRef, job_id: Option<&str>) -> Result<String> {
         let run_id: &str = &run.id;
-        let job = job_id.unwrap_or("job");
-        let mut out = format!("=== logs for run {run_id} · {job} ===\n");
-        for i in 1..=24 {
-            out.push_str(&format!("[00:{i:02}] step output line {i}\n"));
+        if let Some(job) = job_id {
+            let mut out = format!("=== logs for run {run_id} · {job} ===\n");
+            out.push_str(&job_log(job));
+            return Ok(out);
         }
-        if job == "j12" {
-            out.push_str("ERROR: integration suite failed: 2 tests failed\n");
-            out.push_str("  - test_checkout_flow\n  - test_refund\n");
-            out.push_str("Process exited with code 1\n");
-        } else {
-            out.push_str("Done. All steps completed successfully.\n");
+        // No job specified: a sensible whole-run log — concatenate each job's log in order.
+        let job_ids: &[&str] = match run_id {
+            "r501" => &["j1", "j2"],
+            "r500" => &["j10", "j11", "j12"],
+            "r207" => &["j20"],
+            _ => &[],
+        };
+        if job_ids.is_empty() {
+            let mut out = format!("=== logs for run {run_id} ===\n");
+            out.push_str(&job_log(run_id));
+            return Ok(out);
+        }
+        let mut out = String::new();
+        for job in job_ids {
+            out.push_str(&format!("=== job {job} ===\n"));
+            out.push_str(&job_log(job));
+            out.push('\n');
         }
         Ok(out)
     }
@@ -1383,6 +1583,43 @@ mod tests {
         let test = run.stages.iter().find(|s| s.name == "test").unwrap();
         let integ = test.jobs.iter().find(|j| j.name == "integration").unwrap();
         assert!(integ.steps.iter().any(|s| matches!(s.status, PipelineRunStatus::Failed)));
+    }
+
+    #[tokio::test]
+    async fn failed_job_log_has_an_error_marker() {
+        let src = conn().pipelines().unwrap();
+        let log = src.logs(&ItemRef::new("r500"), Some("j12")).await.unwrap();
+        assert!(log.contains("##[error]"), "failing job's log should carry an error marker: {log}");
+        assert!(log.contains("test_checkout_flow"), "keeps the gist of the original failure");
+        assert!(log.contains("Failed!  - Failed: 1, Passed: 97"), "a realistic failure summary line");
+    }
+
+    #[tokio::test]
+    async fn succeeded_job_logs_have_no_error_marker() {
+        let src = conn().pipelines().unwrap();
+        for (run_id, job_id) in [("r500", "j10"), ("r500", "j11"), ("r207", "j20")] {
+            let log = src.logs(&ItemRef::new(run_id), Some(job_id)).await.unwrap();
+            assert!(!log.contains("##[error]"), "{job_id}'s log should not carry an error marker: {log}");
+        }
+    }
+
+    #[test]
+    fn growing_log_is_non_empty_and_grows_with_elapsed_time() {
+        let at_start = unit_log_growing_at(0);
+        assert!(!at_start.is_empty(), "the running job's log should never be empty");
+        let later = unit_log_growing_at(60);
+        assert!(later.len() >= at_start.len(), "the log should grow (or hold steady) as time passes");
+        assert!(later.len() > at_start.len(), "60s in, the log should have grown past the first tick");
+    }
+
+    #[test]
+    fn growing_log_keeps_growing_past_the_scripted_lines() {
+        // Long after the scripted lines run out, it should still be producing fresh content
+        // (the "still running" tail), not stalling.
+        let mid = unit_log_growing_at(120);
+        let far = unit_log_growing_at(600);
+        assert!(far.len() > mid.len());
+        assert!(far.contains("Still running…"));
     }
 
     #[tokio::test]
