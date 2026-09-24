@@ -1637,6 +1637,18 @@ impl App {
         self.active_state().select((len > 0).then_some(0));
     }
 
+    /// Esc / `q` on a section list: clear an active quick filter first, otherwise step back to
+    /// the Command Center. Neither key quits — leaving the app is Ctrl-C, so a stray keypress
+    /// can't tear down a session.
+    fn leave_section_list(&mut self) {
+        if self.filters[self.active].is_empty() {
+            self.screen = Screen::Launchpad;
+        } else {
+            self.filters[self.active].clear();
+            self.reset_filter_selection();
+        }
+    }
+
     /// Handles keys while the quick-filter input is open.
     fn on_filter_key(&mut self, key: Key) {
         match key {
@@ -2160,7 +2172,8 @@ impl App {
 
     async fn on_launchpad_key(&mut self, key: Key, deps: &AppDeps) {
         match key {
-            Key::Char('q') => self.should_quit = true,
+            // No `q` / Esc arm: the Command Center is the root, so "back" has nowhere to go.
+            // Neither key quits — leaving the app is Ctrl-C.
             Key::Up | Key::Char('k') => self.lp_move(-1),
             Key::Down | Key::Char('j') => self.lp_move(1),
             // Left/right move between the two columns; Tab (handled globally) leaves for the
@@ -3379,15 +3392,7 @@ impl App {
         }
 
         match key {
-            // Esc clears an active quick filter first, then quits.
-            Key::Escape => {
-                if self.filters[self.active].is_empty() {
-                    self.should_quit = true;
-                } else {
-                    self.filters[self.active].clear();
-                    self.reset_filter_selection();
-                }
-            }
+            Key::Escape => self.leave_section_list(),
             Key::Left => self.switch_tab(-1),
             Key::Right => self.switch_tab(1),
             Key::Up => {
@@ -3895,7 +3900,7 @@ impl App {
     fn on_pr_view_key(&mut self, key: Key) {
         // Actions and close are handled before borrowing the view (they need &mut self).
         match key {
-            Key::Escape => {
+            Key::Escape | Key::Char('q') => {
                 // In the patch line cursor, Esc steps back to the file list, not out.
                 if let Screen::PrView(v) = &mut self.screen {
                     if v.tab == 3 && v.diff.focus == DiffFocus::Patch {
@@ -3909,15 +3914,6 @@ impl App {
                     return;
                 }
                 self.screen = self.view_origin();
-                return;
-            }
-            Key::Char('q') => {
-                // Don't quit out from under unsubmitted line comments — same prompt as Esc.
-                if matches!(&self.screen, Screen::PrView(v) if !v.pending.is_empty()) {
-                    self.open_pending_exit_prompt();
-                } else {
-                    self.should_quit = true;
-                }
                 return;
             }
             Key::Char('o') => {
@@ -4044,12 +4040,8 @@ impl App {
 
     fn on_wi_view_key(&mut self, key: Key) {
         match key {
-            Key::Escape => {
+            Key::Escape | Key::Char('q') => {
                 self.screen = self.view_origin();
-                return;
-            }
-            Key::Char('q') => {
-                self.should_quit = true;
                 return;
             }
             Key::Char('o') => {
@@ -4076,7 +4068,7 @@ impl App {
     /// Normal-mode character commands.
     async fn on_char(&mut self, c: char, deps: &AppDeps) {
         match c {
-            'q' => self.should_quit = true,
+            'q' => self.leave_section_list(),
             'j' => {
                 self.move_down();
                 self.ensure_visible();
@@ -4397,8 +4389,7 @@ impl App {
 
     fn on_pipeline_key(&mut self, key: Key) {
         match key {
-            Key::Escape => self.screen = self.view_origin(),
-            Key::Char('q') => self.should_quit = true,
+            Key::Escape | Key::Char('q') => self.screen = self.view_origin(),
             Key::Char('T') => self.open_pipeline_trigger(),
             Key::Char('A') => self.open_approval_picker(),
             Key::Char('o') => self.open_selected(),
@@ -4462,7 +4453,7 @@ impl App {
                     Key::Down | Key::Char('j') => log.scroll = log.scroll.saturating_add(1),
                     Key::PageUp | Key::Char('b') => log.scroll = log.scroll.saturating_sub(15),
                     Key::PageDown | Key::Char(' ') => log.scroll = log.scroll.saturating_add(15),
-                    Key::Escape | Key::Char('L') => v.logs = None,
+                    Key::Escape | Key::Char('q') | Key::Char('L') => v.logs = None,
                     _ => {}
                 }
             }
@@ -4948,8 +4939,7 @@ impl App {
 
     async fn on_config_key(&mut self, key: Key, deps: &AppDeps) {
         match key {
-            Key::Escape => self.screen = Screen::List,
-            Key::Char('q') => self.should_quit = true,
+            Key::Escape | Key::Char('q') => self.screen = Screen::List,
             Key::Char('a') => self.start_add_connection(),
             Key::Char('p') => self.open_section_bind(Section::PullRequests, deps),
             Key::Char('w') => self.open_section_bind(Section::WorkItems, deps),
@@ -9760,23 +9750,25 @@ mod tests {
     }
 
     #[test]
-    fn quit_with_pending_comments_prompts_instead_of_quitting() {
+    fn q_with_pending_comments_prompts_instead_of_leaving() {
         let mut app = App::new("slate");
         app.screen = pr_view_with_pending(vec![LineComment { path: "a.rs".into(), line: 1, side: DiffSide::New, body: "nit".into() }]);
 
         app.on_pr_view_key(Key::Char('q'));
 
-        assert!(!app.should_quit, "q doesn't quit out from under unsubmitted comments");
+        assert!(!app.should_quit, "q never quits");
         assert!(matches!(app.screen, Screen::PrView(_)));
         assert!(matches!(&app.overlay, Some(Overlay::Picker { kind, .. }) if matches!(kind, PickerKind::PendingExit)));
     }
 
+    /// `q` is a second spelling of Esc, not a quit: it closes the view it is pressed in.
     #[test]
-    fn quit_without_pending_comments_quits() {
+    fn q_without_pending_comments_leaves_the_pr_view() {
         let mut app = App::new("slate");
         app.screen = pr_view_with_pending(vec![]);
         app.on_pr_view_key(Key::Char('q'));
-        assert!(app.should_quit);
+        assert!(!app.should_quit, "q never quits");
+        assert!(!matches!(app.screen, Screen::PrView(_)), "it closes the view instead");
     }
 
     #[test]
@@ -9863,6 +9855,79 @@ mod tests {
         assert_eq!(app.active, 0);
         app.set_tab(2); // tab 2 = Pipelines
         assert_eq!(app.active, 2);
+    }
+
+    /// Neither Esc nor `q` may tear the session down: both are "back / close" on every screen,
+    /// and Ctrl-C is the only key that leaves the app.
+    #[tokio::test]
+    async fn neither_escape_nor_q_quits_from_any_screen() {
+        let deps = test_deps();
+
+        // Command Center — the root. Both keys are inert; there is nowhere further back.
+        let mut app = App::new("slate");
+        app.screen = Screen::Launchpad;
+        for key in [Key::Escape, Key::Char('q')] {
+            app.on_key(key, &deps).await;
+            assert!(!app.should_quit, "{key:?} doesn't quit from the Command Center");
+            assert!(matches!(app.screen, Screen::Launchpad));
+        }
+
+        // Section list, work item view, pipeline drill-in, config — each steps back.
+        for key in [Key::Escape, Key::Char('q')] {
+            let mut app = App::new("slate");
+            app.active = index_of(Section::Pipelines);
+            app.screen = Screen::List;
+            app.on_key(key, &deps).await;
+            assert!(!app.should_quit, "{key:?} doesn't quit from a section list");
+            assert!(matches!(app.screen, Screen::Launchpad));
+
+            let mut app = App::new("slate");
+            app.screen = Screen::WiView(Box::new(WiView { connection_id: "c".into(), wi: wi(None), threads: vec![], scroll: 0 }));
+            app.on_key(key, &deps).await;
+            assert!(!app.should_quit, "{key:?} doesn't quit from a work item view");
+            assert!(matches!(app.screen, Screen::List));
+
+            let mut app = App::new("slate");
+            app.screen = Screen::Pipeline(Box::new(PipelineView::new("CI".into(), failed_run(), "c".into(), ProviderType::GitHub, "ci".into(), Some("main".into()))));
+            app.on_key(key, &deps).await;
+            assert!(!app.should_quit, "{key:?} doesn't quit from a pipeline drill-in");
+            assert!(matches!(app.screen, Screen::List));
+        }
+
+        // Ctrl-C is what is left.
+        let mut app = App::new("slate");
+        app.screen = Screen::List;
+        app.on_key(Key::Quit, &deps).await;
+        assert!(app.should_quit, "Ctrl-C still quits");
+    }
+
+    /// Esc on a section list is "back", never "quit" — a stray Esc used to tear the whole TUI
+    /// down from the list, while every other screen treats it as a step backwards.
+    #[tokio::test]
+    async fn escape_on_a_section_list_steps_back_instead_of_quitting() {
+        let deps = test_deps();
+
+        let mut app = App::new("slate");
+        app.active = index_of(Section::Pipelines);
+        app.screen = Screen::List;
+        app.on_key(Key::Escape, &deps).await;
+        assert!(!app.should_quit, "Esc doesn't quit from a section list");
+        assert!(matches!(app.screen, Screen::Launchpad), "Esc steps back to the Command Center");
+
+        // With a quick filter still applied, Esc clears that first and stays on the list.
+        let mut app = App::new("slate");
+        app.active = index_of(Section::Pipelines);
+        app.screen = Screen::List;
+        app.filters[app.active] = "ci".into();
+        app.on_key(Key::Escape, &deps).await;
+        assert!(app.filters[app.active].is_empty(), "Esc clears the filter first");
+        assert!(matches!(app.screen, Screen::List), "and stays put while doing it");
+        assert!(!app.should_quit);
+
+        // The Command Center is the end of the line: Esc there does nothing at all.
+        app.on_key(Key::Escape, &deps).await;
+        assert!(matches!(app.screen, Screen::Launchpad));
+        assert!(!app.should_quit);
     }
 
     /// Tab is the one key that always walks the tab strip. Opening an item used to trap it:
