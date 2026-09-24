@@ -4531,8 +4531,10 @@ impl App {
         None
     }
 
-    /// One wheel notch (`dir` -1 up, 1 down) over `hit`. The pane under the pointer takes the
-    /// wheel: a Command Center column or the pipeline tree / log pane gains focus first. Lists
+    /// One wheel notch (`dir` -1 up, 1 down) over `hit`. Where a screen has two panes that take
+    /// keys — the Command Center columns, the pipeline tree and log pane, the diff's file list
+    /// and patch — the one under the pointer takes the wheel; elsewhere it goes wherever the
+    /// keys do (over an unfocused preview, that is the list beside it). Lists
     /// move their selection one row and stop at the ends (Up / Down wrap, which reads as a jump
     /// under a wheel); scrolling text moves three lines a notch.
     fn on_wheel(&mut self, hit: Option<Hit>, dir: isize) -> Option<(Key, usize)> {
@@ -4588,6 +4590,10 @@ impl App {
                 if v.tab == 3 && v.diff.focus == DiffFocus::FileList && matches!(hit, Some(Hit::DiffPatch | Hit::DiffLine(_))) {
                     v.diff.scroll_by(3 * dir as i32);
                     return None;
+                }
+                // Over the file list while the patch has the keys, the wheel changes file.
+                if v.tab == 3 && v.diff.focus == DiffFocus::Patch && matches!(hit, Some(Hit::DiffFile(_))) {
+                    v.diff.exit_patch();
                 }
                 Some((key, if matches!(v.tab, 0 | 2) { 3 } else { 1 }))
             }

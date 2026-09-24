@@ -490,6 +490,8 @@ fn render_lp_column(frame: &mut Frame, area: Rect, app: &App, side: usize, title
         .border_style(Style::default().fg(border))
         .title(Span::styled(format!(" {title} "), Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)));
 
+    // Recorded before the empty case returns, so a click still moves focus to an empty column.
+    hit(area, Hit::LpColumn(side));
     let col = app.lp_column(side);
     let slots = app.lp_slots(side);
     if slots.is_empty() {
@@ -576,7 +578,6 @@ fn render_lp_column(frame: &mut Frame, area: Rect, app: &App, side: usize, title
     let mut state = ListState::default();
     state.select(Some(visual_sel));
     frame.render_stateful_widget(list, area, &mut state);
-    hit(area, Hit::LpColumn(side));
     let body = area.inner(ratatui::layout::Margin::new(1, 1));
     hit_rows(body, state.offset(), item_slot.into_iter().map(|s| s.map(|pos| Hit::LpRow { side, pos })));
 }
