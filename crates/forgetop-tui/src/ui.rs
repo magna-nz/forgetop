@@ -1738,7 +1738,7 @@ fn base_footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
         return overlay.hint();
     }
     if matches!(app.screen, Screen::Launchpad) {
-        return vec![("↑↓", "move"), ("←→", "columns"), ("↵", "open"), ("D", "dismiss"), ("Tab", "sections"), ("r", "refresh"), ("?", "help"), ("q", "quit")];
+        return vec![("↑↓", "move"), ("←→", "columns"), ("↵", "open"), ("D", "dismiss"), ("Tab", "sections"), ("r", "refresh"), ("?", "help"), ("Ctrl-C", "quit")];
     }
     if let Screen::PrView(v) = &app.screen {
         // A merged PR only offers Revert; an open one offers approve / (reject) / merge.
@@ -1773,7 +1773,7 @@ fn base_footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
         };
     }
     if matches!(app.screen, Screen::WiView(_)) {
-        return vec![("PgUp/Dn", "scroll"), ("u", "update state"), ("c", "comment"), ("o", "open"), ("Tab", "sections"), ("Esc", "back"), ("q", "quit")];
+        return vec![("PgUp/Dn", "scroll"), ("u", "update state"), ("c", "comment"), ("o", "open"), ("Tab", "sections"), ("Esc/q", "back")];
     }
     if matches!(app.screen, Screen::Inbox) {
         return vec![("↑↓", "move"), ("↵", "open item"), ("o", "browser"), ("x", "mark read"), ("A", "all read"), ("Tab", "sections"), ("Esc", "back")];
@@ -1786,7 +1786,7 @@ fn base_footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
         if v.can_respond_approvals && !v.actionable_approvals().is_empty() {
             keys.push(("A", "approve"));
         }
-        keys.extend([("T", "trigger"), ("o", "open job"), ("Tab", "sections"), ("Esc", "back"), ("q", "quit")]);
+        keys.extend([("T", "trigger"), ("o", "open job"), ("Tab", "sections"), ("Esc/q", "back")]);
         return keys;
     }
     if matches!(app.screen, Screen::Config(_)) {
@@ -1797,8 +1797,7 @@ fn base_footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
             ("w", "bind-WI"),
             ("s", "pipelines"),
             ("x", "remove"),
-            ("Esc", "back"),
-            ("q", "quit"),
+            ("Esc/q", "back"),
         ];
     }
     let mut keys = vec![("↑↓", "move"), ("←→", "tabs")];
@@ -1816,7 +1815,14 @@ fn base_footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
         keys.push(("g", "repos"));
     }
     keys.push(("/", "find"));
-    keys.extend([("v", "tabs"), ("C", "connections"), ("r", "refresh"), ("t", "theme"), ("?", "help"), ("q", "quit")]);
+    keys.extend([
+        ("v", "tabs"),
+        ("C", "connections"),
+        ("r", "refresh"),
+        ("t", "theme"),
+        ("?", "help"),
+        ("Esc/q", "back"),
+    ]);
     keys
 }
 
@@ -2692,7 +2698,8 @@ fn help_sections() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
                 ("r", "Refresh    t  cycle theme"),
                 ("N", "Notifications — choose which events ping you"),
                 ("?", "This help"),
-                ("q  Ctrl-C", "Quit    Esc  back / close"),
+                ("Esc  q", "Back / close — never quits"),
+                ("Ctrl-C", "Quit"),
             ],
         ),
         (
