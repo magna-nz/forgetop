@@ -4102,14 +4102,15 @@ impl App {
         }
 
         // Tab always walks the tab strip — Command Center, then each visible section — from
-        // any screen, an open PR / work item / pipeline run included. The input-capturing
-        // modes (wizard, overlay, quick filter) return above, so Tab still reaches them.
-        if key == Key::Tab {
+        // any screen, an open PR / work item / pipeline run included; Shift-Tab walks it
+        // backwards. Both wrap. The input-capturing modes (wizard, overlay, quick filter)
+        // return above, so Tab still reaches them.
+        if matches!(key, Key::Tab | Key::BackTab) {
             // Don't walk out from under unsubmitted line comments — same prompt as Esc.
             if matches!(&self.screen, Screen::PrView(v) if !v.pending.is_empty()) {
                 self.open_pending_exit_prompt();
             } else {
-                self.switch_tab(1);
+                self.switch_tab(if key == Key::Tab { 1 } else { -1 });
             }
             return;
         }
@@ -4186,8 +4187,8 @@ impl App {
                 }
             }
             Key::Char(c) => self.on_char(c, deps).await,
-            // Tab is answered globally, before any screen sees it.
-            Key::Tab | Key::Backspace | Key::Ctrl(_) | Key::Quit | Key::Redraw | Key::Home | Key::End | Key::None => {}
+            // Tab and Shift-Tab are answered globally, before any screen sees them.
+            Key::Tab | Key::BackTab | Key::Backspace | Key::Ctrl(_) | Key::Quit | Key::Redraw | Key::Home | Key::End | Key::None => {}
         }
     }
 
@@ -6729,6 +6730,8 @@ pub enum Key {
     Left,
     Right,
     Tab,
+    /// Shift-Tab: the tab strip, backwards.
+    BackTab,
     Enter,
     Escape,
     Backspace,
@@ -11493,6 +11496,23 @@ mod tests {
         }
         app.on_key(Key::Tab, &deps).await;
         assert_eq!(app.active, 1, "Tab moves to the next section");
+    }
+
+    #[tokio::test]
+    async fn shift_tab_walks_the_top_nav_backwards_and_wraps() {
+        let deps = test_deps();
+        let mut app = preview_app(&["1"]);
+        let start = app.top_pos();
+        let n = 1 + app.visible_indices().len();
+        app.on_key(Key::Tab, &deps).await;
+        app.on_key(Key::BackTab, &deps).await;
+        assert_eq!(app.top_pos(), start, "Shift-Tab undoes Tab");
+        app.on_key(Key::BackTab, &deps).await;
+        assert_eq!(app.top_pos(), (start + n - 1) % n, "Shift-Tab steps back, wrapping past the first tab");
+        for _ in 0..n {
+            app.on_key(Key::BackTab, &deps).await;
+        }
+        assert_eq!(app.top_pos(), (start + n - 1) % n, "a full backwards lap returns to the same tab");
     }
 
     #[tokio::test]

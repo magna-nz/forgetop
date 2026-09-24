@@ -3026,7 +3026,7 @@ fn help_sections() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
             "Global",
             vec![
                 ("1–4", "Jump to a tab"),
-                ("Tab", "Next tab — from anywhere, an open item included"),
+                ("Tab  Shift-Tab", "Next / previous tab — from anywhere, an open item included"),
                 ("↑/↓  k/j", "Move selection"),
                 ("Ctrl-P", "Jump to any item (command palette)"),
                 ("i", "Notification inbox (mentions, reviews, CI, assignments)"),
