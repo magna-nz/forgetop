@@ -1374,12 +1374,25 @@ impl App {
         self.visible_indices().first().copied().unwrap_or(0)
     }
 
+    /// The section a screen belongs to on the tab strip. A full-screen item view answers for
+    /// the section its item came from, not `self.active`: a PR opened from the Command Center
+    /// (or the inbox) leaves `self.active` on whatever section was last on screen, and Tab out
+    /// of that PR must still land on the tab after Pull Requests.
+    pub fn screen_section(&self) -> usize {
+        match self.screen {
+            Screen::PrView(_) => index_of(Section::PullRequests),
+            Screen::WiView(_) => index_of(Section::WorkItems),
+            Screen::Pipeline(_) => index_of(Section::Pipelines),
+            _ => self.active,
+        }
+    }
+
     /// The top-level tab position: 0 = Launchpad, then each visible section.
     fn top_pos(&self) -> usize {
         if matches!(self.screen, Screen::Launchpad) {
             0
         } else {
-            1 + self.visible_indices().iter().position(|&i| i == self.active).unwrap_or(0)
+            1 + self.visible_indices().iter().position(|&i| i == self.screen_section()).unwrap_or(0)
         }
     }
 
@@ -1796,10 +1809,10 @@ impl App {
             Key::Char('q') => self.should_quit = true,
             Key::Up | Key::Char('k') => self.lp_move(-1),
             Key::Down | Key::Char('j') => self.lp_move(1),
-            // Left/right move between the two columns; Tab leaves for the section tabs.
+            // Left/right move between the two columns; Tab (handled globally) leaves for the
+            // section tabs.
             Key::Left | Key::Char('h') => self.lp_switch_side(-1),
             Key::Right | Key::Char('l') => self.lp_switch_side(1),
-            Key::Tab => self.switch_tab(1),
             Key::Char(c @ '1'..='4') => self.set_tab(c as usize - '1' as usize),
             Key::Enter => self.open_launchpad_selected(deps).await,
             Key::Char('D') => self.dismiss_selected_lp_item(deps).await,
@@ -2946,6 +2959,19 @@ impl App {
             return;
         }
 
+        // Tab always walks the tab strip — Command Center, then each visible section — from
+        // any screen, an open PR / work item / pipeline run included. The input-capturing
+        // modes (wizard, overlay, quick filter) return above, so Tab still reaches them.
+        if key == Key::Tab {
+            // Don't walk out from under unsubmitted line comments — same prompt as Esc.
+            if matches!(&self.screen, Screen::PrView(v) if !v.pending.is_empty()) {
+                self.open_pending_exit_prompt();
+            } else {
+                self.switch_tab(1);
+            }
+            return;
+        }
+
         // Full-screen sub-views handle their own keys.
         match self.screen {
             Screen::Pipeline(_) => {
@@ -3009,7 +3035,6 @@ impl App {
             }
             Key::Left => self.switch_tab(-1),
             Key::Right => self.switch_tab(1),
-            Key::Tab => self.switch_tab(1),
             Key::Up => {
                 self.move_up();
                 self.ensure_visible();
@@ -3031,7 +3056,8 @@ impl App {
                 }
             }
             Key::Char(c) => self.on_char(c, deps).await,
-            Key::Backspace | Key::Ctrl(_) | Key::Quit | Key::Redraw | Key::None => {}
+            // Tab is answered globally, before any screen sees it.
+            Key::Tab | Key::Backspace | Key::Ctrl(_) | Key::Quit | Key::Redraw | Key::None => {}
         }
     }
 
@@ -9428,6 +9454,62 @@ mod tests {
         assert_eq!(app.active, 0);
         app.set_tab(2); // tab 2 = Pipelines
         assert_eq!(app.active, 2);
+    }
+
+    /// Tab is the one key that always walks the tab strip. Opening an item used to trap it:
+    /// the full-screen views answered their own keys and dropped Tab on the floor.
+    #[tokio::test]
+    async fn tab_walks_the_strip_from_inside_an_open_item_view() {
+        let deps = test_deps();
+
+        // A PR opened from the Command Center leaves `active` on whatever section was last
+        // shown — Tab still has to leave from Pull Requests, the section this item belongs to.
+        let mut app = App::new("slate");
+        app.active = index_of(Section::Pipelines);
+        app.screen = pr_view_showing(pr(None), &known_detail());
+        app.on_key(Key::Tab, &deps).await;
+        assert!(matches!(app.screen, Screen::List), "Tab leaves the PR view for a section list");
+        assert_eq!(app.active, index_of(Section::WorkItems), "the tab after Pull Requests");
+
+        let mut app = App::new("slate");
+        app.screen = Screen::WiView(Box::new(WiView { connection_id: "c".into(), wi: wi(None), threads: vec![], scroll: 0 }));
+        app.on_key(Key::Tab, &deps).await;
+        assert!(matches!(app.screen, Screen::List));
+        assert_eq!(app.active, index_of(Section::Pipelines), "the tab after Work Items");
+
+        // Pipelines is the last tab, so Tab wraps round to the Command Center.
+        let mut app = App::new("slate");
+        app.screen = Screen::Pipeline(Box::new(PipelineView::new("CI".into(), failed_run(), "c".into(), ProviderType::GitHub, "ci".into(), Some("main".into()))));
+        app.on_key(Key::Tab, &deps).await;
+        assert!(matches!(app.screen, Screen::Launchpad), "wraps back to the Command Center");
+
+        // The inbox isn't on the strip; Tab enters it from the section that is active behind it.
+        let mut app = App::new("slate");
+        app.active = index_of(Section::PullRequests);
+        app.screen = Screen::Inbox;
+        app.on_key(Key::Tab, &deps).await;
+        assert!(matches!(app.screen, Screen::List));
+        assert_eq!(app.active, index_of(Section::WorkItems));
+    }
+
+    /// Leaving by Tab must respect the same guard Esc does: buffered line comments are only
+    /// in memory, so walking off the view would drop them silently.
+    #[tokio::test]
+    async fn tab_out_of_a_pr_view_with_unsubmitted_comments_prompts_first() {
+        let deps = test_deps();
+        let mut app = App::new("slate");
+        app.screen = pr_view_showing(pr(None), &known_detail());
+        if let Screen::PrView(v) = &mut app.screen {
+            v.pending.push(LineComment { path: "a.rs".into(), line: 1, side: DiffSide::New, body: "wait".into() });
+        }
+
+        app.on_key(Key::Tab, &deps).await;
+
+        assert!(matches!(app.screen, Screen::PrView(_)), "the view stays put until the prompt is answered");
+        assert!(
+            matches!(&app.overlay, Some(Overlay::Picker { kind: PickerKind::PendingExit, .. })),
+            "same prompt Esc raises"
+        );
     }
 
     #[test]

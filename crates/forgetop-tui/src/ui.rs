@@ -149,7 +149,9 @@ fn render_tabs(frame: &mut Frame, area: Rect, app: &App) {
     } else if matches!(app.screen, Screen::Launchpad) {
         0
     } else {
-        1 + vis.iter().position(|&i| i == app.active).unwrap_or(0)
+        // An open item lights its own section, not whatever list is behind it: a PR opened
+        // from the Command Center belongs to Pull Requests, which is also where Tab leaves from.
+        1 + vis.iter().position(|&i| i == app.screen_section()).unwrap_or(0)
     };
 
     let tabs = Tabs::new(titles)
@@ -1140,7 +1142,7 @@ fn pr_tabs_line(theme: &Theme, view: &PrView) -> Line<'static> {
         spans.push(Span::styled(label, style));
         spans.push(Span::raw(" "));
     }
-    spans.push(Span::styled("  ←/→ tabs · Esc close", Style::default().fg(theme.dim)));
+    spans.push(Span::styled("  ←/→ tabs · Tab sections · Esc close", Style::default().fg(theme.dim)));
     Line::from(spans)
 }
 
@@ -1408,26 +1410,26 @@ fn base_footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
             } else {
                 let mut keys = vec![("←→", "tabs"), ("↑↓", "file"), ("↵", "open file"), ("PgUp/Dn", "scroll")];
                 keys.extend(acts);
-                keys.extend([("o", "open"), ("Esc", "back")]);
+                keys.extend([("o", "open"), ("Tab", "sections"), ("Esc", "back")]);
                 keys
             }
         } else if v.tab == 1 {
             let mut keys = vec![("←→", "tabs"), ("↑↓", "commit"), ("↵", "commit diff")];
             keys.extend(acts);
-            keys.extend([("o", "open"), ("Esc", "back")]);
+            keys.extend([("o", "open"), ("Tab", "sections"), ("Esc", "back")]);
             keys
         } else {
             let mut keys = vec![("←→", "tabs"), ("PgUp/Dn", "scroll")];
             keys.extend(acts_full);
-            keys.extend([("c", "comment"), ("r", "reply"), ("o", "open"), ("Esc", "back")]);
+            keys.extend([("c", "comment"), ("r", "reply"), ("o", "open"), ("Tab", "sections"), ("Esc", "back")]);
             keys
         };
     }
     if matches!(app.screen, Screen::WiView(_)) {
-        return vec![("PgUp/Dn", "scroll"), ("u", "update state"), ("c", "comment"), ("o", "open"), ("Esc", "back"), ("q", "quit")];
+        return vec![("PgUp/Dn", "scroll"), ("u", "update state"), ("c", "comment"), ("o", "open"), ("Tab", "sections"), ("Esc", "back"), ("q", "quit")];
     }
     if matches!(app.screen, Screen::Inbox) {
-        return vec![("↑↓", "move"), ("↵", "open item"), ("o", "browser"), ("x", "mark read"), ("A", "all read"), ("r", "refresh"), ("Esc", "back")];
+        return vec![("↑↓", "move"), ("↵", "open item"), ("o", "browser"), ("x", "mark read"), ("A", "all read"), ("Tab", "sections"), ("Esc", "back")];
     }
     if let Screen::Pipeline(v) = &app.screen {
         if v.logs.is_some() {
@@ -1437,7 +1439,7 @@ fn base_footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
         if v.can_respond_approvals && !v.actionable_approvals().is_empty() {
             keys.push(("A", "approve"));
         }
-        keys.extend([("T", "trigger"), ("o", "open job"), ("Esc", "back"), ("q", "quit")]);
+        keys.extend([("T", "trigger"), ("o", "open job"), ("Tab", "sections"), ("Esc", "back"), ("q", "quit")]);
         return keys;
     }
     if matches!(app.screen, Screen::Config(_)) {
@@ -2335,7 +2337,8 @@ fn help_sections() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
         (
             "Global",
             vec![
-                ("←/→  h/l  Tab  1–3", "Switch tab"),
+                ("←/→  h/l  1–3", "Switch tab"),
+                ("Tab", "Next tab — from anywhere, an open item included"),
                 ("↑/↓  k/j", "Move selection"),
                 ("Ctrl-P", "Jump to any item (command palette)"),
                 ("i", "Notification inbox (mentions, reviews, CI, assignments)"),
