@@ -130,6 +130,8 @@ async fn event_loop(terminal: &mut Term, app: &mut App, deps: &AppDeps) -> Resul
             _ = anim.tick() => {
                 app.tick_anim();
                 app.tick_preview(deps);
+                // Polls an open log pane while its job is live; idle otherwise.
+                app.tick_logs(deps);
             }
         }
     }
@@ -183,6 +185,8 @@ fn map_key(code: KeyCode, mods: KeyModifiers) -> Key {
         KeyCode::Backspace => Key::Backspace,
         KeyCode::PageUp => Key::PageUp,
         KeyCode::PageDown => Key::PageDown,
+        KeyCode::Home => Key::Home,
+        KeyCode::End => Key::End,
         KeyCode::Char(c) => Key::Char(c),
         _ => Key::None,
     }

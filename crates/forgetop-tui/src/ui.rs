@@ -12,8 +12,9 @@ use ratatui::widgets::{
 use ratatui::Frame;
 
 use crate::app::{
-    dashboard_target, pipe_definition_name, App, ConfigView, DiffFocus, DiffView, LpSlot, PipeGroup, PipeHead, PipeLine,
-    PipeRow, PipelineView, PrView, Screen, WiView, PR_TABS, TABS,
+    dashboard_target, is_error_line, match_ranges, pipe_definition_name, App, ConfigView, DiffFocus, DiffView, LogView,
+    LpSlot, PipeGroup, PipeHead, PipeLine, PipeRow, PipelineView, PrView, Screen, WiView, LOG_SPLIT_MIN_WIDTH, LOG_TREE_WIDTH,
+    PR_TABS, TABS,
 };
 use crate::diff::{cursor_line_label, pending_marks};
 use crate::highlight::{lang_for, HlKind, LineHighlighter};
@@ -1980,8 +1981,22 @@ fn base_footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
         return vec![("↑↓", "move"), ("↵", "open item"), ("o", "browser"), ("x", "mark read"), ("A", "all read"), ("Tab", "sections"), ("Esc", "back")];
     }
     if let Screen::Pipeline(v) = &app.screen {
-        if v.logs.is_some() {
-            return vec![("↑↓", "scroll"), ("PgUp/Dn", "jump"), ("Esc", "close logs")];
+        if let Some(log) = &v.logs {
+            if log.search_input.is_some() {
+                return vec![("type", "search"), ("↵", "find"), ("Esc", "cancel")];
+            }
+            if v.logs_have_keys() {
+                let mut keys = vec![("↑↓", "scroll"), ("g/G", "top/end"), ("f", "follow"), ("E", "first error"), ("/", "search")];
+                if log.query.is_some() {
+                    keys.push(("n/N", "next/prev"));
+                }
+                if v.log_split.get() {
+                    keys.push(("w", "tree"));
+                }
+                keys.push(("Esc", "close logs"));
+                return keys;
+            }
+            return vec![("↑↓", "move"), ("↵", "expand"), ("w", "logs"), ("Esc/L", "close logs"), ("q", "back")];
         }
         let mut keys = vec![("↑↓", "move"), ("↵", "expand"), ("L", "logs")];
         if v.can_respond_approvals && !v.actionable_approvals().is_empty() {
@@ -2579,19 +2594,30 @@ fn render_pipeline(frame: &mut Frame, area: Rect, theme: &Theme, view: &Pipeline
         frame.render_widget(Paragraph::new(line), rows[1]);
     }
 
-    // A log pane, when open, replaces the tree.
+    // An open log pane sits beside the tree — or, when there isn't room for both, fills the pane.
     if let Some(log) = &view.logs {
-        let lines: Vec<Line> = log.lines.iter().map(|l| Line::from(Span::styled(l.clone(), Style::default().fg(theme.fg)))).collect();
-        let inner_h = tree_area.height.saturating_sub(2);
-        let max = (lines.len() as u16).saturating_sub(inner_h);
-        frame.render_widget(
-            Paragraph::new(lines).block(section_block(theme, &log.title)).scroll((log.scroll.min(max), 0)),
-            tree_area,
-        );
+        let split = tree_area.width >= LOG_SPLIT_MIN_WIDTH;
+        view.log_split.set(split);
+        if !split {
+            render_log_pane(frame, tree_area, theme, log);
+            return;
+        }
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(LOG_TREE_WIDTH), Constraint::Min(20)])
+            .split(tree_area);
+        render_pipeline_tree(frame, cols[0], theme, view, anim);
+        render_log_pane(frame, cols[1], theme, log);
+        let (active, idle) = if view.log_focus { (cols[1], cols[0]) } else { (cols[0], cols[1]) };
+        mark_focus(frame, active, theme);
+        mark_idle(frame, idle, theme);
         return;
     }
+    render_pipeline_tree(frame, tree_area, theme, view, anim);
+}
 
-    // Tree of stages → jobs → steps.
+/// The stages → jobs → steps tree.
+fn render_pipeline_tree(frame: &mut Frame, tree_area: Rect, theme: &Theme, view: &PipelineView, anim: usize) {
     let nodes = view.flatten();
     let tree_block = section_block(theme, "Stages · jobs · steps");
     if nodes.is_empty() {
@@ -2633,6 +2659,99 @@ fn render_pipeline(frame: &mut Frame, area: Rect, theme: &Theme, view: &Pipeline
     let mut state = ListState::default();
     state.select(Some(view.selected.min(nodes.len().saturating_sub(1))));
     frame.render_stateful_widget(list, tree_area, &mut state);
+}
+
+/// The live state appended to the log pane's title.
+fn log_title(log: &LogView) -> String {
+    let mut title = log.title.clone();
+    if !log.loaded {
+        title.push_str("   loading…");
+    } else if log.live {
+        title.push_str(if log.follow { "   ● live · following" } else { "   ● live · paused" });
+    }
+    if log.fetch_failed {
+        title.push_str("   (update failed — showing last lines)");
+    }
+    title
+}
+
+/// The log pane's bottom line: the open `/` prompt, or the committed search's position, plus
+/// any note (`first error at line N`). `None` when there's nothing to say.
+fn log_status_line<'a>(theme: &Theme, log: &LogView) -> Option<Line<'a>> {
+    let mut spans = Vec::new();
+    if let Some(input) = &log.search_input {
+        spans.push(Span::styled(format!("/{input}"), Style::default().fg(theme.fg)));
+        spans.push(Span::styled("█", Style::default().fg(theme.accent)));
+    } else if let Some(q) = &log.query {
+        spans.push(Span::styled(format!("/{q}"), Style::default().fg(theme.yellow)));
+        let pos = match (log.match_idx, log.matches.len()) {
+            (_, 0) => "no matches".to_string(),
+            (Some(i), n) => format!("{} of {n}", i + 1),
+            (None, n) => format!("{n} matches"),
+        };
+        spans.push(Span::styled(format!("   {pos}"), Style::default().fg(theme.dim)));
+    }
+    if let Some(note) = &log.note {
+        let lead = if spans.is_empty() { "" } else { "   " };
+        spans.push(Span::styled(format!("{lead}{note}"), Style::default().fg(theme.red)));
+    }
+    (!spans.is_empty()).then(|| Line::from(spans))
+}
+
+/// One log line: red when it reports an error, search hits on a yellow background, and the
+/// current match's line on the selection background.
+fn log_line<'a>(theme: &Theme, text: &str, query: Option<&str>, current: bool) -> Line<'a> {
+    let mut base = Style::default().fg(if is_error_line(text) { theme.red } else { theme.fg });
+    if current {
+        base = base.bg(theme.sel_bg);
+    }
+    let ranges = query.map(|q| match_ranges(text, q)).unwrap_or_default();
+    if ranges.is_empty() {
+        return Line::from(Span::styled(text.to_owned(), base));
+    }
+    let hit = Style::default().fg(theme.bg).bg(theme.yellow).add_modifier(Modifier::BOLD);
+    let mut spans = Vec::new();
+    let mut at = 0;
+    for (start, end) in ranges {
+        if start > at {
+            spans.push(Span::styled(text[at..start].to_owned(), base));
+        }
+        spans.push(Span::styled(text[start..end].to_owned(), hit));
+        at = end;
+    }
+    if at < text.len() {
+        spans.push(Span::styled(text[at..].to_owned(), base));
+    }
+    Line::from(spans)
+}
+
+/// The scrollable log pane. Only the visible window is built, so a 10k-line log costs no more
+/// per frame than a short one.
+fn render_log_pane(frame: &mut Frame, area: Rect, theme: &Theme, log: &LogView) {
+    let title = log_title(log);
+    let block = section_block(theme, &title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let status = log_status_line(theme, log);
+    let body_h = inner.height.saturating_sub(u16::from(status.is_some() && inner.height > 1));
+    log.viewport.set(body_h);
+    let top = log.effective_scroll() as usize;
+    let current = log.match_idx.and_then(|i| log.matches.get(i).copied());
+    let lines: Vec<Line> = log
+        .lines
+        .iter()
+        .enumerate()
+        .skip(top)
+        .take(body_h as usize)
+        .map(|(i, l)| log_line(theme, l, log.query.as_deref(), current == Some(i)))
+        .collect();
+    frame.render_widget(Paragraph::new(lines), Rect { height: body_h, ..inner });
+    if let Some(status) = status {
+        if inner.height > body_h {
+            let row = Rect { y: inner.y + body_h, height: 1, ..inner };
+            frame.render_widget(Paragraph::new(status), row);
+        }
+    }
 }
 
 /// The approvals banner for the drill-in: pending gates you can act on, a
@@ -2983,7 +3102,11 @@ fn help_sections() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
                 ("z  Z", "Collapse / expand every group"),
                 ("Enter", "Drill in (stages → jobs → steps)"),
                 ("Enter (in drill-in)", "Expand / collapse a node"),
-                ("L", "View the selected job's logs"),
+                ("L", "View the selected job's logs (beside the tree; a live job's log updates itself)"),
+                ("w (logs open)", "Move the keys between the tree and the log pane"),
+                ("f  g  G", "Logs: toggle follow / top / bottom (and follow)"),
+                ("E", "Logs: jump to the first error line"),
+                ("/  n  N", "Logs: search, next / previous match"),
                 ("A", "Approve / reject a waiting gate (GitHub, GitLab; Azure is view-only)"),
                 ("o", "Open the selected job in the browser"),
                 ("T", "Trigger a run"),
@@ -3864,6 +3987,41 @@ mod tests {
         assert_eq!(flat.len(), 3, "one stage + one job + one step");
         assert_eq!(flat[0].depth, 0);
         assert_eq!(flat[2].depth, 2);
+    }
+
+    #[test]
+    fn the_log_pane_sits_beside_the_tree_and_fills_the_pane_when_narrow() {
+        use crate::app::{LogView, Screen};
+        let mut view = PipelineView::new("CI #101".into(), sample_run(), "demo".into(), ProviderType::GitHub, "ci".into(), None);
+        let mut log = LogView::with_lines("Logs · compile", "j1", vec![]);
+        log.set_text("step one\nerror: boom\nFAILED here\ndone");
+        log.live = true;
+        log.follow = true;
+        log.query = Some("here".into());
+        log.search_input = None;
+        view.logs = Some(log);
+        let mut app = App::new("slate");
+        app.screen = Screen::Pipeline(Box::new(view));
+
+        let wide = render_to_string(&mut app, 160, 30);
+        assert!(wide.contains("Stages · jobs · steps"), "the tree stays beside the logs");
+        assert!(wide.contains("Logs · compile") && wide.contains("● live · following"));
+        assert!(wide.contains("error: boom"));
+        assert!(wide.contains("/here"), "the committed search shows on the status line");
+        let Screen::Pipeline(v) = &app.screen else { panic!() };
+        assert!(v.log_split.get());
+
+        let narrow = render_to_string(&mut app, 70, 30);
+        assert!(!narrow.contains("Stages · jobs · steps"), "narrow: logs alone");
+        let Screen::Pipeline(v) = &app.screen else { panic!() };
+        assert!(!v.log_split.get() && v.logs_have_keys(), "and the logs take the keys");
+
+        // Tiny terminals and empty logs must not panic.
+        if let Screen::Pipeline(v) = &mut app.screen {
+            v.logs = Some(LogView::with_lines("Logs", "j1", vec![]));
+        }
+        render_to_string(&mut app, 20, 6);
+        render_to_string(&mut app, 120, 8);
     }
 
     /// A cache-seeded run must not present remembered status as live — the user waits on runs

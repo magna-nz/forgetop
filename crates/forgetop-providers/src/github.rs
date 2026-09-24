@@ -239,6 +239,84 @@ pub fn map_job(v: &Value) -> PipelineJob {
     }
 }
 
+/// A short summary for a job GitHub hasn't finished (or hasn't published a log for yet),
+/// built from the jobs-list entry's `steps` array so the log pane still shows something
+/// useful while the TUI keeps polling.
+fn gh_job_in_progress_text(job: &Value) -> String {
+    let name = get_str(job, "name").unwrap_or_else(|| "(job)".into());
+    let mut out = format!("{name}: in progress — GitHub publishes this job's log when it finishes\n");
+    for step in get_arr(job, "steps") {
+        let mark = if get_str(step, "status").as_deref() == Some("completed") { '✓' } else { '…' };
+        out.push_str(&format!("  {mark} {}\n", get_str(step, "name").unwrap_or_default()));
+    }
+    out
+}
+
+/// GitHub (and Azure) log lines start with a full ISO-8601 timestamp
+/// (`2024-05-01T12:34:56.1234567Z `, fractional seconds optional). Shortened to `HH:MM:SS  `
+/// for readability; a line that doesn't start with one is returned unchanged.
+fn shorten_log_timestamp(line: &str) -> String {
+    let b = line.as_bytes();
+    if b.len() < 20 {
+        return line.to_string();
+    }
+    let digit = |i: usize| b.get(i).is_some_and(u8::is_ascii_digit);
+    let date_ok = (0..4).all(digit) && b[4] == b'-' && (5..7).all(digit) && b[7] == b'-' && (8..10).all(digit) && b[10] == b'T';
+    if !date_ok {
+        return line.to_string();
+    }
+    let time_ok = (11..13).all(digit) && b[13] == b':' && (14..16).all(digit) && b[16] == b':' && (17..19).all(digit);
+    if !time_ok {
+        return line.to_string();
+    }
+    let mut i = 19;
+    if b.get(i) == Some(&b'.') {
+        i += 1;
+        while b.get(i).is_some_and(u8::is_ascii_digit) {
+            i += 1;
+        }
+    }
+    if b.get(i) != Some(&b'Z') {
+        return line.to_string();
+    }
+    i += 1;
+    let time = &line[11..19];
+    match b.get(i) {
+        Some(b' ') => format!("{time}  {}", &line[i + 1..]),
+        None => format!("{time}  "),
+        _ => line.to_string(), // 'Z' not followed by a space or end of line — not our prefix
+    }
+}
+
+/// Strips ANSI CSI escape sequences (`\x1b[...<final byte>`), leaving markers like
+/// `##[error]` untouched — the TUI keys off those.
+fn strip_ansi(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next();
+            for c2 in chars.by_ref() {
+                if c2.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
+fn clean_log_line(line: &str) -> String {
+    strip_ansi(&shorten_log_timestamp(line))
+}
+
+/// Cleans a whole log body line-by-line (timestamp shortening + ANSI stripping).
+fn clean_log_text(text: &str) -> String {
+    text.lines().map(clean_log_line).collect::<Vec<_>>().join("\n")
+}
+
 pub fn map_file_change(v: &Value) -> FileChange {
     let kind = match get_str(v, "status").as_deref() {
         Some("added") => FileChangeKind::Added,
@@ -460,6 +538,35 @@ impl GitHubClient {
             return Err(Error::Provider(format!("GET {url} -> {}", resp.status())));
         }
         resp.json().await.map_err(prov)
+    }
+
+    /// Fetches plain text, returning `Ok(None)` on a 404 — used for `/actions/jobs/{id}/logs`,
+    /// which 404s until GitHub has published the job's log (redirects to a signed blob URL once
+    /// it has; reqwest follows that redirect and drops `Authorization` cross-host on its own).
+    async fn get_text_opt(&self, url: &str) -> Result<Option<String>> {
+        let resp = self.http.get(url).send().await.map_err(prov)?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            return Err(Error::Provider(format!("GET {url} -> {}", resp.status())));
+        }
+        Ok(Some(resp.text().await.map_err(prov)?))
+    }
+
+    /// The log text for one job, from its jobs-list entry `job`. A job GitHub hasn't finished
+    /// (or hasn't yet published a log for) falls back to an in-progress summary built from its
+    /// steps, rather than erroring.
+    async fn job_log_text(&self, repo: &str, job_id: &str, job: &Value) -> Result<String> {
+        if get_str(job, "status").as_deref() != Some("completed") {
+            return Ok(gh_job_in_progress_text(job));
+        }
+        let url = self.repo_path(repo, &format!("/actions/jobs/{job_id}/logs"));
+        match self.get_text_opt(&url).await? {
+            None => Ok(gh_job_in_progress_text(job)),
+            Some(text) if text.trim().is_empty() => Ok("(no output yet)\n".into()),
+            Some(text) => Ok(clean_log_text(&text)),
+        }
     }
 
     async fn post_json(&self, url: &str, body: Value) -> Result<()> {
@@ -897,12 +1004,25 @@ impl PipelineSource for GitHubPipe {
     async fn logs(&self, run: &ItemRef, job_id: Option<&str>) -> Result<String> {
         let repo = self.0.resolve(run)?;
         let jobs_v = self.0.get_json(&self.0.repo_path(&repo, &format!("/actions/runs/{}/jobs", run.id))).await?;
-        let lines: Vec<String> = get_arr(&jobs_v, "jobs")
-            .iter()
-            .filter(|j| job_id.is_none() || get_i64(j, "id").map(|n| n.to_string()).as_deref() == job_id)
-            .map(|j| format!("{}: {}/{}", get_str(j, "name").unwrap_or_default(), get_str(j, "status").unwrap_or_default(), get_str(j, "conclusion").unwrap_or_else(|| "-".into())))
-            .collect();
-        Ok(lines.join("\n"))
+        let jobs = get_arr(&jobs_v, "jobs");
+        match job_id {
+            Some(id) => {
+                let job = jobs.iter().find(|j| get_i64(j, "id").map(|n| n.to_string()).as_deref() == Some(id));
+                let job = job.ok_or_else(|| Error::NotFound(id.into()))?;
+                self.0.job_log_text(&repo, id, job).await
+            }
+            None => {
+                let mut out = String::new();
+                for job in jobs.iter().take(20) {
+                    let name = get_str(job, "name").unwrap_or_else(|| "(job)".into());
+                    let id = get_i64(job, "id").map(|n| n.to_string()).unwrap_or_default();
+                    out.push_str(&format!("=== {name} ===\n"));
+                    out.push_str(&self.0.job_log_text(&repo, &id, job).await?);
+                    out.push('\n');
+                }
+                Ok(out)
+            }
+        }
     }
     async fn trigger(&self, definition: &ItemRef, branch: Option<&str>) -> Result<()> {
         let repo = self.0.resolve(definition)?;
@@ -1322,5 +1442,34 @@ mod tests {
         // Noise events are dropped.
         let subscribed: Value = serde_json::from_str(r#"{ "event": "subscribed", "actor": { "login": "sam" } }"#).unwrap();
         assert!(map_gh_issue_event(&subscribed).is_none());
+    }
+
+    #[test]
+    fn shortens_log_timestamps() {
+        assert_eq!(shorten_log_timestamp("2024-05-01T12:34:56.1234567Z hello world"), "12:34:56  hello world");
+        assert_eq!(shorten_log_timestamp("2024-05-01T12:34:56Z hello"), "12:34:56  hello"); // no fractional seconds
+        assert_eq!(shorten_log_timestamp("2024-05-01T12:34:56.1Z"), "12:34:56  "); // timestamp with nothing after
+        assert_eq!(shorten_log_timestamp("hello world"), "hello world"); // no timestamp prefix at all
+        assert_eq!(shorten_log_timestamp("not-a-date but long enough to pass the length check"), "not-a-date but long enough to pass the length check");
+    }
+
+    #[test]
+    fn strips_ansi_escapes_but_keeps_markers() {
+        assert_eq!(strip_ansi("\u{1b}[31merror\u{1b}[0m: build failed"), "error: build failed");
+        assert_eq!(strip_ansi("##[error]Process completed with exit code 1."), "##[error]Process completed with exit code 1.");
+        assert_eq!(strip_ansi("no escapes here"), "no escapes here");
+    }
+
+    #[test]
+    fn builds_in_progress_text_from_steps() {
+        let job: Value = serde_json::from_str(
+            r#"{ "name": "build", "status": "in_progress",
+                 "steps": [ { "name": "checkout", "status": "completed" }, { "name": "compile", "status": "in_progress" } ] }"#,
+        )
+        .unwrap();
+        let text = gh_job_in_progress_text(&job);
+        assert!(text.starts_with("build: in progress"));
+        assert!(text.contains("✓ checkout"));
+        assert!(text.contains("… compile"));
     }
 }

@@ -54,6 +54,18 @@ async fn github_lists_pipeline_runs_and_supports_approvals() {
         assert_eq!(got.id, run.id);
         // A finished run just returns [] — this only checks the call decodes.
         pipe.pending_approvals(&ItemRef::new(&run.id)).await.expect("decode pending approvals");
+
+        // A completed job's log should be real log text pulled from the Actions logs endpoint,
+        // not the old one-line `name: status/conclusion` summary.
+        let completed_job = got.stages.iter().flat_map(|s| &s.jobs).find(|j| j.status == PipelineRunStatus::Succeeded || j.status == PipelineRunStatus::Failed);
+        if let Some(job) = completed_job {
+            let text = pipe.logs(&ItemRef::new(&run.id), Some(&job.id)).await.expect("fetch job log");
+            eprintln!("github: job {} log is {} byte(s)", job.name, text.len());
+            assert!(text.lines().count() > 1, "expected multi-line log text, got: {text:?}");
+            // The old buggy behaviour returned exactly one line shaped "name: status/conclusion".
+            let old_one_line_summary = format!("{}: completed/", job.name);
+            assert!(!text.starts_with(&old_one_line_summary), "logs() should no longer return the old status/conclusion summary");
+        }
     }
 }
 

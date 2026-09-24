@@ -20,7 +20,21 @@ async fn azure_connectivity_and_lists() {
     az.conn.work_items().expect("azure work items").list(&WorkItemQuery::default()).await.expect("list work items");
     let pipe = az.conn.pipelines().expect("azure pipelines");
     assert!(pipe.supports_approvals(), "azure supports approvals");
-    pipe.list_runs(&PipelineRunQuery::default()).await.expect("list pipeline runs");
+    let runs = pipe.list_runs(&PipelineRunQuery::default()).await.expect("list pipeline runs");
+
+    // A completed job's log should be real log text pulled from the build's timeline/logs
+    // endpoint, not the old one-line `[type] name: state/result` summary.
+    if let Some(run) = runs.first() {
+        let got = pipe.get_run(&ItemRef::new(&run.id)).await.expect("get a listed run");
+        let completed_job = got.stages.iter().flat_map(|s| &s.jobs).find(|j| j.status == PipelineRunStatus::Succeeded || j.status == PipelineRunStatus::Failed);
+        if let Some(job) = completed_job {
+            let text = pipe.logs(&ItemRef::new(&run.id), Some(&job.id)).await.expect("fetch job log");
+            eprintln!("azure: job {} log is {} byte(s)", job.name, text.len());
+            assert!(text.lines().count() > 1, "expected multi-line log text, got: {text:?}");
+            let old_one_line_summary = format!("[Job] {}: completed/", job.name);
+            assert!(!text.starts_with(&old_one_line_summary), "logs() should no longer return the old state/result summary");
+        }
+    }
 }
 
 #[tokio::test]

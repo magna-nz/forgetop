@@ -269,6 +269,56 @@ async fn gitlab_pipeline_cancel_lifecycle() {
 }
 
 #[tokio::test]
+async fn gitlab_pipeline_logs_lifecycle() {
+    let gl = skip_if_none!(harness::gitlab(), "gitlab");
+    let raw = GlRaw::from_env().expect("gitlab raw");
+    harness::maybe_sweep(raw.sweep()).await;
+    let prefix = harness::run_prefix();
+
+    // Fixture: a throwaway branch whose only job echoes a fixture marker — enough to prove the
+    // adapter is fetching the job's actual trace, not a status summary.
+    let marker = format!("{prefix}-trace-marker");
+    let default_branch = raw.default_branch().await;
+    let branch = format!("{prefix}-logs");
+    raw.create_branch(&branch, &default_branch).await;
+    raw.put_file(".gitlab-ci.yml", &format!("job:\n  script:\n    - echo {marker}\n"), &branch, &format!("{prefix}: add ci")).await;
+    let pipeline_id = match raw.create_pipeline(&branch).await {
+        Ok(id) => id,
+        Err(e) => {
+            // GitLab.com can block CI on unvalidated accounts — treat that as a skip.
+            eprintln!("SKIP gitlab pipeline logs: CI can't run on this account ({e})");
+            raw.delete_branch(&branch).await;
+            return;
+        }
+    };
+    let id = pipeline_id.to_string();
+
+    let pipe = gl.conn.pipelines().expect("gitlab pipelines");
+
+    // Wait for the job to finish and read its id back off the run's stages.
+    let job_id = {
+        let pipe = &pipe;
+        let id = id.as_str();
+        harness::poll(harness::POLL_CANCEL, move || async move {
+            let run = pipe.get_run(&ItemRef::new(id)).await.ok()?;
+            run.stages.iter().flat_map(|s| s.jobs.iter()).find(|j| matches!(j.status, PipelineRunStatus::Succeeded | PipelineRunStatus::Failed)).map(|j| j.id.clone())
+        })
+        .await
+    }
+    .expect("the fixture job finishes");
+
+    let logs = pipe.logs(&ItemRef::new(&id), Some(&job_id)).await.expect("job logs");
+    // The old (buggy) shape was a one-line-per-job status summary, `"{stage} [{name}]: {status}"`.
+    // A real trace for this fixture contains the echoed marker and isn't that summary line.
+    let looks_like_old_status_summary = logs.lines().count() <= 1 && logs.contains('[') && logs.contains(']') && logs.contains(':') && !logs.contains(&marker);
+    assert!(!looks_like_old_status_summary, "logs() returned the job's trace, not a status summary: {logs:?}");
+    assert!(logs.contains(&marker), "the trace contains the fixture's echoed marker: {logs:?}");
+
+    raw.delete_pipeline(pipeline_id).await;
+    raw.delete_branch(&branch).await;
+}
+
+#[tokio::test]
 async fn gitlab_lists_notifications() {
     let gl = skip_if_none!(harness::gitlab(), "gitlab");
     let notifs = gl.conn.notifications().expect("gitlab advertises notifications");

@@ -265,6 +265,31 @@ pub fn map_pipeline(v: &Value, repo: &str) -> PipelineRun {
     }
 }
 
+/// Strips ANSI CSI escape sequences (`\x1b[...<final-byte>`) and normalizes line endings in a
+/// Bitbucket step log, so the TUI's log pane shows clean, plain text. (Duplicated from the
+/// equivalent GitLab helper rather than shared — the two providers' clients own disjoint files.)
+fn strip_log_text(s: &str) -> String {
+    let normalized = s.replace("\r\n", "\n");
+    let mut out = String::with_capacity(normalized.len());
+    let mut chars = normalized.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            let mut lookahead = chars.clone();
+            if lookahead.next() == Some('[') {
+                chars = lookahead;
+                for c2 in chars.by_ref() {
+                    if ('@'..='~').contains(&c2) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out.replace('\r', "")
+}
+
 pub fn map_step(v: &Value) -> PipelineJob {
     PipelineJob {
         id: get_str(v, "uuid").unwrap_or_else(|| "0".into()),
@@ -341,6 +366,43 @@ impl BitbucketClient {
             return Err(Error::Provider(format!("POST {url} -> {}", resp.status())));
         }
         Ok(())
+    }
+
+    /// Like `get_json`, but for a plain-text endpoint (a step's `/log`) — a 404 (log not
+    /// published yet, e.g. the step is still `PENDING`) comes back as `None` rather than an
+    /// error, so callers can show a status line instead of failing the whole request.
+    async fn get_text_opt(&self, url: &str) -> Result<Option<String>> {
+        let resp = self.http.get(url).send().await.map_err(prov)?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            return Err(Error::Provider(format!("GET {url} -> {}", resp.status())));
+        }
+        resp.text().await.map_err(prov).map(Some)
+    }
+
+    /// Fetches one pipeline step's name and log, cleaned up for display. A log that isn't
+    /// published yet, or that comes back empty (a step that just started), reads as a short
+    /// status line rather than an error — the TUI's poll depends on `logs()` not toasting while
+    /// a run is still in flight.
+    async fn step_log(&self, repo: &str, pipeline_uuid: &str, step_uuid: &str) -> Result<(String, String)> {
+        let step_v = self.get_json(&self.repo_path(repo, &format!("/pipelines/{pipeline_uuid}/steps/{step_uuid}"))).await?;
+        let name = get_str(&step_v, "name").unwrap_or_else(|| "(step)".into());
+        let state_name = get_obj(&step_v, "state").and_then(|st| get_str(st, "name")).unwrap_or_else(|| "PENDING".into());
+        let log_url = self.repo_path(repo, &format!("/pipelines/{pipeline_uuid}/steps/{step_uuid}/log"));
+        let body = match self.get_text_opt(&log_url).await? {
+            Some(text) => {
+                let cleaned = strip_log_text(&text);
+                if cleaned.trim().is_empty() {
+                    format!("{name}: {state_name} — no output yet")
+                } else {
+                    cleaned
+                }
+            }
+            None => format!("{name}: {state_name} — no log yet"),
+        };
+        Ok((name, body))
     }
 
     async fn self_name(&self) -> Result<Option<String>> {
@@ -517,14 +579,30 @@ impl PipelineSource for BitbucketPipe {
         }
         Ok(mapped)
     }
-    async fn logs(&self, run: &ItemRef, _job_id: Option<&str>) -> Result<String> {
+    async fn logs(&self, run: &ItemRef, job_id: Option<&str>) -> Result<String> {
         let repo = self.0.resolve(run)?;
-        let steps_v = self.0.get_json(&self.0.repo_path(&repo, &format!("/pipelines/{}/steps", enc_uuid(&run.id)))).await?;
-        let lines: Vec<String> = get_arr(&steps_v, "values")
-            .iter()
-            .map(|s| format!("{}: {}", get_str(s, "name").unwrap_or_default(), get_obj(s, "state").and_then(|st| get_str(st, "name")).unwrap_or_default()))
-            .collect();
-        Ok(lines.join("\n"))
+        let pipeline_uuid = enc_uuid(&run.id);
+        // A specific step: its raw log, cleaned up for display.
+        if let Some(job_id) = job_id {
+            let (_, body) = self.0.step_log(&repo, &pipeline_uuid, &enc_uuid(job_id)).await?;
+            return Ok(body);
+        }
+        // No step specified: concatenate each step's log under a name header. Bounded so a
+        // pipeline with many steps doesn't fan out into dozens of log requests per poll.
+        const MAX_STEPS: usize = 20;
+        let steps_v = self.0.get_json(&self.0.repo_path(&repo, &format!("/pipelines/{pipeline_uuid}/steps"))).await?;
+        let step_uuids: Vec<String> = get_arr(&steps_v, "values").iter().filter_map(|s| get_str(s, "uuid")).take(MAX_STEPS).collect();
+        if step_uuids.is_empty() {
+            return Ok("(no output yet)".into());
+        }
+        let mut out = String::new();
+        for uuid in step_uuids {
+            match self.0.step_log(&repo, &pipeline_uuid, &enc_uuid(&uuid)).await {
+                Ok((name, body)) => out.push_str(&format!("=== {name} ===\n{body}\n")),
+                Err(e) => out.push_str(&format!("(log unavailable: {e})\n")),
+            }
+        }
+        Ok(out)
     }
     async fn trigger(&self, definition: &ItemRef, branch: Option<&str>) -> Result<()> {
         let repo = self.0.resolve(definition)?;
@@ -772,5 +850,28 @@ mod tests {
         assert!(map_bb_activity(&comment).is_none());
         let opened: Value = serde_json::from_str(r#"{ "update": { "state": "OPEN" } }"#).unwrap();
         assert!(map_bb_activity(&opened).is_none());
+    }
+
+    #[test]
+    fn strip_log_text_removes_ansi_colour_codes() {
+        let raw = "\x1b[31mERROR\x1b[0m: build failed\x1b[1;32mOK\x1b[0m";
+        assert_eq!(strip_log_text(raw), "ERROR: build failedOK");
+    }
+
+    #[test]
+    fn strip_log_text_handles_crlf_and_bare_cr() {
+        let raw = "line1\r\nline2\rstill line2\r\nline3";
+        let cleaned = strip_log_text(raw);
+        assert!(!cleaned.contains('\r'), "no stray CR left: {cleaned:?}");
+        assert!(cleaned.contains("line1"));
+        assert!(cleaned.contains("line2"));
+        assert!(cleaned.contains("still line2"));
+        assert!(cleaned.contains("line3"));
+    }
+
+    #[test]
+    fn strip_log_text_leaves_plain_text_untouched() {
+        let raw = "hello world\nsecond line\nthird line";
+        assert_eq!(strip_log_text(raw), raw);
     }
 }
