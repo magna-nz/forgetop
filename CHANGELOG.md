@@ -9,6 +9,34 @@ Adding a release: one `## <version> — <date>` section, a line per user-visible
 and the pull request each one came from. `git log v<previous>..HEAD --merges` lists the
 candidates.
 
+## 1.1.4 — 2026-09-24
+
+Changed
+
+- The **repository** leads a Pipelines row. It sat out past `Started`, at the far right edge —
+  the last place you look, for the one field that says *where* a run happened. It now reads
+  first, immediately left of the pipeline/branch column.
+  ([#191](https://github.com/magna-nz/forgetop/pull/191))
+- A group header is coloured like a row instead of like chrome. Accent is what the borders,
+  the pane titles and the live tab are painted in, and the Pipelines subject column was the
+  only row content anywhere using it — which made the tab read as a different application
+  next to the Title column on Pull Requests and Work Items. Bold still sets a roll-up apart
+  from the runs beneath it. ([#191](https://github.com/magna-nz/forgetop/pull/191))
+- Every run state is named. The status column spelled out four of its six states and drew the
+  other two, so the two outcomes that matter most were a symbol to decode — and said nothing
+  at all where colour is lost. Glyph *and* word now, with `Succeeded` in place of `Passed`.
+  ([#191](https://github.com/magna-nz/forgetop/pull/191))
+- Inside a group, the state is written where it **changes**. A run whose line above already
+  said it shows the glyph alone, so a group that simply passed no longer stacks the same word
+  four deep and the run that broke the streak is what the eye lands on. Nothing is hidden —
+  every row still carries its own coloured glyph — and an ungrouped list repeats as before,
+  since there is no header above a row to have said it.
+  ([#191](https://github.com/magna-nz/forgetop/pull/191))
+
+Release
+
+- 1.1.4 version bump. ([#191](https://github.com/magna-nz/forgetop/pull/191))
+
 ## 1.1.3 — 2026-09-24
 
 Fixed
