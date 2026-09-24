@@ -1904,9 +1904,13 @@ fn render_health(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
+/// The footer's palette key — drawn in yellow on every screen, since it finds everything the
+/// footer leaves out.
+const SEARCH_KEY: &str = "Ctrl-K";
+
 /// Context-aware key glossary for the active tab (azdo-style bar along the bottom). Leads with
-/// the dashboard shortcut (when its server runs) and the Ctrl-K palette, except while the
-/// wizard, an overlay, or the quick-filter is capturing input.
+/// the Ctrl-K palette ("search anywhere") and the dashboard shortcut (when its server runs),
+/// except while the wizard, an overlay, or the quick-filter is capturing input.
 fn footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
     let mut keys = base_footer_keys(app);
     // A focused preview is the item view itself, so its own keys lead; `p` is how back.
@@ -1917,10 +1921,10 @@ fn footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
     // palette is where everything the footer leaves out (feedback, views, find, …) is found,
     // and the dashboard shortcut shows whenever its server is running.
     if app.wizard.is_none() && app.overlay.is_none() && !app.filtering {
-        keys.insert(0, ("Ctrl-K", "palette"));
         if app.dashboard_url.is_some() {
             keys.insert(0, ("B", "dashboard"));
         }
+        keys.insert(0, (SEARCH_KEY, "search anywhere"));
     }
     keys
 }
@@ -2132,9 +2136,10 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         && app.overlay.is_none()
         && app.wizard.is_none();
     for (key, label) in footer_keys(app) {
-        let chip = if item_open && is_write_action(label) { theme.yellow } else { theme.accent };
+        let search = key == SEARCH_KEY;
+        let chip = if search || (item_open && is_write_action(label)) { theme.yellow } else { theme.accent };
         spans.push(Span::styled(format!(" {key} "), bar.fg(theme.bg).bg(chip).add_modifier(Modifier::BOLD)));
-        spans.push(Span::styled(format!(" {label}  "), bar.fg(theme.fg)));
+        spans.push(Span::styled(format!(" {label}  "), bar.fg(if search { theme.yellow } else { theme.fg })));
     }
 
     // Right side: a transient toast, else the standing status line. "Refreshing…" normally
@@ -4634,7 +4639,7 @@ mod tests {
         app.screen = Screen::List;
         app.dashboard_url = Some("http://127.0.0.1:8177/?t=x".into());
         let out = render_to_string(&mut app, 160, 24);
-        assert!(out.contains("Ctrl-K") && out.contains("palette"), "footer advertises the palette");
+        assert!(out.contains("Ctrl-K") && out.contains("search anywhere"), "footer advertises the palette");
         assert!(out.contains(" B ") && out.contains("dashboard"), "footer advertises the running dashboard");
         for gone in ["browser dashboard", "feedback", "save view", "find", "tabs", "sections"] {
             assert!(!out.contains(gone), "{gone} is found through the palette and ? help, not the footer");
