@@ -15,7 +15,7 @@ use std::io::{self, Stdout};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use forgetop_core::Result;
@@ -34,10 +34,14 @@ type Term = Terminal<CrosstermBackend<Stdout>>;
 
 /// Set while `$EDITOR` owns the terminal, so the input thread stops reading keys meant for it.
 static INPUT_PAUSED: AtomicBool = AtomicBool::new(false);
+/// Whether this run captures the mouse (`ui.mouse`, on unless set to false). Read wherever the
+/// terminal is handed back and taken again, so the editor and a crash leave it as they found it.
+static MOUSE: AtomicBool = AtomicBool::new(false);
 
 /// Set up the terminal, run the loop against `deps`, and always restore the terminal.
 pub async fn run(deps: AppDeps, theme_name: &str, dashboard_url: Option<String>) -> Result<()> {
     install_panic_hook();
+    MOUSE.store(deps.config.snapshot().ui.mouse.unwrap_or(true), Ordering::SeqCst);
     let mut terminal = setup_terminal().map_err(forgetop_core::Error::from)?;
 
     let mut app = App::new(theme_name);
@@ -177,6 +181,12 @@ fn input_reader(tx: mpsc::UnboundedSender<Key>) {
             Event::Key(k) if k.kind != KeyEventKind::Release => map_key(k.code, k.modifiers),
             // Wake the loop so it redraws at the new terminal size (fixes zoom/resize).
             Event::Resize(_, _) => Key::Redraw,
+            Event::Mouse(m) => match m.kind {
+                MouseEventKind::Down(MouseButton::Left) => Key::Click(m.column, m.row),
+                MouseEventKind::ScrollUp => Key::ScrollUp(m.column, m.row),
+                MouseEventKind::ScrollDown => Key::ScrollDown(m.column, m.row),
+                _ => Key::None,
+            },
             _ => Key::None,
         };
         if key != Key::None && tx.send(key).is_err() {
@@ -240,7 +250,10 @@ async fn edit_in_editor(terminal: &mut Term, initial: &str) -> std::result::Resu
     let file = path.clone();
     let status = tokio::task::spawn_blocking(move || std::process::Command::new(&program).args(&args).arg(&file).status()).await;
 
-    let resumed = enable_raw_mode().and_then(|()| execute!(io::stdout(), EnterAlternateScreen)).and_then(|()| terminal.clear());
+    let resumed = enable_raw_mode()
+        .and_then(|()| execute!(io::stdout(), EnterAlternateScreen))
+        .and_then(|()| capture_mouse(&mut io::stdout()))
+        .and_then(|()| terminal.clear());
     INPUT_PAUSED.store(false, Ordering::SeqCst);
 
     let text = std::fs::read_to_string(&path);
@@ -272,7 +285,7 @@ fn install_panic_hook() {
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
         forgetop_core::diag::log("panic", &info.to_string());
         eprintln!("\nforgetop crashed — details logged to {}", forgetop_core::diag::log_path().display());
         default(info);
@@ -283,11 +296,22 @@ fn setup_terminal() -> io::Result<Term> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
+    capture_mouse(&mut stdout)?;
     Terminal::new(CrosstermBackend::new(stdout))
+}
+
+/// Starts reporting mouse events, when this run has the mouse on.
+fn capture_mouse(out: &mut impl io::Write) -> io::Result<()> {
+    if MOUSE.load(Ordering::SeqCst) {
+        execute!(out, EnableMouseCapture)?;
+    }
+    Ok(())
 }
 
 fn restore_terminal(terminal: &mut Term) -> io::Result<()> {
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    // Released unconditionally: a no-op when it was never captured, and a shell left
+    // receiving mouse escape codes is unusable.
+    execute!(terminal.backend_mut(), DisableMouseCapture, LeaveAlternateScreen)?;
     terminal.show_cursor()
 }

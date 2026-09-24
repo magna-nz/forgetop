@@ -747,6 +747,8 @@ pub struct App {
     pub notifications: NotificationPrefs,
     /// Hours a review request may wait before its Command Center age turns yellow (red at 3×).
     pub review_sla_hours: u32,
+    /// Where things were in the last frame, for mouse clicks (see [`Hit`]).
+    pub hits: Vec<(ratatui::layout::Rect, Hit)>,
     /// Where desktop notifications are sent. Real OS notifier by default; tests
     /// swap in a recorder.
     notifier: Arc<dyn Notifier>,
@@ -1849,6 +1851,7 @@ impl App {
             view_idx: [0, 0, 0],
             notifications: NotificationPrefs::default(),
             review_sla_hours: forgetop_core::config::DEFAULT_REVIEW_SLA_HOURS,
+            hits: Vec::new(),
             notifier: Arc::new(SystemNotifier),
             pipe_seen: HashMap::new(),
             approval_seen: HashSet::new(),
@@ -4396,9 +4399,201 @@ impl App {
 
     /// Applies a key. `deps` is used for async refresh / actions / theme persistence.
     pub async fn on_key(&mut self, key: Key, deps: &AppDeps) {
-        self.on_key_inner(key, deps).await;
+        // A mouse event either acts directly (selecting a row) or stands in for a key (a second
+        // click on the selected row is Enter), which then takes the ordinary key path.
+        let (key, times) = if key.is_mouse() { self.on_mouse(key).unwrap_or((Key::None, 0)) } else { (key, 1) };
+        for _ in 0..times {
+            self.on_key_inner(key, deps).await;
+        }
         self.settle_preview(deps);
         self.drive_logs(deps);
+    }
+
+    /// Resolves a mouse event against the last frame's hit map. Returns the key it stands for
+    /// and how many times to press it, or `None` when it was handled here (or means nothing).
+    ///
+    /// Clicks act only on the main screen: the wizard, an overlay and the quick filter keep
+    /// their keyboard-only input, so a stray click can't pick an option or confirm a prompt.
+    /// The wheel still scrolls an overlay (it's Up / Down there), but never the wizard or filter.
+    fn on_mouse(&mut self, key: Key) -> Option<(Key, usize)> {
+        let (Key::Click(x, y) | Key::ScrollUp(x, y) | Key::ScrollDown(x, y)) = key else { return None };
+        if self.wizard.is_some() || self.filtering {
+            return None;
+        }
+        let at = ratatui::layout::Position { x, y };
+        let hit = self.hits.iter().rev().find(|(r, _)| r.contains(at)).map(|(_, h)| *h);
+        match key {
+            Key::Click(..) if self.overlay.is_none() => {
+                self.toast = None;
+                self.on_click(hit?)
+            }
+            Key::ScrollUp(..) => self.on_wheel(hit, -1),
+            Key::ScrollDown(..) => self.on_wheel(hit, 1),
+            _ => None,
+        }
+    }
+
+    /// A click on `hit`. The first click on a row selects it; a click on the row that is
+    /// already selected opens it, as Enter would. On a diff line, the second click comments.
+    fn on_click(&mut self, hit: Hit) -> Option<(Key, usize)> {
+        let enter = Some((Key::Enter, 1));
+        match hit {
+            Hit::Tab(pos) => {
+                // Same guard as Tab: don't walk out from under unsubmitted line comments.
+                if matches!(&self.screen, Screen::PrView(v) if !v.pending.is_empty()) {
+                    self.open_pending_exit_prompt();
+                } else {
+                    self.go_to_tab(pos);
+                }
+            }
+            Hit::PrTab(tab) => {
+                if let Screen::PrView(v) = &mut self.screen {
+                    if v.tab != tab {
+                        v.tab = tab;
+                        v.scroll = 0;
+                        v.reset_diff_scope();
+                    }
+                }
+            }
+            Hit::ListRow(i) => {
+                if self.selected() == Some(i) {
+                    return enter;
+                }
+                self.active_state().select(Some(i));
+                self.ensure_visible();
+            }
+            Hit::LpColumn(side) => {
+                if self.lp_side != side {
+                    self.lp_side = side;
+                    self.anim = 0;
+                }
+            }
+            Hit::LpRow { side, pos } => {
+                if self.lp_side == side && self.lp_sel[side] == pos {
+                    return enter;
+                }
+                self.lp_side = side;
+                self.lp_sel[side] = pos;
+                self.anim = 0;
+            }
+            Hit::InboxRow(i) => {
+                if self.inbox_sel == i {
+                    return enter;
+                }
+                self.inbox_sel = i;
+            }
+            Hit::CommitRow(i) => {
+                let Screen::PrView(v) = &mut self.screen else { return None };
+                if v.commit_sel == i {
+                    return enter;
+                }
+                v.commit_sel = i;
+            }
+            Hit::DiffFile(i) => {
+                let Screen::PrView(v) = &mut self.screen else { return None };
+                if v.diff.focus == DiffFocus::FileList && v.diff.selected == i {
+                    return enter;
+                }
+                v.diff.focus = DiffFocus::FileList;
+                if v.diff.selected != i {
+                    v.diff.selected = i;
+                    v.diff.scroll = 0;
+                    v.diff.cursor = 0;
+                }
+            }
+            Hit::DiffLine(i) => {
+                let Screen::PrView(v) = &mut self.screen else { return None };
+                if v.diff.focus == DiffFocus::Patch && v.diff.cursor == i {
+                    return Some((Key::Char('c'), 1));
+                }
+                v.diff.focus = DiffFocus::Patch;
+                v.diff.cursor = i;
+            }
+            Hit::DiffPatch => {}
+            Hit::PipeNode(i) => {
+                let Screen::Pipeline(v) = &mut self.screen else { return None };
+                v.log_focus = false;
+                if v.selected == i {
+                    return enter;
+                }
+                v.selected = i;
+                v.user_moved = true;
+                if v.logs.is_some() {
+                    v.open_logs_for_selection();
+                }
+            }
+            Hit::LogPane => {
+                if let Screen::Pipeline(v) = &mut self.screen {
+                    v.log_focus = true;
+                }
+            }
+        }
+        None
+    }
+
+    /// One wheel notch (`dir` -1 up, 1 down) over `hit`. The pane under the pointer takes the
+    /// wheel: a Command Center column or the pipeline tree / log pane gains focus first. Lists
+    /// move their selection one row and stop at the ends (Up / Down wrap, which reads as a jump
+    /// under a wheel); scrolling text moves three lines a notch.
+    fn on_wheel(&mut self, hit: Option<Hit>, dir: isize) -> Option<(Key, usize)> {
+        let key = if dir < 0 { Key::Up } else { Key::Down };
+        if self.overlay.is_some() {
+            return Some((key, 1));
+        }
+        let step = |sel: usize, len: usize| (sel as isize + dir).clamp(0, len.saturating_sub(1) as isize) as usize;
+        match &mut self.screen {
+            Screen::Launchpad => {
+                if let Some(Hit::LpColumn(side) | Hit::LpRow { side, .. }) = hit {
+                    self.lp_side = side;
+                }
+                Some((key, 1))
+            }
+            Screen::List if !self.preview_focus => {
+                let len = self.active_len();
+                if len > 0 {
+                    let next = step(self.selected_index(), len);
+                    self.active_state().select(Some(next));
+                    self.ensure_visible();
+                }
+                None
+            }
+            Screen::Inbox => {
+                self.inbox_sel = step(self.inbox_sel, self.inbox.len());
+                None
+            }
+            Screen::Pipeline(v) => {
+                if v.logs.is_some() && v.log_split.get() {
+                    match hit {
+                        Some(Hit::LogPane) => v.log_focus = true,
+                        Some(Hit::PipeNode(_)) => v.log_focus = false,
+                        _ => {}
+                    }
+                }
+                if v.logs_have_keys() {
+                    return Some((key, 3));
+                }
+                let len = v.flatten().len();
+                if len > 0 {
+                    v.selected = step(v.selected, len);
+                    v.user_moved = true;
+                    if v.logs.is_some() {
+                        v.open_logs_for_selection();
+                    }
+                }
+                None
+            }
+            Screen::PrView(v) => {
+                // Over the patch while the file list has the keys, the wheel scrolls the patch
+                // rather than changing file.
+                if v.tab == 3 && v.diff.focus == DiffFocus::FileList && matches!(hit, Some(Hit::DiffPatch | Hit::DiffLine(_))) {
+                    v.diff.scroll_by(3 * dir as i32);
+                    return None;
+                }
+                Some((key, if matches!(v.tab, 0 | 2) { 3 } else { 1 }))
+            }
+            Screen::WiView(_) => Some((key, 3)),
+            _ => Some((key, 1)),
+        }
     }
 
     async fn on_key_inner(&mut self, key: Key, deps: &AppDeps) {
@@ -4571,6 +4766,7 @@ impl App {
             Key::Char(c) => self.on_char(c, deps).await,
             // Tab and Shift-Tab are answered globally, before any screen sees them.
             Key::Tab | Key::BackTab | Key::Backspace | Key::Ctrl(_) | Key::Quit | Key::Redraw | Key::Home | Key::End | Key::None => {}
+            Key::Click(..) | Key::ScrollUp(..) | Key::ScrollDown(..) => {}
         }
     }
 
@@ -7349,7 +7545,46 @@ pub enum Key {
     Quit,
     /// Terminal was resized — no-op, but wakes the loop so it redraws at the new size.
     Redraw,
+    /// A left click at (column, row), resolved against the last frame's [`Hit`] map.
+    Click(u16, u16),
+    /// The mouse wheel, one notch, over (column, row).
+    ScrollUp(u16, u16),
+    ScrollDown(u16, u16),
     None,
+}
+
+impl Key {
+    fn is_mouse(self) -> bool {
+        matches!(self, Key::Click(..) | Key::ScrollUp(..) | Key::ScrollDown(..))
+    }
+}
+
+/// What sits under a screen cell in the last frame, so a click can act on it. The renderer
+/// records these as it draws ([`crate::ui::render`]); later entries are drawn on top, so the
+/// last one containing a point wins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hit {
+    /// A tab on the top strip: 0 = Command Center, then each visible section.
+    Tab(usize),
+    /// A PR view sub-tab (Conversation, Commits, Checks, Diff).
+    PrTab(usize),
+    /// A row of the active section list, by the index its selection uses.
+    ListRow(usize),
+    /// A Command Center column, and a row in it (a slot position, as `lp_sel` counts).
+    LpColumn(usize),
+    LpRow { side: usize, pos: usize },
+    /// A notification in the inbox.
+    InboxRow(usize),
+    /// A commit on the PR view's Commits tab.
+    CommitRow(usize),
+    /// A file in the Diff tab's file list.
+    DiffFile(usize),
+    /// The Diff tab's patch pane, and a patch line in it.
+    DiffPatch,
+    DiffLine(usize),
+    /// A node of the pipeline tree, and the log pane beside it.
+    PipeNode(usize),
+    LogPane,
 }
 
 
@@ -12903,5 +13138,131 @@ mod tests {
         assert!(old.timeline.is_empty());
         let old: PrDetail = serde_json::from_str(r#"{"threads":[],"files":[],"checks":[],"commits":[]}"#).expect("an old PR entry decodes");
         assert!(old.timeline.is_empty());
+    }
+
+    // ---- mouse ----
+
+    /// Draws one frame into a test terminal, filling `app.hits`, and returns what it drew.
+    fn draw(app: &mut App, w: u16, h: u16) -> ratatui::buffer::Buffer {
+        let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        t.draw(|f| crate::ui::render(f, app)).unwrap();
+        t.backend().buffer().clone()
+    }
+
+    /// Where `target` was drawn in the last frame (its top-left cell).
+    fn spot(app: &App, target: Hit) -> (u16, u16) {
+        let r = app.hits.iter().find(|(_, h)| *h == target).unwrap_or_else(|| panic!("{target:?} not on screen")).0;
+        (r.x, r.y)
+    }
+
+    fn row_text(buf: &ratatui::buffer::Buffer, y: u16) -> String {
+        (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect()
+    }
+
+    async fn click(app: &mut App, deps: &AppDeps, target: Hit) {
+        let (x, y) = spot(app, target);
+        app.on_key(Key::Click(x, y), deps).await;
+    }
+
+    /// A list without the preview, so it has the full width and the keys.
+    fn mouse_list(ids: &[&str]) -> App {
+        let mut app = preview_app(ids);
+        app.preview_hidden[0] = true;
+        app
+    }
+
+    #[tokio::test]
+    async fn clicking_a_row_selects_it_and_clicking_it_again_opens_it() {
+        let deps = test_deps();
+        let mut app = mouse_list(&["1", "2", "3"]);
+        let buf = draw(&mut app, 150, 30);
+        assert!(row_text(&buf, spot(&app, Hit::ListRow(1)).1).contains("PR 2"), "the row's hit sits on its own text");
+
+        click(&mut app, &deps, Hit::ListRow(1)).await;
+        assert_eq!(app.selected(), Some(1));
+        assert!(matches!(app.screen, Screen::List), "the first click only selects");
+
+        draw(&mut app, 150, 30);
+        click(&mut app, &deps, Hit::ListRow(1)).await;
+        assert!(matches!(&app.screen, Screen::PrView(v) if v.pr.id == "2"), "a second click opens it, like Enter");
+    }
+
+    #[tokio::test]
+    async fn clicking_a_tab_switches_to_it() {
+        let deps = test_deps();
+        let mut app = mouse_list(&["1"]);
+        let buf = draw(&mut app, 150, 30);
+        let (x, y) = spot(&app, Hit::Tab(0));
+        assert!(row_text(&buf, y).chars().skip(x as usize).collect::<String>().starts_with(" Command Center"), "tab 0's hit is on its title");
+        let (x, y) = spot(&app, Hit::Tab(2));
+        assert!(row_text(&buf, y).chars().skip(x as usize).collect::<String>().starts_with(" Work Items"), "tab 2 is Work Items");
+
+        click(&mut app, &deps, Hit::Tab(2)).await;
+        assert!(matches!(app.screen, Screen::List) && app.active == 1);
+        draw(&mut app, 150, 30);
+        click(&mut app, &deps, Hit::Tab(0)).await;
+        assert!(matches!(app.screen, Screen::Launchpad));
+    }
+
+    #[tokio::test]
+    async fn the_wheel_moves_a_list_one_row_and_stops_at_the_ends() {
+        let deps = test_deps();
+        let mut app = mouse_list(&["1", "2"]);
+        draw(&mut app, 150, 30);
+        let (x, y) = spot(&app, Hit::ListRow(0));
+        app.on_key(Key::ScrollUp(x, y), &deps).await;
+        assert_eq!(app.selected(), Some(0), "no wrap to the bottom");
+        app.on_key(Key::ScrollDown(x, y), &deps).await;
+        app.on_key(Key::ScrollDown(x, y), &deps).await;
+        assert_eq!(app.selected(), Some(1), "no wrap to the top");
+    }
+
+    #[tokio::test]
+    async fn clicks_are_ignored_under_an_overlay() {
+        let deps = test_deps();
+        let mut app = mouse_list(&["1", "2"]);
+        draw(&mut app, 150, 30);
+        app.overlay = Some(Overlay::Help { scroll: 0 });
+        click(&mut app, &deps, Hit::ListRow(1)).await;
+        assert_eq!(app.selected(), Some(0));
+        assert!(app.overlay.is_some());
+    }
+
+    #[tokio::test]
+    async fn clicking_a_diff_line_puts_the_cursor_there_and_a_second_click_comments() {
+        let deps = test_deps();
+        let mut app = App::new("slate");
+        let detail = PrDetail {
+            timeline: Vec::new(),
+            threads: vec![],
+            files: vec![changed("a.rs", Some("@@ -1,2 +1,3 @@\n ctx\n+added line\n-removed"))],
+            checks: vec![],
+            commits: vec![],
+        };
+        app.screen = pr_view_showing(pr(None), &detail);
+        draw(&mut app, 150, 30);
+        click(&mut app, &deps, Hit::PrTab(3)).await;
+        assert!(matches!(&app.screen, Screen::PrView(v) if v.tab == 3), "the Diff sub-tab is clickable");
+
+        let buf = draw(&mut app, 150, 30);
+        assert!(row_text(&buf, spot(&app, Hit::DiffLine(2)).1).contains("+added line"));
+        click(&mut app, &deps, Hit::DiffLine(2)).await;
+        let Screen::PrView(v) = &app.screen else { panic!() };
+        assert_eq!((v.diff.focus, v.diff.cursor), (DiffFocus::Patch, 2));
+
+        draw(&mut app, 150, 30);
+        click(&mut app, &deps, Hit::DiffLine(2)).await;
+        assert!(matches!(&app.overlay, Some(Overlay::Input { kind: InputKind::PrLineComment, .. })), "second click opens the line comment");
+    }
+
+    #[test]
+    fn an_unfocused_preview_takes_no_clicks() {
+        let deps = test_deps();
+        let mut app = preview_app(&["1"]);
+        app.settle_preview(&deps);
+        draw(&mut app, 150, 30);
+        assert!(app.preview.is_some(), "the split is showing");
+        assert!(app.hits.iter().any(|(_, h)| matches!(h, Hit::ListRow(_))));
+        assert!(!app.hits.iter().any(|(_, h)| matches!(h, Hit::PrTab(_))), "the preview's sub-tabs are only a picture");
     }
 }

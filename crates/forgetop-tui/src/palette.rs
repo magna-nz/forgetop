@@ -241,7 +241,7 @@ pub fn key_label(key: Key) -> String {
         Key::Home => "Home".into(),
         Key::End => "End".into(),
         Key::Quit => "Ctrl-C".into(),
-        Key::Redraw | Key::None => String::new(),
+        Key::Redraw | Key::Click(..) | Key::ScrollUp(..) | Key::ScrollDown(..) | Key::None => String::new(),
     }
 }
 
