@@ -9,6 +9,36 @@ Adding a release: one `## <version> — <date>` section, a line per user-visible
 and the pull request each one came from. `git log v<previous>..HEAD --merges` lists the
 candidates.
 
+## 1.2.0 — 2026-09-24
+
+Added
+
+- A **preview pane** beside the Pull Requests, Work Items and Pipelines lists on terminals
+  140+ columns wide: the selected item's view, with its detail fetched once the cursor rests.
+  `Enter` / `p` move focus into it and its keys work there; `P` hides it per section.
+  ([#192](https://github.com/magna-nz/forgetop/pull/192))
+- **Live pipeline logs.** The log pane sits beside the stages/jobs/steps tree, refreshes while
+  a job runs and follows the tail until you scroll up. `E` jumps to the first error, `/`
+  searches with `n`/`N`, and a failed run opens on its failing step.
+  ([#193](https://github.com/magna-nz/forgetop/pull/193))
+- **Shift-Tab** walks the tab strip backwards, wrapping, from any screen — the mirror of Tab.
+  ([#194](https://github.com/magna-nz/forgetop/pull/194))
+
+Changed
+
+- Only `Tab` moves the top nav from a section list; the arrows and `h`/`l` no longer do.
+  ([#192](https://github.com/magna-nz/forgetop/pull/192))
+
+Fixed
+
+- The log pane shows a job's real output on GitHub, GitLab, Azure DevOps and Bitbucket, where
+  it used to show a one-line status per job.
+  ([#193](https://github.com/magna-nz/forgetop/pull/193))
+
+Release
+
+- 1.2.0 version bump. ([#194](https://github.com/magna-nz/forgetop/pull/194))
+
 ## 1.1.4 — 2026-09-24
 
 Changed
