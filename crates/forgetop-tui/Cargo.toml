@@ -18,6 +18,7 @@ open.workspace = true
 notify-rust.workspace = true
 fuzzy-matcher.workspace = true
 synoptic.workspace = true
+pulldown-cmark.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

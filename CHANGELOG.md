@@ -9,6 +9,24 @@ Adding a release: one `## <version> — <date>` section, a line per user-visible
 and the pull request each one came from. `git log v<previous>..HEAD --merges` lists the
 candidates.
 
+## 1.3.1 — 2026-09-25
+
+Added
+
+- **Markdown in descriptions.** PR and work-item descriptions in the terminal UI render their
+  markdown: headings, bold, italics, `code`, bullet and numbered lists, `- [x]` task boxes, code
+  blocks, quotes, links and tables. Plain-text descriptions read as before. ([#200](https://github.com/magna-nz/forgetop/pull/200))
+
+Fixed
+
+- **Command Center titles cut to three characters.** A long branch name in one row squeezed every
+  title on that side of the Command Center, and pushed the person and age past the pane border.
+  The branch column is now capped, and it scrolls when its row is selected. ([#200](https://github.com/magna-nz/forgetop/pull/200))
+
+Docs
+
+- A new terminal demo GIF in the README, recorded against 1.3.1. ([#200](https://github.com/magna-nz/forgetop/pull/200))
+
 ## 1.3.0 — 2026-09-25
 
 Added
