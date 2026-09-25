@@ -61,4 +61,20 @@ impl LnRaw {
     pub async fn archive_issue(&self, id: &str) {
         let _ = self.query("mutation($id:String!){ issueArchive(id:$id){ success } }", json!({ "id": id })).await;
     }
+
+    /// Archives fixtures earlier runs leaked — issues this key's user created, titled with the
+    /// run prefix, more than an hour old (so a concurrent run's live fixture is left alone).
+    /// The lifecycle test archives its own issue only if it gets to the end; one that fails
+    /// first leaves it behind, and on a free workspace those count towards the active-issue
+    /// limit until `issueCreate` is refused outright. Returns how many were archived.
+    pub async fn sweep_stale(&self) -> usize {
+        let before = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        let q = "query($p:String!,$b:DateTimeOrDuration!){ issues(first: 100, filter: { title: { startsWith: $p }, creator: { isMe: { eq: true } }, createdAt: { lt: $b } }) { nodes { id } } }";
+        let d = self.query(q, json!({ "p": harness::SWEEP_PREFIX, "b": before })).await;
+        let ids: Vec<String> = d["issues"]["nodes"].as_array().into_iter().flatten().filter_map(|n| n["id"].as_str().map(str::to_string)).collect();
+        for id in &ids {
+            self.archive_issue(id).await;
+        }
+        ids.len()
+    }
 }
