@@ -547,12 +547,13 @@ fn render_lp_column(frame: &mut Frame, area: Rect, app: &App, side: usize, title
                 }
                 let cells = &entry_cells[cell_i];
                 cell_i += 1;
-                // On the focused row, any overflowing column (where, title, person) scrolls so
-                // it's readable.
+                // On the focused row, any overflowing column (where, title, signal, person) scrolls
+                // so it's readable. A multi-coloured signal (checks + diffstat) just truncates:
+                // scrolling it would flatten it to one colour.
                 let line = if selected && focused {
                     let mut c = cells.clone();
-                    for col in [LP_WHERE_COL, LP_TITLE_COL, LP_PERSON_COL] {
-                        if cell_width(&c[col]) > widths[col] {
+                    for col in [LP_WHERE_COL, LP_TITLE_COL, LP_SIGNAL_COL, LP_PERSON_COL] {
+                        if c[col].len() == 1 && cell_width(&c[col]) > widths[col] {
                             let text: String = c[col].iter().map(|s| s.content.as_ref()).collect();
                             let style = c[col].first().map(|s| s.style).unwrap_or_default();
                             c[col] = vec![Span::styled(marquee_window(&text, widths[col], app.anim / 2), style)];
@@ -600,6 +601,16 @@ const LP_WHERE_MAX: usize = 24;
 const LP_PERSON_COL: usize = 5;
 /// Max width for the person column before it truncates (and marquees on the focused row).
 const LP_PERSON_MAX: usize = 16;
+/// The signal column (PR blocker / check roll-up, a run's branch, a work item's type); capped,
+/// and scrolls when selected, so a long branch name can't crowd out the title.
+const LP_SIGNAL_COL: usize = 4;
+/// Max width for the signal column before it truncates (and marquees on the focused row).
+const LP_SIGNAL_MAX: usize = 22;
+/// The title width the capped columns give way to when a half-width pane can't fit them all.
+const LP_TITLE_MIN: usize = 18;
+/// How far each capped column may shrink to make room for [`LP_TITLE_MIN`], in the order they
+/// give way.
+const LP_SHRINK_FLOORS: [(usize, usize); 3] = [(LP_SIGNAL_COL, 14), (LP_PERSON_COL, 8), (LP_WHERE_COL, 12)];
 /// Gap between Launchpad columns — tighter than the nav lists since a column is half-width.
 const LP_GAP: usize = 2;
 /// Blank columns kept at the end of a row. The title column is elastic and would otherwise eat
@@ -767,13 +778,21 @@ fn lp_widths(rows: &[Vec<Vec<Span>>], flex: usize, inner_w: usize) -> Vec<usize>
             w[i] = w[i].max(cell_width(cell));
         }
     }
-    // Cap the person and "where" columns so a long name or `repo · workflow` doesn't crowd out
-    // the title (they scroll instead).
+    // Cap the person, "where" and signal columns so a long name, `repo · workflow` or branch
+    // doesn't crowd out the title (they scroll instead).
     w[LP_PERSON_COL] = w[LP_PERSON_COL].min(LP_PERSON_MAX);
     w[LP_WHERE_COL] = w[LP_WHERE_COL].min(LP_WHERE_MAX);
+    w[LP_SIGNAL_COL] = w[LP_SIGNAL_COL].min(LP_SIGNAL_MAX);
     let padding = COL_LEAD + LP_GAP * (LP_NCOL - 1) + LP_TRAIL;
-    let fixed: usize = (0..LP_NCOL).filter(|&i| i != flex).map(|i| w[i]).sum::<usize>() + padding;
-    w[flex] = w[flex].min(inner_w.saturating_sub(fixed)).max(3);
+    let fixed = |w: &[usize]| (0..LP_NCOL).filter(|&i| i != flex).map(|i| w[i]).sum::<usize>() + padding;
+    // Still too tight for a readable title: shrink the capped columns toward their floors, in
+    // order of how little they're missed (a branch, then a name, then the item's location).
+    let want = w[flex].min(LP_TITLE_MIN);
+    for (col, floor) in LP_SHRINK_FLOORS {
+        let short = want.saturating_sub(inner_w.saturating_sub(fixed(&w)));
+        w[col] -= short.min(w[col].saturating_sub(floor));
+    }
+    w[flex] = w[flex].min(inner_w.saturating_sub(fixed(&w))).max(3);
     w
 }
 
@@ -6030,6 +6049,41 @@ mod tests {
         }
     }
 
+    /// A run's branch is the row's signal; uncapped, one long branch sized that column for the
+    /// whole side and squeezed every title down to three characters.
+    #[test]
+    fn launchpad_long_branch_does_not_squeeze_titles() {
+        let row = |cells: [&str; LP_NCOL]| cells.iter().map(|c| vec![Span::raw(c.to_string())]).collect::<Vec<_>>();
+        let rows = vec![
+            row(["PR", "● open", "payments #1487", "Add idempotency keys to the payments API", "✓ –  +132 -18", "Sam Rivera", "3h"]),
+            row([
+                "CI",
+                "✗ failed",
+                "payments · CI Build",
+                "Tighten the action-palette shortcut help text",
+                "⑂ claude/m4-action-palette-shortcut-f096cc",
+                "Elena Sokolova",
+                "12h",
+            ]),
+        ];
+        let fits = |w: &[usize], inner_w: usize| COL_LEAD + LP_GAP * (LP_NCOL - 1) + LP_TRAIL + w.iter().sum::<usize>() <= inner_w;
+        // One Launchpad column on a 190-column terminal: room for the full minimum title.
+        let w = lp_widths(&rows, LP_TITLE_COL, 87);
+        assert!(w[LP_TITLE_COL] >= LP_TITLE_MIN, "title keeps {LP_TITLE_MIN} columns, got {w:?}");
+        assert!(fits(&w, 87), "the row fits its pane, so person and age stay visible: {w:?}");
+        // On a 170-column terminal the capped columns bottom out at their floors and the title
+        // takes the rest — still a readable title, where it used to be three characters.
+        let w = lp_widths(&rows, LP_TITLE_COL, 77);
+        assert!(w[LP_TITLE_COL] >= 12, "title stays readable, got {w:?}");
+        assert!(w[LP_SIGNAL_COL] <= LP_SIGNAL_MAX, "the branch is capped, got {w:?}");
+        assert!(fits(&w, 77), "the row fits its pane, so person and age stay visible: {w:?}");
+
+        // With room to spare nothing shrinks below its natural width.
+        let wide = lp_widths(&rows, LP_TITLE_COL, 200);
+        assert_eq!(wide[LP_WHERE_COL], "payments · CI Build".chars().count());
+        assert_eq!(wide[LP_PERSON_COL], "Elena Sokolova".chars().count());
+    }
+
     #[test]
     fn launchpad_renders_two_columns_with_typed_rows() {
         use crate::launchpad::{Bucket, Entry, EntryItem};
@@ -6110,7 +6164,8 @@ mod tests {
                 crate::launchpad::EntryItem::Pipe { run, definition_name: Some("CI Build".into()) },
             ),
         ];
-        let out = render_to_string(&mut app, 140, 24);
+        // Wide enough that no column gives way to the title (a narrower pane truncates "where").
+        let out = render_to_string(&mut app, 200, 24);
         assert!(out.contains("payments #42"), "PR row pairs the repository with its number");
         assert!(out.contains("billing · CI Build"), "pipeline row pairs the repository with its workflow");
         assert!(!out.contains("acme/"), "the owner repeats on every row, so it is dropped");
