@@ -37,6 +37,8 @@ pub enum Action {
     /// `new_run` is set when the provider starts a separate run rather than re-queueing this one.
     PipelineRerun { connection_id: String, repo: Option<String>, run_id: String, failed_only: bool, new_run: bool, label: String },
     RemoveConnection { id: String, label: String },
+    /// Confirmed: dismiss every notification currently in the inbox.
+    DismissAllInbox,
     /// Result of a checklist: the ids that ended up ticked, tagged with what they are.
     ApplyToggle { kind: ToggleKind, ids: Vec<String> },
     /// Buffer an inline line comment (body); the target line is held on the PR view.

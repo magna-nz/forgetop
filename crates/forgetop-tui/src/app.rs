@@ -149,6 +149,13 @@ fn mark_cached_inbox_read(cache: &CacheStore, matches: impl Fn(&NotifRow) -> boo
     });
 }
 
+/// Identity of a notification for dismissal. It carries `updated_at` so a thread with new
+/// activity since it was dismissed is a different key — and shows up again.
+fn inbox_dismiss_key(row: &NotifRow) -> String {
+    let at = row.notification.updated_at.map(|t| t.timestamp()).unwrap_or_default();
+    format!("{}:{}:{at}", row.connection_id, row.notification.id)
+}
+
 /// Every cached list a connection contributes rows to. The PR list is keyed by filter and
 /// completed-ness, so all six of its combinations are purged, not just the one on screen.
 fn purge_cached_rows(cache: &CacheStore, conn_id: &str) {
@@ -870,6 +877,9 @@ pub struct App {
     /// Items the user explicitly dismissed from Command Center via the `D` key.
     /// Persisted to config so they stay hidden across restarts.
     lp_dismissed_persisted: HashSet<String>,
+    /// Notifications dismissed from the inbox (`d` / `D`), keyed by [`inbox_dismiss_key`].
+    /// Persisted to config so they stay hidden across restarts.
+    inbox_dismissed: HashSet<String>,
     /// True when the currently-open item view was opened from the Launchpad, so Esc
     /// returns there (with the same row still selected) instead of to the section list.
     lp_origin: bool,
@@ -2580,6 +2590,7 @@ impl App {
             lp_sel: [0, 0],
             lp_dismissed: HashSet::new(),
             lp_dismissed_persisted: HashSet::new(),
+            inbox_dismissed: HashSet::new(),
             lp_origin: false,
             from_inbox: false,
             reloading: false,
@@ -3068,6 +3079,12 @@ impl App {
     /// `rebuild_launchpad` applies the actual filtering on the initial reload).
     pub fn apply_dismissed_launchpad_items(&mut self, ids: &[String]) {
         self.lp_dismissed_persisted = ids.iter().cloned().collect();
+    }
+
+    /// Applies persisted inbox dismissals at startup; the rows themselves are filtered as they
+    /// arrive, from the cache or a reload.
+    pub fn apply_dismissed_notifications(&mut self, keys: &[String]) {
+        self.inbox_dismissed = keys.iter().cloned().collect();
     }
 
     /// Applies the persisted Pipelines grouping at startup. `None` keeps the default.
@@ -4023,7 +4040,12 @@ impl App {
                     if row.notification.url.is_some() {
                         out.push(("Open in browser", c('o')));
                     }
-                    out.extend([("Mark read", c('x')), ("Mark all read", c('A'))]);
+                    out.extend([
+                        ("Mark read", c('x')),
+                        ("Mark all read", c('A')),
+                        ("Dismiss", c('d')),
+                        ("Dismiss all", c('D')),
+                    ]);
                 }
                 out.push(("Refresh", c('r')));
             }
@@ -4319,6 +4341,8 @@ impl App {
             }
             Key::Char('x') => self.mark_selected_inbox_read(deps).await,
             Key::Char('A') => self.mark_all_inbox_read(deps).await,
+            Key::Char('d') => self.dismiss_selected_inbox(deps).await,
+            Key::Char('D') => self.confirm_dismiss_all_inbox(),
             Key::Char('r') => self.request_reload(deps),
             _ => {}
         }
@@ -4462,6 +4486,53 @@ impl App {
         self.toast = Some("All marked read".into());
     }
 
+    /// Hides the selected notification from the inbox (the `d` key). Dismissal is local — the
+    /// provider's own read state is untouched — and persisted, so it survives a restart.
+    async fn dismiss_selected_inbox(&mut self, deps: &AppDeps) {
+        let Some(row) = self.inbox.get(self.inbox_sel) else { return };
+        self.inbox_dismissed.insert(inbox_dismiss_key(row));
+        self.inbox.remove(self.inbox_sel);
+        self.inbox_sel = self.inbox_sel.min(self.inbox.len().saturating_sub(1));
+        self.toast = Some(match self.persist_inbox_dismissed(deps).await {
+            Ok(()) => "Dismissed".into(),
+            Err(error) => error,
+        });
+    }
+
+    /// `D` clears the whole list, so it asks first.
+    fn confirm_dismiss_all_inbox(&mut self) {
+        if self.inbox.is_empty() {
+            return;
+        }
+        self.overlay = Some(Overlay::Confirm {
+            title: "Dismiss all".into(),
+            message: format!("Dismiss all {} notifications from the inbox?", self.inbox.len()),
+            action: Action::DismissAllInbox,
+        });
+    }
+
+    async fn dismiss_all_inbox(&mut self, deps: &AppDeps) {
+        self.inbox_dismissed.extend(self.inbox.iter().map(inbox_dismiss_key));
+        self.inbox.clear();
+        self.inbox_sel = 0;
+        self.toast = Some(match self.persist_inbox_dismissed(deps).await {
+            Ok(()) => "All dismissed".into(),
+            Err(error) => error,
+        });
+    }
+
+    async fn persist_inbox_dismissed(&self, deps: &AppDeps) -> std::result::Result<(), String> {
+        let mut keys: Vec<String> = self.inbox_dismissed.iter().cloned().collect();
+        keys.sort();
+        deps.config.set_dismissed_notifications(keys).await.map_err(|e| format!("Couldn't save: {e}"))
+    }
+
+    /// Drops dismissed notifications from `rows`.
+    fn without_dismissed(&self, mut rows: Vec<NotifRow>) -> Vec<NotifRow> {
+        rows.retain(|row| !self.inbox_dismissed.contains(&inbox_dismiss_key(row)));
+        rows
+    }
+
     // ---- data loading ----
 
     /// Parameters the background fetch needs, snapshotted from `self` at spawn time.
@@ -4587,7 +4658,15 @@ impl App {
             }
         }
         self.prune_pipe_expanded();
-        take_section(&mut self.inbox, r.inbox, sections_ok.inbox);
+        if sections_ok.inbox {
+            // A dismissal the feed no longer returns can never match again (new activity is a
+            // new key), so forget it rather than letting the saved list grow forever. Only on a
+            // complete fetch: a connection that failed returned nothing, not "none of these".
+            let live: HashSet<String> = r.inbox.iter().map(inbox_dismiss_key).collect();
+            self.inbox_dismissed.retain(|key| live.contains(key));
+        }
+        let inbox = self.without_dismissed(r.inbox);
+        take_section(&mut self.inbox, inbox, sections_ok.inbox);
         if self.inbox_sel >= self.inbox.len() {
             self.inbox_sel = self.inbox.len().saturating_sub(1);
         }
@@ -4772,6 +4851,8 @@ impl App {
         seed_section(cache, CACHE_KEY_WORK_ITEMS, &mut self.wis, &mut oldest);
         seed_section(cache, CACHE_KEY_PIPELINES, &mut self.pipes, &mut oldest);
         seed_section(cache, CACHE_KEY_INBOX, &mut self.inbox, &mut oldest);
+        let dismissed = &self.inbox_dismissed;
+        self.inbox.retain(|row| !dismissed.contains(&inbox_dismiss_key(row)));
         seed_section(cache, CACHE_KEY_LAUNCHPAD_MINE, &mut self.lp_prs_mine, &mut oldest);
         seed_section(cache, CACHE_KEY_LAUNCHPAD_REVIEW, &mut self.lp_prs_review, &mut oldest);
         self.data_age = oldest;
@@ -8339,6 +8420,7 @@ impl App {
                 self.execute_pipeline_run_action(action, deps).await
             }
             Action::RemoveConnection { .. } => self.execute_config_action(action, deps).await,
+            Action::DismissAllInbox => self.dismiss_all_inbox(deps).await,
             Action::ApplyToggle { kind, ids } => self.apply_toggle(kind, ids, deps).await,
             Action::AddLineComment(body) => self.add_line_comment(body),
             Action::SubmitReview(event) => self.submit_review(event, deps).await,
@@ -11384,6 +11466,87 @@ mod tests {
         fresh.lp_prs_review = vec![pr_row(p2)];
         fresh.rebuild_launchpad();
         assert!(fresh.lp.is_empty(), "a restarted app keeps the dismissal");
+    }
+
+    #[tokio::test]
+    async fn d_dismisses_the_selected_notification_and_it_stays_hidden_across_reloads_and_restarts() {
+        let deps = test_deps();
+        let mut app = App::new("slate");
+        app.screen = Screen::Inbox;
+        app.inbox = vec![notif_row("a"), notif_row("b"), notif_row("c")];
+        app.inbox_sel = 2;
+
+        app.on_key(Key::Char('d'), &deps).await;
+
+        let ids: Vec<&str> = app.inbox.iter().map(|r| r.notification.id.as_str()).collect();
+        assert_eq!(ids, ["a", "b"], "the selected row is gone");
+        assert_eq!(app.inbox_sel, 1, "the selection stays in range");
+        assert_eq!(app.toast.as_deref(), Some("Dismissed"));
+
+        // The next poll returns it again; it must not come back.
+        let mut r = reloaded(Vec::new());
+        r.inbox = vec![notif_row("a"), notif_row("b"), notif_row("c")];
+        app.apply_reloaded(r, &deps);
+        assert_eq!(app.inbox.len(), 2, "a reload doesn't resurrect a dismissed notification");
+
+        let saved = deps.config.snapshot().ui.dismissed_notifications;
+        assert_eq!(saved.len(), 1, "the dismissal is written to config");
+        let mut fresh = App::new("slate");
+        fresh.apply_dismissed_notifications(&saved);
+        let mut r = reloaded(Vec::new());
+        r.inbox = vec![notif_row("a"), notif_row("c")];
+        fresh.apply_reloaded(r, &deps);
+        let ids: Vec<&str> = fresh.inbox.iter().map(|r| r.notification.id.as_str()).collect();
+        assert_eq!(ids, ["a"], "a restarted app keeps the dismissal");
+    }
+
+    #[tokio::test]
+    async fn shift_d_asks_then_dismisses_the_whole_inbox() {
+        let deps = test_deps();
+        let mut app = App::new("slate");
+        app.screen = Screen::Inbox;
+        app.inbox = vec![notif_row("a"), notif_row("b")];
+
+        app.on_key(Key::Char('D'), &deps).await;
+        assert!(matches!(&app.overlay, Some(Overlay::Confirm { action: Action::DismissAllInbox, .. })));
+        assert_eq!(app.inbox.len(), 2, "nothing is dismissed before confirming");
+
+        app.on_key(Key::Char('y'), &deps).await;
+        assert!(app.inbox.is_empty());
+        assert_eq!(app.unread_count(), 0, "dismissed notifications leave the unread count too");
+        assert_eq!(deps.config.snapshot().ui.dismissed_notifications.len(), 2);
+    }
+
+    #[test]
+    fn a_dismissed_thread_with_new_activity_returns_and_stale_dismissals_are_forgotten() {
+        let deps = test_deps();
+        let mut app = App::new("slate");
+        let mut old = notif_row("a");
+        old.notification.updated_at = Some(Utc::now() - chrono::TimeDelta::hours(1));
+        app.apply_dismissed_notifications(&[inbox_dismiss_key(&old), inbox_dismiss_key(&notif_row("gone"))]);
+
+        let mut fresh = notif_row("a");
+        fresh.notification.updated_at = Some(Utc::now());
+        let mut r = reloaded(Vec::new());
+        r.inbox = vec![fresh];
+        app.apply_reloaded(r, &deps);
+
+        assert_eq!(app.inbox.len(), 1, "new activity on a dismissed thread shows it again");
+        assert!(app.inbox_dismissed.is_empty(), "keys the feed no longer returns are dropped");
+    }
+
+    #[test]
+    fn a_failed_inbox_fetch_keeps_dismissals() {
+        let deps = test_deps();
+        let mut app = App::new("slate");
+        let key = inbox_dismiss_key(&notif_row("a"));
+        app.apply_dismissed_notifications(std::slice::from_ref(&key));
+
+        let mut r = reloaded(Vec::new());
+        r.sections_ok = SectionsOk { inbox: false, ..SectionsOk::complete() };
+        app.apply_reloaded(r, &deps);
+
+        assert!(app.inbox_dismissed.contains(&key), "an outage is not evidence the notification is gone");
     }
 
     #[test]

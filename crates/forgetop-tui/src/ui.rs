@@ -2192,7 +2192,15 @@ fn base_footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
         ];
     }
     if matches!(app.screen, Screen::Inbox) {
-        return vec![("↵", "open item"), ("o", "browser"), ("x", "mark read"), ("A", "all read"), ("Esc", "back")];
+        return vec![
+            ("↵", "open item"),
+            ("o", "browser"),
+            ("x", "mark read"),
+            ("A", "all read"),
+            ("d", "dismiss"),
+            ("D", "dismiss all"),
+            ("Esc", "back"),
+        ];
     }
     if let Screen::Pipeline(v) = &app.screen {
         if v.artifacts.is_some() {

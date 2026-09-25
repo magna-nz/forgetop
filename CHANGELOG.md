@@ -9,6 +9,15 @@ Adding a release: one `## <version> — <date>` section, a line per user-visible
 and the pull request each one came from. `git log v<previous>..HEAD --merges` lists the
 candidates.
 
+## 1.3.2 — 2026-09-25
+
+Added
+
+- **Dismiss notifications.** In the terminal UI's inbox, `d` dismisses the selected notification
+  and `D` dismisses them all (after a confirm). Dismissed notifications stay hidden across
+  refreshes and restarts, and come back if the thread gets new activity. Read state on the forge
+  is left alone. ([#201](https://github.com/magna-nz/forgetop/pull/201))
+
 ## 1.3.1 — 2026-09-25
 
 Added
