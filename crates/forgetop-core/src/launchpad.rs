@@ -620,6 +620,9 @@ mod tests {
             definition_name: Some("CI Build".into()),
             awaiting_approval: awaiting,
             run: PipelineRun {
+                event: None,
+                attempt: None,
+                pull_request: None,
                 repository: None,
                 id: "r".into(),
                 definition_id: "ci".into(),

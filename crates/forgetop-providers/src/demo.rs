@@ -297,28 +297,197 @@ fn pipeline_defs() -> Vec<PipelineDefinition> {
     ]
 }
 
-fn step(name: &str, status: PipelineRunStatus, secs: i64) -> PipelineStep {
-    let now = base();
-    PipelineStep {
-        name: name.into(),
-        status,
-        started_at: Some(now - chrono::Duration::seconds(secs)),
-        finished_at: Some(now),
+/// A step in a GitHub Actions-style job: name, offset from the job's start (seconds), duration
+/// (seconds), and status. The exact same list drives both the run's `PipelineStep`s and the
+/// `##[group]`-sectioned log for the job (see [`gh_stage`]/[`gh_step_log`]), so a step can never
+/// appear in the tree without a matching log section.
+type GhStep = (&'static str, i64, i64, PipelineRunStatus);
+
+/// The branch and PR most of the demo's `CI` runs build — forgetop's own recent history
+/// (`a571ef7`/`1a4c3ae`, see `git log`), so the pane reads like a real self-hosted run.
+const CI_BRANCH: &str = "claude/m4-action-palette-shortcut-f096cc";
+const CI_PR: i64 = 195;
+
+/// A passing `CI` run's steps — mirrors this repo's own `ci.yml`: checkout, Rust toolchain,
+/// cache, Node, the dashboard build, then `cargo build`/`test`/`clippy`, followed by GitHub's
+/// automatic post/cleanup steps. Totals ~101s.
+fn gh_steps_ok() -> Vec<GhStep> {
+    use PipelineRunStatus::Succeeded as Ok_;
+    vec![
+        ("Set up job", 0, 2, Ok_),
+        ("Run actions/checkout@v4", 2, 1, Ok_),
+        ("Run dtolnay/rust-toolchain@stable", 3, 6, Ok_),
+        ("Run Swatinem/rust-cache@v2", 9, 9, Ok_),
+        ("Run actions/setup-node@v4", 18, 6, Ok_),
+        ("Install dashboard deps", 24, 3, Ok_),
+        ("Dashboard tests", 27, 8, Ok_),
+        ("Build dashboard SPA", 35, 7, Ok_),
+        ("Build", 42, 26, Ok_),
+        ("Test", 68, 19, Ok_),
+        ("Clippy", 87, 11, Ok_),
+        ("Post Run actions/setup-node@v4", 98, 0, Ok_),
+        ("Post Run Swatinem/rust-cache@v2", 98, 1, Ok_),
+        ("Post Run actions/checkout@v4", 99, 0, Ok_),
+        ("Complete job", 99, 0, Ok_),
+    ]
+}
+
+/// The same job, but `Test` fails on a (fictionalised) failure in this repo's own `cache` tests
+/// and `Clippy` never runs. Totals ~88s.
+fn gh_steps_failed() -> Vec<GhStep> {
+    use PipelineRunStatus::{Canceled, Failed, Succeeded as Ok_};
+    vec![
+        ("Set up job", 0, 2, Ok_),
+        ("Run actions/checkout@v4", 2, 1, Ok_),
+        ("Run dtolnay/rust-toolchain@stable", 3, 6, Ok_),
+        ("Run Swatinem/rust-cache@v2", 9, 9, Ok_),
+        ("Run actions/setup-node@v4", 18, 5, Ok_),
+        ("Install dashboard deps", 23, 3, Ok_),
+        ("Dashboard tests", 26, 8, Ok_),
+        ("Build dashboard SPA", 34, 7, Ok_),
+        ("Build", 41, 27, Ok_),
+        ("Test", 68, 19, Failed),
+        ("Clippy", 87, 0, Canceled),
+        ("Post Run actions/setup-node@v4", 87, 0, Ok_),
+        ("Post Run Swatinem/rust-cache@v2", 87, 1, Ok_),
+        ("Post Run actions/checkout@v4", 88, 0, Ok_),
+        ("Complete job", 88, 0, Ok_),
+    ]
+}
+
+/// Scales a step list's durations to a different run total (history runs vary in length),
+/// keeping the same names/statuses and recomputing cumulative offsets.
+fn scale_gh_steps(steps: &[GhStep], total_secs: i64, base_total: i64) -> Vec<GhStep> {
+    if total_secs == base_total {
+        return steps.to_vec();
+    }
+    let factor = total_secs as f64 / base_total as f64;
+    let mut out = Vec::with_capacity(steps.len());
+    let mut cursor = 0i64;
+    for (name, _off, dur, status) in steps {
+        let d = if *dur == 0 { 0 } else { ((*dur as f64) * factor).round().max(1.0) as i64 };
+        out.push((*name, cursor, d, *status));
+        cursor += d;
+    }
+    out
+}
+
+/// Builds the single "jobs" stage (GitHub's synthetic stage for a run with only one job) from a
+/// step list, anchored to `run_started`.
+fn gh_stage(run_started: DateTime<Utc>, job_id: &str, steps: &[GhStep]) -> Vec<PipelineStage> {
+    let total = steps.iter().map(|(_, off, dur, _)| off + dur).max().unwrap_or(0);
+    let pl_steps: Vec<PipelineStep> = steps
+        .iter()
+        .map(|(name, off, dur, status)| {
+            let started = run_started + chrono::Duration::seconds(*off);
+            PipelineStep {
+                name: (*name).into(),
+                status: *status,
+                started_at: Some(started),
+                finished_at: Some(started + chrono::Duration::seconds(*dur)),
+            }
+        })
+        .collect();
+    let failed = pl_steps.iter().any(|s| matches!(s.status, PipelineRunStatus::Failed));
+    let job_status = if failed { PipelineRunStatus::Failed } else { PipelineRunStatus::Succeeded };
+    vec![PipelineStage {
+        name: "jobs".into(),
+        status: job_status,
+        jobs: vec![PipelineJob {
+            id: job_id.into(),
+            name: "build · test · clippy".into(),
+            status: job_status,
+            started_at: Some(run_started),
+            finished_at: Some(run_started + chrono::Duration::seconds(total)),
+            steps: pl_steps,
+            url: Some(format!("https://example.test/job/{job_id}")),
+            problem: failed.then(|| "Test failed (exit code 101)".to_string()),
+        }],
+    }]
+}
+
+/// The step list behind each GitHub-style `CI` run's single job, keyed by run id — the same
+/// source both [`pipeline_runs`] and [`job_log`] read from, so a step's name in the tree always
+/// has a matching `##[group]` section in the log.
+fn ci_run_steps(run_id: &str) -> Option<Vec<GhStep>> {
+    const BASE: i64 = 101;
+    match run_id {
+        "r493" => Some(scale_gh_steps(&gh_steps_ok(), 98, BASE)),
+        "r494" => Some(scale_gh_steps(&gh_steps_ok(), 95, BASE)),
+        "r495" => Some(scale_gh_steps(&gh_steps_ok(), 101, BASE)),
+        "r496" => Some(gh_steps_failed()),
+        "r497" => Some(scale_gh_steps(&gh_steps_ok(), 99, BASE)),
+        "r498" => Some(scale_gh_steps(&gh_steps_ok(), 97, BASE)),
+        "r499" => Some(gh_steps_ok()),
+        "r500" => Some(gh_steps_failed()),
+        _ => None,
     }
 }
 
-fn job(id: &str, name: &str, status: PipelineRunStatus, secs: i64, steps: Vec<PipelineStep>, problem: Option<&str>) -> PipelineJob {
-    let now = base();
-    PipelineJob {
+fn ci_run_stage(run_id: &str, run_started: DateTime<Utc>) -> Vec<PipelineStage> {
+    ci_run_steps(run_id).map(|steps| gh_stage(run_started, &format!("job-{run_id}"), &steps)).unwrap_or_default()
+}
+
+/// Builds one GitHub-style `CI` run from its step list (looked up by `id` via [`ci_run_steps`]).
+#[allow(clippy::too_many_arguments)]
+fn ci_run(id: &str, number: i64, title: &str, branch: &str, pull_request: Option<i64>, event: &str, attempt: u32, commit: &str, who: User, started: DateTime<Utc>) -> PipelineRun {
+    let stages = ci_run_stage(id, started);
+    let job = stages.first().and_then(|s| s.jobs.first());
+    let status = job.map(|j| j.status).unwrap_or(PipelineRunStatus::Succeeded);
+    let finished = job.and_then(|j| j.finished_at);
+    PipelineRun {
+        event: Some(event.into()),
+        attempt: Some(attempt),
+        pull_request,
+        repository: None,
         id: id.into(),
-        name: name.into(),
+        definition_id: "ci".into(),
+        number: Some(number),
+        name: Some("CI Build".into()),
+        title: Some(title.into()),
         status,
-        started_at: Some(now - chrono::Duration::seconds(secs)),
-        finished_at: if matches!(status, PipelineRunStatus::Running) { None } else { Some(now) },
-        steps,
-        url: Some(format!("https://example.test/job/{id}")),
-        problem: problem.map(Into::into),
+        triggered_by: Some(who),
+        branch: Some(branch.into()),
+        commit_sha: Some(commit.into()),
+        started_at: Some(started),
+        finished_at: finished,
+        url: Some("https://ci.example.com/runs/demo".into()),
+        stages,
     }
+}
+
+/// One job in the release's `build-local-artifacts` matrix, or one of the jobs queued behind it.
+struct ReleaseJob {
+    id: &'static str,
+    name: &'static str,
+    offset: i64,
+    /// Duration in seconds; `None` for a job that hasn't started (queued).
+    dur: Option<i64>,
+    status: PipelineRunStatus,
+}
+
+fn release_jobs_to_pipeline(run_started: DateTime<Utc>, legs: &[ReleaseJob]) -> Vec<PipelineJob> {
+    legs.iter()
+        .map(|j| {
+            let queued = matches!(j.status, PipelineRunStatus::Queued);
+            let started_at = (!queued).then(|| run_started + chrono::Duration::seconds(j.offset));
+            let finished_at = if matches!(j.status, PipelineRunStatus::Running | PipelineRunStatus::Queued) {
+                None
+            } else {
+                j.dur.map(|d| run_started + chrono::Duration::seconds(j.offset + d))
+            };
+            PipelineJob {
+                id: j.id.into(),
+                name: j.name.into(),
+                status: j.status,
+                started_at,
+                finished_at,
+                steps: vec![],
+                url: Some(format!("https://example.test/job/{}", j.id)),
+                problem: None,
+            }
+        })
+        .collect()
 }
 
 /// Compact (stage-less) run builder for the secondary CI providers.
@@ -327,6 +496,9 @@ fn run(id: &str, def: &str, num: i64, name: &str, title: &str, status: PipelineR
     let now = base();
     let started = now - chrono::Duration::hours(updated_h);
     PipelineRun {
+        event: Some("push".into()),
+        attempt: Some(1),
+        pull_request: None,
         repository: None,
         id: id.into(),
         definition_id: def.into(),
@@ -348,19 +520,20 @@ fn gitlab_pipeline_defs() -> Vec<PipelineDefinition> {
     vec![PipelineDefinition { repository: None, id: "gl-pipeline".into(), name: "Integration Suite".into(), path: Some(".gitlab-ci.yml".into()), url: None }]
 }
 fn gitlab_runs() -> Vec<PipelineRun> {
-    vec![
-        run("gl-9902", "gl-pipeline", 9902, "#9902", "Add a Postgres read replica", PipelineRunStatus::Running, "infra/read-replica", me(), 1),
-        run("gl-9901", "gl-pipeline", 9901, "#9901", "Cache the customer risk score", PipelineRunStatus::Succeeded, "main", alice(), 6),
-    ]
+    // Triggered by the open MR on this branch (northwind-infra !312).
+    let mut r9902 = run("gl-9902", "gl-pipeline", 9902, "#9902", "Add a Postgres read replica", PipelineRunStatus::Running, "infra/read-replica", me(), 1);
+    r9902.pull_request = Some(312);
+    vec![r9902, run("gl-9901", "gl-pipeline", 9901, "#9901", "Cache the customer risk score", PipelineRunStatus::Succeeded, "main", alice(), 6)]
 }
 fn bitbucket_pipeline_defs() -> Vec<PipelineDefinition> {
     vec![PipelineDefinition { repository: None, id: "bb-default".into(), name: "Deploy to Staging".into(), path: Some("bitbucket-pipelines.yml".into()), url: None }]
 }
 fn bitbucket_runs() -> Vec<PipelineRun> {
-    vec![
-        run("bb-441", "bb-default", 441, "#441", "dbt: add revenue recognition model", PipelineRunStatus::Failed, "feat/rev-rec", me(), 2),
-        run("bb-440", "bb-default", 440, "#440", "Tighten CORS on the admin API", PipelineRunStatus::Succeeded, "main", dev(), 10),
-    ]
+    // Triggered by PR #64 ("dbt: add revenue recognition model").
+    let mut r441 = run("bb-441", "bb-default", 441, "#441", "dbt: add revenue recognition model", PipelineRunStatus::Failed, "feat/rev-rec", me(), 2);
+    r441.event = Some("pull_request".into());
+    r441.pull_request = Some(64);
+    vec![r441, run("bb-440", "bb-default", 440, "#440", "Tighten CORS on the admin API", PipelineRunStatus::Succeeded, "main", dev(), 10)]
 }
 fn pipeline_defs_for(conn: &str) -> Vec<PipelineDefinition> {
     let repo = demo_repository(conn);
@@ -383,122 +556,41 @@ fn pipeline_runs_for(conn: &str) -> Vec<PipelineRun> {
 
 fn pipeline_runs() -> Vec<PipelineRun> {
     let now = base();
-    vec![
+
+    // `CI` — GitHub-style single-job runs, seven of them on the same PR branch (a mix of
+    // succeeded and one failed, varying durations) so a history strip/median has something to
+    // show, plus one dedicated failed run (a different branch/PR) with the full annotations /
+    // rerun / logs demonstration, and one queued nightly run.
+    let ci_runs = vec![
+        ci_run("r493", 436, "Add per-repo cache eviction metrics", CI_BRANCH, Some(CI_PR), "push", 1, "5c1a9e2", carol(), now - chrono::Duration::days(4) - chrono::Duration::seconds(98)),
+        ci_run("r494", 437, "Fix flaky rewrite_edits_in_place ordering", CI_BRANCH, Some(CI_PR), "push", 1, "7d4f0b1", bob(), now - chrono::Duration::days(3) - chrono::Duration::seconds(95)),
+        ci_run("r495", 439, "Tighten the action-palette shortcut help text", CI_BRANCH, Some(CI_PR), "push", 1, "b2c8a91", alice(), now - chrono::Duration::days(1) - chrono::Duration::seconds(101)),
+        ci_run("r496", 440, "Leave every footer with Ctrl-K search anywhere", CI_BRANCH, Some(CI_PR), "push", 1, "e91f3d6", me(), now - chrono::Duration::hours(9) - chrono::Duration::seconds(88)),
+        ci_run("r497", 441, "Leave visible-tabs (v) to help and the palette", CI_BRANCH, Some(CI_PR), "push", 2, "14944b9", me(), now - chrono::Duration::hours(3) - chrono::Duration::seconds(99)),
+        ci_run("r498", 442, "Merge pull request #195 from magna-nz/claude/m4-action-palette-shortcut-f096cc", CI_BRANCH, Some(CI_PR), "push", 1, "a571ef7", me(), now - chrono::Duration::minutes(41) - chrono::Duration::seconds(97)),
+        ci_run("r499", 443, "feat(tui): lead every footer with a yellow Ctrl-K search anywhere", CI_BRANCH, Some(CI_PR), "push", 1, "1a4c3ae", me(), now - chrono::Duration::minutes(12) - chrono::Duration::seconds(101)),
+        ci_run(
+            "r500",
+            438,
+            "Cache rewrite: edit entries in place instead of refusing same-timestamp writes",
+            "claude/cache-rewrite-7ab2",
+            Some(198),
+            "pull_request",
+            1,
+            "9c0e1d2",
+            me(),
+            now - chrono::Duration::days(2) - chrono::Duration::seconds(88),
+        ),
         PipelineRun {
-            repository: None,
-            id: "r501".into(),
-            definition_id: "ci".into(),
-            number: Some(501),
-            name: Some("10.1.100".into()),
-            title: Some("Rework the webhook retry queue".into()),
-            status: PipelineRunStatus::Running,
-            triggered_by: Some(alice()),
-            branch: Some("feature/retry".into()),
-            commit_sha: Some("a1b2c3d".into()),
-            started_at: Some(now - chrono::Duration::minutes(4)),
-            finished_at: None,
-            url: Some("https://ci.example.com/runs/demo".into()),
-            stages: vec![
-                PipelineStage {
-                    name: "build".into(),
-                    status: PipelineRunStatus::Succeeded,
-                    jobs: vec![job("j1", "compile", PipelineRunStatus::Succeeded, 95, vec![], None)],
-                },
-                PipelineStage {
-                    name: "test".into(),
-                    status: PipelineRunStatus::Running,
-                    jobs: vec![job(
-                        "j2",
-                        "unit",
-                        PipelineRunStatus::Running,
-                        140,
-                        vec![step("restore", PipelineRunStatus::Succeeded, 12), step("dotnet test", PipelineRunStatus::Running, 128)],
-                        None,
-                    )],
-                },
-            ],
-        },
-        PipelineRun {
-            repository: None,
-            id: "r500".into(),
-            definition_id: "ci".into(),
-            number: Some(500),
-            name: Some("10.1.99".into()),
-            title: Some("Bump Next.js to 14.2.5".into()),
-            status: PipelineRunStatus::Failed,
-            triggered_by: Some(bob()),
-            branch: Some("main".into()),
-            commit_sha: Some("9f8e7d6".into()),
-            started_at: Some(now - chrono::Duration::hours(1)),
-            finished_at: Some(now - chrono::Duration::minutes(52)),
-            url: Some("https://ci.example.com/runs/demo".into()),
-            stages: vec![
-                PipelineStage {
-                    name: "build".into(),
-                    status: PipelineRunStatus::Succeeded,
-                    jobs: vec![job("j10", "compile", PipelineRunStatus::Succeeded, 88, vec![], None)],
-                },
-                PipelineStage {
-                    name: "test".into(),
-                    status: PipelineRunStatus::Failed,
-                    jobs: vec![
-                        job(
-                            "j11",
-                            "unit",
-                            PipelineRunStatus::Succeeded,
-                            64,
-                            vec![step("restore", PipelineRunStatus::Succeeded, 11), step("run", PipelineRunStatus::Succeeded, 53)],
-                            None,
-                        ),
-                        job(
-                            "j12",
-                            "integration",
-                            PipelineRunStatus::Failed,
-                            240,
-                            vec![
-                                step("spin up containers", PipelineRunStatus::Succeeded, 30),
-                                step("run suite", PipelineRunStatus::Failed, 210),
-                            ],
-                            Some("run suite failed (exit 1)"),
-                        ),
-                    ],
-                },
-            ],
-        },
-        PipelineRun {
-            repository: None,
-            id: "r207".into(),
-            definition_id: "release".into(),
-            number: Some(207),
-            name: Some("10.1.98".into()),
-            title: Some("Release 10.1.98".into()),
-            status: PipelineRunStatus::Succeeded,
-            triggered_by: Some(carol()),
-            branch: Some("main".into()),
-            commit_sha: Some("1234abc".into()),
-            started_at: Some(now - chrono::Duration::days(2)),
-            finished_at: Some(now - chrono::Duration::days(2) + chrono::Duration::minutes(8)),
-            url: Some("https://ci.example.com/runs/demo".into()),
-            stages: vec![PipelineStage {
-                name: "publish".into(),
-                status: PipelineRunStatus::Succeeded,
-                jobs: vec![job(
-                    "j20",
-                    "deploy",
-                    PipelineRunStatus::Succeeded,
-                    150,
-                    vec![step("pack", PipelineRunStatus::Succeeded, 40), step("push", PipelineRunStatus::Succeeded, 110)],
-                    None,
-                )],
-            }],
-        },
-        PipelineRun {
+            event: Some("schedule".into()),
+            attempt: Some(1),
+            pull_request: None,
             repository: None,
             id: "r502".into(),
             definition_id: "ci".into(),
-            number: Some(502),
-            name: Some("10.1.101".into()),
-            title: Some("Rotate the KMS signing keys".into()),
+            number: Some(444),
+            name: Some("CI Build".into()),
+            title: Some("Nightly CI".into()),
             status: PipelineRunStatus::Queued,
             triggered_by: Some(alice()),
             branch: Some("main".into()),
@@ -508,7 +600,163 @@ fn pipeline_runs() -> Vec<PipelineRun> {
             url: Some("https://ci.example.com/runs/demo".into()),
             stages: vec![],
         },
-    ]
+    ];
+
+    // `CD (Release)` — one running release (a `build-local-artifacts` matrix across four
+    // targets, two legs still in flight, four jobs queued behind it) plus three previous runs
+    // of the same definition with the same job names, for per-job duration estimates: two
+    // succeeded (one of them — #56 — the artifacts demonstration) and one failed three weeks
+    // back (Windows).
+    let r501_started = now - chrono::Duration::seconds(252);
+    let r501_elapsed = 252i64;
+    let r501 = PipelineRun {
+        event: Some("push".into()),
+        attempt: Some(1),
+        pull_request: None,
+        repository: None,
+        id: "r501".into(),
+        definition_id: "release".into(),
+        number: Some(57),
+        name: Some("v1.2.1".into()),
+        title: Some("release: 1.2.1".into()),
+        status: PipelineRunStatus::Running,
+        triggered_by: Some(me()),
+        branch: Some("v1.2.1".into()),
+        commit_sha: Some("f62f3c5".into()),
+        started_at: Some(r501_started),
+        finished_at: None,
+        url: Some("https://ci.example.com/runs/demo".into()),
+        stages: vec![PipelineStage {
+            name: "jobs".into(),
+            status: PipelineRunStatus::Running,
+            jobs: release_jobs_to_pipeline(
+                r501_started,
+                &[
+                    ReleaseJob { id: "mj-plan", name: "plan", offset: 0, dur: Some(18), status: PipelineRunStatus::Succeeded },
+                    ReleaseJob { id: "mj-aarch64", name: "build-local-artifacts (aarch64-apple-darwin)", offset: 20, dur: Some(182), status: PipelineRunStatus::Succeeded },
+                    ReleaseJob { id: "mj-x86mac", name: "build-local-artifacts (x86_64-apple-darwin)", offset: 20, dur: Some(200), status: PipelineRunStatus::Succeeded },
+                    ReleaseJob { id: "mj-linux", name: "build-local-artifacts (x86_64-unknown-linux-gnu)", offset: 21, dur: Some(r501_elapsed - 21), status: PipelineRunStatus::Running },
+                    ReleaseJob { id: "mj-win", name: "build-local-artifacts (x86_64-pc-windows-msvc)", offset: 22, dur: Some(r501_elapsed - 22), status: PipelineRunStatus::Running },
+                    ReleaseJob { id: "mj-global", name: "build-global-artifacts", offset: 342, dur: None, status: PipelineRunStatus::Queued },
+                    ReleaseJob { id: "mj-host", name: "host", offset: 362, dur: None, status: PipelineRunStatus::Queued },
+                    ReleaseJob { id: "mj-homebrew", name: "publish-homebrew-formula", offset: 384, dur: None, status: PipelineRunStatus::Queued },
+                    ReleaseJob { id: "mj-announce", name: "announce", offset: 398, dur: None, status: PipelineRunStatus::Queued },
+                ],
+            ),
+        }],
+    };
+
+    let r207_started = now - chrono::Duration::days(12);
+    let r207 = PipelineRun {
+        event: Some("push".into()),
+        attempt: Some(1),
+        pull_request: None,
+        repository: None,
+        id: "r207".into(),
+        definition_id: "release".into(),
+        number: Some(56),
+        name: Some("v1.2.0".into()),
+        title: Some("release: 1.2.0".into()),
+        status: PipelineRunStatus::Succeeded,
+        triggered_by: Some(carol()),
+        branch: Some("v1.2.0".into()),
+        commit_sha: Some("3be90a1".into()),
+        started_at: Some(r207_started),
+        finished_at: Some(r207_started + chrono::Duration::seconds(411)),
+        url: Some("https://ci.example.com/runs/demo".into()),
+        stages: vec![PipelineStage {
+            name: "jobs".into(),
+            status: PipelineRunStatus::Succeeded,
+            jobs: release_jobs_to_pipeline(
+                r207_started,
+                &[
+                    ReleaseJob { id: "mj-plan", name: "plan", offset: 0, dur: Some(18), status: PipelineRunStatus::Succeeded },
+                    ReleaseJob { id: "mj-aarch64", name: "build-local-artifacts (aarch64-apple-darwin)", offset: 20, dur: Some(178), status: PipelineRunStatus::Succeeded },
+                    ReleaseJob { id: "mj-x86mac", name: "build-local-artifacts (x86_64-apple-darwin)", offset: 20, dur: Some(196), status: PipelineRunStatus::Succeeded },
+                    ReleaseJob { id: "mj-linux", name: "build-local-artifacts (x86_64-unknown-linux-gnu)", offset: 20, dur: Some(213), status: PipelineRunStatus::Succeeded },
+                    ReleaseJob { id: "mj-win", name: "build-local-artifacts (x86_64-pc-windows-msvc)", offset: 20, dur: Some(318), status: PipelineRunStatus::Succeeded },
+                    ReleaseJob { id: "mj-global", name: "build-global-artifacts", offset: 340, dur: Some(21), status: PipelineRunStatus::Succeeded },
+                    ReleaseJob { id: "mj-host", name: "host", offset: 362, dur: Some(22), status: PipelineRunStatus::Succeeded },
+                    ReleaseJob { id: "mj-homebrew", name: "publish-homebrew-formula", offset: 385, dur: Some(14), status: PipelineRunStatus::Succeeded },
+                    ReleaseJob { id: "mj-announce", name: "announce", offset: 400, dur: Some(11), status: PipelineRunStatus::Succeeded },
+                ],
+            ),
+        }],
+    };
+
+    let r206_started = now - chrono::Duration::days(20);
+    let r206 = PipelineRun {
+        event: Some("manual".into()),
+        attempt: Some(1),
+        pull_request: None,
+        repository: None,
+        id: "r206".into(),
+        definition_id: "release".into(),
+        number: Some(55),
+        name: Some("v1.1.9".into()),
+        title: Some("release: 1.1.9".into()),
+        status: PipelineRunStatus::Succeeded,
+        triggered_by: Some(me()),
+        branch: Some("v1.1.9".into()),
+        commit_sha: Some("6e2a410".into()),
+        started_at: Some(r206_started),
+        finished_at: Some(r206_started + chrono::Duration::seconds(408)),
+        url: Some("https://ci.example.com/runs/demo".into()),
+        stages: vec![PipelineStage {
+            name: "jobs".into(),
+            status: PipelineRunStatus::Succeeded,
+            jobs: release_jobs_to_pipeline(
+                r206_started,
+                &[
+                    ReleaseJob { id: "mj-plan", name: "plan", offset: 0, dur: Some(17), status: PipelineRunStatus::Succeeded },
+                    ReleaseJob { id: "mj-aarch64", name: "build-local-artifacts (aarch64-apple-darwin)", offset: 19, dur: Some(185), status: PipelineRunStatus::Succeeded },
+                    ReleaseJob { id: "mj-x86mac", name: "build-local-artifacts (x86_64-apple-darwin)", offset: 19, dur: Some(198), status: PipelineRunStatus::Succeeded },
+                    ReleaseJob { id: "mj-linux", name: "build-local-artifacts (x86_64-unknown-linux-gnu)", offset: 19, dur: Some(208), status: PipelineRunStatus::Succeeded },
+                    ReleaseJob { id: "mj-win", name: "build-local-artifacts (x86_64-pc-windows-msvc)", offset: 19, dur: Some(315), status: PipelineRunStatus::Succeeded },
+                    ReleaseJob { id: "mj-global", name: "build-global-artifacts", offset: 337, dur: Some(20), status: PipelineRunStatus::Succeeded },
+                    ReleaseJob { id: "mj-host", name: "host", offset: 358, dur: Some(23), status: PipelineRunStatus::Succeeded },
+                    ReleaseJob { id: "mj-homebrew", name: "publish-homebrew-formula", offset: 382, dur: Some(15), status: PipelineRunStatus::Succeeded },
+                    ReleaseJob { id: "mj-announce", name: "announce", offset: 398, dur: Some(10), status: PipelineRunStatus::Succeeded },
+                ],
+            ),
+        }],
+    };
+
+    let r205_started = now - chrono::Duration::weeks(3);
+    let r205 = PipelineRun {
+        event: Some("push".into()),
+        attempt: Some(1),
+        pull_request: None,
+        repository: None,
+        id: "r205".into(),
+        definition_id: "release".into(),
+        number: Some(54),
+        name: Some("v1.1.8".into()),
+        title: Some("release: 1.1.8".into()),
+        status: PipelineRunStatus::Failed,
+        triggered_by: Some(bob()),
+        branch: Some("v1.1.8".into()),
+        commit_sha: Some("2ab7f04".into()),
+        started_at: Some(r205_started),
+        finished_at: Some(r205_started + chrono::Duration::seconds(235)),
+        url: Some("https://ci.example.com/runs/demo".into()),
+        stages: vec![PipelineStage {
+            name: "jobs".into(),
+            status: PipelineRunStatus::Failed,
+            jobs: release_jobs_to_pipeline(
+                r205_started,
+                &[
+                    ReleaseJob { id: "mj-plan", name: "plan", offset: 0, dur: Some(18), status: PipelineRunStatus::Succeeded },
+                    ReleaseJob { id: "mj-aarch64", name: "build-local-artifacts (aarch64-apple-darwin)", offset: 20, dur: Some(175), status: PipelineRunStatus::Succeeded },
+                    ReleaseJob { id: "mj-x86mac", name: "build-local-artifacts (x86_64-apple-darwin)", offset: 20, dur: Some(190), status: PipelineRunStatus::Succeeded },
+                    ReleaseJob { id: "mj-linux", name: "build-local-artifacts (x86_64-unknown-linux-gnu)", offset: 20, dur: Some(205), status: PipelineRunStatus::Succeeded },
+                    ReleaseJob { id: "mj-win", name: "build-local-artifacts (x86_64-pc-windows-msvc)", offset: 20, dur: Some(40), status: PipelineRunStatus::Failed },
+                ],
+            ),
+        }],
+    };
+
+    ci_runs.into_iter().chain([r501, r207, r206, r205]).collect()
 }
 
 /// Session-global store of review comments submitted during this `--demo` run, keyed by PR
@@ -1071,113 +1319,130 @@ impl WorkItemSource for DemoWi {
     }
 }
 
-/// Believable per-job demo logs, keyed by job id (`j1`/`j10` compile, `j2` the live-running
-/// `dotnet test`, `j11` a finished `dotnet test`, `j12` the failing integration suite, `j20`
-/// a deploy) so a "live logs" feature (follow mode, jump-to-first-error, search) has something
-/// real to demonstrate. Fixed timestamps keep everything deterministic except [`unit_log_growing`].
-fn job_log(job_id: &str) -> String {
+/// Believable per-job demo logs. `run_id` disambiguates job ids reused across several release
+/// runs (`mj-plan`, `mj-win`, …); `job_id` alone picks the `CI` GitHub-style jobs (`job-r499`,
+/// …), which are unique per run. Fixed timestamps keep everything deterministic except
+/// [`unit_log_growing`], the one job (`r501`/`mj-linux`) that stays Running for the life of the
+/// `--demo` session.
+fn job_log(run_id: &str, job_id: &str) -> String {
+    if job_id.starts_with("job-") {
+        if let Some(steps) = ci_run_steps(run_id) {
+            return gh_step_log(&steps);
+        }
+    }
+    if run_id == "r501" && job_id == "mj-linux" {
+        return unit_log_growing();
+    }
     match job_id {
-        "j1" | "j10" => compile_log(),
-        "j2" => unit_log_growing(),
-        "j11" => unit_log_succeeded(),
-        "j12" => integration_log_failed(),
-        "j20" => deploy_log(),
+        "mj-plan" => release_plan_log(),
+        "mj-aarch64" => matrix_leg_log("aarch64-apple-darwin"),
+        "mj-x86mac" => matrix_leg_log("x86_64-apple-darwin"),
+        "mj-linux" => matrix_leg_log("x86_64-unknown-linux-gnu"),
+        "mj-win" if run_id == "r205" => matrix_leg_log_failed("x86_64-pc-windows-msvc"),
+        "mj-win" if run_id == "r501" => matrix_leg_log_running("x86_64-pc-windows-msvc"),
+        "mj-win" => matrix_leg_log("x86_64-pc-windows-msvc"),
+        "mj-global" => release_downstream_log("build-global-artifacts"),
+        "mj-host" => release_downstream_log("host"),
+        "mj-homebrew" => release_downstream_log("publish-homebrew-formula"),
+        "mj-announce" => release_downstream_log("announce"),
         other => generic_log(other),
     }
 }
 
-fn compile_log() -> String {
+/// Plausible output for one step of a GitHub-style `CI` job, keyed by the step's name so it
+/// reads as if it actually ran that command.
+fn gh_step_body(name: &str, status: PipelineRunStatus) -> String {
+    match name {
+        "Set up job" => "Current runner version: '2.319.1'\nOperating System: Ubuntu 22.04.4 LTS\nRunner Image: 'ubuntu-22.04:20240701.1.0'\n".into(),
+        "Run actions/checkout@v4" => "Syncing repository: magna-nz/forgetop\nGetting Git version info\nCopying '/usr/bin/git'\nSetting up auth\n".into(),
+        "Run dtolnay/rust-toolchain@stable" => "info: syncing channel updates for 'stable-x86_64-unknown-linux-gnu'\ninfo: latest update on stable, rust version 1.82.0\ninfo: downloading component 'clippy'\n".into(),
+        "Run Swatinem/rust-cache@v2" => "Cache restored successfully\nCache Size: ~412 MB\n".into(),
+        "Run actions/setup-node@v4" => "Found in cache @ /opt/hostedtoolcache/node/20.15.1/x64\nEnvironment details\n  node: v20.15.1\n  npm: 10.7.0\n".into(),
+        "Install dashboard deps" => "added 412 packages in 2.4s\n".into(),
+        "Dashboard tests" => " Test Files  14 passed (14)\n      Tests  86 passed (86)\n   Start at  09:14:02\n   Duration  7.91s\n".into(),
+        "Build dashboard SPA" => "vite v5.3.1 building for production...\n✓ 812 modules transformed.\ndist/assets/index-4f2a9c1e.js  318.42 kB │ gzip: 98.11 kB\n✓ built in 6.44s\n".into(),
+        "Build" => "   Compiling forgetop-core v1.2.1 (/home/runner/work/forgetop/forgetop/crates/forgetop-core)\n   Compiling forgetop-providers v1.2.1 (/home/runner/work/forgetop/forgetop/crates/forgetop-providers)\n   Compiling forgetop-server v1.2.1 (/home/runner/work/forgetop/forgetop/crates/forgetop-server)\n   Compiling forgetop-tui v1.2.1 (/home/runner/work/forgetop/forgetop/crates/forgetop-tui)\n   Compiling forgetop v1.2.1 (/home/runner/work/forgetop/forgetop/crates/forgetop-cli)\n    Finished `release` profile [optimized] target(s) in 25.87s\n".into(),
+        "Test" if matches!(status, PipelineRunStatus::Failed) => rust_test_failure_block(),
+        "Test" => {
+            "running 184 tests\ntest cache::tests::put_refuses_same_timestamp ... ok\ntest cache::tests::rewrite_edits_in_place ... ok\ntest repo::tests::to_connection_relative_strips_host ... ok\n\ntest result: ok. 184 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 18.62s\n"
+                .into()
+        }
+        "Clippy" if matches!(status, PipelineRunStatus::Canceled) => "The job was canceled before this step ran.\n".into(),
+        "Clippy" => "    Checking forgetop-cli v1.2.1\n    Finished checking in 10.91s\nwarning: `forgetop` (bin) generated 0 warnings\n".into(),
+        n if n.starts_with("Post Run") => "Post job cleanup.\n".into(),
+        "Complete job" => "Cleaning up orphan processes\n".into(),
+        _ => "ok\n".into(),
+    }
+}
+
+/// The `Test` step's failure block for the failed `CI` runs — a real (fictionalised) failure in
+/// this repo's own `cache` tests, with the panic location, assertion, and summary a matcher can
+/// find, plus the trailing `##[error]` line GitHub Actions appends on a non-zero exit.
+fn rust_test_failure_block() -> String {
     concat!(
-        "09:36:40  Restoring NuGet packages...\n",
-        "09:36:44  Restored /src/Northwind.sln (in 3.6s)\n",
-        "09:36:45  Northwind.Domain -> bin/Debug/net8.0/Northwind.Domain.dll\n",
-        "09:36:52  Northwind.Infrastructure -> bin/Debug/net8.0/Northwind.Infrastructure.dll\n",
-        "09:37:01  Northwind.Api -> bin/Debug/net8.0/Northwind.Api.dll\n",
-        "09:37:01  Build succeeded.\n",
-        "09:37:01      0 Warning(s)\n",
-        "09:37:01      0 Error(s)\n",
-        "09:37:01  Time Elapsed 00:00:21.44\n",
+        "running 184 tests\n",
+        "test cache::tests::put_refuses_same_timestamp ... ok\n",
+        "test cache::tests::rewrite_edits_in_place ... FAILED\n",
+        "test repo::tests::to_connection_relative_strips_host ... ok\n",
+        "\n",
+        "failures:\n",
+        "\n",
+        "---- cache::tests::rewrite_edits_in_place stdout ----\n",
+        "\n",
+        "thread 'cache::tests::rewrite_edits_in_place' panicked at crates/forgetop-core/src/cache.rs:212:9:\n",
+        "assertion `left == right` failed\n",
+        "  left: 3\n",
+        " right: 4\n",
+        "note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n",
+        "\n",
+        "failures:\n",
+        "    cache::tests::rewrite_edits_in_place\n",
+        "\n",
+        "test result: FAILED. 183 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 19.03s\n",
+        "\n",
+        "##[error]Process completed with exit code 101.\n",
     )
     .to_string()
 }
 
-fn unit_log_succeeded() -> String {
-    concat!(
-        "09:41:40  Restoring NuGet packages...\n",
-        "09:41:41  Restore complete (0.8s)\n",
-        "09:41:41  Northwind.Orders.Tests -> bin/Debug/net8.0/Northwind.Orders.Tests.dll\n",
-        "09:41:42  Starting test execution, please wait...\n",
-        "09:41:42  A total of 1 test files matched the specified pattern.\n",
-        "09:41:43  [xUnit.net 00:00:00.91]   Discovering: Northwind.Orders.Tests\n",
-        "09:41:43  [xUnit.net 00:00:00.98]   Discovered:  Northwind.Orders.Tests\n",
-        "09:41:43  [xUnit.net 00:00:00.99]   Starting:    Northwind.Orders.Tests\n",
-        "09:41:45    Passed OrderServiceTests.CreatesOrder_WithValidItems [12 ms]\n",
-        "09:41:45    Passed OrderServiceTests.RejectsOrder_WithNoItems [3 ms]\n",
-        "09:41:46    Passed OrderServiceTests.AppliesDiscountCode [9 ms]\n",
-        "09:41:47    Passed OrderServiceTests.RecalculatesTotals_OnLineItemChange [14 ms]\n",
-        "09:41:48  [xUnit.net 00:00:05.60]   Finished:    Northwind.Orders.Tests\n",
-        "09:41:48  Passed!  - Failed: 0, Passed: 64, Skipped: 0, Total: 64, Duration: 6 s - Northwind.Orders.Tests.dll\n",
-    )
-    .to_string()
+/// Wraps a GitHub-style job's steps as `##[group]<name>` … `##[endgroup]` sections, in order —
+/// the same shape GitHub Actions' raw log takes, so a client-side parser has something real to
+/// split on.
+fn gh_step_log(steps: &[GhStep]) -> String {
+    let mut out = String::new();
+    for (name, _off, _dur, status) in steps {
+        out.push_str(&format!("##[group]{name}\n"));
+        out.push_str(&gh_step_body(name, *status));
+        out.push_str("##[endgroup]\n");
+    }
+    out
 }
 
-/// The failing job (j12, run r500) — a realistic xUnit failure a matcher can find: a `[FAIL]`
-/// line with `Assert.InRange` detail and a stack line, a `Failed!` summary, and a final
-/// `##[error]` line. Also includes lines that look error-ish but aren't (a clean `Passed!`
-/// summary and a "0 errors" build line) to exercise the false-positive side of the matcher.
-fn integration_log_failed() -> String {
-    concat!(
-        "09:41:10  Restoring NuGet packages...\n",
-        "09:41:12  Restore complete (1.8s)\n",
-        "09:41:12  Building Northwind.Integration.Tests -> bin/Debug/net8.0/Northwind.Integration.Tests.dll\n",
-        "09:41:18  Build succeeded. 0 errors, 2 warnings\n",
-        "09:41:19  Starting test execution, please wait...\n",
-        "09:41:19  A total of 2 test files matched the specified pattern.\n",
-        "09:41:20  [xUnit.net 00:00:00.87]   Discovering: Northwind.Cart.Tests\n",
-        "09:41:20  [xUnit.net 00:00:00.95]   Discovered:  Northwind.Cart.Tests\n",
-        "09:41:20  [xUnit.net 00:00:00.96]   Starting:    Northwind.Cart.Tests\n",
-        "09:41:22    Passed CartTests.test_add_item [41 ms]\n",
-        "09:41:22    Passed CartTests.test_remove_item [18 ms]\n",
-        "09:41:24    Passed InventoryTests.test_reserve_stock [55 ms]\n",
-        "09:41:24    Passed InventoryTests.test_release_stock [22 ms]\n",
-        "09:41:28  [xUnit.net 00:00:08.10]   Finished:    Northwind.Cart.Tests\n",
-        "09:41:28  Passed!  - Failed: 0, Passed: 212, Skipped: 0, Total: 212, Duration: 8 s - Northwind.Cart.Tests.dll\n",
-        "09:41:29  [xUnit.net 00:00:09.00]   Starting:    Northwind.Integration.Tests\n",
-        "09:41:31    Passed RefundTests.test_partial_refund [19 ms]\n",
-        "09:41:31    Passed CheckoutFlowTests.test_apply_discount [30 ms]\n",
-        "09:41:33  [FAIL] CheckoutFlowTests.test_checkout_flow [812 ms]\n",
-        "09:41:33    Assert.InRange() Failure: Value not in range\n",
-        "09:41:33    Expected: value in range (200, 299]\n",
-        "09:41:33    Actual: 503\n",
-        "09:41:33       at Northwind.Integration.Tests.CheckoutFlowTests.test_checkout_flow() in /src/tests/Northwind.Integration.Tests/CheckoutFlowTests.cs:line 47\n",
-        "09:41:33    ----- Inner Stack Trace -----\n",
-        "09:41:33       at System.Net.Http.HttpClient.SendAsync(HttpRequestMessage request)\n",
-        "09:41:35    Passed RefundTests.test_refund [19 ms]\n",
-        "09:41:36  [xUnit.net 00:00:16.40]   Finished:    Northwind.Integration.Tests\n",
-        "09:41:36  Failed!  - Failed: 1, Passed: 97, Skipped: 0, Total: 98, Duration: 16 s - Northwind.Integration.Tests.dll\n",
-        "09:41:36  ##[error]Process completed with exit code 1.\n",
-    )
-    .to_string()
+fn release_plan_log() -> String {
+    "Resolving the 1.2.1 release plan...\nChangelog: CHANGELOG.md (12 entries since 1.2.0)\nTargets: aarch64-apple-darwin, x86_64-apple-darwin, x86_64-unknown-linux-gnu, x86_64-pc-windows-msvc\n".into()
 }
 
-fn deploy_log() -> String {
-    concat!(
-        "09:50:01  Initializing the backend...\n",
-        "09:50:02  Initializing provider plugins...\n",
-        "09:50:04  Terraform has been successfully initialized!\n",
-        "09:50:05  terraform plan -out=tfplan\n",
-        "09:50:09  Plan: 3 to add, 1 to change, 0 to destroy.\n",
-        "09:50:10  terraform apply tfplan\n",
-        "09:50:22  aws_ecs_service.api: Modifying...\n",
-        "09:50:40  aws_ecs_service.api: Modifications complete after 18s\n",
-        "09:50:41  Apply complete! Resources: 3 added, 1 changed, 0 destroyed.\n",
-        "09:50:42  kubectl rollout status deployment/api -n production\n",
-        "09:50:55  deployment \"api\" successfully rolled out\n",
+fn matrix_leg_log(target: &str) -> String {
+    format!(
+        "Downloading crates ...\n   Compiling forgetop-core v1.2.1\n   Compiling forgetop-providers v1.2.1\n   Compiling forgetop-cli v1.2.1\n    Finished `release` profile [optimized] target(s) in 2m41s\nStripping symbols from target/{target}/release/forgetop\nPackaging forgetop-{target}.tar.xz\nUploading forgetop-{target}.tar.xz\n"
     )
-    .to_string()
 }
 
-/// A plausible-but-generic log for a job id/name we don't have a scripted log for.
+fn matrix_leg_log_running(target: &str) -> String {
+    format!("Downloading crates ...\n   Compiling forgetop-core v1.2.1\n   Compiling forgetop-providers v1.2.1\n   Compiling forgetop-cli v1.2.1\nStill building target/{target}/release/forgetop ...\n")
+}
+
+fn matrix_leg_log_failed(target: &str) -> String {
+    format!(
+        "Downloading crates ...\n   Compiling forgetop-core v1.2.1\n   Compiling forgetop-providers v1.2.1\nerror[E0433]: failed to resolve: use of undeclared crate `winapi`\n  --> crates/forgetop-tui/src/platform/windows.rs:9:5\nerror: could not compile `forgetop-tui` (lib) due to 1 previous error\n##[error]Process completed with exit code 101. ({target})\n"
+    )
+}
+
+fn release_downstream_log(name: &str) -> String {
+    format!("Waiting on the build-local-artifacts matrix...\nRunning {name}...\nDone.\n")
+}
+
+/// A plausible-but-generic log for a job id we don't have a scripted log for.
 fn generic_log(job_id: &str) -> String {
     let mut out = format!("09:30:00  Starting job {job_id}...\n");
     for i in 1..=18 {
@@ -1187,8 +1452,8 @@ fn generic_log(job_id: &str) -> String {
     out
 }
 
-/// Process-wide start instant for the demo's one "live" job (r501/j2's `dotnet test` step,
-/// which stays Running for the life of the `--demo` session) — [`unit_log_growing`] measures
+/// Process-wide start instant for the demo's one "live" job (`r501`/`mj-linux`, the matrix leg
+/// that stays Running for the life of the `--demo` session) — [`unit_log_growing`] measures
 /// elapsed time against this so the log starts short and grows the longer `--demo` runs.
 fn demo_start() -> std::time::Instant {
     static START: OnceLock<std::time::Instant> = OnceLock::new();
@@ -1254,8 +1519,9 @@ fn unit_log_growing_at(elapsed_secs: u64) -> String {
     out
 }
 
-/// The growing log for the running job (j2, run r501) — grows with real elapsed time since
-/// `--demo` started (see [`demo_start`]), so a "follow mode" feature has something to follow.
+/// The growing log for the still-running matrix leg (`r501`/`mj-linux`) — grows with real
+/// elapsed time since `--demo` started (see [`demo_start`]), so a "follow mode" feature has
+/// something to follow.
 fn unit_log_growing() -> String {
     unit_log_growing_at(demo_start().elapsed().as_secs())
 }
@@ -1274,6 +1540,7 @@ impl PipelineSource for DemoPipe {
             .into_iter()
             .filter(|r| query.definition_id.as_ref().is_none_or(|d| &r.definition_id == d))
             .map(apply_pipe_cancel)
+            .map(apply_pipe_rerun)
             .collect())
     }
     async fn get_run(&self, run: &ItemRef) -> Result<PipelineRun> {
@@ -1282,31 +1549,36 @@ impl PipelineSource for DemoPipe {
             .into_iter()
             .find(|r| r.id == run_id)
             .map(apply_pipe_cancel)
+            .map(apply_pipe_rerun)
             .ok_or_else(|| forgetop_core::Error::NotFound(run_id.into()))
     }
     async fn logs(&self, run: &ItemRef, job_id: Option<&str>) -> Result<String> {
         let run_id: &str = &run.id;
         if let Some(job) = job_id {
             let mut out = format!("=== logs for run {run_id} · {job} ===\n");
-            out.push_str(&job_log(job));
+            out.push_str(&job_log(run_id, job));
             return Ok(out);
         }
         // No job specified: a sensible whole-run log — concatenate each job's log in order.
+        if ci_run_steps(run_id).is_some() {
+            let job = format!("job-{run_id}");
+            let mut out = format!("=== job {job} ===\n");
+            out.push_str(&job_log(run_id, &job));
+            return Ok(out);
+        }
         let job_ids: &[&str] = match run_id {
-            "r501" => &["j1", "j2"],
-            "r500" => &["j10", "j11", "j12"],
-            "r207" => &["j20"],
+            "r501" | "r207" | "r206" | "r205" => &["mj-plan", "mj-aarch64", "mj-x86mac", "mj-linux", "mj-win", "mj-global", "mj-host", "mj-homebrew", "mj-announce"],
             _ => &[],
         };
         if job_ids.is_empty() {
             let mut out = format!("=== logs for run {run_id} ===\n");
-            out.push_str(&job_log(run_id));
+            out.push_str(&job_log(run_id, run_id));
             return Ok(out);
         }
         let mut out = String::new();
         for job in job_ids {
             out.push_str(&format!("=== job {job} ===\n"));
-            out.push_str(&job_log(job));
+            out.push_str(&job_log(run_id, job));
             out.push('\n');
         }
         Ok(out)
@@ -1319,6 +1591,81 @@ impl PipelineSource for DemoPipe {
         canceled_runs().lock().unwrap().insert(run_id.to_string());
         Ok(())
     }
+    fn supports_rerun(&self) -> bool {
+        true
+    }
+    fn supports_rerun_failed(&self) -> bool {
+        true
+    }
+    async fn rerun_run(&self, run: &ItemRef, failed_only: bool) -> Result<Option<String>> {
+        // Like GitHub: the same run is re-queued as its next attempt.
+        let run_id: &str = &run.id;
+        rerun_state().lock().unwrap().insert(run_id.to_string(), RerunState { failed_only, at: Utc::now() });
+        Ok(None)
+    }
+    fn supports_artifacts(&self) -> bool {
+        true
+    }
+    async fn artifacts(&self, run: &ItemRef) -> Result<Vec<PipelineArtifact>> {
+        let run_id: &str = &run.id;
+        // Only the finished release run (#56) published artifacts — everything else reports none
+        // rather than making up a fake publish step for a `CI` run.
+        if run_id != "r207" {
+            return Ok(Vec::new());
+        }
+        let expires_at = Some(base() + chrono::Duration::days(83));
+        let art = |name: &str, size_bytes: u64| PipelineArtifact {
+            id: format!("art-{name}"),
+            name: name.into(),
+            size_bytes: Some(size_bytes),
+            expires_at,
+            url: Some(format!("https://example.test/releases/v1.2.0/{name}")),
+        };
+        Ok(vec![
+            art("forgetop-aarch64-apple-darwin.tar.xz", 7_900_000),
+            art("forgetop-x86_64-apple-darwin.tar.xz", 8_300_000),
+            art("forgetop-x86_64-unknown-linux-gnu.tar.xz", 8_600_000),
+            art("forgetop-x86_64-pc-windows-msvc.zip", 8_100_000),
+            art("forgetop-installer.sh", 18_000),
+            art("forgetop-installer.ps1", 21_000),
+            art("sha256.sum", 1_000),
+        ])
+    }
+    async fn annotations(&self, run: &ItemRef) -> Result<Vec<PipelineAnnotation>> {
+        let run_id: &str = &run.id;
+        // Only the headline failed run (#438) carries provider annotations — a Failure anchored
+        // to the real panic site, a Warning on an unrelated file, and a Notice.
+        if run_id != "r500" {
+            return Ok(Vec::new());
+        }
+        let job_id = Some("job-r500".to_string());
+        Ok(vec![
+            PipelineAnnotation {
+                level: AnnotationLevel::Failure,
+                message: "assertion `left == right` failed".into(),
+                title: Some("cache::tests::rewrite_edits_in_place".into()),
+                path: Some("crates/forgetop-core/src/cache.rs".into()),
+                line: Some(212),
+                job_id: job_id.clone(),
+            },
+            PipelineAnnotation {
+                level: AnnotationLevel::Warning,
+                message: "'status' is possibly 'undefined'".into(),
+                title: None,
+                path: Some("crates/forgetop-server/web/src/components/Pipelines.tsx".into()),
+                line: Some(88),
+                job_id: job_id.clone(),
+            },
+            PipelineAnnotation {
+                level: AnnotationLevel::Notice,
+                message: "Node.js 16 actions are deprecated. Please update the following actions to use Node.js 20: actions/cache@v3".into(),
+                title: None,
+                path: None,
+                line: None,
+                job_id,
+            },
+        ])
+    }
     fn supports_approvals(&self) -> bool {
         true
     }
@@ -1328,7 +1675,7 @@ impl PipelineSource for DemoPipe {
         if canceled_runs().lock().unwrap().contains(run_id) {
             return Ok(Vec::new());
         }
-        // The running CI run (#501) waits on a production deployment gate you can act on.
+        // The running release (#57) waits on a production deployment gate you can act on.
         Ok(if run_id == "r501" {
             vec![PipelineApproval { id: "production".into(), name: "production".into(), can_respond: true }]
         } else {
@@ -1351,6 +1698,47 @@ fn canceled_runs() -> &'static Mutex<HashSet<String>> {
 fn apply_pipe_cancel(mut run: PipelineRun) -> PipelineRun {
     if canceled_runs().lock().unwrap().contains(&run.id) {
         run.status = PipelineRunStatus::Canceled;
+    }
+    run
+}
+
+/// A session `rerun_run` request, keyed by run id: whether it asked for the whole run or just
+/// the jobs that failed.
+#[derive(Clone, Copy)]
+struct RerunState {
+    failed_only: bool,
+    /// When the rerun was asked for — the new attempt's start.
+    at: DateTime<Utc>,
+}
+
+fn rerun_state() -> &'static Mutex<HashMap<String, RerunState>> {
+    static STORE: OnceLock<Mutex<HashMap<String, RerunState>>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Fold a session rerun onto a freshly-built run, like a real provider re-queuing it: the
+/// attempt bumps, the finish time clears, and the run (and, with `failed_only`, just its failed
+/// jobs — a job that never failed is left exactly as it was) goes back to Queued.
+fn apply_pipe_rerun(mut run: PipelineRun) -> PipelineRun {
+    let Some(state) = rerun_state().lock().unwrap().get(&run.id).copied() else {
+        return run;
+    };
+    run.attempt = Some(run.attempt.unwrap_or(1) + 1);
+    run.started_at = Some(state.at);
+    run.finished_at = None;
+    run.status = PipelineRunStatus::Queued;
+    for stage in run.stages.iter_mut() {
+        for job in stage.jobs.iter_mut() {
+            if state.failed_only && !matches!(job.status, PipelineRunStatus::Failed) {
+                continue;
+            }
+            job.status = PipelineRunStatus::Queued;
+            job.finished_at = None;
+            for s in job.steps.iter_mut() {
+                s.status = PipelineRunStatus::Queued;
+                s.finished_at = None;
+            }
+        }
     }
     run
 }
@@ -1658,27 +2046,131 @@ mod tests {
     async fn run_has_stages_jobs_steps() {
         let src = conn().pipelines().unwrap();
         let run = src.get_run(&ItemRef::new("r500")).await.unwrap();
-        let test = run.stages.iter().find(|s| s.name == "test").unwrap();
-        let integ = test.jobs.iter().find(|j| j.name == "integration").unwrap();
-        assert!(integ.steps.iter().any(|s| matches!(s.status, PipelineRunStatus::Failed)));
+        let stage = run.stages.iter().find(|s| s.name == "jobs").unwrap();
+        let job = stage.jobs.first().expect("the GitHub-style run has a single job");
+        assert!(job.steps.iter().any(|s| s.name == "Test" && matches!(s.status, PipelineRunStatus::Failed)));
+        assert!(job.steps.iter().all(|s| s.started_at.is_some() && s.finished_at.is_some()), "every step is timestamped");
     }
 
     #[tokio::test]
     async fn failed_job_log_has_an_error_marker() {
         let src = conn().pipelines().unwrap();
-        let log = src.logs(&ItemRef::new("r500"), Some("j12")).await.unwrap();
+        let log = src.logs(&ItemRef::new("r500"), Some("job-r500")).await.unwrap();
         assert!(log.contains("##[error]"), "failing job's log should carry an error marker: {log}");
-        assert!(log.contains("test_checkout_flow"), "keeps the gist of the original failure");
-        assert!(log.contains("Failed!  - Failed: 1, Passed: 97"), "a realistic failure summary line");
+        assert!(log.contains("rewrite_edits_in_place"), "keeps the gist of the original failure");
+        assert!(log.contains("test result: FAILED. 183 passed; 1 failed"), "a realistic failure summary line");
+        assert!(log.contains("crates/forgetop-core/src/cache.rs:212:9"), "the panic location is in the log");
     }
 
     #[tokio::test]
     async fn succeeded_job_logs_have_no_error_marker() {
         let src = conn().pipelines().unwrap();
-        for (run_id, job_id) in [("r500", "j10"), ("r500", "j11"), ("r207", "j20")] {
+        for (run_id, job_id) in [("r499", "job-r499"), ("r207", "mj-plan"), ("r207", "mj-aarch64")] {
             let log = src.logs(&ItemRef::new(run_id), Some(job_id)).await.unwrap();
             assert!(!log.contains("##[error]"), "{job_id}'s log should not carry an error marker: {log}");
         }
+    }
+
+    #[test]
+    fn every_gh_style_step_has_a_matching_log_group() {
+        for run_id in ["r493", "r494", "r495", "r496", "r497", "r498", "r499", "r500"] {
+            let steps = ci_run_steps(run_id).unwrap();
+            let log = gh_step_log(&steps);
+            for (name, _, _, _) in &steps {
+                assert!(log.contains(&format!("##[group]{name}\n")), "{run_id}: missing a log group for step {name:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn annotations_are_only_on_the_headline_failed_run() {
+        let src = conn().pipelines().unwrap();
+        let anns = src.annotations(&ItemRef::new("r500")).await.unwrap();
+        assert_eq!(anns.len(), 3);
+        assert!(anns.iter().any(|a| a.level == AnnotationLevel::Failure
+            && a.path.as_deref() == Some("crates/forgetop-core/src/cache.rs")
+            && a.line == Some(212)));
+        assert!(anns.iter().any(|a| a.level == AnnotationLevel::Warning));
+        assert!(anns.iter().any(|a| a.level == AnnotationLevel::Notice));
+        assert!(anns.iter().all(|a| a.job_id.as_deref() == Some("job-r500")));
+
+        assert!(src.annotations(&ItemRef::new("r499")).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn artifacts_are_only_on_the_finished_release_run() {
+        let src = conn().pipelines().unwrap();
+        assert!(src.supports_artifacts());
+        let arts = src.artifacts(&ItemRef::new("r207")).await.unwrap();
+        assert_eq!(arts.len(), 7);
+        assert!(arts.iter().all(|a| a.size_bytes.is_some() && a.expires_at.is_some()));
+        assert!(arts.iter().all(|a| a.url.as_deref().is_some_and(|u| u.starts_with("https://"))));
+
+        assert!(src.artifacts(&ItemRef::new("r501")).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn rerun_bumps_the_attempt_and_requeues_the_whole_run() {
+        let src = DemoPipe { conn: "github".into() };
+        assert!(src.supports_rerun() && src.supports_rerun_failed());
+        // A fabricated id so the session-global rerun store can't pollute other tests reading
+        // the real demo runs (r500 in particular).
+        let id = "demo-rerun-test-whole";
+        src.rerun_run(&ItemRef::new(id), false).await.unwrap();
+
+        let mut run = ci_run("r500", 1, "t", "b", None, "push", 1, "abc", me(), base());
+        run.id = id.to_string();
+        let before_attempt = run.attempt;
+        let after = apply_pipe_rerun(run);
+
+        assert_eq!(after.attempt, before_attempt.map(|a| a + 1));
+        assert_eq!(after.status, PipelineRunStatus::Queued);
+        assert!(after.finished_at.is_none());
+        assert!(after.stages.iter().flat_map(|s| &s.jobs).all(|j| matches!(j.status, PipelineRunStatus::Queued)), "a full rerun requeues every job");
+        assert!(after.stages.iter().flat_map(|s| &s.jobs).flat_map(|j| &j.steps).all(|s| matches!(s.status, PipelineRunStatus::Queued)));
+    }
+
+    #[tokio::test]
+    async fn rerun_failed_only_leaves_jobs_that_never_failed_alone() {
+        let src = DemoPipe { conn: "github".into() };
+        let id = "demo-rerun-test-failed-only";
+        src.rerun_run(&ItemRef::new(id), true).await.unwrap();
+
+        let now = base();
+        let job = |id: &str, status: PipelineRunStatus| PipelineJob {
+            id: id.into(),
+            name: id.into(),
+            status,
+            started_at: Some(now),
+            finished_at: Some(now),
+            steps: vec![],
+            url: None,
+            problem: None,
+        };
+        let run = PipelineRun {
+            event: None,
+            attempt: Some(1),
+            pull_request: None,
+            repository: None,
+            id: id.into(),
+            definition_id: "release".into(),
+            number: Some(1),
+            name: None,
+            title: None,
+            status: PipelineRunStatus::Failed,
+            triggered_by: None,
+            branch: None,
+            commit_sha: None,
+            started_at: Some(now),
+            finished_at: Some(now),
+            url: None,
+            stages: vec![PipelineStage { name: "jobs".into(), status: PipelineRunStatus::Failed, jobs: vec![job("a", PipelineRunStatus::Succeeded), job("b", PipelineRunStatus::Failed)] }],
+        };
+
+        let after = apply_pipe_rerun(run);
+        assert!(matches!(after.stages[0].jobs[0].status, PipelineRunStatus::Succeeded), "the job that didn't fail is untouched");
+        assert!(matches!(after.stages[0].jobs[1].status, PipelineRunStatus::Queued), "the failed job is requeued");
+        assert_eq!(after.attempt, Some(2));
     }
 
     #[test]

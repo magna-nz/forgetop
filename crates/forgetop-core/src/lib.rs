@@ -10,6 +10,7 @@ pub mod filter;
 pub mod launchpad;
 pub mod provider;
 pub mod repo;
+pub mod runlog;
 pub mod secret;
 pub mod service;
 pub mod setup;

@@ -9,6 +9,53 @@ Adding a release: one `## <version> — <date>` section, a line per user-visible
 and the pull request each one came from. `git log v<previous>..HEAD --merges` lists the
 candidates.
 
+## 1.3.0 — 2026-09-25
+
+Added
+
+- **A redesigned pipeline run pane** in the terminal UI: the preview beside the Pipelines list,
+  focused with `Enter`/`p`, and the full-screen view.
+  - A header with the run's event, branch, commit, title, attempt and linked PR.
+  - A **history strip** of the pipeline's recent runs on the branch: status, a duration
+    sparkline, the median, this run against it, and the last failure. `←`/`→` open the older
+    or newer run.
+  - **Timeline bars** for every job and step on one time axis. Post and cleanup steps fold
+    into one line.
+  - For a running run, the estimated finish, shaded estimates for running and queued jobs,
+    and which job is holding the run up.
+  - **Step log sections.** `Enter` on a step opens its part of the job log. Sections fold
+    (`z`/`Z`), and a failed run opens on its first error.
+  - A **failure line** naming the failing test and `file:line`, and a **Problems** panel of
+    the run's annotations (`e`).
+  - **Rerun** (`R`), **rerun failed jobs** (`F`), **artifacts** (`a`) and **copy commit**
+    (`c`).
+
+  The pane uses new provider support for rerun, artifacts and annotations on GitHub, GitLab
+  and Azure DevOps. Bitbucket supports rerun and annotations only. ([#198](https://github.com/magna-nz/forgetop/pull/198))
+- **Activity** on work items and on the PR Conversation tab. ([#196](https://github.com/magna-nz/forgetop/pull/196))
+- **`@` assign** with a searchable picker, and **`e` edit** for titles (in place) and
+  descriptions (in `$EDITOR`). ([#196](https://github.com/magna-nz/forgetop/pull/196))
+- **`X` cancel** for a queued or running run. ([#196](https://github.com/magna-nz/forgetop/pull/196)) It updates on screen straight away and
+  rolls back if the provider refuses. ([#198](https://github.com/magna-nz/forgetop/pull/198))
+- **Mouse support.** Click a tab or row to select it, and click again to open. The wheel
+  scrolls the pane under the pointer. Turn it off with `ui.mouse = false`. ([#197](https://github.com/magna-nz/forgetop/pull/197))
+
+Changed
+
+- **Needs your review** ages count from when the PR was opened. They turn yellow past
+  `ui.review_sla_hours` (default 24h) and red at three times that. ([#197](https://github.com/magna-nz/forgetop/pull/197))
+- On a pipeline run, `F` reruns the failed jobs; everywhere else it still opens feedback.
+  ([#198](https://github.com/magna-nz/forgetop/pull/198))
+
+Fixed
+
+- Wrapped detail panes scroll to their real end. ([#196](https://github.com/magna-nz/forgetop/pull/196))
+- GitLab job logs keep their step sections. ([#198](https://github.com/magna-nz/forgetop/pull/198))
+
+Release
+
+- 1.3.0 version bump. ([#198](https://github.com/magna-nz/forgetop/pull/198))
+
 ## 1.2.1 — 2026-09-24
 
 Added

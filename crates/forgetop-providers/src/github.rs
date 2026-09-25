@@ -201,6 +201,9 @@ fn status_of(v: &Value) -> PipelineRunStatus {
 pub fn map_run(v: &Value, repo: Option<&str>) -> PipelineRun {
     let completed = get_str(v, "status").as_deref() == Some("completed");
     PipelineRun {
+        event: get_str(v, "event"),
+        attempt: get_i64(v, "run_attempt").map(|n| n as u32),
+        pull_request: get_arr(v, "pull_requests").first().and_then(|pr| get_i64(pr, "number")),
         repository: get_obj(v, "repository").and_then(|r| get_str(r, "full_name")).or_else(|| repo.map(str::to_string)),
         id: get_i64(v, "id").map(|n| n.to_string()).unwrap_or_else(|| "0".into()),
         definition_id: get_i64(v, "workflow_id").map(|n| n.to_string()).unwrap_or_else(|| "0".into()),
@@ -237,6 +240,42 @@ pub fn map_job(v: &Value) -> PipelineJob {
         url: get_str(v, "html_url"),
         problem: None,
     }
+}
+
+/// One entry of `GET /actions/runs/{id}/artifacts`. `run_html_url` is the run's own web-UI link
+/// (fetched separately — the artifacts payload itself carries no browser URL), used to build a
+/// link that works on GHES as well as github.com.
+pub fn map_gh_artifact(v: &Value, run_html_url: Option<&str>) -> PipelineArtifact {
+    let id = get_i64(v, "id").map(|n| n.to_string()).unwrap_or_else(|| "0".into());
+    PipelineArtifact {
+        name: get_str(v, "name").unwrap_or_else(|| "artifact".into()),
+        size_bytes: v.get("size_in_bytes").and_then(|x| x.as_u64()),
+        expires_at: get_date(v, "expires_at"),
+        url: run_html_url.map(|h| format!("{h}/artifacts/{id}")),
+        id,
+    }
+}
+
+/// One entry of `GET /repos/{repo}/check-runs/{job_id}/annotations`.
+pub fn map_gh_annotation(v: &Value, job_id: &str) -> PipelineAnnotation {
+    let level = match get_str(v, "annotation_level").as_deref() {
+        Some("failure") => AnnotationLevel::Failure,
+        Some("notice") => AnnotationLevel::Notice,
+        _ => AnnotationLevel::Warning,
+    };
+    PipelineAnnotation {
+        level,
+        message: get_str(v, "message").unwrap_or_default(),
+        title: get_str(v, "title"),
+        path: get_str(v, "path"),
+        line: get_i64(v, "start_line").map(|n| n as u32),
+        job_id: Some(job_id.to_string()),
+    }
+}
+
+/// Sorts annotations most severe first (Failure → Warning → Notice), stable within a level.
+fn sort_annotations(annotations: &mut [PipelineAnnotation]) {
+    annotations.sort_by_key(|a| a.level);
 }
 
 /// A short summary for a job GitHub hasn't finished (or hasn't published a log for yet),
@@ -1034,6 +1073,57 @@ impl PipelineSource for GitHubPipe {
         let url = self.0.repo_path(&repo, &format!("/actions/runs/{}/cancel", run.id));
         self.0.post_json(&url, json!({})).await
     }
+    fn supports_rerun(&self) -> bool {
+        true
+    }
+    fn supports_rerun_failed(&self) -> bool {
+        true
+    }
+    async fn rerun_run(&self, run: &ItemRef, failed_only: bool) -> Result<Option<String>> {
+        // Both re-queue the same run as its next attempt.
+        let repo = self.0.resolve(run)?;
+        let suffix = if failed_only { "rerun-failed-jobs" } else { "rerun" };
+        let url = self.0.repo_path(&repo, &format!("/actions/runs/{}/{suffix}", run.id));
+        self.0.post_json(&url, json!({})).await?;
+        Ok(None)
+    }
+    fn supports_artifacts(&self) -> bool {
+        true
+    }
+    async fn artifacts(&self, run: &ItemRef) -> Result<Vec<PipelineArtifact>> {
+        let repo = self.0.resolve(run)?;
+        // The artifacts list carries no browser URL of its own — fetch the run once to get its
+        // `html_url` (works on GHES too, unlike hardcoding github.com) and build the link from it.
+        let run_v = self.0.get_json(&self.0.repo_path(&repo, &format!("/actions/runs/{}", run.id))).await?;
+        let run_html = get_str(&run_v, "html_url");
+        let url = self.0.repo_path(&repo, &format!("/actions/runs/{}/artifacts?per_page=100", run.id));
+        let v = self.0.get_json(&url).await?;
+        Ok(get_arr(&v, "artifacts").iter().map(|a| map_gh_artifact(a, run_html.as_deref())).collect())
+    }
+    async fn annotations(&self, run: &ItemRef) -> Result<Vec<PipelineAnnotation>> {
+        let repo = self.0.resolve(run)?;
+        let jobs_v = self.0.get_json(&self.0.repo_path(&repo, &format!("/actions/runs/{}/jobs?per_page=100", run.id))).await?;
+        let job_ids: Vec<String> = get_arr(&jobs_v, "jobs").iter().filter_map(|j| get_i64(j, "id").map(|n| n.to_string())).collect();
+        // One call per job, a few at a time. A job whose annotations we can't fetch
+        // (permissions, not a check-run, …) is skipped rather than failing the whole call — the
+        // other jobs' annotations still matter.
+        let mut out = Vec::new();
+        for chunk in job_ids.chunks(4) {
+            let fetched = futures_util::future::join_all(chunk.iter().map(|job_id| {
+                let url = self.0.repo_path(&repo, &format!("/check-runs/{job_id}/annotations?per_page=50"));
+                async move { (job_id, self.0.get_json(&url).await) }
+            }))
+            .await;
+            for (job_id, v) in fetched {
+                if let Ok(Value::Array(arr)) = v {
+                    out.extend(arr.iter().map(|a| map_gh_annotation(a, job_id)));
+                }
+            }
+        }
+        sort_annotations(&mut out);
+        out.truncate(50);
+        Ok(out)
+    }
     fn supports_approvals(&self) -> bool {
         true
     }
@@ -1370,6 +1460,72 @@ mod tests {
         )
         .unwrap();
         assert_eq!(map_job(&job).steps.len(), 1);
+    }
+
+    #[test]
+    fn maps_run_event_attempt_and_pull_request() {
+        let run: Value = serde_json::from_str(
+            r#"{ "id": 123, "workflow_id": 99, "status": "completed", "conclusion": "success",
+                 "event": "pull_request", "run_attempt": 2, "pull_requests": [ { "number": 501 } ] }"#,
+        )
+        .unwrap();
+        let r = map_run(&run, None);
+        assert_eq!(r.event.as_deref(), Some("pull_request"));
+        assert_eq!(r.attempt, Some(2));
+        assert_eq!(r.pull_request, Some(501));
+
+        // A run with none of these (e.g. a schedule trigger with no PR) leaves them all None.
+        let scheduled: Value = serde_json::from_str(r#"{ "id": 1, "workflow_id": 1, "status": "queued", "event": "schedule" }"#).unwrap();
+        let s = map_run(&scheduled, None);
+        assert_eq!(s.event.as_deref(), Some("schedule"));
+        assert_eq!(s.attempt, None);
+        assert_eq!(s.pull_request, None);
+    }
+
+    #[test]
+    fn maps_artifact_with_run_html_url() {
+        let v: Value = serde_json::from_str(
+            r#"{ "id": 42, "name": "build-output", "size_in_bytes": 2048, "expires_at": "2026-08-01T00:00:00Z" }"#,
+        )
+        .unwrap();
+        let a = map_gh_artifact(&v, Some("https://github.com/acme/pay/actions/runs/123"));
+        assert_eq!(a.id, "42");
+        assert_eq!(a.name, "build-output");
+        assert_eq!(a.size_bytes, Some(2048));
+        assert!(a.expires_at.is_some());
+        assert_eq!(a.url.as_deref(), Some("https://github.com/acme/pay/actions/runs/123/artifacts/42"));
+
+        // No run URL available (e.g. lookup failed) — no artifact URL either, rather than a
+        // broken link.
+        let no_run = map_gh_artifact(&v, None);
+        assert_eq!(no_run.url, None);
+    }
+
+    #[test]
+    fn maps_and_sorts_annotations_by_severity() {
+        let failure: Value = serde_json::from_str(
+            r#"{ "annotation_level": "failure", "message": "assertion failed", "title": "test_x", "path": "src/lib.rs", "start_line": 10 }"#,
+        )
+        .unwrap();
+        let notice: Value = serde_json::from_str(r#"{ "annotation_level": "notice", "message": "deprecated call" }"#).unwrap();
+        let warning: Value = serde_json::from_str(r#"{ "annotation_level": "warning", "message": "unused var" }"#).unwrap();
+
+        let f = map_gh_annotation(&failure, "1");
+        assert_eq!(f.level, AnnotationLevel::Failure);
+        assert_eq!(f.title.as_deref(), Some("test_x"));
+        assert_eq!(f.path.as_deref(), Some("src/lib.rs"));
+        assert_eq!(f.line, Some(10));
+        assert_eq!(f.job_id.as_deref(), Some("1"));
+
+        let n = map_gh_annotation(&notice, "2");
+        assert_eq!(n.level, AnnotationLevel::Notice);
+
+        let mut annotations = vec![n, map_gh_annotation(&warning, "3"), f];
+        sort_annotations(&mut annotations);
+        assert_eq!(
+            annotations.iter().map(|a| a.level).collect::<Vec<_>>(),
+            vec![AnnotationLevel::Failure, AnnotationLevel::Warning, AnnotationLevel::Notice]
+        );
     }
 
     #[test]

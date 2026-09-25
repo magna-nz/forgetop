@@ -160,6 +160,20 @@ pub fn map_definition(v: &Value, project: Option<&str>) -> PipelineDefinition {
     }
 }
 
+/// The PR id a `pullRequest`-triggered build was built for: Azure carries it either as
+/// `triggerInfo["pr.number"]` or, failing that, embedded in `sourceBranch` as
+/// `refs/pull/<n>/merge`.
+fn az_pull_request_id(v: &Value) -> Option<i64> {
+    get_obj(v, "triggerInfo")
+        .and_then(|t| t.get("pr.number"))
+        .and_then(|n| n.as_str().and_then(|s| s.parse().ok()).or_else(|| n.as_i64()))
+        .or_else(|| {
+            get_str(v, "sourceBranch")
+                .and_then(|b| b.strip_prefix("refs/pull/").map(str::to_string))
+                .and_then(|rest| rest.split('/').next().and_then(|n| n.parse().ok()))
+        })
+}
+
 pub fn map_build(v: &Value, project: Option<&str>) -> PipelineRun {
     let status = match get_str(v, "status").as_deref() {
         Some("completed") => match get_str(v, "result").as_deref() {
@@ -171,7 +185,11 @@ pub fn map_build(v: &Value, project: Option<&str>) -> PipelineRun {
         Some("inProgress") | Some("cancelling") => PipelineRunStatus::Running,
         _ => PipelineRunStatus::Queued,
     };
+    let reason = get_str(v, "reason");
     PipelineRun {
+        event: reason.clone(),
+        attempt: None,
+        pull_request: if reason.as_deref() == Some("pullRequest") { az_pull_request_id(v) } else { None },
         repository: get_obj(v, "project").and_then(|p| get_str(p, "name")).or_else(|| project.map(str::to_string)),
         id: get_i64(v, "id").map(|n| n.to_string()).unwrap_or_else(|| "0".into()),
         definition_id: get_obj(v, "definition").and_then(|d| get_i64(d, "id")).map(|n| n.to_string()).unwrap_or_else(|| "0".into()),
@@ -635,6 +653,69 @@ fn enclosing_stage_name(by_id: &std::collections::HashMap<String, &Value>, rec: 
     None
 }
 
+/// Walks `parentId` up from a record to the enclosing Job record's id (matching
+/// [`PipelineJob::id`]) — a record's own id if it's itself a Job.
+fn enclosing_job_id(by_id: &std::collections::HashMap<String, &Value>, rec: &Value) -> Option<String> {
+    let mut cur = rec;
+    for _ in 0..6 {
+        if get_str(cur, "type").as_deref() == Some("Job") {
+            return get_str(cur, "id");
+        }
+        cur = by_id.get(&get_str(cur, "parentId")?)?;
+    }
+    None
+}
+
+fn az_annotation_level(issue_type: Option<&str>) -> AnnotationLevel {
+    match issue_type {
+        Some("error") => AnnotationLevel::Failure,
+        Some("warning") => AnnotationLevel::Warning,
+        _ => AnnotationLevel::Notice,
+    }
+}
+
+/// Every timeline record's `issues[]` → a [`PipelineAnnotation`], most severe first, capped so a
+/// noisy build doesn't flood the pane.
+fn az_annotations_from_timeline(records: &[Value]) -> Vec<PipelineAnnotation> {
+    use std::collections::HashMap;
+    const MAX: usize = 50;
+    let by_id: HashMap<String, &Value> = records.iter().filter_map(|r| get_str(r, "id").map(|id| (id, r))).collect();
+    let mut out: Vec<PipelineAnnotation> = records
+        .iter()
+        .flat_map(|rec| {
+            let job_id = enclosing_job_id(&by_id, rec);
+            get_arr(rec, "issues").iter().map(move |issue| PipelineAnnotation {
+                level: az_annotation_level(get_str(issue, "type").as_deref()),
+                message: get_str(issue, "message").unwrap_or_default(),
+                title: None,
+                path: get_obj(issue, "data").and_then(|d| get_str(d, "sourcepath")),
+                line: get_obj(issue, "data").and_then(|d| d.get("linenumber")).and_then(|n| n.as_str().and_then(|s| s.parse().ok()).or_else(|| n.as_u64().map(|n| n as u32))),
+                job_id: job_id.clone(),
+            })
+        })
+        .collect();
+    out.sort_by_key(|a| a.level);
+    out.truncate(MAX);
+    out
+}
+
+/// A build artifact (`_apis/build/builds/{id}/artifacts`) → [`PipelineArtifact`]. Azure reports
+/// size as a string under `resource.properties.artifactsize` when present.
+pub fn map_az_artifact(v: &Value) -> PipelineArtifact {
+    let resource = get_obj(v, "resource");
+    let size_bytes = resource
+        .and_then(|r| get_obj(r, "properties"))
+        .and_then(|p| get_str(p, "artifactsize"))
+        .and_then(|s| s.parse::<u64>().ok());
+    PipelineArtifact {
+        id: get_i64(v, "id").map(|n| n.to_string()).unwrap_or_else(|| "0".into()),
+        name: get_str(v, "name").unwrap_or_else(|| "(artifact)".into()),
+        size_bytes,
+        expires_at: None,
+        url: resource.and_then(|r| get_str(r, "downloadUrl")),
+    }
+}
+
 fn urlencoding(s: &str) -> String {
     s.chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '-' | '_') { c.to_string() } else { format!("%{:02X}", c as u32) }).collect()
 }
@@ -1085,6 +1166,54 @@ impl PipelineSource for AzurePipe {
         }
         Ok(())
     }
+    fn supports_rerun(&self) -> bool {
+        true
+    }
+    fn supports_rerun_failed(&self) -> bool {
+        true
+    }
+    fn rerun_starts_new_run(&self, failed_only: bool) -> bool {
+        // `?retry=true` re-runs the failed jobs of the same build; a whole re-run queues a new one.
+        !failed_only
+    }
+    async fn rerun_run(&self, run: &ItemRef, failed_only: bool) -> Result<Option<String>> {
+        let project = self.0.resolve_project(run)?;
+        if failed_only {
+            // Retries just the build's failed jobs in place.
+            let url = format!("{}/{project}/_apis/build/builds/{}?retry=true&{API}", self.0.base, run.id);
+            let resp = self.0.http.patch(&url).json(&json!({})).send().await.map_err(prov)?;
+            if !resp.status().is_success() {
+                return Err(Error::Provider(format!("PATCH {url} -> {}", resp.status())));
+            }
+            return Ok(None);
+        }
+        // A whole re-run has no dedicated endpoint: queue a fresh build against the same
+        // definition, branch and commit as the one being re-run.
+        let build = self.0.get_json(&format!("{}/{project}/_apis/build/builds/{}?{API}", self.0.base, run.id)).await?;
+        let definition_id = get_obj(&build, "definition").and_then(|d| get_i64(d, "id")).unwrap_or(0);
+        let body = json!({
+            "definition": { "id": definition_id },
+            "sourceBranch": get_str(&build, "sourceBranch"),
+            "sourceVersion": get_str(&build, "sourceVersion"),
+        });
+        let queued = self.0.post_json_read(&format!("{}/{project}/_apis/build/builds?{API}", self.0.base), body).await?;
+        Ok(get_i64(&queued, "id").map(|n| n.to_string()))
+    }
+    fn supports_artifacts(&self) -> bool {
+        true
+    }
+    async fn artifacts(&self, run: &ItemRef) -> Result<Vec<PipelineArtifact>> {
+        let project = self.0.resolve_project(run)?;
+        let url = format!("{}/{project}/_apis/build/builds/{}/artifacts?{API}", self.0.base, run.id);
+        let v = self.0.get_json(&url).await?;
+        Ok(get_arr(&v, "value").iter().map(map_az_artifact).collect())
+    }
+    async fn annotations(&self, run: &ItemRef) -> Result<Vec<PipelineAnnotation>> {
+        let project = self.0.resolve_project(run)?;
+        let url = format!("{}/{project}/_apis/build/builds/{}/timeline?{API}", self.0.base, run.id);
+        let v = self.0.get_json(&url).await?;
+        Ok(az_annotations_from_timeline(get_arr(&v, "records")))
+    }
     async fn logs(&self, run: &ItemRef, job_id: Option<&str>) -> Result<String> {
         let project = self.0.resolve_project(run)?;
         let url = format!("{}/{project}/_apis/build/builds/{}/timeline?{API}", self.0.base, run.id);
@@ -1455,5 +1584,78 @@ mod tests {
     fn az_task_placeholder_line_reports_state_with_no_log() {
         let t: Value = serde_json::from_str(r#"{ "name": "compile", "state": "inProgress" }"#).unwrap();
         assert_eq!(az_task_placeholder_line(&t), "compile: inProgress — no log yet");
+    }
+
+    #[test]
+    fn maps_build_event_and_pull_request_from_trigger_info() {
+        let v: Value = serde_json::from_str(
+            r#"{ "id": 901, "status": "completed", "result": "succeeded", "reason": "pullRequest",
+                 "sourceBranch": "refs/pull/42/merge", "triggerInfo": { "pr.number": "42" } }"#,
+        )
+        .unwrap();
+        let run = map_build(&v, None);
+        assert_eq!(run.event.as_deref(), Some("pullRequest"));
+        assert_eq!(run.pull_request, Some(42));
+        assert_eq!(run.attempt, None);
+
+        // Falls back to parsing the PR number out of sourceBranch when triggerInfo lacks it.
+        let fallback: Value = serde_json::from_str(
+            r#"{ "id": 902, "status": "completed", "result": "succeeded", "reason": "pullRequest", "sourceBranch": "refs/pull/77/merge" }"#,
+        )
+        .unwrap();
+        assert_eq!(map_build(&fallback, None).pull_request, Some(77));
+
+        // A non-PR reason never reports a pull_request, even if sourceBranch looked like one.
+        let ci: Value = serde_json::from_str(r#"{ "id": 903, "status": "completed", "result": "succeeded", "reason": "individualCI", "sourceBranch": "refs/heads/main" }"#).unwrap();
+        let ci_run = map_build(&ci, None);
+        assert_eq!(ci_run.event.as_deref(), Some("individualCI"));
+        assert_eq!(ci_run.pull_request, None);
+    }
+
+    #[test]
+    fn maps_build_artifact_size_and_download_url() {
+        let v: Value = serde_json::from_str(
+            r#"{ "id": 5, "name": "drop", "resource": { "downloadUrl": "https://x/drop.zip", "properties": { "artifactsize": "12345" } } }"#,
+        )
+        .unwrap();
+        let a = map_az_artifact(&v);
+        assert_eq!(a.id, "5");
+        assert_eq!(a.name, "drop");
+        assert_eq!(a.size_bytes, Some(12345));
+        assert_eq!(a.url.as_deref(), Some("https://x/drop.zip"));
+        assert_eq!(a.expires_at, None);
+
+        // No size property at all — not an error, just unknown.
+        let no_size: Value = serde_json::from_str(r#"{ "id": 6, "name": "logs" }"#).unwrap();
+        assert_eq!(map_az_artifact(&no_size).size_bytes, None);
+    }
+
+    #[test]
+    fn timeline_issues_become_annotations_with_job_id_walked_up_and_sorted_by_severity() {
+        let records: Value = serde_json::from_str(
+            r#"[
+                { "id": "stage1", "type": "Stage", "name": "Build", "parentId": null },
+                { "id": "job1", "type": "Job", "name": "build", "parentId": "stage1" },
+                { "id": "task1", "type": "Task", "name": "compile", "parentId": "job1",
+                  "issues": [
+                    { "type": "warning", "message": "unused import", "data": { "sourcepath": "src/a.rs", "linenumber": "3" } },
+                    { "type": "error", "message": "type mismatch", "data": { "sourcepath": "src/b.rs", "linenumber": 10 } }
+                  ] },
+                { "id": "task2", "type": "Task", "name": "lint", "parentId": "job1",
+                  "issues": [ { "type": "unknown", "message": "fyi" } ] }
+            ]"#,
+        )
+        .unwrap();
+        let annotations = az_annotations_from_timeline(records.as_array().unwrap());
+        assert_eq!(annotations.len(), 3);
+        // Failure first, then Warning, then Notice.
+        assert_eq!(annotations[0].level, AnnotationLevel::Failure);
+        assert_eq!(annotations[0].message, "type mismatch");
+        assert_eq!(annotations[0].path.as_deref(), Some("src/b.rs"));
+        assert_eq!(annotations[0].line, Some(10));
+        assert_eq!(annotations[0].job_id.as_deref(), Some("job1")); // walked up from Task to Job
+        assert_eq!(annotations[1].level, AnnotationLevel::Warning);
+        assert_eq!(annotations[1].line, Some(3));
+        assert_eq!(annotations[2].level, AnnotationLevel::Notice);
     }
 }

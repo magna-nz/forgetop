@@ -345,6 +345,52 @@ pub struct PipelineRun {
     pub finished_at: Option<DateTime<Utc>>,
     pub url: Option<String>,
     pub stages: Vec<PipelineStage>,
+    /// What started the run, in the provider's own words (`push`, `pull_request`,
+    /// `schedule`, Azure `individualCI`, GitLab `merge_request_event`, …). `None` when unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event: Option<String>,
+    /// Which attempt of this run this is (GitHub `run_attempt`); `None` where the provider
+    /// doesn't number re-runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u32>,
+    /// The pull/merge request this run was built for, by number, when the provider says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull_request: Option<i64>,
+}
+
+/// How serious a [`PipelineAnnotation`] is. Ordered most severe first, so sorting by it puts
+/// failures on top.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum AnnotationLevel {
+    Failure,
+    Warning,
+    Notice,
+}
+
+/// A problem a run reported, usually anchored to a file and line: a GitHub check-run
+/// annotation, a GitLab failed test case, an Azure timeline issue.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PipelineAnnotation {
+    pub level: AnnotationLevel,
+    pub message: String,
+    /// Short heading where the provider gives one (a test name, an annotation title).
+    pub title: Option<String>,
+    /// Repository-relative file path, when the problem is anchored to one.
+    pub path: Option<String>,
+    pub line: Option<u32>,
+    /// The job that reported it, matching a [`PipelineJob::id`], when known.
+    pub job_id: Option<String>,
+}
+
+/// A file a run published (build output, report, installer).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PipelineArtifact {
+    pub id: String,
+    pub name: String,
+    pub size_bytes: Option<u64>,
+    pub expires_at: Option<DateTime<Utc>>,
+    /// Where a person opens or downloads it in a browser.
+    pub url: Option<String>,
 }
 
 /// A gate on a pipeline run that is waiting for a manual decision (a deployment
