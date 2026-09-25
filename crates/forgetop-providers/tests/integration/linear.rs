@@ -18,6 +18,13 @@ async fn linear_work_item_lifecycle() {
     let raw = LnRaw::from_env().expect("linear raw");
     let prefix = harness::run_prefix();
 
+    // Every run, not just the nightly sweep: leaked issues otherwise pile up until the
+    // workspace refuses to create any more.
+    let swept = raw.sweep_stale().await;
+    if swept > 0 {
+        eprintln!("linear: archived {swept} leaked fixture issue(s)");
+    }
+
     let me = raw.viewer_id().await;
     let team = raw.team_id().await;
     let id = raw.create_issue(&team, &format!("{prefix} issue"), &me).await;
