@@ -12,7 +12,7 @@ use ratatui::widgets::{
 use ratatui::Frame;
 
 use crate::app::{
-    dashboard_target, is_error_line, match_ranges, pipe_definition_name, App, ConfigView, DiffFocus, DiffView, LogView,
+    dashboard_target, is_error_line, match_ranges, pipe_definition_name, App, ConfigView, DiffFocus, DiffView, Hit, LogView,
     LpSlot, PipeGroup, PipeHead, PipeLine, PipeRow, PipelineView, PrView, Screen, WiView, LOG_SPLIT_MIN_WIDTH, LOG_TREE_WIDTH,
     PR_TABS, TABS,
 };
@@ -29,7 +29,42 @@ const FIRST_RUN_HINT: &str = "No connections yet — press n to add one, or C fo
 /// Shown while setup has been handed to the browser and no connection has landed yet.
 const AWAITING_SETUP_TITLE: &str = " Setting up in your browser ";
 
+thread_local! {
+    /// The frame's clickable regions, collected as it draws and handed to `App::hits` at the end.
+    static HITS: std::cell::RefCell<Vec<(Rect, Hit)>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Set while drawing something that only looks like a screen — the unfocused preview — so
+    /// its rows and tabs don't answer clicks meant for the list that has the keys.
+    static HITS_MUTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Records that `rect` (clipped to a non-empty area) shows `target` in this frame.
+fn hit(rect: Rect, target: Hit) {
+    if rect.width > 0 && rect.height > 0 && !HITS_MUTED.with(|m| m.get()) {
+        HITS.with(|h| h.borrow_mut().push((rect, target)));
+    }
+}
+
+/// Records one-row hits for the visible rows of a scrolled list: row `r` of `targets` is drawn
+/// at `body.y + r - offset`. `None` rows (headings, spacers) take no clicks.
+fn hit_rows(body: Rect, offset: usize, targets: impl IntoIterator<Item = Option<Hit>>) {
+    for (r, target) in targets.into_iter().enumerate().skip(offset) {
+        let dy = r - offset;
+        if dy >= body.height as usize {
+            break;
+        }
+        if let Some(t) = target {
+            hit(Rect { y: body.y + dy as u16, height: 1, ..body }, t);
+        }
+    }
+}
+
 pub fn render(frame: &mut Frame, app: &mut App) {
+    HITS.with(|h| h.borrow_mut().clear());
+    render_frame(frame, app);
+    app.hits = HITS.with(|h| std::mem::take(&mut *h.borrow_mut()));
+}
+
+fn render_frame(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     let theme = &app.theme;
 
@@ -156,6 +191,13 @@ fn render_tabs(frame: &mut Frame, area: Rect, app: &App) {
         .block(block);
 
     frame.render_widget(tabs, area);
+    // Tabs lays titles out from the inner left edge, each followed by the two-column divider.
+    let mut x = area.x + 1;
+    for (pos, title) in tab_titles(app).iter().enumerate() {
+        let w = (title.chars().count() as u16).min(area.right().saturating_sub(1).saturating_sub(x));
+        hit(Rect { x, y: area.y + 1, width: w, height: 1 }, Hit::Tab(pos));
+        x = x.saturating_add(w + 2);
+    }
 
     // How to move along the strip, just past its last tab — dim, and only where it can't run
     // into the right-hand chrome (Refreshing…, Notifications).
@@ -341,7 +383,9 @@ fn render_split(frame: &mut Frame, area: Rect, app: &mut App, focused: bool) {
     if focused {
         app.detail_scroll_max = render_item_view(frame, cols[1], &app.theme, &app.screen, app.anim);
     } else if let Some(p) = app.preview.as_ref() {
+        HITS_MUTED.with(|m| m.set(true));
         render_item_view(frame, cols[1], &app.theme, &p.view, app.anim);
+        HITS_MUTED.with(|m| m.set(false));
     }
     let (active, idle) = if focused { (cols[1], cols[0]) } else { (cols[0], cols[1]) };
     mark_focus(frame, active, &app.theme);
@@ -446,6 +490,8 @@ fn render_lp_column(frame: &mut Frame, area: Rect, app: &App, side: usize, title
         .border_style(Style::default().fg(border))
         .title(Span::styled(format!(" {title} "), Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)));
 
+    // Recorded before the empty case returns, so a click still moves focus to an empty column.
+    hit(area, Hit::LpColumn(side));
     let col = app.lp_column(side);
     let slots = app.lp_slots(side);
     if slots.is_empty() {
@@ -458,13 +504,15 @@ fn render_lp_column(frame: &mut Frame, area: Rect, app: &App, side: usize, title
     let entry_cells: Vec<Vec<Vec<Span>>> = slots
         .iter()
         .filter_map(|s| match s {
-            LpSlot::Entry(i) => Some(lp_cells(theme, &app.lp[*i], app.anim, side == 0)),
+            LpSlot::Entry(i) => Some(lp_cells(theme, &app.lp[*i], app.anim, side == 0, app.review_sla_hours)),
             LpSlot::More(_) => None,
         })
         .collect();
     let widths = lp_widths(&entry_cells, 3, content_w);
 
     let mut items: Vec<ListItem> = Vec::new();
+    // The slot each list item shows, for clicks; `None` for headings and spacers.
+    let mut item_slot: Vec<Option<usize>> = Vec::new();
     let mut visual_sel = 0usize;
     let mut last: Option<Bucket> = None;
     let mut cell_i = 0usize;
@@ -480,11 +528,13 @@ fn render_lp_column(frame: &mut Frame, area: Rect, app: &App, side: usize, title
                     let style = Style::default().fg(theme.dim).add_modifier(Modifier::BOLD);
                     if !items.is_empty() {
                         items.push(ListItem::new(Line::from("")));
+                        item_slot.push(None);
                     }
                     items.push(ListItem::new(Line::from(Span::styled(
                         format!("{}  {} ({count})", CIRCLED[rank.min(7)], e.bucket.title()),
                         style,
                     ))));
+                    item_slot.push(None);
                     last = Some(e.bucket);
                 }
                 if selected {
@@ -508,6 +558,7 @@ fn render_lp_column(frame: &mut Frame, area: Rect, app: &App, side: usize, title
                     lp_cells_line(cells, &widths, content_w)
                 };
                 items.push(ListItem::new(line));
+                item_slot.push(Some(pos));
             }
             LpSlot::More(_) => {
                 if selected {
@@ -515,6 +566,7 @@ fn render_lp_column(frame: &mut Frame, area: Rect, app: &App, side: usize, title
                 }
                 let style = Style::default().fg(theme.accent).add_modifier(Modifier::BOLD);
                 items.push(ListItem::new(Line::from(Span::styled("more…".to_string(), style))));
+                item_slot.push(Some(pos));
             }
         }
     }
@@ -526,6 +578,8 @@ fn render_lp_column(frame: &mut Frame, area: Rect, app: &App, side: usize, title
     let mut state = ListState::default();
     state.select(Some(visual_sel));
     frame.render_stateful_widget(list, area, &mut state);
+    let body = area.inner(ratatui::layout::Margin::new(1, 1));
+    hit_rows(body, state.offset(), item_slot.into_iter().map(|s| s.map(|pos| Hit::LpRow { side, pos })));
 }
 
 /// Number of Launchpad row columns (kept in sync with [`lp_cells`]).
@@ -582,11 +636,15 @@ fn pipe_status_label(status: PipelineRunStatus) -> &'static str {
 /// the branch for a run. The "person" is the PR author / who ran the pipeline / the work-item
 /// assignee; `show_person` is false in the right-hand column, where every row is yours anyway
 /// and the name would just repeat down the pane (the empty cell collapses to zero width).
-fn lp_cells(theme: &Theme, e: &crate::launchpad::Entry, anim: usize, show_person: bool) -> Vec<Vec<Span<'static>>> {
+///
+/// A review request's age is how long it has waited (`created_at`, not the last activity a bot
+/// push or a comment would reset), coloured against `sla_hours` so stale asks stand out.
+fn lp_cells(theme: &Theme, e: &crate::launchpad::Entry, anim: usize, show_person: bool, sla_hours: u32) -> Vec<Vec<Span<'static>>> {
     use crate::launchpad::EntryItem;
     let dim = Style::default().fg(theme.dim);
     let fg = Style::default().fg(theme.fg);
-    // Kept calm: type badge, where, person and age are all grey; only the status, the blocker
+    // Kept calm: type badge, where, person and age are all grey (bar a late review request);
+    // only the status, the blocker
     // and the git-diff +/- carry colour.
     let cell = |s: String, st: Style| vec![Span::styled(s, st)];
     let person = |u: Option<&forgetop_core::domain::User>| {
@@ -628,6 +686,12 @@ fn lp_cells(theme: &Theme, e: &crate::launchpad::Entry, anim: usize, show_person
                     s
                 }
             };
+            let age_cell = if e.bucket == crate::launchpad::Bucket::NeedsReview {
+                let waited = pr.created_at.or(pr.updated_at);
+                cell(rel_age(waited), Style::default().fg(sla_color(theme, waited, sla_hours, Utc::now())))
+            } else {
+                age(pr.updated_at)
+            };
             vec![
                 cell("PR".into(), dim),
                 cell(st.to_string(), Style::default().fg(stc)),
@@ -635,7 +699,7 @@ fn lp_cells(theme: &Theme, e: &crate::launchpad::Entry, anim: usize, show_person
                 cell(pr.title.clone(), fg),
                 signal,
                 person(Some(&pr.author)),
-                age(pr.updated_at),
+                age_cell,
             ]
         }
         EntryItem::Pipe { run, definition_name } => {
@@ -666,6 +730,21 @@ fn lp_cells(theme: &Theme, e: &crate::launchpad::Entry, anim: usize, show_person
             person(wi.assignee.as_ref()),
             age(wi.updated_at),
         ],
+    }
+}
+
+/// The colour of a review request's age: grey inside `sla_hours`, yellow past it, red past three
+/// times it. An unknown timestamp stays grey — there is nothing to be late against.
+fn sla_color(theme: &Theme, since: Option<DateTime<Utc>>, sla_hours: u32, now: DateTime<Utc>) -> ratatui::style::Color {
+    let Some(since) = since else { return theme.dim };
+    let waited = (now - since).num_minutes().max(0);
+    let sla = i64::from(sla_hours.max(1)) * 60;
+    if waited >= sla * 3 {
+        theme.red
+    } else if waited >= sla {
+        theme.yellow
+    } else {
+        theme.dim
     }
 }
 
@@ -827,7 +906,12 @@ fn render_inline_list(frame: &mut Frame, area: Rect, app: &mut App, title: &str,
             row
         })
         .collect();
+    let count = lines.len();
     frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), parts[1]);
+    // While the preview has the keys the list only shows where you are; it takes no clicks.
+    if !app.preview_focus {
+        hit_rows(parts[1], scroll as usize, (0..count).map(|i| Some(Hit::ListRow(i))));
+    }
 }
 
 /// Left indent inside the section, and the gap between columns — for breathing room.
@@ -1899,7 +1983,15 @@ fn render_pr_view(frame: &mut Frame, area: Rect, theme: &Theme, view: &PrView) -
     frame.render_widget(Paragraph::new(pr_state_line(theme, &view.pr)), rows[1]);
 
     // Sub-tab bar.
-    frame.render_widget(Paragraph::new(pr_tabs_line(theme, view)), rows[2]);
+    let tabs = pr_tabs_line(theme, view);
+    // Spans alternate: a leading space, then each tab label followed by a one-column gap.
+    let mut x = rows[2].x + 1;
+    for (i, label) in tabs.spans.iter().skip(1).step_by(2).take(PR_TABS.len()).enumerate() {
+        let w = label.content.chars().count() as u16;
+        hit(Rect { x, y: rows[2].y, width: w, height: 1 }.intersection(rows[2]), Hit::PrTab(i));
+        x = x.saturating_add(w + 1);
+    }
+    frame.render_widget(Paragraph::new(tabs), rows[2]);
 
     // Content.
     if view.tab == 3 {
@@ -1913,6 +2005,8 @@ fn render_pr_view(frame: &mut Frame, area: Rect, theme: &Theme, view: &PrView) -
         let total = view.commits.len();
         let scroll = view.commit_sel.saturating_sub(inner_h / 2).min(total.saturating_sub(inner_h.max(1))) as u16;
         frame.render_widget(Paragraph::new(lines).block(section_block(theme, "Commits")).scroll((scroll, 0)), rows[3]);
+        let body = rows[3].inner(ratatui::layout::Margin::new(1, 1));
+        hit_rows(body, scroll as usize, (0..total).map(|i| Some(Hit::CommitRow(i))));
         return 0;
     }
     let (title, lines) = match view.tab {
@@ -2208,6 +2302,8 @@ fn render_inbox(frame: &mut Frame, area: Rect, app: &App) {
     let mut state = TableState::default();
     state.select(Some(app.inbox_sel.min(app.inbox.len().saturating_sub(1))));
     frame.render_stateful_widget(table, area, &mut state);
+    let body = area.inner(ratatui::layout::Margin::new(1, 1));
+    hit_rows(body, state.offset(), (0..app.inbox.len()).map(|i| Some(Hit::InboxRow(i))));
 }
 
 fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
@@ -2336,11 +2432,14 @@ fn render_diff_files(frame: &mut Frame, area: Rect, theme: &Theme, diff: &DiffVi
     // directory header whenever the directory changes; track the selected file's row so
     // the (file-indexed) selection lands on the right display row past the headers.
     let mut rows: Vec<Row> = Vec::new();
+    // The file each table row shows, for clicks; `None` for directory headings.
+    let mut row_file: Vec<Option<usize>> = Vec::new();
     let mut sel_row = 0usize;
     let mut last_dir: Option<&str> = None;
     for (i, f) in diff.files.iter().enumerate() {
         let dir = dir_of(&f.path);
         if last_dir != Some(dir) {
+            row_file.push(None);
             let label = if dir.is_empty() { "(root)".into() } else { format!("{dir}/") };
             rows.push(Row::new(vec![
                 Cell::from(""),
@@ -2355,6 +2454,7 @@ fn render_diff_files(frame: &mut Frame, area: Rect, theme: &Theme, diff: &DiffVi
         }
         let viewed = diff.is_viewed(&f.path);
         let name_style = if viewed { Style::default().fg(theme.dim) } else { Style::default().fg(theme.fg) };
+        row_file.push(Some(i));
         rows.push(Row::new(vec![
             Cell::from(Span::styled(if viewed { "[x]" } else { "[ ]" }, Style::default().fg(theme.dim))),
             Cell::from(kind_badge(theme, f.kind)),
@@ -2372,6 +2472,8 @@ fn render_diff_files(frame: &mut Frame, area: Rect, theme: &Theme, diff: &DiffVi
     let mut state = TableState::default();
     state.select(Some(sel_row));
     frame.render_stateful_widget(table, area, &mut state);
+    let body = area.inner(ratatui::layout::Margin::new(1, 1));
+    hit_rows(body, state.offset(), row_file.into_iter().map(|f| f.map(Hit::DiffFile)));
 }
 
 fn render_diff_patch(frame: &mut Frame, area: Rect, theme: &Theme, diff: &DiffView, pending: &[LineComment]) {
@@ -2427,8 +2529,13 @@ fn render_diff_patch(frame: &mut Frame, area: Rect, theme: &Theme, diff: &DiffVi
     // Build the display lines, splicing each thread in beneath the line it anchors to.
     // `cursor_row` tracks where the cursor's patch line landed (comment lines shift it).
     let mut lines: Vec<Line> = Vec::new();
+    // The patch line each display row shows, for clicks; `None` for inline comment boxes.
+    let mut row_line: Vec<Option<usize>> = Vec::new();
     let mut cursor_row = 0usize;
     for (i, l) in patch.lines().enumerate() {
+        // Every row pushed before the patch line's own is a comment box from the previous line.
+        row_line.resize(lines.len(), None);
+        row_line.push(Some(i));
         let gutter = if marks.contains(&i) {
             Span::styled("▎", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD))
         } else {
@@ -2474,7 +2581,11 @@ fn render_diff_patch(frame: &mut Frame, area: Rect, theme: &Theme, diff: &DiffVi
         diff.scroll
     };
 
+    row_line.resize(lines.len(), None);
     frame.render_widget(Paragraph::new(lines).block(block).scroll((scroll, 0)), area);
+    hit(area, Hit::DiffPatch);
+    let body = area.inner(ratatui::layout::Margin::new(1, 1));
+    hit_rows(body, scroll as usize, row_line.into_iter().map(|l| l.map(Hit::DiffLine)));
 }
 
 /// Wrap `s` to `width` display columns on word boundaries.
@@ -2762,6 +2873,8 @@ fn render_pipeline_tree(frame: &mut Frame, tree_area: Rect, theme: &Theme, view:
     let mut state = ListState::default();
     state.select(Some(view.selected.min(nodes.len().saturating_sub(1))));
     frame.render_stateful_widget(list, tree_area, &mut state);
+    let body = tree_area.inner(ratatui::layout::Margin::new(1, 1));
+    hit_rows(body, state.offset(), (0..nodes.len()).map(|i| Some(Hit::PipeNode(i))));
 }
 
 /// The live state appended to the log pane's title.
@@ -2831,6 +2944,7 @@ fn log_line<'a>(theme: &Theme, text: &str, query: Option<&str>, current: bool) -
 /// The scrollable log pane. Only the visible window is built, so a 10k-line log costs no more
 /// per frame than a short one.
 fn render_log_pane(frame: &mut Frame, area: Rect, theme: &Theme, log: &LogView) {
+    hit(area, Hit::LogPane);
     let title = log_title(log);
     let block = section_block(theme, &title);
     let inner = block.inner(area);
@@ -3223,6 +3337,8 @@ pub(crate) fn help_sections() -> Vec<(&'static str, Vec<(&'static str, &'static 
                 ("B", "Open the web dashboard in your browser"),
                 ("F", "Give feedback through the GitHub issue form"),
                 ("↵  p", "Focus the preview pane (140+ cols); its keys then work, p returns"),
+                ("Click", "Select a tab or row; click it again to open (a diff line: comment)"),
+                ("Wheel", "Scroll the pane under the pointer · Shift-drag selects text"),
                 ("P", "Preview pane off / on for this section"),
                 ("/", "Quick-filter the list"),
                 ("S", "Sort by column (re-pick flips direction)"),
@@ -3476,6 +3592,55 @@ mod tests {
     /// A Launchpad entry in `bucket`, from a stub GitHub connection.
     fn lp_entry(bucket: crate::launchpad::Bucket, item: crate::launchpad::EntryItem) -> crate::launchpad::Entry {
         crate::launchpad::Entry { bucket, connection_id: "c".into(), connection: "GH".into(), provider: ProviderType::GitHub, item }
+    }
+
+    #[test]
+    fn command_center_row_hits_skip_the_bucket_headings() {
+        use crate::launchpad::{Bucket, EntryItem};
+        let mut app = App::new("slate");
+        app.screen = Screen::Launchpad;
+        let titled = |t: &str| {
+            let mut pr = sample_pr();
+            pr.title = t.into();
+            pr
+        };
+        app.lp = vec![
+            lp_entry(Bucket::NeedsReview, EntryItem::Pr(titled("Review me first"))),
+            lp_entry(Bucket::NeedsFixing, EntryItem::Pr(titled("Then fix me"))),
+        ];
+        let width = 200;
+        let out = render_to_string(&mut app, width, 24);
+        let rows: Vec<String> = out.chars().collect::<Vec<_>>().chunks(width as usize).map(|c| c.iter().collect()).collect();
+        let row_of = |pos| app.hits.iter().find(|(_, h)| *h == Hit::LpRow { side: 0, pos }).expect("row hit").0.y as usize;
+        assert!(rows[row_of(0)].contains("Review me first"));
+        assert!(rows[row_of(1)].contains("Then fix me"), "the second bucket's heading and spacer take no slot");
+    }
+
+    #[test]
+    fn sla_color_bands_grey_yellow_red() {
+        let theme = Theme::by_name("slate");
+        let now = Utc::now();
+        let ago = |h: i64| Some(now - chrono::Duration::hours(h));
+        assert_eq!(sla_color(&theme, ago(23), 24, now), theme.dim, "inside the SLA stays grey");
+        assert_eq!(sla_color(&theme, ago(24), 24, now), theme.yellow, "at the SLA turns yellow");
+        assert_eq!(sla_color(&theme, ago(71), 24, now), theme.yellow);
+        assert_eq!(sla_color(&theme, ago(72), 24, now), theme.red, "at three times it turns red");
+        assert_eq!(sla_color(&theme, None, 24, now), theme.dim, "no timestamp, nothing to be late against");
+        assert_eq!(sla_color(&theme, ago(3), 0, now), theme.red, "a zero SLA is clamped to an hour, not a divide-by-zero");
+    }
+
+    #[test]
+    fn review_request_age_is_time_waited_and_coloured() {
+        use crate::launchpad::{Bucket, EntryItem};
+        let theme = Theme::by_name("slate");
+        let mut pr = sample_pr();
+        pr.created_at = Some(Utc::now() - chrono::Duration::hours(30));
+        pr.updated_at = Some(Utc::now() - chrono::Duration::minutes(5));
+        let age = |bucket| lp_cells(&theme, &lp_entry(bucket, EntryItem::Pr(pr.clone())), 0, true, 24)[6][0].clone();
+        let review = age(Bucket::NeedsReview);
+        assert_eq!((review.content.as_ref(), review.style.fg), ("1d", Some(theme.yellow)), "waited since opened, past the SLA");
+        let mine = age(Bucket::YourOpenPrs);
+        assert_eq!((mine.content.as_ref(), mine.style.fg), ("5m", Some(theme.dim)), "other buckets keep last-activity grey");
     }
 
     fn reviewer(name: &str, vote: ReviewVote) -> Reviewer {

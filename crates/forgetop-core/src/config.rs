@@ -109,7 +109,18 @@ pub struct UiState {
     pub work_item_views: Vec<SavedView>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pipeline_views: Vec<SavedView>,
+    /// Hours a review request may wait before its age turns yellow in the Command Center's
+    /// "Needs your review" (red at three times this). `None` = [`DEFAULT_REVIEW_SLA_HOURS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_sla_hours: Option<u32>,
+    /// Whether the terminal UI captures the mouse (click tabs and rows, wheel scroll).
+    /// `None` = on. Capturing means native text selection needs Shift (Option in iTerm).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mouse: Option<bool>,
 }
+
+/// Default for [`UiState::review_sla_hours`].
+pub const DEFAULT_REVIEW_SLA_HOURS: u32 = 24;
 
 /// A named, saved bundle of a section's filter + sort + visible state.
 #[derive(Debug, Clone, Serialize, Deserialize)]

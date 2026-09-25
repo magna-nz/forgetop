@@ -147,6 +147,13 @@ fn pr(
     }
 }
 
+/// Sets when a demo PR was opened, so the review requests span the Command Center's age colours
+/// (grey inside the 24h review SLA, yellow past it, red past three times it).
+fn opened(mut pr: PullRequest, hours_ago: i64) -> PullRequest {
+    pr.created_at = Some(base() - chrono::Duration::hours(hours_ago));
+    pr
+}
+
 /// Compact work-item builder. `mine` assigns it to you; otherwise unassigned.
 fn wi(id: &str, title: &str, state: &str, cat: WorkItemStateCategory, ty: &str, mine: bool, updated_h: i64) -> WorkItem {
     let now = base();
@@ -179,7 +186,7 @@ fn github_prs() -> Vec<PullRequest> {
         // Needs fixing: yours, CI red.
         pr(1492, "Bump Next.js to 14.2.5", me(), PS::Open, CS::Failed, MS::Blocked, vec![rev(bob(), RV::NoVote)], 40, 12, 5, "chore/next-14-2-5", &["frontend", "dependencies"]),
         // Needs your review: a teammate's PR, you're a reviewer.
-        pr(1501, "Refactor the webhook retry queue", bob(), PS::Open, CS::Passed, MS::Mergeable, vec![rev(alice(), RV::Approved), rev(carol(), RV::Rejected), rev(me(), RV::NoVote)], 210, 64, 4, "refactor/webhook-retry", &["reliability"]),
+        opened(pr(1501, "Refactor the webhook retry queue", bob(), PS::Open, CS::Passed, MS::Mergeable, vec![rev(alice(), RV::Approved), rev(carol(), RV::Rejected), rev(me(), RV::NoVote)], 210, 64, 4, "refactor/webhook-retry", &["reliability"]), 18),
         pr(1495, "Tighten CORS on the admin API", carol(), PS::Open, CS::Passed, MS::Mergeable, vec![rev(me(), RV::NoVote)], 18, 6, 9, "security/admin-cors", &["security"]),
         // Draft (yours).
         pr(1476, "Checkout redesign", me(), PS::Draft, CS::Pending, MS::Blocked, vec![], 88, 20, 26, "feat/checkout-redesign", &["frontend", "wip"]),
@@ -205,7 +212,7 @@ fn gitlab_prs() -> Vec<PullRequest> {
         // Yours, open, waiting on review (no action → your open PRs).
         pr(312, "Terraform: add a Postgres read replica", me(), PS::Open, CS::Passed, MS::Mergeable, vec![rev(alice(), RV::NoVote)], 96, 4, 6, "infra/read-replica", &["terraform"]),
         // A teammate's, you're the reviewer → needs your review.
-        pr(318, "Rotate the KMS signing keys", alice(), PS::Open, CS::Passed, MS::Mergeable, vec![rev(me(), RV::NoVote)], 22, 8, 10, "security/kms-rotation", &["security"]),
+        opened(pr(318, "Rotate the KMS signing keys", alice(), PS::Open, CS::Passed, MS::Mergeable, vec![rev(me(), RV::NoVote)], 22, 8, 10, "security/kms-rotation", &["security"]), 30),
         // Yours, merged recently.
         pr(305, "Bump the base image to alpine 3.20", me(), PS::Merged, CS::Passed, MS::Unknown, vec![rev(bob(), RV::Approved)], 6, 6, 40, "chore/alpine-3-20", &["docker"]),
     ]
@@ -222,7 +229,7 @@ fn bitbucket_prs() -> Vec<PullRequest> {
         // Yours, changes requested → needs fixing.
         pr(64, "dbt: add revenue recognition model", me(), PS::Open, CS::Passed, MS::Blocked, vec![rev(dev(), RV::Rejected)], 180, 12, 7, "feat/rev-rec", &["dbt"]),
         // A teammate's, you're the reviewer → needs your review.
-        pr(61, "Fix the nightly ingestion retry", dev(), PS::Open, CS::Passed, MS::Mergeable, vec![rev(me(), RV::NoVote)], 34, 10, 12, "fix/ingestion-retry", &["airflow"]),
+        opened(pr(61, "Fix the nightly ingestion retry", dev(), PS::Open, CS::Passed, MS::Mergeable, vec![rev(me(), RV::NoVote)], 34, 10, 12, "fix/ingestion-retry", &["airflow"]), 26),
     ]
 }
 
