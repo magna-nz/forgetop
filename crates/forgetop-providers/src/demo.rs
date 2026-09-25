@@ -62,7 +62,7 @@ fn rev(u: User, vote: ReviewVote) -> Reviewer {
 /// like a real review. Unknown numbers fall back to a short synthesized note.
 fn pr_description(n: i64, title: &str, branch: &str) -> String {
     let bespoke = match n {
-        1487 => "Adds client-supplied `Idempotency-Key` support to `POST /charge` and `POST /refund` so a retried request can't double-charge.\n\n- Keys are stored in Redis with a 24h TTL; a replay returns the original response.\n- A conflicting body on the same key returns 422.\n\nCloses PAY-1187.",
+        1487 => "## Summary\nAdds client-supplied `Idempotency-Key` support to `POST /charge` and `POST /refund` so a retried request can't **double-charge**.\n\n- Keys are stored in Redis with a 24h TTL; a replay returns the original response.\n- A conflicting body on the same key returns `422`.\n\n## Test plan\n- [x] Unit tests for replay and conflicting bodies\n- [x] Load test against staging\n- [ ] Confirm the Redis TTL in production\n\nCloses PAY-1187.",
         1492 => "Routine bump to pull in the security fixes in the Next.js 14.2.x line.\n\n- Regenerated the lockfile; no app code changes.\n- CI is red on the visual-regression suite — checking whether it's a real diff or just stale snapshots.",
         1501 => "Reworks webhook delivery to use a jittered exponential backoff instead of a fixed 30s interval, and moves retries onto a dedicated queue so one slow endpoint can't starve first-delivery.\n\n- New `RetryPolicy` with a capped backoff.\n- Dead-letters after 12 attempts.\n\nReview focus: the backoff maths and the dead-letter cutoff.",
         1495 => "Restricts the admin API CORS allow-list to the internal dashboard origins (it was effectively `*`).\n\n- Explicit origin allow-list read from config.\n- Credentialed cross-origin requests are rejected otherwise.\n\nCloses SEC-73.",
@@ -85,7 +85,7 @@ fn pr_description(n: i64, title: &str, branch: &str) -> String {
 /// A believable body for each demo work item (keyed by identifier).
 fn wi_description(id: &str, title: &str) -> String {
     let bespoke = match id {
-        "#842" => "p99 on `POST /charge` has crept from ~180ms to ~600ms over the last week.\n\n- Prime suspect is the new risk-score lookup on the hot path.\n- Next: trace a slow request end-to-end and confirm whether the cache is actually being hit.",
+        "#842" => "p99 on `POST /charge` has crept from ~180ms to **~600ms** over the last week.\n\n### Findings\n- Prime suspect is the new risk-score lookup on the hot path.\n- Cache hit rate dropped to *41%* after the last deploy.\n\n### Next steps\n1. Trace a slow request end-to-end.\n2. Confirm whether the cache is actually being hit.",
         "#851" => "We have no visibility into how much of its retry budget the sync worker burns before giving up.\n\n- Emit `retries_used` / `retry_budget` counters.\n- Add a panel and alert when a worker consistently exhausts its budget.",
         "#860" => "`webhook_delivery_spec` fails roughly 1 in 10 CI runs, almost always on the ordering assertion.\n\n- Looks like a timing assumption on async delivery.\n- Fix the ordering expectation or quarantine the test until it's stable.",
         "#77" => "Staging is running prod-sized node pools and costing more than it should.\n\n- Move to smaller instances and enable scale-to-zero overnight.\n- Confirm nothing relies on the current headroom first.",

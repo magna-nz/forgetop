@@ -693,7 +693,7 @@ checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
 
 [[package]]
 name = "forgetop"
-version = "1.3.0"
+version = "1.3.1"
 dependencies = [
  "forgetop-core",
  "forgetop-providers",
@@ -705,7 +705,7 @@ dependencies = [
 
 [[package]]
 name = "forgetop-core"
-version = "1.3.0"
+version = "1.3.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -723,7 +723,7 @@ dependencies = [
 
 [[package]]
 name = "forgetop-providers"
-version = "1.3.0"
+version = "1.3.1"
 dependencies = [
  "async-trait",
  "base64",
@@ -741,7 +741,7 @@ dependencies = [
 
 [[package]]
 name = "forgetop-server"
-version = "1.3.0"
+version = "1.3.1"
 dependencies = [
  "axum",
  "forgetop-core",
@@ -758,7 +758,7 @@ dependencies = [
 
 [[package]]
 name = "forgetop-tui"
-version = "1.3.0"
+version = "1.3.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -767,6 +767,7 @@ dependencies = [
  "fuzzy-matcher",
  "notify-rust",
  "open",
+ "pulldown-cmark",
  "ratatui",
  "serde",
  "serde_json",
@@ -1639,6 +1640,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "pulldown-cmark"
+version = "0.13.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9f068eba8e7071c5f9511831b44f32c740d5adf574e990f946ddb53db2f314e"
+dependencies = [
+ "bitflags",
+ "memchr",
+ "unicase",
 ]
 
 [[package]]

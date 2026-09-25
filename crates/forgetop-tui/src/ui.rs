@@ -1926,9 +1926,7 @@ fn pr_conversation_lines(theme: &Theme, pr: &PullRequest, threads: &[CommentThre
     if let Some(desc) = pr.description.as_ref().filter(|d| !d.trim().is_empty()) {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled("Description", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD))));
-        for l in desc.lines() {
-            lines.push(Line::from(Span::styled(l.to_string(), Style::default().fg(theme.fg))));
-        }
+        lines.extend(crate::markdown::render(desc, theme, theme.fg));
     }
     lines.extend(comment_lines(theme, threads));
     lines.extend(activity_lines(theme, timeline));
@@ -2081,9 +2079,7 @@ fn render_wi_view(frame: &mut Frame, area: Rect, theme: &Theme, view: &WiView) -
     }
     if let Some(desc) = wi.description.as_ref().filter(|d| !d.is_empty()) {
         lines.push(Line::from(""));
-        for l in desc.lines() {
-            lines.push(Line::from(Span::styled(l.to_string(), Style::default().fg(theme.dim))));
-        }
+        lines.extend(crate::markdown::render(desc, theme, theme.dim));
     }
     lines.extend(comment_lines(theme, &view.threads));
     lines.extend(activity_lines(theme, &view.timeline));
@@ -5062,6 +5058,22 @@ mod tests {
     }
 
     #[test]
+    fn pr_description_markdown_is_rendered() {
+        use crate::app::Screen;
+        let mut app = App::new("slate");
+        let mut view = pr_view(0, vec![], vec![]);
+        view.pr.description = Some("## Summary\nAdds **retries**.\n\n- [x] `cargo test`\n- [ ] live check".into());
+        app.screen = Screen::PrView(Box::new(view));
+        let out = render_to_string(&mut app, 120, 30);
+        for shown in ["Summary", "Adds retries.", "☑ cargo test", "☐ live check"] {
+            assert!(out.contains(shown), "{shown:?} renders");
+        }
+        for markup in ["## ", "**", "`", "- [x]"] {
+            assert!(!out.contains(markup), "{markup:?} is rendered, not shown");
+        }
+    }
+
+    #[test]
     fn checks_tab_lists_named_checks_with_status() {
         use crate::app::Screen;
         let checks = vec![
@@ -6445,8 +6457,8 @@ mod tests {
         // Each line of the description lands on its own row, rather than running together.
         assert!(view.contains("The refresh token is dropped after 60 minutes."), "first line renders");
         assert!(view.contains("Repro steps"), "heading renders on its own line");
-        assert!(view.contains("- Sign in"), "list item renders");
-        assert!(view.contains("- Wait > 1 hour"), "a decoded `&gt;` renders as the character");
+        assert!(view.contains("• Sign in"), "list item renders as a bullet");
+        assert!(view.contains("• Wait > 1 hour"), "a decoded `&gt;` renders as the character");
     }
 
     #[test]
