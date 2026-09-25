@@ -239,7 +239,9 @@ async fn github_pipeline_approval_gate_lifecycle() {
     let (uid, _login) = raw.me().await;
     let default = raw.default_branch().await;
     let env_name = prefix.to_string();
-    let wf_file = format!("{prefix}.yml");
+    // Distinct from the cancel test's file: both look runs up by workflow file, and this run can
+    // still be finishing when that test starts — sharing a name made it cancel this one.
+    let wf_file = format!("{prefix}-gate.yml");
     let wf_path = format!(".github/workflows/{wf_file}");
     raw.put_environment(&env_name, uid).await;
     let yaml = format!(
@@ -300,7 +302,7 @@ async fn github_pipeline_cancel_lifecycle() {
 
     // Fixture: a dispatched workflow with a long-running job, leaving time to cancel it.
     let default = raw.default_branch().await;
-    let wf_file = format!("{prefix}.yml");
+    let wf_file = format!("{prefix}-cancel.yml");
     let wf_path = format!(".github/workflows/{wf_file}");
     let yaml = format!(
         "name: {prefix}\non:\n  workflow_dispatch:\njobs:\n  long-running:\n    runs-on: ubuntu-latest\n    steps:\n      - run: sleep 120\n"
