@@ -11,10 +11,15 @@ use ratatui::widgets::{
 };
 use ratatui::Frame;
 
+use std::cmp::Reverse;
+use std::collections::HashMap;
+
+use forgetop_core::runlog;
+
 use crate::app::{
-    dashboard_target, is_error_line, match_ranges, pipe_definition_name, App, ConfigView, DiffFocus, DiffView, Hit, LogView,
-    LpSlot, PipeGroup, PipeHead, PipeLine, PipeRow, PipelineView, PrView, Screen, WiView, LOG_SPLIT_MIN_WIDTH, LOG_TREE_WIDTH,
-    PR_TABS, TABS,
+    dashboard_target, is_active, is_error_line, match_ranges, pipe_definition_name, run_secs, App, ArtifactsPanel, ConfigView,
+    DiffFocus, DiffView, FlatNode, Hit, LogRow, LogView, LpSlot, PipeGroup, PipeHead, PipeLine, PipeRow, PipelineView, PrView,
+    RunHistory, Screen, WiView, LOG_SPLIT_MIN_WIDTH, LOG_TREE_WIDTH, PR_TABS, TABS,
 };
 use crate::diff::{cursor_line_label, pending_marks};
 use crate::highlight::{lang_for, HlKind, LineHighlighter};
@@ -2175,31 +2180,64 @@ fn base_footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
         return vec![("↵", "open item"), ("o", "browser"), ("x", "mark read"), ("A", "all read"), ("Esc", "back")];
     }
     if let Screen::Pipeline(v) = &app.screen {
+        if v.artifacts.is_some() {
+            return vec![("↑↓", "choose"), ("↵", "open"), ("y", "copy link"), ("Esc", "close")];
+        }
+        let on_step = v.selected_node().is_some_and(|n| n.step.is_some() && !n.group);
+        let enter = if on_step { "step log" } else { "expand" };
         if let Some(log) = &v.logs {
             if log.search_input.is_some() {
                 return vec![("type", "search"), ("↵", "find"), ("Esc", "cancel")];
             }
             if v.logs_have_keys() {
-                let mut keys = vec![("↑↓", "scroll"), ("g/G", "top/end"), ("f", "follow"), ("E", "first error"), ("/", "search")];
+                let mut keys = vec![("↑↓", "scroll")];
+                if log.sectioned() {
+                    keys.push(("z/Z", "fold"));
+                }
+                keys.extend([("E", "first error"), ("/", "search")]);
                 if log.query.is_some() {
                     keys.push(("n/N", "next/prev"));
                 }
+                keys.extend([("g/G", "top/end"), ("f", "follow")]);
                 if v.log_split.get() {
                     keys.push(("w", "tree"));
                 }
                 keys.push(("Esc", "close logs"));
                 return keys;
             }
-            return vec![("↵", "expand"), ("w", "logs"), ("Esc/L", "close logs"), ("q", "back")];
+            return vec![("↵", enter), ("w", "logs"), ("Esc/L", "close logs"), ("q", "back")];
         }
-        let mut keys = vec![("↵", "expand"), ("L", "logs")];
+        let finished = !is_active(v.run.status);
+        let mut keys = if v.problem_focus {
+            vec![("↑↓", "problem"), ("↵", "jump to line"), ("e", "tree")]
+        } else {
+            vec![("↵", enter), ("L", "job log")]
+        };
+        if v.history.as_ref().is_some_and(|h| h.entries.len() > 1) {
+            keys.push(("←→", "older/newer run"));
+        }
         if v.can_respond_approvals && !v.actionable_approvals().is_empty() {
             keys.push(("A", "approve"));
         }
-        if matches!(v.run.status, PipelineRunStatus::Queued | PipelineRunStatus::Running) {
+        if finished && v.supports_rerun {
+            keys.push(("R", "rerun"));
+        }
+        if finished && v.supports_rerun_failed && v.run.status != PipelineRunStatus::Succeeded {
+            keys.push(("F", "rerun failed"));
+        }
+        if !finished {
             keys.push(("X", "cancel"));
         }
-        keys.extend([("T", "trigger"), ("o", "open job"), ("Esc/q", "back")]);
+        if v.supports_artifacts {
+            keys.push(("a", "artifacts"));
+        }
+        if !v.problem_focus && !v.annotations.is_empty() {
+            keys.push(("e", "problems"));
+        }
+        if v.run.commit_sha.as_deref().is_some_and(|s| !s.is_empty()) {
+            keys.push(("c", "copy sha"));
+        }
+        keys.extend([("T", "trigger"), ("o", "open"), ("Esc/q", "back")]);
         return keys;
     }
     if matches!(app.screen, Screen::Config(_)) {
@@ -2378,7 +2416,7 @@ fn is_write_action(label: &str) -> bool {
     matches!(
         label,
         "approve" | "reject" | "merge" | "revert" | "comment" | "reply" | "submit review" | "update state" | "assign" | "edit"
-            | "trigger" | "cancel"
+            | "trigger" | "cancel" | "rerun" | "rerun failed"
     )
 }
 
@@ -2774,39 +2812,174 @@ fn render_config(frame: &mut Frame, area: Rect, theme: &Theme, view: &ConfigView
 
 // ---- pipeline drill-in ----
 
+/// Below this many inner columns the run tree drops its timeline bars and reads as a plain tree.
+pub const TIMELINE_MIN_WIDTH: usize = 70;
+/// Most rows the Problems panel shows; more scroll within it.
+const PROBLEM_ROWS: usize = 3;
+
+/// Elapsed seconds as `45s`, `3m12s`, `1h02m` — the drill-in's one duration format.
+fn fmt_secs(secs: i64) -> String {
+    let secs = secs.max(0);
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
+/// A time-axis tick: `0s`, `30s`, `1m`, `1m30`, `2h`.
+fn axis_label(secs: i64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        let (m, r) = (secs / 60, secs % 60);
+        if r == 0 { format!("{m}m") } else { format!("{m}m{r:02}") }
+    } else {
+        let (h, m) = (secs / 3600, (secs % 3600) / 60);
+        if m == 0 { format!("{h}h") } else { format!("{h}h{m:02}") }
+    }
+}
+
+/// `1142` → `1,142`.
+fn thousands(n: usize) -> String {
+    let s = n.to_string();
+    let mut out = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// `bytes` as `18 KB`, `7.9 MB`.
+fn human_size(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    let b = bytes as f64;
+    if b < KB {
+        format!("{bytes} B")
+    } else if b < KB * KB {
+        format!("{:.0} KB", b / KB)
+    } else if b < KB * KB * KB {
+        format!("{:.1} MB", b / (KB * KB))
+    } else {
+        format!("{:.1} GB", b / (KB * KB * KB))
+    }
+}
+
+/// Fits `s` into exactly `w` columns, padding it, or eliding its *middle*: the end of a name is
+/// usually what tells it apart (`build (aarch64-apple-darwin)` from `build (x86_64-…)`). A
+/// parenthesised suffix is kept whole when there's room for it.
+fn fit(s: &str, w: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let n = chars.len();
+    if n <= w {
+        return format!("{s}{}", " ".repeat(w - n));
+    }
+    if w == 0 {
+        return String::new();
+    }
+    if w == 1 {
+        return "…".into();
+    }
+    let take = |range: std::ops::Range<usize>| chars[range].iter().collect::<String>();
+    // A matrix leg: `name (variant)` keeps `(variant)` and shortens the name.
+    if s.ends_with(')') {
+        if let Some(open) = s.rfind('(') {
+            let suffix: Vec<char> = s[open..].chars().collect();
+            let head_n = chars.len() - suffix.len();
+            if suffix.len() + 4 <= w {
+                let head = w - 1 - suffix.len();
+                return format!("{}…{}", take(0..head.min(head_n)).trim_end(), suffix.iter().collect::<String>())
+                    .chars()
+                    .chain(std::iter::repeat(' '))
+                    .take(w)
+                    .collect();
+            }
+            return format!("…{}", take(n - (w - 1)..n));
+        }
+    }
+    let tail = (w - 1) / 2;
+    let head = w - 1 - tail;
+    format!("{}…{}", take(0..head), take(n - tail..n))
+}
+
+/// "finished 12m ago", "started just now".
+fn ago(verb: &str, ts: Option<DateTime<Utc>>) -> Option<String> {
+    ts?;
+    Some(match rel_age(ts).as_str() {
+        "now" => format!("{verb} just now"),
+        age => format!("{verb} {age} ago"),
+    })
+}
+
+/// Runs of equal-styled cells as spans.
+fn cells_to_spans(cells: Vec<(char, Style)>) -> Vec<Span<'static>> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut run = String::new();
+    let mut style = None;
+    for (c, s) in cells {
+        if style != Some(s) && !run.is_empty() {
+            spans.push(Span::styled(std::mem::take(&mut run), style.unwrap_or_default()));
+        }
+        style = Some(s);
+        run.push(c);
+    }
+    if !run.is_empty() {
+        spans.push(Span::styled(run, style.unwrap_or_default()));
+    }
+    spans
+}
+
 fn render_pipeline(frame: &mut Frame, area: Rect, theme: &Theme, view: &PipelineView, anim: usize) {
+    let now = Utc::now();
+    let header = pipeline_header(theme, view, anim, now);
+    let failure = failure_line(theme, view);
     // Reserve a banner row for approvals / unsupported note when there's one to show.
     let banner = approval_banner(theme, view);
-    let mut constraints = vec![Constraint::Length(3)];
+    // The log pane needs the height: history and problems step aside while it is open.
+    let logs_open = view.logs.is_some();
+    let history = view.history.as_ref().filter(|h| !logs_open && h.entries.len() > 1);
+    let problems = !logs_open && !view.annotations.is_empty();
+
+    let mut constraints = vec![Constraint::Length(header.len() as u16 + 2)];
+    if failure.is_some() {
+        constraints.push(Constraint::Length(1));
+    }
     if banner.is_some() {
         constraints.push(Constraint::Length(1));
     }
+    if history.is_some() {
+        constraints.push(Constraint::Length(4));
+    }
+    if problems {
+        constraints.push(Constraint::Length(view.annotations.len().min(PROBLEM_ROWS) as u16 + 2));
+    }
     constraints.push(Constraint::Min(3));
     let rows = Layout::default().direction(Direction::Vertical).constraints(constraints).split(area);
-    let tree_area = rows[rows.len() - 1];
+    let mut at = 0;
+    let mut next = || {
+        at += 1;
+        rows[at - 1]
+    };
 
-    // Header: run identity + status + branch/trigger.
-    let branch = view.branch.clone().unwrap_or_else(|| "—".into());
-    let who = view.run.triggered_by.as_ref().map(|u| u.display_name.clone()).unwrap_or_else(|| "—".into());
-    // A cache-seeded run's status is whatever it was when the view was last open — it may have
-    // gone red since. Say so until the refetch confirms it, rather than painting remembered
-    // status identically to live status: the user acts on this (waits on a run, approves a
-    // gate), so an unmarked stale "Running" is worse than a slower honest one.
-    let mut header = vec![
-        Span::styled(format!("{} ", pipeline_glyph(view.run.status, anim)), Style::default().fg(theme.pipeline_color(view.run.status))),
-        Span::styled(format!("{:?}", view.run.status), Style::default().fg(theme.pipeline_color(view.run.status)).add_modifier(Modifier::BOLD)),
-    ];
-    if view.stale {
-        header.push(Span::styled(" (unconfirmed)", Style::default().fg(theme.yellow)));
+    frame.render_widget(Paragraph::new(header).block(section_block(theme, &view.title)), next());
+    if let Some(line) = failure {
+        frame.render_widget(Paragraph::new(line), next());
     }
-    header.push(Span::styled(format!("   branch {branch}   triggered by {who}"), Style::default().fg(theme.dim)));
-    let header = Line::from(header);
-    let header_block = section_block(theme, &view.title);
-    frame.render_widget(Paragraph::new(header).block(header_block), rows[0]);
-
     if let Some(line) = banner {
-        frame.render_widget(Paragraph::new(line), rows[1]);
+        frame.render_widget(Paragraph::new(line), next());
     }
+    if let Some(h) = history {
+        render_history(frame, next(), theme, h, anim);
+    }
+    if problems {
+        render_problems(frame, next(), theme, view);
+    }
+    let tree_area = next();
 
     // An open log pane sits beside the tree — or, when there isn't room for both, fills the pane.
     if let Some(log) = &view.logs {
@@ -2814,31 +2987,390 @@ fn render_pipeline(frame: &mut Frame, area: Rect, theme: &Theme, view: &Pipeline
         view.log_split.set(split);
         if !split {
             render_log_pane(frame, tree_area, theme, log);
-            return;
+        } else {
+            let cols = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Length(LOG_TREE_WIDTH), Constraint::Min(20)])
+                .split(tree_area);
+            render_pipeline_tree(frame, cols[0], theme, view, anim, now);
+            render_log_pane(frame, cols[1], theme, log);
+            let (active, idle) = if view.log_focus { (cols[1], cols[0]) } else { (cols[0], cols[1]) };
+            mark_focus(frame, active, theme);
+            mark_idle(frame, idle, theme);
         }
-        let cols = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(LOG_TREE_WIDTH), Constraint::Min(20)])
-            .split(tree_area);
-        render_pipeline_tree(frame, cols[0], theme, view, anim);
-        render_log_pane(frame, cols[1], theme, log);
-        let (active, idle) = if view.log_focus { (cols[1], cols[0]) } else { (cols[0], cols[1]) };
-        mark_focus(frame, active, theme);
-        mark_idle(frame, idle, theme);
-        return;
+    } else {
+        render_pipeline_tree(frame, tree_area, theme, view, anim, now);
     }
-    render_pipeline_tree(frame, tree_area, theme, view, anim);
+    if let Some(panel) = &view.artifacts {
+        render_artifacts(frame, area, theme, view, panel, now);
+    }
 }
 
-/// The stages → jobs → steps tree.
-fn render_pipeline_tree(frame: &mut Frame, tree_area: Rect, theme: &Theme, view: &PipelineView, anim: usize) {
+/// The header: status, total time and trigger; commit and title; who, when, attempt and PR.
+fn pipeline_header(theme: &Theme, view: &PipelineView, anim: usize, now: DateTime<Utc>) -> Vec<Line<'static>> {
+    let run = &view.run;
+    let color = theme.pipeline_color(run.status);
+    let dim = Style::default().fg(theme.dim);
+    let mut first = vec![
+        Span::styled(format!("{} ", pipeline_glyph(run.status, anim)), Style::default().fg(color)),
+        Span::styled(pipe_status_word(run.status), Style::default().fg(color).add_modifier(Modifier::BOLD)),
+    ];
+    // A cache-seeded run's status is whatever it was when the view was last open — it may have
+    // gone red since. Say so until the refetch confirms it, rather than painting remembered
+    // status identically to live status: the user acts on this (waits on a run, approves a
+    // gate), so an unmarked stale "Running" is worse than a slower honest one.
+    if view.stale {
+        first.push(Span::styled(" (unconfirmed)", Style::default().fg(theme.yellow)));
+    }
+    if let Some(secs) = run_secs(run, now) {
+        first.push(Span::styled(format!("  {}", fmt_secs(secs)), Style::default().fg(theme.fg).add_modifier(Modifier::BOLD)));
+    }
+    let branch = run.branch.clone().or_else(|| view.branch.clone()).filter(|b| !b.is_empty());
+    match (run.event.as_deref().filter(|e| !e.is_empty()), branch) {
+        (Some(event), Some(b)) => {
+            first.push(Span::styled(format!("   {event} → "), dim));
+            first.push(Span::styled(b, Style::default().fg(theme.cyan)));
+        }
+        (None, Some(b)) => {
+            first.push(Span::styled("   branch ", dim));
+            first.push(Span::styled(b, Style::default().fg(theme.cyan)));
+        }
+        (Some(event), None) => first.push(Span::styled(format!("   {event}"), dim)),
+        (None, None) => {}
+    }
+    let mut lines = vec![Line::from(first)];
+
+    let sha: Option<String> = run.commit_sha.as_deref().filter(|s| !s.is_empty()).map(|s| s.chars().take(7).collect());
+    let title = run.title.clone().filter(|t| !t.is_empty());
+    if sha.is_some() || title.is_some() {
+        let mut second = vec![Span::raw("  ")];
+        if let Some(sha) = sha {
+            second.push(Span::styled(sha, Style::default().fg(theme.magenta)));
+            second.push(Span::raw("  "));
+        }
+        if let Some(title) = title {
+            second.push(Span::styled(title, Style::default().fg(theme.fg)));
+        }
+        lines.push(Line::from(second));
+    }
+
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(who) = &run.triggered_by {
+        parts.push(who.display_name.clone());
+    }
+    let active = is_active(run.status);
+    if active {
+        parts.extend(ago("started", run.started_at));
+    } else {
+        parts.extend(ago("finished", run.finished_at));
+    }
+    if let Some(n) = run.attempt {
+        parts.push(format!("attempt {n}"));
+    }
+    let mut third = vec![Span::styled(format!("  {}", parts.join(" · ")), dim)];
+    let estimate = view.estimates.run_median.filter(|_| run.status == PipelineRunStatus::Running).map(|median| {
+        let elapsed = run_secs(run, now).unwrap_or(0);
+        (median - elapsed, median)
+    });
+    if let Some((left, median)) = estimate {
+        third.push(Span::styled(if parts.is_empty() { "" } else { " · " }, dim));
+        if left > 0 {
+            third.push(Span::styled(format!("done in ~{}", fmt_secs(left)), Style::default().fg(theme.yellow)));
+        } else {
+            third.push(Span::styled(format!("past the usual {}", fmt_secs(median)), Style::default().fg(theme.yellow)));
+        }
+        third.push(Span::styled(format!(" (median of last {})", view.estimates.run_n), dim));
+    }
+    if let Some(pr) = run.pull_request {
+        let lead = if parts.is_empty() && estimate.is_none() { "" } else { " · " };
+        third.push(Span::styled(lead, dim));
+        third.push(Span::styled(format!("PR #{pr} ↗"), Style::default().fg(theme.accent)));
+    }
+    if !parts.is_empty() || estimate.is_some() || run.pull_request.is_some() {
+        lines.push(Line::from(third));
+    }
+    lines
+}
+
+/// The red line under a failed run's header: the failed step, the test and where it broke —
+/// from the provider's first failure annotation, else from the failed job's log.
+fn failure_line<'a>(theme: &Theme, view: &PipelineView) -> Option<Line<'a>> {
+    if view.run.status != PipelineRunStatus::Failed {
+        return None;
+    }
+    let (job_id, step, _) = view.failed_target()?;
+    let annotation = view.annotations.iter().find(|a| a.level == AnnotationLevel::Failure);
+    let from_log = view.log_failure.as_ref().filter(|(j, _)| *j == job_id).map(|(_, f)| f);
+    let (test, location, message) = match annotation {
+        Some(a) => (
+            a.title.clone(),
+            a.path.as_deref().map(|p| match a.line {
+                Some(l) => format!("{}:{l}", runlog::short_location(p)),
+                None => runlog::short_location(p),
+            }),
+            a.message.lines().next().map(str::to_owned),
+        ),
+        None => match from_log {
+            Some(f) => (f.test.clone(), f.location.as_deref().map(runlog::short_location), f.message.clone()),
+            None => (None, None, None),
+        },
+    };
+    let red = Style::default().fg(theme.red);
+    let mut spans = vec![
+        Span::styled(" ✗ ", red.add_modifier(Modifier::BOLD)),
+        Span::styled(step, red.add_modifier(Modifier::BOLD)),
+        Span::styled(" failed", red),
+    ];
+    match (test, location) {
+        (Some(test), location) => {
+            spans.push(Span::styled(" · ", red));
+            spans.push(Span::styled(test, Style::default().fg(theme.fg)));
+            if let Some(loc) = location {
+                spans.push(Span::styled(format!(" · {loc}"), red));
+            }
+        }
+        (None, location) => {
+            if let Some(loc) = location {
+                spans.push(Span::styled(format!(" · {loc}"), red));
+            }
+            if let Some(msg) = message.filter(|m| !m.is_empty()) {
+                spans.push(Span::styled(" · ", red));
+                spans.push(Span::styled(truncate(&msg, 60), Style::default().fg(theme.fg)));
+            }
+        }
+    }
+    spans.push(Span::styled("   E jump", Style::default().fg(theme.dim)));
+    Some(Line::from(spans))
+}
+
+/// The history strip: recent runs' outcomes with this one lit, their durations as a sparkline
+/// against the median, and when this pipeline last failed.
+fn render_history(frame: &mut Frame, area: Rect, theme: &Theme, h: &RunHistory, anim: usize) {
+    const SPARK: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let dim = Style::default().fg(theme.dim);
+    let mut first = vec![Span::raw("  ")];
+    for (i, e) in h.entries.iter().enumerate() {
+        let style = Style::default().fg(theme.pipeline_color(e.status));
+        if h.current == Some(i) {
+            first.push(Span::styled(pipeline_glyph(e.status, anim), style.bg(theme.sel_bg).add_modifier(Modifier::BOLD)));
+            first.push(Span::raw(" "));
+        } else {
+            first.push(Span::styled(format!("{} ", pipeline_glyph(e.status, anim)), style));
+        }
+    }
+    first.push(Span::raw("  "));
+    let secs: Vec<i64> = h.entries.iter().filter_map(|e| e.secs).collect();
+    let (lo, hi) = (secs.iter().copied().min().unwrap_or(0), secs.iter().copied().max().unwrap_or(0));
+    for (i, e) in h.entries.iter().enumerate() {
+        let c = match e.secs {
+            Some(s) if hi > lo => SPARK[(((s - lo) as f64 / (hi - lo) as f64) * 7.0).round() as usize],
+            Some(_) => SPARK[3],
+            None => ' ',
+        };
+        let color = if h.current == Some(i) {
+            theme.pipeline_color(e.status)
+        } else if e.status == PipelineRunStatus::Failed {
+            theme.red
+        } else {
+            theme.dim
+        };
+        first.push(Span::styled(c.to_string(), Style::default().fg(color)));
+    }
+    if let Some(median) = h.median_secs {
+        first.push(Span::styled("   median ", dim));
+        first.push(Span::styled(fmt_secs(median), Style::default().fg(theme.fg)));
+        let this = h.current.and_then(|i| h.entries.get(i)).filter(|e| !is_active(e.status)).and_then(|e| e.secs);
+        if let Some(this) = this.filter(|_| median > 0) {
+            let pct = ((this - median) as f64 / median as f64 * 100.0).round() as i64;
+            first.push(Span::styled(" · this run ", dim));
+            let color = if pct > 0 { theme.yellow } else { theme.green };
+            first.push(Span::styled(format!("{pct:+}%"), Style::default().fg(color)));
+        }
+    }
+
+    let num = |n: Option<i64>| n.map_or_else(|| "·".to_string(), |n| format!("#{n}"));
+    let first_no = num(h.entries.first().and_then(|e| e.number));
+    let mut second = vec![Span::styled(format!("  {first_no}"), dim)];
+    // The open run's number sits under its glyph, where there's room.
+    if let Some(cur) = h.current.filter(|&c| c > 0) {
+        let (col, used) = (2 + 2 * cur, 2 + first_no.chars().count());
+        second.push(Span::raw(" ".repeat(col.saturating_sub(used).max(1))));
+        second.push(Span::styled(num(h.entries[cur].number), Style::default().fg(theme.fg)));
+    }
+    match &h.last_failure {
+        Some(f) => {
+            second.push(Span::styled("   last failure ", dim));
+            second.push(Span::styled(num(f.number), Style::default().fg(theme.red)));
+            let mut tail = String::new();
+            if let Some(age) = f.at.map(|t| rel_age(Some(t))) {
+                tail.push_str(&if age == "now" { " · just now".to_string() } else { format!(" · {age} ago") });
+            }
+            if let Some(step) = &f.step {
+                tail.push_str(&format!(" · in {step}"));
+            }
+            second.push(Span::styled(tail, dim));
+        }
+        None => {
+            // The claim covers the open run too: a failed open run isn't "no failures".
+            let this_failed = h.current.and_then(|i| h.entries.get(i)).is_some_and(|e| e.status == PipelineRunStatus::Failed);
+            let text = if this_failed {
+                format!("   no other failures in the last {}", h.total)
+            } else {
+                format!("   no failures in the last {}", h.total)
+            };
+            second.push(Span::styled(text, dim));
+        }
+    }
+
+    let right = if h.total == 1 { "1 run".to_string() } else { format!("{} runs", h.total) };
+    let title = if h.all_branches { format!("History · {}", h.name) } else { format!("History · {} on this branch", h.name) };
+    let block = section_block(theme, &title).title_top(Line::from(Span::styled(format!(" {right} "), dim)).right_aligned());
+    frame.render_widget(Paragraph::new(vec![Line::from(first), Line::from(second)]).block(block), area);
+}
+
+/// The Problems panel: the run's annotations with their file and line, most severe first.
+fn render_problems(frame: &mut Frame, area: Rect, theme: &Theme, view: &PipelineView) {
+    let count = |level: AnnotationLevel| view.annotations.iter().filter(|a| a.level == level).count();
+    let plural = |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+    let counts: Vec<String> = [
+        (count(AnnotationLevel::Failure), "error", "errors"),
+        (count(AnnotationLevel::Warning), "warning", "warnings"),
+        (count(AnnotationLevel::Notice), "notice", "notices"),
+    ]
+    .into_iter()
+    .filter(|(n, _, _)| *n > 0)
+    .map(|(n, one, many)| plural(n, one, many))
+    .collect();
+    let block = section_block(theme, "Problems")
+        .title_top(Line::from(Span::styled(format!(" {} ", counts.join(" · ")), Style::default().fg(theme.dim))).right_aligned());
+    let visible = area.height.saturating_sub(2).max(1) as usize;
+    let top = if view.problem_focus { view.problem_sel.saturating_sub(visible - 1) } else { 0 };
+    let lines: Vec<Line> = view
+        .annotations
+        .iter()
+        .enumerate()
+        .skip(top)
+        .take(visible)
+        .map(|(i, a)| {
+            let selected = view.problem_focus && i == view.problem_sel;
+            let (glyph, color) = match a.level {
+                AnnotationLevel::Failure => ("✗ ", theme.red),
+                AnnotationLevel::Warning => ("⚠ ", theme.yellow),
+                AnnotationLevel::Notice => ("i ", theme.dim),
+            };
+            let mut spans = vec![
+                Span::styled(if selected { "▐ " } else { "  " }, Style::default().fg(theme.accent)),
+                Span::styled(glyph, Style::default().fg(color)),
+            ];
+            let place = a.path.as_deref().map(|p| match a.line {
+                Some(l) => format!("{p}:{l}"),
+                None => p.to_string(),
+            });
+            let message = a.message.lines().next().unwrap_or("").to_string();
+            match place {
+                Some(place) => {
+                    let mut s = Style::default().fg(theme.fg);
+                    if selected {
+                        s = s.add_modifier(Modifier::BOLD);
+                    }
+                    spans.push(Span::styled(place, s));
+                    spans.push(Span::styled(format!("  {message}"), Style::default().fg(color)));
+                }
+                None => spans.push(Span::styled(message, Style::default().fg(color))),
+            }
+            let mut line = Line::from(spans);
+            if selected {
+                for span in &mut line.spans {
+                    span.style = span.style.bg(theme.sel_bg);
+                }
+            }
+            line
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// The tree's title: the job for a single-job run, `Jobs` for one stage of several, else the
+/// full stages · jobs · steps.
+fn tree_title(view: &PipelineView) -> String {
+    match view.run.stages.as_slice() {
+        [stage] if stage.jobs.len() == 1 && !stage.jobs[0].steps.is_empty() => stage.jobs[0].name.clone(),
+        [stage] if stage.name.eq_ignore_ascii_case("jobs") || stage.name.is_empty() => "Jobs".into(),
+        [stage] => format!("Jobs · {}", stage.name),
+        _ => "Stages · jobs · steps".into(),
+    }
+}
+
+/// An estimate drawn after a job's bar: `start..end` shaded, and what's left of it.
+struct Ghost {
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    /// Seconds left for a running job; `None` for a queued one.
+    left: Option<i64>,
+}
+
+/// Estimated finishes for an in-flight run's jobs, keyed by `(stage, job)`: a running job ends
+/// its median after it started; queued jobs follow the running ones, one after another.
+fn job_ghosts(view: &PipelineView, now: DateTime<Utc>) -> HashMap<(usize, usize), Ghost> {
+    let mut out = HashMap::new();
+    if !is_active(view.run.status) || view.estimates.jobs.is_empty() {
+        return out;
+    }
+    let mut after_running = now;
+    for (si, stage) in view.run.stages.iter().enumerate() {
+        for (ji, job) in stage.jobs.iter().enumerate() {
+            let (Some(median), Some(start)) = (view.estimates.jobs.get(&job.name), job.started_at) else { continue };
+            if job.status != PipelineRunStatus::Running {
+                continue;
+            }
+            let end = start + chrono::Duration::seconds(*median);
+            after_running = after_running.max(end);
+            if end > now {
+                out.insert((si, ji), Ghost { start: now, end, left: Some((end - now).num_seconds()) });
+            }
+        }
+    }
+    let mut chain = after_running;
+    for (si, stage) in view.run.stages.iter().enumerate() {
+        for (ji, job) in stage.jobs.iter().enumerate() {
+            let Some(median) = view.estimates.jobs.get(&job.name) else { continue };
+            if job.status != PipelineRunStatus::Queued {
+                continue;
+            }
+            let end = chain + chrono::Duration::seconds(*median);
+            out.insert((si, ji), Ghost { start: chain, end, left: None });
+            chain = end;
+        }
+    }
+    out
+}
+
+/// The stages → jobs → steps tree. Wide enough, each node gets a bar on a shared time axis;
+/// narrower, it reads as a plain tree.
+fn render_pipeline_tree(frame: &mut Frame, tree_area: Rect, theme: &Theme, view: &PipelineView, anim: usize, now: DateTime<Utc>) {
     let nodes = view.flatten();
-    let tree_block = section_block(theme, "Stages · jobs · steps");
+    let title = tree_title(view);
+    let tree_block = section_block(theme, &title);
     if nodes.is_empty() {
         empty(frame, tree_area, theme, "No stages reported for this run.", tree_block);
         return;
     }
+    let inner_w = tree_area.width.saturating_sub(2) as usize;
+    if inner_w < TIMELINE_MIN_WIDTH || !render_timeline(frame, tree_area, theme, view, &nodes, anim, now) {
+        render_plain_tree(frame, tree_area, theme, view, &nodes, anim, tree_block);
+    }
+}
 
+/// The tree without bars, as it has always read.
+fn render_plain_tree(
+    frame: &mut Frame,
+    tree_area: Rect,
+    theme: &Theme,
+    view: &PipelineView,
+    nodes: &[FlatNode],
+    anim: usize,
+    tree_block: Block,
+) {
     let items: Vec<ListItem> = nodes
         .iter()
         .map(|n| {
@@ -2848,7 +3380,9 @@ fn render_pipeline_tree(frame: &mut Frame, tree_area: Rect, theme: &Theme, view:
                 Some(_) => "▸ ",
                 None => "· ",
             };
-            let label_style = if n.depth == 0 {
+            let label_style = if n.group {
+                Style::default().fg(theme.dim)
+            } else if n.depth == 0 && n.job.is_none() {
                 Style::default().fg(theme.fg).add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(theme.fg)
@@ -2875,6 +3409,322 @@ fn render_pipeline_tree(frame: &mut Frame, tree_area: Rect, theme: &Theme, view:
     frame.render_stateful_widget(list, tree_area, &mut state);
     let body = tree_area.inner(ratatui::layout::Margin::new(1, 1));
     hit_rows(body, state.offset(), (0..nodes.len()).map(|i| Some(Hit::PipeNode(i))));
+}
+
+/// The tree with every node's bar on one time axis. Returns false (drawing nothing) when the
+/// run carries no times to draw, or the bars would be too short to read.
+#[allow(clippy::too_many_arguments)]
+fn render_timeline(
+    frame: &mut Frame,
+    tree_area: Rect,
+    theme: &Theme,
+    view: &PipelineView,
+    nodes: &[FlatNode],
+    anim: usize,
+    now: DateTime<Utc>,
+) -> bool {
+    let run = &view.run;
+    let active = is_active(run.status);
+    let jobs = || run.stages.iter().flat_map(|s| &s.jobs);
+    let starts = run.started_at.into_iter().chain(jobs().filter_map(|j| j.started_at)).chain(jobs().flat_map(|j| &j.steps).filter_map(|s| s.started_at));
+    let Some(t0) = starts.min() else { return false };
+    let ghosts = job_ghosts(view, now);
+    let finishes = run.finished_at.into_iter().chain(jobs().filter_map(|j| j.finished_at)).chain(jobs().flat_map(|j| &j.steps).filter_map(|s| s.finished_at));
+    let mut t_end = finishes.max().unwrap_or(t0);
+    if active {
+        t_end = t_end.max(now);
+    }
+    for g in ghosts.values() {
+        t_end = t_end.max(g.end);
+    }
+    let total = ((t_end - t0).num_milliseconds() as f64 / 1000.0).max(1.0);
+
+    let inner_w = tree_area.width.saturating_sub(2) as usize;
+    let lw = if inner_w >= 98 { 34 } else { 26 };
+    let extra_w = if ghosts.values().any(|g| g.left.is_some()) { 8 } else { 0 };
+    // Selection marker (2) + fold (2) + glyph (2) + label + duration (7) + gap (2).
+    let prefix = 2 + lw + 13;
+    let Some(bar_w) = inner_w.checked_sub(prefix + 1 + extra_w).filter(|w| *w >= 10) else { return false };
+
+    let secs_of = |t: DateTime<Utc>| (t - t0).num_milliseconds() as f64 / 1000.0;
+    let col = |t: DateTime<Utc>| ((secs_of(t) / total) * bar_w as f64).round().max(0.0) as usize;
+    let now_col = active.then(|| col(now)).filter(|&x| x < bar_w);
+    let dim = Style::default().fg(theme.dim);
+
+    // Axis: ticks at a round step, and `now` while the run is in flight.
+    let steps = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400];
+    let max_ticks = (bar_w / 7).clamp(2, 5);
+    let step = steps.iter().copied().find(|s| ((total / *s as f64).floor() as usize) < max_ticks).unwrap_or(86400);
+    let mut axis: Vec<(char, Style)> = vec![(' ', dim); bar_w];
+    // `now` goes down first; a tick that would touch it gives way.
+    let now_at = now_col.map(|x| x.min(bar_w.saturating_sub(3)));
+    if let Some(x) = now_at {
+        for (i, c) in "now".chars().enumerate() {
+            if x + i < bar_w {
+                axis[x + i] = (c, Style::default().fg(theme.accent).add_modifier(Modifier::BOLD));
+            }
+        }
+    }
+    let mut free_from = 0;
+    let mut t = 0;
+    while (t as f64) <= total {
+        let label = axis_label(t);
+        let len = label.chars().count();
+        let x = (((t as f64) / total) * bar_w as f64).round() as usize;
+        let x = x.min(bar_w.saturating_sub(len));
+        let clear_of_now = now_at.is_none_or(|n| x + len < n || x > n + 3);
+        if x >= free_from && x + len <= bar_w && clear_of_now {
+            for (i, c) in label.chars().enumerate() {
+                axis[x + i] = (c, dim);
+            }
+            free_from = x + len + 1;
+        }
+        t += step;
+    }
+    let mut axis_spans = vec![Span::raw(" ".repeat(prefix))];
+    axis_spans.extend(cells_to_spans(axis));
+
+    // The in-flight job furthest from done is the one to watch.
+    let longest = ghosts.values().filter_map(|g| g.left).max();
+    let items: Vec<ListItem> = nodes
+        .iter()
+        .map(|n| {
+            let indent = "  ".repeat(n.depth);
+            let marker = match n.key {
+                Some(_) if n.expanded => "▾ ",
+                Some(_) => "▸ ",
+                None => "· ",
+            };
+            let color = theme.pipeline_color(n.status);
+            let label_style = if n.group || matches!(n.status, PipelineRunStatus::Queued | PipelineRunStatus::Canceled) {
+                Style::default().fg(theme.dim)
+            } else if n.status == PipelineRunStatus::Failed {
+                Style::default().fg(theme.red)
+            } else if n.depth == 0 && n.job.is_none() {
+                Style::default().fg(theme.fg).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.fg)
+            };
+            let running = n.status == PipelineRunStatus::Running;
+            let (duration, dur_style) = match (&n.duration, n.started_at) {
+                (Some(d), _) => (d.clone(), dim),
+                (None, Some(s)) if running => (fmt_secs((now - s).num_seconds()), Style::default().fg(theme.accent)),
+                (None, None) if n.status == PipelineRunStatus::Queued => ("queued".to_string(), dim),
+                _ => ("—".to_string(), dim),
+            };
+            let label_w = lw.saturating_sub(indent.chars().count());
+            let mut spans = vec![
+                Span::raw(indent),
+                Span::styled(marker, dim),
+                Span::styled(format!("{} ", pipeline_glyph(n.status, anim)), Style::default().fg(color)),
+                Span::styled(fit(&n.label, label_w), label_style),
+                Span::styled(format!("{duration:>7}"), dur_style),
+                Span::raw("  "),
+            ];
+
+            let mut cells: Vec<(char, Style)> = vec![(' ', dim); bar_w];
+            let end = n.finished_at.or_else(|| running.then_some(now));
+            if let (Some(s), Some(e)) = (n.started_at, end) {
+                let x0 = col(s).min(bar_w - 1);
+                let len = (secs_of(e) - secs_of(s)).max(0.0) / total * bar_w as f64;
+                let bar = Style::default().fg(color);
+                if len < 0.5 {
+                    cells[x0] = ('▏', bar);
+                } else if len < 1.2 {
+                    cells[x0] = ('▌', bar);
+                } else {
+                    for cell in cells.iter_mut().take((x0 + len.round() as usize).min(bar_w)).skip(x0) {
+                        *cell = ('█', bar);
+                    }
+                }
+            }
+            let ghost = match (n.job, n.step, n.group) {
+                (Some(ji), None, false) => ghosts.get(&(n.stage, ji)),
+                _ => None,
+            };
+            if let Some(g) = ghost {
+                for cell in cells.iter_mut().take(col(g.end).min(bar_w)).skip(col(g.start)) {
+                    if cell.0 == ' ' {
+                        *cell = ('░', dim);
+                    }
+                }
+            }
+            if let Some(x) = now_col {
+                if cells[x].0 == ' ' {
+                    cells[x] = ('┊', Style::default().fg(theme.accent));
+                }
+            }
+            spans.extend(cells_to_spans(cells));
+            if extra_w > 0 {
+                let text = ghost.and_then(|g| g.left).map(|left| format!(" ~{}", axis_label(left))).unwrap_or_default();
+                let style = if ghost.and_then(|g| g.left) == longest && longest.is_some() { theme.yellow } else { theme.dim };
+                spans.push(Span::styled(fit(&text, extra_w), Style::default().fg(style)));
+            }
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+
+    // Leaves are steps where the run reports them, else jobs.
+    let bottom = (!active).then(|| slowest_note(theme, run)).flatten();
+    let count = {
+        let steps = jobs().map(|j| j.steps.len()).sum::<usize>();
+        if steps > 0 { format!("{steps} steps") } else { format!("{} jobs", jobs().count()) }
+    };
+    let title = tree_title(view);
+    let mut block = section_block(theme, &title).title_top(Line::from(Span::styled(format!(" {count} "), dim)).right_aligned());
+    if let Some(note) = bottom {
+        block = block.title_bottom(note);
+    }
+    let inner = block.inner(tree_area);
+    frame.render_widget(block, tree_area);
+    if inner.height == 0 {
+        return true;
+    }
+    frame.render_widget(Paragraph::new(Line::from(axis_spans)), Rect { height: 1, ..inner });
+    let mut list_area = Rect { y: inner.y + 1, height: inner.height.saturating_sub(1), ..inner };
+    // Under a running waterfall, when there's a spare row: the job holding the run up.
+    if let Some(hint) = critical_path_hint(theme, view, &ghosts) {
+        if list_area.height as usize >= nodes.len() + 2 {
+            let row = Rect { y: list_area.y + list_area.height - 1, height: 1, ..list_area };
+            frame.render_widget(Paragraph::new(hint), row);
+            list_area.height -= 1;
+        }
+    }
+    let list = List::new(items).highlight_style(highlight(theme)).highlight_symbol("▐ ");
+    let mut state = ListState::default();
+    state.select(Some(view.selected.min(nodes.len().saturating_sub(1))));
+    frame.render_stateful_widget(list, list_area, &mut state);
+    true
+}
+
+/// The running job expected to finish last — the run's long pole — and, when jobs are queued
+/// behind it, how long the next one waits on it: `windows is the critical path: host waits ~1m28
+/// on it`, or `windows is the long pole · ~1m28 left`.
+fn critical_path_hint(theme: &Theme, view: &PipelineView, ghosts: &HashMap<(usize, usize), Ghost>) -> Option<Line<'static>> {
+    let ((si, ji), ghost) = ghosts.iter().filter(|(_, g)| g.left.is_some()).max_by_key(|(_, g)| g.end)?;
+    let job = view.run.stages.get(*si)?.jobs.get(*ji)?;
+    let left = axis_label(ghost.left?.max(0));
+    // The first queued job, in the run's order.
+    let waiting = view
+        .run
+        .stages
+        .iter()
+        .flat_map(|s| &s.jobs)
+        .find(|j| j.status == PipelineRunStatus::Queued);
+    let dim = Style::default().fg(theme.dim);
+    let fg = Style::default().fg(theme.fg);
+    let spans = match waiting {
+        Some(next) => vec![
+            Span::styled("  ", dim),
+            Span::styled(job.name.clone(), fg),
+            Span::styled(" is the critical path: ", dim),
+            Span::styled(next.name.clone(), fg),
+            Span::styled(format!(" waits ~{left} on it"), dim),
+        ],
+        None => vec![
+            Span::styled("  ", dim),
+            Span::styled(job.name.clone(), fg),
+            Span::styled(format!(" is the long pole · ~{left} left"), dim),
+        ],
+    };
+    Some(Line::from(spans))
+}
+
+/// `slowest Build 26s · Test 19s · Clippy 11s = 55%` — the three longest steps (or jobs) and
+/// their share of the run.
+fn slowest_note(theme: &Theme, run: &PipelineRun) -> Option<Line<'static>> {
+    let jobs: Vec<&PipelineJob> = run.stages.iter().flat_map(|s| &s.jobs).collect();
+    let span = |s: Option<DateTime<Utc>>, f: Option<DateTime<Utc>>| Some((f? - s?).num_seconds().max(0));
+    let mut leaves: Vec<(String, i64)> = if jobs.iter().any(|j| !j.steps.is_empty()) {
+        jobs.iter().flat_map(|j| &j.steps).filter_map(|s| Some((s.name.clone(), span(s.started_at, s.finished_at)?))).collect()
+    } else {
+        jobs.iter().filter_map(|j| Some((j.name.clone(), span(j.started_at, j.finished_at)?))).collect()
+    };
+    leaves.sort_by_key(|(_, secs)| Reverse(*secs));
+    leaves.truncate(3);
+    leaves.retain(|(_, secs)| *secs > 0);
+    let total = run_secs(run, Utc::now()).filter(|t| *t > 0)?;
+    if leaves.is_empty() {
+        return None;
+    }
+    let dim = Style::default().fg(theme.dim);
+    let mut spans = vec![Span::styled(" slowest ", dim)];
+    for (i, (name, secs)) in leaves.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" · ", dim));
+        }
+        spans.push(Span::styled(format!("{} {}", truncate(name, 24), fmt_secs(*secs)), Style::default().fg(theme.fg)));
+    }
+    let share = leaves.iter().map(|(_, s)| *s).sum::<i64>() * 100 / total;
+    spans.push(Span::styled(format!(" = {}% ", share.min(100)), dim));
+    Some(Line::from(spans))
+}
+
+/// The artifacts list over the pane: name and size per row, and the count, total and expiry.
+fn render_artifacts(frame: &mut Frame, area: Rect, theme: &Theme, view: &PipelineView, panel: &ArtifactsPanel, now: DateTime<Utc>) {
+    let width = 62.min(area.width.saturating_sub(6)).max(area.width.min(24));
+    let inner_w = width.saturating_sub(2) as usize;
+    let dim = Style::default().fg(theme.dim);
+    let mut lines: Vec<Line> = Vec::new();
+    match &panel.items {
+        None => {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled("  Loading artifacts…", dim)));
+        }
+        Some(items) if items.is_empty() => {
+            lines.push(Line::from(""));
+            match &panel.error {
+                Some(e) => lines.push(Line::from(Span::styled(format!("  Couldn't list artifacts: {e}"), Style::default().fg(theme.red)))),
+                None => lines.push(Line::from(Span::styled("  This run published no artifacts.", dim))),
+            }
+        }
+        Some(items) => {
+            // Rows that fit between the frame and the two-line footer.
+            let room = (area.height.saturating_sub(4) as usize).max(1);
+            let top = panel.selected.saturating_sub(room - 1);
+            for (i, a) in items.iter().enumerate().skip(top).take(room) {
+                let selected = i == panel.selected;
+                let size = a.size_bytes.map(human_size).unwrap_or_default();
+                let mut name_style = Style::default().fg(theme.fg);
+                if selected {
+                    name_style = name_style.add_modifier(Modifier::BOLD);
+                }
+                let mut line = Line::from(vec![
+                    Span::styled(if selected { "▐ " } else { "  " }, Style::default().fg(theme.accent)),
+                    Span::styled(fit(&a.name, inner_w.saturating_sub(2 + 10)), name_style),
+                    Span::styled(format!("{size:>8}  "), dim),
+                ]);
+                if selected {
+                    for span in &mut line.spans {
+                        span.style = span.style.bg(theme.sel_bg);
+                    }
+                }
+                lines.push(line);
+            }
+            lines.push(Line::from(""));
+            let total: u64 = items.iter().filter_map(|a| a.size_bytes).sum();
+            let mut summary = format!("  {} artifact{}", items.len(), if items.len() == 1 { "" } else { "s" });
+            if total > 0 {
+                summary.push_str(&format!(" · {}", human_size(total)));
+            }
+            if let Some(exp) = items.iter().filter_map(|a| a.expires_at).min() {
+                let days = (exp - now).num_days();
+                summary.push_str(&match days {
+                    d if exp < now => format!(" · expired {} days ago", -d),
+                    0 => " · expire today".to_string(),
+                    1 => " · expire tomorrow".to_string(),
+                    d => format!(" · expire in {d} days"),
+                });
+            }
+            lines.push(Line::from(Span::styled(summary, dim)));
+        }
+    }
+    let height = (lines.len() as u16 + 2).min(area.height);
+    let rect = centered_rect(width, height, area);
+    let title = format!("Artifacts · {}", view.title);
+    let block = section_block(theme, &title).title_bottom(Line::from(Span::styled(" ↵ open · y copy link ", dim)));
+    frame.render_widget(Clear, rect);
+    frame.render_widget(Paragraph::new(lines).block(block), rect);
 }
 
 /// The live state appended to the log pane's title.
@@ -2941,12 +3791,67 @@ fn log_line<'a>(theme: &Theme, text: &str, query: Option<&str>, current: bool) -
     Line::from(spans)
 }
 
+/// A step section's fold header: `▸ name … N lines` folded, `▾ name … line N` open.
+fn section_header<'a>(theme: &Theme, log: &LogView, section: usize, width: usize, cursor: bool) -> Line<'a> {
+    let sec = &log.sections[section];
+    let open = log.open.contains(&section);
+    let meta = if open { format!("line {}", thousands(sec.start + 1)) } else { format!("{} lines", thousands(sec.len())) };
+    let name_w = width.saturating_sub(3 + meta.chars().count() + 1);
+    let name_style = if open {
+        Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme.fg)
+    };
+    let mut line = Line::from(vec![
+        Span::styled(if open { " ▾ " } else { " ▸ " }, Style::default().fg(theme.dim)),
+        Span::styled(fit(&sec.name, name_w), name_style),
+        Span::styled(format!(" {meta}"), Style::default().fg(theme.dim)),
+    ]);
+    if cursor {
+        for span in &mut line.spans {
+            span.style = span.style.bg(theme.sel_bg).add_modifier(Modifier::BOLD);
+        }
+    }
+    line
+}
+
+/// Folded passed steps merged into one header: `▸ 7 steps · checkout … Build SPA   318 lines`.
+fn group_header<'a>(theme: &Theme, log: &LogView, first: usize, last: usize, width: usize, cursor: bool) -> Line<'a> {
+    let (a, b) = (&log.sections[first], &log.sections[last]);
+    let meta = format!("{} lines", thousands(b.end.saturating_sub(a.start)));
+    let name = format!("{} steps · {} … {}", last - first + 1, a.name, b.name);
+    let name_w = width.saturating_sub(3 + meta.chars().count() + 1);
+    let mut line = Line::from(vec![
+        Span::styled(" ▸ ", Style::default().fg(theme.dim)),
+        Span::styled(fit(&name, name_w), Style::default().fg(theme.dim)),
+        Span::styled(format!(" {meta}"), Style::default().fg(theme.dim)),
+    ]);
+    if cursor {
+        for span in &mut line.spans {
+            span.style = span.style.bg(theme.sel_bg).add_modifier(Modifier::BOLD);
+        }
+    }
+    line
+}
+
 /// The scrollable log pane. Only the visible window is built, so a 10k-line log costs no more
-/// per frame than a short one.
+/// per frame than a short one. A log that marks its steps draws each as a fold header, its
+/// lines indented beneath, with a cursor row.
 fn render_log_pane(frame: &mut Frame, area: Rect, theme: &Theme, log: &LogView) {
     hit(area, Hit::LogPane);
     let title = log_title(log);
-    let block = section_block(theme, &title);
+    let mut block = section_block(theme, &title);
+    if log.loaded {
+        block = block.title_top(
+            Line::from(Span::styled(format!(" {} lines ", thousands(log.lines.len())), Style::default().fg(theme.dim))).right_aligned(),
+        );
+        if let Some(e) = log.first_error {
+            block = block.title_bottom(Line::from(Span::styled(
+                format!(" first error · line {} ", thousands(e + 1)),
+                Style::default().fg(theme.red),
+            )));
+        }
+    }
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let status = log_status_line(theme, log);
@@ -2954,13 +3859,37 @@ fn render_log_pane(frame: &mut Frame, area: Rect, theme: &Theme, log: &LogView) 
     log.viewport.set(body_h);
     let top = log.effective_scroll() as usize;
     let current = log.match_idx.and_then(|i| log.matches.get(i).copied());
+    let sectioned = log.sectioned();
+    let cursor = sectioned.then(|| log.cursor_row());
     let lines: Vec<Line> = log
-        .lines
+        .rows
         .iter()
         .enumerate()
         .skip(top)
         .take(body_h as usize)
-        .map(|(i, l)| log_line(theme, l, log.query.as_deref(), current == Some(i)))
+        .map(|(r, row)| match *row {
+            LogRow::Header(s) => section_header(theme, log, s, inner.width as usize, cursor == Some(r)),
+            LogRow::Group(a, b) => group_header(theme, log, a, b, inner.width as usize, cursor == Some(r)),
+            LogRow::Line(l) if sectioned => {
+                let text = runlog::strip_timestamp(&log.lines[l]);
+                let mut line = log_line(theme, text, log.query.as_deref(), current == Some(l));
+                let at = cursor == Some(r);
+                let lead = if at {
+                    let color = if is_error_line(text) { theme.red } else { theme.accent };
+                    Span::styled(" ▶ ", Style::default().fg(color).add_modifier(Modifier::BOLD))
+                } else {
+                    Span::raw("   ")
+                };
+                line.spans.insert(0, lead);
+                if at {
+                    for span in &mut line.spans {
+                        span.style = span.style.bg(theme.sel_bg);
+                    }
+                }
+                line
+            }
+            LogRow::Line(l) => log_line(theme, &log.lines[l], log.query.as_deref(), current == Some(l)),
+        })
         .collect();
     frame.render_widget(Paragraph::new(lines), Rect { height: body_h, ..inner });
     if let Some(status) = status {
@@ -3023,7 +3952,9 @@ fn render_overlay(frame: &mut Frame, area: Rect, app: &App) {
 
     let (body, hint_color): (Vec<Line>, _) = match overlay {
         Overlay::Confirm { message, .. } => (
-            vec![Line::from(""), Line::from(Span::styled(message.clone(), Style::default().fg(theme.fg)))],
+            std::iter::once(Line::from(""))
+                .chain(message.split('\n').map(|l| Line::from(Span::styled(l.to_owned(), Style::default().fg(theme.fg)))))
+                .collect(),
             theme.yellow,
         ),
         Overlay::Picker { items, selected, .. } => (
@@ -3408,13 +4339,21 @@ pub(crate) fn help_sections() -> Vec<(&'static str, Vec<(&'static str, &'static 
                 ("G", "Group by pipeline / trigger / branch / off"),
                 ("Enter or Space (on a group)", "Expand / collapse"),
                 ("z  Z", "Collapse / expand every group"),
-                ("Enter", "Drill in (stages → jobs → steps)"),
-                ("Enter (in drill-in)", "Expand / collapse a node"),
+                ("Enter", "Open the run pane (history, timeline, logs)"),
+                ("Enter (on a step)", "Open that step's section of its job's log"),
+                ("Enter (on a job)", "Expand / collapse it"),
+                ("←  →", "Step to the older / newer run of this pipeline on this branch"),
                 ("L", "View the selected job's logs (beside the tree; a live job's log updates itself)"),
                 ("w (logs open)", "Move the keys between the tree and the log pane"),
+                ("z  Z (logs)", "Fold / unfold the step section under the cursor / all of them"),
                 ("f  g  G", "Logs: toggle follow / top / bottom (and follow)"),
-                ("E", "Logs: jump to the first error line"),
+                ("E", "Jump to the first error (from the tree: in the failed job's log)"),
                 ("/  n  N", "Logs: search, next / previous match"),
+                ("e", "Problems panel: move the keys in and out; Enter jumps to the line"),
+                ("R", "Rerun the whole run (finished runs, where the provider can)"),
+                ("F (in a run)", "Rerun only the failed jobs"),
+                ("a", "List the run's artifacts — Enter opens one, y copies its link"),
+                ("c", "Copy the run's commit sha"),
                 ("A", "Approve / reject a waiting gate (GitHub, GitLab; Azure is view-only)"),
                 ("o", "Open the selected job in the browser"),
                 ("T", "Trigger a run"),
@@ -4344,9 +5283,19 @@ mod tests {
 
     #[test]
     fn pipeline_view_flattens_stage_job_step() {
+        // One stage with one job: both levels are dropped and the steps sit at the top.
         let view = PipelineView::new("CI #101".into(), sample_run(), "demo".into(), ProviderType::GitHub, "ci".into(), Some("main".into()));
         let flat = view.flatten();
-        assert_eq!(flat.len(), 3, "one stage + one job + one step");
+        assert_eq!(flat.len(), 1, "only the step");
+        assert_eq!((flat[0].label.as_str(), flat[0].depth, flat[0].step), ("cargo build", 0, Some(0)));
+        assert_eq!(flat[0].job_id.as_deref(), Some("j1"), "the step still knows its job");
+
+        // Two stages keep every level.
+        let mut run = sample_run();
+        run.stages.push(run.stages[0].clone());
+        let view = PipelineView::new("CI #101".into(), run, "demo".into(), ProviderType::GitHub, "ci".into(), None);
+        let flat = view.flatten();
+        assert_eq!(flat.len(), 6, "stage + job + step, twice");
         assert_eq!(flat[0].depth, 0);
         assert_eq!(flat[2].depth, 2);
     }
@@ -4366,7 +5315,7 @@ mod tests {
         app.screen = Screen::Pipeline(Box::new(view));
 
         let wide = render_to_string(&mut app, 160, 30);
-        assert!(wide.contains("Stages · jobs · steps"), "the tree stays beside the logs");
+        assert!(wide.contains("cargo build"), "the tree stays beside the logs");
         assert!(wide.contains("Logs · compile") && wide.contains("● live · following"));
         assert!(wide.contains("error: boom"));
         assert!(wide.contains("/here"), "the committed search shows on the status line");
@@ -4374,7 +5323,7 @@ mod tests {
         assert!(v.log_split.get());
 
         let narrow = render_to_string(&mut app, 70, 30);
-        assert!(!narrow.contains("Stages · jobs · steps"), "narrow: logs alone");
+        assert!(!narrow.contains("cargo build"), "narrow: logs alone");
         let Screen::Pipeline(v) = &app.screen else { panic!() };
         assert!(!v.log_split.get() && v.logs_have_keys(), "and the logs take the keys");
 
@@ -4436,10 +5385,10 @@ mod tests {
             Some("main".into()),
         )));
         let out = render_to_string(&mut app, 120, 30);
-        assert!(out.contains("Build"), "stage name");
-        assert!(out.contains("compile"), "job name");
+        // A single-stage, single-job run titles the tree with its job and lists the steps.
+        assert!(out.contains("compile"), "job name, as the tree's title");
         assert!(out.contains("cargo build"), "step name");
-        assert!(out.contains("expand") && out.contains("trigger"), "drill-in footer keys");
+        assert!(out.contains("step log") && out.contains("trigger"), "drill-in footer keys");
     }
 
     #[test]
@@ -5885,5 +6834,411 @@ mod tests {
         for key in ["update state", "assign", "edit", "comment", "back"] {
             assert!(footer.contains(key), "{key:?} is in the footer: {footer}");
         }
+    }
+
+    // ---- the run pane (history, timeline, failure line, problems, artifacts) ----
+
+    /// `secs` seconds after a fixed instant `base` seconds before now.
+    fn at(base: i64, secs: i64) -> DateTime<Utc> {
+        Utc::now() - chrono::Duration::seconds(base) + chrono::Duration::seconds(secs)
+    }
+
+    fn step(name: &str, status: PipelineRunStatus, times: Option<(DateTime<Utc>, Option<DateTime<Utc>>)>) -> PipelineStep {
+        PipelineStep { name: name.into(), status, started_at: times.map(|t| t.0), finished_at: times.and_then(|t| t.1) }
+    }
+
+    /// CI #443 from the mockup: one job, eleven steps and four cleanup steps, finished 12m ago.
+    fn ci443() -> PipelineRun {
+        let base = 12 * 60 + 101;
+        let spans = [
+            ("Set up job", 0, 2),
+            ("Run actions/checkout@v4", 2, 1),
+            ("Run dtolnay/rust-toolchain@stable", 3, 6),
+            ("Run Swatinem/rust-cache@v2", 9, 9),
+            ("Run actions/setup-node@v4", 18, 6),
+            ("Install dashboard deps", 24, 3),
+            ("Dashboard tests", 27, 8),
+            ("Build dashboard SPA", 35, 7),
+            ("Build", 42, 26),
+            ("Test", 68, 19),
+            ("Clippy", 87, 11),
+            ("Post Run actions/setup-node@v4", 98, 0),
+            ("Post Run Swatinem/rust-cache@v2", 98, 1),
+            ("Post Run actions/checkout@v4", 99, 0),
+            ("Complete job", 99, 0),
+        ];
+        let steps = spans
+            .iter()
+            .map(|(n, s, d)| step(n, PipelineRunStatus::Succeeded, Some((at(base, *s), Some(at(base, s + d))))))
+            .collect();
+        PipelineRun {
+            event: Some("push".into()),
+            attempt: Some(1),
+            pull_request: Some(195),
+            repository: None,
+            id: "r443".into(),
+            definition_id: "ci".into(),
+            number: Some(443),
+            name: Some("CI".into()),
+            title: Some("feat(tui): lead every footer with a yellow Ctrl-K search anywhere".into()),
+            status: PipelineRunStatus::Succeeded,
+            triggered_by: Some(User { id: "u".into(), display_name: "magna-nz".into(), handle: None, avatar_url: None }),
+            branch: Some("claude/m4-action-palette-shortcut-f096cc".into()),
+            commit_sha: Some("1a4c3aeb2f0d6c4e8a9b1c2d3e4f5a6b7c8d9e0f".into()),
+            started_at: Some(at(base, 0)),
+            finished_at: Some(at(base, 101)),
+            url: None,
+            stages: vec![PipelineStage {
+                name: "jobs".into(),
+                status: PipelineRunStatus::Succeeded,
+                jobs: vec![PipelineJob {
+                    id: "j1".into(),
+                    name: "build · test · clippy".into(),
+                    status: PipelineRunStatus::Succeeded,
+                    started_at: Some(at(base, 0)),
+                    finished_at: Some(at(base, 101)),
+                    steps,
+                    url: None,
+                    problem: None,
+                }],
+            }],
+        }
+    }
+
+    /// A list row for a run of CI on the same branch, `hours` ago, lasting `secs`.
+    fn history_row(n: i64, status: PipelineRunStatus, hours: i64, secs: i64) -> crate::app::PipeRow {
+        let mut run = ci443();
+        run.id = format!("r{n}");
+        run.number = Some(n);
+        run.status = status;
+        run.stages.clear();
+        run.started_at = Some(Utc::now() - chrono::Duration::hours(hours));
+        run.finished_at = Some(Utc::now() - chrono::Duration::hours(hours) + chrono::Duration::seconds(secs));
+        crate::app::PipeRow {
+            connection_id: "c".into(),
+            connection: "GH".into(),
+            provider: ProviderType::GitHub,
+            run,
+            definition_name: Some("CI".into()),
+            awaiting_approval: false,
+        }
+    }
+
+    /// An app showing `view`, with CI's recent runs on its branch in the list.
+    fn pane_app(view: PipelineView) -> App {
+        let mut app = App::new("slate");
+        app.pipes = vec![
+            history_row(436, PipelineRunStatus::Succeeded, 60, 98),
+            history_row(437, PipelineRunStatus::Succeeded, 55, 95),
+            history_row(438, PipelineRunStatus::Failed, 48, 88),
+            history_row(439, PipelineRunStatus::Succeeded, 40, 101),
+            history_row(440, PipelineRunStatus::Succeeded, 30, 96),
+            history_row(441, PipelineRunStatus::Succeeded, 20, 99),
+            history_row(442, PipelineRunStatus::Succeeded, 10, 97),
+        ];
+        let mut current = history_row(443, PipelineRunStatus::Succeeded, 0, 101);
+        current.run = view.run.clone();
+        app.pipes.push(current);
+        app.screen = Screen::Pipeline(Box::new(view));
+        app.refresh_pipeline_context();
+        app
+    }
+
+    /// Just the pane, `w` × `h`, as rows of text.
+    fn pane_rows(app: &App, w: u16, h: u16) -> Vec<String> {
+        let Screen::Pipeline(view) = &app.screen else { panic!("pipeline screen") };
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal.draw(|f| render_pipeline(f, f.area(), &app.theme, view, 0)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let rows: Vec<String> = (0..h).map(|y| (0..w).map(|x| buf[(x, y)].symbol()).collect()).collect();
+        if std::env::var_os("FORGETOP_SHOW_PANE").is_some() {
+            println!("{}", rows.join("\n"));
+        }
+        rows
+    }
+
+    #[test]
+    fn a_passing_run_reads_as_header_history_and_a_timeline_at_81_and_112_columns() {
+        let view = PipelineView::new("CI #443".into(), ci443(), "c".into(), ProviderType::GitHub, "ci".into(), None);
+        let app = pane_app(view);
+        for w in [81u16, 112] {
+            let rows = pane_rows(&app, w, 30);
+            let all = rows.join("\n");
+            // Header: status, time, trigger; commit and title; who, when, attempt, PR.
+            assert!(rows[1].contains("Succeeded") && rows[1].contains("1m41s") && rows[1].contains("push → claude/m4"), "{}", rows[1]);
+            assert!(rows[2].contains("1a4c3ae") && rows[2].contains("feat(tui)"), "{}", rows[2]);
+            assert!(rows[3].contains("magna-nz · finished 12m ago · attempt 1") && rows[3].contains("PR #195"), "{}", rows[3]);
+            // History: eight runs, the median of the others, the last failure.
+            assert!(all.contains("History · CI on this branch") && all.contains("8 runs"), "{all}");
+            assert!(all.contains("median 1m37s") && all.contains("this run +4%"), "{all}");
+            assert!(all.contains("#436") && all.contains("#443") && all.contains("last failure #438"), "{all}");
+            // Timeline: the job is the title, the steps sit at the top with bars on one axis.
+            assert!(all.contains("build · test · clippy") && all.contains("15 steps"), "{all}");
+            assert!(all.contains("0s") && all.contains("30s") && all.contains("1m"), "axis ticks: {all}");
+            assert!(all.contains("4 post & cleanup steps"), "cleanup steps fold");
+            assert!(!all.contains("Complete job"), "folded away");
+            assert!(all.contains("█"), "bars drawn");
+            assert!(all.contains("slowest Build 26s · Test 19s · Clippy 11s"), "{all}");
+            assert!(!all.contains("jobs "), "the synthetic stage is gone");
+        }
+        // Narrower than the timeline needs: the plain tree, no bars.
+        let rows = pane_rows(&app, 60, 30).join("\n");
+        assert!(rows.contains("Build  26s") && !rows.contains("1m30"), "no bars, no axis: {rows}");
+        // Tiny and empty must not panic.
+        pane_rows(&app, 10, 4);
+        pane_rows(&app, 1, 1);
+        let empty = PipelineView::new("CI".into(), sample_run_without_stages(), "c".into(), ProviderType::GitHub, "ci".into(), None);
+        let app = pane_app(empty);
+        pane_rows(&app, 81, 30);
+        pane_rows(&app, 3, 2);
+    }
+
+    fn sample_run_without_stages() -> PipelineRun {
+        let mut run = sample_run();
+        run.stages.clear();
+        run
+    }
+
+    /// CI #438 from the mockup: failed in Test, Clippy never ran.
+    fn ci438() -> PipelineRun {
+        let mut run = ci443();
+        run.id = "r438".into();
+        run.number = Some(438);
+        run.status = PipelineRunStatus::Failed;
+        run.event = Some("pull_request".into());
+        run.branch = Some("claude/cache-rewrite-7ab2".into());
+        run.commit_sha = Some("9c0e1d2aa".into());
+        let job = &mut run.stages[0].jobs[0];
+        job.status = PipelineRunStatus::Failed;
+        job.steps.truncate(11);
+        job.steps[9].status = PipelineRunStatus::Failed;
+        job.steps[10] = step("Clippy", PipelineRunStatus::Canceled, None);
+        run.stages[0].status = PipelineRunStatus::Failed;
+        run
+    }
+
+    fn annotation(level: AnnotationLevel, path: Option<&str>, line: Option<u32>, message: &str) -> PipelineAnnotation {
+        PipelineAnnotation { level, message: message.into(), title: None, path: path.map(Into::into), line, job_id: Some("j1".into()) }
+    }
+
+    #[test]
+    fn a_failed_run_names_the_failure_folds_the_passed_steps_and_lists_its_problems() {
+        let mut view = PipelineView::new("CI #438".into(), ci438(), "c".into(), ProviderType::GitHub, "ci".into(), None);
+        view.supports_approvals = true;
+        let mut failure = annotation(AnnotationLevel::Failure, Some("crates/forgetop-core/src/cache.rs"), Some(212), "assertion `left == right` failed");
+        failure.title = Some("rewrite_edits_in_place".into());
+        view.annotations = vec![
+            failure,
+            annotation(AnnotationLevel::Warning, Some("crates/forgetop-server/web/src/Pipelines.tsx"), Some(88), "'status' is possibly 'undefined'"),
+            annotation(AnnotationLevel::Notice, None, None, "Node.js 16 actions are deprecated: actions/cache@v3"),
+        ];
+        view.problem_focus = true;
+        let app = pane_app(view);
+        for w in [81u16, 112] {
+            let all = pane_rows(&app, w, 30).join("\n");
+            assert!(all.contains("✗ Test failed · rewrite_edits_in_place · cache.rs:212   E jump"), "{all}");
+            assert!(all.contains("Problems") && all.contains("1 error · 1 warning · 1 notice"), "{all}");
+            assert!(all.contains("▐ ✗ crates/forgetop-core/src/cache.rs:212"), "the focused problem is marked: {all}");
+            assert!(all.contains("8 steps passed") && all.contains("Build") && all.contains("Clippy"), "{all}");
+            assert!(!all.contains("Dashboard tests"), "folded into the passed group");
+            assert!(all.contains("pull_request → claude/cache-rewrite-7ab2") && all.contains("9c0e1d2"), "{all}");
+        }
+
+        // Without an annotation the failure line reads from the failed job's log.
+        let mut view = PipelineView::new("CI #438".into(), ci438(), "c".into(), ProviderType::GitHub, "ci".into(), None);
+        view.log_failure = Some((
+            "j1".into(),
+            runlog::FailureSummary {
+                line: 3,
+                test: Some("put_refuses_same_timestamp".into()),
+                location: Some("crates/forgetop-core/src/cache.rs:98".into()),
+                message: None,
+            },
+        ));
+        let all = pane_rows(&pane_app(view), 81, 30).join("\n");
+        assert!(all.contains("✗ Test failed · put_refuses_same_timestamp · cache.rs:98"), "{all}");
+    }
+
+    /// Release #57 from the mockup: a waterfall of parallel jobs, running, with estimates.
+    fn release57() -> PipelineRun {
+        let base = 252;
+        let job = |id: &str, name: &str, status: PipelineRunStatus, span: Option<(i64, Option<i64>)>| PipelineJob {
+            id: id.into(),
+            name: name.into(),
+            status,
+            started_at: span.map(|s| at(base, s.0)),
+            finished_at: span.and_then(|s| s.1.map(|f| at(base, f))),
+            steps: Vec::new(),
+            url: None,
+            problem: None,
+        };
+        let mut run = ci443();
+        run.id = "r57".into();
+        run.number = Some(57);
+        run.definition_id = "release".into();
+        run.status = PipelineRunStatus::Running;
+        run.event = Some("tag push".into());
+        run.branch = Some("v1.2.1".into());
+        run.started_at = Some(at(base, 0));
+        run.finished_at = None;
+        run.stages = vec![PipelineStage {
+            name: "jobs".into(),
+            status: PipelineRunStatus::Running,
+            jobs: vec![
+                job("p", "plan", PipelineRunStatus::Succeeded, Some((0, Some(18)))),
+                job("a", "aarch64-apple-darwin", PipelineRunStatus::Succeeded, Some((20, Some(202)))),
+                job("l", "x86_64-unknown-linux-gnu", PipelineRunStatus::Running, Some((21, None))),
+                job("w", "x86_64-pc-windows-msvc", PipelineRunStatus::Running, Some((22, None))),
+                job("h", "host", PipelineRunStatus::Queued, None),
+                job("n", "announce", PipelineRunStatus::Queued, None),
+            ],
+        }];
+        run
+    }
+
+    #[test]
+    fn a_running_run_draws_growing_bars_ghost_estimates_and_a_finish_time() {
+        let mut view = PipelineView::new("Release #57".into(), release57(), "c".into(), ProviderType::GitHub, "release".into(), None);
+        view.supports_approvals = true;
+        let mut app = pane_app(view);
+        // Estimates come from recent succeeded runs; set them as the app would have.
+        if let Screen::Pipeline(v) = &mut app.screen {
+            v.estimates.run_median = Some(408);
+            v.estimates.run_n = 5;
+            v.estimates.jobs = [("x86_64-unknown-linux-gnu", 271), ("x86_64-pc-windows-msvc", 340), ("host", 22), ("announce", 11)]
+                .into_iter()
+                .map(|(n, s)| (n.to_string(), s))
+                .collect();
+            v.estimates.job_runs = 3;
+        }
+        for w in [81u16, 112] {
+            let all = pane_rows(&app, w, 30).join("\n");
+            assert!(all.contains("Running") && all.contains("tag push → v1.2.1"), "{all}");
+            assert!(all.contains("started 4m ago · attempt 1 · done in ~2m3"), "{all}");
+            assert!(all.contains("(median of last 5)"), "{all}");
+            assert!(all.contains("Jobs") && all.contains("6 jobs"), "{all}");
+            assert!(all.contains("now"), "the axis marks now: {all}");
+            assert!(all.contains("░"), "ghost bars: {all}");
+            assert!(all.contains("~1m") && all.contains("~3"), "time left on each running job: {all}");
+            assert!(!all.contains("now5m") && !all.contains("now4m"), "ticks give way to now: {all}");
+            assert!(all.contains("queued"), "{all}");
+        }
+    }
+
+    #[test]
+    fn the_artifacts_overlay_shows_loading_then_rows_sizes_and_expiry() {
+        let mut view = PipelineView::new("Release #56".into(), ci443(), "c".into(), ProviderType::GitHub, "ci".into(), None);
+        view.artifacts = Some(crate::app::ArtifactsPanel::default());
+        let mut app = pane_app(view);
+        assert!(pane_rows(&app, 81, 30).join("\n").contains("Loading artifacts…"));
+        let artifact = |name: &str, size: u64| PipelineArtifact {
+            id: name.into(),
+            name: name.into(),
+            size_bytes: Some(size),
+            expires_at: Some(Utc::now() + chrono::Duration::days(83) + chrono::Duration::hours(1)),
+            url: Some(format!("https://example.test/{name}")),
+        };
+        if let Screen::Pipeline(v) = &mut app.screen {
+            v.artifacts.as_mut().unwrap().items = Some(vec![
+                artifact("forgetop-aarch64-apple-darwin.tar.xz", 8_283_750),
+                artifact("forgetop-installer.sh", 18 * 1024),
+            ]);
+        }
+        for w in [81u16, 112] {
+            let all = pane_rows(&app, w, 30).join("\n");
+            assert!(all.contains("Artifacts · Release #56"), "{all}");
+            assert!(all.contains("▐ forgetop-aarch64-apple-darwin.tar.xz") && all.contains("7.9 MB"), "{all}");
+            assert!(all.contains("18 KB"), "{all}");
+            assert!(all.contains("2 artifacts · 7.9 MB · expire in 83 days"), "{all}");
+            assert!(all.contains("↵ open · y copy link"), "{all}");
+        }
+        pane_rows(&app, 12, 5);
+    }
+
+    #[test]
+    fn a_sectioned_log_draws_fold_headers_and_a_cursor_on_the_first_error() {
+        let mut view = PipelineView::new("CI #438".into(), ci438(), "c".into(), ProviderType::GitHub, "ci".into(), None);
+        let mut log = crate::app::LogView::new("Logs · Test".into(), "j1".into(), false);
+        log.steps = vec!["Set up job".into(), "Build".into(), "Test".into(), "Clippy".into()];
+        log.target_step = Some(2);
+        log.set_text(
+            "2024-05-01T10:00:00.0000000Z ##[group]Set up job\n\
+             2024-05-01T10:00:00.1000000Z runner\n\
+             2024-05-01T10:00:01.0000000Z ##[group]Run cargo build\n\
+             2024-05-01T10:00:01.1000000Z ##[endgroup]\n\
+             2024-05-01T10:00:02.0000000Z Compiling x\n\
+             2024-05-01T10:00:03.0000000Z ##[group]Run cargo test\n\
+             2024-05-01T10:00:03.1000000Z ##[endgroup]\n\
+             2024-05-01T10:00:04.0000000Z running 184 tests\n\
+             2024-05-01T10:00:05.0000000Z test cache::tests::rewrite_edits_in_place ... FAILED\n\
+             2024-05-01T10:00:06.0000000Z ##[error]Process completed with exit code 101.",
+        );
+        view.logs = Some(log);
+        let app = pane_app(view);
+        let all = pane_rows(&app, 81, 30).join("\n");
+        assert!(all.contains("▸ Set up job") && all.contains("2 lines"), "folded: {all}");
+        assert!(all.contains("▸ Run cargo build"), "{all}");
+        assert!(all.contains("▾ Run cargo test") && all.contains("line 6"), "the failed step is open: {all}");
+        assert!(all.contains("▶ test cache::tests::rewrite_edits_in_place ... FAILED"), "the cursor sits on the first error: {all}");
+        assert!(!all.contains("2024-05-01T10:00:04"), "timestamps are not drawn inside sections");
+        assert!(!all.contains("##[endgroup]"), "marker lines are hidden");
+        assert!(all.contains("10 lines") && all.contains("first error · line 9"), "{all}");
+        // Full screen keeps the tree beside the log.
+        let all = pane_rows(&app, 112, 30).join("\n");
+        assert!(all.contains("Logs · Test") && all.contains("8 steps passed"), "{all}");
+    }
+
+    #[test]
+    fn long_names_lose_their_middle_and_keep_a_matrix_legs_suffix() {
+        let leg = fit("build-local-artifacts (aarch64-apple-darwin)", 26);
+        assert_eq!(leg.chars().count(), 26);
+        assert!(leg.ends_with("(aarch64-apple-darwin)"), "{leg}");
+        let tiny = fit("build-local-artifacts (x86_64-unknown-linux-gnu)", 20);
+        assert_eq!(tiny.chars().count(), 20);
+        assert!(tiny.starts_with('…') && tiny.ends_with("gnu)"), "{tiny}");
+        let plain = fit("Run dtolnay/rust-toolchain@stable", 20);
+        assert_eq!(plain.chars().count(), 20);
+        assert!(plain.starts_with("Run dtol") && plain.ends_with("@stable") && plain.contains('…'), "{plain}");
+        assert_eq!(fit("short", 7), "short  ");
+    }
+
+    #[test]
+    fn a_queued_rerun_shows_no_elapsed_time_or_estimate_and_a_failed_open_run_is_not_no_failures() {
+        let mut run = ci443();
+        run.status = PipelineRunStatus::Queued;
+        run.started_at = Some(Utc::now() - chrono::Duration::hours(48));
+        run.finished_at = None;
+        let mut view = PipelineView::new("CI #443".into(), run, "c".into(), ProviderType::GitHub, "ci".into(), None);
+        view.estimates.run_median = Some(97);
+        view.estimates.run_n = 5;
+        let rows = pane_rows(&pane_app(view), 81, 30);
+        assert!(!rows[1].contains("48h") && rows[1].contains("Queued"), "{}", rows[1]);
+        assert!(!rows.join("\n").contains("past the usual"), "no estimate for a queued run");
+
+        // The open run failed and nothing else did.
+        let mut app = pane_app(PipelineView::new("CI #443".into(), ci438(), "c".into(), ProviderType::GitHub, "ci".into(), None));
+        app.pipes.retain(|p| p.run.id == "r438" || p.run.status != PipelineRunStatus::Failed);
+        for p in &mut app.pipes {
+            p.run.branch = Some("claude/cache-rewrite-7ab2".into());
+        }
+        app.refresh_pipeline_context();
+        let all = pane_rows(&app, 81, 30).join("\n");
+        assert!(all.contains("no other failures in the last"), "{all}");
+    }
+
+    #[test]
+    fn a_running_waterfall_names_its_critical_path() {
+        let mut view = PipelineView::new("Release #57".into(), release57(), "c".into(), ProviderType::GitHub, "release".into(), None);
+        view.supports_approvals = true;
+        let mut app = pane_app(view);
+        // Set after the app has built its own (empty) estimates, as the background fetch would.
+        if let Screen::Pipeline(v) = &mut app.screen {
+            v.estimates.jobs = [("x86_64-unknown-linux-gnu", 271), ("x86_64-pc-windows-msvc", 340), ("host", 22)]
+                .into_iter()
+                .map(|(n, s)| (n.to_string(), s))
+                .collect();
+        }
+        let all = pane_rows(&app, 81, 30).join("\n");
+        assert!(all.contains("x86_64-pc-windows-msvc is the critical path: host waits ~1m"), "{all}");
     }
 }

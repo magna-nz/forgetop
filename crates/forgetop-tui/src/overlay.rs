@@ -32,6 +32,10 @@ pub enum Action {
     /// `repo` is the definition's **connection-relative** repository — a connection spanning
     /// several has no single "own" one to fall back on, so the target must be carried explicitly.
     PipelineTrigger { connection_id: String, repo: Option<String>, definition_id: String, branch: Option<String>, label: String },
+    /// Confirmed: re-run a finished run — every job, or with `failed_only` just the failed ones.
+    /// `repo` is the run's connection-relative repository, as for [`Action::PipelineTrigger`].
+    /// `new_run` is set when the provider starts a separate run rather than re-queueing this one.
+    PipelineRerun { connection_id: String, repo: Option<String>, run_id: String, failed_only: bool, new_run: bool, label: String },
     RemoveConnection { id: String, label: String },
     /// Result of a checklist: the ids that ended up ticked, tagged with what they are.
     ApplyToggle { kind: ToggleKind, ids: Vec<String> },

@@ -11,6 +11,7 @@ use forgetop_core::config::{NotificationPrefs, SavedView, SortPref};
 use forgetop_core::domain::*;
 use forgetop_core::filter::pull_request_matches;
 use forgetop_core::provider::*;
+use forgetop_core::runlog::{self, FailureSummary, LogSection};
 use forgetop_core::service::{ConfigService, ConnectionHealth, ConnectionHealthService, SectionService};
 use ratatui::widgets::TableState;
 use tokio::sync::mpsc;
@@ -20,6 +21,9 @@ use crate::overlay::{Action, InputKind, Outcome, Overlay, PickerKind, SearchItem
 use crate::palette::{self, CommandContext, GoTo, PaletteItem, PaletteKind, PaletteTarget};
 use crate::theme::Theme;
 use crate::wizard::{provider_sections, section_label, Wizard, WizardOutcome};
+
+/// Reading a job log for errors lives in core, so the web dashboard reads it the same way.
+pub use forgetop_core::runlog::{first_error_line, is_error_line};
 
 const DASHBOARD_OPEN_FAILURE_CONTEXT: &str = "action";
 const DASHBOARD_OPEN_FAILURE_MESSAGE: &str = "failed to open local dashboard in browser";
@@ -51,6 +55,8 @@ const DIAG_PIPELINE_DISCOVERY: &str = "tui.pipeline.discovery";
 const DIAG_PIPELINE_RUN: &str = "tui.pipeline.run";
 const DIAG_PIPELINE_APPROVALS: &str = "tui.pipeline.approvals";
 const DIAG_PIPELINE_LOGS: &str = "tui.pipeline.logs";
+const DIAG_PIPELINE_ANNOTATIONS: &str = "tui.pipeline.annotations";
+const DIAG_PIPELINE_ARTIFACTS: &str = "tui.pipeline.artifacts";
 const DIAG_NOTIFICATION_SCAN_FEEDS: &str = "tui.notification_scan.feeds";
 const DIAG_INBOX_FEEDS: &str = "tui.inbox.feeds";
 const DIAG_INBOX_PR_DETAIL: &str = "tui.inbox.pr_detail";
@@ -204,6 +210,37 @@ fn project_addressed_sections(provider: ProviderType) -> bool {
 
 type FeedbackOpener = fn(&str) -> std::result::Result<(), String>;
 
+/// Puts text on the system clipboard. A function pointer, like [`FeedbackOpener`], so tests can
+/// exercise the copy keys without writing escape codes to the terminal.
+type ClipboardWriter = fn(&str) -> std::result::Result<(), String>;
+
+/// Copies through the terminal with an OSC 52 escape — no clipboard crate, and it works over
+/// SSH and inside tmux (with `set-clipboard on`). Terminals that don't support it ignore it.
+fn osc52_clipboard(text: &str) -> std::result::Result<(), String> {
+    use std::io::Write;
+    let seq = format!("\x1b]52;c;{}\x07", base64_encode(text.as_bytes()));
+    let mut out = std::io::stdout();
+    out.write_all(seq.as_bytes()).and_then(|()| out.flush()).map_err(|e| e.to_string())
+}
+
+/// Standard base64 with padding — just enough for OSC 52.
+pub fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [chunk[0], chunk.get(1).copied().unwrap_or(0), chunk.get(2).copied().unwrap_or(0)];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(ALPHABET[((n >> (18 - 6 * i)) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
 fn system_feedback_opener(target: &str) -> std::result::Result<(), String> {
     open::that(target).map_err(|error| error.to_string())
 }
@@ -262,6 +299,12 @@ pub enum AppEvent {
     /// A pipeline job's log finished fetching (the whole log — providers don't send deltas).
     /// Applied only if the drill-in still shows that job's log pane.
     PipelineLogsLoaded { conn_id: String, run_id: String, job_id: String, text: std::result::Result<String, String> },
+    /// A run's artifact list finished fetching, for the drill-in's artifacts overlay. Applied only
+    /// if that overlay is still open on that run.
+    PipelineArtifactsLoaded { conn_id: String, run_id: String, result: std::result::Result<Vec<PipelineArtifact>, String> },
+    /// The provider answered a rerun or cancel sent by [`App::execute_pipeline_run_action`]:
+    /// the new run's id when it started one.
+    PipelineRunActionDone { token: u64, result: std::result::Result<Option<String>, String> },
 }
 
 /// A snapshot of everything the background fetch needs from `self` at spawn time, so it
@@ -628,6 +671,20 @@ pub struct PipelineDetail {
     pub approvals: Vec<PipelineApproval>,
     pub supports_approvals: bool,
     pub can_respond_approvals: bool,
+    /// Problems the run reported. Defaulted so entries cached before these fields existed
+    /// still read back.
+    #[serde(default)]
+    pub annotations: Vec<PipelineAnnotation>,
+    #[serde(default)]
+    pub supports_rerun: bool,
+    #[serde(default)]
+    pub supports_rerun_failed: bool,
+    #[serde(default)]
+    pub supports_artifacts: bool,
+    #[serde(default)]
+    pub rerun_new_run: bool,
+    #[serde(default)]
+    pub rerun_failed_new_run: bool,
 }
 
 /// `None` means that call failed. See [`PrDetailFetch`] for why the distinction from an
@@ -638,6 +695,12 @@ pub struct PipelineDetailFetch {
     pub approvals: Option<Vec<PipelineApproval>>,
     pub supports_approvals: Option<bool>,
     pub can_respond_approvals: Option<bool>,
+    pub annotations: Option<Vec<PipelineAnnotation>>,
+    pub supports_rerun: Option<bool>,
+    pub supports_rerun_failed: Option<bool>,
+    pub supports_artifacts: Option<bool>,
+    pub rerun_new_run: Option<bool>,
+    pub rerun_failed_new_run: Option<bool>,
 }
 
 /// A section's repository scope, as the header indicator and empty state read it.
@@ -835,6 +898,24 @@ pub struct App {
     /// The log fetch in flight — `(conn, run, job)` key and anim ticks waited — so at most
     /// one goes out at a time and a poll never piles on top of a slow one.
     log_inflight: Option<(String, u16)>,
+    /// Run details fetched this session, keyed by [`pipeline_detail_cache_key`]: what per-job
+    /// duration estimates read, from recent succeeded runs of the same pipeline. Session-only,
+    /// so estimates work with the cache disabled (`--demo`).
+    run_details: HashMap<String, PipelineRun>,
+    /// Estimate fetches already sent this session, so each run's detail is asked for once.
+    estimate_requested: HashSet<String>,
+    /// Where the copy keys (`c`, `y`) write. OSC 52 in production.
+    clipboard: ClipboardWriter,
+    /// Reruns and cancels waiting on the provider, by token.
+    run_actions: HashMap<u64, PendingRunAction>,
+    next_run_action: u64,
+    /// Optimistic run changes held against stale refreshes, by `(connection, run id)`.
+    held_runs: HashMap<(String, String), RunHold>,
+    /// A run a rerun started, to open once it shows up in the list: `(connection, run id)`.
+    follow_new_run: Option<(String, String)>,
+    /// Detail keys whose annotations were asked for, and the run status they were asked at —
+    /// a finished run's problems don't change until it is rerun.
+    annotations_asked: std::cell::RefCell<HashMap<String, PipelineRunStatus>>,
 }
 
 /// Full-screen views layered above the list. The large views are boxed so the
@@ -1035,6 +1116,143 @@ pub struct FlatNode {
     pub url: Option<String>,
     /// The job id whose logs this node maps to (for `L`); `None` for stages.
     pub job_id: Option<String>,
+    /// The node's span — a step's, job's, stage's or folded group's. Drives the timeline bars.
+    pub started_at: Option<DateTime<Utc>>,
+    pub finished_at: Option<DateTime<Utc>>,
+    /// Where the node sits in the run: its stage, its job (not for a stage row), and its step
+    /// (steps only).
+    pub stage: usize,
+    pub job: Option<usize>,
+    pub step: Option<usize>,
+    /// A folded run of steps ("8 steps passed", "4 post & cleanup steps"), not a single step.
+    pub group: bool,
+}
+
+/// Trailing steps that only tidy up after a job: `Post …` hooks and `Complete job`.
+fn is_cleanup_step(name: &str) -> bool {
+    let n = name.trim();
+    n.starts_with("Post ") || n.eq_ignore_ascii_case("Complete job")
+}
+
+/// How a job's steps fold in the tree, as `(passed, cleanup)`: steps `..passed` fold into one
+/// "N steps passed" node (on a failed run, the leading passed steps — keeping the one just before
+/// the failure in view), and steps `cleanup..` into one "N post & cleanup steps" node. A fold
+/// needs at least two steps; `passed == 0` and `cleanup == steps.len()` mean no fold.
+pub fn step_folds(job: &PipelineJob, run_failed: bool) -> (usize, usize) {
+    let n = job.steps.len();
+    let mut cleanup = n;
+    while cleanup > 0 && is_cleanup_step(&job.steps[cleanup - 1].name) {
+        cleanup -= 1;
+    }
+    if n - cleanup < 2 {
+        cleanup = n;
+    }
+    let mut passed = 0;
+    if run_failed {
+        if let Some(f) = job.steps.iter().position(|s| s.status == PipelineRunStatus::Failed) {
+            let lead = job.steps.iter().take_while(|s| s.status == PipelineRunStatus::Succeeded).count();
+            let k = lead.min(f.saturating_sub(1)).min(cleanup);
+            if k >= 2 {
+                passed = k;
+            }
+        }
+    }
+    (passed, cleanup)
+}
+
+/// The span of some steps: earliest start to latest finish, the finish only once all are done.
+fn steps_span(steps: &[PipelineStep]) -> (Option<DateTime<Utc>>, Option<DateTime<Utc>>) {
+    let start = steps.iter().filter_map(|s| s.started_at).min();
+    let finish =
+        if steps.iter().all(|s| s.finished_at.is_some()) { steps.iter().filter_map(|s| s.finished_at).max() } else { None };
+    (start, finish)
+}
+
+/// A folded group's status: the first step that didn't pass, else passed.
+fn steps_status(steps: &[PipelineStep]) -> PipelineRunStatus {
+    steps.iter().map(|s| s.status).find(|s| *s != PipelineRunStatus::Succeeded).unwrap_or(PipelineRunStatus::Succeeded)
+}
+
+/// A run's elapsed seconds: start to finish, or to `now` while it is still going.
+pub fn run_secs(run: &PipelineRun, now: DateTime<Utc>) -> Option<i64> {
+    // A queued run's start is when it was asked for, not when it began: no time used yet.
+    if run.status == PipelineRunStatus::Queued {
+        return None;
+    }
+    let start = run.started_at?;
+    let end = match run.finished_at {
+        Some(f) => f,
+        None if is_active(run.status) => now,
+        None => return None,
+    };
+    Some((end - start).num_seconds().max(0))
+}
+
+/// One run in a pipeline's history strip.
+#[derive(Debug, Clone)]
+pub struct HistEntry {
+    pub run_id: String,
+    pub number: Option<i64>,
+    pub status: PipelineRunStatus,
+    /// Elapsed seconds, when the run has started (running runs count to now).
+    pub secs: Option<i64>,
+    pub started_at: Option<DateTime<Utc>>,
+    /// Index into `App::pipes`, to open the run and move the list selection to it.
+    pub row: usize,
+}
+
+/// The most recent failure among a run's history, for the strip's "last failure" note.
+#[derive(Debug, Clone)]
+pub struct LastFailure {
+    pub number: Option<i64>,
+    pub at: Option<DateTime<Utc>>,
+    /// The failed step (or job) when that run's stages are known.
+    pub step: Option<String>,
+}
+
+/// Recent runs of the same pipeline on the same branch, oldest first, with the open run marked.
+/// Built from the rows the list already holds — no fetch — and rebuilt whenever they change.
+#[derive(Debug, Clone, Default)]
+pub struct RunHistory {
+    /// The pipeline's name, for the panel title.
+    pub name: String,
+    pub entries: Vec<HistEntry>,
+    /// The open run's position in `entries`.
+    pub current: Option<usize>,
+    /// Median elapsed time of the succeeded runs among all of this branch's rows, and how many.
+    pub median_secs: Option<i64>,
+    pub median_n: usize,
+    /// How many runs of this pipeline on this branch the list holds (the strip shows ≤ 10).
+    pub total: usize,
+    /// The branch had fewer than two runs (a tag, say), so this is the pipeline's history on
+    /// every branch.
+    pub all_branches: bool,
+    pub last_failure: Option<LastFailure>,
+}
+
+/// Most runs the history strip shows.
+pub const HISTORY_LEN: usize = 10;
+/// Recent succeeded runs whose job times feed the per-job estimates.
+pub const ESTIMATE_RUNS: usize = 3;
+
+/// How long an in-flight run and its jobs should take, from medians of recent runs.
+#[derive(Debug, Clone, Default)]
+pub struct Estimates {
+    /// Median elapsed time of this pipeline's succeeded runs, and how many it is taken over.
+    pub run_median: Option<i64>,
+    pub run_n: usize,
+    /// Median duration per job name, over up to [`ESTIMATE_RUNS`] recent succeeded runs.
+    pub jobs: HashMap<String, i64>,
+    pub job_runs: usize,
+}
+
+/// The run's artifact list, shown over the pane (`a`).
+#[derive(Debug, Clone, Default)]
+pub struct ArtifactsPanel {
+    /// `None` while the fetch is out.
+    pub items: Option<Vec<PipelineArtifact>>,
+    pub error: Option<String>,
+    pub selected: usize,
 }
 
 /// One approve/reject option offered by the pipeline-approval picker.
@@ -1062,23 +1280,46 @@ pub const LOG_SPLIT_MIN_WIDTH: u16 = 90;
 /// Width of the stages/jobs/steps tree beside an open log pane.
 pub const LOG_TREE_WIDTH: u16 = 38;
 
+/// One row of a log pane: a log line, or a step section's fold header — which stands in for the
+/// section's own marker line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogRow {
+    Line(usize),
+    Header(usize),
+    /// Consecutive folded sections of passed steps, `first..=last`, drawn as one header.
+    Group(usize, usize),
+}
+
+/// A jump a log pane owes once its lines arrive, asked for before they had (`E` from the tree,
+/// ↵ on a problem).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LogJump {
+    FirstError,
+    /// The first line containing any of these, most specific first.
+    Find(Vec<String>),
+}
+
 /// A scrollable log view over one job, shown beside the pipeline drill-in's tree.
 ///
 /// The provider hands back the whole log on every call, so a poll simply replaces `lines`;
-/// what the user is doing (scroll, follow, search) is carried across the replacement.
+/// what the user is doing (scroll, follow, search, folds) is carried across the replacement.
+///
+/// When the log marks its steps (see [`runlog::parse_sections`]) each step becomes a fold
+/// header, and a cursor row appears for `z` to act on. A log without markers keeps the plain
+/// scrolling behaviour: one row per line, no cursor.
 pub struct LogView {
     /// Pane title, e.g. `Logs · dotnet test` (live state is appended by the renderer).
     pub title: String,
     /// The job these lines belong to — answers for any other job are dropped.
     pub job_id: String,
     pub lines: Vec<String>,
-    /// Top visible line while not following.
+    /// Top visible row while not following.
     pub scroll: u16,
     /// Pinned to the bottom as lines arrive. On by default for a live job.
     pub follow: bool,
     /// The job was still running at the last check, so the pane is polling.
     pub live: bool,
-    /// Visible line count of the last frame, written by the renderer so scrolling can clamp.
+    /// Visible row count of the last frame, written by the renderer so scrolling can clamp.
     pub viewport: Cell<u16>,
     /// The `/` prompt's text while it is open.
     pub search_input: Option<String>,
@@ -1092,6 +1333,30 @@ pub struct LogView {
     pub fetch_failed: bool,
     /// At least one fetch has answered for this job.
     pub loaded: bool,
+    /// Per-step sections parsed from `lines`; empty when the log marks none.
+    pub sections: Vec<LogSection>,
+    /// Sections shown unfolded, by index into `sections`.
+    pub open: HashSet<usize>,
+    /// What the pane draws, top to bottom. Scrolling counts rows, not lines.
+    pub rows: Vec<LogRow>,
+    /// The row under the cursor (sectioned logs only) — what `z` folds.
+    pub cursor: usize,
+    /// The job's step names, to match a step to its section.
+    pub steps: Vec<String>,
+    /// Which of those steps passed — folded runs of passed steps merge into one header.
+    pub step_passed: Vec<bool>,
+    /// How many lines of the whole log were dropped before `lines[0]` (see [`LOG_MAX_LINES`]).
+    /// Folds and the view are remembered by *absolute* line, so a poll that drops more of the
+    /// head doesn't shift them onto other steps.
+    pub base: usize,
+    /// The step (index into `steps`) to unfold and land on when the lines first arrive.
+    pub target_step: Option<usize>,
+    /// The first line [`is_error_line`] matches, kept alongside the lines it was read from.
+    pub first_error: Option<usize>,
+    /// A jump waiting for the lines.
+    pending: Option<LogJump>,
+    /// The first folding has been decided; later polls keep the user's folds.
+    folds_ready: bool,
     /// A fetch is wanted; [`App::pump_logs`] sends it once nothing else is in flight.
     want_fetch: bool,
     poll_ticks: u16,
@@ -1100,7 +1365,7 @@ pub struct LogView {
 impl LogView {
     /// A pane that has asked for its first fetch. `live` decides follow's default.
     pub fn new(title: String, job_id: String, live: bool) -> Self {
-        Self {
+        let mut log = Self {
             title,
             job_id,
             lines: vec!["Loading logs…".into()],
@@ -1115,9 +1380,22 @@ impl LogView {
             note: None,
             fetch_failed: false,
             loaded: false,
+            sections: Vec::new(),
+            open: HashSet::new(),
+            rows: Vec::new(),
+            cursor: 0,
+            steps: Vec::new(),
+            step_passed: Vec::new(),
+            base: 0,
+            target_step: None,
+            first_error: None,
+            pending: None,
+            folds_ready: false,
             want_fetch: true,
             poll_ticks: 0,
-        }
+        };
+        log.relayout();
+        log
     }
 
     /// A finished pane already holding `lines` (tests and fixtures).
@@ -1127,17 +1405,23 @@ impl LogView {
         log.lines = lines;
         log.loaded = true;
         log.want_fetch = false;
+        log.reparse();
         log
     }
 
-    /// The last line the top of the viewport can sit on. Before the first frame the viewport is
-    /// unknown, so a single line is assumed.
-    pub fn max_scroll(&self) -> u16 {
-        let vp = self.viewport.get().max(1) as usize;
-        self.lines.len().saturating_sub(vp).min(u16::MAX as usize) as u16
+    /// Whether the log marks its steps, so it draws fold headers and has a cursor.
+    pub fn sectioned(&self) -> bool {
+        !self.sections.is_empty()
     }
 
-    /// Top visible line: the bottom while following, else `scroll` clamped.
+    /// The last row the top of the viewport can sit on. Before the first frame the viewport is
+    /// unknown, so a single row is assumed.
+    pub fn max_scroll(&self) -> u16 {
+        let vp = self.viewport.get().max(1) as usize;
+        self.rows.len().saturating_sub(vp).min(u16::MAX as usize) as u16
+    }
+
+    /// Top visible row: the bottom while following, else `scroll` clamped.
     pub fn effective_scroll(&self) -> u16 {
         if self.follow {
             self.max_scroll()
@@ -1146,9 +1430,190 @@ impl LogView {
         }
     }
 
-    /// Scrolls by `delta` lines. Scrolling up breaks follow; scrolling down never re-arms it
-    /// (only `G`/End does).
+    /// The cursor's row: the last one while following.
+    pub fn cursor_row(&self) -> usize {
+        let last = self.rows.len().saturating_sub(1);
+        if self.follow {
+            last
+        } else {
+            self.cursor.min(last)
+        }
+    }
+
+    /// The first line a row stands for (a header stands for its section's marker line).
+    pub fn row_line(&self, row: LogRow) -> usize {
+        match row {
+            LogRow::Line(l) => l,
+            LogRow::Header(s) | LogRow::Group(s, _) => self.sections.get(s).map_or(0, |s| s.start),
+        }
+    }
+
+    /// Whether section `s` is a step that passed.
+    fn section_passed(&self, s: usize) -> bool {
+        self.sections.get(s).and_then(|sec| sec.step).and_then(|j| self.step_passed.get(j)).copied().unwrap_or(false)
+    }
+
+    /// The row drawing `line`, or the first one after it (a hidden marker line has none).
+    fn row_of_line(&self, line: usize) -> usize {
+        let at = self.rows.partition_point(|r| self.row_line(*r) < line);
+        at.min(self.rows.len().saturating_sub(1))
+    }
+
+    fn section_of_line(&self, line: usize) -> Option<usize> {
+        self.sections.iter().position(|s| s.contains(line))
+    }
+
+    /// The row drawing section `section`'s header — its merged group's, when it is in one.
+    fn header_row(&self, section: usize) -> usize {
+        self.rows
+            .iter()
+            .position(|r| match *r {
+                LogRow::Header(s) => s == section,
+                LogRow::Group(a, b) => (a..=b).contains(&section),
+                LogRow::Line(_) => false,
+            })
+            .unwrap_or(0)
+    }
+
+    /// Rebuilds `rows` from the lines, sections and folds.
+    fn relayout(&mut self) {
+        let mut rows = Vec::with_capacity(self.lines.len());
+        if self.sections.is_empty() {
+            rows.extend((0..self.lines.len()).map(LogRow::Line));
+        } else {
+            let (mut line, mut next) = (0, 0);
+            while line < self.lines.len() {
+                while next < self.sections.len() && self.sections[next].start < line {
+                    next += 1;
+                }
+                // Two or more folded passed steps in a row read as one header.
+                let folded_pass = |s: usize| !self.open.contains(&s) && self.section_passed(s);
+                let mut last = next;
+                while next < self.sections.len()
+                    && self.sections[next].start == line
+                    && folded_pass(last)
+                    && last + 1 < self.sections.len()
+                    && folded_pass(last + 1)
+                    && self.sections[last + 1].start == self.sections[last].end
+                {
+                    last += 1;
+                }
+                if last > next {
+                    rows.push(LogRow::Group(next, last));
+                    line = self.sections[last].end.max(line + 1);
+                    next = last + 1;
+                    continue;
+                }
+                if let Some(sec) = self.sections.get(next).filter(|s| s.start == line) {
+                    rows.push(LogRow::Header(next));
+                    if self.open.contains(&next) {
+                        for l in sec.start + 1..sec.end.min(self.lines.len()) {
+                            if !runlog::is_hidden_marker(&self.lines[l]) {
+                                rows.push(LogRow::Line(l));
+                            }
+                        }
+                    }
+                    line = sec.end.max(line + 1);
+                    next += 1;
+                } else {
+                    if !runlog::is_hidden_marker(&self.lines[line]) {
+                        rows.push(LogRow::Line(line));
+                    }
+                    line += 1;
+                }
+            }
+        }
+        self.rows = rows;
+        if self.cursor >= self.rows.len() {
+            self.cursor = self.rows.len().saturating_sub(1);
+        }
+    }
+
+    /// Re-reads sections and the first error from `lines`, deciding the first folding once.
+    #[cfg(test)]
+    fn reparse(&mut self) {
+        self.reparse_from(self.base);
+    }
+
+    /// Re-reads the lines, where the previous ones started at absolute line `old_base`.
+    fn reparse_from(&mut self, old_base: usize) {
+        self.first_error = first_error_line(&self.lines);
+        // Folds are carried by absolute line: a section keeps its fold however much of the
+        // log's head a later poll drops.
+        let open_abs: HashSet<usize> =
+            self.open.iter().filter_map(|&s| self.sections.get(s)).map(|s| s.start + old_base).collect();
+        let last_abs = self.sections.last().map(|s| s.start + old_base);
+        self.sections = runlog::parse_step_sections(&self.lines, &self.steps);
+        let base = self.base;
+        self.open = (0..self.sections.len()).filter(|&s| open_abs.contains(&(self.sections[s].start + base))).collect();
+        let mut land = None;
+        if self.sectioned() {
+            if !self.folds_ready {
+                self.folds_ready = true;
+                land = self.initial_section();
+                self.open = land.into_iter().collect();
+            } else if self.live {
+                // Steps that started since the last poll are the ones being watched.
+                let fresh = (0..self.sections.len()).filter(|&s| last_abs.is_none_or(|l| self.sections[s].start + base > l));
+                self.open.extend(fresh.collect::<Vec<_>>());
+            }
+        }
+        self.relayout();
+        // Land on the opened step — its first error if it has one — with its header at the top.
+        if let Some(s) = land.filter(|_| !self.follow) {
+            let header = self.header_row(s);
+            let sec = &self.sections[s];
+            let err = self.lines[sec.start..sec.end.min(self.lines.len())].iter().position(|l| is_error_line(l));
+            self.cursor = err.map_or(header, |i| self.row_of_line(sec.start + i));
+            self.scroll = header.min(self.max_scroll() as usize) as u16;
+            self.ensure_cursor_visible();
+        }
+    }
+
+    /// The section to leave unfolded first: the step the pane was opened for, else the one
+    /// holding the first error, else — for a live job — the latest.
+    fn initial_section(&self) -> Option<usize> {
+        self.target_step
+            .and_then(|i| runlog::step_section(&self.sections, &self.steps, i))
+            .or_else(|| self.first_error.and_then(|l| self.section_of_line(l)))
+            .or_else(|| self.live.then(|| self.sections.len().checked_sub(1)).flatten())
+    }
+
+    /// Scrolls just enough to bring the cursor row into view.
+    fn ensure_cursor_visible(&mut self) {
+        let vp = self.viewport.get().max(1) as usize;
+        let top = self.effective_scroll() as usize;
+        let cursor = self.cursor_row();
+        if cursor < top {
+            self.scroll = cursor as u16;
+        } else if cursor >= top + vp {
+            self.scroll = (cursor + 1 - vp).min(self.max_scroll() as usize) as u16;
+        } else {
+            self.scroll = top as u16;
+        }
+    }
+
+    /// Moves the cursor (sectioned logs) by `delta` rows. Moving up breaks follow.
+    fn move_cursor(&mut self, delta: i32) {
+        let Some(last) = self.rows.len().checked_sub(1) else { return };
+        let top = self.effective_scroll();
+        self.cursor = (self.cursor_row() as i64 + i64::from(delta)).clamp(0, last as i64) as usize;
+        if delta < 0 && self.follow {
+            self.follow = false;
+            self.scroll = top;
+        }
+        if !self.follow {
+            self.ensure_cursor_visible();
+        }
+    }
+
+    /// Scrolls by `delta` rows — or, in a sectioned log, moves the cursor. Scrolling up breaks
+    /// follow; scrolling down never re-arms it (only `G`/End does).
     fn scroll_by(&mut self, delta: i32) {
+        if self.sectioned() {
+            self.move_cursor(delta);
+            return;
+        }
         let cur = self.effective_scroll() as i32;
         self.scroll = (cur + delta).clamp(0, self.max_scroll() as i32) as u16;
         if delta < 0 {
@@ -1158,18 +1623,139 @@ impl LogView {
 
     fn scroll_top(&mut self) {
         self.scroll = 0;
+        self.cursor = 0;
         self.follow = false;
     }
 
     fn scroll_bottom(&mut self) {
         self.scroll = self.max_scroll();
+        self.cursor = self.rows.len().saturating_sub(1);
         self.follow = true;
     }
 
-    /// Brings `line` into view with a couple of lines of context above it, and stops following.
+    /// Brings `line` into view with a couple of rows of context above it — unfolding its section
+    /// first — puts the cursor on it, and stops following.
     fn jump_to(&mut self, line: usize) {
         self.follow = false;
-        self.scroll = line.saturating_sub(2).min(self.max_scroll() as usize) as u16;
+        if let Some(s) = self.section_of_line(line) {
+            if self.open.insert(s) {
+                self.relayout();
+            }
+        }
+        let row = self.row_of_line(line);
+        self.cursor = row;
+        self.scroll = row.saturating_sub(2).min(self.max_scroll() as usize) as u16;
+    }
+
+    /// `z`: folds or unfolds the section under the cursor, keeping the cursor on its header.
+    fn toggle_fold(&mut self) {
+        if !self.sectioned() {
+            return;
+        }
+        let section = match self.rows.get(self.cursor_row()).copied() {
+            Some(LogRow::Header(s)) => Some(s),
+            Some(LogRow::Group(a, b)) => {
+                // A merged group opens every step in it.
+                let top = self.effective_scroll();
+                self.follow = false;
+                self.scroll = top;
+                self.open.extend(a..=b);
+                self.relayout();
+                self.cursor = self.header_row(a);
+                self.ensure_cursor_visible();
+                return;
+            }
+            Some(LogRow::Line(l)) => self.section_of_line(l),
+            None => None,
+        };
+        let Some(s) = section else { return };
+        let top = self.effective_scroll();
+        self.follow = false;
+        self.scroll = top;
+        if !self.open.remove(&s) {
+            self.open.insert(s);
+        }
+        self.relayout();
+        self.cursor = self.header_row(s);
+        self.ensure_cursor_visible();
+    }
+
+    /// `Z`: unfolds every section, or folds them all when all are already open.
+    fn toggle_all_folds(&mut self) {
+        if !self.sectioned() {
+            return;
+        }
+        let line = self.rows.get(self.cursor_row()).map(|r| self.row_line(*r));
+        let top = self.effective_scroll();
+        self.follow = false;
+        self.scroll = top;
+        if self.open.len() == self.sections.len() {
+            self.open.clear();
+        } else {
+            self.open = (0..self.sections.len()).collect();
+        }
+        self.relayout();
+        if let Some(line) = line {
+            self.cursor = match self.section_of_line(line) {
+                Some(s) if !self.open.contains(&s) => self.header_row(s),
+                _ => self.row_of_line(line),
+            };
+        }
+        self.ensure_cursor_visible();
+    }
+
+    /// Unfolds the `index`th step's section and puts its header at the top. Before the lines
+    /// arrive this just records the step, for the first folding to open.
+    pub fn focus_step(&mut self, index: usize) {
+        self.target_step = Some(index);
+        if !self.loaded || !self.sectioned() {
+            return;
+        }
+        match runlog::step_section(&self.sections, &self.steps, index) {
+            Some(s) => {
+                self.open.insert(s);
+                self.relayout();
+                self.follow = false;
+                self.cursor = self.header_row(s);
+                self.scroll = self.cursor.min(self.max_scroll() as usize) as u16;
+            }
+            None => {
+                let name = self.steps.get(index).cloned().unwrap_or_default();
+                self.note = Some(format!("no section for {name} in this log"));
+            }
+        }
+    }
+
+    /// Queues a jump for when the lines arrive, or makes it now if they already have.
+    pub fn request_jump(&mut self, jump: LogJump) {
+        self.pending = Some(jump);
+        if self.loaded {
+            self.apply_pending();
+        }
+    }
+
+    fn apply_pending(&mut self) {
+        let Some(jump) = self.pending.take() else { return };
+        match jump {
+            LogJump::FirstError => self.jump_first_error(),
+            LogJump::Find(needles) => {
+                let hit = needles
+                    .iter()
+                    .filter(|n| !n.is_empty())
+                    .find_map(|n| self.lines.iter().position(|l| l.contains(n.as_str())));
+                match hit {
+                    Some(i) => {
+                        self.jump_to(i);
+                        self.note = Some(format!("line {}", i + 1));
+                    }
+                    None => {
+                        self.jump_first_error();
+                        let what = needles.first().cloned().unwrap_or_default();
+                        self.note = Some(format!("{what} isn't in this log — first error instead"));
+                    }
+                }
+            }
+        }
     }
 
     /// Replaces the lines with a fresh fetch, keeping the tail past [`LOG_MAX_LINES`], the view
@@ -1178,19 +1764,36 @@ impl LogView {
         let lines: Vec<String> =
             if text.trim().is_empty() { vec!["(no logs returned)".into()] } else { text.lines().map(str::to_owned).collect() };
         let (lines, dropped) = cap_tail(lines, LOG_MAX_LINES);
-        let prev_match = self.match_idx.and_then(|i| self.matches.get(i).copied());
+        // Everything below is remembered as an absolute line (`base` + index), then mapped back
+        // onto the new lines and rows: the head the cap drops can grow between polls.
+        let old_base = self.base;
+        let abs = |line: usize| line + old_base;
+        let prev_match = self.match_idx.and_then(|i| self.matches.get(i).copied()).map(abs);
+        let keep_view = self.loaded && !self.follow;
+        let top_line = keep_view.then(|| self.rows.get(self.effective_scroll() as usize).map(|r| abs(self.row_line(*r)))).flatten();
+        let cursor_line = (keep_view && self.sectioned())
+            .then(|| self.rows.get(self.cursor).map(|r| abs(self.row_line(*r))))
+            .flatten();
         self.lines = lines;
-        if !self.follow {
-            self.scroll = self.scroll.saturating_sub(dropped.min(u16::MAX as usize) as u16);
+        self.base = dropped;
+        self.reparse_from(old_base);
+        let local = |line: usize| line.saturating_sub(dropped);
+        if let Some(line) = top_line {
+            self.scroll = self.row_of_line(local(line)).min(self.max_scroll() as usize) as u16;
+        }
+        if let Some(line) = cursor_line {
+            self.cursor = self.row_of_line(local(line));
         }
         self.recompute_matches();
         self.match_idx = match prev_match {
             Some(line) if !self.matches.is_empty() => {
-                let target = line.saturating_sub(dropped);
+                let target = local(line);
                 Some(self.matches.iter().position(|&m| m >= target).unwrap_or(self.matches.len() - 1))
             }
             _ => None,
         };
+        self.loaded = true;
+        self.apply_pending();
     }
 
     fn recompute_matches(&mut self) {
@@ -1212,7 +1815,7 @@ impl LogView {
         if self.matches.is_empty() {
             return;
         }
-        let top = self.effective_scroll() as usize;
+        let top = self.rows.get(self.effective_scroll() as usize).map_or(0, |r| self.row_line(*r));
         let idx = self.matches.iter().position(|&m| m >= top).unwrap_or(0);
         self.match_idx = Some(idx);
         self.jump_to(self.matches[idx]);
@@ -1270,72 +1873,6 @@ pub fn cap_tail(mut lines: Vec<String>, max: usize) -> (Vec<String>, usize) {
         lines.drain(..dropped);
     }
     (lines, dropped)
-}
-
-/// Whether a log line reports a failure: CI annotations (`##[error]`), test-runner verdicts
-/// (`[FAIL]`, `FAILED`), compiler diagnostics (`error:`, `error[E…]`, `ERROR`, `Error:`),
-/// `npm ERR!`, and a non-zero exit code. Summary lines that count zero failures (`0 errors`,
-/// `Failed: 0`, `exit code 0`) don't qualify.
-pub fn is_error_line(line: &str) -> bool {
-    if line.contains("##[error]") || line.contains("[FAIL]") || line.contains("npm ERR!") {
-        return true;
-    }
-    if has_token(line, "FAILED", |_| true) || has_token(line, "FAIL", |_| true) || has_token(line, "ERROR", |_| true) {
-        return true;
-    }
-    // Title-case verdicts (`Failed!`, `Tests Failed: 3`) — but not prose like `Failed to retry`.
-    if has_token(line, "Failed", |next| matches!(next, Some('!' | ':'))) {
-        return true;
-    }
-    if has_token(line, "error", |next| matches!(next, Some(':' | '['))) || has_token(line, "Error", |next| next == Some(':')) {
-        return true;
-    }
-    nonzero_exit_code(line)
-}
-
-/// `word` as a whole token (not inside a longer identifier) whose following character passes
-/// `next_ok`, and which isn't a zero count (`0 FAILED`, `ERROR: 0`).
-fn has_token(line: &str, word: &str, next_ok: impl Fn(Option<char>) -> bool) -> bool {
-    let is_word = |c: char| c.is_alphanumeric() || c == '_';
-    line.match_indices(word).any(|(i, _)| {
-        let before = line[..i].chars().next_back();
-        let rest = &line[i + word.len()..];
-        let after = rest.chars().next();
-        !before.is_some_and(is_word)
-            && !after.is_some_and(is_word)
-            && next_ok(after)
-            && !ends_with_zero(&line[..i])
-            && !starts_with_zero(rest)
-    })
-}
-
-/// `text` ends in the number 0 (ignoring trailing spaces), e.g. the `0 ` of `0 FAILED`.
-fn ends_with_zero(text: &str) -> bool {
-    let t = text.trim_end();
-    t.ends_with('0') && !t[..t.len() - 1].ends_with(|c: char| c.is_ascii_digit())
-}
-
-/// `text` is a count of 0 after optional `:`/`=`/spaces, e.g. the `: 0` of `ERROR: 0`.
-fn starts_with_zero(text: &str) -> bool {
-    let t = text.trim_start_matches([':', '=', ' ']);
-    t.starts_with('0') && !t[1..].starts_with(|c: char| c.is_ascii_digit())
-}
-
-/// `exit code N` / `exited with code N` (any case) with N other than 0.
-fn nonzero_exit_code(line: &str) -> bool {
-    let lower = line.to_ascii_lowercase();
-    ["exit code", "exited with code"].iter().any(|pat| {
-        lower.match_indices(pat).any(|(i, _)| {
-            let rest = lower[i + pat.len()..].trim_start_matches([':', ' ']);
-            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-            !digits.is_empty() && !digits.trim_start_matches('0').is_empty()
-        })
-    })
-}
-
-/// Index of the first line [`is_error_line`] matches.
-pub fn first_error_line(lines: &[String]) -> Option<usize> {
-    lines.iter().position(|l| is_error_line(l))
 }
 
 /// Lines containing `query`, compared ASCII-case-insensitively (so byte offsets line up with
@@ -1447,6 +1984,30 @@ pub struct PipelineView {
     /// Set on open (see `open_pipeline_for`) and cleared only in `apply_pipeline_detail`, once a
     /// real fetch has actually answered.
     pub stale: bool,
+    /// Whether this run's provider can re-run a whole run / only its failed jobs, and list its
+    /// artifacts. From the detail fetch; `false` until it answers.
+    pub supports_rerun: bool,
+    pub supports_rerun_failed: bool,
+    pub supports_artifacts: bool,
+    /// Whether this provider's rerun (all / failed only) starts a separate run.
+    pub rerun_new_run: bool,
+    pub rerun_failed_new_run: bool,
+    /// Problems the run reported (the Problems panel), most severe first.
+    pub annotations: Vec<PipelineAnnotation>,
+    /// Keys go to the Problems panel (`e`), and which problem is selected.
+    pub problem_focus: bool,
+    pub problem_sel: usize,
+    /// Recent runs of this pipeline on this branch. Rebuilt by the app from its list rows.
+    pub history: Option<RunHistory>,
+    /// Estimated durations for an in-flight run. Rebuilt by the app.
+    pub estimates: Estimates,
+    /// Folded step groups (`….pass` / `….post` keys) the user opened. They start folded, so
+    /// unlike `collapsed` this records the exceptions.
+    unfolded: HashSet<String>,
+    /// The artifacts overlay, while open.
+    pub artifacts: Option<ArtifactsPanel>,
+    /// What the failed job's log says went wrong, read when that log loads: `(job id, summary)`.
+    pub log_failure: Option<(String, FailureSummary)>,
 }
 
 impl PipelineView {
@@ -1470,6 +2031,19 @@ impl PipelineView {
             can_respond_approvals: false,
             approvals: Vec::new(),
             stale: false,
+            supports_rerun: false,
+            supports_rerun_failed: false,
+            supports_artifacts: false,
+            rerun_new_run: false,
+            rerun_failed_new_run: false,
+            annotations: Vec::new(),
+            problem_focus: false,
+            problem_sel: 0,
+            history: None,
+            estimates: Estimates::default(),
+            unfolded: HashSet::new(),
+            artifacts: None,
+            log_failure: None,
         }
     }
 
@@ -1485,6 +2059,23 @@ impl PipelineView {
     /// approve/reject (see [`PipelineView::actionable_approvals`]), so only a call that actually
     /// answered may set them — never a value read back out of the cache, which may name a gate
     /// that was decided an hour ago.
+    /// Takes the problems and capabilities a detail carries.
+    fn apply_extras(&mut self, detail: &PipelineDetail) {
+        // An in-flight run's problems are the last attempt's; they come back once it finishes.
+        self.annotations = if is_active(detail.run.status) { Vec::new() } else { detail.annotations.clone() };
+        if self.problem_sel >= self.annotations.len() {
+            self.problem_sel = self.annotations.len().saturating_sub(1);
+        }
+        if self.annotations.is_empty() {
+            self.problem_focus = false;
+        }
+        self.supports_rerun = detail.supports_rerun;
+        self.supports_rerun_failed = detail.supports_rerun_failed;
+        self.supports_artifacts = detail.supports_artifacts;
+        self.rerun_new_run = detail.rerun_new_run;
+        self.rerun_failed_new_run = detail.rerun_failed_new_run;
+    }
+
     fn apply_fresh_run(&mut self, run: PipelineRun, approvals: Option<Vec<PipelineApproval>>) {
         self.run = run;
         self.apply_confirmed_approvals(approvals);
@@ -1518,26 +2109,36 @@ impl PipelineView {
         }
     }
 
-    /// Row of a job (or one of its steps) in [`PipelineView::flatten`]'s order, assuming its
-    /// stage (and, for a step, the job) is expanded.
-    fn node_index(&self, si: usize, ji: usize, step: Option<usize>) -> usize {
-        let mut idx = 0;
-        for (s, stage) in self.run.stages.iter().enumerate() {
-            idx += 1; // the stage row
-            if s < si && self.collapsed.contains(&format!("s{s}")) {
-                continue;
-            }
-            for (j, job) in stage.jobs.iter().enumerate() {
-                if s == si && j == ji {
-                    return idx + step.map_or(0, |k| k + 1);
-                }
-                idx += 1;
-                if !self.collapsed.contains(&format!("s{s}.j{j}")) {
-                    idx += job.steps.len();
-                }
-            }
+    /// Row of a job (or one of its steps) in [`PipelineView::flatten`]'s order. Its stage and
+    /// job must already be expanded; a step folded into a group has that group opened. A job whose
+    /// own row isn't drawn (a single-job run) lands on its first row.
+    fn node_index(&mut self, si: usize, ji: usize, step: Option<usize>) -> usize {
+        let find = |nodes: &[FlatNode]| {
+            nodes.iter().position(|n| !n.group && n.stage == si && n.job == Some(ji) && n.step == step)
+        };
+        if let Some(i) = find(&self.flatten()) {
+            return i;
         }
-        idx
+        self.unfolded.insert(format!("s{si}.j{ji}.pass"));
+        self.unfolded.insert(format!("s{si}.j{ji}.post"));
+        let nodes = self.flatten();
+        find(&nodes)
+            .or_else(|| nodes.iter().position(|n| n.stage == si && n.job == Some(ji)))
+            .unwrap_or(0)
+    }
+
+    /// The node under the cursor.
+    pub fn selected_node(&self) -> Option<FlatNode> {
+        self.flatten().into_iter().nth(self.selected)
+    }
+
+    /// The run's first failed node as `(job id, step name, step index)` — what the failure line
+    /// names and `E` opens.
+    pub fn failed_target(&self) -> Option<(String, String, Option<usize>)> {
+        let (si, ji, step) = first_failed_node(&self.run)?;
+        let job = self.run.stages.get(si)?.jobs.get(ji)?;
+        let name = step.and_then(|k| job.steps.get(k)).map_or_else(|| job.name.clone(), |s| s.name.clone());
+        Some((job.id.clone(), name, step))
     }
 
     /// Whether the job the log pane follows is still running — the run's own status when the
@@ -1549,24 +2150,43 @@ impl PipelineView {
     }
 
     /// Opens (or re-targets) the log pane on the selected node's job. Steps share their job's
-    /// log, so moving between a job and its steps keeps the pane as it is. Returns false when
-    /// the node has no job (a stage).
+    /// log, so moving between a job and its steps keeps the pane — landing on a step unfolds its
+    /// section. Returns false when the node has no job (a stage).
     fn open_logs_for_selection(&mut self) -> bool {
         let nodes = self.flatten();
         let Some(node) = nodes.get(self.selected) else { return false };
         let Some(job_id) = node.job_id.clone() else { return false };
-        if self.logs.as_ref().is_some_and(|l| l.job_id == job_id) {
-            return true;
+        let step = if node.group { None } else { node.step };
+        let reuse = self.logs.as_ref().is_some_and(|l| l.job_id == job_id);
+        let log = self.open_logs_for_job(&job_id, step);
+        if reuse {
+            if let Some(k) = step {
+                log.focus_step(k);
+            }
         }
-        let job = self.run.stages.iter().flat_map(|s| &s.jobs).find(|j| j.id == job_id);
-        let label = job.map_or_else(|| node.label.clone(), |j| j.name.clone());
-        let live = is_active(job.map_or(self.run.status, |j| j.status));
-        // A search carries over to the next job: it is usually the same question.
-        let query = self.logs.as_mut().and_then(|l| l.query.take());
-        let mut log = LogView::new(format!("Logs · {label}"), job_id, live);
-        log.query = query;
-        self.logs = Some(log);
         true
+    }
+
+    /// The log pane on `job_id`, opening it if it shows another job (or none). A new pane lands
+    /// on `step`, or on the job's failed step.
+    fn open_logs_for_job(&mut self, job_id: &str, step: Option<usize>) -> &mut LogView {
+        if !self.logs.as_ref().is_some_and(|l| l.job_id == job_id) {
+            let job = self.run.stages.iter().flat_map(|s| &s.jobs).find(|j| j.id == job_id);
+            let label = job.map_or_else(|| job_id.to_string(), |j| j.name.clone());
+            let live = is_active(job.map_or(self.run.status, |j| j.status));
+            // A search carries over to the next job: it is usually the same question.
+            let query = self.logs.as_mut().and_then(|l| l.query.take());
+            let mut log = LogView::new(format!("Logs · {label}"), job_id.to_string(), live);
+            log.query = query;
+            if let Some(job) = job {
+                log.steps = job.steps.iter().map(|s| s.name.clone()).collect();
+                log.step_passed = job.steps.iter().map(|s| s.status == PipelineRunStatus::Succeeded).collect();
+            }
+            log.target_step =
+                step.or_else(|| job.and_then(|j| j.steps.iter().position(|s| s.status == PipelineRunStatus::Failed)));
+            self.logs = Some(log);
+        }
+        self.logs.as_mut().expect("the pane was just opened")
     }
 
     /// Whether keys go to the log pane: it is open, and either focused or alone on screen.
@@ -1589,57 +2209,137 @@ impl PipelineView {
     }
 
     /// Flattens stages/jobs/steps into visible rows, honouring collapsed nodes.
+    ///
+    /// A run with a single stage drops the stage row (GitHub's synthetic `jobs`), and a single
+    /// stage with a single job drops the job row too, so the steps sit at the top. Leading passed
+    /// steps of a failed run and trailing cleanup steps fold into one row each (see
+    /// [`step_folds`]); those start folded and open on ↵.
     pub fn flatten(&self) -> Vec<FlatNode> {
         let mut out = Vec::new();
+        let single_stage = self.run.stages.len() == 1;
+        let failed = self.run.status == PipelineRunStatus::Failed;
         for (si, stage) in self.run.stages.iter().enumerate() {
             let key = format!("s{si}");
             let expanded = !self.collapsed.contains(&key);
-            out.push(FlatNode {
-                depth: 0,
-                label: stage.name.clone(),
-                status: stage.status,
-                key: (!stage.jobs.is_empty()).then(|| key.clone()),
-                expanded,
-                duration: stage_duration(&stage.jobs),
-                problem: None,
-                url: None,
-                job_id: None,
-            });
-            if !expanded {
-                continue;
+            if !single_stage {
+                let start = stage.jobs.iter().filter_map(|j| j.started_at).min();
+                let finish = if stage.jobs.iter().all(|j| j.finished_at.is_some()) {
+                    stage.jobs.iter().filter_map(|j| j.finished_at).max()
+                } else {
+                    None
+                };
+                out.push(FlatNode {
+                    depth: 0,
+                    label: stage.name.clone(),
+                    status: stage.status,
+                    key: (!stage.jobs.is_empty()).then(|| key.clone()),
+                    expanded,
+                    duration: stage_duration(&stage.jobs),
+                    problem: None,
+                    url: None,
+                    job_id: None,
+                    started_at: start,
+                    finished_at: finish,
+                    stage: si,
+                    job: None,
+                    step: None,
+                    group: false,
+                });
+                if !expanded {
+                    continue;
+                }
             }
+            let job_depth = usize::from(!single_stage);
+            let single_job = single_stage && stage.jobs.len() == 1 && !stage.jobs[0].steps.is_empty();
             for (ji, job) in stage.jobs.iter().enumerate() {
                 let jkey = format!("s{si}.j{ji}");
-                let jexpanded = !self.collapsed.contains(&jkey);
-                out.push(FlatNode {
-                    depth: 1,
-                    label: job.name.clone(),
-                    status: job.status,
-                    key: (!job.steps.is_empty()).then(|| jkey.clone()),
-                    expanded: jexpanded,
-                    duration: fmt_duration(job.started_at, job.finished_at),
-                    problem: job.problem.clone(),
-                    url: job.url.clone(),
-                    job_id: Some(job.id.clone()),
-                });
+                let jexpanded = single_job || !self.collapsed.contains(&jkey);
+                if !single_job {
+                    out.push(FlatNode {
+                        depth: job_depth,
+                        label: job.name.clone(),
+                        status: job.status,
+                        key: (!job.steps.is_empty()).then(|| jkey.clone()),
+                        expanded: jexpanded,
+                        duration: fmt_duration(job.started_at, job.finished_at),
+                        problem: job.problem.clone(),
+                        url: job.url.clone(),
+                        job_id: Some(job.id.clone()),
+                        started_at: job.started_at,
+                        finished_at: job.finished_at,
+                        stage: si,
+                        job: Some(ji),
+                        step: None,
+                        group: false,
+                    });
+                }
                 if jexpanded {
-                    for step in &job.steps {
-                        out.push(FlatNode {
-                            depth: 2,
-                            label: step.name.clone(),
-                            status: step.status,
-                            key: None,
-                            expanded: false,
-                            duration: fmt_duration(step.started_at, step.finished_at),
-                            problem: None,
-                            url: job.url.clone(),
-                            job_id: Some(job.id.clone()),
-                        });
-                    }
+                    let depth = if single_job { job_depth } else { job_depth + 1 };
+                    self.flatten_steps(&mut out, si, ji, job, depth, failed);
                 }
             }
         }
         out
+    }
+
+    /// A job's step rows, with its passed and cleanup runs folded into group rows.
+    fn flatten_steps(&self, out: &mut Vec<FlatNode>, si: usize, ji: usize, job: &PipelineJob, depth: usize, failed: bool) {
+        let (passed, cleanup) = step_folds(job, failed);
+        let step_node = |k: usize, step: &PipelineStep, depth: usize| FlatNode {
+            depth,
+            label: step.name.clone(),
+            status: step.status,
+            key: None,
+            expanded: false,
+            duration: fmt_duration(step.started_at, step.finished_at),
+            problem: None,
+            url: job.url.clone(),
+            job_id: Some(job.id.clone()),
+            started_at: step.started_at,
+            finished_at: step.finished_at,
+            stage: si,
+            job: Some(ji),
+            step: Some(k),
+            group: false,
+        };
+        let group = |out: &mut Vec<FlatNode>, range: std::ops::Range<usize>, label: String, suffix: &str| {
+            let key = format!("s{si}.j{ji}.{suffix}");
+            let open = self.unfolded.contains(&key);
+            let steps = &job.steps[range.clone()];
+            let (start, finish) = steps_span(steps);
+            out.push(FlatNode {
+                depth,
+                label,
+                status: steps_status(steps),
+                key: Some(key),
+                expanded: open,
+                duration: fmt_duration(start, finish),
+                problem: None,
+                url: job.url.clone(),
+                job_id: Some(job.id.clone()),
+                started_at: start,
+                finished_at: finish,
+                stage: si,
+                job: Some(ji),
+                step: None,
+                group: true,
+            });
+            if open {
+                for k in range {
+                    out.push(step_node(k, &job.steps[k], depth + 1));
+                }
+            }
+        };
+        if passed > 0 {
+            group(out, 0..passed, format!("{passed} steps passed"), "pass");
+        }
+        for k in passed..cleanup {
+            out.push(step_node(k, &job.steps[k], depth));
+        }
+        if cleanup < job.steps.len() {
+            let n = job.steps.len() - cleanup;
+            group(out, cleanup..job.steps.len(), format!("{n} post & cleanup steps"), "post");
+        }
     }
 
     fn move_sel(&mut self, delta: isize) {
@@ -1663,8 +2363,10 @@ impl PipelineView {
     /// Expands/collapses the node under the cursor (no-op on leaf steps).
     fn toggle_selected(&mut self) {
         if let Some(Some(key)) = self.flatten().get(self.selected).map(|n| n.key.clone()) {
-            if !self.collapsed.remove(&key) {
-                self.collapsed.insert(key);
+            // Folded step groups start closed, so they record the opened ones instead.
+            let set = if key.ends_with(".pass") || key.ends_with(".post") { &mut self.unfolded } else { &mut self.collapsed };
+            if !set.remove(&key) {
+                set.insert(key);
             }
             let len = self.flatten().len();
             if self.selected >= len {
@@ -1886,6 +2588,14 @@ impl App {
             preview_focus: false,
             content_w: 0,
             log_inflight: None,
+            run_details: HashMap::new(),
+            estimate_requested: HashSet::new(),
+            clipboard: osc52_clipboard,
+            run_actions: HashMap::new(),
+            next_run_action: 0,
+            held_runs: HashMap::new(),
+            follow_new_run: None,
+            annotations_asked: std::cell::RefCell::new(HashMap::new()),
         }
     }
 
@@ -2599,6 +3309,7 @@ impl App {
         match event {
             AppEvent::Reloaded(r) => {
                 self.apply_reloaded(*r, deps);
+                self.follow_started_run(deps);
                 self.refresh_preview_row();
                 // The scope indicator's denominator depends on the catalog the fetch may have
                 // just brought back, so it is recomputed here rather than inside the fetch.
@@ -2611,6 +3322,14 @@ impl App {
                 self.with_preview_screen(&key.clone(), |app| app.apply_wi_detail(deps, key, *detail, fetched_at));
             }
             AppEvent::PipelineDetailLoaded { key, detail, fetched_at } => {
+                // Every run detail seen this session feeds the job estimates of in-flight runs.
+                if let Some(run) = &detail.run {
+                    self.run_details.insert(key.clone(), run.clone());
+                }
+                // Problems that weren't answered may be asked for again.
+                if detail.annotations.is_none() {
+                    self.annotations_asked.borrow_mut().remove(&key);
+                }
                 self.with_preview_screen(&key.clone(), |app| app.apply_pipeline_detail(deps, key, *detail, fetched_at));
             }
             AppEvent::PrDecorationsLoaded { items } => {
@@ -2619,8 +3338,14 @@ impl App {
             AppEvent::PipelineLogsLoaded { conn_id, run_id, job_id, text } => {
                 self.apply_pipeline_logs(&conn_id, &run_id, &job_id, text);
             }
+            AppEvent::PipelineArtifactsLoaded { conn_id, run_id, result } => {
+                self.apply_pipeline_artifacts(&conn_id, &run_id, result);
+            }
+            AppEvent::PipelineRunActionDone { token, result } => self.finish_run_action(token, result, deps),
         }
         self.drive_logs(deps);
+        self.refresh_pipeline_context();
+        self.request_estimates(deps);
     }
 
 
@@ -2825,6 +3550,7 @@ impl App {
     /// [`PREVIEW_SETTLE_TICKS`].
     pub fn tick_preview(&mut self, deps: &AppDeps) {
         self.settle_preview(deps);
+        self.refresh_pipeline_context();
         let request = match self.preview.as_mut() {
             Some(p) if !p.sent => {
                 p.ticks = p.ticks.saturating_add(1);
@@ -2837,6 +3563,7 @@ impl App {
             _ => return,
         };
         self.send_detail_request(deps, request);
+        self.request_estimates(deps);
     }
 
     /// After a refresh, carries the fresh list row into the preview (a PR's status, reviewers
@@ -2869,11 +3596,26 @@ impl App {
         }
     }
 
+    /// Whether a detail fetch for the pipeline view `key` names should ask for its problems: only
+    /// for a finished run (an in-flight one hasn't reported them yet), and once per status — a
+    /// finished run's problems don't change until it runs again. Records the ask.
+    fn wants_annotations(&self, key: &str) -> bool {
+        let view = [Some(&self.screen), self.preview.as_ref().map(|p| &p.view)].into_iter().flatten().find_map(|s| match s {
+            Screen::Pipeline(v) if pipeline_detail_cache_key(&v.connection_id, &v.run.item_ref()) == key => Some(v),
+            _ => None,
+        });
+        let Some(status) = view.map(|v| v.run.status).filter(|s| !is_active(*s)) else { return false };
+        self.annotations_asked.borrow_mut().insert(key.to_string(), status) != Some(status)
+    }
+
     fn send_detail_request(&self, deps: &AppDeps, request: DetailRequest) {
         match request {
             DetailRequest::Pr { conn_id, item, key } => self.request_pr_detail(deps, conn_id, item, key),
             DetailRequest::Wi { conn_id, item, key } => self.request_wi_detail(deps, conn_id, item, key),
-            DetailRequest::Pipeline { conn_id, item, key } => self.request_pipeline_detail(deps, conn_id, item, key),
+            DetailRequest::Pipeline { conn_id, item, key } => {
+                let annotations = self.wants_annotations(&key);
+                self.request_pipeline_detail(deps, conn_id, item, key, annotations)
+            }
         }
     }
 
@@ -2906,10 +3648,11 @@ impl App {
     /// Moves the preview's view into the screen, still drawn beside the list.
     fn focus_preview(&mut self, deps: &AppDeps) {
         let Some(mut p) = self.preview.take() else { return };
+        // The view is the screen before its fetch goes out, so the fetch can see what it holds.
+        self.screen = std::mem::replace(&mut p.view, Screen::List);
         if !p.sent {
             self.send_detail_request(deps, p.request.clone());
         }
-        self.screen = std::mem::replace(&mut p.view, Screen::List);
         self.preview_focus = true;
         // Esc from the focused pane returns to this list.
         self.lp_origin = false;
@@ -3222,6 +3965,9 @@ impl App {
                         if log.query.is_some() {
                             out.extend([("Next match", c('n')), ("Previous match", c('N'))]);
                         }
+                        if log.sectioned() {
+                            out.extend([("Fold / unfold this step", c('z')), ("Fold / unfold every step", c('Z'))]);
+                        }
                         out.extend([("Toggle follow", c('f')), ("Jump to the first error", c('E')), ("Close logs", Key::Escape)]);
                     }
                     logs => {
@@ -3239,6 +3985,28 @@ impl App {
                         }
                         if v.can_respond_approvals && !v.actionable_approvals().is_empty() {
                             out.push(("Approve / reject a gate", c('A')));
+                        }
+                        let finished = !is_active(v.run.status);
+                        if finished && v.supports_rerun {
+                            out.push(("Rerun the run", c('R')));
+                        }
+                        if finished && v.supports_rerun_failed && v.run.status != PipelineRunStatus::Succeeded {
+                            out.push(("Rerun the failed jobs", c('F')));
+                        }
+                        if v.run.status == PipelineRunStatus::Failed {
+                            out.push(("Jump to the first error", c('E')));
+                        }
+                        if v.supports_artifacts {
+                            out.push(("List artifacts", c('a')));
+                        }
+                        if !v.annotations.is_empty() {
+                            out.push(("Problems", c('e')));
+                        }
+                        if v.run.commit_sha.as_deref().is_some_and(|s| !s.is_empty()) {
+                            out.push(("Copy the commit sha", c('c')));
+                        }
+                        if v.history.as_ref().is_some_and(|h| h.entries.len() > 1) {
+                            out.extend([("Older run", Key::Left), ("Newer run", Key::Right)]);
                         }
                         if self.selected_url().is_some() {
                             out.push(("Open the job in browser", c('o')));
@@ -3296,7 +4064,11 @@ impl App {
         let mut keys: Vec<Key> =
             if applies { self.context_actions().into_iter().map(|(_, k)| k).collect() } else { Vec::new() };
         if section == "Global" {
-            keys.extend([Key::Ctrl('k'), Key::Char('?'), Key::Char('B'), Key::Char('F')]);
+            keys.extend([Key::Ctrl('k'), Key::Char('?'), Key::Char('B')]);
+            // `F` is feedback everywhere but a pipeline run, where it reruns the failed jobs.
+            if !self.f_reruns() {
+                keys.push(Key::Char('F'));
+            }
             if !matches!(&self.screen, Screen::Pipeline(v) if v.logs_have_keys()) {
                 keys.extend([Key::Char('n'), Key::Char('N')]);
             }
@@ -3804,6 +4576,13 @@ impl App {
         self.request_pr_decorations(deps);
         take_section(&mut self.wis, r.wis, sections_ok.wis);
         take_section(&mut self.pipes, r.pipes, sections_ok.pipes);
+        if !self.held_runs.is_empty() {
+            for i in 0..self.pipes.len() {
+                let conn = self.pipes[i].connection_id.clone();
+                let run = self.pipes[i].run.clone();
+                self.pipes[i].run = self.settle_held(&conn, run);
+            }
+        }
         self.prune_pipe_expanded();
         take_section(&mut self.inbox, r.inbox, sections_ok.inbox);
         if self.inbox_sel >= self.inbox.len() {
@@ -3843,6 +4622,11 @@ impl App {
         // Keep the open pipeline view live, but only if it's still the same run (the user
         // may have navigated away during the fetch).
         if let Some((run_id, run, approvals)) = r.open_pipeline {
+            let conn = match &self.screen {
+                Screen::Pipeline(v) => v.connection_id.clone(),
+                _ => String::new(),
+            };
+            let run = self.settle_held(&conn, run);
             if let Screen::Pipeline(v) = &mut self.screen {
                 if v.run.id == run_id {
                     // This run came off the wire, so it confirms a cache-seeded view just as the
@@ -4087,8 +4871,29 @@ impl App {
     /// the flag, so the unchanged-check is skipped for it. Once confirmed, later revalidations
     /// that find nothing new go back to causing no repaint, same as the PR path.
     fn apply_pipeline_detail(&mut self, deps: &AppDeps, key: String, fetch: PipelineDetailFetch, fetched_at: DateTime<Utc>) {
-        let PipelineDetailFetch { run, approvals, supports_approvals, can_respond_approvals } = fetch;
-        if run.is_none() && approvals.is_none() && supports_approvals.is_none() && can_respond_approvals.is_none() {
+        let PipelineDetailFetch {
+            run,
+            approvals,
+            supports_approvals,
+            can_respond_approvals,
+            annotations,
+            supports_rerun,
+            supports_rerun_failed,
+            supports_artifacts,
+            rerun_new_run,
+            rerun_failed_new_run,
+        } = fetch;
+        if run.is_none()
+            && approvals.is_none()
+            && supports_approvals.is_none()
+            && can_respond_approvals.is_none()
+            && annotations.is_none()
+            && supports_rerun.is_none()
+            && supports_rerun_failed.is_none()
+            && supports_artifacts.is_none()
+            && rerun_new_run.is_none()
+            && rerun_failed_new_run.is_none()
+        {
             // Nothing was learned, so there is nothing to write and nothing to repaint.
             return;
         }
@@ -4110,21 +4915,37 @@ impl App {
             supports_approvals.unwrap_or_else(|| known.as_ref().map(|k| k.supports_approvals).unwrap_or(false));
         let resolved_can_respond = can_respond_approvals
             .unwrap_or_else(|| known.as_ref().map(|k| k.can_respond_approvals).unwrap_or(false));
+        // Unlike gates, problems and capabilities drive no write of their own, so the cache's
+        // answer may stand in for a call that failed.
+        let flag = |fresh: Option<bool>, cached: fn(&PipelineDetail) -> bool| {
+            fresh.unwrap_or_else(|| known.as_ref().is_some_and(cached))
+        };
         let detail = PipelineDetail {
             run: resolved_run,
             approvals: resolved_approvals,
             supports_approvals: resolved_supports,
             can_respond_approvals: resolved_can_respond,
+            annotations: annotations
+                .clone()
+                .unwrap_or_else(|| known.as_ref().map(|k| k.annotations.clone()).unwrap_or_default()),
+            supports_rerun: flag(supports_rerun, |k| k.supports_rerun),
+            supports_rerun_failed: flag(supports_rerun_failed, |k| k.supports_rerun_failed),
+            supports_artifacts: flag(supports_artifacts, |k| k.supports_artifacts),
+            rerun_new_run: flag(rerun_new_run, |k| k.rerun_new_run),
+            rerun_failed_new_run: flag(rerun_failed_new_run, |k| k.rerun_failed_new_run),
         };
         // See `apply_pr_detail`: a newer entry already won, so the screen must not go back.
         if deps.cache.put(&key, &detail, fetched_at) == CachePut::Stale {
             return;
         }
 
+        let conn = match &self.screen {
+            Screen::Pipeline(v) if pipeline_detail_cache_key(&v.connection_id, &v.run.item_ref()) == key => v.connection_id.clone(),
+            _ => return,
+        };
+        let mut detail = detail;
+        detail.run = self.settle_held(&conn, detail.run);
         let Screen::Pipeline(v) = &mut self.screen else { return };
-        if pipeline_detail_cache_key(&v.connection_id, &v.run.item_ref()) != key {
-            return;
-        }
         // `approvals`, never `detail.approvals`: a gate the cache remembers may already have been
         // decided, and `actionable_approvals` turns whatever is on screen into a real
         // approve/reject against the provider. A failed `pending_approvals` therefore leaves the
@@ -4134,9 +4955,11 @@ impl App {
             if v.stale || !pipeline_detail_unchanged(v, &detail, approvals.as_deref()) {
                 v.supports_approvals = detail.supports_approvals;
                 v.can_respond_approvals = detail.can_respond_approvals;
+                v.apply_extras(&detail);
                 v.apply_fresh_run(detail.run, approvals);
             }
         } else if !pipeline_detail_unchanged(v, &detail, approvals.as_deref()) {
+            v.apply_extras(&detail);
             // The run itself wasn't reconfirmed this round (only approvals/capabilities
             // answered) — patch those in place, but leave the run and `stale` exactly as they
             // are: only a real `get_run` may confirm the run is actually live.
@@ -4148,14 +4971,16 @@ impl App {
 
     /// Kicks off the background fetch for a just-opened pipeline view's detail, without blocking
     /// the render loop. Mirrors [`App::request_pr_detail`].
-    fn request_pipeline_detail(&self, deps: &AppDeps, conn_id: String, run: ItemRef, key: String) {
+    ///
+    /// `annotations` asks for the run's problems too — see [`App::wants_annotations`].
+    fn request_pipeline_detail(&self, deps: &AppDeps, conn_id: String, run: ItemRef, key: String, annotations: bool) {
         let Some(tx) = self.job_tx.clone() else {
             return;
         };
         let deps = deps.clone();
         let fetched_at = Utc::now();
         tokio::spawn(async move {
-            let detail = fetch_pipeline_detail(&deps, &conn_id, &run).await;
+            let detail = fetch_pipeline_detail(&deps, &conn_id, &run, annotations).await;
             let _ = tx.send(AppEvent::PipelineDetailLoaded { key, detail: Box::new(detail), fetched_at });
         });
     }
@@ -4407,6 +5232,8 @@ impl App {
         }
         self.settle_preview(deps);
         self.drive_logs(deps);
+        self.refresh_pipeline_context();
+        self.request_estimates(deps);
     }
 
     /// Resolves a mouse event against the last frame's hit map. Returns the key it stands for
@@ -4665,7 +5492,8 @@ impl App {
         }
         // `F` opens the GitHub feedback issue form (available from anywhere). Input-capturing
         // modes above retain priority so an uppercase F can still be typed into them.
-        if key == Key::Char('F') {
+        // Inside a pipeline run `F` reruns its failed jobs instead (see `on_pipeline_screen_key`).
+        if key == Key::Char('F') && !self.f_reruns() {
             self.open_feedback();
             return;
         }
@@ -4700,7 +5528,9 @@ impl App {
         // Full-screen sub-views handle their own keys.
         match self.screen {
             Screen::Pipeline(_) => {
-                self.on_pipeline_screen_key(key);
+                if !self.on_pipeline_deps_key(key, deps) {
+                    self.on_pipeline_screen_key(key);
+                }
                 return;
             }
             Screen::Config(_) => {
@@ -5609,14 +6439,16 @@ impl App {
     ) -> (Screen, DetailRequest) {
         let item = ItemRef::maybe(fallback.repository.clone(), run_id);
         let key = pipeline_detail_cache_key(&conn_id, &item);
-        let (run, supports_approvals, can_respond_approvals) = match deps.cache.get::<PipelineDetail>(&key) {
-            Some(entry) => (entry.value.run, entry.value.supports_approvals, entry.value.can_respond_approvals),
-            None => (fallback, false, false),
-        };
+        let cached = deps.cache.get::<PipelineDetail>(&key).map(|entry| entry.value);
+        let run = cached.as_ref().map_or(fallback, |d| d.run.clone());
 
         let mut view = PipelineView::new(title, run, conn_id.clone(), provider, definition_id, branch);
-        view.supports_approvals = supports_approvals;
-        view.can_respond_approvals = can_respond_approvals;
+        if let Some(d) = &cached {
+            view.supports_approvals = d.supports_approvals;
+            view.can_respond_approvals = d.can_respond_approvals;
+            // Gates never seed (see above); problems and capabilities drive no write of their own.
+            view.apply_extras(d);
+        }
         view.stale = true;
         view.auto_select_failed();
         (Screen::Pipeline(Box::new(view)), DetailRequest::Pipeline { conn_id, item, key })
@@ -5647,6 +6479,10 @@ impl App {
         };
         let key = pipeline_detail_cache_key(&conn_id, &run_ref);
         let known = deps.cache.get::<PipelineDetail>(&key).map(|e| e.value);
+        let annotations = match &self.screen {
+            Screen::Pipeline(v) => v.annotations.clone(),
+            _ => known.as_ref().map(|k| k.annotations.clone()).unwrap_or_default(),
+        };
         let detail = PipelineDetail {
             run: run.clone(),
             approvals: approvals
@@ -5655,6 +6491,12 @@ impl App {
                 .unwrap_or_default(),
             supports_approvals,
             can_respond_approvals,
+            annotations,
+            supports_rerun: feed.source.supports_rerun(),
+            supports_rerun_failed: feed.source.supports_rerun_failed(),
+            supports_artifacts: feed.source.supports_artifacts(),
+            rerun_new_run: feed.source.rerun_starts_new_run(false),
+            rerun_failed_new_run: feed.source.rerun_starts_new_run(true),
         };
         if deps.cache.put(&key, &detail, fetched_at) == CachePut::Stale {
             return; // the store holds something newer — see `apply_pr_detail`
@@ -5779,6 +6621,719 @@ impl App {
         self.rebuild_launchpad();
     }
 
+    // ---- run pane: history, estimates, problems, rerun / cancel, artifacts, copy ----
+
+    /// Whether `F` reruns failed jobs here rather than opening the feedback form: only on a
+    /// finished run whose provider can rerun just the failed jobs.
+    fn f_reruns(&self) -> bool {
+        matches!(&self.screen, Screen::Pipeline(v) if v.supports_rerun_failed && !is_active(v.run.status))
+    }
+
+    /// Recent runs of the view's pipeline on its branch, from the list rows (no fetch).
+    fn pipeline_history(&self, v: &PipelineView) -> Option<RunHistory> {
+        let branch = v.run.branch.as_deref().or(v.branch.as_deref());
+        let same_pipeline = |p: &PipeRow| {
+            p.connection_id == v.connection_id && p.run.definition_id == v.run.definition_id && p.run.repository == v.run.repository
+        };
+        let distinct = |rows: &[usize]| rows.iter().map(|&i| self.pipes[i].run.id.as_str()).collect::<HashSet<_>>().len();
+        let mut rows: Vec<usize> =
+            (0..self.pipes.len()).filter(|&i| same_pipeline(&self.pipes[i]) && self.pipes[i].run.branch.as_deref() == branch).collect();
+        // A branch with a single run — a tag, typically — says nothing on its own: show the
+        // pipeline's runs on every branch instead.
+        let mut all_branches = false;
+        if distinct(&rows) < 2 {
+            let all: Vec<usize> = (0..self.pipes.len()).filter(|&i| same_pipeline(&self.pipes[i])).collect();
+            if distinct(&all) > distinct(&rows) {
+                rows = all;
+                all_branches = true;
+            }
+        }
+        if rows.is_empty() {
+            return None;
+        }
+        rows.sort_by(|&a, &b| {
+            let (x, y) = (&self.pipes[a].run, &self.pipes[b].run);
+            x.started_at.cmp(&y.started_at).then(x.number.cmp(&y.number))
+        });
+        // One feed per subscription can list a run twice; the strip shows it once.
+        let mut seen = HashSet::new();
+        rows.retain(|&i| seen.insert(self.pipes[i].run.id.clone()));
+
+        let now = Utc::now();
+        // The open run is the freshest copy of itself — the row may be a refresh behind.
+        let run_of = |i: usize| if self.pipes[i].run.id == v.run.id { &v.run } else { &self.pipes[i].run };
+        let pos = rows.iter().position(|&i| self.pipes[i].run.id == v.run.id);
+        let start = rows.len().saturating_sub(HISTORY_LEN).min(pos.unwrap_or(usize::MAX));
+        let window = &rows[start..(start + HISTORY_LEN).min(rows.len())];
+        let entries = window
+            .iter()
+            .map(|&i| {
+                let run = run_of(i);
+                HistEntry {
+                    run_id: run.id.clone(),
+                    number: run.number,
+                    status: run.status,
+                    secs: run_secs(run, now),
+                    started_at: run.started_at,
+                    row: i,
+                }
+            })
+            .collect();
+        // This run is measured against the others, never against itself.
+        let succeeded: Vec<i64> = rows
+            .iter()
+            .map(|&i| run_of(i))
+            .filter(|r| r.status == PipelineRunStatus::Succeeded && r.id != v.run.id)
+            .filter_map(|r| run_secs(r, now))
+            .collect();
+        let last_failure = rows.iter().rev().map(|&i| &self.pipes[i]).find(|p| p.run.status == PipelineRunStatus::Failed && p.run.id != v.run.id).map(|p| {
+            let key = pipeline_detail_cache_key(&p.connection_id, &p.run.item_ref());
+            let run = self.run_details.get(&key).unwrap_or(&p.run);
+            let step = first_failed_node(run).and_then(|(si, ji, k)| {
+                let job = run.stages.get(si)?.jobs.get(ji)?;
+                Some(k.and_then(|k| job.steps.get(k)).map_or_else(|| job.name.clone(), |s| s.name.clone()))
+            });
+            LastFailure { number: p.run.number, at: p.run.finished_at.or(p.run.started_at), step }
+        });
+        Some(RunHistory {
+            name: pipe_definition_name(&self.pipes[rows[0]]),
+            entries,
+            current: pos.map(|p| p - start),
+            median_secs: runlog::median(&succeeded),
+            median_n: succeeded.len(),
+            total: rows.len(),
+            all_branches,
+            last_failure,
+        })
+    }
+
+    /// Recent succeeded runs of the view's pipeline (any branch) whose job times can feed an
+    /// estimate, newest first: `(detail key, row)`.
+    fn estimate_candidates(&self, v: &PipelineView) -> Vec<(String, usize)> {
+        let mut rows: Vec<usize> = (0..self.pipes.len())
+            .filter(|&i| {
+                let p = &self.pipes[i];
+                p.connection_id == v.connection_id
+                    && p.run.definition_id == v.run.definition_id
+                    && p.run.status == PipelineRunStatus::Succeeded
+                    && p.run.id != v.run.id
+            })
+            .collect();
+        rows.sort_by_key(|&i| Reverse(self.pipes[i].run.started_at));
+        let mut seen = HashSet::new();
+        rows.retain(|&i| seen.insert(self.pipes[i].run.id.clone()));
+        rows.into_iter()
+            .take(ESTIMATE_RUNS)
+            .map(|i| (pipeline_detail_cache_key(&self.pipes[i].connection_id, &self.pipes[i].run.item_ref()), i))
+            .collect()
+    }
+
+    /// How long the view's in-flight run and its jobs should take.
+    fn pipeline_estimates(&self, v: &PipelineView, history: Option<&RunHistory>) -> Estimates {
+        let mut e = Estimates::default();
+        if let Some(h) = history.filter(|h| h.median_n > 0) {
+            e.run_median = h.median_secs;
+            e.run_n = h.median_n;
+        } else {
+            // No succeeded run on this branch yet: the pipeline's runs anywhere.
+            let now = Utc::now();
+            let secs: Vec<i64> = self
+                .pipes
+                .iter()
+                .filter(|p| {
+                    p.connection_id == v.connection_id
+                        && p.run.definition_id == v.run.definition_id
+                        && p.run.status == PipelineRunStatus::Succeeded
+                        && p.run.id != v.run.id
+                })
+                .filter_map(|p| run_secs(&p.run, now))
+                .collect();
+            e.run_median = runlog::median(&secs);
+            e.run_n = secs.len();
+        }
+        let mut per_job: HashMap<String, Vec<i64>> = HashMap::new();
+        for (key, row) in self.estimate_candidates(v) {
+            let listed = &self.pipes[row].run;
+            let Some(run) = self.run_details.get(&key).or_else(|| has_timed_jobs(listed).then_some(listed)) else { continue };
+            e.job_runs += 1;
+            for job in run.stages.iter().flat_map(|s| &s.jobs) {
+                if let (Some(a), Some(b)) = (job.started_at, job.finished_at) {
+                    per_job.entry(job.name.clone()).or_default().push((b - a).num_seconds().max(0));
+                }
+            }
+        }
+        e.jobs = per_job.into_iter().filter_map(|(name, secs)| runlog::median(&secs).map(|m| (name, m))).collect();
+        e
+    }
+
+    /// Rebuilds the history strip and estimates of the pipeline view on screen and of the one in
+    /// the preview, from the list rows and the session's run details. No I/O.
+    pub(crate) fn refresh_pipeline_context(&mut self) {
+        let context = |app: &App, screen: &Screen| match screen {
+            Screen::Pipeline(v) => {
+                let history = app.pipeline_history(v);
+                let estimates =
+                    if is_active(v.run.status) { app.pipeline_estimates(v, history.as_ref()) } else { Estimates::default() };
+                Some((history, estimates))
+            }
+            _ => None,
+        };
+        if let Some((history, estimates)) = context(self, &self.screen) {
+            if let Screen::Pipeline(v) = &mut self.screen {
+                v.history = history;
+                v.estimates = estimates;
+            }
+        }
+        let preview = self.preview.as_ref().and_then(|p| context(self, &p.view));
+        if let (Some((history, estimates)), Some(p)) = (preview, self.preview.as_mut()) {
+            if let Screen::Pipeline(v) = &mut p.view {
+                v.history = history;
+                v.estimates = estimates;
+            }
+        }
+    }
+
+    /// Asks, once per session, for the details of the recent succeeded runs an in-flight run's
+    /// job estimates are read from — through the ordinary detail fetch, in the background.
+    fn request_estimates(&mut self, deps: &AppDeps) {
+        if self.job_tx.is_none() {
+            return;
+        }
+        let mut wanted = Vec::new();
+        // An unfocused preview waits for its own detail fetch to go out — the cursor has
+        // settled — so holding ↓ through the list doesn't fetch estimates for every run passed.
+        let preview = self.preview.as_ref().filter(|p| p.sent).map(|p| &p.view);
+        for screen in [Some(&self.screen), preview].into_iter().flatten() {
+            let Screen::Pipeline(v) = screen else { continue };
+            if !is_active(v.run.status) {
+                continue;
+            }
+            for (key, row) in self.estimate_candidates(v) {
+                let listed = &self.pipes[row];
+                if self.run_details.contains_key(&key) || self.estimate_requested.contains(&key) || has_timed_jobs(&listed.run) {
+                    continue;
+                }
+                wanted.push((listed.connection_id.clone(), listed.run.item_ref(), key));
+            }
+        }
+        for (conn_id, item, key) in wanted {
+            if self.estimate_requested.insert(key.clone()) {
+                // Estimates read job times only; they never ask for problems.
+                self.request_pipeline_detail(deps, conn_id, item, key, false);
+            }
+        }
+    }
+
+    /// Keys on the drill-in that need `deps`: `←`/`→` through the history, `a` artifacts.
+    /// Returns false for anything else, or while the logs, or the artifacts list, hold the keys.
+    fn on_pipeline_deps_key(&mut self, key: Key, deps: &AppDeps) -> bool {
+        let Screen::Pipeline(v) = &self.screen else { return false };
+        if v.artifacts.is_some() || v.logs_have_keys() {
+            return false;
+        }
+        match key {
+            Key::Left => self.step_pipeline_history(-1, deps),
+            Key::Right => self.step_pipeline_history(1, deps),
+            Key::Char('a') => self.open_artifacts(deps),
+            _ => return false,
+        }
+        true
+    }
+
+    /// `←` / `→`: opens the older / newer run from the history strip in place, and moves the
+    /// list selection to it, so `p` returns to that run.
+    fn step_pipeline_history(&mut self, delta: isize, deps: &AppDeps) {
+        let Screen::Pipeline(v) = &self.screen else { return };
+        let target = v.history.as_ref().and_then(|h| {
+            let at = h.current? as isize + delta;
+            usize::try_from(at).ok().and_then(|at| h.entries.get(at)).map(|e| e.row)
+        });
+        let Some(row) = target.filter(|&r| r < self.pipes.len()) else {
+            self.toast = Some(
+                if delta < 0 { "No older run of this pipeline on this branch" } else { "This is the newest run on this branch" }.into(),
+            );
+            return;
+        };
+        let pipe = &self.pipes[row];
+        let (view, request) = Self::build_pipeline_view(
+            deps,
+            pipe.connection_id.clone(),
+            pipe.provider,
+            pipe.run.id.clone(),
+            pipe.run.definition_id.clone(),
+            pipe.run.branch.clone(),
+            pipe_label(pipe),
+            pipe.run.clone(),
+        );
+        self.screen = view;
+        self.send_detail_request(deps, request);
+        self.select_pipe_row(row);
+        self.refresh_pipeline_context();
+    }
+
+    /// Puts the Pipelines list cursor on the run at `row`, opening its group if it is folded.
+    fn select_pipe_row(&mut self, row: usize) {
+        if self.active != 2 {
+            return;
+        }
+        let find = |app: &App| app.pipe_lines().iter().position(|l| matches!(l, PipeLine::Run(i) if *i == row));
+        let mut pos = find(self);
+        if pos.is_none() && self.pipe_group != PipeGroup::Off {
+            if let Some(p) = self.pipes.get(row) {
+                let key = self.pipe_group_key(p);
+                if self.pipe_expanded.insert(key) {
+                    pos = find(self);
+                }
+            }
+        }
+        if let Some(pos) = pos {
+            self.pipe_state.select(Some(pos));
+            self.ensure_visible();
+        }
+    }
+
+    /// `e`: moves the keys into the Problems panel and back.
+    fn toggle_problem_focus(&mut self) {
+        let Screen::Pipeline(v) = &mut self.screen else { return };
+        if v.annotations.is_empty() {
+            self.toast = Some("No problems reported for this run".into());
+            return;
+        }
+        v.problem_focus = !v.problem_focus;
+        v.problem_sel = v.problem_sel.min(v.annotations.len() - 1);
+    }
+
+    /// Keys while the Problems panel has focus. False for keys it leaves to the tree.
+    fn on_problems_key(&mut self, key: Key) -> bool {
+        let Screen::Pipeline(v) = &mut self.screen else { return false };
+        let n = v.annotations.len();
+        match key {
+            Key::Up | Key::Char('k') => v.problem_sel = v.problem_sel.saturating_sub(1),
+            Key::Down | Key::Char('j') => {
+                if v.problem_sel + 1 < n {
+                    v.problem_sel += 1;
+                }
+            }
+            Key::Escape | Key::Char('e') => v.problem_focus = false,
+            Key::Enter => self.open_problem(),
+            _ => return false,
+        }
+        true
+    }
+
+    /// ↵ on a problem: opens its job's log at the line it names (`path:line`, else its message).
+    fn open_problem(&mut self) {
+        let Screen::Pipeline(v) = &mut self.screen else { return };
+        let Some(a) = v.annotations.get(v.problem_sel).cloned() else { return };
+        let known = |id: &String| v.run.stages.iter().flat_map(|s| &s.jobs).any(|j| &j.id == id);
+        let job_id = a
+            .job_id
+            .clone()
+            .filter(known)
+            .or_else(|| v.failed_target().map(|t| t.0))
+            .or_else(|| v.run.stages.iter().flat_map(|s| &s.jobs).next().map(|j| j.id.clone()));
+        let Some(job_id) = job_id else {
+            self.toast = Some("No job to open for this problem".into());
+            return;
+        };
+        let mut needles = Vec::new();
+        match (&a.path, a.line) {
+            (Some(path), Some(line)) => {
+                needles.push(format!("{path}:{line}"));
+                needles.push(format!("{}:{line}", runlog::short_location(path)));
+            }
+            (Some(path), None) => needles.push(path.clone()),
+            _ => {}
+        }
+        needles.push(a.message.lines().next().unwrap_or("").trim().to_string());
+        v.problem_focus = false;
+        if let Some(i) = v.flatten().iter().position(|n| n.job_id.as_deref() == Some(job_id.as_str())) {
+            v.selected = i;
+        }
+        v.open_logs_for_job(&job_id, None).request_jump(LogJump::Find(needles));
+        v.log_focus = true;
+    }
+
+    /// `E` from the tree (the failure line's hint): the failed job's log at its first error.
+    fn open_first_error(&mut self) {
+        let Screen::Pipeline(v) = &mut self.screen else { return };
+        let Some((si, ji, step)) = first_failed_node(&v.run) else {
+            self.toast = Some("Nothing failed in this run".into());
+            return;
+        };
+        let Some(job_id) = v.run.stages.get(si).and_then(|s| s.jobs.get(ji)).map(|j| j.id.clone()) else { return };
+        v.selected = v.node_index(si, ji, step);
+        v.user_moved = true;
+        v.open_logs_for_job(&job_id, step).request_jump(LogJump::FirstError);
+        v.log_focus = true;
+    }
+
+    /// ↵ on a step: its job's log, scrolled to that step's section.
+    fn open_step_logs(&mut self) {
+        let Screen::Pipeline(v) = &mut self.screen else { return };
+        let Some(node) = v.selected_node() else { return };
+        let (Some(job_id), Some(step)) = (node.job_id, node.step) else { return };
+        let reuse = v.logs.as_ref().is_some_and(|l| l.job_id == job_id);
+        let log = v.open_logs_for_job(&job_id, Some(step));
+        if reuse {
+            log.focus_step(step);
+        }
+        v.log_focus = true;
+    }
+
+    /// `R` / `F`: confirms re-running the open run (all of it, or its failed jobs).
+    fn confirm_rerun(&mut self, failed_only: bool) {
+        let Screen::Pipeline(v) = &self.screen else { return };
+        if is_active(v.run.status) {
+            self.toast = Some(format!("{} is still running — C cancels it", v.title));
+            return;
+        }
+        let supported = if failed_only { v.supports_rerun_failed } else { v.supports_rerun };
+        if !supported {
+            let what = if failed_only { "Rerunning failed jobs" } else { "Rerunning a run" };
+            self.toast = Some(format!("{what} isn't supported for {}", v.provider.as_str()));
+            return;
+        }
+        let failed_jobs: Vec<&str> = v
+            .run
+            .stages
+            .iter()
+            .flat_map(|s| &s.jobs)
+            .filter(|j| matches!(j.status, PipelineRunStatus::Failed | PipelineRunStatus::Canceled))
+            .map(|j| j.name.as_str())
+            .collect();
+        if failed_only && failed_jobs.is_empty() && v.run.status == PipelineRunStatus::Succeeded {
+            self.toast = Some("Nothing failed in this run — R reruns all of it".into());
+            return;
+        }
+        let mut message = if failed_only {
+            format!("Rerun the failed {} of {}?", if failed_jobs.len() == 1 { "job" } else { "jobs" }, v.title)
+        } else {
+            format!("Rerun every job of {}?", v.title)
+        };
+        if failed_only && !failed_jobs.is_empty() {
+            message.push('\n');
+            for name in failed_jobs.iter().take(5) {
+                message.push_str(&format!("\n  ✗ {name}"));
+            }
+            if failed_jobs.len() > 5 {
+                message.push_str(&format!("\n  … and {} more", failed_jobs.len() - 5));
+            }
+        }
+        let new_run = if failed_only { v.rerun_failed_new_run } else { v.rerun_new_run };
+        let mut same = Vec::new();
+        if new_run {
+            // A provider that starts a separate run: there's no attempt to count up.
+            same.push(match v.run.branch.as_deref().or(v.branch.as_deref()).filter(|b| !b.is_empty()) {
+                Some(b) => format!("Starts a new run on {b}"),
+                None => "Starts a new run".to_string(),
+            });
+        } else {
+            if let Some(sha) = v.run.commit_sha.as_deref().filter(|s| !s.is_empty()) {
+                same.push(format!("Same commit {}", sha.chars().take(7).collect::<String>()));
+            }
+            if let Some(n) = v.run.attempt {
+                same.push(format!("becomes attempt {}", n + 1));
+            }
+        }
+        if !same.is_empty() {
+            message.push_str("\n\n");
+            message.push_str(&same.join(" · "));
+        }
+        let action = Action::PipelineRerun {
+            connection_id: v.connection_id.clone(),
+            repo: v.run.repository.clone(),
+            run_id: v.run.id.clone(),
+            failed_only,
+            new_run,
+            label: v.title.clone(),
+        };
+        let title = if failed_only { "Rerun failed jobs" } else { "Rerun run" };
+        self.overlay = Some(Overlay::Confirm { title: title.into(), message, action });
+    }
+
+    /// Runs a confirmed rerun or cancel. Optimistic: the pane and the list show the outcome
+    /// straight away, the provider is asked in the background (its answer comes back as
+    /// [`AppEvent::PipelineRunActionDone`]), and a refusal puts the run back as it was. A rerun
+    /// that starts a *new* run leaves the open one alone and follows the new one once it lists.
+    async fn execute_pipeline_run_action(&mut self, action: Action, deps: &AppDeps) {
+        let (conn_id, repo, run_id, label, rerun, new_run) = match action {
+            Action::PipelineRerun { connection_id, repo, run_id, failed_only, new_run, label } => {
+                (connection_id, repo, run_id, label, Some(failed_only), new_run)
+            }
+            Action::PipelineCancel { connection_id, run, label } => (connection_id, run.repo, run.id, label, None, false),
+            _ => return,
+        };
+        let run = ItemRef::maybe(repo, run_id.clone());
+        let now = Utc::now();
+        let optimistic = !new_run;
+        let mut undo = if optimistic {
+            self.change_run(&conn_id, &run_id, |r| match rerun {
+                Some(failed_only) => mark_rerun(r, failed_only, now),
+                None => mark_canceled(r, now),
+            })
+        } else {
+            RunUndo { conn_id: conn_id.clone(), view: None, extras: None, rows: Vec::new() }
+        };
+        if optimistic && rerun.is_some() {
+            // The old attempt's problems don't describe the new one.
+            if let Screen::Pipeline(v) = &mut self.screen {
+                if v.connection_id == conn_id && v.run.id == run_id {
+                    undo.extras = Some((std::mem::take(&mut v.annotations), v.log_failure.take()));
+                    v.problem_focus = false;
+                }
+            }
+        }
+        if optimistic {
+            // Until the provider catches up, a refresh that still says the old thing mustn't
+            // flip the run back.
+            let shown = match &self.screen {
+                Screen::Pipeline(v) if v.connection_id == conn_id && v.run.id == run_id => Some(v.run.clone()),
+                _ => self.pipes.iter().find(|p| p.connection_id == conn_id && p.run.id == run_id).map(|p| p.run.clone()),
+            };
+            if let Some(shown) = shown {
+                self.held_runs.insert((conn_id.clone(), run_id.clone()), RunHold { run: shown, until: now + chrono::Duration::seconds(RUN_HOLD_SECS) });
+            }
+        }
+        let token = self.next_run_action;
+        self.next_run_action += 1;
+        self.run_actions.insert(token, PendingRunAction { undo, run_id, label, rerun, new_run });
+        let Some(tx) = self.job_tx.clone() else {
+            // No event loop to answer on (a bare harness): ask inline.
+            let result = run_action_call(deps, &conn_id, &run, rerun).await;
+            self.finish_run_action(token, result, deps);
+            return;
+        };
+        let deps = deps.clone();
+        tokio::spawn(async move {
+            let result = run_action_call(&deps, &conn_id, &run, rerun).await;
+            let _ = tx.send(AppEvent::PipelineRunActionDone { token, result });
+        });
+    }
+
+    /// Folds in the provider's answer to a rerun or cancel.
+    fn finish_run_action(&mut self, token: u64, result: std::result::Result<Option<String>, String>, deps: &AppDeps) {
+        let Some(pending) = self.run_actions.remove(&token) else { return };
+        let PendingRunAction { undo, run_id, label, rerun, new_run } = pending;
+        let conn_id = undo.conn_id.clone();
+        match result {
+            Err(e) => {
+                self.held_runs.remove(&(conn_id, run_id));
+                self.restore_run(undo);
+                let what = if rerun.is_some() { "Rerun" } else { "Cancel" };
+                self.toast_error(format!("{what} failed: {e}"));
+            }
+            Ok(started) => {
+                let started = started.filter(|id| *id != run_id);
+                if new_run || started.is_some() {
+                    self.held_runs.remove(&(conn_id.clone(), run_id));
+                    self.toast = Some(match &started {
+                        Some(id) => format!("Started a new run of {label} ({id}) — it opens here once it lists"),
+                        None => format!("Started a new run of {label}"),
+                    });
+                    if let Some(id) = started {
+                        self.follow_new_run = Some((conn_id, id));
+                    }
+                } else {
+                    self.toast = Some(match rerun {
+                        Some(true) => format!("Rerunning the failed jobs of {label}"),
+                        Some(false) => format!("Rerunning {label}"),
+                        None => format!("Cancelled {label}"),
+                    });
+                    // The provider has the last word on what the run looks like now.
+                    if let Screen::Pipeline(v) = &self.screen {
+                        if v.connection_id == conn_id && v.run.id == run_id {
+                            if let Some(request) = DetailRequest::for_view(&self.screen) {
+                                self.send_detail_request(deps, request);
+                            }
+                        }
+                    }
+                }
+                self.request_reload(deps);
+            }
+        }
+    }
+
+    /// A refreshed copy of a run, unless an optimistic change to it is still being held: then
+    /// the held copy, until the provider's own answer shows the change (or the hold runs out).
+    fn settle_held(&mut self, conn_id: &str, fresh: PipelineRun) -> PipelineRun {
+        let key = (conn_id.to_string(), fresh.id.clone());
+        let Some(hold) = self.held_runs.get(&key) else { return fresh };
+        let caught_up = match hold.run.status {
+            PipelineRunStatus::Canceled => !is_active(fresh.status),
+            _ => is_active(fresh.status),
+        };
+        if caught_up || Utc::now() > hold.until {
+            self.held_runs.remove(&key);
+            return fresh;
+        }
+        hold.run.clone()
+    }
+
+    /// Once the run a rerun started shows up in the list, the pane moves to it.
+    fn follow_started_run(&mut self, deps: &AppDeps) {
+        let Some((conn_id, id)) = self.follow_new_run.clone() else { return };
+        let Some(row) = self.pipes.iter().position(|p| p.connection_id == conn_id && p.run.id == id) else { return };
+        self.follow_new_run = None;
+        if !matches!(&self.screen, Screen::Pipeline(v) if v.connection_id == conn_id) {
+            return;
+        }
+        let pipe = &self.pipes[row];
+        let label = pipe_label(pipe);
+        let (view, request) = Self::build_pipeline_view(
+            deps,
+            pipe.connection_id.clone(),
+            pipe.provider,
+            pipe.run.id.clone(),
+            pipe.run.definition_id.clone(),
+            pipe.run.branch.clone(),
+            label.clone(),
+            pipe.run.clone(),
+        );
+        self.screen = view;
+        self.send_detail_request(deps, request);
+        self.select_pipe_row(row);
+        self.refresh_pipeline_context();
+        self.toast = Some(format!("Now showing {label}, the new run"));
+    }
+
+    /// Applies `change` to a run wherever it is shown — the open view and its list rows —
+    /// returning what it replaced.
+    fn change_run(&mut self, conn_id: &str, run_id: &str, change: impl Fn(&mut PipelineRun)) -> RunUndo {
+        let mut undo = RunUndo { conn_id: conn_id.to_string(), view: None, extras: None, rows: Vec::new() };
+        if let Screen::Pipeline(v) = &mut self.screen {
+            if v.connection_id == conn_id && v.run.id == run_id {
+                undo.view = Some(v.run.clone());
+                change(&mut v.run);
+                v.clamp_selection();
+            }
+        }
+        for (i, row) in self.pipes.iter_mut().enumerate() {
+            if row.connection_id == conn_id && row.run.id == run_id {
+                undo.rows.push((i, row.run.clone()));
+                change(&mut row.run);
+            }
+        }
+        self.rebuild_launchpad();
+        undo
+    }
+
+    /// Puts back what [`App::change_run`] replaced, where it is still the same run.
+    fn restore_run(&mut self, undo: RunUndo) {
+        if let (Some(prev), Screen::Pipeline(v)) = (undo.view, &mut self.screen) {
+            if v.connection_id == undo.conn_id && v.run.id == prev.id {
+                v.run = prev;
+                if let Some((annotations, log_failure)) = undo.extras {
+                    v.annotations = annotations;
+                    v.log_failure = log_failure;
+                }
+                v.clamp_selection();
+            }
+        }
+        for (i, prev) in undo.rows {
+            if let Some(row) = self.pipes.get_mut(i).filter(|r| r.connection_id == undo.conn_id && r.run.id == prev.id) {
+                row.run = prev;
+            }
+        }
+        self.rebuild_launchpad();
+    }
+
+    /// `a`: opens the artifacts list over the pane and fetches it in the background.
+    fn open_artifacts(&mut self, deps: &AppDeps) {
+        let Screen::Pipeline(v) = &mut self.screen else { return };
+        if !v.supports_artifacts {
+            self.toast = Some(format!("Artifacts aren't supported for {}", v.provider.as_str()));
+            return;
+        }
+        v.artifacts = Some(ArtifactsPanel::default());
+        let (conn_id, run) = (v.connection_id.clone(), v.run.item_ref());
+        let Some(tx) = self.job_tx.clone() else { return };
+        let deps = deps.clone();
+        tokio::spawn(async move {
+            let result = match pipeline_source(&deps, &conn_id).await {
+                Some(source) => source.artifacts(&run).await.map_err(|e| {
+                    log_operation_failure(DIAG_PIPELINE_ARTIFACTS);
+                    e.to_string()
+                }),
+                None => Err("pipeline connection not found".into()),
+            };
+            let _ = tx.send(AppEvent::PipelineArtifactsLoaded { conn_id, run_id: run.id, result });
+        });
+    }
+
+    /// Fills the artifacts list, if it is still open on that run.
+    fn apply_pipeline_artifacts(&mut self, conn_id: &str, run_id: &str, result: std::result::Result<Vec<PipelineArtifact>, String>) {
+        let Screen::Pipeline(v) = &mut self.screen else { return };
+        if v.connection_id != conn_id || v.run.id != run_id {
+            return;
+        }
+        let Some(panel) = &mut v.artifacts else { return };
+        match result {
+            Ok(items) => {
+                panel.items = Some(items);
+                panel.error = None;
+            }
+            Err(e) => {
+                panel.items = Some(Vec::new());
+                panel.error = Some(e);
+            }
+        }
+        panel.selected = 0;
+    }
+
+    /// Keys while the artifacts list is open: move, open in the browser, copy the link, close.
+    fn on_artifacts_key(&mut self, key: Key) {
+        let Screen::Pipeline(v) = &mut self.screen else { return };
+        let Some(panel) = &mut v.artifacts else { return };
+        let n = panel.items.as_ref().map_or(0, Vec::len);
+        let url = panel.items.as_ref().and_then(|items| items.get(panel.selected)).map(|a| a.url.clone());
+        match key {
+            Key::Escape | Key::Char('q' | 'a') => v.artifacts = None,
+            Key::Up | Key::Char('k') => panel.selected = panel.selected.saturating_sub(1),
+            Key::Down | Key::Char('j') => {
+                if panel.selected + 1 < n {
+                    panel.selected += 1;
+                }
+            }
+            Key::Enter | Key::Char('o') => match url {
+                Some(Some(url)) => {
+                    self.toast = Some(match open::that(&url) {
+                        Ok(()) => format!("Opened {url}"),
+                        Err(e) => format!("Couldn't open browser: {e}"),
+                    });
+                }
+                Some(None) => self.toast = Some("This artifact has no link".into()),
+                None => {}
+            },
+            Key::Char('y') => match url {
+                Some(Some(url)) => self.copy_to_clipboard(&url, "artifact link"),
+                Some(None) => self.toast = Some("This artifact has no link".into()),
+                None => {}
+            },
+            _ => {}
+        }
+    }
+
+    /// Copies `text` and says so.
+    fn copy_to_clipboard(&mut self, text: &str, what: &str) {
+        self.toast = Some(match (self.clipboard)(text) {
+            Ok(()) => format!("Copied {what}"),
+            Err(e) => format!("Couldn't copy {what}: {e}"),
+        });
+    }
+
+    /// `c`: copies the open run's full commit sha.
+    fn copy_commit_sha(&mut self) {
+        let Screen::Pipeline(v) = &self.screen else { return };
+        match v.run.commit_sha.clone().filter(|s| !s.is_empty()) {
+            Some(sha) => {
+                let short: String = sha.chars().take(7).collect();
+                self.copy_to_clipboard(&sha, &format!("commit {short}"));
+            }
+            None => self.toast = Some("This run has no commit sha".into()),
+        }
+    }
+
     fn on_pipeline_key(&mut self, key: Key) {
         match key {
             Key::Escape | Key::Char('q') => self.screen = self.view_origin(),
@@ -5791,7 +7346,8 @@ impl App {
                     match other {
                         Key::Up | Key::Char('k') => view.move_sel(-1),
                         Key::Down | Key::Char('j') => view.move_sel(1),
-                        Key::Enter | Key::Char(' ') | Key::Right | Key::Left => view.toggle_selected(),
+                        // ←/→ step through the run history (see `on_pipeline_deps_key`).
+                        Key::Enter | Key::Char(' ') => view.toggle_selected(),
                         _ => {}
                     }
                 }
@@ -5800,9 +7356,14 @@ impl App {
     }
 
     /// Keys on the drill-in. With logs open, `w` moves the keys between the tree and the log
-    /// pane; the tree keeps its own keys and re-targets the pane as the cursor crosses jobs.
+    /// pane; the tree keeps its own keys and re-targets the pane as the cursor crosses jobs. The
+    /// artifacts list and the Problems panel take the keys while they are open / focused.
     fn on_pipeline_screen_key(&mut self, key: Key) {
         let Screen::Pipeline(v) = &mut self.screen else { return };
+        if v.artifacts.is_some() {
+            self.on_artifacts_key(key);
+            return;
+        }
         let logs_open = v.logs.is_some();
         if logs_open && key == Key::Char('w') {
             if v.log_split.get() {
@@ -5816,10 +7377,21 @@ impl App {
             self.on_pipeline_logs_key(key);
             return;
         }
+        if v.problem_focus && self.on_problems_key(key) {
+            return;
+        }
+        let Screen::Pipeline(v) = &mut self.screen else { return };
+        let on_step = v.selected_node().is_some_and(|n| n.step.is_some() && !n.group);
         match key {
             Key::Char('L') if logs_open => v.logs = None,
             Key::Escape if logs_open => v.logs = None,
             Key::Char('L') => self.open_pipeline_logs(),
+            Key::Enter if on_step => self.open_step_logs(),
+            Key::Char('e') => self.toggle_problem_focus(),
+            Key::Char('E') => self.open_first_error(),
+            Key::Char('R') => self.confirm_rerun(false),
+            Key::Char('F') => self.confirm_rerun(true),
+            Key::Char('c') => self.copy_commit_sha(),
             _ => {
                 self.on_pipeline_key(key);
                 // Moving across jobs points the open pane at the new job's log.
@@ -5875,6 +7447,8 @@ impl App {
                 }
             }
             Key::Char('E') => log.jump_first_error(),
+            Key::Char('z') => log.toggle_fold(),
+            Key::Char('Z') => log.toggle_all_folds(),
             Key::Char('/') => log.search_input = Some(String::new()),
             Key::Char('n' | 'N') => {
                 if log.query.is_none() {
@@ -5971,6 +7545,14 @@ impl App {
                 log.set_text(&text);
                 log.loaded = true;
                 log.fetch_failed = false;
+                // A failed job's log is where the failure line reads from when the provider
+                // reported no annotation.
+                let failed = v.run.stages.iter().flat_map(|s| &s.jobs).any(|j| j.id == job_id && j.status == PipelineRunStatus::Failed);
+                if failed {
+                    if let Some(summary) = runlog::failure_summary(&log.lines) {
+                        v.log_failure = Some((job_id.to_string(), summary));
+                    }
+                }
             }
             Err(e) if !log.loaded => {
                 v.logs = None;
@@ -6025,38 +7607,6 @@ impl App {
         });
     }
 
-    /// Cancels a run, then re-reads it. The run's status is left for the provider to report —
-    /// a cancel is a request that can take a while to land (or be refused), not a state the
-    /// client can assume — so the drill-in and the list are refetched rather than patched.
-    async fn cancel_pipeline(&mut self, connection_id: String, run: ItemRef, label: String, deps: &AppDeps) {
-        let feeds = match deps.sections.pipeline_feeds().await {
-            Ok(f) => f,
-            Err(e) => {
-                self.toast_error(format!("Cancel failed: {e}"));
-                return;
-            }
-        };
-        let Some(feed) = feeds.iter().find(|f| f.connection.connection_id() == connection_id) else {
-            self.toast = Some("Pipeline connection not found".into());
-            return;
-        };
-        match feed.source.cancel_run(&run).await {
-            Ok(()) => {
-                self.toast = Some(format!("Cancel requested for {label}"));
-                if matches!(&self.screen, Screen::Pipeline(v) if v.connection_id == connection_id && v.run.item_ref() == run) {
-                    let key = pipeline_detail_cache_key(&connection_id, &run);
-                    self.request_pipeline_detail(deps, connection_id, run, key);
-                }
-                let mut errors = Vec::new();
-                self.reload_pipelines(deps, &mut errors).await;
-                self.fix_selection();
-                if let Some(e) = errors.first() {
-                    self.toast = Some(e.clone());
-                }
-            }
-            Err(e) => self.toast_error(format!("Cancel failed: {e}")),
-        }
-    }
 
     async fn execute_pipeline_action(&mut self, action: Action, deps: &AppDeps) {
         let Action::PipelineTrigger { connection_id, repo, definition_id, branch, label } = action else { return };
@@ -6739,7 +8289,9 @@ impl App {
             | Action::WiSetDescription(_) => self.execute_wi_action(action, deps).await,
             Action::WiEdit(field) => self.start_wi_edit(field),
             Action::PipelineTrigger { .. } => self.execute_pipeline_action(action, deps).await,
-            Action::PipelineCancel { connection_id, run, label } => self.cancel_pipeline(connection_id, run, label, deps).await,
+            Action::PipelineRerun { .. } | Action::PipelineCancel { .. } => {
+                self.execute_pipeline_run_action(action, deps).await
+            }
             Action::RemoveConnection { .. } => self.execute_config_action(action, deps).await,
             Action::ApplyToggle { kind, ids } => self.apply_toggle(kind, ids, deps).await,
             Action::AddLineComment(body) => self.add_line_comment(body),
@@ -7274,8 +8826,120 @@ fn log_fetch_key(conn_id: &str, run_id: &str, job_id: &str) -> String {
 }
 
 /// Whether a run is still in flight (only these can be waiting on an approval gate).
-fn is_active(status: PipelineRunStatus) -> bool {
+pub fn is_active(status: PipelineRunStatus) -> bool {
     matches!(status, PipelineRunStatus::Queued | PipelineRunStatus::Running)
+}
+
+/// Whether a listed run already carries timed jobs, so its detail needn't be fetched for an
+/// estimate.
+fn has_timed_jobs(run: &PipelineRun) -> bool {
+    run.stages.iter().flat_map(|s| &s.jobs).any(|j| j.started_at.is_some() && j.finished_at.is_some())
+}
+
+/// An attempt's problems as the pane shows them: `(annotations, failure read from its log)`.
+type AttemptProblems = (Vec<PipelineAnnotation>, Option<(String, FailureSummary)>);
+
+/// What an optimistic rerun or cancel replaced, so a refusal can put it back.
+struct RunUndo {
+    conn_id: String,
+    view: Option<PipelineRun>,
+    /// The view's problems and failure line, cleared by a rerun.
+    extras: Option<AttemptProblems>,
+    /// `(index into App::pipes, the row's run)`.
+    rows: Vec<(usize, PipelineRun)>,
+}
+
+/// A rerun or cancel in flight: what to undo, and what to say when the provider answers.
+struct PendingRunAction {
+    undo: RunUndo,
+    run_id: String,
+    label: String,
+    /// `Some(failed_only)` for a rerun, `None` for a cancel.
+    rerun: Option<bool>,
+    /// The provider starts a new run rather than re-queueing this one.
+    new_run: bool,
+}
+
+/// An optimistic change held against refreshes that haven't caught up with it yet.
+struct RunHold {
+    run: PipelineRun,
+    until: DateTime<Utc>,
+}
+
+/// How long an optimistic rerun or cancel is held against a provider still reporting the old
+/// state.
+const RUN_HOLD_SECS: i64 = 60;
+
+/// The provider call behind a rerun (`Some(failed_only)`) or a cancel (`None`).
+async fn run_action_call(
+    deps: &AppDeps,
+    conn_id: &str,
+    run: &ItemRef,
+    rerun: Option<bool>,
+) -> std::result::Result<Option<String>, String> {
+    let Some(source) = pipeline_source(deps, conn_id).await else {
+        return Err("pipeline connection not found".into());
+    };
+    match rerun {
+        Some(failed_only) => source.rerun_run(run, failed_only).await,
+        None => source.cancel_run(run).await.map(|()| None),
+    }
+    .map_err(|e| e.to_string())
+}
+
+/// A rerun as it will look once queued: the run (and the jobs it re-runs) back to Queued, their
+/// times cleared, and the attempt counted up. The provider's answer replaces it on refresh.
+/// It starts `now`, so it keeps its place at the new end of the history.
+fn mark_rerun(run: &mut PipelineRun, failed_only: bool, now: DateTime<Utc>) {
+    let redo = |s: PipelineRunStatus| !failed_only || matches!(s, PipelineRunStatus::Failed | PipelineRunStatus::Canceled);
+    run.status = PipelineRunStatus::Queued;
+    run.started_at = Some(now);
+    run.finished_at = None;
+    run.attempt = run.attempt.map(|n| n + 1);
+    for stage in &mut run.stages {
+        for job in stage.jobs.iter_mut().filter(|j| redo(j.status)) {
+            job.status = PipelineRunStatus::Queued;
+            job.started_at = None;
+            job.finished_at = None;
+            job.problem = None;
+            for step in &mut job.steps {
+                step.status = PipelineRunStatus::Queued;
+                step.started_at = None;
+                step.finished_at = None;
+            }
+        }
+        if stage.jobs.iter().any(|j| j.status == PipelineRunStatus::Queued) {
+            stage.status = PipelineRunStatus::Queued;
+        }
+    }
+}
+
+/// A cancel as it will look once it lands: whatever was still running or queued is Canceled.
+fn mark_canceled(run: &mut PipelineRun, now: DateTime<Utc>) {
+    if is_active(run.status) {
+        run.status = PipelineRunStatus::Canceled;
+        run.finished_at.get_or_insert(now);
+    }
+    for stage in &mut run.stages {
+        for job in stage.jobs.iter_mut().filter(|j| is_active(j.status)) {
+            job.status = PipelineRunStatus::Canceled;
+            if job.started_at.is_some() {
+                job.finished_at.get_or_insert(now);
+            }
+            for step in job.steps.iter_mut().filter(|s| is_active(s.status)) {
+                step.status = PipelineRunStatus::Canceled;
+            }
+        }
+        if is_active(stage.status) {
+            stage.status = PipelineRunStatus::Canceled;
+        }
+    }
+}
+
+/// The pipeline source behind a connection, through the same feeds every pipeline call uses.
+async fn pipeline_source(deps: &AppDeps, conn_id: &str) -> Option<Arc<dyn PipelineSource>> {
+    let feeds = detail_or_default(deps.sections.pipeline_feeds().await, DIAG_PIPELINE_FEEDS);
+    feeds.into_iter().find(|f| f.connection.connection_id() == conn_id).map(|f| f.source)
 }
 
 /// Runs awaiting the user's approval now that weren't at the previous refresh.
@@ -7786,28 +9450,45 @@ async fn fetch_wi_detail(deps: &AppDeps, conn_id: &str, item: &ItemRef) -> WiDet
 }
 
 /// Fetches the run + capabilities + approvals behind a pipeline drill-in, off the render loop.
-/// Mirrors [`fetch_pr_detail`]; left sequential for the same reason. Approvals are fetched
-/// regardless of whether `get_run` itself succeeded — they're addressed by the run ref, not the
-/// fetched run object, so a failure to enrich the run needn't also blank the approvals answer.
-async fn fetch_pipeline_detail(deps: &AppDeps, conn_id: &str, run_ref: &ItemRef) -> PipelineDetailFetch {
+/// Approvals are fetched regardless of whether `get_run` itself succeeded — they're addressed by
+/// the run ref, not the fetched run object, so a failure to enrich the run needn't also blank the
+/// approvals answer. With `annotations`, the run's problems are asked for alongside — at the same
+/// time, so a slow annotations call never holds up the run itself; `None` leaves them unasked.
+async fn fetch_pipeline_detail(deps: &AppDeps, conn_id: &str, run_ref: &ItemRef, annotations: bool) -> PipelineDetailFetch {
     let feeds = detail_or_default(deps.sections.pipeline_feeds().await, DIAG_PIPELINE_FEEDS);
     let Some(feed) = feeds.iter().find(|f| f.connection.connection_id() == conn_id) else {
         return PipelineDetailFetch::default();
     };
     let source = &feed.source;
-    let run = detail_or_none(source.get_run(run_ref).await, DIAG_PIPELINE_RUN);
     let supports_approvals = source.supports_approvals();
     let can_respond_approvals = source.can_respond_to_approvals();
-    let approvals = if supports_approvals {
-        detail_or_none(source.pending_approvals(run_ref).await, DIAG_PIPELINE_APPROVALS)
-    } else {
-        Some(Vec::new())
+    let approvals = async {
+        if supports_approvals {
+            detail_or_none(source.pending_approvals(run_ref).await, DIAG_PIPELINE_APPROVALS)
+        } else {
+            Some(Vec::new())
+        }
     };
+    let problems = async {
+        if annotations {
+            detail_or_none(source.annotations(run_ref).await, DIAG_PIPELINE_ANNOTATIONS)
+        } else {
+            None
+        }
+    };
+    let (run, approvals, annotations) = tokio::join!(source.get_run(run_ref), approvals, problems);
+    let run = detail_or_none(run, DIAG_PIPELINE_RUN);
     PipelineDetailFetch {
         run,
         approvals,
         supports_approvals: Some(supports_approvals),
         can_respond_approvals: Some(can_respond_approvals),
+        annotations,
+        supports_rerun: Some(source.supports_rerun()),
+        supports_rerun_failed: Some(source.supports_rerun_failed()),
+        supports_artifacts: Some(source.supports_artifacts()),
+        rerun_new_run: Some(source.rerun_starts_new_run(false)),
+        rerun_failed_new_run: Some(source.rerun_starts_new_run(true)),
     }
 }
 
@@ -7895,6 +9576,12 @@ fn pipeline_detail_unchanged(
         && confirmed_approvals.is_none_or(|fresh| fresh == v.approvals)
         && v.supports_approvals == d.supports_approvals
         && v.can_respond_approvals == d.can_respond_approvals
+        && v.annotations == d.annotations
+        && v.supports_rerun == d.supports_rerun
+        && v.supports_rerun_failed == d.supports_rerun_failed
+        && v.supports_artifacts == d.supports_artifacts
+        && v.rerun_new_run == d.rerun_new_run
+        && v.rerun_failed_new_run == d.rerun_failed_new_run
 }
 
 
@@ -9812,13 +11499,13 @@ mod tests {
         let mut app = App::new("slate");
         app.screen = Screen::Pipeline(Box::new(PipelineView::new("CI".into(), failed_run(), "c".into(), ProviderType::GitHub, "ci".into(), Some("main".into()))));
 
-        // Node 0 is the stage (no deep link) → falls back to the run URL.
-        assert_eq!(app.selected_url().as_deref(), Some("http://run"));
-        // Node 1 is the job → its own deep link.
-        if let Screen::Pipeline(v) = &mut app.screen {
-            v.selected = 1;
-        }
+        // A single-stage run has no stage row: node 0 is the job → its own deep link.
         assert_eq!(app.selected_url().as_deref(), Some("http://job"));
+        // A node with no link of its own (past the end here) falls back to the run URL.
+        if let Screen::Pipeline(v) = &mut app.screen {
+            v.selected = 9;
+        }
+        assert_eq!(app.selected_url().as_deref(), Some("http://run"));
 
         // The log pane scrolls and closes on Esc.
         if let Screen::Pipeline(v) = &mut app.screen {
@@ -11022,6 +12709,7 @@ mod tests {
                     approvals: Some(vec![]),
                     supports_approvals: Some(true),
                     can_respond_approvals: Some(true),
+                    ..Default::default()
                 }),
                 fetched_at: Utc::now(),
             },
@@ -11047,6 +12735,7 @@ mod tests {
             approvals: vec![approval("g1", true)],
             supports_approvals: true,
             can_respond_approvals: true,
+            annotations: Vec::new(), supports_rerun: false, supports_rerun_failed: false, supports_artifacts: false, rerun_new_run: false, rerun_failed_new_run: false,
         };
         cache.put(&key, &known, Utc::now() - chrono::TimeDelta::seconds(30));
 
@@ -11069,6 +12758,7 @@ mod tests {
                     approvals: None,
                     supports_approvals: None,
                     can_respond_approvals: None,
+                    ..Default::default()
                 }),
                 fetched_at: Utc::now(),
             },
@@ -11102,6 +12792,7 @@ mod tests {
                 approvals: vec![approval("g1", true)],
                 supports_approvals: true,
                 can_respond_approvals: true,
+                annotations: Vec::new(), supports_rerun: false, supports_rerun_failed: false, supports_artifacts: false, rerun_new_run: false, rerun_failed_new_run: false,
             },
             Utc::now() - chrono::TimeDelta::seconds(30),
         );
@@ -11121,6 +12812,7 @@ mod tests {
                     approvals: None,
                     supports_approvals: Some(true),
                     can_respond_approvals: Some(true),
+                    ..Default::default()
                 }),
                 fetched_at: Utc::now(),
             },
@@ -11163,6 +12855,7 @@ mod tests {
                     approvals: Some(Vec::new()),
                     supports_approvals: Some(true),
                     can_respond_approvals: Some(true),
+                    ..Default::default()
                 }),
                 fetched_at: Utc::now(),
             },
@@ -11189,6 +12882,7 @@ mod tests {
                 approvals: vec![approval("g1", true)],
                 supports_approvals: true,
                 can_respond_approvals: false,
+                annotations: Vec::new(), supports_rerun: false, supports_rerun_failed: false, supports_artifacts: false, rerun_new_run: false, rerun_failed_new_run: false,
             },
             Utc::now() - chrono::TimeDelta::seconds(30),
         );
@@ -11206,6 +12900,7 @@ mod tests {
                     approvals: None,
                     supports_approvals: Some(true),
                     can_respond_approvals: Some(true),
+                    ..Default::default()
                 }),
                 fetched_at: Utc::now(),
             },
@@ -11235,7 +12930,7 @@ mod tests {
         let run = pipeline_run("1", PipelineRunStatus::Running, vec![]);
         let key = pipeline_detail_cache_key("c", &run.item_ref());
         let known =
-            PipelineDetail { run: run.clone(), approvals: vec![], supports_approvals: false, can_respond_approvals: false };
+            PipelineDetail { run: run.clone(), approvals: vec![], supports_approvals: false, can_respond_approvals: false, annotations: Vec::new(), supports_rerun: false, supports_rerun_failed: false, supports_artifacts: false, rerun_new_run: false, rerun_failed_new_run: false };
         let seeded = Utc::now() - chrono::TimeDelta::seconds(30);
         cache.put(&key, &known, seeded);
 
@@ -11275,6 +12970,7 @@ mod tests {
                 approvals: vec![approval("g1", true)],
                 supports_approvals: true,
                 can_respond_approvals: true,
+                annotations: Vec::new(), supports_rerun: false, supports_rerun_failed: false, supports_artifacts: false, rerun_new_run: false, rerun_failed_new_run: false,
             },
             Utc::now(),
         );
@@ -11310,6 +13006,7 @@ mod tests {
                     approvals: Some(vec![]),
                     supports_approvals: Some(false),
                     can_respond_approvals: Some(false),
+                    ..Default::default()
                 }),
                 fetched_at: Utc::now(),
             },
@@ -11324,10 +13021,14 @@ mod tests {
     fn fresh_pipeline_detail_preserves_logs_and_collapsed_while_patching() {
         let deps = deps_with_cache(memory_cache());
         let mut app = App::new("slate");
+        // Two stages, so the "build" stage has a row to collapse (a lone stage has none).
         let run = pipeline_run(
             "1",
             PipelineRunStatus::Running,
-            vec![pipeline_stage("build", PipelineRunStatus::Running, vec![pipeline_job("j1", PipelineRunStatus::Running)])],
+            vec![
+                pipeline_stage("build", PipelineRunStatus::Running, vec![pipeline_job("j1", PipelineRunStatus::Running)]),
+                pipeline_stage("deploy", PipelineRunStatus::Queued, vec![pipeline_job("j2", PipelineRunStatus::Queued)]),
+            ],
         );
         let key = pipeline_detail_cache_key("c", &run.item_ref());
         let mut view = PipelineView::new("CI".into(), run.clone(), "c".into(), ProviderType::GitHub, "ci".into(), None);
@@ -11339,7 +13040,10 @@ mod tests {
         let fresh = pipeline_run(
             "1",
             PipelineRunStatus::Succeeded,
-            vec![pipeline_stage("build", PipelineRunStatus::Succeeded, vec![pipeline_job("j1", PipelineRunStatus::Succeeded)])],
+            vec![
+                pipeline_stage("build", PipelineRunStatus::Succeeded, vec![pipeline_job("j1", PipelineRunStatus::Succeeded)]),
+                pipeline_stage("deploy", PipelineRunStatus::Succeeded, vec![pipeline_job("j2", PipelineRunStatus::Succeeded)]),
+            ],
         );
         app.on_event(
             AppEvent::PipelineDetailLoaded {
@@ -11349,6 +13053,7 @@ mod tests {
                     approvals: Some(vec![]),
                     supports_approvals: Some(false),
                     can_respond_approvals: Some(false),
+                    ..Default::default()
                 }),
                 fetched_at: Utc::now(),
             },
@@ -11388,6 +13093,7 @@ mod tests {
                     approvals: Some(vec![]),
                     supports_approvals: Some(false),
                     can_respond_approvals: Some(false),
+                    ..Default::default()
                 }),
                 fetched_at: Utc::now(),
             },
@@ -12713,7 +14419,7 @@ mod tests {
         let run = pipeline_run("1", PipelineRunStatus::Running, vec![pipeline_stage("build", PipelineRunStatus::Running, vec![job1, job2])]);
         let mut app = App::new("slate");
         app.screen = Screen::Pipeline(Box::new(PipelineView::new("CI".into(), run, "c".into(), ProviderType::GitHub, "ci".into(), None)));
-        app.on_pipeline_screen_key(Key::Down); // → job j1
+        // One stage: no stage row, so the cursor starts on job j1.
         app.on_pipeline_screen_key(Key::Char('L'));
         assert_eq!(open_log(&app).job_id, "j1");
         assert!(!open_log(&app).follow, "a finished job doesn't follow");
@@ -13288,5 +14994,783 @@ mod tests {
         assert!(app.preview.is_some(), "the split is showing");
         assert!(app.hits.iter().any(|(_, h)| matches!(h, Hit::ListRow(_))));
         assert!(!app.hits.iter().any(|(_, h)| matches!(h, Hit::PrTab(_))), "the preview's sub-tabs are only a picture");
+    }
+
+    // ---- run pane: history, estimates, folding, log sections, and the write keys ----
+
+    /// What the recording provider was asked to do, and how it answers.
+    #[derive(Clone, Default)]
+    struct PipeCalls {
+        log: Arc<std::sync::Mutex<Vec<String>>>,
+        refuse: bool,
+        rerun: bool,
+        artifacts: bool,
+        /// A rerun starts this new run instead of re-queueing the old one.
+        new_run: Option<String>,
+        /// When set, a rerun waits for this before answering — to see the pane mid-flight.
+        gate: Option<Arc<tokio::sync::Notify>>,
+    }
+
+    impl PipeCalls {
+        fn calls(&self) -> Vec<String> {
+            self.log.lock().unwrap().clone()
+        }
+    }
+
+    struct MockPipeSource(PipeCalls);
+
+    impl MockPipeSource {
+        fn record(&self, call: String) -> forgetop_core::Result<()> {
+            self.0.log.lock().unwrap().push(call);
+            if self.0.refuse {
+                Err(forgetop_core::Error::Provider("the provider said no".into()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl PipelineSource for MockPipeSource {
+        async fn discover(&self) -> forgetop_core::Result<Vec<PipelineDefinition>> {
+            Ok(Vec::new())
+        }
+        async fn list_runs(&self, _query: &PipelineRunQuery) -> forgetop_core::Result<Vec<PipelineRun>> {
+            Ok(Vec::new())
+        }
+        async fn get_run(&self, run: &ItemRef) -> forgetop_core::Result<PipelineRun> {
+            Err(forgetop_core::Error::NotFound(run.id.clone()))
+        }
+        async fn logs(&self, _run: &ItemRef, _job_id: Option<&str>) -> forgetop_core::Result<String> {
+            Ok(String::new())
+        }
+        async fn trigger(&self, _definition: &ItemRef, _branch: Option<&str>) -> forgetop_core::Result<()> {
+            Ok(())
+        }
+        async fn cancel_run(&self, run: &ItemRef) -> forgetop_core::Result<()> {
+            self.record(format!("cancel {}", run.id))
+        }
+        fn supports_rerun(&self) -> bool {
+            self.0.rerun
+        }
+        fn supports_rerun_failed(&self) -> bool {
+            self.0.rerun
+        }
+        fn rerun_starts_new_run(&self, _failed_only: bool) -> bool {
+            self.0.new_run.is_some()
+        }
+        async fn rerun_run(&self, run: &ItemRef, failed_only: bool) -> forgetop_core::Result<Option<String>> {
+            if let Some(gate) = &self.0.gate {
+                gate.notified().await;
+            }
+            self.record(format!("rerun {} failed_only={failed_only}", run.id))?;
+            Ok(self.0.new_run.clone())
+        }
+        fn supports_artifacts(&self) -> bool {
+            self.0.artifacts
+        }
+        async fn artifacts(&self, run: &ItemRef) -> forgetop_core::Result<Vec<PipelineArtifact>> {
+            self.record(format!("artifacts {}", run.id))?;
+            Ok(vec![PipelineArtifact {
+                id: "a1".into(),
+                name: "forgetop.tar.xz".into(),
+                size_bytes: Some(8_000_000),
+                expires_at: None,
+                url: Some("https://example.test/a1".into()),
+            }])
+        }
+    }
+
+    struct MockPipeConn(PipeCalls, Capabilities);
+
+    #[async_trait::async_trait]
+    impl ProviderConnection for MockPipeConn {
+        fn connection_id(&self) -> &str {
+            "c"
+        }
+        fn provider_type(&self) -> ProviderType {
+            ProviderType::GitHub
+        }
+        fn display_name(&self) -> &str {
+            "GH"
+        }
+        fn capabilities(&self) -> &Capabilities {
+            &self.1
+        }
+        fn pull_requests(&self) -> Option<Arc<dyn PullRequestSource>> {
+            None
+        }
+        fn work_items(&self) -> Option<Arc<dyn WorkItemSource>> {
+            None
+        }
+        fn pipelines(&self) -> Option<Arc<dyn PipelineSource>> {
+            Some(Arc::new(MockPipeSource(self.0.clone())))
+        }
+        async fn check(&self) -> bool {
+            true
+        }
+    }
+
+    struct MockPipeFactory(PipeCalls);
+
+    impl ProviderFactory for MockPipeFactory {
+        fn provider_type(&self) -> ProviderType {
+            ProviderType::GitHub
+        }
+        fn describe_capabilities(&self) -> Capabilities {
+            Capabilities { supports_pipelines: true, ..Capabilities::default() }
+        }
+        fn create(&self, _connection: &Connection, _secret: Option<String>) -> forgetop_core::Result<Arc<dyn ProviderConnection>> {
+            Ok(Arc::new(MockPipeConn(self.0.clone(), self.describe_capabilities())))
+        }
+    }
+
+    /// Deps whose one pipeline connection, `c`, is the recording provider.
+    async fn deps_with_pipes(calls: PipeCalls) -> AppDeps {
+        use forgetop_core::config::InMemoryConfigStore;
+        use forgetop_core::secret::InMemorySecretStore;
+        use forgetop_core::service::ConnectionResolver;
+
+        let registry = Arc::new(ProviderRegistry::new(vec![Arc::new(MockPipeFactory(calls))]));
+        let secrets = Arc::new(InMemorySecretStore::default());
+        let config = Arc::new(ConfigService::new(Arc::new(InMemoryConfigStore::default()), secrets.clone(), registry.clone()));
+        let connection = Connection {
+            id: "c".into(),
+            provider_type: ProviderType::GitHub,
+            display_name: "GH".into(),
+            base_url: None,
+            organization: None,
+            project: None,
+            repository: None,
+            username: None,
+            credential_ref: None,
+            repo_scope: None,
+        };
+        config.add_or_update_connection(connection, None).await.unwrap();
+        config.subscribe_pipeline("c", "ci").await.unwrap();
+        let resolver = Arc::new(ConnectionResolver::new(config.clone(), registry, secrets));
+        AppDeps {
+            sections: Arc::new(SectionService::new(config.clone(), resolver.clone())),
+            health: Arc::new(ConnectionHealthService::new(config.clone(), resolver)),
+            config,
+            cache: Arc::new(CacheStore::disabled()),
+        }
+    }
+
+    fn row_of(run: PipelineRun) -> PipeRow {
+        PipeRow {
+            connection_id: "c".into(),
+            connection: "GH".into(),
+            provider: ProviderType::GitHub,
+            run,
+            definition_name: Some("CI".into()),
+            awaiting_approval: false,
+        }
+    }
+
+    /// The Pipelines tab with `run` open in its pane and listed.
+    fn run_pane_app(run: PipelineRun) -> App {
+        let mut app = App::new("slate");
+        app.clipboard = |_| Ok(());
+        app.active = 2;
+        app.pipes.push(row_of(run.clone()));
+        let title = format!("CI #{}", run.number.unwrap_or(0));
+        app.screen = Screen::Pipeline(Box::new(PipelineView::new(title, run, "c".into(), ProviderType::GitHub, "ci".into(), None)));
+        app
+    }
+
+    fn pane(app: &App) -> &PipelineView {
+        let Screen::Pipeline(v) = &app.screen else { panic!("expected the pipeline screen") };
+        v
+    }
+
+    fn pane_mut(app: &mut App) -> &mut PipelineView {
+        let Screen::Pipeline(v) = &mut app.screen else { panic!("expected the pipeline screen") };
+        v
+    }
+
+    fn secs_ago(s: i64) -> DateTime<Utc> {
+        Utc::now() - chrono::Duration::seconds(s)
+    }
+
+    #[test]
+    fn base64_matches_the_rfc_4648_vectors() {
+        for (plain, encoded) in [("", ""), ("f", "Zg=="), ("fo", "Zm8="), ("foo", "Zm9v"), ("foob", "Zm9vYg=="), ("foobar", "Zm9vYmFy")] {
+            assert_eq!(base64_encode(plain.as_bytes()), encoded, "{plain}");
+        }
+    }
+
+    static FEEDBACK_OPENED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    #[tokio::test]
+    async fn f_reruns_the_failed_jobs_only_where_it_can_and_the_pane_shows_it_queued_before_the_provider_answers() {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let calls = PipeCalls { rerun: true, gate: Some(gate.clone()), ..PipeCalls::default() };
+        let deps = deps_with_pipes(calls.clone()).await;
+        let mut run = failed_run();
+        run.attempt = Some(1);
+        run.commit_sha = Some("9c0e1d2aa".into());
+        let mut app = run_pane_app(run);
+        app.feedback_opener = |_| {
+            FEEDBACK_OPENED.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        };
+
+        // A provider that can't rerun failed jobs leaves F to the feedback form.
+        app.on_key(Key::Char('F'), &deps).await;
+        assert!(app.overlay.is_none());
+        assert!(FEEDBACK_OPENED.load(std::sync::atomic::Ordering::SeqCst), "F falls through to feedback");
+
+        pane_mut(&mut app).supports_rerun = true;
+        pane_mut(&mut app).supports_rerun_failed = true;
+        pane_mut(&mut app).annotations = vec![PipelineAnnotation {
+            level: AnnotationLevel::Failure,
+            message: "old attempt".into(),
+            title: None,
+            path: None,
+            line: None,
+            job_id: None,
+        }];
+        app.on_key(Key::Char('F'), &deps).await;
+        match &app.overlay {
+            Some(Overlay::Confirm { title, message, action: Action::PipelineRerun { failed_only: true, new_run: false, run_id, .. } }) => {
+                assert_eq!(title, "Rerun failed jobs");
+                assert_eq!(run_id, "r1");
+                assert!(message.contains("✗ unit"), "names the failed job: {message}");
+                assert!(message.contains("Same commit 9c0e1d2 · becomes attempt 2"), "{message}");
+            }
+            _ => panic!("expected the rerun confirm"),
+        }
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.job_tx = Some(tx);
+        app.on_key(Key::Char('y'), &deps).await;
+        // The provider hasn't answered — it is still waiting on the gate — and the pane already
+        // shows the rerun.
+        assert!(calls.calls().is_empty(), "the provider hasn't been asked yet");
+        assert_eq!(pane(&app).run.status, PipelineRunStatus::Queued, "the pane shows it queued");
+        assert!(pane(&app).run.started_at.is_some(), "it starts now, keeping its place in the history");
+        assert_eq!(pane(&app).run.attempt, Some(2));
+        assert_eq!(pane(&app).run.stages[0].jobs[0].status, PipelineRunStatus::Queued, "the failed job re-queued");
+        assert_eq!(app.pipes[0].run.status, PipelineRunStatus::Queued, "and so does the list row");
+        assert!(pane(&app).annotations.is_empty(), "the old attempt's problems are gone");
+
+        gate.notify_one();
+        let event = loop {
+            let event = rx.recv().await.expect("the provider's answer");
+            if matches!(event, AppEvent::PipelineRunActionDone { .. }) {
+                break event;
+            }
+        };
+        app.on_event(event, &deps);
+        assert_eq!(calls.calls(), vec!["rerun r1 failed_only=true".to_string()]);
+        assert!(app.toast.as_deref().is_some_and(|t| t.starts_with("Rerunning the failed jobs of CI #1")), "{:?}", app.toast);
+
+        // A refresh that still reports the old attempt doesn't flip the pane back.
+        let key = pipeline_detail_cache_key("c", &pane(&app).run.item_ref());
+        app.on_event(
+            AppEvent::PipelineDetailLoaded {
+                key,
+                detail: Box::new(PipelineDetailFetch { run: Some(failed_run()), ..Default::default() }),
+                fetched_at: Utc::now(),
+            },
+            &deps,
+        );
+        assert_eq!(pane(&app).run.status, PipelineRunStatus::Queued, "held until the provider catches up");
+    }
+
+    #[tokio::test]
+    async fn a_rerun_that_starts_a_new_run_leaves_the_old_one_alone_and_follows_the_new_one() {
+        let calls = PipeCalls { rerun: true, new_run: Some("r2".into()), ..PipeCalls::default() };
+        let deps = deps_with_pipes(calls.clone()).await;
+        let mut app = run_pane_app(failed_run());
+        pane_mut(&mut app).supports_rerun = true;
+        pane_mut(&mut app).rerun_new_run = true;
+        app.on_key(Key::Char('R'), &deps).await;
+        match &app.overlay {
+            Some(Overlay::Confirm { message, action: Action::PipelineRerun { new_run: true, .. }, .. }) => {
+                assert!(message.contains("Starts a new run on main"), "{message}");
+                assert!(!message.contains("attempt"), "{message}");
+            }
+            _ => panic!("expected the rerun confirm"),
+        }
+        app.on_key(Key::Char('y'), &deps).await;
+        assert_eq!(calls.calls(), vec!["rerun r1 failed_only=false".to_string()]);
+        assert_eq!(pane(&app).run.status, PipelineRunStatus::Failed, "the old run isn't marked re-queued");
+        assert!(app.toast.as_deref().is_some_and(|t| t.contains("Started a new run") && t.contains("r2")), "{:?}", app.toast);
+
+        // The next reload lists the new run: the pane moves to it.
+        let mut next = failed_run();
+        next.id = "r2".into();
+        next.number = Some(2);
+        next.status = PipelineRunStatus::Queued;
+        let mut r = reloaded_with_health(Vec::new());
+        r.pipes = vec![row_of(failed_run()), row_of(next)];
+        app.on_event(AppEvent::Reloaded(Box::new(r)), &deps);
+        assert_eq!(pane(&app).run.id, "r2", "the pane follows the new run");
+        assert!(app.toast.as_deref().is_some_and(|t| t.contains("the new run")), "{:?}", app.toast);
+    }
+
+    #[tokio::test]
+    async fn a_refused_rerun_puts_the_run_back_and_says_why() {
+        let calls = PipeCalls { rerun: true, refuse: true, ..PipeCalls::default() };
+        let deps = deps_with_pipes(calls.clone()).await;
+        let mut app = run_pane_app(failed_run());
+        pane_mut(&mut app).supports_rerun = true;
+        app.on_key(Key::Char('R'), &deps).await;
+        assert!(matches!(&app.overlay, Some(Overlay::Confirm { action: Action::PipelineRerun { failed_only: false, .. }, .. })));
+        app.on_key(Key::Char('y'), &deps).await;
+        assert_eq!(calls.calls(), vec!["rerun r1 failed_only=false".to_string()]);
+        assert_eq!(pane(&app).run.status, PipelineRunStatus::Failed, "rolled back");
+        assert_eq!(pane(&app).run.stages[0].jobs[0].status, PipelineRunStatus::Failed);
+        assert_eq!(app.pipes[0].run.status, PipelineRunStatus::Failed);
+        assert!(app.toast.as_deref().is_some_and(|t| t.contains("Rerun failed") && t.contains("the provider said no")), "{:?}", app.toast);
+    }
+
+    #[tokio::test]
+    async fn cancel_is_offered_only_on_a_live_run_and_lands_before_the_provider_answers() {
+        let calls = PipeCalls::default();
+        let deps = deps_with_pipes(calls.clone()).await;
+        let mut app = run_pane_app(failed_run());
+        app.on_key(Key::Char('X'), &deps).await;
+        assert!(app.overlay.is_none());
+        assert_eq!(app.toast.as_deref(), Some("Only a queued or running run can be cancelled"));
+
+        let mut running = pipeline_run("r9", PipelineRunStatus::Running, vec![pipeline_stage("build", PipelineRunStatus::Running, vec![pipeline_job("j1", PipelineRunStatus::Running)])]);
+        running.number = Some(9);
+        let mut app = run_pane_app(running);
+        pane_mut(&mut app).supports_rerun = true;
+        app.on_key(Key::Char('R'), &deps).await;
+        assert!(app.overlay.is_none(), "a live run can't be rerun");
+        assert!(app.toast.as_deref().is_some_and(|t| t.contains("still running")));
+
+        app.on_key(Key::Char('X'), &deps).await;
+        assert!(matches!(&app.overlay, Some(Overlay::Confirm { action: Action::PipelineCancel { .. }, .. })));
+        app.on_key(Key::Char('y'), &deps).await;
+        assert_eq!(calls.calls(), vec!["cancel r9".to_string()]);
+        assert_eq!(pane(&app).run.status, PipelineRunStatus::Canceled);
+        assert_eq!(pane(&app).run.stages[0].jobs[0].status, PipelineRunStatus::Canceled);
+        assert_eq!(app.toast.as_deref(), Some("Cancelled CI #9"));
+    }
+
+    #[tokio::test]
+    async fn artifacts_load_in_the_background_copy_their_link_and_close() {
+        let calls = PipeCalls { artifacts: true, ..PipeCalls::default() };
+        let deps = deps_with_pipes(calls.clone()).await;
+        let mut app = run_pane_app(failed_run());
+        app.on_key(Key::Char('a'), &deps).await;
+        assert!(pane(&app).artifacts.is_none());
+        assert!(app.toast.as_deref().is_some_and(|t| t.contains("Artifacts aren't supported for GitHub")));
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.job_tx = Some(tx);
+        pane_mut(&mut app).supports_artifacts = true;
+        app.on_key(Key::Char('a'), &deps).await;
+        assert!(pane(&app).artifacts.as_ref().is_some_and(|p| p.items.is_none()), "loading");
+        let event = rx.recv().await.expect("the artifacts answer");
+        assert!(matches!(event, AppEvent::PipelineArtifactsLoaded { .. }));
+        app.on_event(event, &deps);
+        assert_eq!(calls.calls(), vec!["artifacts r1".to_string()]);
+        let panel = pane(&app).artifacts.as_ref().expect("still open");
+        assert_eq!(panel.items.as_ref().map(Vec::len), Some(1));
+
+        app.on_key(Key::Char('y'), &deps).await;
+        assert_eq!(app.toast.as_deref(), Some("Copied artifact link"));
+        app.on_key(Key::Char('j'), &deps).await; // one row: nowhere to go
+        assert_eq!(pane(&app).artifacts.as_ref().map(|p| p.selected), Some(0));
+        app.on_key(Key::Escape, &deps).await;
+        assert!(pane(&app).artifacts.is_none(), "Esc closes the list, not the run");
+    }
+
+    static COPIED: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+    #[tokio::test]
+    async fn c_copies_the_full_commit_sha() {
+        let deps = test_deps();
+        let mut run = failed_run();
+        run.commit_sha = Some("1a4c3aeb2f0d".into());
+        let mut app = run_pane_app(run);
+        app.clipboard = |text| {
+            *COPIED.lock().unwrap() = Some(text.to_string());
+            Ok(())
+        };
+        app.on_key(Key::Char('c'), &deps).await;
+        assert_eq!(COPIED.lock().unwrap().as_deref(), Some("1a4c3aeb2f0d"));
+        assert_eq!(app.toast.as_deref(), Some("Copied commit 1a4c3ae"));
+
+        let mut app = run_pane_app(failed_run());
+        app.on_key(Key::Char('c'), &deps).await;
+        assert_eq!(app.toast.as_deref(), Some("This run has no commit sha"));
+    }
+
+    /// Runs `n` of CI on main, `i` hours apart, succeeded unless listed in `failed`.
+    fn ci_history(n: i64, failed: &[i64], secs: impl Fn(i64) -> i64) -> Vec<PipeRow> {
+        (1..=n)
+            .map(|i| {
+                let status = if failed.contains(&i) { PipelineRunStatus::Failed } else { PipelineRunStatus::Succeeded };
+                let mut run = pipeline_run(&format!("r{i}"), status, vec![]);
+                run.number = Some(i);
+                run.started_at = Some(secs_ago((n - i + 1) * 3600));
+                run.finished_at = run.started_at.map(|s| s + chrono::Duration::seconds(secs(i)));
+                row_of(run)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn history_measures_the_run_against_the_median_of_the_others_and_names_the_last_failure() {
+        let mut app = App::new("slate");
+        app.pipes = ci_history(5, &[3], |i| [0, 100, 120, 90, 110, 200][i as usize]);
+        // Another branch and another pipeline stay out of it.
+        let mut elsewhere = ci_history(1, &[], |_| 5).remove(0);
+        elsewhere.run.branch = Some("dev".into());
+        elsewhere.run.id = "other".into();
+        app.pipes.push(elsewhere);
+        let run = app.pipes[4].run.clone();
+        app.screen = Screen::Pipeline(Box::new(PipelineView::new("CI #5".into(), run, "c".into(), ProviderType::GitHub, "ci".into(), None)));
+        app.refresh_pipeline_context();
+
+        let h = pane(&app).history.clone().expect("history");
+        assert_eq!(h.entries.iter().map(|e| e.number.unwrap()).collect::<Vec<_>>(), vec![1, 2, 3, 4, 5], "oldest first");
+        assert_eq!(h.current, Some(4));
+        assert_eq!(h.median_secs, Some(110), "the median of 100, 120, 110 — not the failure, not this run");
+        assert_eq!(h.median_n, 3);
+        assert_eq!(h.last_failure.as_ref().and_then(|f| f.number), Some(3));
+
+        // A long history keeps the ten around the open run, the open run always among them.
+        let mut app = App::new("slate");
+        app.pipes = ci_history(14, &[], |_| 60);
+        let run = app.pipes[1].run.clone();
+        app.screen = Screen::Pipeline(Box::new(PipelineView::new("CI #2".into(), run, "c".into(), ProviderType::GitHub, "ci".into(), None)));
+        app.refresh_pipeline_context();
+        let h = pane(&app).history.clone().expect("history");
+        assert_eq!(h.entries.len(), HISTORY_LEN);
+        assert_eq!(h.total, 14);
+        assert_eq!(h.current.map(|c| h.entries[c].run_id.clone()).as_deref(), Some("r2"));
+    }
+
+    #[tokio::test]
+    async fn left_and_right_open_the_older_and_newer_run_and_the_list_selection_follows() {
+        let deps = test_deps();
+        let mut app = App::new("slate");
+        app.active = 2;
+        app.pipes = ci_history(3, &[], |_| 60);
+        app.pipe_state.select(Some(0)); // the collapsed CI group
+        let run = app.pipes[2].run.clone();
+        app.screen = Screen::Pipeline(Box::new(PipelineView::new("CI #3".into(), run, "c".into(), ProviderType::GitHub, "ci".into(), None)));
+        app.refresh_pipeline_context();
+
+        app.on_key(Key::Left, &deps).await;
+        assert_eq!(pane(&app).run.id, "r2", "the older run is open");
+        let sel = app.pipe_state.selected().expect("a selection");
+        assert!(matches!(app.pipe_lines().get(sel), Some(PipeLine::Run(i)) if app.pipes[*i].run.id == "r2"), "the list points at it");
+        assert_eq!(pane(&app).history.as_ref().and_then(|h| h.current), Some(1));
+
+        app.on_key(Key::Left, &deps).await;
+        app.on_key(Key::Left, &deps).await;
+        assert_eq!(pane(&app).run.id, "r1");
+        assert_eq!(app.toast.as_deref(), Some("No older run of this pipeline on this branch"));
+        app.on_key(Key::Right, &deps).await;
+        app.on_key(Key::Right, &deps).await;
+        app.on_key(Key::Right, &deps).await;
+        assert_eq!(pane(&app).run.id, "r3");
+        assert_eq!(app.toast.as_deref(), Some("This is the newest run on this branch"));
+    }
+
+    #[test]
+    fn estimates_take_job_medians_from_recent_succeeded_runs_of_the_same_pipeline() {
+        let mut app = App::new("slate");
+        app.pipes = ci_history(4, &[], |i| 100 + i * 10);
+        let mut running = pipeline_run("live", PipelineRunStatus::Running, vec![pipeline_stage("build", PipelineRunStatus::Running, vec![pipeline_job("build", PipelineRunStatus::Running)])]);
+        running.started_at = Some(secs_ago(30));
+        app.pipes.push(row_of(running.clone()));
+        // The three most recent succeeded runs' details, as the background fetch leaves them.
+        for (i, secs) in [(4, 60), (3, 80), (2, 100)] {
+            let mut job = pipeline_job("build", PipelineRunStatus::Succeeded);
+            job.started_at = Some(secs_ago(1000));
+            job.finished_at = job.started_at.map(|s| s + chrono::Duration::seconds(secs));
+            let mut run = app.pipes[i - 1].run.clone();
+            run.stages = vec![pipeline_stage("build", PipelineRunStatus::Succeeded, vec![job])];
+            app.run_details.insert(pipeline_detail_cache_key("c", &run.item_ref()), run);
+        }
+        app.screen = Screen::Pipeline(Box::new(PipelineView::new("CI".into(), running, "c".into(), ProviderType::GitHub, "ci".into(), None)));
+        app.refresh_pipeline_context();
+        let e = &pane(&app).estimates;
+        assert_eq!(e.jobs.get("build"), Some(&80), "median of 60, 80 and 100");
+        assert_eq!(e.job_runs, ESTIMATE_RUNS);
+        assert_eq!(e.run_median, Some(125), "median of the four succeeded runs on this branch");
+        assert_eq!(e.run_n, 4);
+    }
+
+    #[test]
+    fn the_tree_folds_cleanup_steps_and_a_failed_runs_leading_passes() {
+        let names = ["Set up job", "checkout", "toolchain", "Build", "Test", "Clippy", "Post checkout", "Complete job"];
+        let status = |i: usize| match i {
+            4 => PipelineRunStatus::Failed,
+            5 => PipelineRunStatus::Canceled,
+            _ => PipelineRunStatus::Succeeded,
+        };
+        let mut job = pipeline_job("j1", PipelineRunStatus::Failed);
+        job.steps = names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| PipelineStep { name: (*n).into(), status: status(i), started_at: None, finished_at: None })
+            .collect();
+        let run = pipeline_run("1", PipelineRunStatus::Failed, vec![pipeline_stage("jobs", PipelineRunStatus::Failed, vec![job])]);
+        let mut view = PipelineView::new("CI".into(), run.clone(), "c".into(), ProviderType::GitHub, "ci".into(), None);
+        let labels = |v: &PipelineView| v.flatten().iter().map(|n| n.label.clone()).collect::<Vec<_>>();
+        assert_eq!(
+            labels(&view),
+            vec!["3 steps passed", "Build", "Test", "Clippy", "2 post & cleanup steps"],
+            "one stage and one job: no stage or job rows; passes before the failure and cleanup fold"
+        );
+        view.toggle_selected(); // the passed group opens
+        assert_eq!(labels(&view)[..4], ["3 steps passed", "Set up job", "checkout", "toolchain"]);
+        assert_eq!(view.flatten()[1].depth, 1);
+        view.toggle_selected();
+        assert_eq!(labels(&view).len(), 5, "and folds again");
+
+        // First load lands on the failed step.
+        let mut view = PipelineView::new("CI".into(), run.clone(), "c".into(), ProviderType::GitHub, "ci".into(), None);
+        view.stale = true;
+        view.auto_select_failed();
+        assert_eq!(view.flatten()[view.selected].label, "Test");
+
+        // A passing run folds only its cleanup.
+        let mut ok = run;
+        ok.status = PipelineRunStatus::Succeeded;
+        for s in &mut ok.stages[0].jobs[0].steps {
+            s.status = PipelineRunStatus::Succeeded;
+        }
+        let view = PipelineView::new("CI".into(), ok, "c".into(), ProviderType::GitHub, "ci".into(), None);
+        assert_eq!(labels(&view).len(), 7, "six steps and the cleanup group");
+    }
+
+    const SECTIONED: &str = "prelude\n\
+        ##[group]Set up job\n\
+        runner 2.3\n\
+        ##[group]Run cargo build\n\
+        ##[endgroup]\n\
+        Compiling x\n\
+        ##[group]Run cargo test\n\
+        ##[endgroup]\n\
+        running 2 tests\n\
+        test a ... FAILED\n\
+        needle here\n\
+        ##[group]Clippy\n\
+        clippy says hi";
+
+    fn sectioned_log() -> LogView {
+        let mut log = LogView::new("Logs · j1".into(), "j1".into(), false);
+        log.steps = vec!["Set up job".into(), "Build".into(), "Test".into(), "Clippy".into()];
+        log.set_text(SECTIONED);
+        log
+    }
+
+    #[test]
+    fn a_sectioned_log_opens_the_failing_step_and_z_folds_what_the_cursor_is_on() {
+        let mut log = sectioned_log();
+        assert_eq!(log.sections.len(), 4);
+        assert_eq!(log.open, [2].into_iter().collect(), "only the step holding the first error is open");
+        let rows = log.rows.clone();
+        assert_eq!(rows[0], LogRow::Line(0), "the preamble stays a plain line");
+        assert_eq!(rows[1], LogRow::Header(0));
+        assert!(!rows.contains(&LogRow::Line(4)) && !rows.contains(&LogRow::Line(7)), "endgroup markers are hidden");
+        assert_eq!(log.rows[log.cursor], LogRow::Line(9), "the cursor starts on the first error");
+
+        log.toggle_fold(); // z inside "Run cargo test" folds it, cursor to its header
+        assert!(log.open.is_empty());
+        assert_eq!(log.rows[log.cursor], LogRow::Header(2));
+        log.toggle_fold();
+        assert!(log.open.contains(&2), "z again unfolds");
+
+        log.toggle_all_folds(); // Z: not all open → open all
+        assert_eq!(log.open.len(), 4);
+        log.toggle_all_folds(); // Z: all open → fold all
+        assert!(log.open.is_empty());
+        assert_eq!(log.rows.len(), 5, "preamble + four headers");
+
+        // E and search both unfold what they land in.
+        log.jump_first_error();
+        assert!(log.open.contains(&2));
+        assert_eq!(log.rows[log.cursor], LogRow::Line(9));
+        log.toggle_all_folds();
+        log.toggle_all_folds();
+        assert!(log.open.is_empty());
+        log.search_input = Some("clippy says".into());
+        log.commit_search();
+        assert!(log.open.contains(&3), "the match's section opened");
+        assert_eq!(log.rows[log.cursor], LogRow::Line(12));
+
+        // j/k move the cursor rather than the view in a sectioned log.
+        log.scroll_top();
+        log.scroll_by(1);
+        assert_eq!(log.cursor, 1);
+    }
+
+    #[test]
+    fn a_log_without_sections_behaves_as_it_always_did() {
+        let mut log = LogView::with_lines("Logs", "j1", lines(&["a", "b", "error: c"]));
+        assert!(!log.sectioned());
+        assert_eq!(log.rows, vec![LogRow::Line(0), LogRow::Line(1), LogRow::Line(2)]);
+        log.toggle_fold();
+        log.toggle_all_folds();
+        assert_eq!(log.rows.len(), 3, "z and Z do nothing");
+    }
+
+    /// A single-job run whose steps are the sections of [`SECTIONED`].
+    fn sectioned_run() -> PipelineRun {
+        let mut job = pipeline_job("j1", PipelineRunStatus::Failed);
+        job.steps = ["Set up job", "Build", "Test", "Clippy"]
+            .iter()
+            .map(|n| PipelineStep {
+                name: (*n).into(),
+                status: if *n == "Test" { PipelineRunStatus::Failed } else { PipelineRunStatus::Succeeded },
+                started_at: None,
+                finished_at: None,
+            })
+            .collect();
+        pipeline_run("1", PipelineRunStatus::Failed, vec![pipeline_stage("jobs", PipelineRunStatus::Failed, vec![job])])
+    }
+
+    #[tokio::test]
+    async fn enter_on_a_step_opens_that_steps_section_of_the_job_log() {
+        let deps = test_deps();
+        let mut app = run_pane_app(sectioned_run());
+        pane_mut(&mut app).selected = 1; // "Build"
+        app.on_key(Key::Enter, &deps).await;
+        let log = pane(&app).logs.as_ref().expect("the job's log opened");
+        assert_eq!((log.job_id.as_str(), log.target_step), ("j1", Some(1)));
+        assert!(pane(&app).log_focus);
+        app.apply_pipeline_logs("c", "1", "j1", Ok(SECTIONED.into()));
+        let log = pane(&app).logs.as_ref().unwrap();
+        assert_eq!(log.open, [1].into_iter().collect(), "Build's section, by name through `Run cargo build`");
+        assert_eq!(log.rows[log.cursor], LogRow::Header(1));
+        // The failed job's log also feeds the failure line.
+        let (job, summary) = pane(&app).log_failure.clone().expect("a failure read from the log");
+        assert_eq!((job.as_str(), summary.test.as_deref()), ("j1", Some("a")));
+    }
+
+    #[tokio::test]
+    async fn e_from_the_tree_opens_the_failed_log_at_its_first_error() {
+        let deps = test_deps();
+        let mut app = run_pane_app(sectioned_run());
+        app.on_key(Key::Char('E'), &deps).await;
+        assert_eq!(pane(&app).flatten()[pane(&app).selected].label, "Test", "the tree points at the failed step");
+        app.apply_pipeline_logs("c", "1", "j1", Ok(SECTIONED.into()));
+        let log = pane(&app).logs.as_ref().expect("open");
+        assert_eq!(log.rows[log.cursor], LogRow::Line(9));
+        assert_eq!(log.note.as_deref(), Some("first error at line 10"));
+    }
+
+    #[tokio::test]
+    async fn enter_on_a_problem_opens_its_job_log_at_the_line_it_names() {
+        let deps = test_deps();
+        let mut app = run_pane_app(sectioned_run());
+        app.on_key(Key::Char('e'), &deps).await;
+        assert_eq!(app.toast.as_deref(), Some("No problems reported for this run"));
+        pane_mut(&mut app).annotations = vec![PipelineAnnotation {
+            level: AnnotationLevel::Failure,
+            message: "needle".into(),
+            title: None,
+            path: Some("src/here.rs".into()),
+            line: Some(4),
+            job_id: Some("j1".into()),
+        }];
+        app.on_key(Key::Char('e'), &deps).await;
+        assert!(pane(&app).problem_focus);
+        app.on_key(Key::Enter, &deps).await;
+        assert!(!pane(&app).problem_focus && pane(&app).log_focus);
+        app.apply_pipeline_logs("c", "1", "j1", Ok(SECTIONED.into()));
+        let log = pane(&app).logs.as_ref().expect("open");
+        assert_eq!(log.rows[log.cursor], LogRow::Line(10), "no `src/here.rs:4` in the log, so the message");
+        assert_eq!(log.note.as_deref(), Some("line 11"));
+    }
+
+    #[test]
+    fn a_branch_with_one_run_shows_the_pipelines_history_across_branches() {
+        let mut app = App::new("slate");
+        app.pipes = ci_history(3, &[], |_| 60);
+        let mut tag = pipeline_run("tag", PipelineRunStatus::Succeeded, vec![]);
+        tag.branch = Some("v1.2.1".into());
+        tag.started_at = Some(secs_ago(10));
+        tag.finished_at = Some(secs_ago(5));
+        app.pipes.push(row_of(tag.clone()));
+        app.screen = Screen::Pipeline(Box::new(PipelineView::new("CI".into(), tag, "c".into(), ProviderType::GitHub, "ci".into(), None)));
+        app.refresh_pipeline_context();
+        let h = pane(&app).history.clone().expect("history");
+        assert!(h.all_branches);
+        assert_eq!(h.entries.len(), 4, "every branch's runs");
+        assert_eq!(h.current, Some(3));
+    }
+
+    #[test]
+    fn annotations_are_asked_for_a_finished_run_once_per_status() {
+        let mut app = run_pane_app(failed_run());
+        let key = pipeline_detail_cache_key("c", &pane(&app).run.item_ref());
+        assert!(app.wants_annotations(&key), "a finished run's problems are asked for");
+        assert!(!app.wants_annotations(&key), "and not again while its status holds");
+        pane_mut(&mut app).run.status = PipelineRunStatus::Running;
+        assert!(!app.wants_annotations(&key), "an in-flight run's never are");
+        pane_mut(&mut app).run.status = PipelineRunStatus::Succeeded;
+        assert!(app.wants_annotations(&key), "a new outcome asks again");
+        assert!(!app.wants_annotations("some other run"), "nothing on screen, nothing asked");
+    }
+
+    #[test]
+    fn folds_and_the_view_survive_the_line_cap_dropping_more_of_the_head() {
+        // Three steps, the second big; a live log grows at its tail, so each poll the cap
+        // drops more of the head.
+        let body = |tail: usize| {
+            let mut t = String::new();
+            for i in 0..8000 {
+                t.push_str(&format!("preamble {i}\n"));
+            }
+            t.push_str("##[group]Run one\none\n##[group]Run two\n");
+            for i in 0..3000 {
+                t.push_str(&format!("two {i}\n"));
+            }
+            t.push_str("##[group]Run three\n");
+            for i in 0..tail {
+                t.push_str(&format!("three {i}\n"));
+            }
+            t
+        };
+        let mut log = LogView::new("Logs".into(), "j1".into(), false);
+        log.steps = vec!["one".into(), "two".into(), "three".into()];
+        log.set_text(&body(1000));
+        assert!(log.base > 0, "the head was capped");
+        log.viewport.set(10);
+        // Open "two" and put the cursor on one of its lines.
+        let two = log.sections.iter().position(|s| s.name == "Run two").unwrap();
+        log.open = [two].into_iter().collect();
+        log.relayout();
+        let target = log.lines.iter().position(|l| l == "two 1500").unwrap();
+        log.jump_to(target);
+        let top_before = log.rows[log.effective_scroll() as usize];
+        let top_text = log.lines[log.row_line(top_before)].clone();
+
+        // The next poll has 500 more lines, so 500 more of the head are dropped.
+        let before = log.base;
+        log.set_text(&body(1500));
+        assert_eq!(log.base, before + 500);
+        let two = log.sections.iter().position(|s| s.name == "Run two").unwrap();
+        assert_eq!(log.open, [two].into_iter().collect(), "the same step is still the open one");
+        assert_eq!(log.lines[log.row_line(log.rows[log.cursor])], "two 1500", "the cursor stayed on its line");
+        assert_eq!(log.lines[log.row_line(log.rows[log.effective_scroll() as usize])], top_text, "and the view on its content");
+    }
+
+    #[test]
+    fn folded_passed_steps_merge_into_one_header_that_z_opens() {
+        let mut log = LogView::new("Logs".into(), "j1".into(), false);
+        log.steps = vec!["one".into(), "two".into(), "three".into(), "four".into()];
+        log.step_passed = vec![true, true, true, false];
+        log.set_text("##[group]Run one\na\n##[group]Run two\nb\n##[group]Run three\nc\n##[group]Run four\nerror: d");
+        assert_eq!(log.rows[0], LogRow::Group(0, 2), "three passed steps, one header");
+        assert_eq!(log.rows[1], LogRow::Header(3));
+        log.cursor = 0;
+        log.toggle_fold();
+        assert!((0..3).all(|s| log.open.contains(&s)), "z opens every step in the group");
+        assert_eq!(log.rows[0], LogRow::Header(0));
     }
 }

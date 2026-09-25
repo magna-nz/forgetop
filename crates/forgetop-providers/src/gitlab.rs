@@ -134,11 +134,20 @@ pub fn gl_pipeline_status(status: Option<&str>) -> PipelineRunStatus {
     }
 }
 
+/// The merge request a pipeline ref names — `refs/merge-requests/<iid>/head` or `/merge`.
+fn merge_request_iid(git_ref: &str) -> Option<i64> {
+    git_ref.strip_prefix("refs/merge-requests/")?.split('/').next()?.parse().ok()
+}
+
 pub fn map_pipeline(v: &Value, repo: Option<&str>) -> PipelineRun {
     PipelineRun {
-        event: None,
+        // GitLab calls it `source` (push, merge_request_event, schedule, …) — same idea as
+        // GitHub's `event`, just a different field name.
+        event: get_str(v, "source"),
+        // GitLab doesn't number re-runs the way GitHub's `run_attempt` does.
         attempt: None,
-        pull_request: None,
+        // A merge-request pipeline runs on `refs/merge-requests/<iid>/head` (or `/merge`).
+        pull_request: get_str(v, "ref").as_deref().and_then(merge_request_iid),
         repository: repo.map(str::to_string),
         id: get_i64(v, "id").map(|n| n.to_string()).unwrap_or_else(|| "0".into()),
         definition_id: "pipelines".into(),
@@ -166,6 +175,39 @@ pub fn map_gl_job(v: &Value) -> PipelineJob {
         steps: vec![],
         url: get_str(v, "web_url"),
         problem: get_str(v, "failure_reason").filter(|s| !s.is_empty()).map(|s| s.replace('_', " ")),
+    }
+}
+
+/// One entry of `GET /projects/:id/pipelines/:pipeline_id/jobs` that published an artifact.
+/// `None` when the job has no `artifacts_file` at all (most jobs).
+pub fn map_gl_artifact(v: &Value) -> Option<PipelineArtifact> {
+    let file = get_obj(v, "artifacts_file")?;
+    let id = get_i64(v, "id").map(|n| n.to_string()).unwrap_or_else(|| "0".into());
+    let job_name = get_str(v, "name").unwrap_or_else(|| "job".into());
+    let name = get_str(file, "filename").unwrap_or_else(|| format!("{job_name} artifacts"));
+    Some(PipelineArtifact {
+        id,
+        name,
+        size_bytes: file.get("size").and_then(|x| x.as_u64()),
+        expires_at: get_date(v, "artifacts_expire_at"),
+        url: get_str(v, "web_url").map(|w| format!("{w}/artifacts/browse")),
+    })
+}
+
+/// One failed/errored test case from `GET /projects/:id/pipelines/:pipeline_id/test_report`.
+pub fn map_gl_annotation(v: &Value) -> PipelineAnnotation {
+    let message = get_str(v, "system_output")
+        .as_deref()
+        .and_then(|s| s.lines().map(str::trim).find(|l| !l.is_empty()).map(str::to_string))
+        .or_else(|| get_str(v, "status"))
+        .unwrap_or_else(|| "failed".into());
+    PipelineAnnotation {
+        level: AnnotationLevel::Failure,
+        message,
+        title: get_str(v, "name"),
+        path: get_str(v, "file"),
+        line: None,
+        job_id: None,
     }
 }
 
@@ -227,12 +269,18 @@ fn strip_ansi(s: &str) -> String {
     out
 }
 
-/// Removes GitLab's collapsible-section markers (`section_start:<ts>:<name>[...]` /
-/// `section_end:<ts>:<name>[...]`), each of which is terminated by the `\r` that used to
-/// precede the (already-ANSI-stripped) cursor-reset control code.
+/// Rewrites GitLab's collapsible-section markers (`section_start:<ts>:<name>[...]` /
+/// `section_end:<ts>:<name>[...]`, each terminated by the `\r` that used to precede the
+/// already-ANSI-stripped cursor-reset code). A start becomes a GitHub-style `##[group]<header>`
+/// — the header text GitLab prints after it, or the section's name when there is none — so the
+/// shared log reader (`forgetop_core::runlog`) finds the job's steps in one dialect; an end is
+/// dropped, since a group runs to the next one.
 fn strip_section_markers(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
+    // GitLab nests sections; only an outermost one becomes a group, so a step's inner sections
+    // stay part of it rather than splitting it.
+    let mut depth = 0usize;
     loop {
         let next = match (rest.find("section_start:"), rest.find("section_end:")) {
             (Some(a), Some(b)) => Some(a.min(b)),
@@ -245,6 +293,22 @@ fn strip_section_markers(s: &str) -> String {
         };
         out.push_str(&rest[..idx]);
         let after = &rest[idx..];
+        if after.starts_with("section_end:") {
+            depth = depth.saturating_sub(1);
+        }
+        if let Some(spec) = after.strip_prefix("section_start:").filter(|_| {
+            depth += 1;
+            depth == 1
+        }) {
+            let spec = &spec[..spec.find(['\r', '\n']).unwrap_or(spec.len())];
+            let name = spec.split_once(':').map(|(_, name)| name).unwrap_or(spec);
+            let name = name.split('[').next().unwrap_or(name).trim();
+            out.push_str("##[group]");
+            let header_follows = after.find('\r').is_some_and(|r| !after[r + 1..].split('\n').next().unwrap_or("").trim().is_empty());
+            if !header_follows {
+                out.push_str(name);
+            }
+        }
         rest = match after.find('\r') {
             Some(r) => &after[r + 1..],
             None => match after.find('\n') {
@@ -481,6 +545,19 @@ impl GitLabClient {
         resp.json().await.map_err(prov)
     }
 
+    /// Like `get_json`, but returns `Ok(None)` on a 404 instead of erroring — used for
+    /// `/test_report`, which 404s when the pipeline published no JUnit reports at all.
+    async fn get_json_opt(&self, url: &str) -> Result<Option<Value>> {
+        let resp = self.http.get(url).send().await.map_err(prov)?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            return Err(Error::Provider(format!("GET {url} -> {}", resp.status())));
+        }
+        Ok(Some(resp.json().await.map_err(prov)?))
+    }
+
     /// Like `get_json`, but for a plain-text endpoint (a job's `/trace`).
     async fn get_text(&self, url: &str) -> Result<String> {
         let resp = self.http.get(url).send().await.map_err(prov)?;
@@ -500,6 +577,15 @@ impl GitLabClient {
 
     async fn post_json(&self, url: &str, body: Value) -> Result<()> {
         self.send(self.http.post(url).json(&body), &format!("POST {url}")).await
+    }
+
+    /// Like `post_json`, but returns the created resource (a new pipeline).
+    async fn post_json_read(&self, url: &str, body: Value) -> Result<Value> {
+        let resp = self.http.post(url).json(&body).send().await.map_err(prov)?;
+        if !resp.status().is_success() {
+            return Err(Error::Provider(format!("POST {url} -> {}", resp.status())));
+        }
+        resp.json().await.map_err(prov)
     }
 
     async fn self_username(&self) -> Result<Option<String>> {
@@ -896,6 +982,61 @@ impl PipelineSource for GitLabPipe {
         let project = self.0.resolve(run)?;
         self.0.post_json(&self.0.project_path(&project, &format!("/pipelines/{}/cancel", run.id)), json!({})).await
     }
+    fn supports_rerun(&self) -> bool {
+        true
+    }
+    fn supports_rerun_failed(&self) -> bool {
+        true
+    }
+    fn rerun_starts_new_run(&self, failed_only: bool) -> bool {
+        // `retry` re-queues the failed jobs of the same pipeline; a whole re-run is a new one.
+        !failed_only
+    }
+    async fn rerun_run(&self, run: &ItemRef, failed_only: bool) -> Result<Option<String>> {
+        let project = self.0.resolve(run)?;
+        if failed_only {
+            // Retries just the failed jobs on the existing pipeline.
+            self.0.post_json(&self.0.project_path(&project, &format!("/pipelines/{}/retry", run.id)), json!({})).await?;
+            return Ok(None);
+        }
+        // A whole-run re-run has no direct "rerun" endpoint — start a fresh pipeline on the ref
+        // the original one ran on (its current head). A merge-request pipeline's ref can't be
+        // passed to `POST /pipeline`; those are started through the merge request instead.
+        let pipeline_v = self.0.get_json(&self.0.project_path(&project, &format!("/pipelines/{}", run.id))).await?;
+        let git_ref = get_str(&pipeline_v, "ref").ok_or_else(|| Error::Provider("pipeline has no ref to rerun on".into()))?;
+        let created = match merge_request_iid(&git_ref) {
+            Some(iid) => self.0.post_json_read(&self.0.project_path(&project, &format!("/merge_requests/{iid}/pipelines")), json!({})).await?,
+            None => self.0.post_json_read(&self.0.project_path(&project, "/pipeline"), json!({ "ref": git_ref })).await?,
+        };
+        Ok(get_i64(&created, "id").map(|n| n.to_string()))
+    }
+    fn supports_artifacts(&self) -> bool {
+        true
+    }
+    async fn artifacts(&self, run: &ItemRef) -> Result<Vec<PipelineArtifact>> {
+        let project = self.0.resolve(run)?;
+        let jobs_v = self.0.get_json(&self.0.project_path(&project, &format!("/pipelines/{}/jobs?per_page=100", run.id))).await?;
+        Ok(jobs_v.as_array().unwrap_or(&vec![]).iter().filter_map(map_gl_artifact).collect())
+    }
+    async fn annotations(&self, run: &ItemRef) -> Result<Vec<PipelineAnnotation>> {
+        let project = self.0.resolve(run)?;
+        let url = self.0.project_path(&project, &format!("/pipelines/{}/test_report", run.id));
+        // No JUnit reports published for this pipeline at all — an empty list, not an error.
+        let Some(v) = self.0.get_json_opt(&url).await? else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::new();
+        for suite in get_arr(&v, "test_suites") {
+            for case in get_arr(suite, "test_cases") {
+                match get_str(case, "status").as_deref() {
+                    Some("failed") | Some("error") => out.push(map_gl_annotation(case)),
+                    _ => {}
+                }
+            }
+        }
+        out.truncate(50);
+        Ok(out)
+    }
     fn supports_approvals(&self) -> bool {
         true
     }
@@ -1134,6 +1275,53 @@ mod tests {
     }
 
     #[test]
+    fn maps_pipeline_event_from_source() {
+        let v: Value = serde_json::from_str(r#"{ "id": 1, "status": "success", "source": "merge_request_event" }"#).unwrap();
+        let run = map_pipeline(&v, None);
+        assert_eq!(run.event.as_deref(), Some("merge_request_event"));
+        assert_eq!(run.attempt, None);
+        assert_eq!(run.pull_request, None);
+    }
+
+    #[test]
+    fn maps_job_artifact_and_skips_jobs_without_one() {
+        let with_artifact: Value = serde_json::from_str(
+            r#"{ "id": 55, "name": "build", "web_url": "https://gitlab.com/p/-/jobs/55",
+                 "artifacts_expire_at": "2026-08-01T00:00:00Z",
+                 "artifacts_file": { "filename": "artifacts.zip", "size": 4096 } }"#,
+        )
+        .unwrap();
+        let a = map_gl_artifact(&with_artifact).expect("has artifact");
+        assert_eq!(a.id, "55");
+        assert_eq!(a.name, "artifacts.zip");
+        assert_eq!(a.size_bytes, Some(4096));
+        assert!(a.expires_at.is_some());
+        assert_eq!(a.url.as_deref(), Some("https://gitlab.com/p/-/jobs/55/artifacts/browse"));
+
+        let without: Value = serde_json::from_str(r#"{ "id": 56, "name": "lint" }"#).unwrap();
+        assert!(map_gl_artifact(&without).is_none());
+    }
+
+    #[test]
+    fn maps_failed_test_case_to_annotation() {
+        let case: Value = serde_json::from_str(
+            r#"{ "status": "failed", "name": "test_retry", "file": "spec/retry_spec.rb",
+                 "system_output": "\n  expected true, got false\n  more detail" }"#,
+        )
+        .unwrap();
+        let a = map_gl_annotation(&case);
+        assert_eq!(a.level, AnnotationLevel::Failure);
+        assert_eq!(a.title.as_deref(), Some("test_retry"));
+        assert_eq!(a.path.as_deref(), Some("spec/retry_spec.rb"));
+        assert_eq!(a.message, "expected true, got false");
+        assert_eq!(a.line, None);
+
+        // No system_output at all — falls back to the status rather than an empty message.
+        let bare: Value = serde_json::from_str(r#"{ "status": "error", "name": "test_bare" }"#).unwrap();
+        assert_eq!(map_gl_annotation(&bare).message, "error");
+    }
+
+    #[test]
     fn maps_commit_and_status() {
         let commit: Value =
             serde_json::from_str(r#"{ "short_id": "a1b2c3d", "title": "Fix bug", "author_name": "Dana", "created_at": "2026-06-01T10:00:00Z", "web_url": "u" }"#).unwrap();
@@ -1211,9 +1399,33 @@ mod tests {
         let cleaned = strip_ci_log(raw);
         assert!(!cleaned.contains("section_start"), "section_start marker removed: {cleaned:?}");
         assert!(!cleaned.contains("section_end"), "section_end marker removed: {cleaned:?}");
+        assert!(cleaned.starts_with("##[group]executing step\n"), "a start becomes a group named by its header: {cleaned:?}");
         assert!(cleaned.contains("executing step"));
         assert!(cleaned.contains("$ echo hi"));
         assert!(cleaned.contains("hi"));
+    }
+
+    #[test]
+    fn gitlab_sections_parse_as_steps_in_the_shared_log_reader() {
+        let raw = "Running with gitlab-runner\nsection_start:1700000000:prepare_script[collapsed=true]\r\x1b[0K\x1b[36;1mPreparing environment\x1b[0m\nRunning on runner-1\nsection_end:1700000001:prepare_script\r\x1b[0K\nsection_start:1700000002:step_script\r\x1b[0K\n$ cargo test\ntest result: ok\nsection_end:1700000009:step_script\r\x1b[0K\n";
+        let lines: Vec<String> = strip_ci_log(raw).lines().map(str::to_owned).collect();
+        let names: Vec<String> = forgetop_core::runlog::parse_sections(&lines).into_iter().map(|s| s.name).collect();
+        assert_eq!(names, vec!["Preparing environment".to_string(), "step_script".to_string()], "{lines:?}");
+    }
+
+    #[test]
+    fn nested_gitlab_sections_stay_inside_their_step() {
+        let raw = "section_start:1:step_script\r\x1b[0KExecuting script\n$ make\nsection_start:2:inner[collapsed=true]\r\x1b[0KCompiling\ncc a.c\nsection_end:3:inner\r\x1b[0K\ndone\nsection_end:4:step_script\r\x1b[0K\nsection_start:5:after_script\r\x1b[0K\nbye\nsection_end:6:after_script\r\x1b[0K\n";
+        let lines: Vec<String> = strip_ci_log(raw).lines().map(str::to_owned).collect();
+        let names: Vec<String> = forgetop_core::runlog::parse_sections(&lines).into_iter().map(|s| s.name).collect();
+        assert_eq!(names, vec!["Executing script".to_string(), "after_script".to_string()], "{lines:?}");
+    }
+
+    #[test]
+    fn merge_request_refs_name_their_iid() {
+        assert_eq!(merge_request_iid("refs/merge-requests/12/head"), Some(12));
+        assert_eq!(merge_request_iid("refs/merge-requests/7/merge"), Some(7));
+        assert_eq!(merge_request_iid("main"), None);
     }
 
     #[test]

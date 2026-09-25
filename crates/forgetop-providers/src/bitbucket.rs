@@ -243,14 +243,29 @@ pub fn bb_status(state: Option<&Value>) -> PipelineRunStatus {
     }
 }
 
+/// A pipeline's trigger → `PipelineRun::event`: the trigger's own name (`PUSH`, `MANUAL`,
+/// `SCHEDULE`, …) lowercased, or `"pull_request"` when the target itself says it was a PR build
+/// (Bitbucket's `pullrequest` target type).
+fn bb_event(v: &Value) -> Option<String> {
+    if get_obj(v, "target").and_then(|t| get_str(t, "type")).as_deref() == Some("pipeline_pullrequest_target") {
+        return Some("pull_request".into());
+    }
+    get_obj(v, "trigger").and_then(|t| get_str(t, "name")).map(|n| n.to_ascii_lowercase())
+}
+
+/// The pull request a run was built for, when its target carries one.
+fn bb_pull_request(v: &Value) -> Option<i64> {
+    get_obj(v, "target").and_then(|t| get_obj(t, "pullrequest")).and_then(|pr| get_i64(pr, "id"))
+}
+
 /// `repo` is the connection-relative `workspace/slug`, which is also exactly the path segment
 /// Bitbucket's web UI wants for a run's deep link.
 pub fn map_pipeline(v: &Value, repo: &str) -> PipelineRun {
     let number = get_i64(v, "build_number");
     PipelineRun {
-        event: None,
+        event: bb_event(v),
         attempt: None,
-        pull_request: None,
+        pull_request: bb_pull_request(v),
         repository: Some(repo.to_string()),
         id: get_str(v, "uuid").unwrap_or_else(|| number.map(|n| n.to_string()).unwrap_or_else(|| "0".into())),
         definition_id: "pipelines".into(),
@@ -291,6 +306,23 @@ fn strip_log_text(s: &str) -> String {
         out.push(c);
     }
     out.replace('\r', "")
+}
+
+/// A commit report annotation (`/commit/{sha}/reports/{report}/annotations`) → [`PipelineAnnotation`].
+pub fn map_bb_annotation(v: &Value) -> PipelineAnnotation {
+    let level = match get_str(v, "severity").as_deref() {
+        Some("HIGH") | Some("CRITICAL") => AnnotationLevel::Failure,
+        Some("MEDIUM") => AnnotationLevel::Warning,
+        _ => AnnotationLevel::Notice,
+    };
+    PipelineAnnotation {
+        level,
+        message: get_str(v, "summary").unwrap_or_default(),
+        title: None,
+        path: get_str(v, "path"),
+        line: get_i64(v, "line").map(|n| n as u32),
+        job_id: None,
+    }
 }
 
 pub fn map_step(v: &Value) -> PipelineJob {
@@ -359,6 +391,15 @@ impl BitbucketClient {
         let resp = self.http.get(url).send().await.map_err(prov)?;
         if !resp.status().is_success() {
             return Err(Error::Provider(format!("GET {url} -> {}", resp.status())));
+        }
+        resp.json().await.map_err(prov)
+    }
+
+    /// Like `post_ok`, but returns the created resource (a new pipeline run).
+    async fn post_json_read(&self, url: &str, body: Value) -> Result<Value> {
+        let resp = self.http.post(url).json(&body).send().await.map_err(prov)?;
+        if !resp.status().is_success() {
+            return Err(Error::Provider(format!("POST {url} -> {}", resp.status())));
         }
         resp.json().await.map_err(prov)
     }
@@ -615,6 +656,56 @@ impl PipelineSource for BitbucketPipe {
     async fn cancel_run(&self, run: &ItemRef) -> Result<()> {
         let repo = self.0.resolve(run)?;
         self.0.post_ok(&self.0.repo_path(&repo, &format!("/pipelines/{}/stopPipeline", enc_uuid(&run.id))), json!({})).await
+    }
+    fn supports_rerun(&self) -> bool {
+        true
+    }
+    // Bitbucket has no endpoint to retry just a run's failed jobs — a re-run always starts the
+    // pipeline over, so `supports_rerun_failed` stays the default `false`.
+    fn rerun_starts_new_run(&self, _failed_only: bool) -> bool {
+        // Bitbucket re-runs a pipeline by starting a new one against the same target.
+        true
+    }
+    async fn rerun_run(&self, run: &ItemRef, failed_only: bool) -> Result<Option<String>> {
+        if failed_only {
+            return Err(Error::Provider("re-running only failed jobs isn't supported by this provider".into()));
+        }
+        let repo = self.0.resolve(run)?;
+        let uuid = enc_uuid(&run.id);
+        let run_v = self.0.get_json(&self.0.repo_path(&repo, &format!("/pipelines/{uuid}"))).await?;
+        // Re-run against the exact same target (branch/commit/PR) the original run used.
+        let target = run_v.get("target").cloned().ok_or_else(|| Error::Provider(format!("pipeline run '{}' has no target to re-run", run.id)))?;
+        let created = self.0.post_json_read(&self.0.repo_path(&repo, "/pipelines"), json!({ "target": target })).await?;
+        Ok(get_str(&created, "uuid"))
+    }
+    // Annotations come from the Code Insights reports attached to the run's commit; artifacts
+    // have no equivalent Bitbucket Cloud endpoint, so `supports_artifacts` stays the default
+    // `false` rather than claiming a capability with nothing behind it.
+    async fn annotations(&self, run: &ItemRef) -> Result<Vec<PipelineAnnotation>> {
+        let repo = self.0.resolve(run)?;
+        let uuid = enc_uuid(&run.id);
+        let run_v = self.0.get_json(&self.0.repo_path(&repo, &format!("/pipelines/{uuid}"))).await?;
+        let Some(sha) = get_obj(&run_v, "target").and_then(|t| get_obj(t, "commit")).and_then(|c| get_str(c, "hash")) else {
+            return Ok(vec![]);
+        };
+        let reports_v = self.0.get_json(&self.0.repo_path(&repo, &format!("/commit/{sha}/reports?pagelen=100"))).await?;
+        let mut out: Vec<PipelineAnnotation> = Vec::new();
+        for report in get_arr(&reports_v, "values") {
+            let Some(report_id) = get_str(report, "uuid") else { continue };
+            let url = self.0.repo_path(&repo, &format!("/commit/{sha}/reports/{}/annotations?pagelen=100", enc_uuid(&report_id)));
+            // A report whose annotations fail to load (permissions, a malformed report) is
+            // skipped rather than failing the whole pane.
+            if let Ok(anns_v) = self.0.get_json(&url).await {
+                out.extend(get_arr(&anns_v, "values").iter().map(map_bb_annotation));
+            }
+        }
+        out.sort_by_key(|a| match a.level {
+            AnnotationLevel::Failure => 0,
+            AnnotationLevel::Warning => 1,
+            AnnotationLevel::Notice => 2,
+        });
+        out.truncate(50);
+        Ok(out)
     }
 }
 
@@ -876,5 +967,42 @@ mod tests {
     fn strip_log_text_leaves_plain_text_untouched() {
         let raw = "hello world\nsecond line\nthird line";
         assert_eq!(strip_log_text(raw), raw);
+    }
+
+    #[test]
+    fn maps_pipeline_event_and_pull_request_from_target() {
+        let push: Value = serde_json::from_str(r#"{ "trigger": { "name": "PUSH" }, "target": { "type": "pipeline_ref_target" } }"#).unwrap();
+        let run = map_pipeline(&push, "a/b");
+        assert_eq!(run.event.as_deref(), Some("push"));
+        assert_eq!(run.pull_request, None);
+        assert_eq!(run.attempt, None);
+
+        let pr: Value = serde_json::from_str(
+            r#"{ "trigger": { "name": "PUSH" }, "target": { "type": "pipeline_pullrequest_target", "pullrequest": { "id": 9 } } }"#,
+        )
+        .unwrap();
+        let pr_run = map_pipeline(&pr, "a/b");
+        assert_eq!(pr_run.event.as_deref(), Some("pull_request")); // target type wins over trigger name
+        assert_eq!(pr_run.pull_request, Some(9));
+
+        let manual: Value = serde_json::from_str(r#"{ "trigger": { "name": "MANUAL" } }"#).unwrap();
+        assert_eq!(map_pipeline(&manual, "a/b").event.as_deref(), Some("manual"));
+    }
+
+    #[test]
+    fn maps_report_annotations_by_severity() {
+        let high: Value = serde_json::from_str(r#"{ "severity": "HIGH", "summary": "leak", "path": "src/a.rs", "line": 5 }"#).unwrap();
+        assert_eq!(map_bb_annotation(&high).level, AnnotationLevel::Failure);
+        let critical: Value = serde_json::from_str(r#"{ "severity": "CRITICAL", "summary": "boom" }"#).unwrap();
+        assert_eq!(map_bb_annotation(&critical).level, AnnotationLevel::Failure);
+        let medium: Value = serde_json::from_str(r#"{ "severity": "MEDIUM", "summary": "smell" }"#).unwrap();
+        assert_eq!(map_bb_annotation(&medium).level, AnnotationLevel::Warning);
+        let low: Value = serde_json::from_str(r#"{ "severity": "LOW", "summary": "nit", "path": "src/b.rs", "line": 1 }"#).unwrap();
+        let low_a = map_bb_annotation(&low);
+        assert_eq!(low_a.level, AnnotationLevel::Notice);
+        assert_eq!(low_a.message, "nit");
+        assert_eq!(low_a.path.as_deref(), Some("src/b.rs"));
+        assert_eq!(low_a.line, Some(1));
+        assert_eq!(low_a.job_id, None);
     }
 }
