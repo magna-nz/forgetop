@@ -3309,38 +3309,72 @@ struct Ghost {
     left: Option<i64>,
 }
 
-/// Estimated finishes for an in-flight run's jobs, keyed by `(stage, job)`: a running job ends
-/// its median after it started; queued jobs follow the running ones, one after another.
+/// A matrix leg's base name: `build (x86_64-apple-darwin)` → `build`.
+fn matrix_base(name: &str) -> Option<&str> {
+    let (base, rest) = name.rsplit_once(" (")?;
+    rest.ends_with(')').then_some(base.trim())
+}
+
+/// A job name's first word (`build-global-artifacts` → `build`), for guessing what a queued job
+/// waits on.
+fn first_word(name: &str) -> &str {
+    name.split(['-', '_', ' ', ':', '/']).next().unwrap_or(name)
+}
+
+/// Estimated finishes for an in-flight run's jobs, keyed by `(stage, job)`. A running job ends
+/// its median after it started. Queued jobs in one stage run side by side, starting when the
+/// stage is ready — once everything running is estimated done, and after the stage before —
+/// while successive stages follow each other. A single-stage run (GitHub's `jobs`) says nothing
+/// of what waits on what, so a queued job whose name shares its first word with a running
+/// matrix (`build (…)`) starts after that matrix, and any other once the running jobs are done.
 fn job_ghosts(view: &PipelineView, now: DateTime<Utc>) -> HashMap<(usize, usize), Ghost> {
     let mut out = HashMap::new();
     if !is_active(view.run.status) || view.estimates.jobs.is_empty() {
         return out;
     }
+    let secs = |s: i64| chrono::Duration::seconds(s);
     let mut after_running = now;
+    // When each running matrix (by base name) is estimated done.
+    let mut matrices: HashMap<String, DateTime<Utc>> = HashMap::new();
     for (si, stage) in view.run.stages.iter().enumerate() {
         for (ji, job) in stage.jobs.iter().enumerate() {
             let (Some(median), Some(start)) = (view.estimates.jobs.get(&job.name), job.started_at) else { continue };
             if job.status != PipelineRunStatus::Running {
                 continue;
             }
-            let end = start + chrono::Duration::seconds(*median);
+            let end = (start + secs(*median)).max(now);
             after_running = after_running.max(end);
+            if let Some(base) = matrix_base(&job.name) {
+                let done = matrices.entry(base.to_string()).or_insert(end);
+                *done = (*done).max(end);
+            }
             if end > now {
                 out.insert((si, ji), Ghost { start: now, end, left: Some((end - now).num_seconds()) });
             }
         }
     }
-    let mut chain = after_running;
+    let single_stage = view.run.stages.len() == 1;
+    let mut ready = after_running;
     for (si, stage) in view.run.stages.iter().enumerate() {
+        let mut stage_done = ready;
         for (ji, job) in stage.jobs.iter().enumerate() {
             let Some(median) = view.estimates.jobs.get(&job.name) else { continue };
             if job.status != PipelineRunStatus::Queued {
                 continue;
             }
-            let end = chain + chrono::Duration::seconds(*median);
-            out.insert((si, ji), Ghost { start: chain, end, left: None });
-            chain = end;
+            let start = if single_stage {
+                matrices
+                    .iter()
+                    .find(|(base, _)| first_word(base) == first_word(&job.name))
+                    .map_or(after_running, |(_, done)| *done)
+            } else {
+                ready
+            };
+            let end = start + secs(*median);
+            stage_done = stage_done.max(end);
+            out.insert((si, ji), Ghost { start, end, left: None });
         }
+        ready = stage_done;
     }
     out
 }
@@ -3426,7 +3460,15 @@ fn render_timeline(
     let run = &view.run;
     let active = is_active(run.status);
     let jobs = || run.stages.iter().flat_map(|s| &s.jobs);
-    let starts = run.started_at.into_iter().chain(jobs().filter_map(|j| j.started_at)).chain(jobs().flat_map(|j| &j.steps).filter_map(|s| s.started_at));
+    // While a rerun of failed jobs is in flight, the jobs it kept still carry the earlier
+    // attempt's times; the axis starts at this attempt, and their bars (from before it) drop out.
+    let floor = if active { run.started_at } else { None };
+    let starts = run
+        .started_at
+        .into_iter()
+        .chain(jobs().filter_map(|j| j.started_at))
+        .chain(jobs().flat_map(|j| &j.steps).filter_map(|s| s.started_at))
+        .filter(|t| floor.is_none_or(|f| *t >= f));
     let Some(t0) = starts.min() else { return false };
     let ghosts = job_ghosts(view, now);
     let finishes = run.finished_at.into_iter().chain(jobs().filter_map(|j| j.finished_at)).chain(jobs().flat_map(|j| &j.steps).filter_map(|s| s.finished_at));
@@ -3524,7 +3566,8 @@ fn render_timeline(
 
             let mut cells: Vec<(char, Style)> = vec![(' ', dim); bar_w];
             let end = n.finished_at.or_else(|| running.then_some(now));
-            if let (Some(s), Some(e)) = (n.started_at, end) {
+            if let (Some(s), Some(e)) = (n.started_at, end.filter(|e| *e >= t0)) {
+                let s = s.max(t0);
                 let x0 = col(s).min(bar_w - 1);
                 let len = (secs_of(e) - secs_of(s)).max(0.0) / total * bar_w as f64;
                 let bar = Style::default().fg(color);
@@ -3604,13 +3647,11 @@ fn critical_path_hint(theme: &Theme, view: &PipelineView, ghosts: &HashMap<(usiz
     let ((si, ji), ghost) = ghosts.iter().filter(|(_, g)| g.left.is_some()).max_by_key(|(_, g)| g.end)?;
     let job = view.run.stages.get(*si)?.jobs.get(*ji)?;
     let left = axis_label(ghost.left?.max(0));
-    // The first queued job, in the run's order.
-    let waiting = view
-        .run
-        .stages
-        .iter()
-        .flat_map(|s| &s.jobs)
-        .find(|j| j.status == PipelineRunStatus::Queued);
+    // The first queued job, in the run's order, whose estimate starts when the long pole ends —
+    // the one actually waiting on it.
+    let waiting = view.run.stages.iter().enumerate().flat_map(|(s, st)| st.jobs.iter().enumerate().map(move |(j, job)| ((s, j), job))).find(|(at, job)| {
+        job.status == PipelineRunStatus::Queued && ghosts.get(at).is_some_and(|g| g.left.is_none() && g.start == ghost.end)
+    }).map(|(_, job)| job);
     let dim = Style::default().fg(theme.dim);
     let fg = Style::default().fg(theme.fg);
     let spans = match waiting {
@@ -7240,5 +7281,95 @@ mod tests {
         }
         let all = pane_rows(&app, 81, 30).join("\n");
         assert!(all.contains("x86_64-pc-windows-msvc is the critical path: host waits ~1m"), "{all}");
+    }
+
+    fn ghost_job(name: &str, status: PipelineRunStatus, started: Option<DateTime<Utc>>) -> PipelineJob {
+        PipelineJob { id: name.into(), name: name.into(), status, started_at: started, finished_at: None, steps: Vec::new(), url: None, problem: None }
+    }
+
+    fn ghost_view(stages: Vec<PipelineStage>, medians: &[(&str, i64)]) -> PipelineView {
+        let mut run = ci443();
+        run.status = PipelineRunStatus::Running;
+        run.finished_at = None;
+        run.stages = stages;
+        let mut v = PipelineView::new("R".into(), run, "c".into(), ProviderType::GitHub, "ci".into(), None);
+        v.estimates.jobs = medians.iter().map(|(n, s)| (n.to_string(), *s)).collect();
+        v
+    }
+
+    #[test]
+    fn queued_jobs_in_a_stage_run_side_by_side_and_stages_follow_each_other() {
+        let now = Utc::now();
+        let stage = |name: &str, jobs| PipelineStage { name: name.into(), status: PipelineRunStatus::Running, jobs };
+        let v = ghost_view(
+            vec![
+                stage("build", vec![ghost_job("a", PipelineRunStatus::Running, Some(now - chrono::Duration::seconds(50)))]),
+                stage("test", vec![ghost_job("b", PipelineRunStatus::Queued, None), ghost_job("c", PipelineRunStatus::Queued, None)]),
+                stage("ship", vec![ghost_job("d", PipelineRunStatus::Queued, None)]),
+            ],
+            &[("a", 100), ("b", 30), ("c", 60), ("d", 10)],
+        );
+        let g = job_ghosts(&v, now);
+        let at = |k: (usize, usize)| ((g[&k].start - now).num_seconds(), (g[&k].end - now).num_seconds());
+        assert_eq!(at((0, 0)), (0, 50), "a runs its median from its start");
+        assert_eq!(at((1, 0)), (50, 80), "b and c start together once a is done");
+        assert_eq!(at((1, 1)), (50, 110));
+        assert_eq!(at((2, 0)), (110, 120), "the next stage waits for the slower of them");
+    }
+
+    #[test]
+    fn in_a_single_stage_a_queued_job_waits_on_the_matrix_it_follows() {
+        let now = Utc::now();
+        let ago = |s: i64| Some(now - chrono::Duration::seconds(s));
+        let v = ghost_view(
+            vec![PipelineStage {
+                name: "jobs".into(),
+                status: PipelineRunStatus::Running,
+                jobs: vec![
+                    ghost_job("build-local-artifacts (linux)", PipelineRunStatus::Running, ago(50)),
+                    ghost_job("build-local-artifacts (windows)", PipelineRunStatus::Running, ago(50)),
+                    ghost_job("lint", PipelineRunStatus::Running, ago(20)),
+                    ghost_job("build-global-artifacts", PipelineRunStatus::Queued, None),
+                    ghost_job("host", PipelineRunStatus::Queued, None),
+                    ghost_job("announce", PipelineRunStatus::Queued, None),
+                ],
+            }],
+            &[
+                ("build-local-artifacts (linux)", 80),
+                ("build-local-artifacts (windows)", 100),
+                ("lint", 120),
+                ("build-global-artifacts", 20),
+                ("host", 10),
+                ("announce", 5),
+            ],
+        );
+        let g = job_ghosts(&v, now);
+        let start = |j: usize| (g[&(0, j)].start - now).num_seconds();
+        assert_eq!(start(3), 50, "build-global follows the build matrix (windows leg ends at +50)");
+        assert_eq!(start(4), 100, "host waits for everything running (lint ends at +100)");
+        assert_eq!(start(5), 100, "queued jobs don't chain one after another");
+    }
+
+    #[test]
+    fn an_in_flight_rerun_of_failed_jobs_starts_its_timeline_at_the_new_attempt() {
+        let now = Utc::now();
+        let mut run = ci443();
+        // A two-day-old run: `passed` kept its times, `retried` is running again.
+        let old = now - chrono::Duration::days(2);
+        let mut passed = ghost_job("passed", PipelineRunStatus::Succeeded, Some(old));
+        passed.finished_at = Some(old + chrono::Duration::seconds(40));
+        let retried = ghost_job("retried", PipelineRunStatus::Running, Some(now - chrono::Duration::seconds(30)));
+        run.stages = vec![PipelineStage { name: "jobs".into(), status: PipelineRunStatus::Running, jobs: vec![passed, retried] }];
+        run.status = PipelineRunStatus::Running;
+        run.started_at = Some(now - chrono::Duration::seconds(35));
+        run.finished_at = None;
+        let view = PipelineView::new("CI #9".into(), run, "c".into(), ProviderType::GitHub, "ci".into(), None);
+        let rows = pane_rows(&pane_app(view), 81, 30);
+        let axis = rows.iter().find(|r| r.contains("0s")).expect("an axis");
+        assert!(!axis.contains('h') && !axis.contains('d'), "seconds, not days: {axis}");
+        let retried = rows.iter().find(|r| r.contains("retried")).unwrap();
+        assert!(retried.contains("███"), "the running job's bar is readable: {retried}");
+        let passed = rows.iter().find(|r| r.contains("passed")).unwrap();
+        assert!(passed.contains("40s"), "the kept job keeps its own duration: {passed}");
     }
 }

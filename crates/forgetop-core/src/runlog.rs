@@ -12,13 +12,15 @@
 //!   GitLab provider rewrites its top-level sections to `##[group]<header>` before the log gets
 //!   here and drops the inner ones, so this dialect is mostly for raw traces.)
 //!
-//! When the job's step names are known, [`parse_step_sections`] is the better reader: a GitHub
-//! `##[group]` only starts a section when it is the next step the job ran, so groups a step opens
-//! in its own output stay part of that step. And in a log with Azure markers, `##[group]` never
+//! When the job's step names are known, [`parse_step_sections`] is the better reader: each step
+//! claims the GitHub `##[group]` that best names it, in order, so groups a step opens in its own
+//! output stay part of that step. And in a log with Azure markers, `##[group]` never
 //! starts a section — Azure uses it for folding inside a step.
 //!
 //! Lines may carry a leading ISO-8601 timestamp (`2024-05-01T10:00:00.1234567Z `), which GitHub
 //! and Azure both prepend; every matcher here looks past it.
+
+use std::cmp::Reverse;
 
 /// One step's stretch of a job log, as line indices into the text it was parsed from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -190,9 +192,12 @@ pub fn parse_sections(lines: &[String]) -> Vec<LogSection> {
 ///
 /// * a log with Azure `##[section]Starting:` markers is sectioned by those alone — its
 ///   `##[group]`s fold content inside a step;
-/// * otherwise a `##[group]` starts a section only when it names the next step still to come
-///   (see [`find_section`] for how loosely a name matches); any other group is content of the
-///   step before it. When no group names any step the steps can't be told apart this way, and
+/// * otherwise each step, in order, takes the best-matching group still to come: an exact name
+///   (trimmed, case-insensitive, past GitHub's `Run `) over a loose one ([`find_section`]), and
+///   a `Run …` step header over a group a step's own output opened — so a `cargo test --no-run`
+///   group inside Build doesn't take the Test step's place. A step looks no further than the
+///   first group that exactly names a later step. Every other group is content of the step
+///   before it. When no group names any step the steps can't be told apart this way, and
 ///   every group is a section, as in [`parse_sections`].
 ///
 /// Each section it returns carries the step it was matched to.
@@ -212,16 +217,35 @@ pub fn parse_step_sections(lines: &[String], steps: &[String]) -> Vec<LogSection
         }
         return all;
     }
-    // GitHub: walk the groups in order, keeping only those that name the next step.
+    // GitHub: give each step, in order, the best of the groups still to come — looking only as
+    // far as the first group that names a *later* step outright, which must be that step's.
+    let score = |group: &str, step: &str| -> u8 {
+        if name_matches_strictly(group, step) {
+            3
+        } else if name_matches(group, step) {
+            // Every step header GitHub writes starts `Run ` (`Run cargo test`, `Run actions/…`);
+            // a group opened by a step's own output usually doesn't.
+            if group.trim_start().starts_with("Run ") { 2 } else { 1 }
+        } else {
+            0
+        }
+    };
+    let mut owner: Vec<Option<usize>> = vec![None; all.len()];
+    let mut from = 0;
+    for (j, step) in steps.iter().enumerate() {
+        let horizon = (from..all.len())
+            .find(|&g| steps[j + 1..].iter().any(|later| name_matches_strictly(&all[g].name, later)))
+            .unwrap_or(all.len());
+        let best = (from..horizon).filter(|&g| score(&all[g].name, step) > 0).max_by_key(|&g| (score(&all[g].name, step), Reverse(g)));
+        if let Some(g) = best {
+            owner[g] = Some(j);
+            from = g + 1;
+        }
+    }
     let mut kept: Vec<LogSection> = Vec::new();
-    let mut next = 0;
-    for sec in all.iter() {
-        let matched = (next..steps.len()).find(|&j| name_matches(&sec.name, &steps[j]));
-        match (matched, kept.last_mut()) {
-            (Some(j), _) => {
-                next = j + 1;
-                kept.push(LogSection { step: Some(j), ..sec.clone() });
-            }
+    for (sec, step) in all.iter().zip(&owner) {
+        match (step, kept.last_mut()) {
+            (Some(j), _) => kept.push(LogSection { step: Some(*j), ..sec.clone() }),
             // Content of the step before: that section now runs on through this one.
             (None, Some(last)) if last.end == sec.start => last.end = sec.end,
             (None, _) => {}
@@ -231,6 +255,13 @@ pub fn parse_step_sections(lines: &[String], steps: &[String]) -> Vec<LogSection
         return all;
     }
     kept
+}
+
+/// Whether a section name names `step` outright: the same name, trimmed and case-insensitive,
+/// also past GitHub's `Run ` prefix — no substring guessing.
+fn name_matches_strictly(section: &str, step: &str) -> bool {
+    let unrun = |s: &str| norm(s.trim_start().strip_prefix("Run ").unwrap_or(s));
+    norm(section) == norm(step) || unrun(section) == unrun(step)
 }
 
 /// Whether a section name names `step`, by the passes [`find_section`] takes.
@@ -729,6 +760,26 @@ mod tests {
         assert_eq!(parse_sections(&log).len(), 4, "without steps every group is a section");
         // No group names any step: every group stays a section.
         assert_eq!(parse_step_sections(&log, &strings(&["alpha", "beta"])).len(), 4);
+    }
+
+    #[test]
+    fn a_nested_group_that_loosely_names_a_later_step_does_not_take_its_place() {
+        let log = lines(
+            "##[group]Run cargo build\n\
+             ##[endgroup]\n\
+             ##[group]cargo test --no-run\n\
+             compiled test binaries\n\
+             ##[endgroup]\n\
+             ##[group]Run cargo test\n\
+             test a ... ok",
+        );
+        let s = parse_step_sections(&log, &strings(&["cargo build", "Test"]));
+        assert_eq!(names(&s), vec!["Run cargo build", "Run cargo test"], "the nested group stays Build's");
+        assert_eq!((s[0].start, s[0].end, s[0].step), (0, 5, Some(0)));
+        assert_eq!((s[1].start, s[1].step), (5, Some(1)));
+        // Skipping a step that logged no group takes an exact name.
+        let s = parse_step_sections(&log, &strings(&["Set up job", "cargo build", "cargo test"]));
+        assert_eq!(s.iter().map(|x| x.step).collect::<Vec<_>>(), vec![Some(1), Some(2)]);
     }
 
     #[test]

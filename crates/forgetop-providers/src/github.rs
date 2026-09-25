@@ -275,11 +275,7 @@ pub fn map_gh_annotation(v: &Value, job_id: &str) -> PipelineAnnotation {
 
 /// Sorts annotations most severe first (Failure → Warning → Notice), stable within a level.
 fn sort_annotations(annotations: &mut [PipelineAnnotation]) {
-    annotations.sort_by_key(|a| match a.level {
-        AnnotationLevel::Failure => 0,
-        AnnotationLevel::Warning => 1,
-        AnnotationLevel::Notice => 2,
-    });
+    annotations.sort_by_key(|a| a.level);
 }
 
 /// A short summary for a job GitHub hasn't finished (or hasn't published a log for yet),

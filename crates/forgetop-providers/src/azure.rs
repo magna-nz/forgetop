@@ -694,11 +694,7 @@ fn az_annotations_from_timeline(records: &[Value]) -> Vec<PipelineAnnotation> {
             })
         })
         .collect();
-    out.sort_by_key(|a| match a.level {
-        AnnotationLevel::Failure => 0,
-        AnnotationLevel::Warning => 1,
-        AnnotationLevel::Notice => 2,
-    });
+    out.sort_by_key(|a| a.level);
     out.truncate(MAX);
     out
 }

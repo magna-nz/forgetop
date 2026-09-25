@@ -308,6 +308,28 @@ fn strip_log_text(s: &str) -> String {
     out.replace('\r', "")
 }
 
+/// The writable part of a fetched run's `target`, to start the same pipeline again: its type,
+/// ref, selector, PR endpoints, and commits reduced to `{type, hash}` — the GET shape also
+/// carries read-only expansions (links, summaries, the PR object) a create doesn't take.
+fn rerun_target(target: &Value) -> Value {
+    let commit = |v: &Value| get_str(v, "hash").map(|hash| json!({ "type": "commit", "hash": hash }));
+    let mut out = serde_json::Map::new();
+    for key in ["type", "ref_type", "ref_name", "source", "destination"] {
+        if let Some(v) = target.get(key).filter(|v| v.is_string()) {
+            out.insert(key.into(), v.clone());
+        }
+    }
+    if let Some(selector) = target.get("selector").filter(|v| v.is_object()) {
+        out.insert("selector".into(), selector.clone());
+    }
+    for key in ["commit", "destination_commit"] {
+        if let Some(c) = target.get(key).and_then(commit) {
+            out.insert(key.into(), c);
+        }
+    }
+    Value::Object(out)
+}
+
 /// A commit report annotation (`/commit/{sha}/reports/{report}/annotations`) → [`PipelineAnnotation`].
 pub fn map_bb_annotation(v: &Value) -> PipelineAnnotation {
     let level = match get_str(v, "severity").as_deref() {
@@ -674,7 +696,7 @@ impl PipelineSource for BitbucketPipe {
         let uuid = enc_uuid(&run.id);
         let run_v = self.0.get_json(&self.0.repo_path(&repo, &format!("/pipelines/{uuid}"))).await?;
         // Re-run against the exact same target (branch/commit/PR) the original run used.
-        let target = run_v.get("target").cloned().ok_or_else(|| Error::Provider(format!("pipeline run '{}' has no target to re-run", run.id)))?;
+        let target = run_v.get("target").map(rerun_target).ok_or_else(|| Error::Provider(format!("pipeline run '{}' has no target to re-run", run.id)))?;
         let created = self.0.post_json_read(&self.0.repo_path(&repo, "/pipelines"), json!({ "target": target })).await?;
         Ok(get_str(&created, "uuid"))
     }
@@ -699,11 +721,7 @@ impl PipelineSource for BitbucketPipe {
                 out.extend(get_arr(&anns_v, "values").iter().map(map_bb_annotation));
             }
         }
-        out.sort_by_key(|a| match a.level {
-            AnnotationLevel::Failure => 0,
-            AnnotationLevel::Warning => 1,
-            AnnotationLevel::Notice => 2,
-        });
+        out.sort_by_key(|a| a.level);
         out.truncate(50);
         Ok(out)
     }
@@ -987,6 +1005,30 @@ mod tests {
 
         let manual: Value = serde_json::from_str(r#"{ "trigger": { "name": "MANUAL" } }"#).unwrap();
         assert_eq!(map_pipeline(&manual, "a/b").event.as_deref(), Some("manual"));
+    }
+
+    #[test]
+    fn rerun_target_keeps_only_the_writable_fields() {
+        let target: Value = serde_json::from_str(
+            r#"{ "type": "pipeline_pullrequest_target", "source": "feat/x", "destination": "main",
+                 "commit": { "type": "commit", "hash": "abc123", "links": { "self": { "href": "https://x" } } },
+                 "destination_commit": { "hash": "def456", "links": {} },
+                 "pullrequest": { "id": 9, "title": "x", "links": {} },
+                 "selector": { "type": "pull-requests", "pattern": "**" } }"#,
+        )
+        .unwrap();
+        let out = rerun_target(&target);
+        assert_eq!(
+            out,
+            serde_json::json!({
+                "type": "pipeline_pullrequest_target", "source": "feat/x", "destination": "main",
+                "commit": { "type": "commit", "hash": "abc123" },
+                "destination_commit": { "type": "commit", "hash": "def456" },
+                "selector": { "type": "pull-requests", "pattern": "**" }
+            })
+        );
+        let branch: Value = serde_json::from_str(r#"{ "type": "pipeline_ref_target", "ref_type": "branch", "ref_name": "main", "commit": { "hash": "abc" } }"#).unwrap();
+        assert_eq!(rerun_target(&branch)["ref_name"], "main");
     }
 
     #[test]

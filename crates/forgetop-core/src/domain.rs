@@ -358,8 +358,9 @@ pub struct PipelineRun {
     pub pull_request: Option<i64>,
 }
 
-/// How serious a [`PipelineAnnotation`] is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// How serious a [`PipelineAnnotation`] is. Ordered most severe first, so sorting by it puts
+/// failures on top.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum AnnotationLevel {
     Failure,
     Warning,

@@ -305,6 +305,8 @@ pub enum AppEvent {
     /// The provider answered a rerun or cancel sent by [`App::execute_pipeline_run_action`]:
     /// the new run's id when it started one.
     PipelineRunActionDone { token: u64, result: std::result::Result<Option<String>, String> },
+    /// A finished run's problems, fetched apart from its detail. `None` means the call failed.
+    PipelineAnnotationsLoaded { key: String, annotations: Option<Vec<PipelineAnnotation>> },
 }
 
 /// A snapshot of everything the background fetch needs from `self` at spawn time, so it
@@ -916,6 +918,9 @@ pub struct App {
     /// Detail keys whose annotations were asked for, and the run status they were asked at —
     /// a finished run's problems don't change until it is rerun.
     annotations_asked: std::cell::RefCell<HashMap<String, PipelineRunStatus>>,
+    /// Problems fetched this session, by detail key — what a detail landing after them carries,
+    /// whichever of the two events arrives first.
+    annotations_by_key: HashMap<String, Vec<PipelineAnnotation>>,
 }
 
 /// Full-screen views layered above the list. The large views are boxed so the
@@ -2596,6 +2601,7 @@ impl App {
             held_runs: HashMap::new(),
             follow_new_run: None,
             annotations_asked: std::cell::RefCell::new(HashMap::new()),
+            annotations_by_key: HashMap::new(),
         }
     }
 
@@ -3326,10 +3332,6 @@ impl App {
                 if let Some(run) = &detail.run {
                     self.run_details.insert(key.clone(), run.clone());
                 }
-                // Problems that weren't answered may be asked for again.
-                if detail.annotations.is_none() {
-                    self.annotations_asked.borrow_mut().remove(&key);
-                }
                 self.with_preview_screen(&key.clone(), |app| app.apply_pipeline_detail(deps, key, *detail, fetched_at));
             }
             AppEvent::PrDecorationsLoaded { items } => {
@@ -3342,6 +3344,7 @@ impl App {
                 self.apply_pipeline_artifacts(&conn_id, &run_id, result);
             }
             AppEvent::PipelineRunActionDone { token, result } => self.finish_run_action(token, result, deps),
+            AppEvent::PipelineAnnotationsLoaded { key, annotations } => self.apply_pipeline_annotations(deps, key, annotations),
         }
         self.drive_logs(deps);
         self.refresh_pipeline_context();
@@ -4927,6 +4930,7 @@ impl App {
             can_respond_approvals: resolved_can_respond,
             annotations: annotations
                 .clone()
+                .or_else(|| self.annotations_by_key.get(&key).cloned())
                 .unwrap_or_else(|| known.as_ref().map(|k| k.annotations.clone()).unwrap_or_default()),
             supports_rerun: flag(supports_rerun, |k| k.supports_rerun),
             supports_rerun_failed: flag(supports_rerun_failed, |k| k.supports_rerun_failed),
@@ -4979,9 +4983,49 @@ impl App {
         };
         let deps = deps.clone();
         let fetched_at = Utc::now();
+        if annotations {
+            // Its own task and event: a slow annotations call never holds up the run.
+            let (deps, tx, conn_id, run, key) = (deps.clone(), tx.clone(), conn_id.clone(), run.clone(), key.clone());
+            tokio::spawn(async move {
+                let annotations = match pipeline_source(&deps, &conn_id).await {
+                    Some(source) => detail_or_none(source.annotations(&run).await, DIAG_PIPELINE_ANNOTATIONS),
+                    None => None,
+                };
+                let _ = tx.send(AppEvent::PipelineAnnotationsLoaded { key, annotations });
+            });
+        }
         tokio::spawn(async move {
-            let detail = fetch_pipeline_detail(&deps, &conn_id, &run, annotations).await;
+            let detail = fetch_pipeline_detail(&deps, &conn_id, &run).await;
             let _ = tx.send(AppEvent::PipelineDetailLoaded { key, detail: Box::new(detail), fetched_at });
+        });
+    }
+
+    /// A finished run's problems landed: remembered for the session, written into the cached
+    /// detail, and shown if the run is still on screen (or in the preview).
+    fn apply_pipeline_annotations(&mut self, deps: &AppDeps, key: String, annotations: Option<Vec<PipelineAnnotation>>) {
+        let Some(annotations) = annotations else {
+            // Unanswered: may be asked for again.
+            self.annotations_asked.borrow_mut().remove(&key);
+            return;
+        };
+        self.annotations_by_key.insert(key.clone(), annotations.clone());
+        let cached = annotations.clone();
+        deps.cache.rewrite::<PipelineDetail>(&key, move |mut d| {
+            d.annotations = cached;
+            d
+        });
+        self.with_preview_screen(&key.clone(), move |app| {
+            let Screen::Pipeline(v) = &mut app.screen else { return };
+            if pipeline_detail_cache_key(&v.connection_id, &v.run.item_ref()) != key || is_active(v.run.status) {
+                return;
+            }
+            v.annotations = annotations;
+            if v.problem_sel >= v.annotations.len() {
+                v.problem_sel = v.annotations.len().saturating_sub(1);
+            }
+            if v.annotations.is_empty() {
+                v.problem_focus = false;
+            }
         });
     }
 
@@ -6715,6 +6759,7 @@ impl App {
                 let p = &self.pipes[i];
                 p.connection_id == v.connection_id
                     && p.run.definition_id == v.run.definition_id
+                    && p.run.repository == v.run.repository
                     && p.run.status == PipelineRunStatus::Succeeded
                     && p.run.id != v.run.id
             })
@@ -6743,6 +6788,7 @@ impl App {
                 .filter(|p| {
                     p.connection_id == v.connection_id
                         && p.run.definition_id == v.run.definition_id
+                        && p.run.repository == v.run.repository
                         && p.run.status == PipelineRunStatus::Succeeded
                         && p.run.id != v.run.id
                 })
@@ -7073,7 +7119,7 @@ impl App {
                 None => mark_canceled(r, now),
             })
         } else {
-            RunUndo { conn_id: conn_id.clone(), view: None, extras: None, rows: Vec::new() }
+            RunUndo { conn_id: conn_id.clone(), view: None, extras: None, row: None }
         };
         if optimistic && rerun.is_some() {
             // The old attempt's problems don't describe the new one.
@@ -7200,7 +7246,7 @@ impl App {
     /// Applies `change` to a run wherever it is shown — the open view and its list rows —
     /// returning what it replaced.
     fn change_run(&mut self, conn_id: &str, run_id: &str, change: impl Fn(&mut PipelineRun)) -> RunUndo {
-        let mut undo = RunUndo { conn_id: conn_id.to_string(), view: None, extras: None, rows: Vec::new() };
+        let mut undo = RunUndo { conn_id: conn_id.to_string(), view: None, extras: None, row: None };
         if let Screen::Pipeline(v) = &mut self.screen {
             if v.connection_id == conn_id && v.run.id == run_id {
                 undo.view = Some(v.run.clone());
@@ -7208,11 +7254,9 @@ impl App {
                 v.clamp_selection();
             }
         }
-        for (i, row) in self.pipes.iter_mut().enumerate() {
-            if row.connection_id == conn_id && row.run.id == run_id {
-                undo.rows.push((i, row.run.clone()));
-                change(&mut row.run);
-            }
+        for row in self.pipes.iter_mut().filter(|r| r.connection_id == conn_id && r.run.id == run_id) {
+            undo.row.get_or_insert_with(|| row.run.clone());
+            change(&mut row.run);
         }
         self.rebuild_launchpad();
         undo
@@ -7230,9 +7274,11 @@ impl App {
                 v.clamp_selection();
             }
         }
-        for (i, prev) in undo.rows {
-            if let Some(row) = self.pipes.get_mut(i).filter(|r| r.connection_id == undo.conn_id && r.run.id == prev.id) {
-                row.run = prev;
+        // By identity, not position: a reload may have landed while the provider was deciding,
+        // moving (or duplicating) the run's rows.
+        if let Some(prev) = undo.row {
+            for row in self.pipes.iter_mut().filter(|r| r.connection_id == undo.conn_id && r.run.id == prev.id) {
+                row.run = prev.clone();
             }
         }
         self.rebuild_launchpad();
@@ -8845,8 +8891,8 @@ struct RunUndo {
     view: Option<PipelineRun>,
     /// The view's problems and failure line, cleared by a rerun.
     extras: Option<AttemptProblems>,
-    /// `(index into App::pipes, the row's run)`.
-    rows: Vec<(usize, PipelineRun)>,
+    /// The run as its list rows showed it, restored onto every row of that run.
+    row: Option<PipelineRun>,
 }
 
 /// A rerun or cancel in flight: what to undo, and what to say when the provider answers.
@@ -9452,9 +9498,9 @@ async fn fetch_wi_detail(deps: &AppDeps, conn_id: &str, item: &ItemRef) -> WiDet
 /// Fetches the run + capabilities + approvals behind a pipeline drill-in, off the render loop.
 /// Approvals are fetched regardless of whether `get_run` itself succeeded — they're addressed by
 /// the run ref, not the fetched run object, so a failure to enrich the run needn't also blank the
-/// approvals answer. With `annotations`, the run's problems are asked for alongside — at the same
-/// time, so a slow annotations call never holds up the run itself; `None` leaves them unasked.
-async fn fetch_pipeline_detail(deps: &AppDeps, conn_id: &str, run_ref: &ItemRef, annotations: bool) -> PipelineDetailFetch {
+/// approvals answer; the two go out together. The run's problems are not fetched here — see
+/// [`App::request_pipeline_detail`], which asks for them separately so they never delay the run.
+async fn fetch_pipeline_detail(deps: &AppDeps, conn_id: &str, run_ref: &ItemRef) -> PipelineDetailFetch {
     let feeds = detail_or_default(deps.sections.pipeline_feeds().await, DIAG_PIPELINE_FEEDS);
     let Some(feed) = feeds.iter().find(|f| f.connection.connection_id() == conn_id) else {
         return PipelineDetailFetch::default();
@@ -9469,21 +9515,14 @@ async fn fetch_pipeline_detail(deps: &AppDeps, conn_id: &str, run_ref: &ItemRef,
             Some(Vec::new())
         }
     };
-    let problems = async {
-        if annotations {
-            detail_or_none(source.annotations(run_ref).await, DIAG_PIPELINE_ANNOTATIONS)
-        } else {
-            None
-        }
-    };
-    let (run, approvals, annotations) = tokio::join!(source.get_run(run_ref), approvals, problems);
+    let (run, approvals) = tokio::join!(source.get_run(run_ref), approvals);
     let run = detail_or_none(run, DIAG_PIPELINE_RUN);
     PipelineDetailFetch {
         run,
         approvals,
         supports_approvals: Some(supports_approvals),
         can_respond_approvals: Some(can_respond_approvals),
-        annotations,
+        annotations: None,
         supports_rerun: Some(source.supports_rerun()),
         supports_rerun_failed: Some(source.supports_rerun_failed()),
         supports_artifacts: Some(source.supports_artifacts()),
@@ -15772,5 +15811,91 @@ mod tests {
         log.toggle_fold();
         assert!((0..3).all(|s| log.open.contains(&s)), "z opens every step in the group");
         assert_eq!(log.rows[0], LogRow::Header(0));
+    }
+
+    fn a_problem(message: &str) -> PipelineAnnotation {
+        PipelineAnnotation { level: AnnotationLevel::Failure, message: message.into(), title: None, path: None, line: None, job_id: None }
+    }
+
+    #[test]
+    fn problems_arrive_apart_from_the_run_and_land_whichever_comes_first() {
+        let deps = deps_with_cache(memory_cache());
+        // The run first, then its problems.
+        let mut app = run_pane_app(failed_run());
+        let key = pipeline_detail_cache_key("c", &pane(&app).run.item_ref());
+        let detail = || Box::new(PipelineDetailFetch { run: Some(failed_run()), approvals: Some(Vec::new()), ..Default::default() });
+        app.on_event(AppEvent::PipelineDetailLoaded { key: key.clone(), detail: detail(), fetched_at: Utc::now() }, &deps);
+        assert!(pane(&app).annotations.is_empty());
+        app.on_event(AppEvent::PipelineAnnotationsLoaded { key: key.clone(), annotations: Some(vec![a_problem("boom")]) }, &deps);
+        assert_eq!(pane(&app).annotations.len(), 1, "shown when they land");
+        let cached = deps.cache.get::<PipelineDetail>(&key).expect("cached").value;
+        assert_eq!(cached.annotations.len(), 1, "and written into the cached detail");
+
+        // The problems first, then a run refresh: the refresh keeps them.
+        let deps = deps_with_cache(memory_cache());
+        let mut app = run_pane_app(failed_run());
+        app.on_event(AppEvent::PipelineAnnotationsLoaded { key: key.clone(), annotations: Some(vec![a_problem("boom")]) }, &deps);
+        app.on_event(AppEvent::PipelineDetailLoaded { key: key.clone(), detail: detail(), fetched_at: Utc::now() }, &deps);
+        assert_eq!(pane(&app).annotations.len(), 1, "a detail landing after them doesn't blank them");
+
+        // A failed call may be asked again.
+        assert!(app.wants_annotations(&key));
+        app.on_event(AppEvent::PipelineAnnotationsLoaded { key: key.clone(), annotations: None }, &deps);
+        assert!(app.wants_annotations(&key), "unanswered, so asked again");
+    }
+
+    #[tokio::test]
+    async fn a_refused_rerun_restores_the_runs_rows_even_after_a_reload_moved_them() {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let calls = PipeCalls { rerun: true, refuse: true, gate: Some(gate.clone()), ..PipeCalls::default() };
+        let deps = deps_with_pipes(calls.clone()).await;
+        let mut app = run_pane_app(failed_run());
+        pane_mut(&mut app).supports_rerun = true;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.job_tx = Some(tx);
+        app.on_key(Key::Char('R'), &deps).await;
+        app.on_key(Key::Char('y'), &deps).await;
+        assert_eq!(app.pipes[0].run.status, PipelineRunStatus::Queued);
+
+        // A reload lands mid-flight with the run at another position.
+        let mut other = failed_run();
+        other.id = "r0".into();
+        let mut r = reloaded_with_health(Vec::new());
+        r.pipes = vec![row_of(other), row_of(failed_run())];
+        app.on_event(AppEvent::Reloaded(Box::new(r)), &deps);
+        assert_eq!(app.pipes[1].run.status, PipelineRunStatus::Queued, "held against the stale reload");
+
+        gate.notify_one();
+        let event = loop {
+            let event = rx.recv().await.expect("an answer");
+            if matches!(event, AppEvent::PipelineRunActionDone { .. }) {
+                break event;
+            }
+        };
+        app.on_event(event, &deps);
+        assert_eq!(app.pipes[1].run.status, PipelineRunStatus::Failed, "restored where it now is");
+        assert_eq!(app.pipes[0].run.id, "r0");
+        assert_eq!(pane(&app).run.status, PipelineRunStatus::Failed);
+    }
+
+    #[test]
+    fn estimates_ignore_the_same_pipeline_in_another_repository() {
+        let mut app = App::new("slate");
+        let mut elsewhere = ci_history(1, &[], |_| 999).remove(0);
+        elsewhere.run.repository = Some("acme/other".into());
+        let elsewhere_run = elsewhere.run.clone();
+        app.pipes.push(elsewhere);
+        let mut job = pipeline_job("build", PipelineRunStatus::Succeeded);
+        job.started_at = Some(secs_ago(1000));
+        job.finished_at = Some(secs_ago(1));
+        let mut detailed = elsewhere_run;
+        detailed.stages = vec![pipeline_stage("build", PipelineRunStatus::Succeeded, vec![job])];
+        app.run_details.insert(pipeline_detail_cache_key("c", &detailed.item_ref()), detailed);
+        let running = pipeline_run("live", PipelineRunStatus::Running, vec![pipeline_stage("build", PipelineRunStatus::Running, vec![pipeline_job("build", PipelineRunStatus::Running)])]);
+        app.pipes.push(row_of(running.clone()));
+        app.screen = Screen::Pipeline(Box::new(PipelineView::new("CI".into(), running, "c".into(), ProviderType::GitHub, "ci".into(), None)));
+        app.refresh_pipeline_context();
+        let e = &pane(&app).estimates;
+        assert_eq!((e.job_runs, e.run_median), (0, None), "another repository's runs don't count");
     }
 }
