@@ -51,6 +51,7 @@ pub async fn run(deps: AppDeps, theme_name: &str, dashboard_url: Option<String>)
     app.apply_hidden_work_item_states(&deps.config.snapshot().ui.hidden_work_item_states);
     app.apply_preview_hidden(&deps.config.snapshot().ui.preview_hidden);
     app.apply_dismissed_launchpad_items(&deps.config.snapshot().ui.dismissed_launchpad_items);
+    app.apply_dismissed_notifications(&deps.config.snapshot().ui.dismissed_notifications);
     {
         let ui = deps.config.snapshot().ui;
         app.apply_sorts(ui.pr_sort, ui.work_item_sort, ui.pipeline_sort);

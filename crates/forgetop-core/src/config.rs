@@ -88,6 +88,10 @@ pub struct UiState {
     /// "Needs you" list ("connection_id:item_id" keys, see launchpad::Entry::key).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dismissed_launchpad_items: Vec<String>,
+    /// Notifications the user dismissed from the TUI inbox ("connection_id:id:updated_at"
+    /// keys), so a thread with new activity comes back rather than staying hidden.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dismissed_notifications: Vec<String>,
     /// Per-view sort column + direction. `None` = provider order.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr_sort: Option<SortPref>,
