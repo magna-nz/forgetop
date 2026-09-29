@@ -390,6 +390,26 @@ export interface PrDecoration {
 }
 
 /** The repositories a connection's credentials can reach — the scope picker's candidates. */
+/** A pipeline a connection can fetch runs of (`PipelineDefinition` in `forgetop-core`). */
+export interface PipelineDefinition {
+  id: string;
+  /** Connection-relative repository (or, on Azure, the project). */
+  repository?: string | null;
+  name: string;
+  /** Azure's folder (`\\Releases\\Core`), or a workflow file path elsewhere. */
+  path?: string | null;
+  url?: string | null;
+}
+
+/** `GET /api/pipelines/definitions`: a connection's pipelines and which are fetched. Pipelines
+ *  are opt-in — `all` false with `selected` empty fetches nothing. */
+export interface PipelineSelection {
+  definitions: PipelineDefinition[];
+  /** Every pipeline, including ones created later. */
+  all: boolean;
+  selected: string[];
+}
+
 export interface RepositoryPage {
   repositories: string[];
   /** True when the provider had more than we fetched, so the picker says "5 of 500+" rather

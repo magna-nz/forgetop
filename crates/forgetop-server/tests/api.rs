@@ -626,3 +626,51 @@ async fn notifications_carry_drill_in_targets_and_mark_read() {
         .expect("the notification is still listed");
     assert_eq!(same["notification"]["unread"], false, "it now reads as read");
 }
+
+/// Pipelines are opt-in on the dashboard too: a connection bound from the web starts with nothing
+/// selected, the picker's endpoints read and write the selection, and re-saving the connection
+/// form keeps it.
+#[tokio::test]
+async fn pipeline_selection_is_opt_in_and_survives_a_connection_resave() {
+    let server = spawn(demo_deps(false).await, 0).await.expect("server binds");
+    let base = format!("http://127.0.0.1:{}", server.port);
+    let client = reqwest::Client::new();
+    let tok = server.token.clone();
+    let hdr = |r: reqwest::RequestBuilder| r.header("x-forgetop-token", &tok);
+
+    let form = serde_json::json!({ "provider": "GitHub", "display_name": "GH", "bind_pipelines": true });
+    let saved: serde_json::Value =
+        hdr(client.post(format!("{base}/api/connections"))).json(&form).send().await.unwrap().json().await.unwrap();
+    let id = saved["id"].as_str().unwrap().to_string();
+    let defs_url = format!("{base}/api/pipelines/definitions?id={id}");
+    let defs = || async { hdr(client.get(&defs_url)).send().await.unwrap().json::<serde_json::Value>().await.unwrap() };
+
+    let d = defs().await;
+    let all_ids: Vec<String> = d["definitions"].as_array().unwrap().iter().map(|x| x["id"].as_str().unwrap().to_string()).collect();
+    assert!(!all_ids.is_empty(), "discovery lists the demo pipelines");
+    assert_eq!(d["all"], false);
+    assert_eq!(d["selected"].as_array().unwrap().len(), 0, "nothing selected by default");
+    let runs: serde_json::Value = hdr(client.get(format!("{base}/api/pipelines"))).send().await.unwrap().json().await.unwrap();
+    assert_eq!(runs.as_array().unwrap().len(), 0, "nothing selected fetches nothing");
+
+    let pick = serde_json::json!({ "id": id, "ids": [all_ids[0]] });
+    assert_eq!(hdr(client.post(format!("{base}/api/pipelines/selection"))).json(&pick).send().await.unwrap().status(), 200);
+    assert_eq!(defs().await["selected"], serde_json::json!([all_ids[0]]));
+
+    // The connection form re-saves every section it binds; that must not undo the pick.
+    let resave = serde_json::json!({ "id": id, "provider": "GitHub", "display_name": "GH", "bind_pipelines": true });
+    hdr(client.post(format!("{base}/api/connections"))).json(&resave).send().await.unwrap();
+    assert_eq!(defs().await["selected"], serde_json::json!([all_ids[0]]), "kept across a re-save");
+
+    let all = serde_json::json!({ "id": id, "all": true });
+    hdr(client.post(format!("{base}/api/pipelines/selection"))).json(&all).send().await.unwrap();
+    assert_eq!(defs().await["all"], true);
+
+    let none = serde_json::json!({ "id": id, "ids": [] });
+    hdr(client.post(format!("{base}/api/pipelines/selection"))).json(&none).send().await.unwrap();
+    let d = defs().await;
+    assert_eq!((d["all"].clone(), d["selected"].as_array().unwrap().len()), (serde_json::json!(false), 0));
+
+    let missing = hdr(client.get(format!("{base}/api/pipelines/definitions?id=nope"))).send().await.unwrap();
+    assert_eq!(missing.status(), 404);
+}

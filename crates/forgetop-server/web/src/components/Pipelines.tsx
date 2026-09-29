@@ -7,10 +7,12 @@ import { ErrorState } from "./ErrorState";
 import { useListView } from "./ControlBar";
 import { usePipelineOpener } from "./PipelineDetail";
 import { useRepoScope } from "./RepoScope";
+import { usePipelineScope } from "./PipelineScope";
 
 export function Pipelines() {
   const { data, isLoading, error } = usePipelines();
   const scope = useRepoScope("pipelines");
+  const pipes = usePipelineScope();
   const { rows, bar } = useListView<PipeRow>({
     storageKey: "pipelines",
     rows: data,
@@ -41,12 +43,36 @@ export function Pipelines() {
         action={scope.control}
       />
     );
+  // The pipeline picker stays reachable in every state below: with nothing selected there are no
+  // rows, and that is exactly when it is needed.
+  const controls = (
+    <div className="flex flex-wrap items-center gap-2 px-5 pt-4 max-w-5xl mx-auto">
+      {pipes.control}
+      {scope.control}
+    </div>
+  );
+  if (pipes.noneSelected)
+    // Pipelines are opt-in: nothing was fetched because nothing was chosen yet. The picker sits in
+    // the card, like the empty repository scope's.
+    return (
+      <StateCard
+        icon="◇"
+        title="No pipelines selected"
+        sub="Choose which pipelines to show. Your choice is saved."
+        action={pipes.control}
+      />
+    );
   if (!data || data.length === 0)
-    return <StateCard icon="◇" title="No pipeline runs" sub="Recent CI runs for your repositories appear here." />;
+    return (
+      <>
+        {controls}
+        <StateCard icon="◇" title="No pipeline runs" sub="Recent runs of the pipelines you've chosen appear here." />
+      </>
+    );
 
   return (
     <>
-      <div className="flex flex-wrap items-center gap-2 px-5 pt-4 max-w-5xl mx-auto">{scope.control}</div>
+      {controls}
       {bar}
       <List>
         {rows.map((row, i) => (
