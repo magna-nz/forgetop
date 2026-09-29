@@ -3997,6 +3997,7 @@ impl App {
                     0 => out.push(("Filter by status", c('f'))),
                     1 => out.push(("Choose which states to show", c('f'))),
                     _ => out.extend([
+                        ("Choose pipelines to show", c('w')),
                         ("Trigger a run", c('T')),
                         ("Cycle grouping", c('G')),
                         ("Collapse every group", c('z')),
@@ -6334,7 +6335,7 @@ impl App {
     }
 
     /// "N of M" over the pipeline connections whose discovery has answered. Subscribing to
-    /// everything (or to nothing, which the feed reads the same way) counts every definition;
+    /// everything counts every definition; nothing selected counts none (pipelines are opt-in);
     /// an explicit list counts the ids discovery still knows, so a deleted pipeline isn't
     /// counted as fetched.
     fn pipe_scope_of(&self, deps: &AppDeps) -> Option<PipeScope> {
@@ -6346,7 +6347,7 @@ impl App {
             let Some(defs) = self.pipe_catalog.get(&sub.connection_id) else { continue };
             known = true;
             available += defs.len();
-            selected += if sub.auto_discover_all || sub.definition_ids.is_empty() {
+            selected += if sub.auto_discover_all {
                 defs.len()
             } else {
                 defs.iter().filter(|d| sub.definition_ids.contains(&d.id)).count()
@@ -8044,7 +8045,8 @@ impl App {
             let result = match section {
                 Section::PullRequests => deps.config.bind_pull_requests(&id).await,
                 Section::WorkItems => deps.config.bind_work_items(&id).await,
-                Section::Pipelines => deps.config.set_pipeline_auto_discover(&id, true).await,
+                // Pipelines are opt-in: the connection is added with nothing selected (`w`).
+                Section::Pipelines => deps.config.bind_pipelines(&id).await,
             };
             match result {
                 Ok(()) => bound += 1,
@@ -8276,9 +8278,9 @@ impl App {
 
         let cfg = deps.config.snapshot();
         let sub = cfg.pipelines.as_ref().and_then(|p| p.subscriptions.iter().find(|s| s.connection_id == id));
-        // An empty list is fetched as "everything" (see `pipeline_run_queries`), so it is shown
-        // that way rather than as a checklist with nothing ticked.
-        let auto = sub.map(|s| s.auto_discover_all || s.definition_ids.is_empty()).unwrap_or(true);
+        // Pipelines are opt-in: only "every pipeline" or an explicit selection is ticked. The
+        // selection is saved to the config, so it opens as it was left on the next run.
+        let auto = sub.is_some_and(|s| s.auto_discover_all);
         let subscribed: std::collections::HashSet<String> =
             sub.map(|s| s.definition_ids.iter().cloned().collect()).unwrap_or_default();
 
@@ -8290,8 +8292,8 @@ impl App {
         self.overlay = Some(Overlay::Toggle {
             title: format!("Pipelines · {display}"),
             kind: ToggleKind::PipelineSubs { connection_id: id },
-            // Nothing ticked would be fetched as everything, so it isn't offered as a choice.
-            min_one: true,
+            // Nothing ticked is a real choice: this connection's runs are not fetched.
+            min_one: false,
             items,
             selected: 0,
             filter: Some(String::new()),
@@ -8311,7 +8313,13 @@ impl App {
         };
         match saved {
             Ok(()) => {
-                self.toast = Some(if all { "Fetching every pipeline".into() } else { format!("Fetching {} pipeline(s)", ids.len()) });
+                self.toast = Some(if all {
+                    "Fetching every pipeline".into()
+                } else if ids.is_empty() {
+                    "No pipelines selected".into()
+                } else {
+                    format!("Fetching {} pipeline(s)", ids.len())
+                });
                 // Runs of a pipeline just unticked go now, not on the next reload.
                 if !all {
                     self.pipes.retain(|r| r.connection_id != connection_id || ids.contains(&r.run.definition_id));
@@ -9432,9 +9440,12 @@ pub const LIST_COLUMNS: [&[&str]; 3] = [
 ];
 
 /// Provider starts off everywhere: the repository already says where a row lives, and the
-/// provider is a column of the same word down most accounts.
+/// provider is a column of the same word down most accounts. On Pipelines the repository starts
+/// off too — the pipeline name says what ran, and on a busy Azure org it is one project repeated
+/// down every row.
 fn default_hidden_columns() -> [Vec<String>; 3] {
-    std::array::from_fn(|_| vec!["Provider".to_string()])
+    let provider = || vec!["Provider".to_string()];
+    [provider(), provider(), vec!["Provider".to_string(), "Repository".to_string()]]
 }
 
 /// The display label of `section`'s active sort, for the list title ("· by Updated").
@@ -16516,5 +16527,11 @@ mod tests {
         assert_eq!(sub.definition_ids, vec!["ci".to_string(), "cd".to_string()]);
         assert_eq!(app.pipe_scope.as_ref().map(PipeScope::label).as_deref(), Some("Pipelines · 2 of 3"));
         assert!(app.pipes.is_empty(), "the unticked pipeline's runs are gone before the reload lands");
+
+        // Nothing ticked is saved as nothing selected — and reads as such, not as everything.
+        app.apply_pipeline_subs("c", vec![], &deps).await;
+        let sub = deps.config.snapshot().pipelines.unwrap().subscriptions[0].clone();
+        assert!(!sub.auto_discover_all && sub.definition_ids.is_empty());
+        assert_eq!(app.pipe_scope.as_ref().map(PipeScope::label).as_deref(), Some("Pipelines · 0 of 3"));
     }
 }

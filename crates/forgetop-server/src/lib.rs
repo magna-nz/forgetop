@@ -155,6 +155,8 @@ fn router(state: AppState) -> Router {
         .route("/api/connections/test", post(test_connection))
         .route("/api/connections/repositories", get(connection_repositories))
         .route("/api/connections/scope", post(set_connection_scope))
+        .route("/api/pipelines/definitions", get(pipeline_definitions))
+        .route("/api/pipelines/selection", post(set_pipeline_selection))
         .layer(middleware::from_fn_with_state(state.clone(), auth))
         .with_state(state);
 
@@ -469,3 +471,55 @@ async fn set_connection_scope(State(s): State<AppState>, Json(req): Json<ScopeRe
     }
 }
 
+/// A pipeline connection's discovered definitions and which of them are fetched — the picker's
+/// candidates. Pipelines are opt-in: nothing selected (`all` false, `selected` empty) fetches
+/// nothing.
+#[derive(serde::Serialize)]
+struct PipelineDefinitionsResp {
+    definitions: Vec<forgetop_core::domain::PipelineDefinition>,
+    all: bool,
+    selected: Vec<String>,
+}
+
+async fn pipeline_definitions(State(s): State<AppState>, Query(q): Query<IdQuery>) -> Response {
+    let source = match s.deps.sections.pipeline_source_for(&q.id).await {
+        Ok(Some(source)) => source,
+        Ok(None) => return (StatusCode::NOT_FOUND, "that connection doesn't support pipelines").into_response(),
+        Err(e) => return (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
+    };
+    let definitions = match source.discover().await {
+        Ok(defs) => defs,
+        Err(e) => return (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
+    };
+    let cfg = s.deps.config.snapshot();
+    let sub = cfg.pipelines.as_ref().and_then(|p| p.subscriptions.iter().find(|s| s.connection_id == q.id));
+    Json(PipelineDefinitionsResp {
+        definitions,
+        all: sub.is_some_and(|s| s.auto_discover_all),
+        selected: sub.map(|s| s.definition_ids.clone()).unwrap_or_default(),
+    })
+    .into_response()
+}
+
+#[derive(Deserialize)]
+struct PipelineSelectionReq {
+    id: String,
+    /// Every pipeline, including ones created later. Wins over `ids`.
+    #[serde(default)]
+    all: bool,
+    /// The chosen definitions. Empty is a real choice — fetch nothing.
+    #[serde(default)]
+    ids: Vec<String>,
+}
+
+async fn set_pipeline_selection(State(s): State<AppState>, Json(req): Json<PipelineSelectionReq>) -> Response {
+    let saved = if req.all {
+        s.deps.config.set_pipeline_auto_discover(&req.id, true).await
+    } else {
+        s.deps.config.set_pipeline_definitions(&req.id, req.ids).await
+    };
+    match saved {
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
+    }
+}

@@ -178,7 +178,9 @@ pub async fn save(config: &ConfigService, sections: &SectionService, req: SaveCo
             (Section::PullRequests, false) => config.unbind_pull_requests(&id).await,
             (Section::WorkItems, true) => config.bind_work_items(&id).await,
             (Section::WorkItems, false) => config.unbind_work_items(&id).await,
-            (Section::Pipelines, true) => config.set_pipeline_auto_discover(&id, true).await,
+            // Pipelines are opt-in: added with nothing selected, chosen from the picker. An
+            // existing selection is kept — this form re-saves every section on each edit.
+            (Section::Pipelines, true) => config.bind_pipelines(&id).await,
             (Section::Pipelines, false) => config.unbind_pipelines(&id).await,
         };
         result.map_err(|e| e.to_string())?;

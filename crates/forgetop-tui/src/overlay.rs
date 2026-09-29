@@ -216,9 +216,10 @@ impl Overlay {
             Overlay::Picker { .. } => vec![("↑↓", "choose"), ("↵", "select"), ("Esc", "cancel")],
             Overlay::Input { .. } => vec![("Esc", "cancel"), ("↵", "submit")],
             Overlay::Toggle { filter: Some(_), .. } => {
-                vec![("type", "search"), ("↑↓", "move"), ("space", "toggle"), ("↵", "apply")]
+                // The "search:" line says typing searches; the room goes to Ctrl-A.
+                vec![("↑↓", "move"), ("space", "toggle"), ("^A", "all"), ("↵", "apply")]
             }
-            Overlay::Toggle { .. } => vec![("↑↓", "move"), ("space", "toggle"), ("↵", "apply")],
+            Overlay::Toggle { .. } => vec![("↑↓", "move"), ("space", "toggle"), ("a", "all"), ("↵", "apply")],
             Overlay::Search { kind: SearchKind::Assignee { me }, .. } => {
                 let mut keys = vec![("type", "search"), ("↑↓", "choose"), ("↵", "assign")];
                 if me.is_some() {
@@ -311,6 +312,16 @@ impl Overlay {
                                 item.on = true;
                             }
                         }
+                        Outcome::Keep
+                    }
+                    // Everything shown on, or all of it off. A searchable toggle spends letters
+                    // on the query, so there it's Ctrl-A only.
+                    Key::Ctrl('a') => {
+                        toggle_all(items, &visible, *selected, *min_one);
+                        Outcome::Keep
+                    }
+                    Key::Char('a') if filter.is_none() => {
+                        toggle_all(items, &visible, *selected, *min_one);
                         Outcome::Keep
                     }
                     Key::Char(c) if filter.is_some() => {
@@ -519,6 +530,20 @@ pub fn visible_search_indices(items: &[SearchItem], query: &str) -> Vec<usize> {
 
 /// The rows a checklist currently shows: everything, or what matches its search query.
 /// `Overlay::Toggle::selected` indexes into this, not into `items`.
+/// Ticks every visible item, or — when they are all ticked already — clears them. A `min_one`
+/// checklist keeps the item under the cursor ticked if clearing would leave nothing on.
+fn toggle_all(items: &mut [ToggleItem], visible: &[usize], selected: usize, min_one: bool) {
+    let turn_on = !visible.iter().all(|&i| items[i].on);
+    for &i in visible {
+        items[i].on = turn_on;
+    }
+    if min_one && !items.iter().any(|i| i.on) {
+        if let Some(item) = visible.get(selected).and_then(|&i| items.get_mut(i)) {
+            item.on = true;
+        }
+    }
+}
+
 pub fn visible_toggle_indices(items: &[ToggleItem], filter: Option<&str>) -> Vec<usize> {
     let q = filter.unwrap_or("").trim().to_lowercase();
     items
@@ -617,6 +642,32 @@ mod tests {
         let Overlay::Toggle { items, .. } = &o else { panic!("toggle") };
         assert!(items[1].on, "the matched repository was ticked");
         assert!(items[0].on && !items[2].on, "the others are untouched");
+    }
+
+    #[test]
+    fn ctrl_a_ticks_or_clears_everything_shown() {
+        let mut o = Overlay::Toggle {
+            title: "Pipelines".into(),
+            kind: ToggleKind::PipelineSubs { connection_id: "c".into() },
+            min_one: false,
+            items: repos(&["ci", "cd", "nightly"], &["ci"]),
+            selected: 0,
+            filter: Some(String::new()),
+        };
+        o.handle(Key::Ctrl('a'));
+        let Overlay::Toggle { items, filter, .. } = &o else { panic!("toggle") };
+        assert!(items.iter().all(|i| i.on), "some ticked → all ticked");
+        assert_eq!(filter.as_deref(), Some(""), "Ctrl-A is not typed into the search");
+        o.handle(Key::Ctrl('a'));
+        let Overlay::Toggle { items, .. } = &o else { panic!("toggle") };
+        assert!(items.iter().all(|i| !i.on), "all ticked → none");
+
+        // With a search, only what it shows is ticked.
+        o.handle(Key::Char('n'));
+        o.handle(Key::Char('i'));
+        o.handle(Key::Ctrl('a'));
+        let Overlay::Toggle { items, .. } = &o else { panic!("toggle") };
+        assert_eq!(items.iter().filter(|i| i.on).map(|i| i.id.as_str()).collect::<Vec<_>>(), vec!["nightly"]);
     }
 
     #[test]

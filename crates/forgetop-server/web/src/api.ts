@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import type { ConnectionRow, FileChange, HealthRow, LaunchpadResponse, NotifRow, PipeRef, PipelineDetail, PipeRow, PrDecoration, PrDetail, PrRef, ProviderInfo, PrRow, RepositoryPage, WiDetail, WiRef, WiRow } from "./types";
+import type { ConnectionRow, FileChange, HealthRow, LaunchpadResponse, NotifRow, PipeRef, PipelineDetail, PipelineSelection, PipeRow, PrDecoration, PrDetail, PrRef, ProviderInfo, PrRow, RepositoryPage, WiDetail, WiRef, WiRow } from "./types";
 
 // The session token arrives once in the URL (`/?t=…`). We stash it in sessionStorage (so a
 // refresh keeps working) and strip it from the visible URL, then replay it on every API call.
@@ -156,6 +156,11 @@ export const usePipelineDetail = (ref: PipeRef | null) =>
  *  stop an already-scoped connection fetching. */
 export const fetchConnectionRepositories = (connectionId: string) =>
   api<RepositoryPage>(`/api/connections/repositories?id=${encodeURIComponent(connectionId)}`);
+
+/** A pipeline connection's discovered pipelines and its saved selection — the pipeline
+ *  picker's candidates. */
+export const fetchPipelineSelection = (connectionId: string) =>
+  api<PipelineSelection>(`/api/pipelines/definitions?id=${encodeURIComponent(connectionId)}`);
 
 export const useConnectionRepositories = (connectionId: string | null) =>
   useQuery({

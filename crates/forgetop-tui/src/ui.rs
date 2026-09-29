@@ -1221,6 +1221,9 @@ fn list_title(base: String, filter: &str) -> String {
 /// "nothing to show": nothing was fetched because nothing was asked for, and the fix is one key.
 const NO_REPOS_HINT: &str = "No repositories selected. Press w to choose which ones to fetch from.";
 
+/// Pipelines are opt-in: shown until at least one is chosen from the `w` picker.
+const NO_PIPELINES_HINT: &str = "No pipelines selected. Press w to choose which pipelines to show.";
+
 /// Appends "· Repos · 5 of 37" to a section title, once discovery has a real count to show.
 fn with_scope(base: String, app: &App, section: usize) -> String {
     match &app.repo_scope[section] {
@@ -1558,7 +1561,7 @@ impl PipeCol {
 }
 
 /// Picks the columns for what is currently on screen.
-fn pipe_columns(app: &App, lines: &[PipeLine], multi_provider: bool) -> Vec<PipeCol> {
+fn pipe_columns(app: &App, lines: &[PipeLine]) -> Vec<PipeCol> {
     let grouped = app.pipe_group != PipeGroup::Off;
     let approvals = lines.iter().any(|l| match l {
         PipeLine::Head(h) => h.approval,
@@ -1570,9 +1573,8 @@ fn pipe_columns(app: &App, lines: &[PipeLine], multi_provider: bool) -> Vec<Pipe
         cols.push(PipeCol::Tree);
     }
     cols.push(PipeCol::Status);
-    if multi_provider {
-        cols.push(PipeCol::Provider);
-    }
+    // Shown whenever `c` has it on, however many providers there are — it starts off.
+    cols.push(PipeCol::Provider);
     // The repository leads: it is what a run is read against, and trailing it behind the
     // timings left the one fact that says *where* this is happening at the far edge.
     cols.push(PipeCol::Repository);
@@ -1739,6 +1741,8 @@ fn render_pipes(frame: &mut Frame, area: Rect, app: &mut App) {
             NO_REPOS_HINT.to_string()
         } else if app.health.is_empty() {
             FIRST_RUN_HINT.to_string()
+        } else if app.pipe_scope.as_ref().is_some_and(|s| s.selected == 0) {
+            NO_PIPELINES_HINT.to_string()
         } else if app.loading {
             loading_msg(app, "Loading pipeline runs…")
         } else {
@@ -1753,10 +1757,7 @@ fn render_pipes(frame: &mut Frame, area: Rect, app: &mut App) {
     let lines = app.pipe_lines();
     let any_open = lines.iter().any(|l| matches!(l, PipeLine::Head(h) if h.expanded));
 
-    let mut providers: Vec<String> = idxs.iter().map(|&i| provider_tag(app.pipes[i].provider, &app.pipes[i].connection)).collect();
-    providers.sort();
-    providers.dedup();
-    let cols = pipe_columns(app, &lines, providers.len() > 1);
+    let cols = pipe_columns(app, &lines);
     let owner = shared_owner(app, &idxs);
 
     // Headers and runs are the same shape now, so they go through `columnize` together and
@@ -4325,6 +4326,21 @@ fn render_overlay(frame: &mut Frame, area: Rect, app: &App) {
         })
         .collect::<Vec<_>>();
 
+    // A list taller than the screen is windowed around the cursor, so moving past the bottom
+    // scrolls instead of walking off the card. `pinned` lines (a search box) always stay on top.
+    let (pinned, sel_line) = match overlay {
+        Overlay::Picker { selected, .. } => (0, *selected),
+        Overlay::Toggle { selected, filter, .. } => {
+            let pinned = usize::from(filter.is_some());
+            (pinned, pinned + *selected)
+        }
+        Overlay::Search { selected, .. } => (2, 2 + *selected),
+        _ => (0, 0),
+    };
+    // Borders, the blank line and the hint row, plus a line of margin above and below.
+    let max_body = (area.height as usize).saturating_sub(6).max(pinned + 1);
+    let body = window_lines(body, pinned, sel_line, max_body);
+
     let mut lines = body;
     lines.push(Line::from(""));
     lines.push(Line::from(hint));
@@ -4342,6 +4358,20 @@ fn render_overlay(frame: &mut Frame, area: Rect, app: &App) {
 
     frame.render_widget(Clear, rect);
     frame.render_widget(Paragraph::new(lines).block(block).wrap(Wrap { trim: false }), rect);
+}
+
+/// Keeps `body` to `max` lines: the first `pinned` stay put and the rest are windowed so line
+/// `sel` stays in view, centred where there's room either side.
+fn window_lines<'a>(mut body: Vec<Line<'a>>, pinned: usize, sel: usize, max: usize) -> Vec<Line<'a>> {
+    if body.len() <= max || pinned >= body.len() {
+        return body;
+    }
+    let rows = body.split_off(pinned);
+    let room = max.saturating_sub(pinned).max(1);
+    let sel = sel.saturating_sub(pinned).min(rows.len() - 1);
+    let start = sel.saturating_sub(room / 2).min(rows.len() - room.min(rows.len()));
+    body.extend(rows.into_iter().skip(start).take(room));
+    body
 }
 
 /// The status dot's colour, following the shared green/blue/yellow/red/grey model.
@@ -5901,6 +5931,7 @@ mod tests {
             }
         };
         let mut app = App::new("slate");
+        app.hidden_cols[2].retain(|c| c != "Repository"); // off by default; this is about the column
         app.screen = Screen::List;
         app.active = 2;
         app.pipes = vec![
@@ -5972,23 +6003,27 @@ mod tests {
         app
     }
 
-    /// A column every row fills identically is nine characters of nothing. Provider only
-    /// earns its place once there is more than one provider to tell apart.
+    /// Provider and Repository start off on Pipelines, however many providers feed the list,
+    /// and `c` turns either on — Provider even for a single provider.
     #[test]
-    fn the_provider_column_appears_only_when_providers_differ() {
+    fn provider_and_repository_start_off_and_c_turns_them_on() {
         use PipelineRunStatus::Succeeded as S;
         let mut app = pipe_list(&[
             ("CI", "nz/app", "main", "aaa", 10, S),
             ("Integration", "nz/app", "main", "aaa", 12, S),
         ]);
-        app.hidden_cols[2].clear(); // off by default; `c` turns it on
-        let out = render_to_string(&mut app, 150, 16);
-        assert!(!out.contains("Provider"), "one provider, so no Provider column");
-
         app.pipes[1].provider = ProviderType::GitLab;
         app.pipes[1].connection = "GL".into();
         let out = render_to_string(&mut app, 150, 16);
-        assert!(out.contains("Provider"), "two providers, so the column is worth its width");
+        assert!(!out.contains("Provider"), "off by default, even with two providers");
+        assert!(!out.contains("Repository"), "off by default");
+
+        app.pipes[1].provider = app.pipes[0].provider;
+        app.pipes[1].connection = app.pipes[0].connection.clone();
+        app.hidden_cols[2].clear();
+        let out = render_to_string(&mut app, 150, 16);
+        assert!(out.contains("Provider"), "on, even with one provider");
+        assert!(out.contains("Repository"), "on");
     }
 
     /// The owner prefix repeats down the whole column when there is only one owner.
@@ -5999,6 +6034,7 @@ mod tests {
             ("CI", "magna-nz/forgetop", "main", "aaa", 10, S),
             ("Release", "magna-nz/test-pg", "main", "bbb", 12, S),
         ]);
+        app.hidden_cols[2].retain(|c| c != "Repository"); // off by default; this is about the column
         let out = render_to_string(&mut app, 150, 16);
         assert!(out.contains("forgetop") && out.contains("test-pg"), "both repositories named");
         assert!(!out.contains("magna-nz/"), "the owner every row shares is dropped");
@@ -6193,6 +6229,7 @@ mod tests {
             ("CI", "nz/app", "main", "aaa", 10, S),
             ("Integration", "nz/other", "v2.0", "bbb", 20, S),
         ]);
+        app.hidden_cols[2].retain(|c| c != "Repository"); // off by default; this is about the column
 
         // The whole screen comes back as one string, so the heading row is picked out by
         // splitting on the pane's own border — "Pipelines" in the tab bar is not a column.
@@ -6250,6 +6287,7 @@ mod tests {
             ("Integration", "magna-nz/forgetop", "claude/changelog-release-notes", "aaa", 10, S),
             ("CI", "other-org/forgetop", "main", "bbb", 20, S),
         ]);
+        app.hidden_cols[2].retain(|c| c != "Repository"); // off by default; this is about the column
         app.pipes[0].awaiting_approval = true;
         app.pipes[1].provider = ProviderType::GitLab;
         app.pipes[1].connection = "GL".into();
@@ -6659,6 +6697,63 @@ mod tests {
         assert!(out.contains("Visible tabs"), "toggle title");
         assert!(out.contains("▶"), "green arrow marks a visible section");
         assert!(out.contains("toggle"), "toggle footer hint");
+    }
+
+    /// Pipelines are opt-in: with nothing chosen the header reads "0 of N" and the list says
+    /// how to choose, rather than claiming there are no runs.
+    #[test]
+    fn no_pipelines_selected_points_at_the_picker() {
+        let mut app = App::new("slate");
+        app.screen = Screen::List;
+        app.active = 2;
+        app.health.push(forgetop_core::service::ConnectionHealth {
+            connection: forgetop_core::provider::Connection {
+                id: "c".into(),
+                provider_type: ProviderType::AzureDevOps,
+                display_name: "ADO".into(),
+                base_url: None,
+                organization: None,
+                project: None,
+                repository: None,
+                username: None,
+                credential_ref: None,
+                repo_scope: None,
+            },
+            healthy: true,
+        });
+        app.pipe_scope = Some(crate::app::PipeScope { connections: vec!["c".into()], selected: 0, available: 154 });
+        let out = render_to_string(&mut app, 160, 24);
+        assert!(out.contains("Pipelines · 0 of 154"), "header counts nothing selected");
+        assert!(out.contains("Press w to choose"), "the list points at the picker");
+        assert!(!out.contains("No pipeline runs"));
+    }
+
+    /// A checklist longer than the terminal scrolls with the cursor: the row it's on is drawn,
+    /// the search box stays on top, and the footer hint is still on screen.
+    #[test]
+    fn a_long_checklist_scrolls_to_the_cursor() {
+        use crate::overlay::{Overlay, ToggleItem, ToggleKind};
+        let mut app = App::new("slate");
+        let items = (0..100).map(|n| ToggleItem { id: n.to_string(), label: format!("pipeline-{n:03}"), on: false }).collect();
+        app.overlay = Some(Overlay::Toggle {
+            title: "Pipelines · ADO".into(),
+            kind: ToggleKind::PipelineSubs { connection_id: "c".into() },
+            min_one: false,
+            items,
+            selected: 80,
+            filter: Some(String::new()),
+        });
+        let out = render_to_string(&mut app, 100, 24);
+        assert!(out.contains("pipeline-080"), "the cursor's row is in view");
+        assert!(!out.contains("pipeline-000"), "the top has scrolled away");
+        assert!(out.contains("search:"), "the search box stays pinned");
+        assert!(out.contains("apply"), "the footer hint still fits");
+
+        if let Some(Overlay::Toggle { selected, .. }) = &mut app.overlay {
+            *selected = 99;
+        }
+        let out = render_to_string(&mut app, 100, 24);
+        assert!(out.contains("pipeline-099"), "the last row is reachable");
     }
 
     #[test]

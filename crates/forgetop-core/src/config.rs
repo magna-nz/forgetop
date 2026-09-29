@@ -211,6 +211,11 @@ pub struct ForgetopConfig {
     pub pipelines: Option<PipelineBinding>,
     #[serde(default)]
     pub ui: UiState,
+    /// Pipelines became opt-in: an empty selection fetches nothing, where it used to fetch
+    /// everything. Set once the one-time reset of "every pipeline" subscriptions has run (see
+    /// `ConfigService::load`), so a later "tick everything" choice is never reset again.
+    #[serde(default)]
+    pub pipelines_opt_in: bool,
 }
 
 impl ForgetopConfig {

@@ -17,6 +17,8 @@ import type {
   HealthRow,
   LaunchpadResponse,
   NotifRow,
+  PipelineSelection,
+  PipeRow,
   WiDetail as WiDetailData,
   WiRef,
   WiRow,
@@ -106,5 +108,18 @@ export function patchWorkItem(qc: QueryClient, ref: Pick<WiRef, "conn" | "repo" 
 export function setConnectionScopeInCache(qc: QueryClient, id: string, scope: string[]): void {
   qc.setQueriesData<ConnectionRow[]>({ queryKey: ["connections"] }, (rows) =>
     rows?.map((c) => (c.id === id ? { ...c, repo_scope: [...scope] } : c)),
+  );
+}
+
+/**
+ * Applies a new pipeline selection for one connection: the picker's ticks and count move at once,
+ * and runs of a pipeline just unticked leave the list before the refetch lands. Newly ticked
+ * pipelines' runs can't be known client-side, so they arrive with the refetch.
+ */
+export function setPipelineSelectionInCache(qc: QueryClient, id: string, all: boolean, selected: string[]): void {
+  qc.setQueryData<PipelineSelection>(["pipeline-definitions", id], (cur) => cur && { ...cur, all, selected });
+  if (all) return;
+  qc.setQueriesData<PipeRow[]>({ queryKey: ["pipelines"] }, (rows) =>
+    rows?.filter((r) => r.connection_id !== id || selected.includes(r.run.definition_id)),
   );
 }

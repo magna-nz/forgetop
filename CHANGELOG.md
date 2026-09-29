@@ -9,33 +9,47 @@ Adding a release: one `## <version> — <date>` section, a line per user-visible
 and the pull request each one came from. `git log v<previous>..HEAD --merges` lists the
 candidates.
 
-## Unreleased
+## 1.5.0 — 2026-09-29
 
 Added
 
 - **Choose the list's columns.** In the terminal UI, `c` opens a checklist of the list's columns
   on Pull Requests, Work Items and Pipelines. Space toggles a column and Enter applies. Provider
-  starts off, and your choice is saved.
+  starts off, and your choice is saved. ([#207](https://github.com/magna-nz/forgetop/pull/207))
+- **Choose pipelines in the dashboard.** The dashboard's Pipelines page has a
+  `Pipelines · 0 of 154` button with a searchable checklist per connection and All/None. It is the
+  same saved choice the terminal's `w` edits. ([#PRNUM](https://github.com/magna-nz/forgetop/pull/PRNUM))
 - **Line numbers in diffs.** Every line of a pull request diff is numbered. Added and unchanged
-  lines show their new line number, and removed lines show their old one.
+  lines show their new line number, and removed lines show their old one. ([#207](https://github.com/magna-nz/forgetop/pull/207))
 
 Changed
 
+- **Pipelines are opt-in.** A connection bound to Pipelines starts with no pipelines chosen, and
+  the header reads `Pipelines · 0 of 154` until you pick some with `w` (or the dashboard's
+  picker). Your choice is saved. On the first run of this version, a connection that was
+  fetching every pipeline is reset to none. A connection where you'd picked specific pipelines
+  keeps them. ([#PRNUM](https://github.com/magna-nz/forgetop/pull/PRNUM))
+- **Pipelines hide Provider and Repository by default.** Both can be turned on with `c`, and
+  Provider now shows when it's on even with a single provider. ([#PRNUM](https://github.com/magna-nz/forgetop/pull/PRNUM))
 - **Pull Requests open on Mine.** The views now run Mine, Review, All, and the tab lands on Mine.
-  A saved list that still starts with the old All, Mine, Review order is reordered.
+  A saved list that still starts with the old All, Mine, Review order is reordered. ([#207](https://github.com/magna-nz/forgetop/pull/207))
 - **New connections start with no repositories chosen.** The repositories a new connection can
   reach are still discovered, so the header reads `Repos · 0 of 38`. The list asks you to pick,
-  and nothing is fetched until you do. The dashboard's empty state now has the picker too.
+  and nothing is fetched until you do. The dashboard's empty state now has the picker too. ([#207](https://github.com/magna-nz/forgetop/pull/207))
 - **`w` chooses repositories** (it was `g`), matching Pipelines, where `w` chooses pipelines. It
   is now in the footer. Sorted lists name their sort in the title (`· by Updated`), and a list on
-  its own gets the highlighted title that Pipelines has.
+  its own gets the highlighted title that Pipelines has. ([#207](https://github.com/magna-nz/forgetop/pull/207))
 
 Fixed
 
+- **Long pop-up lists scroll.** In the terminal UI, a checklist or picker taller than the screen
+  (such as `w` on an Azure org with 150 pipelines) now scrolls with the cursor instead of running
+  off the bottom. In a searchable checklist, Ctrl-A ticks or clears everything shown; elsewhere
+  it's `a`. ([#PRNUM](https://github.com/magna-nz/forgetop/pull/PRNUM))
 - **A stalled request no longer leaves a list loading forever.** Provider requests now give up
   after 10 seconds without a connection or 30 seconds of silence. Before this, one hung request
   blocked every later refresh, and a view such as Mine never left "Loading…". Switching views
-  before the first refresh lands now shows that view's cached rows.
+  before the first refresh lands now shows that view's cached rows. ([#207](https://github.com/magna-nz/forgetop/pull/207))
 
 ## 1.4.0 — 2026-09-29
 

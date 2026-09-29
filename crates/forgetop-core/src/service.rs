@@ -37,7 +37,10 @@ impl ConfigService {
     }
 
     pub async fn load(&self) -> Result<()> {
-        let cfg = self.store.load().await?;
+        let mut cfg = self.store.load().await?;
+        if migrate_pipelines_opt_in(&mut cfg) {
+            self.store.save(&cfg).await?;
+        }
         *self.config.lock().unwrap() = cfg;
         Ok(())
     }
@@ -242,6 +245,13 @@ impl ConfigService {
         .await
     }
 
+    /// Adds a connection to the Pipelines section with nothing selected — pipelines are opt-in,
+    /// chosen from the picker. An existing subscription is left exactly as it is, so re-binding
+    /// never undoes a selection.
+    pub async fn bind_pipelines(&self, connection_id: &str) -> Result<()> {
+        self.mutate_subscription(connection_id, |_| {}).await
+    }
+
     pub async fn set_pipeline_auto_discover(&self, connection_id: &str, auto_discover_all: bool) -> Result<()> {
         self.mutate_subscription(connection_id, move |s| s.auto_discover_all = auto_discover_all).await
     }
@@ -366,6 +376,27 @@ impl ConfigService {
     }
 }
 
+/// The one-time switch to opt-in pipelines: a subscription saved as "every pipeline" was, until
+/// now, what binding a connection did on its own, so it is reset to nothing selected. Runs once —
+/// the marker keeps a later deliberate "every pipeline" from being reset. Returns whether the
+/// saved config needs rewriting (a subscription was reset).
+fn migrate_pipelines_opt_in(cfg: &mut ForgetopConfig) -> bool {
+    if cfg.pipelines_opt_in {
+        return false;
+    }
+    cfg.pipelines_opt_in = true;
+    let Some(binding) = &mut cfg.pipelines else { return false };
+    let mut changed = false;
+    // An empty list with the flag off also used to mean "everything". An explicit list was a
+    // real choice and is kept.
+    for sub in binding.subscriptions.iter_mut().filter(|s| s.auto_discover_all || s.definition_ids.is_empty()) {
+        sub.auto_discover_all = false;
+        sub.definition_ids.clear();
+        changed = true;
+    }
+    changed
+}
+
 /// Turns a configured connection id into a live [`ProviderConnection`].
 pub struct ConnectionResolver {
     config: Arc<ConfigService>,
@@ -417,11 +448,16 @@ const MAX_CONCURRENT_RUN_QUERIES: usize = 4;
 /// own recent runs, exactly as an explicit subscription does.
 ///
 /// A definition id is only unique within its repository, so each query is addressed at the
-/// repository discovery says the definition belongs to. Only when there is nothing to address —
+/// repository discovery says the definition belongs to. Pipelines are opt-in, so nothing
+/// selected asks for nothing. Only when there is nothing to address —
 /// subscribed to everything and discovery came back empty — does it fall back to one
 /// connection-wide query, so a discovery hiccup still shows something.
 pub fn pipeline_run_queries(sub: &PipelineSubscription, defs: &[PipelineDefinition]) -> Vec<PipelineRunQuery> {
-    let all = sub.auto_discover_all || sub.definition_ids.is_empty();
+    // Pipelines are opt-in: nothing selected fetches nothing.
+    if !sub.auto_discover_all && sub.definition_ids.is_empty() {
+        return Vec::new();
+    }
+    let all = sub.auto_discover_all;
     let ids: Vec<&String> = if all { defs.iter().map(|d| &d.id).collect() } else { sub.definition_ids.iter().collect() };
     if ids.is_empty() {
         return vec![PipelineRunQuery { definition_id: None, repository: None, branch: None, limit: Some(20) }];
@@ -853,7 +889,6 @@ mod tests {
         let defs = vec![def("proj/app", "pr-check"), def("proj/app", "mainline"), def("proj/web", "deploy")];
         for sub in [
             PipelineSubscription { connection_id: "ado".into(), definition_ids: vec![], auto_discover_all: true },
-            PipelineSubscription { connection_id: "ado".into(), definition_ids: vec![], auto_discover_all: false },
             // Auto-discovery wins over a stale explicit list.
             PipelineSubscription { connection_id: "ado".into(), definition_ids: vec!["pr-check".into()], auto_discover_all: true },
         ] {
@@ -873,5 +908,87 @@ mod tests {
         let queries = pipeline_run_queries(&sub, &[]);
         assert_eq!(queries.len(), 1);
         assert_eq!(queries[0].definition_id, None);
+    }
+
+    /// Pipelines are opt-in: a connection with nothing selected asks for no runs at all.
+    #[test]
+    fn nothing_selected_fetches_nothing() {
+        let sub = PipelineSubscription { connection_id: "ado".into(), definition_ids: vec![], auto_discover_all: false };
+        assert!(pipeline_run_queries(&sub, &[def("proj/app", "ci")]).is_empty());
+        assert!(pipeline_run_queries(&sub, &[]).is_empty());
+    }
+
+    /// Binding adds the connection with nothing selected, and re-binding (the web form re-saves
+    /// every section on each edit) leaves a selection alone.
+    #[tokio::test]
+    async fn bind_pipelines_selects_nothing_and_keeps_an_existing_selection() {
+        let (svc, _) = service();
+        svc.add_or_update_connection(conn("gh-1", ProviderType::GitHub), None).await.unwrap();
+        svc.bind_pipelines("gh-1").await.unwrap();
+        let sub = svc.snapshot().pipelines.unwrap().subscriptions[0].clone();
+        assert!(!sub.auto_discover_all && sub.definition_ids.is_empty());
+
+        svc.set_pipeline_definitions("gh-1", vec!["ci".into()]).await.unwrap();
+        svc.bind_pipelines("gh-1").await.unwrap();
+        let subs = svc.snapshot().pipelines.unwrap().subscriptions;
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].definition_ids, vec!["ci".to_string()]);
+    }
+
+    fn sub(id: &str, ids: &[&str], all: bool) -> PipelineSubscription {
+        PipelineSubscription {
+            connection_id: id.into(),
+            definition_ids: ids.iter().map(|s| s.to_string()).collect(),
+            auto_discover_all: all,
+        }
+    }
+
+    /// The switch to opt-in resets "every pipeline" subscriptions once, keeps explicit
+    /// selections, and never runs again — so a later "tick everything" survives restarts.
+    #[test]
+    fn opt_in_migration_resets_every_pipeline_once() {
+        let mut cfg = ForgetopConfig {
+            pipelines: Some(PipelineBinding {
+                subscriptions: vec![sub("ado", &[], true), sub("gh", &[], false), sub("gl", &["ci"], false)],
+            }),
+            ..Default::default()
+        };
+        assert!(migrate_pipelines_opt_in(&mut cfg));
+        assert!(cfg.pipelines_opt_in);
+        let subs = &cfg.pipelines.as_ref().unwrap().subscriptions;
+        assert_eq!(subs[0], sub("ado", &[], false));
+        assert_eq!(subs[1], sub("gh", &[], false));
+        assert_eq!(subs[2], sub("gl", &["ci"], false), "an explicit selection is kept");
+
+        cfg.pipelines.as_mut().unwrap().subscriptions[0].auto_discover_all = true;
+        assert!(!migrate_pipelines_opt_in(&mut cfg), "runs once");
+        assert!(cfg.pipelines.unwrap().subscriptions[0].auto_discover_all);
+    }
+
+    /// Through the real load path: the reset is saved, and a later "every pipeline" choice
+    /// survives the next launch's load.
+    #[tokio::test]
+    async fn opt_in_reset_is_saved_and_not_repeated_on_the_next_load() {
+        let store = Arc::new(InMemoryConfigStore::default());
+        let svc = ConfigService::new(store.clone(), Arc::new(InMemorySecretStore::default()), registry());
+        svc.add_or_update_connection(conn("gh-1", ProviderType::GitHub), None).await.unwrap();
+        svc.set_pipeline_auto_discover("gh-1", true).await.unwrap();
+
+        svc.load().await.unwrap();
+        let saved = store.load().await.unwrap();
+        assert!(saved.pipelines_opt_in);
+        assert!(!saved.pipelines.unwrap().subscriptions[0].auto_discover_all, "reset on disk");
+
+        svc.set_pipeline_auto_discover("gh-1", true).await.unwrap();
+        svc.load().await.unwrap();
+        assert!(svc.snapshot().pipelines.unwrap().subscriptions[0].auto_discover_all, "kept after restart");
+    }
+
+    /// A config with no pipelines is only marked, never rewritten on disk for it.
+    #[test]
+    fn opt_in_migration_without_pipelines_needs_no_save() {
+        let mut cfg = ForgetopConfig::default();
+        assert!(!migrate_pipelines_opt_in(&mut cfg));
+        assert!(cfg.pipelines_opt_in);
     }
 }
