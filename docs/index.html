@@ -270,6 +270,7 @@
 <p class="lede">The same app in a browser, built into the binary and served on loopback.</p>
 <p>forgetop ships the <strong>same app as a local web dashboard</strong> — the Command Center, all three lists, PR review with an inline-comment diff viewer, the command palette, sort/filter, themes, and every write action (approve, merge, comment, submit a review, change a work-item state, approve a pipeline gate, retry a run, mark a notification read). It's a React app <strong>built into the binary</strong> and served by forgetop itself — no separate install, no external network.</p>
 <p>The terminal UI and the dashboard are two frontends over one core, so they show the <strong>same data</strong>, act through the <strong>same providers</strong>, and share the <strong>same config + keychain</strong> — a connection or a setting changed in one shows up in the other.</p>
+<figure class="demo"><a href="demos/dashboard-hero.gif"><img src="demos/dashboard-hero.gif" alt="The web dashboard: Command Center, a PR panel, then the Pull Requests, Work Items and Pipelines pages" width="1000" height="563" loading="lazy"></a><figcaption>Every page of the dashboard, run against <code>forgetop --dashboard --demo</code>.</figcaption></figure>
 <h3 id="opening-it">Opening it <a class="anchor" href="#opening-it" aria-label="Link to this section">#</a></h3>
 <ul>
 <li><strong>From the TUI:</strong> press <strong><code>B</code></strong> (shown in the footer and <code>?</code> help on every screen).
@@ -376,6 +377,7 @@
 <p>The <strong>Timeline</strong> (newest first) shows who did what: approvals, change-requests, merges, state changes and comments — assembled from each provider's timeline/activity/history API (GitHub reviews + issue events, Bitbucket activity, GitLab resource-events + approvals, Azure reviewer votes, plus comments). A provider without a timeline API just shows the comment activity.</p>
 <p>The header has an <strong>↗ open-in-provider</strong> link. The action bar shows a <strong>checks badge</strong> on the left — green <strong>"All checks passed"</strong> or red <strong>"N checks failed"</strong>; click it for a popover listing every check (each links to the provider) — and <strong>Approve</strong>, <strong>Request changes</strong>, <strong>Merge</strong> on the right. Choosing an action closes the panel. Press <strong>Esc</strong> or click the backdrop to close.</p>
 <h3 id="reviewing-code-with-line-comments">Reviewing code with line comments <a class="anchor" href="#reviewing-code-with-line-comments" aria-label="Link to this section">#</a></h3>
+<figure class="demo"><a href="demos/dashboard-review.gif"><img src="demos/dashboard-review.gif" alt="Reviewing a PR in the dashboard: commits, files, an inline comment, submit, approve" width="1200" height="675" loading="lazy"></a><figcaption>Commits → Files → an inline comment on a diff line → <strong>Submit comments</strong> → <strong>Approve</strong>.</figcaption></figure>
 <p>On the <strong>Files</strong> tab, click the <strong><code>+</code></strong> on a code line to write an inline comment. Comments are <strong>buffered as pending</strong> (shown in a blue <em>pending</em> box) so you can comment on several lines first, then submit them together as one review — <strong>Submit comments</strong>, <strong>Request changes</strong>, or <strong>Approve</strong>. If you try to close the panel with comments still pending, forgetop asks before discarding them.</p>
 <ul>
 <li><strong>GitHub</strong> posts it as a single native review.
@@ -433,6 +435,7 @@
 </li>
 </ul>
 <h4 id="reviewing-code-with-line-comments-1">Reviewing code with line comments</h4>
+<figure class="demo"><a href="demos/terminal-review.gif"><img src="demos/terminal-review.gif" alt="Reviewing a PR in the terminal: Diff tab, line cursor, an inline comment, approve" width="1400" height="788" loading="lazy"></a><figcaption>Diff tab → <code>Enter</code> on a file → move the line cursor → <code>c</code> to comment → <code>a</code> to approve.</figcaption></figure>
 <p>In the Diff tab's line cursor, press <code>c</code> on a code line to write an inline comment. Comments are <strong>buffered locally</strong> — the line gets a <code>▎</code> marker — so you can comment on several lines first. Press <strong><code>s</code></strong> to submit them all as one review, choosing the verdict: <strong>Comment</strong>, <strong>Approve</strong>, or <strong>Request changes</strong>. If you press <code>Esc</code> <strong>or <code>q</code></strong> to leave with comments still buffered, forgetop asks whether to <strong>submit</strong> or <strong>leave without submitting</strong> first, so you don't lose them by accident.</p>
 <ul>
 <li><strong>GitHub</strong> posts it as a single native review.
@@ -457,6 +460,7 @@
 <p>The Work Items view shows only items <strong>assigned to you</strong> — each provider resolves the current user from your token (<code>@me</code>, <code>currentUser()</code>, <code>isMe</code>, …), so there's nothing to configure.</p>
 <div class="surface surface-dash">
 <p>Browse-and-open; the write actions live in the item panel.</p>
+<figure class="demo"><a href="demos/dashboard-workitem.gif"><img src="demos/dashboard-workitem.gif" alt="A work item panel in the dashboard: reassigning it and moving it to In Review" width="1200" height="675" loading="lazy"></a><figcaption>Open an item, reassign it, then <strong>Move ▾</strong> it to In Review.</figcaption></figure>
 <ul>
 <li><strong>Click a work item</strong> to open its panel: the <strong>description</strong>, a <strong>Timeline</strong> of events (status changes, assignments, comments — from the provider's history: Jira changelog, Linear issue history, Azure work-item revisions, GitHub/GitLab issue events), <strong>comment threads</strong> with a box to add a comment, and a <strong>Move ▾</strong> control to change state.
 </li>
@@ -612,6 +616,7 @@
 <p>The <strong>command palette</strong> is a fuzzy jump across <em>everything already loaded</em>: every PR, work item, and pipeline, from every connected provider, in one list. Type to filter (matching the title, author, branch, identifier, or connection); each row carries a status dot in the usual green/blue/red/grey colours. It searches only what's loaded — no network round-trip — so it's instant.</p>
 <div class="surface surface-dash">
 <p>Press <strong><code>⌘K</code></strong> (Ctrl-K on Windows/Linux) from anywhere to open it; type to filter, click a result (or <code>↑</code>/<code>↓</code> then <code>Enter</code>) to open it, <code>Esc</code> to dismiss.</p>
+<figure class="demo"><a href="demos/dashboard-search.gif"><img src="demos/dashboard-search.gif" alt="The dashboard command palette: searching for a PR and opening it" width="1200" height="675" loading="lazy"></a><figcaption><code>⌘K</code>, type a few letters, <code>Enter</code> opens the pull request.</figcaption></figure>
 </div>
 <div class="surface surface-tui">
 <p>Press <strong><code>Ctrl-P</code></strong> (from the Command Center or any list) to open it; <code>↑</code>/<code>↓</code> (or <code>Ctrl-n</code>/<code>Ctrl-p</code>) to move, <code>Enter</code> to open the item's full view, <code>Esc</code> to dismiss.</p>
@@ -866,6 +871,8 @@
 <h2 id="themes">Themes <a class="anchor" href="#themes" aria-label="Link to this section">#</a></h2>
 <p class="lede">Four built-in themes, remembered per surface.</p>
 <p>Four built-in themes — <code>slate</code> (default), <code>dark</code>, <code>light</code>, and <code>matrix</code>. In the terminal, cycle with <code>t</code> (256-colour palettes, so they render correctly on every terminal, including ones without truecolor); in the <a href="#web-dashboard">web dashboard</a>, use the theme toggle in the sidebar footer. Each side remembers your choice (the dashboard's per browser).</p>
+<figure class="demo"><a href="demos/terminal-themes.gif"><img src="demos/terminal-themes.gif" alt="The terminal UI cycling through slate, dark, light and matrix" width="1400" height="788" loading="lazy"></a><figcaption>Terminal: <code>t</code> cycles the theme.</figcaption></figure>
+<figure class="demo"><a href="demos/dashboard-themes.gif"><img src="demos/dashboard-themes.gif" alt="The web dashboard cycling through slate, dark, light and matrix" width="1200" height="675" loading="lazy"></a><figcaption>Dashboard: the theme toggle in the sidebar footer.</figcaption></figure>
 </div>
 <div class="rail"></div>
 </div>

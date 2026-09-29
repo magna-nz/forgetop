@@ -256,6 +256,19 @@ h4 { font-size: 14px; font-weight: 650; margin: 20px 0 6px; }
 }
 .lede { font-size: 17px; color: var(--muted); }
 
+/* demo recordings (docs/demos/*.gif), linked to the full-size file */
+.demo { margin: 4px 0 18px; }
+.demo a { display: block; }
+.demo img {
+  display: block;
+  width: 100%;
+  height: auto;
+  border: 1px solid var(--rule-strong);
+  border-radius: 8px;
+  background: var(--code-bg);
+}
+.demo figcaption { font-size: 13px; color: var(--faint); margin-top: 6px; }
+
 p { margin: 0 0 14px; }
 ul, ol { margin: 0 0 14px; padding-left: 20px; }
 li { margin: 0 0 6px; }
