@@ -19,6 +19,9 @@ Fixed
   screen was cached, so the first launch after Pull Requests switched to opening on Mine had
   nothing to show for it. The list also shows pull requests as soon as they're fetched instead of
   waiting for work items, pipelines, notifications and repository discovery to finish. ([#211](https://github.com/magna-nz/forgetop/pull/211))
+- **Azure DevOps runs show their stages.** A run's jobs are attached to the stage they belong to,
+  so the pipeline view lists them instead of "No stages reported". A pipeline with no stages of its
+  own shows its jobs under "Jobs". ([#209](https://github.com/magna-nz/forgetop/pull/209))
 
 ## 1.5.0 — 2026-09-29
 
