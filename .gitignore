@@ -27,3 +27,7 @@ Thumbs.db
 # Dashboard SPA build artifacts (rebuilt by forgetop-server/build.rs)
 crates/forgetop-server/web/node_modules/
 crates/forgetop-server/web/dist/
+
+# Isolated public demo build artifacts
+demo/node_modules/
+demo/dist/
