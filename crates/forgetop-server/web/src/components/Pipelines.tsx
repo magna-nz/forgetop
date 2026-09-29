@@ -38,6 +38,7 @@ export function Pipelines() {
         icon="◍"
         title="No repositories selected"
         sub="This connection spans your whole account — choose which repositories it fetches from."
+        action={scope.control}
       />
     );
   if (!data || data.length === 0)

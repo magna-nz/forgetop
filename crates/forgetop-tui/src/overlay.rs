@@ -119,6 +119,8 @@ pub enum ToggleKind {
     /// Which repositories a connection fetches from; item ids are **connection-relative**
     /// repository paths. Ticking none is a real choice — fetch nothing — so `min_one` is off.
     RepoScope { connection_id: String },
+    /// Which columns a section's list table draws; item ids are header names.
+    Columns { section: usize },
 }
 
 /// One row of a [`Overlay::Toggle`] checklist.

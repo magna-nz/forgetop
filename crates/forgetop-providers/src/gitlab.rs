@@ -1147,7 +1147,7 @@ impl ProviderFactory for GitLabFactory {
         if let Some(pat) = secret {
             headers.insert(AUTHORIZATION, format!("Bearer {pat}").parse().map_err(prov)?);
         }
-        let http = reqwest::Client::builder().default_headers(headers).build().map_err(prov)?;
+        let http = crate::http_client(headers).map_err(prov)?;
 
         let client = Arc::new(GitLabClient {
             http,

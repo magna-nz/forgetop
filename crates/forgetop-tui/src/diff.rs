@@ -65,6 +65,41 @@ pub fn comment_target(patch: &str, cursor: usize) -> Option<(i64, DiffSide)> {
     None
 }
 
+/// The file line number to print beside each patch line: the new-side number for added and
+/// context lines, the old-side number for removed ones, `None` for headers. One pass, so a
+/// renderer can number every row without calling [`comment_target`] per line.
+pub fn gutter_numbers(patch: &str) -> Vec<Option<(i64, DiffSide)>> {
+    let (mut old_ln, mut new_ln) = (0i64, 0i64);
+    patch
+        .lines()
+        .map(|line| {
+            if let Some((o, n)) = parse_hunk_header(line) {
+                old_ln = o;
+                new_ln = n;
+                return None;
+            }
+            if new_ln == 0 || line.starts_with("+++") || line.starts_with("---") {
+                return None;
+            }
+            Some(match line.chars().next() {
+                Some('+') => {
+                    new_ln += 1;
+                    (new_ln - 1, DiffSide::New)
+                }
+                Some('-') => {
+                    old_ln += 1;
+                    (old_ln - 1, DiffSide::Old)
+                }
+                _ => {
+                    old_ln += 1;
+                    new_ln += 1;
+                    (new_ln - 1, DiffSide::New)
+                }
+            })
+        })
+        .collect()
+}
+
 /// The patch display-line index whose **new-side** line number equals `target`, or `None`
 /// if it isn't in this patch. Used to jump the cursor to a thread anchored at a file line.
 pub fn patch_line_for_source_line(patch: &str, target: i64) -> Option<usize> {
@@ -131,6 +166,18 @@ mod tests {
         assert_eq!(cursor_line_label(patch, 1).as_deref(), Some("line 20")); // context → new line 20
         assert_eq!(cursor_line_label(patch, 2).as_deref(), Some("line 21")); // added → new line 21
         assert_eq!(cursor_line_label(patch, 3).as_deref(), Some("line 11 (old)")); // removed → old line 11
+    }
+
+    #[test]
+    fn gutter_numbers_agree_with_the_cursor_label() {
+        let patch = "diff --git a/x b/x\n@@ -10,3 +20,4 @@\n ctx\n+new\n-old";
+        assert_eq!(
+            gutter_numbers(patch),
+            vec![None, None, Some((20, DiffSide::New)), Some((21, DiffSide::New)), Some((11, DiffSide::Old))]
+        );
+        for i in 0..patch.lines().count() {
+            assert_eq!(gutter_numbers(patch)[i], comment_target(patch, i), "row {i}");
+        }
     }
 
     #[test]

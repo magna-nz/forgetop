@@ -1358,7 +1358,7 @@ impl ProviderFactory for AzureDevOpsFactory {
             let token = base64::engine::general_purpose::STANDARD.encode(format!(":{pat}"));
             headers.insert(AUTHORIZATION, format!("Basic {token}").parse().map_err(prov)?);
         }
-        let http = reqwest::Client::builder().default_headers(headers).build().map_err(prov)?;
+        let http = crate::http_client(headers).map_err(prov)?;
 
         let client = Arc::new(AzureClient { http, base, scope, self_id: tokio::sync::Mutex::new(None) });
         Ok(Arc::new(AzureConnection { id: connection.id.clone(), display_name: connection.display_name.clone(), client, caps: azure_capabilities() }))

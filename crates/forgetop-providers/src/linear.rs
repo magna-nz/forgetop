@@ -335,7 +335,7 @@ impl ProviderFactory for LinearFactory {
             // Linear personal API keys are sent as the raw Authorization value.
             headers.insert(AUTHORIZATION, key.parse().map_err(prov)?);
         }
-        let http = reqwest::Client::builder().default_headers(headers).build().map_err(prov)?;
+        let http = crate::http_client(headers).map_err(prov)?;
         let client = Arc::new(LinearClient { http, base: connection.base_url.clone().unwrap_or_else(|| "https://api.linear.app/graphql".into()) });
         Ok(Arc::new(LinearConnection { id: connection.id.clone(), display_name: connection.display_name.clone(), client, caps: linear_capabilities() }))
     }

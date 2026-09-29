@@ -191,7 +191,7 @@ export function List({ children }: { children: ReactNode }) {
   return <div className="flex flex-col gap-2 p-5 max-w-5xl mx-auto">{children}</div>;
 }
 
-export function StateCard({ icon, title, sub }: { icon: string; title: string; sub?: string }) {
+export function StateCard({ icon, title, sub, action }: { icon: string; title: string; sub?: string; action?: ReactNode }) {
   return (
     <div className="flex flex-col items-center justify-center gap-2 py-24 text-center" style={{ color: "var(--dim)" }}>
       <div className="text-4xl opacity-60">{icon}</div>
@@ -199,6 +199,7 @@ export function StateCard({ icon, title, sub }: { icon: string; title: string; s
         {title}
       </div>
       {sub && <div className="text-sm max-w-sm">{sub}</div>}
+      {action && <div className="mt-2">{action}</div>}
     </div>
   );
 }

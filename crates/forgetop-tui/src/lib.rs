@@ -56,6 +56,7 @@ pub async fn run(deps: AppDeps, theme_name: &str, dashboard_url: Option<String>)
         let ui = deps.config.snapshot().ui;
         app.apply_sorts(ui.pr_sort, ui.work_item_sort, ui.pipeline_sort);
         app.apply_pipe_group(ui.pipeline_group);
+        app.apply_hidden_columns(ui.hidden_columns);
         app.apply_views(ui.pr_views, ui.work_item_views, ui.pipeline_views);
         app.notifications = ui.notifications;
         // Zero would paint every request red; treat it as unset.

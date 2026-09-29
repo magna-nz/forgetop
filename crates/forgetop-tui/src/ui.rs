@@ -379,6 +379,9 @@ fn render_content(frame: &mut Frame, area: Rect, app: &mut App) {
         return;
     }
     render_table(frame, area, app);
+    // Alone on screen, the list is what takes the keys — lit the way the focused half of a split
+    // is, so every section's list reads the same whether or not a preview is up.
+    mark_focus(frame, area, &app.theme);
 }
 
 /// The section list with its preview over it. Unfocused, the pane is the preview built for the
@@ -1076,6 +1079,34 @@ const PR_TITLE_COL: usize = 4;
 /// A title narrower than this reads as noise, so columns are shed to keep at least this much.
 const MIN_TITLE_W: usize = 28;
 
+/// Drops the columns the user switched off with `c`, before anything is shed for width. Takes
+/// and returns the same indices [`shed_columns`] works in (title, sort arrow, shed order),
+/// remapped past the dropped columns.
+#[allow(clippy::type_complexity)]
+fn hide_columns(
+    app: &App,
+    section: usize,
+    headers: &[&'static str],
+    mut cells: Vec<Vec<(String, Style)>>,
+    flex: usize,
+    sort: Option<(usize, bool)>,
+    drop_order: &[usize],
+) -> (Vec<&'static str>, Vec<Vec<(String, Style)>>, usize, Option<(usize, bool)>, Vec<usize>) {
+    let keep: Vec<bool> = headers.iter().enumerate().map(|(i, h)| i == flex || app.col_shown(section, h)).collect();
+    let new_index = |old: usize| -> Option<usize> { keep[old].then(|| keep[..old].iter().filter(|k| **k).count()) };
+    for row in &mut cells {
+        let mut i = 0;
+        row.retain(|_| {
+            i += 1;
+            keep[i - 1]
+        });
+    }
+    let kept = headers.iter().enumerate().filter(|(i, _)| keep[*i]).map(|(_, h)| *h).collect();
+    let sort = sort.and_then(|(col, desc)| new_index(col).map(|c| (c, desc)));
+    let drop_order = drop_order.iter().filter_map(|&c| new_index(c)).collect();
+    (kept, cells, new_index(flex).unwrap_or(0), sort, drop_order)
+}
+
 /// Drops columns, in `drop_order`, until the `flex` column can show [`MIN_TITLE_W`] characters
 /// (or all of its widest value, if shorter). A wide list is returned untouched; a narrow one
 /// keeps its identifying columns and loses the ones an open item repeats. The sort arrow follows its column, and disappears with it if that one is shed.
@@ -1188,7 +1219,7 @@ fn list_title(base: String, filter: &str) -> String {
 
 /// Shown when a section's connections have explicitly chosen no repositories. Deliberately not
 /// "nothing to show": nothing was fetched because nothing was asked for, and the fix is one key.
-const NO_REPOS_HINT: &str = "No repositories selected. Press g to choose which ones to fetch from.";
+const NO_REPOS_HINT: &str = "No repositories selected. Press w to choose which ones to fetch from.";
 
 /// Appends "· Repos · 5 of 37" to a section title, once discovery has a real count to show.
 fn with_scope(base: String, app: &App, section: usize) -> String {
@@ -1199,7 +1230,15 @@ fn with_scope(base: String, app: &App, section: usize) -> String {
 }
 
 fn scope_is_empty(app: &App, section: usize) -> bool {
-    app.repo_scope[section].as_ref().is_some_and(|s| s.none_selected)
+    app.no_repos_chosen(section)
+}
+
+/// Appends "· by Updated" once the section is sorted by a column, as Pipelines names its grouping.
+fn with_sort(mut base: String, app: &App, section: usize) -> String {
+    if let Some(label) = app.sort_for(section).and_then(|p| crate::app::sort_label(section, p)) {
+        base.push_str(&format!(" · by {label}"));
+    }
+    base
 }
 
 /// The repository column: just the trailing name, since the owner/workspace repeats on every row.
@@ -1331,6 +1370,7 @@ fn render_prs(frame: &mut Frame, area: Rect, app: &mut App) {
     let theme = &app.theme;
     let idxs = app.filtered_pr_indices();
     let base = with_scope(format!("Pull Requests · {}", crate::app::pr_status_summary(&app.pr_shown_statuses)), app, 0);
+    let base = with_sort(base, app, 0);
     let title = list_title(base, &app.filters[0]);
     if idxs.is_empty() {
         let msg = if !app.filters[0].is_empty() {
@@ -1378,7 +1418,8 @@ fn render_prs(frame: &mut Frame, area: Rect, app: &mut App) {
 
     // On a narrow terminal, shed the least useful columns first — Provider, ±, Author,
     // Updated — before the title gets squeezed.
-    let (headers, cells, sort) = shed_columns(&headers, cells, PR_TITLE_COL, sort_marker(app, 0), inner_w, &[1, 7, 5, 8]);
+    let (headers, cells, title_col, sort, order) = hide_columns(app, 0, &headers, cells, PR_TITLE_COL, sort_marker(app, 0), &[1, 7, 5, 8]);
+    let (headers, cells, sort) = shed_columns(&headers, cells, title_col, sort, inner_w, &order);
     let flex = headers.iter().position(|h| *h == "Title").unwrap_or(0);
     let (header, rows) = columnize(dim, &headers, &cells, flex, inner_w, sort);
     let selected = app.selected().and_then(|i| cells.get(i)).map(|r| (flex, r[flex].0.clone()));
@@ -1410,7 +1451,7 @@ fn render_wis(frame: &mut Frame, area: Rect, app: &mut App) {
     } else {
         format!("Work Items · mine · {hidden_in_view} state(s) hidden")
     };
-    let title = list_title(with_scope(base, app, 1), &app.filters[1]);
+    let title = list_title(with_sort(with_scope(base, app, 1), app, 1), &app.filters[1]);
     if idxs.is_empty() {
         let msg = if !app.filters[1].is_empty() {
             "No matches. Esc clears the filter.".to_string()
@@ -1450,7 +1491,8 @@ fn render_wis(frame: &mut Frame, area: Rect, app: &mut App) {
         .collect();
 
     // Provider, Type, Assignee, Updated go first on a narrow terminal.
-    let (headers, cells, sort) = shed_columns(&headers, cells, 3, sort_marker(app, 1), inner_w, &[1, 4, 5, 6]);
+    let (headers, cells, title_col, sort, order) = hide_columns(app, 1, &headers, cells, 3, sort_marker(app, 1), &[1, 4, 5, 6]);
+    let (headers, cells, sort) = shed_columns(&headers, cells, title_col, sort, inner_w, &order);
     let flex = headers.iter().position(|h| *h == "Title").unwrap_or(0);
     let (header, rows) = columnize(dim, &headers, &cells, flex, inner_w, sort);
     let selected = app.selected().and_then(|i| cells.get(i)).map(|r| (flex, r[flex].0.clone()));
@@ -1485,6 +1527,20 @@ enum PipeCol {
 }
 
 impl PipeCol {
+    /// The name `c`'s column picker knows this column by; `None` for the ones always drawn.
+    fn pick_name(self) -> Option<&'static str> {
+        match self {
+            PipeCol::Tree | PipeCol::Status | PipeCol::Subject => None,
+            PipeCol::Provider => Some("Provider"),
+            PipeCol::Repository => Some("Repository"),
+            PipeCol::Runs => Some("Runs"),
+            PipeCol::Branch => Some("Branch"),
+            PipeCol::Commit => Some("Commit"),
+            PipeCol::Started => Some("Started"),
+            PipeCol::Approval => Some("Approval"),
+        }
+    }
+
     fn heading(self, app: &App, any_open: bool) -> String {
         match self {
             PipeCol::Tree | PipeCol::Status => String::new(),
@@ -1534,6 +1590,7 @@ fn pipe_columns(app: &App, lines: &[PipeLine], multi_provider: bool) -> Vec<Pipe
     if approvals {
         cols.push(PipeCol::Approval);
     }
+    cols.retain(|c| c.pick_name().is_none_or(|n| app.col_shown(2, n)));
     cols
 }
 
@@ -2370,9 +2427,13 @@ fn base_footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
         keys.push(("↵", "open"));
     }
     match app.active {
-        0 => keys.extend([("f", "status"), ("S", "sort"), ("o", "browser")]),
-        1 => keys.extend([("f", "states"), ("S", "sort"), ("o", "browser")]),
-        2 => keys.extend([("w", "pipelines"), ("G", "group"), ("S", "sort"), ("T", "trigger"), ("o", "open")]),
+        0 => keys.extend([("w", "repos"), ("f", "status"), ("S", "sort"), ("c", "columns"), ("o", "browser")]),
+        1 => keys.extend([("w", "repos"), ("f", "states"), ("S", "sort"), ("c", "columns"), ("o", "browser")]),
+        2 => {
+            // Until repositories are chosen `w` picks those, since there are no pipelines yet.
+            let w = if app.no_repos_chosen(2) { "repos" } else { "pipelines" };
+            keys.extend([("w", w), ("G", "group"), ("S", "sort"), ("c", "columns"), ("T", "trigger"), ("o", "open")]);
+        }
         _ => {}
     }
     keys.extend([
@@ -2709,6 +2770,16 @@ fn render_diff_patch(frame: &mut Frame, area: Rect, theme: &Theme, diff: &DiffVi
 
     // One highlighter per file (regexes compile once); None for unhighlighted languages.
     let mut hl = lang_for(&file.path).and_then(LineHighlighter::new);
+    // The file line beside every row — the number the cursor label and comments use: new-side
+    // for added and context lines, old-side for removed ones (the +/- already says which).
+    let numbers = crate::diff::gutter_numbers(patch);
+    let num_w = numbers.iter().flatten().map(|(n, _)| n.to_string().len()).max().unwrap_or(1);
+    let num_span = |i: usize| -> Span<'static> {
+        match numbers.get(i).copied().flatten() {
+            Some((n, _)) => Span::styled(format!("{n:>num_w$} "), Style::default().fg(theme.dim)),
+            None => Span::raw(" ".repeat(num_w + 1)),
+        }
+    };
 
     // Build the display lines, splicing each thread in beneath the line it anchors to.
     // `cursor_row` tracks where the cursor's patch line landed (comment lines shift it).
@@ -2729,16 +2800,18 @@ fn render_diff_patch(frame: &mut Frame, area: Rect, theme: &Theme, diff: &DiffVi
             cursor_row = lines.len();
             // Pad to full width (minus the gutter) so the highlight spans the row.
             let mut text = l.to_string();
-            let w = text.chars().count();
+            let w = text.chars().count() + num_w + 1;
             if w + 1 < inner_w {
                 text.push_str(&" ".repeat(inner_w - 1 - w));
             }
             lines.push(Line::from(vec![
                 gutter,
+                num_span(i),
                 Span::styled(text, Style::default().fg(patch_fg(theme, l)).bg(theme.sel_bg).add_modifier(Modifier::BOLD)),
             ]));
         } else {
             let mut line = patch_line_hl(theme, l, hl.as_mut());
+            line.spans.insert(0, num_span(i));
             line.spans.insert(0, gutter);
             lines.push(line);
         }
@@ -4460,7 +4533,8 @@ pub(crate) fn help_sections() -> Vec<(&'static str, Vec<(&'static str, &'static 
                 ("P", "Preview while browsing, off / on for this section (Pipelines: on)"),
                 ("/", "Quick-filter the list"),
                 ("S", "Sort by column (re-pick flips direction)"),
-                ("g", "Repositories — which ones this section fetches from"),
+                ("w", "Repositories — which ones this section fetches from (Pipelines: which pipelines)"),
+                ("c", "Columns — which ones the list shows"),
                 ("o", "Open selected in browser"),
                 ("v", "Choose which tabs are visible"),
                 ("C", "Connections (opens the dashboard)"),
@@ -5234,7 +5308,8 @@ mod tests {
         let (hb, ho) = (header(&bare), header(&open));
         assert_eq!(hb, ho);
         let cut = 200 - 200 * 70 / 100;
-        let left = |r: &String| r.chars().take(cut - 1).collect::<String>();
+        // From the first column in: the border itself is heavy while the list alone has focus.
+        let left = |r: &String| r.chars().skip(1).take(cut - 2).collect::<String>();
         assert_eq!(left(&open[ho]), left(&bare[hb]), "the header keeps every column where it was");
         assert!(open[ho - 1].contains("PR #42"), "the pane sits over the rest, framed on the list's top row");
         assert_eq!(open[ho].chars().nth(cut - 1), Some('…'), "a row the pane cuts short says so");
@@ -5385,8 +5460,39 @@ mod tests {
     }
 
     #[test]
+    fn provider_is_off_by_default_and_hidden_columns_leave_the_table() {
+        let mut app = App::new("slate");
+        app.screen = Screen::List;
+        app.prs.push(crate::app::PrRow {
+            connection_id: "c".into(),
+            connection: "MyHub".into(),
+            provider: ProviderType::GitHub,
+            pr: sample_pr(),
+        });
+        app.pr_state.select(Some(0));
+        let out = render_to_string(&mut app, 140, 24);
+        assert!(!out.contains("Provider") && !out.contains("MyHub"), "Provider starts off");
+        assert!(out.contains("Author"));
+
+        app.hidden_cols[0] = vec!["Author".into()];
+        let out = render_to_string(&mut app, 140, 24);
+        assert!(out.contains("Provider") && !out.contains("Author"), "the picker's choice is what's drawn");
+    }
+
+    #[test]
+    fn a_sorted_list_names_its_sort_in_the_title() {
+        let mut app = App::new("slate");
+        app.screen = Screen::List;
+        app.prs.push(crate::app::PrRow { connection_id: "c".into(), connection: "GH".into(), provider: ProviderType::GitHub, pr: sample_pr() });
+        app.pr_state.select(Some(0));
+        app.pr_sort = Some(forgetop_core::config::SortPref { key: "updated".into(), desc: true });
+        assert!(render_to_string(&mut app, 160, 24).contains("· by Updated"));
+    }
+
+    #[test]
     fn pr_list_shows_the_provider_column_for_aggregation() {
         let mut app = App::new("slate");
+        app.hidden_cols[0].clear(); // off by default; `c` turns it on
         app.screen = Screen::List;
         app.prs.push(crate::app::PrRow {
             connection_id: "c".into(),
@@ -5875,6 +5981,7 @@ mod tests {
             ("CI", "nz/app", "main", "aaa", 10, S),
             ("Integration", "nz/app", "main", "aaa", 12, S),
         ]);
+        app.hidden_cols[2].clear(); // off by default; `c` turns it on
         let out = render_to_string(&mut app, 150, 16);
         assert!(!out.contains("Provider"), "one provider, so no Provider column");
 
@@ -6090,7 +6197,7 @@ mod tests {
         // The whole screen comes back as one string, so the heading row is picked out by
         // splitting on the pane's own border — "Pipelines" in the tab bar is not a column.
         let heading = |out: &str| -> String {
-            out.split('\u{2502}').find(|seg| seg.contains("Repository")).unwrap_or_default().to_string()
+            out.split(['\u{2502}', '\u{2503}']).find(|seg| seg.contains("Repository")).unwrap_or_default().to_string()
         };
 
         for group in [crate::app::PipeGroup::Pipeline, crate::app::PipeGroup::Trigger, crate::app::PipeGroup::Off] {
