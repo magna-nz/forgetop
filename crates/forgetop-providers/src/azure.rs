@@ -577,42 +577,7 @@ impl AzureClient {
     async fn read_stages(&self, project: &str, run_id: &str) -> Vec<PipelineStage> {
         let url = format!("{}/{project}/_apis/build/builds/{run_id}/timeline?{API}", self.base);
         let Ok(v) = self.get_json(&url).await else { return vec![] };
-        let records: Vec<&Value> = get_arr(&v, "records").iter().collect();
-        records
-            .iter()
-            .filter(|r| get_str(r, "type").as_deref() == Some("Stage"))
-            .map(|stage| {
-                let stage_id = get_str(stage, "id");
-                let jobs = records
-                    .iter()
-                    .filter(|r| get_str(r, "type").as_deref() == Some("Job") && get_str(r, "parentId") == stage_id)
-                    .map(|job| {
-                        let job_id = get_str(job, "id");
-                        let steps = records
-                            .iter()
-                            .filter(|r| get_str(r, "type").as_deref() == Some("Task") && get_str(r, "parentId") == job_id)
-                            .map(|t| PipelineStep {
-                                name: get_str(t, "name").unwrap_or_else(|| "step".into()),
-                                status: record_status(t),
-                                started_at: get_date(t, "startTime"),
-                                finished_at: get_date(t, "finishTime"),
-                            })
-                            .collect();
-                        PipelineJob {
-                            id: job_id.unwrap_or_else(|| "0".into()),
-                            name: get_str(job, "name").unwrap_or_else(|| "job".into()),
-                            status: record_status(job),
-                            started_at: get_date(job, "startTime"),
-                            finished_at: get_date(job, "finishTime"),
-                            steps,
-                            url: None,
-                            problem: az_problem(job),
-                        }
-                    })
-                    .collect();
-                PipelineStage { name: get_str(stage, "name").unwrap_or_else(|| "stage".into()), status: record_status(stage), jobs }
-            })
-            .collect()
+        stages_from_timeline(get_arr(&v, "records"))
     }
 
     /// Pending approval gates on a build run, read from its timeline.
@@ -639,6 +604,80 @@ fn approval_gates_from_timeline(records: &[Value]) -> Vec<PipelineApproval> {
             Some(PipelineApproval { id, name, can_respond: true })
         })
         .collect()
+}
+
+/// A build timeline → stages → jobs → steps. Azure nests `Stage → Phase → Job → Task`, so a
+/// Job's `parentId` is its Phase, not its Stage: walk up to find the Stage. Jobs with no
+/// enclosing Stage (classic pipelines) are gathered under one "Jobs" stage. Azure names the
+/// implicit stage of a stage-less YAML pipeline `__default`; that reads as "Jobs" too.
+fn stages_from_timeline(records: &[Value]) -> Vec<PipelineStage> {
+    let by_id: std::collections::HashMap<String, &Value> =
+        records.iter().filter_map(|r| Some((get_str(r, "id")?, r))).collect();
+    let order = |r: &Value| r.get("order").and_then(Value::as_i64).unwrap_or(i64::MAX);
+    let of_type = |ty: &str| {
+        let mut v: Vec<&Value> = records.iter().filter(|r| get_str(r, "type").as_deref() == Some(ty)).collect();
+        v.sort_by_key(|r| order(r));
+        v
+    };
+    let map_job = |job: &Value| {
+        let job_id = get_str(job, "id");
+        let mut tasks: Vec<&Value> = records
+            .iter()
+            .filter(|r| get_str(r, "type").as_deref() == Some("Task") && get_str(r, "parentId") == job_id)
+            .collect();
+        tasks.sort_by_key(|r| order(r));
+        PipelineJob {
+            id: job_id.clone().unwrap_or_else(|| "0".into()),
+            name: get_str(job, "name").unwrap_or_else(|| "job".into()),
+            status: record_status(job),
+            started_at: get_date(job, "startTime"),
+            finished_at: get_date(job, "finishTime"),
+            steps: tasks
+                .iter()
+                .map(|t| PipelineStep {
+                    name: get_str(t, "name").unwrap_or_else(|| "step".into()),
+                    status: record_status(t),
+                    started_at: get_date(t, "startTime"),
+                    finished_at: get_date(t, "finishTime"),
+                })
+                .collect(),
+            url: None,
+            problem: az_problem(job),
+        }
+    };
+    let jobs = of_type("Job");
+    let mut stages: Vec<PipelineStage> = of_type("Stage")
+        .into_iter()
+        .map(|stage| {
+            let stage_id = get_str(stage, "id");
+            let name = get_str(stage, "name").filter(|n| n != "__default").unwrap_or_else(|| "Jobs".into());
+            let jobs = jobs.iter().filter(|j| enclosing_stage_id(&by_id, j) == stage_id).map(|j| map_job(j)).collect();
+            PipelineStage { name, status: record_status(stage), jobs }
+        })
+        .collect();
+    let orphans: Vec<&&Value> = jobs.iter().filter(|j| enclosing_stage_id(&by_id, j).is_none()).collect();
+    if !orphans.is_empty() {
+        let jobs: Vec<PipelineJob> = orphans.iter().map(|j| map_job(j)).collect();
+        let has = |st: PipelineRunStatus| jobs.iter().any(|j| j.status == st);
+        let status = [PipelineRunStatus::Failed, PipelineRunStatus::Running, PipelineRunStatus::Queued, PipelineRunStatus::Canceled]
+            .into_iter()
+            .find(|st| has(*st))
+            .unwrap_or(PipelineRunStatus::Succeeded);
+        stages.push(PipelineStage { name: "Jobs".into(), status, jobs });
+    }
+    stages
+}
+
+/// Walks `parentId` up from a record to the enclosing Stage record's id.
+fn enclosing_stage_id(by_id: &std::collections::HashMap<String, &Value>, rec: &Value) -> Option<String> {
+    let mut cur = rec;
+    for _ in 0..6 {
+        if get_str(cur, "type").as_deref() == Some("Stage") {
+            return get_str(cur, "id");
+        }
+        cur = by_id.get(&get_str(cur, "parentId")?)?;
+    }
+    None
 }
 
 /// Walks `parentId` up from a record to the enclosing Stage record's name.
@@ -1555,6 +1594,59 @@ mod tests {
         assert_eq!(strip_ansi("\u{1b}[31merror\u{1b}[0m: build failed"), "error: build failed");
         assert_eq!(strip_ansi("##[error]Process completed with exit code 1."), "##[error]Process completed with exit code 1.");
         assert_eq!(strip_ansi("no escapes here"), "no escapes here");
+    }
+
+    #[test]
+    fn stages_from_timeline_walks_jobs_up_through_their_phase() {
+        let records: Value = serde_json::from_str(
+            r#"[
+                { "id": "s2", "type": "Stage", "name": "Deploy", "order": 2, "state": "completed", "result": "succeeded" },
+                { "id": "s1", "type": "Stage", "name": "Build", "order": 1, "state": "completed", "result": "succeeded" },
+                { "id": "p1", "type": "Phase", "name": "Build", "parentId": "s1" },
+                { "id": "j2", "type": "Job", "name": "test", "parentId": "p1", "order": 2 },
+                { "id": "j1", "type": "Job", "name": "compile", "parentId": "p1", "order": 1 },
+                { "id": "t1", "type": "Task", "name": "checkout", "parentId": "j1", "order": 1 },
+                { "id": "p2", "type": "Phase", "name": "Deploy", "parentId": "s2" },
+                { "id": "j3", "type": "Job", "name": "release", "parentId": "p2", "order": 1 }
+            ]"#,
+        )
+        .unwrap();
+        let stages = stages_from_timeline(records.as_array().unwrap());
+        let shape: Vec<(String, Vec<String>)> =
+            stages.iter().map(|s| (s.name.clone(), s.jobs.iter().map(|j| j.name.clone()).collect())).collect();
+        assert_eq!(
+            shape,
+            vec![("Build".into(), vec!["compile".into(), "test".into()]), ("Deploy".into(), vec!["release".into()])]
+        );
+        assert_eq!(stages[0].jobs[0].steps.len(), 1);
+    }
+
+    #[test]
+    fn stages_from_timeline_names_the_implicit_stage_and_gathers_stageless_jobs() {
+        let implicit: Value = serde_json::from_str(
+            r#"[
+                { "id": "s", "type": "Stage", "name": "__default" },
+                { "id": "p", "type": "Phase", "parentId": "s" },
+                { "id": "j", "type": "Job", "name": "build", "parentId": "p" }
+            ]"#,
+        )
+        .unwrap();
+        let stages = stages_from_timeline(implicit.as_array().unwrap());
+        assert_eq!(stages.len(), 1);
+        assert_eq!(stages[0].name, "Jobs");
+        assert_eq!(stages[0].jobs.len(), 1);
+
+        let classic: Value = serde_json::from_str(
+            r#"[
+                { "id": "p", "type": "Phase", "name": "Agent job 1" },
+                { "id": "j", "type": "Job", "name": "Agent job 1", "parentId": "p", "state": "completed", "result": "failed" }
+            ]"#,
+        )
+        .unwrap();
+        let stages = stages_from_timeline(classic.as_array().unwrap());
+        assert_eq!(stages.len(), 1);
+        assert_eq!(stages[0].name, "Jobs");
+        assert_eq!(stages[0].status, PipelineRunStatus::Failed);
     }
 
     #[test]
