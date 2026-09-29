@@ -9,6 +9,20 @@ Adding a release: one `## <version> — <date>` section, a line per user-visible
 and the pull request each one came from. `git log v<previous>..HEAD --merges` lists the
 candidates.
 
+## 1.5.1 — 2026-09-29
+
+Fixed
+
+- **Mine no longer sits on "Loading…" while All has rows.** In the terminal UI, the pull
+  requests a refresh fetches are now cached together, with who you're signed in as, and every
+  view (Mine, Review, All) is worked out from that cache at launch. Before, only the view on
+  screen was cached, so the first launch after Pull Requests switched to opening on Mine had
+  nothing to show for it. The list also shows pull requests as soon as they're fetched instead of
+  waiting for work items, pipelines, notifications and repository discovery to finish. ([#211](https://github.com/magna-nz/forgetop/pull/211))
+- **Azure DevOps runs show their stages.** A run's jobs are attached to the stage they belong to,
+  so the pipeline view lists them instead of "No stages reported". A pipeline with no stages of its
+  own shows its jobs under "Jobs". ([#209](https://github.com/magna-nz/forgetop/pull/209))
+
 ## 1.5.0 — 2026-09-29
 
 Added
