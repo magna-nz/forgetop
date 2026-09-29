@@ -361,6 +361,9 @@ pub struct Reloaded {
     /// Repository discovery, when this fetch was asked to seed it. `None` means "not this
     /// time" and leaves the existing catalog alone.
     catalog: Option<HashMap<String, RepositoryPage>>,
+    /// Each connection's discovered pipeline definitions, from the discoveries that answered.
+    /// Merged into [`App::pipe_catalog`]; a connection missing here keeps its last catalog.
+    pipe_catalog: HashMap<String, Vec<PipelineDefinition>>,
     /// Which sections came back whole, and so may be written to the cache.
     sections_ok: SectionsOk,
     /// When this reload was *asked for*, not when it landed. See [`App::request_reload`].
@@ -743,6 +746,22 @@ impl ScopeSummary {
     }
 }
 
+/// How many of a section's discovered pipelines are fetched, across its connections.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PipeScope {
+    /// The pipeline connections, in subscription order — the picker asks which when several.
+    pub connections: Vec<String>,
+    pub selected: usize,
+    pub available: usize,
+}
+
+impl PipeScope {
+    /// "Pipelines · 6 of 38" for the section header.
+    pub fn label(&self) -> String {
+        format!("Pipelines · {} of {}", self.selected, self.available)
+    }
+}
+
 pub struct App {
     pub theme: Theme,
     pub active: usize,
@@ -771,6 +790,12 @@ pub struct App {
     pub repo_catalog: HashMap<String, RepositoryPage>,
     /// Connection ids behind an open "which connection?" scope picker, indexed by its selection.
     repo_scope_choices: Vec<String>,
+    /// Each pipeline connection's discovered definitions, keyed by connection id — the
+    /// denominator in "Pipelines · 6 of 38" and the candidates of the add/remove picker.
+    pub pipe_catalog: HashMap<String, Vec<PipelineDefinition>>,
+    /// The Pipelines header's "which pipelines are fetched" summary. On that section it stands
+    /// in for the repository summary: what is fetched there is chosen pipeline by pipeline.
+    pub pipe_scope: Option<PipeScope>,
     pub status: String,
     pub loading: bool,
     /// Scroll offset for the current list; body height captured during render.
@@ -2547,6 +2572,8 @@ impl App {
             repo_scope: [None, None, None],
             repo_catalog: HashMap::new(),
             repo_scope_choices: Vec::new(),
+            pipe_catalog: HashMap::new(),
+            pipe_scope: None,
             health: Vec::new(),
             visible: [true; 3],
             status: "Loading…".into(),
@@ -4573,7 +4600,8 @@ impl App {
         // connection that differed only in a filter applied after the response came back.
         let (pr_pool, prs_ok) = fetch_pr_pool(&deps, &mut errors).await;
         let (wis, wis_ok) = fetch_work_items(&deps, &mut errors).await;
-        let (pipes, pipes_ok) = fetch_pipelines(&deps, &mut errors).await;
+        let mut pipe_catalog = HashMap::new();
+        let (pipes, pipes_ok) = fetch_pipelines(&deps, &mut errors, &mut pipe_catalog).await;
         let (inbox, inbox_ok) = fetch_notifications(&deps, &mut errors).await;
         let health = deps.health.check_all().await;
         let review = derive_pool_rows(&pr_pool, PullRequestFilter::ReviewRequested, false);
@@ -4604,6 +4632,7 @@ impl App {
             open_pipeline,
             errors,
             catalog,
+            pipe_catalog,
             sections_ok,
             requested_at: p.requested_at,
         }
@@ -4690,6 +4719,7 @@ impl App {
         if let Some(catalog) = r.catalog {
             self.repo_catalog = catalog;
         }
+        self.pipe_catalog.extend(r.pipe_catalog);
         // A connection landed while we were waiting on the browser — the reason for the
         // waiting card is gone, so retire it rather than leave it sitting over live data.
         // `health` is the same signal the first-run hint keys off, so the two agree.
@@ -5265,12 +5295,16 @@ impl App {
                     let conn_id = feed.connection.connection_id().to_string();
                     // Map definition_id → pipeline name so rows can show the pipeline
                     // (e.g. "CI Build") separately from the run/release (e.g. "10.1.100").
-                    let defs = detail_or_default(feed.source.discover().await, DIAG_PIPELINE_DISCOVERY);
+                    let discovered = feed.source.discover().await;
+                    if let Ok(defs) = &discovered {
+                        self.pipe_catalog.insert(conn_id.clone(), defs.clone());
+                    }
+                    let defs = detail_or_default(discovered, DIAG_PIPELINE_DISCOVERY);
                     let def_names: HashMap<String, String> =
                         defs.iter().map(|d| (d.id.clone(), d.name.clone())).collect();
                     let me = detail_or_default(feed.source.current_user().await, DIAG_PIPELINE_CURRENT_USER);
-                    for q in feed_queries(&feed.subscription, &defs) {
-                        match feed.source.list_runs(&q).await {
+                    for result in feed.list_runs(&defs).await {
+                        match result {
                             Ok(runs) => {
                                 let supports = feed.source.supports_approvals();
                                 for run in runs {
@@ -6207,6 +6241,33 @@ impl App {
         let pipe_ids =
             cfg.pipelines.as_ref().map(|p| p.subscriptions.iter().map(|s| s.connection_id.clone()).collect()).unwrap_or_default();
         self.repo_scope = [bound(pr_ids), bound(wi_ids), bound(pipe_ids)];
+        self.pipe_scope = self.pipe_scope_of(deps);
+    }
+
+    /// "N of M" over the pipeline connections whose discovery has answered. Subscribing to
+    /// everything (or to nothing, which the feed reads the same way) counts every definition;
+    /// an explicit list counts the ids discovery still knows, so a deleted pipeline isn't
+    /// counted as fetched.
+    fn pipe_scope_of(&self, deps: &AppDeps) -> Option<PipeScope> {
+        let cfg = deps.config.snapshot();
+        let subs = cfg.pipelines.as_ref().map(|p| p.subscriptions.clone()).unwrap_or_default();
+        let (mut selected, mut available) = (0, 0);
+        let mut known = false;
+        for sub in &subs {
+            let Some(defs) = self.pipe_catalog.get(&sub.connection_id) else { continue };
+            known = true;
+            available += defs.len();
+            selected += if sub.auto_discover_all || sub.definition_ids.is_empty() {
+                defs.len()
+            } else {
+                defs.iter().filter(|d| sub.definition_ids.contains(&d.id)).count()
+            };
+        }
+        (known && available > 0).then(|| PipeScope {
+            connections: subs.iter().map(|s| s.connection_id.clone()).collect(),
+            selected,
+            available,
+        })
     }
 
     /// Where Esc lands when closing an item view: back to the Launchpad if it was
@@ -6439,6 +6500,11 @@ impl App {
             'f' if self.active == 1 => self.open_wi_states_toggle(),
             // Pipeline trigger (Pipelines tab).
             'T' if self.active == 2 => self.open_pipeline_trigger(),
+            // `w` = which pipelines you **w**atch. On this section it replaces the repository
+            // scope: Azure groups pipelines by project and folder, not by repository, so
+            // "which pipelines" is the question the user is actually answering. (`p` is taken by
+            // the preview focus.)
+            'w' if self.active == 2 => self.open_pipeline_subs_from_list(deps).await,
             // `G` cycles how the Pipelines list is **G**rouped. Lowercase `g` is taken by the
             // repo scope picker below, which is a different axis (what is fetched, not how
             // what was fetched is arranged).
@@ -8031,9 +8097,40 @@ impl App {
         self.list_scroll = 0;
     }
 
-    /// Discovers a connection's pipeline definitions and opens a subscribe checklist.
+    /// Opens the subscribe checklist for the connection selected on the Config screen.
     async fn open_pipeline_subs(&mut self, deps: &AppDeps) {
         let Some((id, display)) = self.config_selected_id() else { return };
+        self.open_pipeline_subs_for(id, display, deps).await;
+    }
+
+    /// The Pipelines section's add/remove picker. The subscription is per connection, so with
+    /// several the user says which first, as the repository picker does.
+    async fn open_pipeline_subs_from_list(&mut self, deps: &AppDeps) {
+        let cfg = deps.config.snapshot();
+        let ids: Vec<String> =
+            cfg.pipelines.as_ref().map(|p| p.subscriptions.iter().map(|s| s.connection_id.clone()).collect()).unwrap_or_default();
+        let name = |id: &String| cfg.find_connection(id).map(|c| c.display_name.clone()).unwrap_or_else(|| id.clone());
+        match ids.as_slice() {
+            [] => self.toast = Some("No connection feeds Pipelines — bind one with C".into()),
+            [only] => {
+                let display = name(only);
+                self.open_pipeline_subs_for(only.clone(), display, deps).await;
+            }
+            many => {
+                let items = many.iter().map(name).collect();
+                self.repo_scope_choices = many.to_vec();
+                self.overlay = Some(Overlay::Picker {
+                    title: "Pipelines · which connection?".into(),
+                    items,
+                    selected: 0,
+                    kind: PickerKind::PipelineSubsConnection,
+                });
+            }
+        }
+    }
+
+    /// Discovers a connection's pipeline definitions and opens a subscribe checklist.
+    async fn open_pipeline_subs_for(&mut self, id: String, display: String, deps: &AppDeps) {
         let source = match deps.sections.pipeline_source_for(&id).await {
             Ok(Some(s)) => s,
             _ => {
@@ -8052,32 +8149,55 @@ impl App {
             self.toast = Some("No pipelines found for this connection".into());
             return;
         }
+        self.pipe_catalog.insert(id.clone(), defs.clone());
+        let mut defs = defs;
+        // Grouped by where they live (project + folder, or repository), so a folder's pipelines
+        // sit together and the search can narrow to one.
+        defs.sort_by_key(|d| (pipeline_location(d), d.name.to_lowercase()));
 
         let cfg = deps.config.snapshot();
         let sub = cfg.pipelines.as_ref().and_then(|p| p.subscriptions.iter().find(|s| s.connection_id == id));
-        let auto = sub.map(|s| s.auto_discover_all).unwrap_or(false);
+        // An empty list is fetched as "everything" (see `pipeline_run_queries`), so it is shown
+        // that way rather than as a checklist with nothing ticked.
+        let auto = sub.map(|s| s.auto_discover_all || s.definition_ids.is_empty()).unwrap_or(true);
         let subscribed: std::collections::HashSet<String> =
             sub.map(|s| s.definition_ids.iter().cloned().collect()).unwrap_or_default();
 
         let items = defs
             .iter()
-            .map(|d| ToggleItem { id: d.id.clone(), label: d.name.clone(), on: auto || subscribed.contains(&d.id) })
+            .map(|d| ToggleItem { id: d.id.clone(), label: pipeline_label(d), on: auto || subscribed.contains(&d.id) })
             .collect();
 
         self.overlay = Some(Overlay::Toggle {
-            title: format!("Subscribe · {display}"),
+            title: format!("Pipelines · {display}"),
             kind: ToggleKind::PipelineSubs { connection_id: id },
-            min_one: false,
+            // Nothing ticked would be fetched as everything, so it isn't offered as a choice.
+            min_one: true,
             items,
             selected: 0,
-            filter: None,
+            filter: Some(String::new()),
         });
     }
 
     async fn apply_pipeline_subs(&mut self, connection_id: &str, ids: Vec<String>, deps: &AppDeps) {
-        match deps.config.set_pipeline_definitions(connection_id, ids.clone()).await {
+        // Every pipeline ticked is saved as "all", so one created later is picked up too.
+        let all = self
+            .pipe_catalog
+            .get(connection_id)
+            .is_some_and(|defs| !defs.is_empty() && defs.iter().all(|d| ids.contains(&d.id)));
+        let saved = if all {
+            deps.config.set_pipeline_auto_discover(connection_id, true).await
+        } else {
+            deps.config.set_pipeline_definitions(connection_id, ids.clone()).await
+        };
+        match saved {
             Ok(()) => {
-                self.toast = Some(format!("Subscribed to {} pipeline(s)", ids.len()));
+                self.toast = Some(if all { "Fetching every pipeline".into() } else { format!("Fetching {} pipeline(s)", ids.len()) });
+                // Runs of a pipeline just unticked go now, not on the next reload.
+                if !all {
+                    self.pipes.retain(|r| r.connection_id != connection_id || ids.contains(&r.run.definition_id));
+                }
+                self.refresh_repo_scope(deps);
                 self.request_reload(deps);
                 self.rebuild_config_view(deps).await;
             }
@@ -8440,6 +8560,17 @@ impl App {
             Action::OpenRepoScope { index } => {
                 if let Some(id) = self.repo_scope_choices.get(index).cloned() {
                     self.open_repo_scope_for(id, deps).await;
+                }
+            }
+            Action::OpenPipelineSubs { index } => {
+                if let Some(id) = self.repo_scope_choices.get(index).cloned() {
+                    let display = deps
+                        .config
+                        .snapshot()
+                        .find_connection(&id)
+                        .map(|c| c.display_name.clone())
+                        .unwrap_or_else(|| id.clone());
+                    self.open_pipeline_subs_for(id, display, deps).await;
                 }
             }
             Action::OpenItem { kind, id, connection_id } => {
@@ -9456,7 +9587,13 @@ async fn fetch_notifications(deps: &AppDeps, errors: &mut Vec<String>) -> (Vec<N
     (out, ok)
 }
 
-async fn fetch_pipelines(deps: &AppDeps, errors: &mut Vec<String>) -> (Vec<PipeRow>, bool) {
+/// `catalog` collects each connection's discovered definitions, for the header's
+/// "Pipelines · N of M" and the add/remove picker — only from discoveries that answered.
+async fn fetch_pipelines(
+    deps: &AppDeps,
+    errors: &mut Vec<String>,
+    catalog: &mut HashMap<String, Vec<PipelineDefinition>>,
+) -> (Vec<PipeRow>, bool) {
     let mut out = Vec::new();
     let mut ok = true;
     match deps.sections.pipeline_feeds().await {
@@ -9468,7 +9605,10 @@ async fn fetch_pipelines(deps: &AppDeps, errors: &mut Vec<String>) -> (Vec<PipeR
                 // Discovery failing isn't cosmetic: it decides which runs are even asked for,
                 // so the rows that come back are a subset of what a healthy fetch would return.
                 let defs = match detail_or_none(feed.source.discover().await, DIAG_PIPELINE_DISCOVERY) {
-                    Some(defs) => defs,
+                    Some(defs) => {
+                        catalog.insert(conn_id.clone(), defs.clone());
+                        defs
+                    }
                     None => {
                         ok = false;
                         Vec::new()
@@ -9486,8 +9626,8 @@ async fn fetch_pipelines(deps: &AppDeps, errors: &mut Vec<String>) -> (Vec<PipeR
                         None
                     }
                 };
-                for q in feed_queries(&feed.subscription, &defs) {
-                    match feed.source.list_runs(&q).await {
+                for result in feed.list_runs(&defs).await {
+                    match result {
                         Ok(runs) => {
                             let supports = feed.source.supports_approvals();
                             for run in runs {
@@ -9944,24 +10084,24 @@ fn wi_query() -> WorkItemQuery {
     WorkItemQuery { mine_only: true, include_completed: false, limit: Some(50) }
 }
 
-/// One query per subscribed definition, or a single catch-all when auto-discovering.
-///
-/// A subscribed definition id is only unique within its repository, so each query is addressed at
-/// the repository discovery says the definition belongs to — otherwise a connection spanning
-/// several would ask every one of them about a definition only one of them has.
-fn feed_queries(sub: &forgetop_core::config::PipelineSubscription, defs: &[PipelineDefinition]) -> Vec<PipelineRunQuery> {
-    if sub.auto_discover_all || sub.definition_ids.is_empty() {
-        return vec![PipelineRunQuery { definition_id: None, repository: None, branch: None, limit: Some(20) }];
+/// Where a pipeline lives, for the picker: its project or repository, then — for Azure — the
+/// folder it was filed under. The root folder (`\`) and a workflow file path add nothing.
+fn pipeline_location(d: &PipelineDefinition) -> String {
+    let folder = d.path.as_deref().filter(|p| p.starts_with('\\') && p.len() > 1);
+    match (d.repository.as_deref(), folder) {
+        (Some(repo), Some(folder)) => format!("{repo} {folder}"),
+        (Some(repo), None) => repo.to_string(),
+        (None, Some(folder)) => folder.to_string(),
+        (None, None) => String::new(),
     }
-    sub.definition_ids
-        .iter()
-        .map(|id| PipelineRunQuery {
-            repository: defs.iter().find(|d| &d.id == id).and_then(|d| d.repository.clone()),
-            definition_id: Some(id.clone()),
-            branch: None,
-            limit: Some(10),
-        })
-        .collect()
+}
+
+/// A picker row: the pipeline's name, then where it lives.
+fn pipeline_label(d: &PipelineDefinition) -> String {
+    match pipeline_location(d) {
+        loc if loc.is_empty() => d.name.clone(),
+        loc => format!("{}  ·  {loc}", d.name),
+    }
 }
 
 #[cfg(test)]
@@ -10079,6 +10219,7 @@ mod tests {
                 open_pipeline: None,
                 errors: vec![private_error.into()],
                 catalog: None,
+                pipe_catalog: HashMap::new(),
                 sections_ok: SectionsOk::complete(),
                 requested_at: Utc::now(),
             },
@@ -10677,6 +10818,7 @@ mod tests {
             open_pipeline: None,
             errors: Vec::new(),
             catalog: None,
+            pipe_catalog: HashMap::new(),
             sections_ok: SectionsOk::complete(),
             requested_at: Utc::now(),
         }
@@ -11204,6 +11346,7 @@ mod tests {
                 health: vec![],
                 scan: None,
                 catalog: None,
+                pipe_catalog: HashMap::new(),
                 open_pipeline: None,
                 errors: vec![],
                 sections_ok: SectionsOk::complete(),
@@ -14921,7 +15064,7 @@ mod tests {
         let mut app = App::new("slate");
         // Global `r` refreshes a list; in a PR view `r` replies. The Refresh row must not reply.
         app.screen = open_pr_screen(PullRequestStatus::Open);
-        palette_run(&mut app, "?cycle theme", &deps).await;
+        palette_run(&mut app, "?refresh", &deps).await;
         assert!(app.overlay.is_none(), "Refresh from a PR view must not open the reply input");
         assert!(app.toast.as_deref().is_some_and(|t| t.starts_with("Press r")));
 
@@ -16084,5 +16227,47 @@ mod tests {
         app.refresh_pipeline_context();
         let e = &pane(&app).estimates;
         assert_eq!((e.job_runs, e.run_median), (0, None), "another repository's runs don't count");
+    }
+
+    fn def_at(id: &str, repo: Option<&str>, path: Option<&str>) -> PipelineDefinition {
+        PipelineDefinition { repository: repo.map(Into::into), id: id.into(), name: id.into(), path: path.map(Into::into), url: None }
+    }
+
+    /// Azure files pipelines under folders; the picker shows the project and folder so a busy
+    /// org's 38 pipelines can be told apart and searched by folder. The root folder and a
+    /// GitHub workflow file path add nothing.
+    #[test]
+    fn picker_rows_say_where_a_pipeline_lives() {
+        assert_eq!(pipeline_label(&def_at("MainLine", Some("Tilt"), Some("\\Releases\\Core"))), "MainLine  ·  Tilt \\Releases\\Core");
+        assert_eq!(pipeline_label(&def_at("Tests", Some("Tilt"), Some("\\"))), "Tests  ·  Tilt");
+        assert_eq!(pipeline_label(&def_at("ci", Some("acme/pay"), Some(".github/workflows/ci.yml"))), "ci  ·  acme/pay");
+        assert_eq!(pipeline_label(&def_at("CI Build", None, None)), "CI Build");
+    }
+
+    /// The Pipelines header counts pipelines, and the add/remove picker writes the subscription:
+    /// ticking every one is saved as "all" so a pipeline created later is fetched too, and an
+    /// unticked pipeline's rows leave the list at once.
+    #[tokio::test]
+    async fn the_pipeline_picker_rewrites_the_subscription_and_the_header_count() {
+        let deps = deps_with_pipes(PipeCalls::default()).await;
+        let mut app = App::new("slate");
+        app.pipe_catalog.insert("c".into(), vec![def_at("ci", None, None), def_at("cd", None, None), def_at("nightly", None, None)]);
+        app.refresh_repo_scope(&deps);
+        assert_eq!(app.pipe_scope.as_ref().map(PipeScope::label).as_deref(), Some("Pipelines · 1 of 3"), "subscribed to ci only");
+
+        app.apply_pipeline_subs("c", vec!["ci".into(), "cd".into(), "nightly".into()], &deps).await;
+        let sub = deps.config.snapshot().pipelines.unwrap().subscriptions[0].clone();
+        assert!(sub.auto_discover_all, "every pipeline ticked is saved as all");
+        assert_eq!(app.pipe_scope.as_ref().map(PipeScope::label).as_deref(), Some("Pipelines · 3 of 3"));
+
+        let mut nightly = row_of(failed_run());
+        nightly.run.definition_id = "nightly".into();
+        app.pipes = vec![nightly];
+        app.apply_pipeline_subs("c", vec!["ci".into(), "cd".into()], &deps).await;
+        let sub = deps.config.snapshot().pipelines.unwrap().subscriptions[0].clone();
+        assert!(!sub.auto_discover_all);
+        assert_eq!(sub.definition_ids, vec!["ci".to_string(), "cd".to_string()]);
+        assert_eq!(app.pipe_scope.as_ref().map(PipeScope::label).as_deref(), Some("Pipelines · 2 of 3"));
+        assert!(app.pipes.is_empty(), "the unticked pipeline's runs are gone before the reload lands");
     }
 }

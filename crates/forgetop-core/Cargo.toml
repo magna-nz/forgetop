@@ -18,6 +18,7 @@ keyring.workspace = true
 dirs.workspace = true
 regex.workspace = true
 fs2.workspace = true
+futures-util.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

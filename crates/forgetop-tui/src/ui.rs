@@ -1581,7 +1581,12 @@ fn pipe_status_cell(status: PipelineRunStatus, anim: usize) -> String {
 fn render_pipes(frame: &mut Frame, area: Rect, app: &mut App) {
     let theme = &app.theme;
     let idxs = app.filtered_pipe_indices();
-    let mut base = with_scope("Pipelines".to_string(), app, 2);
+    // What this section fetches is chosen pipeline by pipeline, so its header counts pipelines;
+    // the repository count stands in only until discovery has answered.
+    let mut base = match &app.pipe_scope {
+        Some(scope) => scope.label(),
+        None => with_scope("Pipelines".to_string(), app, 2),
+    };
     if app.pipe_group != PipeGroup::Off && !idxs.is_empty() {
         // The column arrow means "runs sort by this", within each group. Group order is a
         // separate fact, so it is stated — but only while it is the whole story: with an
@@ -2156,14 +2161,15 @@ fn base_footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
             if merged { vec![("R", "revert")] } else { vec![("a", "approve"), ("x", "reject"), ("m", "merge")] };
         return if v.tab == 3 {
             if v.diff.focus == DiffFocus::Patch {
-                let mut keys = vec![("↑↓", "line"), ("]/[", "threads"), ("c", "comment"), ("r", "reply")];
+                let mut keys = vec![("↑↓", "line"), ("v", "mark viewed"), ("]/[", "threads"), ("c", "comment"), ("r", "reply")];
                 if !v.pending.is_empty() {
                     keys.push(("s", "submit review"));
                 }
                 keys.extend([("PgUp/Dn", "jump"), ("Esc", "files"), ("o", "open")]);
                 keys
             } else {
-                let mut keys = vec![("←→", "tabs"), ("↑↓", "file"), ("↵", "open file"), ("PgUp/Dn", "scroll")];
+                // `v` ticks the file's `[ ]` to `[x]`; without the hint the box reads as decoration.
+                let mut keys = vec![("←→", "tabs"), ("↑↓", "file"), ("↵", "open file"), ("v", "mark viewed"), ("PgUp/Dn", "scroll")];
                 keys.extend(acts);
                 keys.extend([("o", "open"), ("Esc", "back")]);
                 keys
@@ -2285,7 +2291,7 @@ fn base_footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
     match app.active {
         0 => keys.extend([("f", "status"), ("S", "sort"), ("o", "browser")]),
         1 => keys.extend([("f", "states"), ("S", "sort"), ("o", "browser")]),
-        2 => keys.extend([("G", "group"), ("S", "sort"), ("T", "trigger"), ("o", "open")]),
+        2 => keys.extend([("w", "pipelines"), ("G", "group"), ("S", "sort"), ("T", "trigger"), ("o", "open")]),
         _ => {}
     }
     keys.extend([
@@ -4341,7 +4347,8 @@ pub(crate) fn help_sections() -> Vec<(&'static str, Vec<(&'static str, &'static 
                 ("o", "Open selected in browser"),
                 ("v", "Choose which tabs are visible"),
                 ("C", "Connections (opens the dashboard)"),
-                ("r", "Refresh    t  cycle theme"),
+                ("r", "Refresh"),
+                ("t", "Cycle theme"),
                 ("N", "Notifications — choose which events ping you"),
                 ("?", "This help"),
                 ("Esc  q", "Back / close — never quits"),
@@ -4400,6 +4407,7 @@ pub(crate) fn help_sections() -> Vec<(&'static str, Vec<(&'static str, &'static 
         (
             "Pipelines",
             vec![
+                ("w", "Pipelines — add or remove which ones are fetched"),
                 ("G", "Group by pipeline / trigger / branch / off"),
                 ("Enter or Space (on a group)", "Expand / collapse"),
                 ("z  Z", "Collapse / expand every group"),
@@ -4436,34 +4444,31 @@ pub(crate) fn help_sections() -> Vec<(&'static str, Vec<(&'static str, &'static 
     ]
 }
 
-fn render_help(frame: &mut Frame, area: Rect, theme: &Theme, scroll: u16) {
-    // Build each section as a group of lines, then balance the groups across two columns so
-    // the whole reference fits on one screen without scrolling.
-    let group = |name: &'static str, keys: Vec<(&'static str, &'static str)>| -> Vec<Line<'static>> {
-        let mut g = vec![Line::from(Span::styled(name, Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)))];
-        for (k, d) in keys {
-            g.push(Line::from(vec![
-                Span::styled(format!("  {k:<15}"), Style::default().fg(theme.yellow)),
-                Span::styled(d, Style::default().fg(theme.fg)),
-            ]));
-        }
-        g.push(Line::from(""));
-        g
-    };
-    let (mut left, mut right): (Vec<Line>, Vec<Line>) = (Vec::new(), Vec::new());
-    let (mut lh, mut rh) = (0usize, 0usize);
-    for (name, keys) in help_sections() {
-        let g = group(name, keys);
-        if lh <= rh {
-            lh += g.len();
-            left.extend(g);
-        } else {
-            rh += g.len();
-            right.extend(g);
-        }
-    }
+/// Width of the help's key column. A key longer than this gets a line of its own.
+const HELP_KEY_W: usize = 16;
+/// Where a help description starts: two spaces of margin, the key column, two spaces of gap.
+const HELP_DESC_AT: usize = 2 + HELP_KEY_W + 2;
 
-    let width = 104.min(area.width.saturating_sub(4));
+/// One help entry laid out for a column `width` wide, as (key, description) text per screen
+/// line. Descriptions wrap with a hanging indent, so every line of one sits in the description
+/// column rather than back under the keys. A key too long for its column takes a line of its
+/// own, instead of running into the description.
+fn help_entry_rows(key: &str, desc: &str, width: usize) -> Vec<(String, String)> {
+    let desc_w = width.saturating_sub(HELP_DESC_AT).max(12);
+    let indent = " ".repeat(HELP_DESC_AT);
+    let mut rows = Vec::new();
+    let mut wrapped = wrap_words(desc, desc_w).into_iter();
+    if key.chars().count() > HELP_KEY_W {
+        rows.push((format!("  {key}"), String::new()));
+    } else if let Some(first) = wrapped.next() {
+        rows.push((format!("  {key:<HELP_KEY_W$}  "), first));
+    }
+    rows.extend(wrapped.map(|line| (indent.clone(), line)));
+    rows
+}
+
+fn render_help(frame: &mut Frame, area: Rect, theme: &Theme, scroll: u16) {
+    let width = 132.min(area.width.saturating_sub(4));
     let height = area.height.saturating_sub(2).max(12);
     let rect = centered_rect(width, height, area);
 
@@ -4479,14 +4484,53 @@ fn render_help(frame: &mut Frame, area: Rect, theme: &Theme, scroll: u16) {
     frame.render_widget(Clear, rect);
     frame.render_widget(block, rect);
 
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .spacing(2)
-        .split(inner);
+    // Two columns only where each still has room for a readable description; a narrow terminal
+    // gets one column rather than two cramped ones.
+    let two = inner.width >= 90;
+    let cols: Vec<Rect> = if two {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .spacing(3)
+            .split(inner)
+            .to_vec()
+    } else {
+        vec![inner]
+    };
+    // Laid out for the narrower column: a section may land in either, and percentage rounding
+    // can leave the right one a column short.
+    let col_w = cols.iter().map(|c| c.width as usize).min().unwrap_or(0);
+
+    // Each section is laid out already wrapped, so its height is its real height and the
+    // columns balance on what is actually drawn.
+    let group = |name: &'static str, keys: Vec<(&'static str, &'static str)>| -> Vec<Line<'static>> {
+        let mut g = vec![Line::from(Span::styled(name, Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)))];
+        for (k, d) in keys {
+            for (key, desc) in help_entry_rows(k, d, col_w) {
+                g.push(Line::from(vec![
+                    Span::styled(key, Style::default().fg(theme.yellow)),
+                    Span::styled(desc, Style::default().fg(theme.fg)),
+                ]));
+            }
+        }
+        g.push(Line::from(""));
+        g
+    };
+    let (mut left, mut right): (Vec<Line>, Vec<Line>) = (Vec::new(), Vec::new());
+    for (name, keys) in help_sections() {
+        let g = group(name, keys);
+        if !two || left.len() <= right.len() {
+            left.extend(g);
+        } else {
+            right.extend(g);
+        }
+    }
+
     let scroll = (scroll, 0);
-    frame.render_widget(Paragraph::new(left).scroll(scroll).wrap(Wrap { trim: false }), cols[0]);
-    frame.render_widget(Paragraph::new(right).scroll(scroll).wrap(Wrap { trim: false }), cols[1]);
+    frame.render_widget(Paragraph::new(left).scroll(scroll), cols[0]);
+    if two {
+        frame.render_widget(Paragraph::new(right).scroll(scroll), cols[1]);
+    }
 }
 
 fn render_wizard(frame: &mut Frame, area: Rect, app: &App) {
@@ -5315,7 +5359,7 @@ mod tests {
     fn help_overlay_lists_all_sections() {
         let mut app = App::new("slate");
         app.overlay = Some(crate::overlay::Overlay::Help { scroll: 0 });
-        let out = render_to_string(&mut app, 100, 44);
+        let out = render_to_string(&mut app, 100, 60);
         for expected in ["Keybindings", "Global", "Pull Requests", "PR view", "Pipelines", "Merge (choose strategy)"] {
             assert!(out.contains(expected), "help should show '{expected}'");
         }
@@ -7450,5 +7494,60 @@ mod tests {
         assert!(retried.contains("███"), "the running job's bar is readable: {retried}");
         let passed = rows.iter().find(|r| r.contains("passed")).unwrap();
         assert!(passed.contains("40s"), "the kept job keeps its own duration: {passed}");
+    }
+
+    /// A wrapped help description continues in the description column, never back under the
+    /// keys, and no row is wider than the column it is laid out for.
+    #[test]
+    fn help_descriptions_wrap_with_a_hanging_indent() {
+        let rows = help_entry_rows("S", "Sort by column (re-pick flips direction, which is handy when a list is long)", 44);
+        assert!(rows.len() > 1, "long enough to wrap: {rows:?}");
+        assert!(rows[0].0.starts_with("  S "));
+        for (key, desc) in &rows[1..] {
+            assert_eq!(key.len(), HELP_DESC_AT, "continuations are indented to the description");
+            assert!(key.trim().is_empty());
+            assert!(!desc.is_empty());
+        }
+        assert!(rows.iter().all(|(k, d)| k.chars().count() + d.chars().count() <= 44), "{rows:?}");
+    }
+
+    /// A key too long for its column gets a line of its own instead of running into its text.
+    #[test]
+    fn a_long_help_key_takes_its_own_line() {
+        let rows = help_entry_rows("Enter or Space (on a group)", "Expand / collapse", 60);
+        assert_eq!(rows[0], ("  Enter or Space (on a group)".to_string(), String::new()));
+        assert_eq!(rows[1], (" ".repeat(HELP_DESC_AT), "Expand / collapse".to_string()));
+    }
+
+    #[test]
+    fn the_help_screen_never_runs_a_key_into_its_description() {
+        let mut app = App::new("slate");
+        app.overlay = Some(Overlay::Help { scroll: 0 });
+        for width in [80, 120, 160] {
+            let out = render_to_string(&mut app, width, 200);
+            assert!(!out.contains("(on a group)Expand"), "width {width}");
+            assert!(out.contains("Tab  Shift-Tab"), "width {width}");
+        }
+    }
+
+    /// The Diff tab's `[ ]` boxes tick with `v`, and the footer says so — in the file list and
+    /// in the patch's line cursor, where `v` works too.
+    #[test]
+    fn the_diff_footer_says_how_to_mark_a_file_viewed() {
+        use crate::app::Screen;
+        let mut app = App::new("slate");
+        app.screen = Screen::PrView(Box::new(pr_view(0, vec![], vec![])));
+        if let Screen::PrView(v) = &mut app.screen {
+            v.tab = 3;
+        }
+        assert!(base_footer_keys(&app).contains(&("v", "mark viewed")), "file list");
+        if let Screen::PrView(v) = &mut app.screen {
+            v.diff.focus = DiffFocus::Patch;
+        }
+        assert!(base_footer_keys(&app).contains(&("v", "mark viewed")), "patch line cursor");
+        if let Screen::PrView(v) = &mut app.screen {
+            v.tab = 0;
+        }
+        assert!(!base_footer_keys(&app).contains(&("v", "mark viewed")), "only on the Diff tab");
     }
 }

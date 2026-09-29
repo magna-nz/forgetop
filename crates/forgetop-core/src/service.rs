@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::watch;
 
 use crate::config::*;
-use crate::domain::Section;
+use crate::domain::{PipelineDefinition, PipelineRun, Section};
 use crate::error::{Error, Result};
 use crate::provider::*;
 use crate::secret::SecretStore;
@@ -396,6 +396,53 @@ pub struct PipelineFeed {
     pub subscription: PipelineSubscription,
 }
 
+/// How many runs are fetched for each pipeline definition.
+pub const RUNS_PER_DEFINITION: u32 = 10;
+
+/// How many run queries a feed has in flight at once — polite to the provider's rate limit.
+const MAX_CONCURRENT_RUN_QUERIES: usize = 4;
+
+/// The run queries for a pipeline subscription: one per definition, never one for the whole
+/// connection.
+///
+/// A connection-wide "latest N runs" is a window a busy pipeline fills on its own — twenty PR
+/// checks push every quieter pipeline's history out, and a main-line build that ran dozens of
+/// times reads as "1 run". So subscribing to everything asks each discovered definition for its
+/// own recent runs, exactly as an explicit subscription does.
+///
+/// A definition id is only unique within its repository, so each query is addressed at the
+/// repository discovery says the definition belongs to. Only when there is nothing to address —
+/// subscribed to everything and discovery came back empty — does it fall back to one
+/// connection-wide query, so a discovery hiccup still shows something.
+pub fn pipeline_run_queries(sub: &PipelineSubscription, defs: &[PipelineDefinition]) -> Vec<PipelineRunQuery> {
+    let all = sub.auto_discover_all || sub.definition_ids.is_empty();
+    let ids: Vec<&String> = if all { defs.iter().map(|d| &d.id).collect() } else { sub.definition_ids.iter().collect() };
+    if ids.is_empty() {
+        return vec![PipelineRunQuery { definition_id: None, repository: None, branch: None, limit: Some(20) }];
+    }
+    ids.into_iter()
+        .map(|id| PipelineRunQuery {
+            repository: defs.iter().find(|d| &d.id == id).and_then(|d| d.repository.clone()),
+            definition_id: Some(id.clone()),
+            branch: None,
+            limit: Some(RUNS_PER_DEFINITION),
+        })
+        .collect()
+}
+
+impl PipelineFeed {
+    /// Runs every query of this feed's subscription (see [`pipeline_run_queries`]), a few at a
+    /// time, and returns each query's result in order so the caller reports failures its own way.
+    pub async fn list_runs(&self, defs: &[PipelineDefinition]) -> Vec<Result<Vec<PipelineRun>>> {
+        let queries = pipeline_run_queries(&self.subscription, defs);
+        let mut out = Vec::with_capacity(queries.len());
+        for chunk in queries.chunks(MAX_CONCURRENT_RUN_QUERIES) {
+            out.extend(futures_util::future::join_all(chunk.iter().map(|q| self.source.list_runs(q))).await);
+        }
+        out
+    }
+}
+
 /// One connection feeding the aggregated Pull Requests list.
 pub struct PullRequestFeed {
     pub connection: Arc<dyn ProviderConnection>,
@@ -773,5 +820,54 @@ mod tests {
         let sub = &cfg.pipelines.unwrap().subscriptions[0];
         assert!(!sub.auto_discover_all);
         assert_eq!(sub.definition_ids, vec!["ci".to_string(), "release".to_string()]);
+    }
+
+    fn def(repo: &str, id: &str) -> PipelineDefinition {
+        PipelineDefinition { repository: Some(repo.into()), id: id.into(), name: id.into(), path: None, url: None }
+    }
+
+    /// A subscribed definition id is only unique within its repository, so each pipeline query
+    /// must be addressed at the repository discovery says the definition belongs to.
+    #[test]
+    fn pipeline_queries_are_addressed_at_the_definition_s_own_repository() {
+        let defs = vec![def("acme/pay", "ci"), def("acme/web", "release")];
+        let sub = PipelineSubscription {
+            connection_id: "gh".into(),
+            definition_ids: vec!["ci".into(), "release".into()],
+            auto_discover_all: false,
+        };
+        let queries = pipeline_run_queries(&sub, &defs);
+        assert_eq!(queries[0].repository.as_deref(), Some("acme/pay"));
+        assert_eq!(queries[1].repository.as_deref(), Some("acme/web"));
+    }
+
+    /// Subscribing to everything must not mean "the connection's latest 20 runs": a busy PR check
+    /// fills that window alone and a main-line pipeline with dozens of runs reads as one. Each
+    /// discovered definition gets its own query instead.
+    #[test]
+    fn subscribing_to_everything_queries_every_definition_on_its_own() {
+        let defs = vec![def("proj/app", "pr-check"), def("proj/app", "mainline"), def("proj/web", "deploy")];
+        for sub in [
+            PipelineSubscription { connection_id: "ado".into(), definition_ids: vec![], auto_discover_all: true },
+            PipelineSubscription { connection_id: "ado".into(), definition_ids: vec![], auto_discover_all: false },
+            // Auto-discovery wins over a stale explicit list.
+            PipelineSubscription { connection_id: "ado".into(), definition_ids: vec!["pr-check".into()], auto_discover_all: true },
+        ] {
+            let queries = pipeline_run_queries(&sub, &defs);
+            let ids: Vec<_> = queries.iter().map(|q| q.definition_id.as_deref()).collect();
+            assert_eq!(ids, vec![Some("pr-check"), Some("mainline"), Some("deploy")]);
+            assert!(queries.iter().all(|q| q.limit == Some(RUNS_PER_DEFINITION)));
+            assert_eq!(queries[2].repository.as_deref(), Some("proj/web"));
+        }
+    }
+
+    /// With nothing discovered there is no definition to ask about, so one connection-wide query
+    /// still shows whatever recent runs there are.
+    #[test]
+    fn an_empty_discovery_falls_back_to_one_connection_wide_query() {
+        let sub = PipelineSubscription { connection_id: "ado".into(), definition_ids: vec![], auto_discover_all: true };
+        let queries = pipeline_run_queries(&sub, &[]);
+        assert_eq!(queries.len(), 1);
+        assert_eq!(queries[0].definition_id, None);
     }
 }
