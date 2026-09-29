@@ -59,6 +59,8 @@ pub enum Action {
     /// Open the repository-scope picker for the connection at this index of the section's
     /// repo-addressed connections.
     OpenRepoScope { index: usize },
+    /// Open the Pipelines add/remove checklist for the connection at `index`.
+    OpenPipelineSubs { index: usize },
     /// Jump to an item chosen in the command palette. The app re-resolves the full
     /// PR / work item / pipeline from its lists by `(kind, id)` and opens its view.
     OpenItem { kind: PaletteKind, id: String, connection_id: String },
@@ -141,6 +143,8 @@ pub enum PickerKind {
     /// Choose which bound connection's repository scope to edit, when a section has more than
     /// one repo-addressed connection. Resolves to the picked index.
     RepoScopeConnection,
+    /// Choose which pipeline connection's subscription to edit. Resolves to the picked index.
+    PipelineSubsConnection,
     /// Shown on Esc when line comments are buffered but unsubmitted: submit or leave.
     PendingExit,
     /// First run: set up the first connection in the terminal, or in the browser.
@@ -468,6 +472,7 @@ fn resolve_picker(kind: PickerKind, selected: usize, items: &[String]) -> Action
         PickerKind::SortColumn { section } => Action::SetSort { section, index: selected },
         PickerKind::ApprovalGate => Action::PickApproval { index: selected },
         PickerKind::RepoScopeConnection => Action::OpenRepoScope { index: selected },
+        PickerKind::PipelineSubsConnection => Action::OpenPipelineSubs { index: selected },
         PickerKind::PendingExit => match selected {
             0 => Action::OpenReviewMenu,
             _ => Action::LeavePrView,

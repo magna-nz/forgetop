@@ -3,15 +3,14 @@
 
 use std::sync::Arc;
 
-use forgetop_core::config::PipelineSubscription;
 use forgetop_core::domain::{
-    CheckRun, CommentThread, Commit, FileChange, Notification, PipelineApproval, PipelineDefinition, PipelineRun,
+    CheckRun, CommentThread, Commit, FileChange, Notification, PipelineApproval, PipelineRun,
     PipelineRunStatus, ProviderType, PullRequest, PullRequestStatus, TimelineEvent, TimelineEventKind, WorkItem,
 };
 use forgetop_core::filter::run_triggered_by;
 use forgetop_core::launchpad::{self, EntryItem, PipeInput, PrInput, WiInput};
 use forgetop_core::provider::{
-    ItemRef, PipelineRunQuery, PipelineSource, PrDecoration, PullRequestFilter, PullRequestQuery, PullRequestSource,
+    ItemRef, PipelineSource, PrDecoration, PullRequestFilter, PullRequestQuery, PullRequestSource,
     WorkItemQuery, WorkItemSource,
 };
 use forgetop_core::service::{ConnectionHealthService, SectionService};
@@ -158,27 +157,6 @@ pub async fn work_items(sections: &SectionService) -> Vec<WiRow> {
     out
 }
 
-/// Queries for a pipeline subscription — mirrors the TUI: all recent runs when auto-discovering,
-/// else the subscribed definitions.
-///
-/// A subscribed definition id is only unique within its repository, so each query is addressed at
-/// the repository discovery says the definition belongs to. Without that, a connection spanning
-/// several repositories would ask every one of them about a definition only one of them has.
-fn pipe_queries(sub: &PipelineSubscription, defs: &[PipelineDefinition]) -> Vec<PipelineRunQuery> {
-    if sub.definition_ids.is_empty() {
-        return vec![PipelineRunQuery { definition_id: None, repository: None, branch: None, limit: Some(20) }];
-    }
-    sub.definition_ids
-        .iter()
-        .map(|id| PipelineRunQuery {
-            repository: defs.iter().find(|d| &d.id == id).and_then(|d| d.repository.clone()),
-            definition_id: Some(id.clone()),
-            branch: None,
-            limit: Some(10),
-        })
-        .collect()
-}
-
 pub async fn pipelines(sections: &SectionService) -> Vec<PipeRow> {
     let mut out = Vec::new();
     if let Ok(feeds) = sections.pipeline_feeds().await.inspect_err(|_| log_fetch_failure("dashboard.pipelines.feeds")) {
@@ -192,8 +170,8 @@ pub async fn pipelines(sections: &SectionService) -> Vec<PipeRow> {
             let def_names: std::collections::HashMap<String, String> =
                 defs.iter().map(|d| (d.id.clone(), d.name.clone())).collect();
             let supports = feed.source.supports_approvals();
-            for query in pipe_queries(&feed.subscription, &defs) {
-                if let Ok(runs) = feed.source.list_runs(&query).await.inspect_err(|_| log_fetch_failure("dashboard.pipelines.list")) {
+            for result in feed.list_runs(&defs).await {
+                if let Ok(runs) = result.inspect_err(|_| log_fetch_failure("dashboard.pipelines.list")) {
                     for run in runs {
                         // Only in-flight runs can be waiting on a gate — bound the extra calls.
                         let approvals = if supports && is_active(run.status) {
@@ -346,8 +324,8 @@ async fn pipe_inputs(sections: &SectionService) -> Vec<PipeInput> {
                 .await
                 .inspect_err(|_| log_fetch_failure("dashboard.launchpad.pipeline_current_user"))
                 .unwrap_or_default();
-            for query in pipe_queries(&feed.subscription, &defs) {
-                if let Ok(runs) = feed.source.list_runs(&query).await.inspect_err(|_| log_fetch_failure("dashboard.launchpad.pipelines")) {
+            for result in feed.list_runs(&defs).await {
+                if let Ok(runs) = result.inspect_err(|_| log_fetch_failure("dashboard.launchpad.pipelines")) {
                     for run in runs {
                         let awaiting_approval = supports
                             && is_active(run.status)
@@ -737,27 +715,5 @@ mod tests {
             .create(&conn(ProviderType::Bitbucket, Some("ws".into()), Some("repo".into()), Some("u".into())), None)
             .unwrap();
         assert!(!bb.pull_requests().unwrap().list_omits_decoration(), "Bitbucket fills them from the list");
-    }
-
-    /// A subscribed definition id is only unique within its repository, so each pipeline query
-    /// must be addressed at the repository discovery says the definition belongs to.
-    #[test]
-    fn pipeline_queries_are_addressed_at_the_definition_s_own_repository() {
-        let defs = vec![
-            PipelineDefinition { repository: Some("acme/pay".into()), id: "ci".into(), name: "CI".into(), path: None, url: None },
-            PipelineDefinition { repository: Some("acme/web".into()), id: "release".into(), name: "Release".into(), path: None, url: None },
-        ];
-        let sub = PipelineSubscription {
-            connection_id: "gh".into(),
-            definition_ids: vec!["ci".into(), "release".into()],
-            auto_discover_all: false,
-        };
-        let queries = pipe_queries(&sub, &defs);
-        assert_eq!(queries[0].repository.as_deref(), Some("acme/pay"));
-        assert_eq!(queries[1].repository.as_deref(), Some("acme/web"));
-
-        // Auto-discovery has no definition to place, so it fans out over the whole scope.
-        let all = PipelineSubscription { connection_id: "gh".into(), definition_ids: vec![], auto_discover_all: true };
-        assert_eq!(pipe_queries(&all, &defs)[0].repository, None);
     }
 }

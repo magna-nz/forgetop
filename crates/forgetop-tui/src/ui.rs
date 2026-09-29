@@ -1581,7 +1581,12 @@ fn pipe_status_cell(status: PipelineRunStatus, anim: usize) -> String {
 fn render_pipes(frame: &mut Frame, area: Rect, app: &mut App) {
     let theme = &app.theme;
     let idxs = app.filtered_pipe_indices();
-    let mut base = with_scope("Pipelines".to_string(), app, 2);
+    // What this section fetches is chosen pipeline by pipeline, so its header counts pipelines;
+    // the repository count stands in only until discovery has answered.
+    let mut base = match &app.pipe_scope {
+        Some(scope) => scope.label(),
+        None => with_scope("Pipelines".to_string(), app, 2),
+    };
     if app.pipe_group != PipeGroup::Off && !idxs.is_empty() {
         // The column arrow means "runs sort by this", within each group. Group order is a
         // separate fact, so it is stated — but only while it is the whole story: with an
@@ -2285,7 +2290,7 @@ fn base_footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
     match app.active {
         0 => keys.extend([("f", "status"), ("S", "sort"), ("o", "browser")]),
         1 => keys.extend([("f", "states"), ("S", "sort"), ("o", "browser")]),
-        2 => keys.extend([("G", "group"), ("S", "sort"), ("T", "trigger"), ("o", "open")]),
+        2 => keys.extend([("w", "pipelines"), ("G", "group"), ("S", "sort"), ("T", "trigger"), ("o", "open")]),
         _ => {}
     }
     keys.extend([
@@ -4401,6 +4406,7 @@ pub(crate) fn help_sections() -> Vec<(&'static str, Vec<(&'static str, &'static 
             "Pipelines",
             vec![
                 ("G", "Group by pipeline / trigger / branch / off"),
+                ("w", "Pipelines — add or remove which ones are fetched"),
                 ("Enter or Space (on a group)", "Expand / collapse"),
                 ("z  Z", "Collapse / expand every group"),
                 ("Enter", "Open the run pane (history, timeline, logs)"),
