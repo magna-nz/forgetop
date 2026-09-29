@@ -18,7 +18,7 @@ Fixed
   view (Mine, Review, All) is worked out from that cache at launch. Before, only the view on
   screen was cached, so the first launch after Pull Requests switched to opening on Mine had
   nothing to show for it. The list also shows pull requests as soon as they're fetched instead of
-  waiting for work items, pipelines, notifications and repository discovery to finish. (PR_LINK)
+  waiting for work items, pipelines, notifications and repository discovery to finish. ([#211](https://github.com/magna-nz/forgetop/pull/211))
 
 ## 1.5.0 — 2026-09-29
 
