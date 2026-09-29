@@ -1531,6 +1531,9 @@ struct DemoPipe {
 }
 #[async_trait]
 impl PipelineSource for DemoPipe {
+    async fn current_user(&self) -> Result<Option<String>> {
+        Ok(Some(DEMO_ME.to_string()))
+    }
     async fn discover(&self) -> Result<Vec<PipelineDefinition>> {
         Ok(pipeline_defs_for(&self.conn))
     }

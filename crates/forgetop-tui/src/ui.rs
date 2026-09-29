@@ -5520,6 +5520,7 @@ mod tests {
             provider: ProviderType::GitHub,
             definition_name: Some("CI Build".into()),
             awaiting_approval: true,
+            triggered_by_me: true,
             run: sample_run(),
         });
         app.pipe_state.select(Some(0));
@@ -5569,6 +5570,7 @@ mod tests {
                 provider: ProviderType::GitHub,
                 definition_name: Some(def.into()),
                 awaiting_approval: false,
+                triggered_by_me: true,
                 run,
             }
         };
@@ -5635,6 +5637,7 @@ mod tests {
                     provider: ProviderType::GitHub,
                     definition_name: Some((*def).into()),
                     awaiting_approval: false,
+                    triggered_by_me: true,
                     run,
                 }
             })
@@ -7037,6 +7040,7 @@ mod tests {
             run,
             definition_name: Some("CI".into()),
             awaiting_approval: false,
+            triggered_by_me: true,
         }
     }
 

@@ -600,6 +600,9 @@ impl PullRequestSource for BitbucketPr {
 
 #[async_trait]
 impl PipelineSource for BitbucketPipe {
+    async fn current_user(&self) -> Result<Option<String>> {
+        self.0.self_name().await
+    }
     async fn discover(&self) -> Result<Vec<PipelineDefinition>> {
         // Bitbucket has no named pipeline definitions — model each repository's CI as one.
         Ok(self

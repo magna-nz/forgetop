@@ -395,6 +395,16 @@ pub trait PipelineSource: Send + Sync {
     async fn discover(&self) -> Result<Vec<PipelineDefinition>>;
     async fn list_runs(&self, query: &PipelineRunQuery) -> Result<Vec<PipelineRun>>;
     async fn get_run(&self, run: &ItemRef) -> Result<PipelineRun>;
+    /// The signed-in user's identity, as [`PullRequestSource::current_user`] gives it — matched
+    /// against a run's `triggered_by` by [`run_triggered_by`](crate::filter::run_triggered_by) so
+    /// the Command Center shows only the runs you started.
+    ///
+    /// `None` — the default — means the identity cannot be established. Unlike the pull-request
+    /// filter, that shows *none* of the connection's runs there: a "your work" list full of other
+    /// people's builds is worse than an empty one, and the Pipelines page still lists them all.
+    async fn current_user(&self) -> Result<Option<String>> {
+        Ok(None)
+    }
     async fn logs(&self, run: &ItemRef, job_id: Option<&str>) -> Result<String>;
     /// Triggers a pipeline. `definition` addresses the definition — its `repo` says which
     /// repository's pipeline to start, which a connection spanning several cannot infer.

@@ -9,7 +9,7 @@ use chrono::{DateTime, Local, Utc};
 use forgetop_core::cache::{CachePut, CacheStore};
 use forgetop_core::config::{NotificationPrefs, SavedView, SortPref};
 use forgetop_core::domain::*;
-use forgetop_core::filter::pull_request_matches;
+use forgetop_core::filter::{pull_request_matches, run_triggered_by};
 use forgetop_core::provider::*;
 use forgetop_core::runlog::{self, FailureSummary, LogSection};
 use forgetop_core::service::{ConfigService, ConnectionHealth, ConnectionHealthService, SectionService};
@@ -54,6 +54,7 @@ const DIAG_PIPELINE_FEEDS: &str = "tui.pipeline.feeds";
 const DIAG_PIPELINE_DISCOVERY: &str = "tui.pipeline.discovery";
 const DIAG_PIPELINE_RUN: &str = "tui.pipeline.run";
 const DIAG_PIPELINE_APPROVALS: &str = "tui.pipeline.approvals";
+const DIAG_PIPELINE_CURRENT_USER: &str = "tui.pipeline.current_user";
 const DIAG_PIPELINE_LOGS: &str = "tui.pipeline.logs";
 const DIAG_PIPELINE_ANNOTATIONS: &str = "tui.pipeline.annotations";
 const DIAG_PIPELINE_ARTIFACTS: &str = "tui.pipeline.artifacts";
@@ -410,6 +411,10 @@ pub struct PipeRow {
     pub definition_name: Option<String>,
     /// True when this run has a gate the authenticated user can approve/reject.
     pub awaiting_approval: bool,
+    /// True when the authenticated user started this run — the Command Center lists only these.
+    /// Defaults to `false` for rows cached before it existed; the next reload sets it.
+    #[serde(default)]
+    pub triggered_by_me: bool,
 }
 
 /// How the Pipelines list groups its runs.
@@ -5263,6 +5268,7 @@ impl App {
                     let defs = detail_or_default(feed.source.discover().await, DIAG_PIPELINE_DISCOVERY);
                     let def_names: HashMap<String, String> =
                         defs.iter().map(|d| (d.id.clone(), d.name.clone())).collect();
+                    let me = detail_or_default(feed.source.current_user().await, DIAG_PIPELINE_CURRENT_USER);
                     for q in feed_queries(&feed.subscription, &defs) {
                         match feed.source.list_runs(&q).await {
                             Ok(runs) => {
@@ -5279,6 +5285,7 @@ impl App {
                                         .iter()
                                         .any(|approval| approval.can_respond);
                                     let definition_name = def_names.get(&run.definition_id).cloned();
+                                    let triggered_by_me = run_triggered_by(&run, me.as_deref());
                                     rows.push(PipeRow {
                                         connection_id: conn_id.clone(),
                                         connection: name.clone(),
@@ -5286,6 +5293,7 @@ impl App {
                                         run,
                                         definition_name,
                                         awaiting_approval,
+                                        triggered_by_me,
                                     });
                                 }
                             }
@@ -9468,6 +9476,16 @@ async fn fetch_pipelines(deps: &AppDeps, errors: &mut Vec<String>) -> (Vec<PipeR
                 };
                 let def_names: HashMap<String, String> =
                     defs.iter().map(|d| (d.id.clone(), d.name.clone())).collect();
+                // An identity that can't be established owns no runs — see `run_triggered_by`. A
+                // failed lookup would cache every row as someone else's, so it clears the section
+                // flag like discovery's failure does.
+                let me = match detail_or_none(feed.source.current_user().await, DIAG_PIPELINE_CURRENT_USER) {
+                    Some(me) => me,
+                    None => {
+                        ok = false;
+                        None
+                    }
+                };
                 for q in feed_queries(&feed.subscription, &defs) {
                     match feed.source.list_runs(&q).await {
                         Ok(runs) => {
@@ -9488,7 +9506,8 @@ async fn fetch_pipelines(deps: &AppDeps, errors: &mut Vec<String>) -> (Vec<PipeR
                                     ok = false;
                                 }
                                 let definition_name = def_names.get(&run.definition_id).cloned();
-                                out.push(PipeRow { connection_id: conn_id.clone(), connection: name.clone(), provider, run, definition_name, awaiting_approval });
+                                let triggered_by_me = run_triggered_by(&run, me.as_deref());
+                                out.push(PipeRow { connection_id: conn_id.clone(), connection: name.clone(), provider, run, definition_name, awaiting_approval, triggered_by_me });
                             }
                         }
                         Err(e) => {
@@ -11829,6 +11848,7 @@ mod tests {
             provider: ProviderType::GitHub,
             definition_name: None,
             awaiting_approval: awaiting,
+            triggered_by_me: true,
             run: PipelineRun {
                 event: None,
                 attempt: None,
@@ -11924,6 +11944,7 @@ mod tests {
             provider: ProviderType::GitHub,
             definition_name: None,
             awaiting_approval: false,
+            triggered_by_me: true,
             run: PipelineRun {
                 event: None,
                 attempt: None,
@@ -11966,6 +11987,7 @@ mod tests {
             provider: ProviderType::GitHub,
             definition_name: None,
             awaiting_approval: awaiting,
+            triggered_by_me: true,
             run: PipelineRun {
                 event: None,
                 attempt: None,
@@ -13732,6 +13754,7 @@ mod tests {
             provider: ProviderType::GitHub,
             definition_name: Some(def.into()),
             awaiting_approval: false,
+            triggered_by_me: true,
             run: PipelineRun {
                 event: None,
                 attempt: None,
@@ -15367,6 +15390,7 @@ mod tests {
             run,
             definition_name: Some("CI".into()),
             awaiting_approval: false,
+            triggered_by_me: true,
         }
     }
 

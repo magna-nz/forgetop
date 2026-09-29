@@ -8,6 +8,7 @@ use forgetop_core::domain::{
     CheckRun, CommentThread, Commit, FileChange, Notification, PipelineApproval, PipelineDefinition, PipelineRun,
     PipelineRunStatus, ProviderType, PullRequest, PullRequestStatus, TimelineEvent, TimelineEventKind, WorkItem,
 };
+use forgetop_core::filter::run_triggered_by;
 use forgetop_core::launchpad::{self, EntryItem, PipeInput, PrInput, WiInput};
 use forgetop_core::provider::{
     ItemRef, PipelineRunQuery, PipelineSource, PrDecoration, PullRequestFilter, PullRequestQuery, PullRequestSource,
@@ -322,9 +323,9 @@ async fn wi_inputs(sections: &SectionService) -> Vec<WiInput> {
     out
 }
 
-/// Pipeline inputs with the two derived flags the classifier needs: the pipeline's display name
-/// (from discovery) and whether an in-flight run is waiting on an approval gate you can respond
-/// to. Mirrors the TUI's pipeline reload.
+/// Pipeline inputs with the derived flags the classifier needs: the pipeline's display name (from
+/// discovery), whether an in-flight run is waiting on an approval gate you can respond to, and
+/// whether you started it. Mirrors the TUI's pipeline reload.
 async fn pipe_inputs(sections: &SectionService) -> Vec<PipeInput> {
     let mut out = Vec::new();
     if let Ok(feeds) = sections.pipeline_feeds().await.inspect_err(|_| log_fetch_failure("dashboard.launchpad.pipeline_feeds")) {
@@ -338,6 +339,13 @@ async fn pipe_inputs(sections: &SectionService) -> Vec<PipeInput> {
             let def_names: std::collections::HashMap<String, String> =
                 defs.iter().map(|d| (d.id.clone(), d.name.clone())).collect();
             let supports = feed.source.supports_approvals();
+            // An identity that can't be established owns no runs — see `run_triggered_by`.
+            let me = feed
+                .source
+                .current_user()
+                .await
+                .inspect_err(|_| log_fetch_failure("dashboard.launchpad.pipeline_current_user"))
+                .unwrap_or_default();
             for query in pipe_queries(&feed.subscription, &defs) {
                 if let Ok(runs) = feed.source.list_runs(&query).await.inspect_err(|_| log_fetch_failure("dashboard.launchpad.pipelines")) {
                     for run in runs {
@@ -358,6 +366,7 @@ async fn pipe_inputs(sections: &SectionService) -> Vec<PipeInput> {
                             provider: feed.connection.provider_type(),
                             definition_name: def_names.get(&run.definition_id).cloned(),
                             awaiting_approval,
+                            triggered_by_me: run_triggered_by(&run, me.as_deref()),
                             run,
                         });
                     }
