@@ -18,7 +18,7 @@ Added
   starts off, and your choice is saved. ([#207](https://github.com/magna-nz/forgetop/pull/207))
 - **Choose pipelines in the dashboard.** The dashboard's Pipelines page has a
   `Pipelines · 0 of 154` button with a searchable checklist per connection and All/None. It is the
-  same saved choice the terminal's `w` edits. ([#PRNUM](https://github.com/magna-nz/forgetop/pull/PRNUM))
+  same saved choice the terminal's `w` edits. ([#208](https://github.com/magna-nz/forgetop/pull/208))
 - **Line numbers in diffs.** Every line of a pull request diff is numbered. Added and unchanged
   lines show their new line number, and removed lines show their old one. ([#207](https://github.com/magna-nz/forgetop/pull/207))
 
@@ -28,9 +28,9 @@ Changed
   the header reads `Pipelines · 0 of 154` until you pick some with `w` (or the dashboard's
   picker). Your choice is saved. On the first run of this version, a connection that was
   fetching every pipeline is reset to none. A connection where you'd picked specific pipelines
-  keeps them. ([#PRNUM](https://github.com/magna-nz/forgetop/pull/PRNUM))
+  keeps them. ([#208](https://github.com/magna-nz/forgetop/pull/208))
 - **Pipelines hide Provider and Repository by default.** Both can be turned on with `c`, and
-  Provider now shows when it's on even with a single provider. ([#PRNUM](https://github.com/magna-nz/forgetop/pull/PRNUM))
+  Provider now shows when it's on even with a single provider. ([#208](https://github.com/magna-nz/forgetop/pull/208))
 - **Pull Requests open on Mine.** The views now run Mine, Review, All, and the tab lands on Mine.
   A saved list that still starts with the old All, Mine, Review order is reordered. ([#207](https://github.com/magna-nz/forgetop/pull/207))
 - **New connections start with no repositories chosen.** The repositories a new connection can
@@ -45,7 +45,7 @@ Fixed
 - **Long pop-up lists scroll.** In the terminal UI, a checklist or picker taller than the screen
   (such as `w` on an Azure org with 150 pipelines) now scrolls with the cursor instead of running
   off the bottom. In a searchable checklist, Ctrl-A ticks or clears everything shown; elsewhere
-  it's `a`. ([#PRNUM](https://github.com/magna-nz/forgetop/pull/PRNUM))
+  it's `a`. ([#208](https://github.com/magna-nz/forgetop/pull/208))
 - **A stalled request no longer leaves a list loading forever.** Provider requests now give up
   after 10 seconds without a connection or 30 seconds of silence. Before this, one hung request
   blocked every later refresh, and a view such as Mine never left "Loading…". Switching views
