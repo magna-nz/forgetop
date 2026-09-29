@@ -40,6 +40,11 @@ thread_local! {
     /// Set while drawing something that only looks like a screen — the unfocused preview — so
     /// its rows and tabs don't answer clicks meant for the list that has the keys.
     static HITS_MUTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Set while drawing a section list the pane will cover: the screen column where the pane
+    /// begins, so the selected row's title scrolls within what stays visible.
+    static LIST_CUT: std::cell::Cell<Option<u16>> = const { std::cell::Cell::new(None) };
+    /// Set while drawing the item that has the keys in the pane, where Tab walks a PR's tabs.
+    static IN_PANE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Records that `rect` (clipped to a non-empty area) shows `target` in this frame.
@@ -376,25 +381,62 @@ fn render_content(frame: &mut Frame, area: Rect, app: &mut App) {
     render_table(frame, area, app);
 }
 
-/// The section list beside its preview. Unfocused, the right half is the preview built for the
+/// The section list with its preview over it. Unfocused, the pane is the preview built for the
 /// selected row; focused, it is the live view that is the screen, with every key it has. Which
-/// half has focus has to read at a glance: it gets heavy borders, the other goes dim.
+/// side has focus has to read at a glance: it gets heavy borders, the other goes dim.
+///
+/// The list is laid out at full width whether or not the pane is up, and the pane is drawn over
+/// its right-hand side — opening and closing it never moves a column. Browsing, the pane leaves
+/// the list most of the width; an open item takes the room a diff, a thread or a log needs.
 fn render_split(frame: &mut Frame, area: Rect, app: &mut App, focused: bool) {
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-        .split(area);
-    render_table(frame, cols[0], app);
+    let pane_w = area.width * if focused { 70 } else { 45 } / 100;
+    let pane = Rect { x: area.right() - pane_w, width: pane_w, ..area };
+    let list = Rect { width: area.width - pane_w, ..area };
+
+    LIST_CUT.with(|c| c.set(Some(pane.x)));
+    render_table(frame, area, app);
+    LIST_CUT.with(|c| c.set(None));
+    mark_cut_rows(frame, area, pane.x, &app.theme);
+    // What the pane covers takes no clicks meant for the list.
+    HITS.with(|h| {
+        for (rect, _) in h.borrow_mut().iter_mut() {
+            *rect = rect.intersection(list);
+        }
+    });
+
+    frame.render_widget(ratatui::widgets::Clear, pane);
     if focused {
-        app.detail_scroll_max = render_item_view(frame, cols[1], &app.theme, &app.screen, app.anim);
+        IN_PANE.with(|c| c.set(true));
+        app.detail_scroll_max = render_item_view(frame, pane, &app.theme, &app.screen, app.anim);
+        IN_PANE.with(|c| c.set(false));
     } else if let Some(p) = app.preview.as_ref() {
         HITS_MUTED.with(|m| m.set(true));
-        render_item_view(frame, cols[1], &app.theme, &p.view, app.anim);
+        render_item_view(frame, pane, &app.theme, &p.view, app.anim);
         HITS_MUTED.with(|m| m.set(false));
     }
-    let (active, idle) = if focused { (cols[1], cols[0]) } else { (cols[0], cols[1]) };
+    let (active, idle) = if focused { (pane, list) } else { (list, pane) };
     mark_focus(frame, active, &app.theme);
     mark_idle(frame, idle, &app.theme);
+}
+
+/// Ends each list row the pane cuts short with `…` in the last column left showing, so a
+/// hidden column reads as hidden rather than missing. Frame lines are left alone.
+fn mark_cut_rows(frame: &mut Frame, area: Rect, cut: u16, theme: &Theme) {
+    if cut <= area.x || cut >= area.right() {
+        return;
+    }
+    let buf = frame.buffer_mut();
+    for y in area.top() + 1..area.bottom().saturating_sub(1) {
+        let edge = &buf[(cut - 1, y)];
+        if FRAME_LIGHT.contains(&edge.symbol()) || FRAME_HEAVY.contains(&edge.symbol()) {
+            continue;
+        }
+        // The list's own right border is the last column; anything before it is content.
+        let hidden = (cut..area.right() - 1).any(|x| !buf[(x, y)].symbol().trim().is_empty());
+        if hidden {
+            buf[(cut - 1, y)].set_symbol("…").set_fg(theme.dim);
+        }
+    }
 }
 
 /// Draws a PR, work-item or pipeline view into `area`, returning how far it can scroll (the
@@ -900,7 +942,17 @@ fn mark_selected_idle(line: &mut Line, theme: &Theme) {
 
 /// Renders a section as a fixed column header + a scrollable body of rows, with the
 /// selected row highlighted. Enter opens a full-screen view for the row.
-fn render_inline_list(frame: &mut Frame, area: Rect, app: &mut App, title: &str, header: Line<'static>, rows: Vec<Line<'static>>) {
+/// `flex` names the column that flexes and the selected row's full text in it: when a pane
+/// covers the list's right side ([`LIST_CUT`]), that text scrolls within what stays visible.
+fn render_inline_list(
+    frame: &mut Frame,
+    area: Rect,
+    app: &mut App,
+    title: &str,
+    header: Line<'static>,
+    rows: Vec<Line<'static>>,
+    flex: Option<(usize, String)>,
+) {
     let block = section_block(&app.theme, title);
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -919,6 +971,9 @@ fn render_inline_list(frame: &mut Frame, area: Rect, app: &mut App, title: &str,
         .enumerate()
         .map(|(i, mut row)| {
             if i == selected {
+                if let (Some(cut), Some((col, text))) = (LIST_CUT.with(|c| c.get()), flex.as_ref()) {
+                    scroll_cut_cell(&mut row, *col, text, inner.x, cut, app.anim);
+                }
                 // While the preview beside it has focus, the list keeps only a quiet marker: the
                 // bright bar belongs in the pane that takes the keys.
                 if app.preview_focus {
@@ -936,6 +991,23 @@ fn render_inline_list(frame: &mut Frame, area: Rect, app: &mut App, title: &str,
     if !app.preview_focus {
         hit_rows(parts[1], scroll as usize, (0..count).map(|i| Some(Hit::ListRow(i))));
     }
+}
+
+/// Scrolls column `col` of a [`cells_line`] row within the part left of `cut` (less one column
+/// for the `…` that marks a cut row), so a title the pane covers can still be read in full.
+fn scroll_cut_cell(row: &mut Line<'static>, col: usize, text: &str, x0: u16, cut: u16, anim: usize) {
+    let at = 1 + 2 * col; // the lead span, then each cell after a gap span
+    if at >= row.spans.len() {
+        return;
+    }
+    let start = x0 as usize + row.spans[..at].iter().map(|s| s.content.chars().count()).sum::<usize>();
+    let visible = (cut as usize).saturating_sub(start + 1);
+    let width = row.spans[at].content.chars().count();
+    if visible == 0 || width <= visible || text.chars().count() <= visible {
+        return;
+    }
+    let window = marquee_window(text, visible, anim / 2);
+    row.spans[at].content = format!("{window:<width$}").into();
 }
 
 /// Left indent inside the section, and the gap between columns — for breathing room.
@@ -1005,9 +1077,8 @@ const PR_TITLE_COL: usize = 4;
 const MIN_TITLE_W: usize = 28;
 
 /// Drops columns, in `drop_order`, until the `flex` column can show [`MIN_TITLE_W`] characters
-/// (or all of its widest value, if shorter). A wide list is returned untouched; a narrow one —
-/// beside the preview pane — keeps its identifying columns and loses the ones the preview
-/// repeats. The sort arrow follows its column, and disappears with it if that one is shed.
+/// (or all of its widest value, if shorter). A wide list is returned untouched; a narrow one
+/// keeps its identifying columns and loses the ones an open item repeats. The sort arrow follows its column, and disappears with it if that one is shed.
 #[allow(clippy::type_complexity)]
 fn shed_columns(
     headers: &[&'static str],
@@ -1305,12 +1376,13 @@ fn render_prs(frame: &mut Frame, area: Rect, app: &mut App) {
         })
         .collect();
 
-    // Beside the preview the list is narrow: shed the columns the preview repeats, least
-    // useful first — Provider, ±, Author, Updated — before the title gets squeezed.
+    // On a narrow terminal, shed the least useful columns first — Provider, ±, Author,
+    // Updated — before the title gets squeezed.
     let (headers, cells, sort) = shed_columns(&headers, cells, PR_TITLE_COL, sort_marker(app, 0), inner_w, &[1, 7, 5, 8]);
     let flex = headers.iter().position(|h| *h == "Title").unwrap_or(0);
     let (header, rows) = columnize(dim, &headers, &cells, flex, inner_w, sort);
-    render_inline_list(frame, area, app, &title, header, rows);
+    let selected = app.selected().and_then(|i| cells.get(i)).map(|r| (flex, r[flex].0.clone()));
+    render_inline_list(frame, area, app, &title, header, rows, selected);
 }
 
 // ---- Work Items ----
@@ -1377,11 +1449,12 @@ fn render_wis(frame: &mut Frame, area: Rect, app: &mut App) {
         })
         .collect();
 
-    // Provider, Type, Assignee, Updated go first when the list sits beside the preview.
+    // Provider, Type, Assignee, Updated go first on a narrow terminal.
     let (headers, cells, sort) = shed_columns(&headers, cells, 3, sort_marker(app, 1), inner_w, &[1, 4, 5, 6]);
     let flex = headers.iter().position(|h| *h == "Title").unwrap_or(0);
     let (header, rows) = columnize(dim, &headers, &cells, flex, inner_w, sort);
-    render_inline_list(frame, area, app, &title, header, rows);
+    let selected = app.selected().and_then(|i| cells.get(i)).map(|r| (flex, r[flex].0.clone()));
+    render_inline_list(frame, area, app, &title, header, rows, selected);
 }
 
 // ---- Pipelines ----
@@ -1501,28 +1574,33 @@ fn pipe_sort_marker(app: &App, cols: &[PipeCol]) -> Option<(usize, bool)> {
 /// needs attention, so it must not be the thing that falls off; Repository, Commit and
 /// Provider are context and give way first.
 fn fit_columns(cols: &mut Vec<PipeCol>, cells: &mut [Vec<(String, Style)>], headings: &[String], inner_w: usize) {
-    let natural = |cols: &[PipeCol], cells: &[Vec<(String, Style)>]| -> usize {
+    let mut headings = headings.to_vec();
+    let widths = |headings: &[String], cells: &[Vec<(String, Style)>]| -> Vec<usize> {
         let mut w: Vec<usize> = headings.iter().map(|h| h.chars().count()).collect();
         for row in cells.iter() {
             for (i, (text, _)) in row.iter().enumerate() {
                 w[i] = w[i].max(text.chars().count());
             }
         }
-        w.iter().sum::<usize>() + COL_LEAD + COL_GAP * cols.len().saturating_sub(1)
+        w
     };
-
-    // The repository goes last: it is the column the list leads with, and beside the preview
-    // pane (the default on a wide terminal) this narrow case is the everyday one.
-    for droppable in [PipeCol::Provider, PipeCol::Commit, PipeCol::Repository] {
-        if natural(cols, cells) <= inner_w {
-            return;
-        }
-        if let Some(at) = cols.iter().position(|c| *c == droppable) {
+    let padding = |n: usize| COL_LEAD + COL_GAP * n.saturating_sub(1);
+    let drop = |cols: &mut Vec<PipeCol>, cells: &mut [Vec<(String, Style)>], headings: &mut Vec<String>, col: PipeCol| {
+        if let Some(at) = cols.iter().position(|c| *c == col) {
             cols.remove(at);
+            headings.remove(at);
             for row in cells.iter_mut() {
                 row.remove(at);
             }
         }
+    };
+
+    // The repository goes last: it is the column the list leads with.
+    for droppable in [PipeCol::Provider, PipeCol::Commit, PipeCol::Repository] {
+        if widths(&headings, cells).iter().sum::<usize>() + padding(cols.len()) <= inner_w {
+            return;
+        }
+        drop(cols, cells, &mut headings, droppable);
     }
 }
 
@@ -1648,7 +1726,8 @@ fn render_pipes(frame: &mut Frame, area: Rect, app: &mut App) {
     let heading_refs: Vec<&str> = headings.iter().map(String::as_str).collect();
     let flex = cols.iter().position(|c| *c == PipeCol::Subject).unwrap_or(0);
     let (header, rows) = columnize(dim, &heading_refs, &cells, flex, inner_w, pipe_sort_marker(app, &cols));
-    render_inline_list(frame, area, app, &title, header, rows);
+    let selected = app.selected().and_then(|i| cells.get(i)).map(|r| (flex, r[flex].0.clone()));
+    render_inline_list(frame, area, app, &title, header, rows, selected);
 }
 
 fn head_cell(col: PipeCol, h: &PipeHead, theme: &Theme, anim: usize, owner: Option<&String>) -> (String, Style) {
@@ -1876,7 +1955,9 @@ fn pr_tabs_line(theme: &Theme, view: &PrView) -> Line<'static> {
         spans.push(Span::styled(label, style));
         spans.push(Span::raw(" "));
     }
-    spans.push(Span::styled("  ←/→ tabs · Esc close", Style::default().fg(theme.dim)));
+    // In the pane Tab walks these tabs too; full screen it walks the top nav.
+    let keys = if IN_PANE.with(|c| c.get()) { "  Tab ←/→ tabs · Esc close" } else { "  ←/→ tabs · Esc close" };
+    spans.push(Span::styled(keys, Style::default().fg(theme.dim)));
     Line::from(spans)
 }
 
@@ -2456,15 +2537,41 @@ fn kind_badge(theme: &Theme, kind: FileChangeKind) -> Span<'static> {
 }
 
 fn render_diff(frame: &mut Frame, area: Rect, theme: &Theme, diff: &DiffView, pending: &[LineComment]) {
+    // A single file leaves nothing to pick: the patch takes the whole width, and its title
+    // carries what the file list would have (the path, the counts, whether it's reviewed).
+    if diff.files.len() == 1 {
+        render_diff_patch(frame, area, theme, diff, pending);
+        return;
+    }
     // File list on the left; the patch on the right renders comment threads inline,
     // beneath the lines they anchor to (unanchored threads live on the Conversation tab).
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(44), Constraint::Min(20)])
+        .constraints([Constraint::Length(diff_files_width(diff, area.width)), Constraint::Min(20)])
         .split(area);
 
     render_diff_files(frame, cols[0], theme, diff);
     render_diff_patch(frame, cols[1], theme, diff, pending);
+}
+
+/// Narrowest and widest the diff's file list is drawn.
+const DIFF_FILES_MIN_W: u16 = 24;
+const DIFF_FILES_MAX_W: u16 = 40;
+
+/// The file list is as wide as its longest filename needs, within
+/// [`DIFF_FILES_MIN_W`]..=[`DIFF_FILES_MAX_W`] and never more than a quarter of the pane: the
+/// patch is what's being read. A longer name is cut, as a directory heading may be.
+fn diff_files_width(diff: &DiffView, pane_w: u16) -> u16 {
+    let name = diff.files.iter().map(|f| base_of(&f.path).chars().count()).max().unwrap_or(0);
+    let stats = diff.files.iter().map(|f| diff_stat(f).chars().count()).max().unwrap_or(0);
+    // Borders 2, highlight symbol 2, "[ ]" 3, badge 1, the name's two-space lead, and a
+    // column gap between each of the four cells.
+    let natural = (2 + 2 + 3 + 1 + 2 + name + stats + 3) as u16;
+    natural.clamp(DIFF_FILES_MIN_W, DIFF_FILES_MAX_W.min((pane_w / 4).max(DIFF_FILES_MIN_W)))
+}
+
+fn diff_stat(f: &FileChange) -> String {
+    format!("+{} -{}", f.additions, f.deletions)
 }
 
 /// The directory portion of a path (`""` for a root-level file).
@@ -2478,11 +2585,12 @@ fn base_of(path: &str) -> &str {
 }
 
 fn render_diff_files(frame: &mut Frame, area: Rect, theme: &Theme, diff: &DiffView) {
+    // The PR is named in the header above; a commit's diff says which commit.
     let scope = match &diff.commit_label {
         Some(l) => format!("commit {l}"),
-        None => diff.pr_label.clone(),
+        None => "Files".into(),
     };
-    let title = format!("{scope} · files · {}/{} reviewed", diff.viewed_count(), diff.files.len());
+    let title = format!("{scope} · {}/{} reviewed", diff.viewed_count(), diff.files.len());
     let block = section_block(theme, &title);
     if diff.files.is_empty() {
         empty(frame, area, theme, "No changed files.", block);
@@ -2520,11 +2628,12 @@ fn render_diff_files(frame: &mut Frame, area: Rect, theme: &Theme, diff: &DiffVi
             Cell::from(Span::styled(if viewed { "[x]" } else { "[ ]" }, Style::default().fg(theme.dim))),
             Cell::from(kind_badge(theme, f.kind)),
             Cell::from(Span::styled(format!("  {}", base_of(&f.path)), name_style)),
-            Cell::from(Span::styled(format!("+{} -{}", f.additions, f.deletions), Style::default().fg(theme.dim))),
+            Cell::from(Span::styled(diff_stat(f), Style::default().fg(theme.dim))),
         ]));
     }
 
-    let widths = [Constraint::Length(3), Constraint::Length(1), Constraint::Min(10), Constraint::Length(10)];
+    let stat_w = diff.files.iter().map(|f| diff_stat(f).chars().count()).max().unwrap_or(0) as u16;
+    let widths = [Constraint::Length(3), Constraint::Length(1), Constraint::Min(4), Constraint::Length(stat_w)];
     let table = Table::new(rows, widths)
         .block(block)
         .column_spacing(1)
@@ -2552,10 +2661,18 @@ fn render_diff_patch(frame: &mut Frame, area: Rect, theme: &Theme, diff: &DiffVi
 
     let patch_focus = diff.focus == DiffFocus::Patch;
     // In the line cursor, show where we are; otherwise just the file summary.
-    let title = match patch_focus.then(|| cursor_line_label(patch, diff.cursor)).flatten() {
+    let mut title = match patch_focus.then(|| cursor_line_label(patch, diff.cursor)).flatten() {
         Some(loc) => format!("{}  (+{} -{}) · {loc}", file.path, file.additions, file.deletions),
         None => format!("{}  (+{} -{})", file.path, file.additions, file.deletions),
     };
+    // Without a file list beside it, the title says what the list would have.
+    if diff.files.len() == 1 {
+        let mark = if diff.is_viewed(&file.path) { "[x]" } else { "[ ]" };
+        title = format!("{mark} {title}");
+        if let Some(l) = &diff.commit_label {
+            title.push_str(&format!(" · commit {l}"));
+        }
+    }
     let block = section_block(theme, &title);
 
     let inner_w = area.width.saturating_sub(2) as usize;
@@ -4325,16 +4442,16 @@ pub(crate) fn help_sections() -> Vec<(&'static str, Vec<(&'static str, &'static 
             "Global",
             vec![
                 ("1–4", "Jump to a tab"),
-                ("Tab  Shift-Tab", "Next / previous tab — from anywhere, an open item included"),
+                ("Tab  Shift-Tab", "Next / previous tab — from anywhere; a PR open in the pane walks its own tabs"),
                 ("↑/↓  k/j", "Move selection"),
                 ("Ctrl-K  Ctrl-P", "Command palette: search items, actions, views, settings, keys"),
                 ("i", "Notification inbox (mentions, reviews, CI, assignments)"),
                 ("B", "Open the web dashboard in your browser"),
                 ("F", "Give feedback through the GitHub issue form"),
-                ("↵  p", "Focus the preview pane (140+ cols); its keys then work, p returns"),
+                ("↵  p", "Open the selected item in the pane (140+ cols); Esc or p closes it"),
                 ("Click", "Select a tab or row; click it again to open (a diff line: comment)"),
                 ("Wheel", "Scroll the pane under the pointer · Shift-drag selects text"),
-                ("P", "Preview pane off / on for this section"),
+                ("P", "Preview while browsing, off / on for this section (Pipelines: on)"),
                 ("/", "Quick-filter the list"),
                 ("S", "Sort by column (re-pick flips direction)"),
                 ("g", "Repositories — which ones this section fetches from"),
@@ -5024,6 +5141,65 @@ mod tests {
         assert!(out.contains("src/"), "directory header");
         assert!(out.contains("[x]"), "a viewed file's checkbox is ticked");
         assert!(out.contains("[ ]"), "an unviewed file's checkbox is empty");
+    }
+
+    #[test]
+    fn a_single_file_diff_gives_the_patch_the_whole_width() {
+        use crate::app::Screen;
+        let file = FileChange {
+            path: "terraform/main.tf".into(),
+            kind: FileChangeKind::Modified,
+            additions: 49,
+            deletions: 0,
+            patch: Some("@@ -1,1 +1,2 @@\n one\n+two".into()),
+        };
+        let mut app = App::new("slate");
+        app.screen = Screen::PrView(Box::new(pr_view(3, vec![], vec![file])));
+        let out = render_to_string(&mut app, 120, 24);
+        assert!(!out.contains("reviewed"), "no file list to pick from");
+        assert!(out.contains("[ ] terraform/main.tf  (+49 -0)"), "the patch title says what the list would have");
+    }
+
+    #[test]
+    fn the_diff_file_list_is_sized_to_its_names_within_a_quarter_of_the_pane() {
+        let file = |p: &str| FileChange { path: p.into(), kind: FileChangeKind::Modified, additions: 49, deletions: 0, patch: None };
+        let mut diff = pr_view(3, vec![], vec![file("a/main.tf"), file("a/io.tf")]).diff;
+        // Borders, symbol, checkbox, badge, lead, "main.tf" and "+49 -0" with their gaps.
+        assert_eq!(diff_files_width(&diff, 200), 26, "as wide as the longest name needs");
+        assert_eq!(diff_files_width(&diff, 60), DIFF_FILES_MIN_W, "a quarter of a narrow pane, but never under the floor");
+        diff.files.push(file("a/an_uncommonly_long_module_file_name.tf"));
+        assert_eq!(diff_files_width(&diff, 200), DIFF_FILES_MAX_W, "a long name is cut at the ceiling");
+        assert_eq!(diff_files_width(&diff, 120), 30, "and at a quarter of the pane");
+    }
+
+    #[test]
+    fn the_pane_covers_the_list_without_moving_its_columns() {
+        let mut app = App::new("slate");
+        let mut pr = sample_pr();
+        pr.title = "Add idempotency keys to the payments API so retried charges never double-bill".into();
+        app.prs.push(crate::app::PrRow { connection_id: "c".into(), connection: "GH".into(), provider: ProviderType::GitHub, pr });
+        app.pr_state.select(Some(0));
+        app.screen = Screen::List;
+        let bare = render_to_rows(&mut app, 200, 24);
+
+        app.screen = Screen::PrView(Box::new(pr_view(0, vec![], vec![])));
+        app.preview_focus = true;
+        let open = render_to_rows(&mut app, 200, 24);
+
+        let header = |rows: &[String]| rows.iter().position(|r| r.contains("Title")).expect("the list's header row");
+        let (hb, ho) = (header(&bare), header(&open));
+        assert_eq!(hb, ho);
+        let cut = 200 - 200 * 70 / 100;
+        let left = |r: &String| r.chars().take(cut - 1).collect::<String>();
+        assert_eq!(left(&open[ho]), left(&bare[hb]), "the header keeps every column where it was");
+        assert!(open[ho - 1].contains("PR #42"), "the pane sits over the rest, framed on the list's top row");
+        assert_eq!(open[ho].chars().nth(cut - 1), Some('…'), "a row the pane cuts short says so");
+
+        // The selected title is longer than what shows, so it scrolls there.
+        let row = |app: &mut App| render_to_rows(app, 200, 24)[ho + 1].chars().take(cut - 1).collect::<String>();
+        let first = row(&mut app);
+        app.anim = 40;
+        assert_ne!(row(&mut app), first, "the cut title scrolls");
     }
 
     #[test]

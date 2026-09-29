@@ -901,7 +901,8 @@ pub struct App {
     pub should_quit: bool,
     /// The preview pane beside the section list, while the list is the screen.
     pub preview: Option<Preview>,
-    /// Per section, whether the user switched the preview off (`P`). On by default.
+    /// Per section, whether the list's automatic preview is off. `P` switches it; until the user
+    /// has, [`DEFAULT_PREVIEW_HIDDEN`] decides.
     pub preview_hidden: [bool; 3],
     /// True while the preview is focused: its view is `screen`, drawn beside the list.
     pub preview_focus: bool,
@@ -992,6 +993,11 @@ pub const PREVIEW_SETTLE_TICKS: u8 = 2;
 /// both halves would be too cramped to read.
 pub const PREVIEW_MIN_WIDTH: u16 = 140;
 
+/// Which sections' lists preview the selected row without being asked, until the user switches
+/// it with `P`. Pull requests and work items are opened to be read, so their lists keep the full
+/// width and Enter opens the pane; a pipeline run is glanced at, so its list previews as you move.
+pub const DEFAULT_PREVIEW_HIDDEN: [bool; 3] = [true, true, false];
+
 /// The unfocused preview beside a section list: the very view `Enter` would open (a
 /// [`Screen::PrView`], [`Screen::WiView`] or [`Screen::Pipeline`]), built from the row and the
 /// cache. Focusing it (`p`) makes that view the active screen, drawn in the same place, so every
@@ -1060,6 +1066,15 @@ pub struct DraftComment {
 }
 
 impl PrView {
+    /// Moves `delta` tabs along, wrapping. Changing tab resets the scroll (each tab starts at
+    /// the top), drops any patch line cursor, and restores the whole-PR diff on the Diff tab.
+    pub fn step_tab(&mut self, delta: isize) {
+        let n = PR_TABS.len() as isize;
+        self.tab = (self.tab as isize + delta).rem_euclid(n) as usize;
+        self.scroll = 0;
+        self.reset_diff_scope();
+    }
+
     /// Restores the whole-PR diff if the view was showing a single commit's changes.
     fn reset_diff_scope(&mut self) {
         self.diff.focus = DiffFocus::FileList;
@@ -2600,7 +2615,7 @@ impl App {
             last_refresh: Local::now(),
             should_quit: false,
             preview: None,
-            preview_hidden: [false; 3],
+            preview_hidden: DEFAULT_PREVIEW_HIDDEN,
             preview_focus: false,
             content_w: 0,
             log_inflight: None,
@@ -2990,6 +3005,7 @@ impl App {
         }
         let next = self.active_state().selected().map_or(0, |i| (i + 1) % len);
         self.active_state().select(Some(next));
+        self.anim = 0; // restart the title scroll on the newly-selected row
     }
 
     pub fn move_up(&mut self) {
@@ -2999,6 +3015,7 @@ impl App {
         }
         let next = self.active_state().selected().map_or(0, |i| (i + len - 1) % len);
         self.active_state().select(Some(next));
+        self.anim = 0; // restart the title scroll on the newly-selected row
     }
 
     /// Section indices currently shown in the tab bar, in order.
@@ -3472,14 +3489,25 @@ impl App {
 
     // ---- preview pane ----
 
-    /// Whether the section list shows the preview pane: on unless switched off for this
-    /// section, and only when the terminal is wide enough for both halves.
+    /// Whether the section list shows the preview pane unasked: on unless off for this section,
+    /// and only when the terminal is wide enough for both halves.
     pub fn preview_shown(&self) -> bool {
         self.active < 3 && !self.preview_hidden[self.active] && self.content_w >= PREVIEW_MIN_WIDTH
     }
 
-    /// Applies the persisted per-section preview switches at startup.
-    pub fn apply_preview_hidden(&mut self, hidden: &[Section]) {
+    /// Whether an item can open in the pane beside its list: a section list on a terminal wide
+    /// enough for both, whether or not that list previews unasked.
+    fn pane_fits(&self) -> bool {
+        self.active < 3 && self.content_w >= PREVIEW_MIN_WIDTH
+    }
+
+    /// Applies the persisted per-section preview switches at startup; `None` (never switched)
+    /// keeps [`DEFAULT_PREVIEW_HIDDEN`].
+    pub fn apply_preview_hidden(&mut self, hidden: Option<&[Section]>) {
+        let Some(hidden) = hidden else {
+            self.preview_hidden = DEFAULT_PREVIEW_HIDDEN;
+            return;
+        };
         self.preview_hidden = [false; 3];
         for section in hidden {
             self.preview_hidden[index_of(*section)] = true;
@@ -3654,48 +3682,56 @@ impl App {
         self.preview = Some(p);
     }
 
-    /// The preview's own keys. From the list, Enter (or `p`) focuses the pane — its view becomes
-    /// the screen, drawn in the same place, and the footer turns to that item's keys. With no
-    /// preview showing, Enter keeps opening the full-screen view. From a focused pane `p` hands
-    /// focus back, keeping the view (tab, scroll, buffered comments) as it was. `P` switches the
-    /// pane off or on for the section; pressed while focused, the view stays open full screen.
     /// Whether the Pipelines list cursor is on a group header rather than a run.
     pub fn pipe_head_selected(&self) -> bool {
         self.active == 2
             && self.pipe_state.selected().is_some_and(|sel| matches!(self.pipe_lines().get(sel), Some(PipeLine::Head(_))))
     }
 
-    /// Moves the preview's view into the screen, still drawn beside the list.
-    fn focus_preview(&mut self, deps: &AppDeps) {
-        let Some(mut p) = self.preview.take() else { return };
+    /// Moves the preview's view into the screen, still drawn beside the list. A list that
+    /// doesn't preview unasked builds the selected row's view here, so Enter opens the pane
+    /// either way. Returns whether there was a view to focus.
+    fn focus_preview(&mut self, deps: &AppDeps) -> bool {
+        if self.preview.is_none() && self.pane_fits() {
+            self.preview = self.build_selected_preview(deps).map(|(view, request)| Preview {
+                section: self.active,
+                key: request.key().to_owned(),
+                view,
+                request,
+                sent: false,
+                ticks: 0,
+            });
+        }
+        let Some(mut p) = self.preview.take() else { return false };
         // The view is the screen before its fetch goes out, so the fetch can see what it holds.
         self.screen = std::mem::replace(&mut p.view, Screen::List);
         if !p.sent {
             self.send_detail_request(deps, p.request.clone());
         }
         self.preview_focus = true;
+        self.anim = 0; // the list's cut title scrolls from its start
         // Esc from the focused pane returns to this list.
         self.lp_origin = false;
         self.from_inbox = false;
+        true
     }
 
+    /// The preview's own keys. From the list, Enter (or `p`) opens the selected item in the pane
+    /// — its view becomes the screen, drawn beside the list, and the footer turns to that item's
+    /// keys — whether or not the list was previewing it. Only a terminal too narrow for both
+    /// halves opens the full-screen view instead. From a focused pane `p` (or Esc) hands focus
+    /// back, keeping the view (tab, scroll, buffered comments) as it was for a list that
+    /// previews. `P` switches the automatic preview off or on for the section.
     async fn on_preview_key(&mut self, key: Key, deps: &AppDeps) -> bool {
         let on_list = matches!(self.screen, Screen::List);
         let focused = self.preview_focus && matches!(self.screen, Screen::PrView(_) | Screen::WiView(_) | Screen::Pipeline(_));
         match key {
             // On a pipeline group header Enter keeps expanding / collapsing the group; it is a
             // run row that Enter moves into the pane.
-            Key::Enter if on_list && self.preview.is_some() && !self.pipe_head_selected() => {
-                self.focus_preview(deps);
-                true
-            }
+            Key::Enter if on_list && !self.pipe_head_selected() => self.focus_preview(deps),
             Key::Char('p') if on_list => {
-                if self.preview.is_some() {
-                    self.focus_preview(deps);
-                } else if self.preview_hidden[self.active] {
-                    self.toast = Some("The preview is off here. P turns it on.".into());
-                } else if self.content_w < PREVIEW_MIN_WIDTH {
-                    self.toast = Some(format!("The preview needs a terminal at least {PREVIEW_MIN_WIDTH} columns wide."));
+                if !self.focus_preview(deps) && self.active < 3 && self.content_w < PREVIEW_MIN_WIDTH {
+                    self.toast = Some(format!("The pane needs a terminal at least {PREVIEW_MIN_WIDTH} columns wide."));
                 }
                 true
             }
@@ -3718,7 +3754,10 @@ impl App {
                 self.preview_focus = false;
                 let hidden: Vec<Section> = (0..3).filter(|&i| self.preview_hidden[i]).map(section_of).collect();
                 let _ = deps.config.set_preview_hidden(hidden).await;
-                self.toast = Some(if self.preview_hidden[section] { "Preview off. P turns it back on." } else { "Preview on." }.into());
+                self.toast = Some(
+                    if self.preview_hidden[section] { "Preview off: Enter opens the pane. P turns it back on." } else { "Preview on." }
+                        .into(),
+                );
                 true
             }
             _ => false,
@@ -3917,11 +3956,11 @@ impl App {
                 if self.selected().is_some() {
                     out.push(("Open selected in browser", c('o')));
                 }
-                if self.preview.is_some() {
-                    out.push(("Focus the preview pane", c('p')));
+                if self.selected().is_some() && self.pane_fits() {
+                    out.push(("Open in the pane", c('p')));
                 }
                 out.extend([
-                    ("Preview pane on / off", c('P')),
+                    ("Preview while browsing on / off", c('P')),
                     ("Choose visible tabs", c('v')),
                     ("Refresh", c('r')),
                     ("Cycle theme", c('t')),
@@ -4064,7 +4103,7 @@ impl App {
         }
         // A view focused from the list's preview pane: `on_preview_key` answers `p` / `P` first.
         if self.preview_focus && matches!(self.screen, Screen::PrView(_) | Screen::WiView(_) | Screen::Pipeline(_)) {
-            out.extend([("Back to the list", c('p')), ("Preview pane on / off", c('P'))]);
+            out.extend([("Back to the list", c('p')), ("Preview while browsing on / off", c('P'))]);
         }
         out
     }
@@ -5508,6 +5547,7 @@ impl App {
                     let next = step(self.selected_index(), len);
                     self.active_state().select(Some(next));
                     self.ensure_visible();
+                    self.anim = 0; // restart the title scroll on the newly-selected row
                 }
                 None
             }
@@ -5632,10 +5672,18 @@ impl App {
             return;
         }
 
-        // Tab always walks the tab strip — Command Center, then each visible section — from
-        // any screen, an open PR / work item / pipeline run included; Shift-Tab walks it
-        // backwards. Both wrap. The input-capturing modes (wizard, overlay, quick filter)
-        // return above, so Tab still reaches them.
+        // Tab walks the tab strip — Command Center, then each visible section — from any
+        // screen, an open PR / work item / pipeline run included; Shift-Tab walks it backwards.
+        // Both wrap. A PR open in the pane beside its list is the exception: there Tab walks the
+        // PR's own tabs, and Esc closes the pane to hand Tab back to the strip. The
+        // input-capturing modes (wizard, overlay, quick filter) return above, so Tab still
+        // reaches them.
+        if matches!(key, Key::Tab | Key::BackTab) && self.preview_focus {
+            if let Screen::PrView(v) = &mut self.screen {
+                v.step_tab(if key == Key::Tab { 1 } else { -1 });
+                return;
+            }
+        }
         if matches!(key, Key::Tab | Key::BackTab) {
             // Don't walk out from under unsubmitted line comments — same prompt as Esc.
             if matches!(&self.screen, Screen::PrView(v) if !v.pending.is_empty()) {
@@ -6291,20 +6339,9 @@ impl App {
         }
         let max = self.detail_scroll_max;
         let Screen::PrView(v) = &mut self.screen else { return };
-        let n = PR_TABS.len();
         match key {
-            // Changing tab resets the scroll (each tab starts at the top), drops any
-            // patch line cursor, and restores the whole-PR diff on the Diff tab.
-            Key::Left | Key::Char('h') => {
-                v.tab = (v.tab + n - 1) % n;
-                v.scroll = 0;
-                v.reset_diff_scope();
-            }
-            Key::Right | Key::Char('l') => {
-                v.tab = (v.tab + 1) % n;
-                v.scroll = 0;
-                v.reset_diff_scope();
-            }
+            Key::Left | Key::Char('h') => v.step_tab(-1),
+            Key::Right | Key::Char('l') => v.step_tab(1),
             // Enter on a file drops into a line cursor within its patch.
             Key::Enter if v.tab == 3 => v.diff.enter_patch(),
             // Diff-tab review ergonomics: mark viewed, jump between threads.
@@ -14166,6 +14203,7 @@ mod tests {
         app.screen = Screen::List;
         app.pr_state.select(Some(0));
         app.content_w = 150;
+        app.preview_hidden[0] = false; // PRs don't preview by default; these tests are about the preview
         app
     }
 
@@ -14239,7 +14277,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enter_focuses_the_preview_when_it_is_showing_and_opens_full_screen_when_not() {
+    async fn enter_focuses_the_preview_when_it_is_showing_and_opens_full_screen_only_when_narrow() {
         let deps = test_deps();
         let mut app = preview_app(&["1"]);
         app.settle_preview(&deps);
@@ -14248,10 +14286,43 @@ mod tests {
         assert!(matches!(app.screen, Screen::PrView(_)));
 
         let mut app = preview_app(&["1"]);
-        app.preview_hidden[0] = true;
+        app.content_w = PREVIEW_MIN_WIDTH - 1;
         app.on_key(Key::Enter, &deps).await;
-        assert!(!app.preview_focus, "no pane, so Enter opens the full view as before");
+        assert!(!app.preview_focus, "no room for the pane, so Enter opens the full view");
         assert!(matches!(app.screen, Screen::PrView(_)));
+    }
+
+    #[test]
+    fn prs_and_work_items_open_on_enter_while_pipelines_preview_unasked() {
+        let mut app = App::new("slate");
+        assert_eq!(app.preview_hidden, [true, true, false]);
+        app.apply_preview_hidden(Some(&[Section::Pipelines]));
+        assert_eq!(app.preview_hidden, [false, false, true], "a saved choice wins over the defaults");
+        app.apply_preview_hidden(Some(&[]));
+        assert_eq!(app.preview_hidden, [false; 3], "switched back on everywhere stays on");
+        app.apply_preview_hidden(None);
+        assert_eq!(app.preview_hidden, DEFAULT_PREVIEW_HIDDEN, "never switched: the defaults");
+    }
+
+    #[tokio::test]
+    async fn with_the_preview_off_enter_opens_the_pane_and_esc_closes_it() {
+        let deps = test_deps();
+        let mut app = preview_app(&["1", "2"]);
+        app.preview_hidden[0] = true;
+        app.settle_preview(&deps);
+        assert!(app.preview.is_none(), "the list keeps the full width while browsing");
+
+        app.on_key(Key::Down, &deps).await;
+        app.on_key(Key::Enter, &deps).await;
+        assert!(app.preview_focus, "Enter opens the pane beside the list");
+        let Screen::PrView(v) = &app.screen else { panic!("the pane holds the PR view") };
+        assert_eq!(v.pr.id, "2", "the row under the cursor");
+
+        app.on_key(Key::Escape, &deps).await;
+        app.settle_preview(&deps);
+        assert!(matches!(app.screen, Screen::List));
+        assert!(!app.preview_focus);
+        assert!(app.preview.is_none(), "Esc closes the pane rather than leaving a preview behind");
     }
 
     #[tokio::test]
@@ -14332,11 +14403,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tab_out_of_a_focused_preview_drops_focus() {
+    async fn tab_walks_a_pr_s_own_tabs_in_the_pane_and_the_strip_once_it_is_closed() {
         let deps = test_deps();
         let mut app = preview_app(&["1"]);
-        app.settle_preview(&deps);
-        app.on_key(Key::Char('p'), &deps).await;
+        app.on_key(Key::Enter, &deps).await;
+        let tab = |app: &App| match &app.screen {
+            Screen::PrView(v) => v.tab,
+            _ => panic!("the PR stays open in the pane"),
+        };
+        for want in [1, 2, 3, 0] {
+            app.on_key(Key::Tab, &deps).await;
+            assert_eq!(tab(&app), want, "Tab steps the PR's tabs and wraps");
+        }
+        app.on_key(Key::BackTab, &deps).await;
+        assert_eq!(tab(&app), 3, "Shift-Tab steps back, wrapping");
+        assert_eq!(app.active, 0, "the top nav hasn't moved");
+        assert!(app.preview_focus);
+
+        app.on_key(Key::Escape, &deps).await;
+        app.on_key(Key::Tab, &deps).await;
+        assert_eq!(app.active, 1, "with the pane closed, Tab moves the top nav");
+    }
+
+    #[tokio::test]
+    async fn tab_out_of_a_focused_pipeline_run_drops_focus() {
+        let deps = test_deps();
+        let mut app = App::new("slate");
+        app.pipes = vec![pipe_row("r1", PipelineRunStatus::Failed, false)];
+        app.active = 2;
+        app.screen = Screen::List;
+        app.pipe_group = PipeGroup::Off;
+        app.pipe_state.select(Some(0));
+        app.content_w = 150;
+        app.on_key(Key::Enter, &deps).await;
+        assert!(app.preview_focus, "the run opens in the pane");
+        // A run has no tabs of its own, so Tab keeps walking the top nav.
         app.on_key(Key::Tab, &deps).await;
         assert!(!app.preview_focus, "focus never outlives the focused view");
     }
@@ -14349,11 +14450,11 @@ mod tests {
         app.on_key(Key::Char('P'), &deps).await;
         assert!(app.preview_hidden[0]);
         assert!(app.preview.is_none());
-        assert_eq!(deps.config.snapshot().ui.preview_hidden, vec![Section::PullRequests]);
+        assert_eq!(deps.config.snapshot().ui.preview_hidden, Some(vec![Section::PullRequests, Section::WorkItems]));
 
         app.on_key(Key::Char('P'), &deps).await;
         assert!(!app.preview_hidden[0]);
-        assert!(deps.config.snapshot().ui.preview_hidden.is_empty());
+        assert_eq!(deps.config.snapshot().ui.preview_hidden, Some(vec![Section::WorkItems]), "saved, not left to the defaults");
         assert!(app.preview.is_some(), "back on, and rebuilt straight away");
     }
 
