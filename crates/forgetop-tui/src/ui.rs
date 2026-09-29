@@ -1382,7 +1382,7 @@ fn render_prs(frame: &mut Frame, area: Rect, app: &mut App) {
             NO_REPOS_HINT.to_string()
         } else if app.health.is_empty() {
             FIRST_RUN_HINT.to_string()
-        } else if app.loading {
+        } else if app.loading && !app.prs_landed {
             loading_msg(app, "Loading pull requests…")
         } else {
             "No pull requests. Press f to change filter, r to refresh.".to_string()
@@ -5644,6 +5644,34 @@ mod tests {
         let out = render_to_string(&mut app, 160, 24);
         assert!(out.contains("No repositories selected"), "says why the list is empty");
         assert!(!out.contains("No pull requests"), "and doesn't claim there are none");
+    }
+
+    #[test]
+    fn an_empty_view_stops_loading_once_the_pool_has_landed() {
+        // The rest of the refresh is still out, but the PR pool is in: an empty view now means
+        // there are none, and a spinner would say they are still coming.
+        let mut app = App::new("slate");
+        app.screen = Screen::List;
+        app.health.push(forgetop_core::service::ConnectionHealth {
+            connection: forgetop_core::provider::Connection {
+                id: "c".into(),
+                provider_type: ProviderType::GitHub,
+                display_name: "GH".into(),
+                base_url: None,
+                organization: None,
+                project: None,
+                repository: None,
+                username: None,
+                credential_ref: None,
+                repo_scope: None,
+            },
+            healthy: true,
+        });
+        app.loading = true;
+        assert!(render_to_string(&mut app, 160, 24).contains("Loading pull requests"));
+        app.prs_landed = true;
+        let out = render_to_string(&mut app, 160, 24);
+        assert!(out.contains("No pull requests") && !out.contains("Loading pull requests"));
     }
 
     #[test]
