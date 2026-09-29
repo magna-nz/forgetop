@@ -23,6 +23,11 @@ Fixed
   so the pipeline view lists them instead of "No stages reported". A pipeline with no stages of its
   own shows its jobs under "Jobs". ([#209](https://github.com/magna-nz/forgetop/pull/209))
 
+Docs
+
+- Re-recorded the README GIFs against 1.5.0, and added short demos beside each feature on the
+  docs site. ([#210](https://github.com/magna-nz/forgetop/pull/210))
+
 ## 1.5.0 — 2026-09-29
 
 Added
