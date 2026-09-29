@@ -2161,14 +2161,15 @@ fn base_footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
             if merged { vec![("R", "revert")] } else { vec![("a", "approve"), ("x", "reject"), ("m", "merge")] };
         return if v.tab == 3 {
             if v.diff.focus == DiffFocus::Patch {
-                let mut keys = vec![("↑↓", "line"), ("]/[", "threads"), ("c", "comment"), ("r", "reply")];
+                let mut keys = vec![("↑↓", "line"), ("v", "mark viewed"), ("]/[", "threads"), ("c", "comment"), ("r", "reply")];
                 if !v.pending.is_empty() {
                     keys.push(("s", "submit review"));
                 }
                 keys.extend([("PgUp/Dn", "jump"), ("Esc", "files"), ("o", "open")]);
                 keys
             } else {
-                let mut keys = vec![("←→", "tabs"), ("↑↓", "file"), ("↵", "open file"), ("PgUp/Dn", "scroll")];
+                // `v` ticks the file's `[ ]` to `[x]`; without the hint the box reads as decoration.
+                let mut keys = vec![("←→", "tabs"), ("↑↓", "file"), ("↵", "open file"), ("v", "mark viewed"), ("PgUp/Dn", "scroll")];
                 keys.extend(acts);
                 keys.extend([("o", "open"), ("Esc", "back")]);
                 keys
@@ -7527,5 +7528,26 @@ mod tests {
             assert!(!out.contains("(on a group)Expand"), "width {width}");
             assert!(out.contains("Tab  Shift-Tab"), "width {width}");
         }
+    }
+
+    /// The Diff tab's `[ ]` boxes tick with `v`, and the footer says so — in the file list and
+    /// in the patch's line cursor, where `v` works too.
+    #[test]
+    fn the_diff_footer_says_how_to_mark_a_file_viewed() {
+        use crate::app::Screen;
+        let mut app = App::new("slate");
+        app.screen = Screen::PrView(Box::new(pr_view(0, vec![], vec![])));
+        if let Screen::PrView(v) = &mut app.screen {
+            v.tab = 3;
+        }
+        assert!(base_footer_keys(&app).contains(&("v", "mark viewed")), "file list");
+        if let Screen::PrView(v) = &mut app.screen {
+            v.diff.focus = DiffFocus::Patch;
+        }
+        assert!(base_footer_keys(&app).contains(&("v", "mark viewed")), "patch line cursor");
+        if let Screen::PrView(v) = &mut app.screen {
+            v.tab = 0;
+        }
+        assert!(!base_footer_keys(&app).contains(&("v", "mark viewed")), "only on the Diff tab");
     }
 }
