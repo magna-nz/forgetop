@@ -15064,7 +15064,7 @@ mod tests {
         let mut app = App::new("slate");
         // Global `r` refreshes a list; in a PR view `r` replies. The Refresh row must not reply.
         app.screen = open_pr_screen(PullRequestStatus::Open);
-        palette_run(&mut app, "?cycle theme", &deps).await;
+        palette_run(&mut app, "?refresh", &deps).await;
         assert!(app.overlay.is_none(), "Refresh from a PR view must not open the reply input");
         assert!(app.toast.as_deref().is_some_and(|t| t.starts_with("Press r")));
 
