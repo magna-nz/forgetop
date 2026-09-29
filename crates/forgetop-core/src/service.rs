@@ -302,6 +302,12 @@ impl ConfigService {
         self.persist(cfg).await
     }
 
+    pub async fn set_hidden_columns(&self, hidden: [Vec<String>; 3]) -> Result<()> {
+        let mut cfg = self.snapshot();
+        cfg.ui.hidden_columns = Some(hidden);
+        self.persist(cfg).await
+    }
+
     pub async fn set_dismissed_launchpad_items(&self, dismissed: Vec<String>) -> Result<()> {
         let mut cfg = self.snapshot();
         cfg.ui.dismissed_launchpad_items = dismissed;
@@ -555,23 +561,22 @@ impl SectionService {
     }
 }
 
-/// How many repositories a brand-new connection starts scoped to — the most recently active
-/// ones. Small on purpose: the cost of a refresh is one list call per repository, and the user
-/// widens it from the scope picker.
-pub const DEFAULT_REPO_SCOPE_SIZE: usize = 5;
-
-/// Gives a freshly-added connection a starting repository scope: the most recently active
-/// repositories its credentials can reach, capped at [`DEFAULT_REPO_SCOPE_SIZE`].
+/// Gives a freshly-added connection a starting repository scope: none of them, chosen.
+///
+/// Discovery still runs, so the repositories the credentials reach are known up front and the
+/// user picks from them ("0 of 38"); nothing is fetched until they do. Returns that discovery
+/// page, for a frontend to show the count without discovering again.
 ///
 /// Best-effort and deliberately inert on anything already established — it only acts when the
 /// scope has never been set *and* no legacy single repository was supplied, so it can neither
 /// overwrite a user's choice nor change an existing connection. If discovery fails or returns
-/// nothing, the scope stays `None` and the connection behaves exactly as it did before.
+/// nothing, the scope stays `None` and the connection behaves exactly as it did before: an
+/// empty scope is only a useful starting point when there is something to pick.
 pub async fn seed_default_repo_scope(
     config: &ConfigService,
     sections: &SectionService,
     connection_id: &str,
-) -> Result<Option<Vec<String>>> {
+) -> Result<Option<RepositoryPage>> {
     let Some(conn) = config.snapshot().find_connection(connection_id).cloned() else { return Ok(None) };
     if conn.repo_scope.is_some() || conn.repository.is_some() {
         return Ok(None);
@@ -580,9 +585,8 @@ pub async fn seed_default_repo_scope(
     if page.repositories.is_empty() {
         return Ok(None);
     }
-    let scope: Vec<String> = page.repositories.into_iter().take(DEFAULT_REPO_SCOPE_SIZE).collect();
-    config.set_repo_scope(connection_id, Some(scope.clone())).await?;
-    Ok(Some(scope))
+    config.set_repo_scope(connection_id, Some(Vec::new())).await?;
+    Ok(Some(page))
 }
 
 /// A configured connection and whether it's currently reachable/authed.

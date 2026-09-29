@@ -805,7 +805,7 @@ impl ProviderFactory for BitbucketFactory {
             let encoded = base64::engine::general_purpose::STANDARD.encode(format!("{username}:{app_password}"));
             headers.insert(AUTHORIZATION, format!("Basic {encoded}").parse().map_err(prov)?);
         }
-        let http = reqwest::Client::builder().default_headers(headers).build().map_err(prov)?;
+        let http = crate::http_client(headers).map_err(prov)?;
 
         let client = Arc::new(BitbucketClient {
             http,

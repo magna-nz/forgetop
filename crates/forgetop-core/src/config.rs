@@ -104,6 +104,11 @@ pub struct UiState {
     /// or "off" for the ungrouped list. Unknown values fall back to the default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pipeline_group: Option<String>,
+    /// Columns the user has switched off in the terminal's list tables, by header name
+    /// ("Provider", "Author", …), one list per section in tab order (Pull Requests, Work Items,
+    /// Pipelines). `None` means never chosen, and each frontend's defaults apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hidden_columns: Option<[Vec<String>; 3]>,
     /// Which desktop notifications are enabled. Defaults to all on.
     #[serde(default)]
     pub notifications: NotificationPrefs,

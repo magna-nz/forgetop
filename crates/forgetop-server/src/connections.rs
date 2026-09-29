@@ -184,9 +184,9 @@ pub async fn save(config: &ConfigService, sections: &SectionService, req: SaveCo
         result.map_err(|e| e.to_string())?;
     }
 
-    // A brand-new account connection with nothing picked starts on its most recently active
-    // repositories rather than fetching nothing. Best-effort by design: if discovery fails the
-    // scope stays unset and the connection behaves exactly as it did before.
+    // A brand-new account connection starts with no repositories chosen once discovery has
+    // found some: the user picks, and nothing is fetched until they do. Best-effort by design:
+    // if discovery fails the scope stays unset and the connection behaves exactly as before.
     let _ = service::seed_default_repo_scope(config, sections, &id).await;
 
     Ok(id)

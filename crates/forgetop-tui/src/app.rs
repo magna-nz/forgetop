@@ -832,6 +832,8 @@ pub struct App {
     /// Work-item state names hidden from the list (provider-specific strings).
     /// Persisted; anything not listed is shown.
     pub wi_hidden_states: HashSet<String>,
+    /// List-table columns switched off per section, by header name (`c` picks). Persisted.
+    pub hidden_cols: [Vec<String>; 3],
     /// Per-view sort (column key + direction); `None` = provider order. Persisted.
     pub pr_sort: Option<SortPref>,
     pub wi_sort: Option<SortPref>,
@@ -2606,6 +2608,7 @@ impl App {
             filters: [String::new(), String::new(), String::new()],
             filtering: false,
             wi_hidden_states: HashSet::new(),
+            hidden_cols: default_hidden_columns(),
             pr_sort: None,
             wi_sort: None,
             pipe_sort: None,
@@ -3119,6 +3122,22 @@ impl App {
         }
     }
 
+    /// Applies persisted column choices at startup; `None` (never chosen) keeps the defaults.
+    pub fn apply_hidden_columns(&mut self, hidden: Option<[Vec<String>; 3]>) {
+        self.hidden_cols = hidden.unwrap_or_else(default_hidden_columns);
+    }
+
+    /// Nothing chosen to fetch from: every connection's scope emptied, or repositories
+    /// discovered and none picked yet (how a new connection starts).
+    pub fn no_repos_chosen(&self, section: usize) -> bool {
+        self.repo_scope[section].as_ref().is_some_and(|s| s.none_selected || s.selected == 0)
+    }
+
+    /// Whether the `name`d column of `section`'s table is switched on.
+    pub fn col_shown(&self, section: usize, name: &str) -> bool {
+        !self.hidden_cols[section].iter().any(|h| h == name)
+    }
+
     /// Applies persisted hidden work-item-state preferences at startup.
     pub fn apply_hidden_work_item_states(&mut self, hidden: &[String]) {
         self.wi_hidden_states = hidden.iter().cloned().collect();
@@ -3155,10 +3174,13 @@ impl App {
     /// Applies persisted saved views at startup, seeding defaults for empty sections.
     pub fn apply_views(&mut self, pr: Vec<SavedView>, wi: Vec<SavedView>, pipe: Vec<SavedView>) {
         self.views = [
-            if pr.is_empty() { default_views(0) } else { pr },
+            if pr.is_empty() { default_views(0) } else { reorder_legacy_pr_views(pr) },
             if wi.is_empty() { default_views(1) } else { wi },
             if pipe.is_empty() { default_views(2) } else { pipe },
         ];
+        // Land on the first view. Only its base filter: a persisted section sort outranks the
+        // view's (and the default views carry none), so this must not go through `apply_view`.
+        self.pr_filter = parse_pr_filter(self.views[0].first().and_then(|v| v.filter.as_deref()));
     }
 
     /// The active view for a section, if any.
@@ -3846,6 +3868,10 @@ impl App {
     async fn goto_pr_section(&mut self, filter: PullRequestFilter, show_merged: bool, deps: &AppDeps) {
         self.goto_section(Section::PullRequests);
         self.pr_filter = filter;
+        // Highlight the view that matches, so the bar doesn't claim a different one.
+        if let Some(i) = self.views[0].iter().position(|v| parse_pr_filter(v.filter.as_deref()) == filter) {
+            self.view_idx[0] = i;
+        }
         if show_merged {
             self.pr_shown_statuses.insert(PullRequestStatus::Merged);
         }
@@ -3977,7 +4003,11 @@ impl App {
                         ("Expand every group", c('Z')),
                     ]),
                 }
-                out.extend([("Sort by column", c('S')), ("Repositories to fetch", c('g'))]);
+                out.extend([("Sort by column", c('S')), ("Choose columns", c('c'))]);
+                // On Pipelines `w` is the pipeline picker once repositories are chosen.
+                if s != 2 || self.no_repos_chosen(2) {
+                    out.push(("Repositories to fetch", c('w')));
+                }
                 if self.views[s].len() > 1 {
                     out.extend([("Previous saved view", c('[')), ("Next saved view", c(']'))]);
                 }
@@ -4755,8 +4785,10 @@ impl App {
         if sections_ok.all() {
             self.data_age = None;
         }
+        // Merged, not replaced: a connection added while this fetch was out has its page
+        // already, and this fetch's catalog was taken before it existed.
         if let Some(catalog) = r.catalog {
-            self.repo_catalog = catalog;
+            self.repo_catalog.extend(catalog);
         }
         self.pipe_catalog.extend(r.pipe_catalog);
         // A connection landed while we were waiting on the browser — the reason for the
@@ -5213,10 +5245,19 @@ impl App {
     /// which rows a view should show.
     fn refresh_derived_prs(&mut self, deps: &AppDeps) {
         self.prs = self.derive_pr_rows(self.pr_filter, self.pr_wants_completed());
+        // Before the first fetch lands the pool is empty, so every view would derive to nothing.
+        // Switching views then is exactly when the cache is the better answer: it holds each
+        // view's last rows under its own key, the same ones `seed_from_cache` paints at launch.
+        if !self.pr_pool_loaded {
+            if let Some(entry) = deps.cache.get::<Vec<PrRow>>(&prs_cache_key(self.pr_filter, self.pr_wants_completed())) {
+                self.prs = entry.value;
+            }
+        }
         // Until a fetch has actually landed there is nothing to derive the Launchpad from, and
         // deriving anyway would blank the rows `seed_from_cache` painted — the blank landing
-        // screen the seeding exists to prevent. The list above is still cleared, because an
-        // empty list under the new heading is honest where carrying the old view's rows is not.
+        // screen the seeding exists to prevent. The list above shows the new view's own cached
+        // rows, or nothing: an empty list under the new heading is honest where carrying the
+        // old view's rows is not.
         if self.pr_pool_loaded {
             self.lp_prs_mine = self.derive_pr_rows(PullRequestFilter::Mine, true);
             self.lp_prs_review = self.derive_pr_rows(PullRequestFilter::ReviewRequested, false);
@@ -6533,6 +6574,8 @@ impl App {
             'V' => self.open_save_view(),
             'X' => self.open_delete_view(),
             // Filter by status (PRs) / by state (Work Items) — 'f' = filter on both tabs.
+            // `c` = which **c**olumns the list table draws.
+            'c' => self.open_columns_toggle(),
             'f' if self.active == 0 => self.open_pr_status_toggle(),
             'f' if self.active == 1 => self.open_wi_states_toggle(),
             // Pipeline trigger (Pipelines tab).
@@ -6541,17 +6584,18 @@ impl App {
             // scope: Azure groups pipelines by project and folder, not by repository, so
             // "which pipelines" is the question the user is actually answering. (`p` is taken by
             // the preview focus.)
-            'w' if self.active == 2 => self.open_pipeline_subs_from_list(deps).await,
-            // `G` cycles how the Pipelines list is **G**rouped. Lowercase `g` is taken by the
-            // repo scope picker below, which is a different axis (what is fetched, not how
-            // what was fetched is arranged).
+            // Until repositories are chosen there are no pipelines to pick from — discovery fans
+            // out over the same scope — so `w` opens the repository picker instead.
+            'w' if self.active == 2 && !self.no_repos_chosen(2) => self.open_pipeline_subs_from_list(deps).await,
+            // `G` cycles how the Pipelines list is **G**rouped.
             'G' if self.active == 2 => self.cycle_pipe_group(deps).await,
             ' ' if self.active == 2 => self.enter_pipeline_line(deps),
             'z' if self.active == 2 => self.set_all_pipe_groups(false),
             'Z' if self.active == 2 => self.set_all_pipe_groups(true),
-            // `g` = which **g**it repositories this section's connections fetch from. Unlike the
-            // `f` filter, this gates what is *fetched*, not what is shown from what was fetched.
-            'g' => self.open_repo_scope(deps).await,
+            // `w` = which repositories this section **w**atches — the same key Pipelines uses for
+            // which pipelines it watches. Unlike the `f` filter, this gates what is *fetched*,
+            // not what is shown from what was fetched.
+            'w' => self.open_repo_scope(deps).await,
             // Work-item state/comment (u / c) and PR write actions live inside the
             // opened item's view — press Enter first.
             _ => {}
@@ -7979,13 +8023,17 @@ impl App {
             return;
         }
 
-        // A brand-new account connection with nothing picked starts on its most recently active
-        // repositories rather than fetching nothing. Best-effort: if discovery fails the scope
-        // stays unset and the connection behaves exactly as a single-repository one did.
+        // A brand-new account connection starts with no repositories chosen, but with the ones
+        // its credentials reach already discovered, so the header reads "0 of 38" and the list
+        // asks for a pick. Best-effort: if discovery fails the scope stays unset and the
+        // connection behaves exactly as a single-repository one did.
         let seeded = forgetop_core::service::seed_default_repo_scope(&deps.config, &deps.sections, &id)
             .await
             .ok()
             .flatten();
+        if let Some(page) = &seeded {
+            self.repo_catalog.insert(id.clone(), page.clone());
+        }
 
         // Bind every section that was ticked. One failing section does not abandon the rest:
         // the connection already exists, so the useful outcome is "bound what it could" plus
@@ -8017,7 +8065,11 @@ impl App {
             n => format!(" · {n} sections"),
         };
         self.toast = Some(match &seeded {
-            Some(scope) => format!("Added {} connection · {} repositories{sections}", provider.as_str(), scope.len()),
+            Some(page) => format!(
+                "Added {} connection{sections} · {} repositories found — press w to choose",
+                provider.as_str(),
+                page.repositories.len()
+            ),
             None => format!("Added {} connection{sections}", provider.as_str()),
         });
         self.request_reload(deps);
@@ -8057,6 +8109,33 @@ impl App {
             .collect();
         self.overlay =
             Some(Overlay::Toggle { title: "Show statuses".into(), kind: ToggleKind::PrStatuses, min_one: true, items, selected: 0, filter: None });
+    }
+
+    /// Opens the "Columns" checklist for the active list: ticked = shown. The status and title
+    /// columns aren't offered — a row without them has nothing left to read.
+    fn open_columns_toggle(&mut self) {
+        let section = self.active;
+        let items = LIST_COLUMNS[section]
+            .iter()
+            .map(|&c| ToggleItem { on: self.col_shown(section, c), id: c.into(), label: c.into() })
+            .collect();
+        self.overlay = Some(Overlay::Toggle {
+            title: "Columns".into(),
+            kind: ToggleKind::Columns { section },
+            min_one: false,
+            items,
+            selected: 0,
+            filter: None,
+        });
+    }
+
+    /// `ids` are the columns left ticked; every other offered column is hidden.
+    async fn apply_columns(&mut self, section: usize, shown: Vec<String>, deps: &AppDeps) {
+        self.hidden_cols[section] =
+            LIST_COLUMNS[section].iter().filter(|c| !shown.iter().any(|s| s == *c)).map(|c| c.to_string()).collect();
+        if let Err(e) = deps.config.set_hidden_columns(self.hidden_cols.clone()).await {
+            self.toast = Some(format!("Couldn't save: {e}"));
+        }
     }
 
     /// `ids` are the statuses left ticked. Rebuilds the shown set and repaints.
@@ -8099,6 +8178,9 @@ impl App {
             }
             ToggleKind::PrStatuses => {
                 self.apply_pr_statuses(ids, deps);
+            }
+            ToggleKind::Columns { section } => {
+                self.apply_columns(section, ids, deps).await;
             }
             ToggleKind::Notifications => {
                 self.apply_notifications(ids, deps).await;
@@ -9342,6 +9424,24 @@ fn pipe_matches(p: &PipeRow, q: &str) -> bool {
 
 // ---- sorting ----
 
+/// The columns `c` can switch off, per section, by header name. Status and title always show.
+pub const LIST_COLUMNS: [&[&str]; 3] = [
+    &["Provider", "Repository", "#", "Author", "State", "±", "Updated"],
+    &["Provider", "ID", "Type", "Assignee", "Updated"],
+    &["Provider", "Repository", "Runs", "Branch", "Commit", "Started", "Approval"],
+];
+
+/// Provider starts off everywhere: the repository already says where a row lives, and the
+/// provider is a column of the same word down most accounts.
+fn default_hidden_columns() -> [Vec<String>; 3] {
+    std::array::from_fn(|_| vec!["Provider".to_string()])
+}
+
+/// The display label of `section`'s active sort, for the list title ("· by Updated").
+pub fn sort_label(section: usize, pref: &SortPref) -> Option<&'static str> {
+    sort_cols(section).iter().find(|c| c.key == pref.key).map(|c| c.label)
+}
+
 /// One sortable column: a stable `key` (persisted) and a display `label`.
 pub struct SortCol {
     pub key: &'static str,
@@ -10101,6 +10201,19 @@ fn pr_filter_key(f: PullRequestFilter) -> &'static str {
 }
 
 /// The built-in views seeded for a section that has none saved.
+/// Saved PR views that still open with the old stock trio (All, Mine, Review) get it in the
+/// current order. Saving any view persists the whole list, stock views included, so without
+/// this everyone who ever saved one would keep landing on All.
+fn reorder_legacy_pr_views(mut views: Vec<SavedView>) -> Vec<SavedView> {
+    let stock = |v: &SavedView, name: &str| {
+        v.name == name && v.filter.as_deref() == Some(&name.to_lowercase()) && v.query.is_empty() && v.sort.is_none()
+    };
+    if views.len() >= 3 && stock(&views[0], "All") && stock(&views[1], "Mine") && stock(&views[2], "Review") {
+        views[..3].rotate_left(1);
+    }
+    views
+}
+
 fn default_views(section: usize) -> Vec<SavedView> {
     let v = |name: &str, filter: Option<&str>| SavedView {
         name: name.into(),
@@ -10110,7 +10223,9 @@ fn default_views(section: usize) -> Vec<SavedView> {
         hidden_states: Vec::new(),
     };
     match section {
-        0 => vec![v("All", Some("all")), v("Mine", Some("mine")), v("Review", Some("review"))],
+        // Yours first, and where the tab lands: the two narrow views are what you open it for,
+        // and both are derived from the one pool All is, so none costs a fetch of its own.
+        0 => vec![v("Mine", Some("mine")), v("Review", Some("review")), v("All", Some("all"))],
         _ => vec![v("All", None)],
     }
 }
@@ -11163,6 +11278,26 @@ mod tests {
         assert_eq!(app.lp_prs_mine.len(), 1, "the seeded Launchpad survives a view switch");
         assert_eq!(app.lp_prs_review.len(), 1);
         assert!(app.prs.is_empty(), "the list itself is empty rather than mislabelled");
+    }
+
+    /// Switching view before the first fetch lands shows that view's cached rows rather than
+    /// an empty list under a spinner — the pool they would be derived from isn't there yet.
+    #[test]
+    fn a_view_switch_before_the_first_fetch_shows_that_views_cached_rows() {
+        let dir = std::env::temp_dir().join(format!("forgetop-view-cache-{}", std::process::id()));
+        let cache = Arc::new(CacheStore::new(dir.join("cache.json")));
+        cache.put(&prs_cache_key(PullRequestFilter::Mine, false), &vec![pr_row(pr(None))], Utc::now());
+        let deps = deps_with_cache(cache);
+        let mut app = App::new("slate");
+
+        app.pr_filter = PullRequestFilter::Mine;
+        app.refresh_derived_prs(&deps);
+        assert_eq!(app.prs.len(), 1, "Mine's cached rows are on screen");
+
+        app.pr_filter = PullRequestFilter::ReviewRequested;
+        app.refresh_derived_prs(&deps);
+        assert!(app.prs.is_empty(), "a view with nothing cached stays empty, never another view's rows");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// The cache key must describe the rows actually written. They follow the screen, so a
@@ -12273,7 +12408,7 @@ mod tests {
 
     #[test]
     fn saved_views_defaults_and_seeding() {
-        assert_eq!(default_views(0).iter().map(|v| v.name.clone()).collect::<Vec<_>>(), vec!["All", "Mine", "Review"]);
+        assert_eq!(default_views(0).iter().map(|v| v.name.clone()).collect::<Vec<_>>(), vec!["Mine", "Review", "All"]);
         assert_eq!(default_views(1).len(), 1);
         assert_eq!(parse_pr_filter(Some("mine")), PullRequestFilter::Mine);
         assert_eq!(parse_pr_filter(Some("review")), PullRequestFilter::ReviewRequested);
@@ -12283,6 +12418,17 @@ mod tests {
         let mut app = App::new("slate");
         app.apply_views(vec![], vec![], vec![]);
         assert_eq!(app.views[0].len(), 3);
+        assert_eq!(app.pr_filter, PullRequestFilter::Mine, "the tab lands on the first view, Mine");
+
+        // A saved list that still opens with the old stock order is moved to the new one;
+        // anything the user built after it stays where it was.
+        let old: Vec<SavedView> = ["all", "mine", "review"]
+            .iter()
+            .map(|f| SavedView { name: format!("{}{}", f[..1].to_uppercase(), &f[1..]), filter: Some(f.to_string()), query: String::new(), sort: None, hidden_states: vec![] })
+            .chain([saved_view("Hot")])
+            .collect();
+        app.apply_views(old, vec![], vec![]);
+        assert_eq!(app.views[0].iter().map(|v| v.name.as_str()).collect::<Vec<_>>(), vec!["Mine", "Review", "All", "Hot"]);
         assert_eq!(app.views[1].len(), 1);
 
         let custom = vec![SavedView { name: "Stale".into(), filter: None, query: "old".into(), sort: None, hidden_states: vec![] }];

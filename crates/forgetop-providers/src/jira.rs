@@ -325,7 +325,7 @@ impl ProviderFactory for JiraFactory {
             headers.insert(AUTHORIZATION, format!("Basic {encoded}").parse().map_err(prov)?);
         }
         headers.insert(reqwest::header::ACCEPT, "application/json".parse().unwrap());
-        let http = reqwest::Client::builder().default_headers(headers).build().map_err(prov)?;
+        let http = crate::http_client(headers).map_err(prov)?;
 
         let site = site.trim_end_matches('/').to_string();
         let api = format!("{site}/rest/api/2");

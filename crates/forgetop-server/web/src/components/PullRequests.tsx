@@ -78,6 +78,7 @@ export function PullRequests() {
           icon="◍"
           title="No repositories selected"
           sub="This connection spans your whole account — choose which repositories it fetches from."
+          action={scope.control}
         />
       ) : !data || data.length === 0 ? (
         <StateCard icon={EMPTY[view].icon} title={EMPTY[view].title} sub={EMPTY[view].sub} />

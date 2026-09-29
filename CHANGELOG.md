@@ -9,6 +9,34 @@ Adding a release: one `## <version> — <date>` section, a line per user-visible
 and the pull request each one came from. `git log v<previous>..HEAD --merges` lists the
 candidates.
 
+## Unreleased
+
+Added
+
+- **Choose the list's columns.** In the terminal UI, `c` opens a checklist of the list's columns
+  on Pull Requests, Work Items and Pipelines. Space toggles a column and Enter applies. Provider
+  starts off, and your choice is saved.
+- **Line numbers in diffs.** Every line of a pull request diff is numbered. Added and unchanged
+  lines show their new line number, and removed lines show their old one.
+
+Changed
+
+- **Pull Requests open on Mine.** The views now run Mine, Review, All, and the tab lands on Mine.
+  A saved list that still starts with the old All, Mine, Review order is reordered.
+- **New connections start with no repositories chosen.** The repositories a new connection can
+  reach are still discovered, so the header reads `Repos · 0 of 38`. The list asks you to pick,
+  and nothing is fetched until you do. The dashboard's empty state now has the picker too.
+- **`w` chooses repositories** (it was `g`), matching Pipelines, where `w` chooses pipelines. It
+  is now in the footer. Sorted lists name their sort in the title (`· by Updated`), and a list on
+  its own gets the highlighted title that Pipelines has.
+
+Fixed
+
+- **A stalled request no longer leaves a list loading forever.** Provider requests now give up
+  after 10 seconds without a connection or 30 seconds of silence. Before this, one hung request
+  blocked every later refresh, and a view such as Mine never left "Loading…". Switching views
+  before the first refresh lands now shows that view's cached rows.
+
 ## 1.4.0 — 2026-09-29
 
 Changed
