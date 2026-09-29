@@ -1118,6 +1118,9 @@ impl WorkItemSource for AzureWi {
 
 #[async_trait]
 impl PipelineSource for AzurePipe {
+    async fn current_user(&self) -> Result<Option<String>> {
+        self.0.self_id().await
+    }
     async fn discover(&self) -> Result<Vec<PipelineDefinition>> {
         // Build definitions belong to a *project*, not a repository. Fanning out over the scope's
         // repositories would return every definition once per repository in its project; the

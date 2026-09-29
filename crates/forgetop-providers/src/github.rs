@@ -994,6 +994,9 @@ impl WorkItemSource for GitHubWi {
 
 #[async_trait]
 impl PipelineSource for GitHubPipe {
+    async fn current_user(&self) -> Result<Option<String>> {
+        self.0.self_login().await
+    }
     async fn discover(&self) -> Result<Vec<PipelineDefinition>> {
         let scope = &self.0.scope;
         Ok(fan_out(scope, "github.pipelines.discover", |repo| async move {

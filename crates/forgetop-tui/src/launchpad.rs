@@ -38,6 +38,7 @@ pub fn build(prs_review: &[PrRow], prs_mine: &[PrRow], wis: &[WiRow], pipes: &[P
             run: r.run.clone(),
             definition_name: r.definition_name.clone(),
             awaiting_approval: r.awaiting_approval,
+            triggered_by_me: r.triggered_by_me,
         })
         .collect();
 

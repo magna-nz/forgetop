@@ -894,6 +894,9 @@ impl WorkItemSource for GitLabWi {
 
 #[async_trait]
 impl PipelineSource for GitLabPipe {
+    async fn current_user(&self) -> Result<Option<String>> {
+        self.0.self_username().await
+    }
     async fn discover(&self) -> Result<Vec<PipelineDefinition>> {
         // GitLab has no named pipeline definitions — model each project's CI as one.
         Ok(self

@@ -1,6 +1,6 @@
 //! Client-side pull-request filtering (Mine / ReviewRequested) given the current user.
 
-use crate::domain::{PullRequest, User};
+use crate::domain::{PipelineRun, PullRequest, User};
 use crate::provider::PullRequestFilter;
 
 pub fn apply_pull_request_filter(prs: Vec<PullRequest>, filter: PullRequestFilter, me: Option<&str>) -> Vec<PullRequest> {
@@ -24,6 +24,18 @@ pub fn pull_request_matches(pr: &PullRequest, filter: PullRequestFilter, me: Opt
         PullRequestFilter::All => true,
         PullRequestFilter::Mine => is_user(&pr.author, me),
         PullRequestFilter::ReviewRequested => pr.reviewers.iter().any(|r| is_user(&r.user, me)),
+    }
+}
+
+/// Whether the signed-in user `me` started `run`.
+///
+/// Stricter than [`pull_request_matches`]: an unknown identity (`me` of `None`) or a run with no
+/// recorded triggerer (a scheduled or cron run) is *not* yours, so it stays out of the Command
+/// Center rather than filling it with everyone's builds.
+pub fn run_triggered_by(run: &PipelineRun, me: Option<&str>) -> bool {
+    match (me, &run.triggered_by) {
+        (Some(me), Some(who)) => is_user(who, me),
+        _ => false,
     }
 }
 
@@ -99,5 +111,33 @@ mod tests {
         let result = apply_pull_request_filter(prs, PullRequestFilter::ReviewRequested, Some("alice"));
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].id, "2");
+    }
+
+    #[test]
+    fn run_is_yours_only_when_you_started_it() {
+        let run = |who: Option<User>| PipelineRun {
+            id: "r".into(),
+            repository: None,
+            definition_id: "ci".into(),
+            number: None,
+            name: None,
+            title: None,
+            status: PipelineRunStatus::Succeeded,
+            triggered_by: who,
+            branch: None,
+            commit_sha: None,
+            started_at: None,
+            finished_at: None,
+            url: None,
+            stages: vec![],
+            event: None,
+            attempt: None,
+            pull_request: None,
+        };
+        assert!(run_triggered_by(&run(Some(user("me", "alice"))), Some("alice")));
+        assert!(!run_triggered_by(&run(Some(user("them", "bob"))), Some("alice")));
+        // A scheduled run has no triggerer, and an unknown identity owns nothing.
+        assert!(!run_triggered_by(&run(None), Some("alice")));
+        assert!(!run_triggered_by(&run(Some(user("me", "alice"))), None));
     }
 }

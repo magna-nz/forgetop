@@ -409,7 +409,7 @@ pub struct WiInput {
     pub wi: WorkItem,
 }
 
-/// A pipeline run plus its connection and the two derived flags the classifier needs.
+/// A pipeline run plus its connection and the derived flags the classifier needs.
 pub struct PipeInput {
     pub connection_id: String,
     pub connection: String,
@@ -417,6 +417,10 @@ pub struct PipeInput {
     pub run: PipelineRun,
     pub definition_name: Option<String>,
     pub awaiting_approval: bool,
+    /// You started this run — see [`run_triggered_by`](crate::filter::run_triggered_by). Only
+    /// your runs are listed or flagged as needing a fix; an approval gate you can respond to
+    /// surfaces whoever started the run, since the run is waiting on you.
+    pub triggered_by_me: bool,
 }
 
 fn bucket_rank(b: Bucket) -> usize {
@@ -512,12 +516,17 @@ pub fn build(prs_review: &[PrInput], prs_mine: &[PrInput], wis: &[WiInput], pipe
         item: EntryItem::Wi(r.wi.clone()),
     }));
     // Pipelines: a left action bucket when they need you (approval gate / failed), and the
-    // recent-runs reference list on the right.
+    // recent-runs reference list on the right. Only runs you started count — other people's
+    // failures aren't yours to fix — except a gate you can approve, which is blocked on you.
     for r in pipes {
-        if let Some(bucket) = classify_pipe(r.run.status, r.awaiting_approval) {
-            out.push(pipe_entry(r, bucket));
+        match classify_pipe(r.run.status, r.awaiting_approval) {
+            Some(Bucket::ApprovalsWaiting) => out.push(pipe_entry(r, Bucket::ApprovalsWaiting)),
+            Some(bucket) if r.triggered_by_me => out.push(pipe_entry(r, bucket)),
+            _ => {}
         }
-        out.push(pipe_entry(r, Bucket::RecentPipelines));
+        if r.triggered_by_me {
+            out.push(pipe_entry(r, Bucket::RecentPipelines));
+        }
     }
 
     // Bucket by urgency; within a bucket oldest-first, except the recent reference lists
@@ -619,6 +628,7 @@ mod tests {
             provider: ProviderType::GitHub,
             definition_name: Some("CI Build".into()),
             awaiting_approval: awaiting,
+            triggered_by_me: true,
             run: PipelineRun {
                 event: None,
                 attempt: None,
@@ -824,7 +834,27 @@ mod tests {
     }
 
     #[test]
-    fn build_lists_every_run_in_recent_pipelines() {
+    fn build_lists_only_your_runs() {
+        let theirs = |status, awaiting| PipeInput { triggered_by_me: false, ..pipe(status, awaiting) };
+        let out = build(
+            &[],
+            &[],
+            &[],
+            &[
+                theirs(PipelineRunStatus::Failed, false),
+                theirs(PipelineRunStatus::Succeeded, false),
+                theirs(PipelineRunStatus::Running, true),
+            ],
+        )
+        .entries;
+        let buckets: Vec<Bucket> = out.iter().map(|e| e.bucket).collect();
+        // Someone else's gate you can approve is still waiting on you, but their failures and
+        // their run history aren't yours.
+        assert_eq!(buckets, vec![Bucket::ApprovalsWaiting]);
+    }
+
+    #[test]
+    fn build_lists_every_run_of_yours_in_recent_pipelines() {
         let out = build(&[], &[], &[], &[pipe(PipelineRunStatus::Failed, false), pipe(PipelineRunStatus::Succeeded, false)]).entries;
         let buckets: Vec<Bucket> = out.iter().map(|e| e.bucket).collect();
         assert_eq!(buckets.iter().filter(|&&b| b == Bucket::RecentPipelines).count(), 2);
