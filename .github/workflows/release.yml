@@ -220,10 +220,15 @@ jobs:
   host:
     needs:
       - plan
+      - custom-integration
       - build-local-artifacts
       - build-global-artifacts
     # Only run if we're "publishing", and only if plan, local and global didn't fail (skipped is fine)
-    if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
+    # HAND-EDITED (forgetop): the integration gate must also have passed. A failed gate skips
+    # the builds, and "skipped is fine" would otherwise publish a release with no binaries.
+    # `allow-dirty = ["ci"]` in dist-workspace.toml keeps dist from rejecting this edit;
+    # re-apply it after any `dist init` / `dist generate`.
+    if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && needs.custom-integration.result == 'success' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     runs-on: "ubuntu-22.04"

@@ -19,6 +19,16 @@ pub struct GhRaw {
     repo: String,
 }
 
+/// Every Contents-API write is a commit to the test repo's default branch, which other CI
+/// runs (a PR's and main's, say) commit fixtures to as well. When two land at once GitHub
+/// rejects the loser with 409 "is at <sha> but expected <sha>" — the branch moved, nothing
+/// is wrong with the write — so it is retried against the new head.
+const BRANCH_RACE_RETRIES: u32 = 5;
+
+async fn branch_race_backoff(attempt: u32) {
+    tokio::time::sleep(std::time::Duration::from_millis(500 * u64::from(attempt))).await;
+}
+
 impl GhRaw {
     /// Builds from `FORGETOP_IT_GITHUB_*`, or `None` when creds are absent (skip).
     pub fn from_env() -> Option<Self> {
@@ -87,25 +97,45 @@ impl GhRaw {
     /// Creates or updates a file on `branch`. Returns the new content sha.
     pub async fn put_file(&self, path: &str, content: &str, branch: &str, message: &str) -> String {
         let encoded = base64::engine::general_purpose::STANDARD.encode(content.as_bytes());
-        // Include the existing sha if the file already exists (update vs create).
-        let existing = self.raw(Method::GET, &self.url(&format!("/contents/{path}?ref={branch}")), None).await;
-        let mut body = json!({ "message": message, "content": encoded, "branch": branch });
-        if existing.0.is_success() {
-            if let Ok(v) = serde_json::from_str::<Value>(&existing.1) {
-                if let Some(sha) = v["sha"].as_str() {
-                    body["sha"] = json!(sha);
-                }
+        let url = self.url(&format!("/contents/{path}"));
+        let mut attempt = 0;
+        loop {
+            let mut body = json!({ "message": message, "content": encoded, "branch": branch });
+            // Include the existing sha if the file already exists (update vs create).
+            if let Some(sha) = self.file_sha(path, branch).await {
+                body["sha"] = json!(sha);
             }
+            let (status, text) = self.raw(Method::PUT, &url, Some(body)).await;
+            if status == reqwest::StatusCode::CONFLICT && attempt < BRANCH_RACE_RETRIES {
+                attempt += 1;
+                branch_race_backoff(attempt).await;
+                continue;
+            }
+            assert!(status.is_success(), "PUT {url} -> {status}: {text}");
+            let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+            return v["content"]["sha"].as_str().unwrap_or_default().to_string();
         }
-        let v = self.send(Method::PUT, &self.url(&format!("/contents/{path}")), Some(body)).await;
-        v["content"]["sha"].as_str().unwrap_or_default().to_string()
     }
 
     pub async fn delete_file(&self, path: &str, branch: &str, message: &str) {
-        let existing = self.raw(Method::GET, &self.url(&format!("/contents/{path}?ref={branch}")), None).await;
-        let Ok(v) = serde_json::from_str::<Value>(&existing.1) else { return };
-        let Some(sha) = v["sha"].as_str() else { return };
-        self.try_send(Method::DELETE, &self.url(&format!("/contents/{path}")), Some(json!({ "message": message, "sha": sha, "branch": branch }))).await;
+        let url = self.url(&format!("/contents/{path}"));
+        for attempt in 0..=BRANCH_RACE_RETRIES {
+            let Some(sha) = self.file_sha(path, branch).await else { return };
+            let (status, _) = self.raw(Method::DELETE, &url, Some(json!({ "message": message, "sha": sha, "branch": branch }))).await;
+            if status != reqwest::StatusCode::CONFLICT {
+                return;
+            }
+            branch_race_backoff(attempt + 1).await;
+        }
+    }
+
+    /// The blob sha of `path` on `branch`, if the file exists there.
+    async fn file_sha(&self, path: &str, branch: &str) -> Option<String> {
+        let (status, text) = self.raw(Method::GET, &self.url(&format!("/contents/{path}?ref={branch}")), None).await;
+        if !status.is_success() {
+            return None;
+        }
+        serde_json::from_str::<Value>(&text).ok()?["sha"].as_str().map(str::to_string)
     }
 
     /// Opens a PR; returns its number (the adapter's PR id).
