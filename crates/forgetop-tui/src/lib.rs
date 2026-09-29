@@ -49,7 +49,7 @@ pub async fn run(deps: AppDeps, theme_name: &str, dashboard_url: Option<String>)
     app.dashboard_url = dashboard_url;
     app.apply_hidden_sections(&deps.config.snapshot().ui.hidden_sections);
     app.apply_hidden_work_item_states(&deps.config.snapshot().ui.hidden_work_item_states);
-    app.apply_preview_hidden(&deps.config.snapshot().ui.preview_hidden);
+    app.apply_preview_hidden(deps.config.snapshot().ui.preview_hidden.as_deref());
     app.apply_dismissed_launchpad_items(&deps.config.snapshot().ui.dismissed_launchpad_items);
     app.apply_dismissed_notifications(&deps.config.snapshot().ui.dismissed_notifications);
     {

@@ -9,6 +9,22 @@ Adding a release: one `## <version> — <date>` section, a line per user-visible
 and the pull request each one came from. `git log v<previous>..HEAD --merges` lists the
 candidates.
 
+## 1.4.0 — 2026-09-29
+
+Changed
+
+- **The item pane opens on Enter.** In the terminal UI, the Pull Requests and Work Items lists
+  keep their full width. Enter opens the selected item in a pane over the right of the list, and
+  Esc closes it. Pipelines still preview the selected run as you browse. `P` switches the automatic
+  preview on or off per section, and your choice is saved. ([#205](https://github.com/magna-nz/forgetop/pull/205))
+- **The list stays put under the pane.** Opening or closing the pane never moves a column.
+  Rows it covers end in `…`, and the selected title scrolls so it can be read in full. ([#205](https://github.com/magna-nz/forgetop/pull/205))
+- **Tab walks a PR's tabs in the pane.** With a pull request open in the pane, Tab and Shift-Tab
+  move between Conversation, Commits, Checks and Diff. Tab moves between sections again once the
+  pane is closed. ([#205](https://github.com/magna-nz/forgetop/pull/205))
+- **More room for the diff.** The diff's file list is only as wide as its filenames need. A
+  single-file diff drops the list and shows the file in the patch title. ([#205](https://github.com/magna-nz/forgetop/pull/205))
+
 ## 1.3.2 — 2026-09-25
 
 Added
