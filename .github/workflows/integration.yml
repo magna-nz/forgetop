@@ -1,11 +1,14 @@
 name: Integration
 
-# Live provider integration tests. Runs on every (non-fork) PR, on push to main,
-# and on release tags as a gate. A nightly run sweeps any leaked fixtures.
+# Live provider integration tests. Runs on every (non-fork) PR and on push to main, and
+# gates releases: the Release workflow calls it on a `v*` tag before it builds or
+# publishes anything. A nightly run sweeps any leaked fixtures.
+#
+# Not triggered by the tag push itself: that ran a second copy alongside Release's gate,
+# both committing fixtures to the shared test repo at once, and the race failed the gate.
 on:
   push:
     branches: [main]
-    tags: ["v*"]
   pull_request:
   schedule:
     - cron: "0 3 * * *" # nightly cleanup sweep

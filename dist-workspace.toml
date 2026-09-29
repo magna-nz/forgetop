@@ -15,6 +15,11 @@ tap = "magna-nz/homebrew-tap"
 publish-jobs = ["homebrew", "./publish-crates"]
 # Plan jobs to run in CI
 plan-jobs = ["./integration"]
+# release.yml is hand-edited so `host` also requires the integration gate to have passed —
+# dist's generated `if:` treats skipped builds as fine, and a failed gate skips them, which
+# published a v1.4.0 release with no binaries. Without this, `dist plan` rejects the edit.
+# Re-apply the edit (search release.yml for HAND-EDITED) after any `dist init`.
+allow-dirty = ["ci"]
 # Target platforms to build apps for (Rust target-triple syntax)
 targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
 # Path that installers should place binaries in
