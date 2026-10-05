@@ -9,6 +9,16 @@ Adding a release: one `## <version> — <date>` section, a line per user-visible
 and the pull request each one came from. `git log v<previous>..HEAD --merges` lists the
 candidates.
 
+## 1.5.2 — 2026-10-05
+
+Fixed
+
+- **Azure DevOps runs waiting on an approval show as running.** A run parked on a gate (say,
+  before a Prod stage) dropped out of the pipeline list, which showed the previous run's ✓
+  instead. In-progress and queued runs now come back with the rest. Stages Azure skipped show as
+  skipped (⊘) rather than failed (✗), and a stage that passed with warnings shows ▲.
+  ([#214](https://github.com/magna-nz/forgetop/pull/214))
+
 ## 1.5.1 — 2026-09-29
 
 Fixed
