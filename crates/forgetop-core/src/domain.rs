@@ -70,10 +70,35 @@ pub enum WorkItemStateCategory {
 pub enum PipelineRunStatus {
     Queued,
     Running,
+    /// In flight but parked: held on an approval gate, so nothing is running and nothing will
+    /// until someone acts. A stage behind the gate reads this too.
+    Waiting,
     Succeeded,
     PartiallySucceeded,
     Failed,
     Canceled,
+    /// Never ran — skipped by its condition, or because something before it failed. Not a
+    /// failure in its own right.
+    Skipped,
+}
+
+impl PipelineRunStatus {
+    /// Still in flight: queued, running, or waiting on a gate. Only these can be cancelled or
+    /// held by an approval.
+    pub fn is_active(self) -> bool {
+        matches!(self, Self::Queued | Self::Running | Self::Waiting)
+    }
+
+    /// The status to show for a run that may be held on approvals. An active run with a pending
+    /// gate is [`Waiting`](Self::Waiting) — the run list can't see the gate, only the approvals
+    /// lookup can, so every surface asks here rather than deciding for itself.
+    pub fn with_pending_approval(self, pending: bool) -> Self {
+        if pending && self.is_active() {
+            Self::Waiting
+        } else {
+            self
+        }
+    }
 }
 
 /// Roll-up CI/check state for a pull request.
@@ -494,4 +519,38 @@ pub struct Notification {
     pub url: Option<String>,
     pub unread: bool,
     pub updated_at: Option<DateTime<Utc>>,
+}
+
+#[cfg(test)]
+mod pipeline_status_tests {
+    use super::PipelineRunStatus::{self, *};
+
+    #[test]
+    fn waiting_is_in_flight_and_skipped_is_not() {
+        for s in [Queued, Running, Waiting] {
+            assert!(s.is_active(), "{s:?}");
+        }
+        for s in [Succeeded, PartiallySucceeded, Failed, Canceled, Skipped] {
+            assert!(!s.is_active(), "{s:?}");
+        }
+    }
+
+    #[test]
+    fn a_pending_gate_holds_only_an_active_run() {
+        assert_eq!(Running.with_pending_approval(true), Waiting);
+        assert_eq!(Queued.with_pending_approval(true), Waiting);
+        assert_eq!(Running.with_pending_approval(false), Running);
+        // A finished run's leftover gate doesn't rewrite its outcome.
+        assert_eq!(Succeeded.with_pending_approval(true), Succeeded);
+        assert_eq!(Failed.with_pending_approval(true), Failed);
+    }
+
+    #[test]
+    fn new_states_round_trip_by_name() {
+        for s in [Waiting, Skipped] {
+            let json = serde_json::to_string(&s).unwrap();
+            assert_eq!(serde_json::from_str::<PipelineRunStatus>(&json).unwrap(), s);
+        }
+        assert_eq!(serde_json::to_string(&Waiting).unwrap(), "\"Waiting\"");
+    }
 }

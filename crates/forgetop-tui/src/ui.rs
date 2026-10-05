@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use forgetop_core::runlog;
 
 use crate::app::{
-    dashboard_target, is_active, is_error_line, match_ranges, pipe_definition_name, run_secs, App, ArtifactsPanel, ConfigView,
+    dashboard_target, is_error_line, match_ranges, pipe_definition_name, run_secs, App, ArtifactsPanel, ConfigView,
     DiffFocus, DiffView, FlatNode, Hit, LogRow, LogView, LpSlot, PipeGroup, PipeHead, PipeLine, PipeRow, PipelineView, PrView,
     RunHistory, Screen, WiView, LOG_SPLIT_MIN_WIDTH, LOG_TREE_WIDTH, PR_TABS, TABS,
 };
@@ -684,6 +684,8 @@ fn pipe_status_label(status: PipelineRunStatus) -> &'static str {
         PipelineRunStatus::PartiallySucceeded => "partial",
         PipelineRunStatus::Failed => "failed",
         PipelineRunStatus::Canceled => "canceled",
+        PipelineRunStatus::Waiting => "waiting",
+        PipelineRunStatus::Skipped => "skipped",
     }
 }
 
@@ -1701,6 +1703,8 @@ fn pipe_status_word(status: PipelineRunStatus) -> &'static str {
         PipelineRunStatus::Canceled => "Canceled",
         PipelineRunStatus::Succeeded => "Succeeded",
         PipelineRunStatus::Failed => "Failed",
+        PipelineRunStatus::Waiting => "Waiting",
+        PipelineRunStatus::Skipped => "Skipped",
     }
 }
 
@@ -2375,7 +2379,7 @@ fn base_footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
             }
             return vec![("↵", enter), ("w", "logs"), ("Esc/L", "close logs"), ("q", "back")];
         }
-        let finished = !is_active(v.run.status);
+        let finished = !v.run.status.is_active();
         let mut keys = if v.problem_focus {
             vec![("↑↓", "problem"), ("↵", "jump to line"), ("e", "tree")]
         } else {
@@ -3278,7 +3282,7 @@ fn pipeline_header(theme: &Theme, view: &PipelineView, anim: usize, now: DateTim
     if let Some(who) = &run.triggered_by {
         parts.push(who.display_name.clone());
     }
-    let active = is_active(run.status);
+    let active = run.status.is_active();
     if active {
         parts.extend(ago("started", run.started_at));
     } else {
@@ -3399,7 +3403,7 @@ fn render_history(frame: &mut Frame, area: Rect, theme: &Theme, h: &RunHistory, 
     if let Some(median) = h.median_secs {
         first.push(Span::styled("   median ", dim));
         first.push(Span::styled(fmt_secs(median), Style::default().fg(theme.fg)));
-        let this = h.current.and_then(|i| h.entries.get(i)).filter(|e| !is_active(e.status)).and_then(|e| e.secs);
+        let this = h.current.and_then(|i| h.entries.get(i)).filter(|e| !e.status.is_active()).and_then(|e| e.secs);
         if let Some(this) = this.filter(|_| median > 0) {
             let pct = ((this - median) as f64 / median as f64 * 100.0).round() as i64;
             first.push(Span::styled(" · this run ", dim));
@@ -3549,7 +3553,7 @@ fn first_word(name: &str) -> &str {
 /// matrix (`build (…)`) starts after that matrix, and any other once the running jobs are done.
 fn job_ghosts(view: &PipelineView, now: DateTime<Utc>) -> HashMap<(usize, usize), Ghost> {
     let mut out = HashMap::new();
-    if !is_active(view.run.status) || view.estimates.jobs.is_empty() {
+    if !view.run.status.is_active() || view.estimates.jobs.is_empty() {
         return out;
     }
     let secs = |s: i64| chrono::Duration::seconds(s);
@@ -3678,7 +3682,7 @@ fn render_timeline(
     now: DateTime<Utc>,
 ) -> bool {
     let run = &view.run;
-    let active = is_active(run.status);
+    let active = run.status.is_active();
     let jobs = || run.stages.iter().flat_map(|s| &s.jobs);
     // While a rerun of failed jobs is in flight, the jobs it kept still carry the earlier
     // attempt's times; the axis starts at this attempt, and their bars (from before it) drop out.

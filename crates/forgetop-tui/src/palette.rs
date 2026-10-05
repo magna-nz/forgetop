@@ -341,13 +341,13 @@ pub fn pipe_candidate(row: &PipeRow) -> PaletteItem {
     let run_name = row.run.name.as_deref().unwrap_or("");
     let branch = row.run.branch.as_deref().unwrap_or("");
     // Mirrors Theme::pipeline_color: succeeded green, running blue, failed red,
-    // partial yellow, queued/canceled grey.
+    // partial/waiting yellow, queued/canceled/skipped grey.
     let tone = match row.run.status {
         PipelineRunStatus::Succeeded => Tone::Good,
         PipelineRunStatus::Running => Tone::Active,
         PipelineRunStatus::Failed => Tone::Bad,
-        PipelineRunStatus::PartiallySucceeded => Tone::Warn,
-        PipelineRunStatus::Queued | PipelineRunStatus::Canceled => Tone::Neutral,
+        PipelineRunStatus::PartiallySucceeded | PipelineRunStatus::Waiting => Tone::Warn,
+        PipelineRunStatus::Queued | PipelineRunStatus::Canceled | PipelineRunStatus::Skipped => Tone::Neutral,
     };
     PaletteItem {
         subtitle: subtitle(&[run_name, branch, &row.connection]),

@@ -106,15 +106,16 @@ impl Theme {
         THEMES[(idx + 1) % THEMES.len()]
     }
 
-    /// Green = succeeded, blue = actively running, red = failed (needs a look), grey =
-    /// waiting/neutral (queued, canceled). Yellow is the one partial-success exception.
+    /// Green = succeeded, blue = actively running, red = failed (needs a look), yellow = held
+    /// (partial success, or parked on an approval gate), grey = neutral (queued, canceled,
+    /// skipped).
     pub fn pipeline_color(&self, status: PipelineRunStatus) -> Color {
         match status {
             PipelineRunStatus::Succeeded => self.green,
             PipelineRunStatus::Running => self.blue,
             PipelineRunStatus::Failed => self.red,
-            PipelineRunStatus::PartiallySucceeded => self.yellow,
-            PipelineRunStatus::Queued | PipelineRunStatus::Canceled => self.dim,
+            PipelineRunStatus::PartiallySucceeded | PipelineRunStatus::Waiting => self.yellow,
+            PipelineRunStatus::Queued | PipelineRunStatus::Canceled | PipelineRunStatus::Skipped => self.dim,
         }
     }
 
@@ -135,7 +136,8 @@ pub fn pipeline_icon(status: PipelineRunStatus) -> &'static str {
         PipelineRunStatus::Queued => "◔",
         PipelineRunStatus::Failed => "✗",
         PipelineRunStatus::PartiallySucceeded => "▲",
-        PipelineRunStatus::Canceled => "⊘",
+        PipelineRunStatus::Canceled | PipelineRunStatus::Skipped => "⊘",
+        PipelineRunStatus::Waiting => "⏸",
     }
 }
 

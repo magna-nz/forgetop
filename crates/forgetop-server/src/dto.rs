@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use forgetop_core::domain::{
     CheckRun, CommentThread, Commit, FileChange, Notification, PipelineApproval, PipelineRun,
-    PipelineRunStatus, ProviderType, PullRequest, PullRequestStatus, TimelineEvent, TimelineEventKind, WorkItem,
+    ProviderType, PullRequest, PullRequestStatus, TimelineEvent, TimelineEventKind, WorkItem,
 };
 use forgetop_core::filter::run_triggered_by;
 use forgetop_core::launchpad::{self, EntryItem, PipeInput, PrInput, WiInput};
@@ -172,9 +172,9 @@ pub async fn pipelines(sections: &SectionService) -> Vec<PipeRow> {
             let supports = feed.source.supports_approvals();
             for result in feed.list_runs(&defs).await {
                 if let Ok(runs) = result.inspect_err(|_| log_fetch_failure("dashboard.pipelines.list")) {
-                    for run in runs {
+                    for mut run in runs {
                         // Only in-flight runs can be waiting on a gate — bound the extra calls.
-                        let approvals = if supports && is_active(run.status) {
+                        let approvals = if supports && run.status.is_active() {
                             feed.source
                                 .pending_approvals(&run.item_ref())
                                 .await
@@ -183,6 +183,7 @@ pub async fn pipelines(sections: &SectionService) -> Vec<PipeRow> {
                         } else {
                             Vec::new()
                         };
+                        run.status = run.status.with_pending_approval(!approvals.is_empty());
                         out.push(PipeRow {
                             connection_id: feed.connection.connection_id().to_string(),
                             connection: feed.connection.display_name().to_string(),
@@ -240,10 +241,6 @@ pub struct LaunchpadRow {
     pub provider: ProviderType,
     #[serde(flatten)]
     pub item: LaunchpadItem,
-}
-
-fn is_active(status: PipelineRunStatus) -> bool {
-    matches!(status, PipelineRunStatus::Queued | PipelineRunStatus::Running)
 }
 
 /// The query behind every Command Center PR fetch. It **decorates**, for two separate reasons —
@@ -326,18 +323,19 @@ async fn pipe_inputs(sections: &SectionService) -> Vec<PipeInput> {
                 .unwrap_or_default();
             for result in feed.list_runs(&defs).await {
                 if let Ok(runs) = result.inspect_err(|_| log_fetch_failure("dashboard.launchpad.pipelines")) {
-                    for run in runs {
-                        let awaiting_approval = supports
-                            && is_active(run.status)
-                            && feed
-                                .source
+                    for mut run in runs {
+                        let approvals = if supports && run.status.is_active() {
+                            feed.source
                                 .pending_approvals(&run.item_ref())
                                 .await
-                                .inspect_err(|_| {
-                                    log_fetch_failure("dashboard.launchpad.pipeline_approvals")
-                                })
-                                .map(|a| a.iter().any(|x| x.can_respond))
-                                .unwrap_or(false);
+                                .inspect_err(|_| log_fetch_failure("dashboard.launchpad.pipeline_approvals"))
+                                .unwrap_or_default()
+                        } else {
+                            Vec::new()
+                        };
+                        // Any pending gate holds the run; only one you can answer puts it in your queue.
+                        run.status = run.status.with_pending_approval(!approvals.is_empty());
+                        let awaiting_approval = approvals.iter().any(|x| x.can_respond);
                         out.push(PipeInput {
                             connection_id: feed.connection.connection_id().to_string(),
                             connection: feed.connection.display_name().to_string(),
@@ -576,9 +574,9 @@ pub async fn pipe_source(sections: &SectionService, conn: &str) -> Option<Arc<dy
 
 pub async fn pipeline_detail(sections: &SectionService, conn: &str, run: &ItemRef) -> Option<PipelineDetail> {
     let source = pipe_source(sections, conn).await?;
-    let run = source.get_run(run).await.inspect_err(|_| log_fetch_failure("dashboard.pipeline_detail.get")).ok()?;
+    let mut run = source.get_run(run).await.inspect_err(|_| log_fetch_failure("dashboard.pipeline_detail.get")).ok()?;
     // Only in-flight runs can be waiting on a gate — mirror the list endpoint's bound.
-    let approvals = if source.supports_approvals() && is_active(run.status) {
+    let approvals = if source.supports_approvals() && run.status.is_active() {
         source
             .pending_approvals(&run.item_ref())
             .await
@@ -587,6 +585,7 @@ pub async fn pipeline_detail(sections: &SectionService, conn: &str, run: &ItemRe
     } else {
         Vec::new()
     };
+    run.status = run.status.with_pending_approval(!approvals.is_empty());
     Some(PipelineDetail { run, approvals })
 }
 

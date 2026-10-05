@@ -11,7 +11,7 @@ export type WorkItemStateCategory =
   | "Started"
   | "Completed"
   | "Canceled";
-export type PipelineRunStatus = "Queued" | "Running" | "Succeeded" | "PartiallySucceeded" | "Failed" | "Canceled";
+export type PipelineRunStatus = "Queued" | "Running" | "Waiting" | "Succeeded" | "PartiallySucceeded" | "Failed" | "Canceled" | "Skipped";
 export type CheckStatus = "None" | "Pending" | "Passed" | "Failed";
 export type MergeableState = "Unknown" | "Mergeable" | "Blocked" | "Conflicting";
 export type NotificationKind =

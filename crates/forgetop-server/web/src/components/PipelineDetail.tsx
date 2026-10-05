@@ -116,12 +116,12 @@ function PipelineDetailPanel({ pipeRef, onClose }: { pipeRef: PipeRef; onClose: 
             </div>
           )}
 
-          {(data.approvals.length > 0 || run.status === "Running" || run.status === "Queued") && (
+          {(data.approvals.length > 0 || run.status === "Running" || run.status === "Queued" || run.status === "Waiting") && (
             <div className="flex flex-wrap items-center gap-2 rounded-lg px-3 py-2.5" style={{ background: "var(--card)", border: "1px solid var(--border)" }}>
               {data.approvals.map((g) => (
                 <Gate key={g.id} gate={g} />
               ))}
-              {(run.status === "Running" || run.status === "Queued") && <ActBtn label="■ Cancel" color="var(--red)" disabled={busy} onClick={cancel} />}
+              {(run.status === "Running" || run.status === "Queued" || run.status === "Waiting") && <ActBtn label="■ Cancel" color="var(--red)" disabled={busy} onClick={cancel} />}
             </div>
           )}
 

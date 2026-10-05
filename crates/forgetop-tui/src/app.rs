@@ -1266,7 +1266,7 @@ pub fn run_secs(run: &PipelineRun, now: DateTime<Utc>) -> Option<i64> {
     let start = run.started_at?;
     let end = match run.finished_at {
         Some(f) => f,
-        None if is_active(run.status) => now,
+        None if run.status.is_active() => now,
         None => return None,
     };
     Some((end - start).num_seconds().max(0))
@@ -2146,7 +2146,7 @@ impl PipelineView {
     /// Takes the problems and capabilities a detail carries.
     fn apply_extras(&mut self, detail: &PipelineDetail) {
         // An in-flight run's problems are the last attempt's; they come back once it finishes.
-        self.annotations = if is_active(detail.run.status) { Vec::new() } else { detail.annotations.clone() };
+        self.annotations = if detail.run.status.is_active() { Vec::new() } else { detail.annotations.clone() };
         if self.problem_sel >= self.annotations.len() {
             self.problem_sel = self.annotations.len().saturating_sub(1);
         }
@@ -2230,7 +2230,7 @@ impl PipelineView {
     pub fn log_target_active(&self) -> bool {
         let Some(log) = &self.logs else { return false };
         let job = self.run.stages.iter().flat_map(|s| &s.jobs).find(|j| j.id == log.job_id);
-        is_active(job.map_or(self.run.status, |j| j.status))
+        job.map_or(self.run.status, |j| j.status).is_active()
     }
 
     /// Opens (or re-targets) the log pane on the selected node's job. Steps share their job's
@@ -2257,7 +2257,7 @@ impl PipelineView {
         if !self.logs.as_ref().is_some_and(|l| l.job_id == job_id) {
             let job = self.run.stages.iter().flat_map(|s| &s.jobs).find(|j| j.id == job_id);
             let label = job.map_or_else(|| job_id.to_string(), |j| j.name.clone());
-            let live = is_active(job.map_or(self.run.status, |j| j.status));
+            let live = job.map_or(self.run.status, |j| j.status).is_active();
             // A search carries over to the next job: it is usually the same question.
             let query = self.logs.as_mut().and_then(|l| l.query.take());
             let mut log = LogView::new(format!("Logs · {label}"), job_id.to_string(), live);
@@ -3737,7 +3737,7 @@ impl App {
             Screen::Pipeline(v) if pipeline_detail_cache_key(&v.connection_id, &v.run.item_ref()) == key => Some(v),
             _ => None,
         });
-        let Some(status) = view.map(|v| v.run.status).filter(|s| !is_active(*s)) else { return false };
+        let Some(status) = view.map(|v| v.run.status).filter(|s| !s.is_active()) else { return false };
         self.annotations_asked.borrow_mut().insert(key.to_string(), status) != Some(status)
     }
 
@@ -4133,13 +4133,13 @@ impl App {
                             out.push(("View the job's logs", c('L')));
                         }
                         out.push(("Trigger a run", c('T')));
-                        if is_active(v.run.status) {
+                        if v.run.status.is_active() {
                             out.push(("Cancel the run", c('X')));
                         }
                         if v.can_respond_approvals && !v.actionable_approvals().is_empty() {
                             out.push(("Approve / reject a gate", c('A')));
                         }
-                        let finished = !is_active(v.run.status);
+                        let finished = !v.run.status.is_active();
                         if finished && v.supports_rerun {
                             out.push(("Rerun the run", c('R')));
                         }
@@ -5276,7 +5276,7 @@ impl App {
         });
         self.with_preview_screen(&key.clone(), move |app| {
             let Screen::Pipeline(v) = &mut app.screen else { return };
-            if pipeline_detail_cache_key(&v.connection_id, &v.run.item_ref()) != key || is_active(v.run.status) {
+            if pipeline_detail_cache_key(&v.connection_id, &v.run.item_ref()) != key || v.run.status.is_active() {
                 return;
             }
             v.annotations = annotations;
@@ -5464,7 +5464,7 @@ impl App {
                                     // Only in-flight runs can be waiting on a gate — bound the
                                     // extra per-run approval calls to those.
                                     let awaiting_approval = supports
-                                        && is_active(run.status)
+                                        && run.status.is_active()
                                         && detail_or_default(
                                             feed.source.pending_approvals(&run.item_ref()).await,
                                             DIAG_PIPELINE_APPROVALS,
@@ -6979,7 +6979,7 @@ impl App {
     /// Whether `F` reruns failed jobs here rather than opening the feedback form: only on a
     /// finished run whose provider can rerun just the failed jobs.
     fn f_reruns(&self) -> bool {
-        matches!(&self.screen, Screen::Pipeline(v) if v.supports_rerun_failed && !is_active(v.run.status))
+        matches!(&self.screen, Screen::Pipeline(v) if v.supports_rerun_failed && !v.run.status.is_active())
     }
 
     /// Recent runs of the view's pipeline on its branch, from the list rows (no fetch).
@@ -7128,7 +7128,7 @@ impl App {
             Screen::Pipeline(v) => {
                 let history = app.pipeline_history(v);
                 let estimates =
-                    if is_active(v.run.status) { app.pipeline_estimates(v, history.as_ref()) } else { Estimates::default() };
+                    if v.run.status.is_active() { app.pipeline_estimates(v, history.as_ref()) } else { Estimates::default() };
                 Some((history, estimates))
             }
             _ => None,
@@ -7160,7 +7160,7 @@ impl App {
         let preview = self.preview.as_ref().filter(|p| p.sent).map(|p| &p.view);
         for screen in [Some(&self.screen), preview].into_iter().flatten() {
             let Screen::Pipeline(v) = screen else { continue };
-            if !is_active(v.run.status) {
+            if !v.run.status.is_active() {
                 continue;
             }
             for (key, row) in self.estimate_candidates(v) {
@@ -7339,7 +7339,7 @@ impl App {
     /// `R` / `F`: confirms re-running the open run (all of it, or its failed jobs).
     fn confirm_rerun(&mut self, failed_only: bool) {
         let Screen::Pipeline(v) = &self.screen else { return };
-        if is_active(v.run.status) {
+        if v.run.status.is_active() {
             self.toast = Some(format!("{} is still running — C cancels it", v.title));
             return;
         }
@@ -7515,8 +7515,8 @@ impl App {
         let key = (conn_id.to_string(), fresh.id.clone());
         let Some(hold) = self.held_runs.get(&key) else { return fresh };
         let caught_up = match hold.run.status {
-            PipelineRunStatus::Canceled => !is_active(fresh.status),
-            _ => is_active(fresh.status),
+            PipelineRunStatus::Canceled => !fresh.status.is_active(),
+            _ => fresh.status.is_active(),
         };
         if caught_up || Utc::now() > hold.until {
             self.held_runs.remove(&key);
@@ -7950,7 +7950,7 @@ impl App {
     /// be cancelled; a finished one says so instead of asking.
     fn open_pipeline_cancel(&mut self) {
         let Screen::Pipeline(v) = &self.screen else { return };
-        if !is_active(v.run.status) {
+        if !v.run.status.is_active() {
             self.toast = Some("Only a queued or running run can be cancelled".into());
             return;
         }
@@ -9291,11 +9291,6 @@ fn log_fetch_key(conn_id: &str, run_id: &str, job_id: &str) -> String {
     format!("{conn_id}\u{1f}{run_id}\u{1f}{job_id}")
 }
 
-/// Whether a run is still in flight (only these can be waiting on an approval gate).
-pub fn is_active(status: PipelineRunStatus) -> bool {
-    matches!(status, PipelineRunStatus::Queued | PipelineRunStatus::Running)
-}
-
 /// Whether a listed run already carries timed jobs, so its detail needn't be fetched for an
 /// estimate.
 fn has_timed_jobs(run: &PipelineRun) -> bool {
@@ -9382,21 +9377,21 @@ fn mark_rerun(run: &mut PipelineRun, failed_only: bool, now: DateTime<Utc>) {
 
 /// A cancel as it will look once it lands: whatever was still running or queued is Canceled.
 fn mark_canceled(run: &mut PipelineRun, now: DateTime<Utc>) {
-    if is_active(run.status) {
+    if run.status.is_active() {
         run.status = PipelineRunStatus::Canceled;
         run.finished_at.get_or_insert(now);
     }
     for stage in &mut run.stages {
-        for job in stage.jobs.iter_mut().filter(|j| is_active(j.status)) {
+        for job in stage.jobs.iter_mut().filter(|j| j.status.is_active()) {
             job.status = PipelineRunStatus::Canceled;
             if job.started_at.is_some() {
                 job.finished_at.get_or_insert(now);
             }
-            for step in job.steps.iter_mut().filter(|s| is_active(s.status)) {
+            for step in job.steps.iter_mut().filter(|s| s.status.is_active()) {
                 step.status = PipelineRunStatus::Canceled;
             }
         }
-        if is_active(stage.status) {
+        if stage.status.is_active() {
             stage.status = PipelineRunStatus::Canceled;
         }
     }
@@ -9609,11 +9604,13 @@ fn wi_state_rank(c: WorkItemStateCategory) -> u8 {
 fn pipe_status_rank(s: PipelineRunStatus) -> u8 {
     match s {
         PipelineRunStatus::Failed => 0,
-        PipelineRunStatus::Canceled => 1,
-        PipelineRunStatus::Running => 2,
-        PipelineRunStatus::Queued => 3,
-        PipelineRunStatus::PartiallySucceeded => 4,
-        PipelineRunStatus::Succeeded => 5,
+        // Held on a gate: someone has to act, so it sorts with the failures.
+        PipelineRunStatus::Waiting => 1,
+        PipelineRunStatus::Canceled | PipelineRunStatus::Skipped => 2,
+        PipelineRunStatus::Running => 3,
+        PipelineRunStatus::Queued => 4,
+        PipelineRunStatus::PartiallySucceeded => 5,
+        PipelineRunStatus::Succeeded => 6,
     }
 }
 
@@ -9854,7 +9851,7 @@ async fn fetch_pipelines(
                                 // A failed gate check is not "no gate": caching the row as clear
                                 // would hide a pending approval until the next whole reload, so
                                 // it clears the section flag like discovery's failure does.
-                                let (awaiting_approval, gate_ok) = if supports && is_active(run.status) {
+                                let (awaiting_approval, gate_ok) = if supports && run.status.is_active() {
                                     gate_from_approvals(detail_or_none(
                                         feed.source.pending_approvals(&run.item_ref()).await,
                                         DIAG_PIPELINE_APPROVALS,

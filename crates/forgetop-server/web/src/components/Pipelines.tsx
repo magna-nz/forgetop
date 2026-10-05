@@ -24,6 +24,7 @@ export function Pipelines() {
     ],
     statuses: [
       { label: "Running", match: (r) => r.run.status === "Running" },
+      { label: "Waiting", match: (r) => r.run.status === "Waiting" },
       { label: "Failed", match: (r) => r.run.status === "Failed" },
       { label: "Succeeded", match: (r) => r.run.status === "Succeeded" },
       { label: "Awaiting approval", match: (r) => r.approvals.some((a) => a.can_respond) },
