@@ -183,7 +183,7 @@ pub async fn pipelines(sections: &SectionService) -> Vec<PipeRow> {
                         } else {
                             Vec::new()
                         };
-                        run.status = run.status.with_pending_approval(!approvals.is_empty());
+                        run.status = run.shown_status(approvals.iter().any(|a| a.blocks_run));
                         out.push(PipeRow {
                             connection_id: feed.connection.connection_id().to_string(),
                             connection: feed.connection.display_name().to_string(),
@@ -334,7 +334,7 @@ async fn pipe_inputs(sections: &SectionService) -> Vec<PipeInput> {
                             Vec::new()
                         };
                         // Any pending gate holds the run; only one you can answer puts it in your queue.
-                        run.status = run.status.with_pending_approval(!approvals.is_empty());
+                        run.status = run.shown_status(approvals.iter().any(|a| a.blocks_run));
                         let awaiting_approval = approvals.iter().any(|x| x.can_respond);
                         out.push(PipeInput {
                             connection_id: feed.connection.connection_id().to_string(),
@@ -585,7 +585,7 @@ pub async fn pipeline_detail(sections: &SectionService, conn: &str, run: &ItemRe
     } else {
         Vec::new()
     };
-    run.status = run.status.with_pending_approval(!approvals.is_empty());
+    run.status = run.shown_status(approvals.iter().any(|a| a.blocks_run));
     Some(PipelineDetail { run, approvals })
 }
 

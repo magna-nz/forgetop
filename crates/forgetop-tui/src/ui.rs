@@ -17,9 +17,10 @@ use std::collections::HashMap;
 use forgetop_core::runlog;
 
 use crate::app::{
-    dashboard_target, is_error_line, match_ranges, pipe_definition_name, run_secs, App, ArtifactsPanel, ConfigView,
-    DiffFocus, DiffView, FlatNode, Hit, LogRow, LogView, LpSlot, PipeGroup, PipeHead, PipeLine, PipeRow, PipelineView, PrView,
-    RunHistory, Screen, WiView, LOG_SPLIT_MIN_WIDTH, LOG_TREE_WIDTH, PR_TABS, TABS,
+    dashboard_target, first_failed_node, gate_stage, is_error_line, last_activity, match_ranges, pipe_definition_name,
+    provider_label, run_secs, waiting_secs, App, ArtifactsPanel, ConfigView, DiffFocus, DiffView, FlatNode, Hit, LogRow,
+    LogView, LpSlot, PipeGroup, PipeHead, PipeLine, PipeRow, PipelineView, PrView, RunHistory, Screen, WiView,
+    LOG_SPLIT_MIN_WIDTH, LOG_TREE_WIDTH, PR_TABS, TABS,
 };
 use crate::diff::{cursor_line_label, pending_marks};
 use crate::highlight::{lang_for, HlKind, LineHighlighter};
@@ -1527,8 +1528,14 @@ enum PipeCol {
     /// on the header when it is the key, on the child when it is what varies.
     Branch,
     Commit,
+    /// What the run is doing or stuck on: the gate it waits at, the job that broke, the job
+    /// running. Shown only while some row has something to say.
+    Now,
+    /// One glyph per stage, for rows whose run carries its stages.
+    Stages,
+    /// How long the run took (so far, while in flight).
+    Took,
     Started,
-    Approval,
 }
 
 impl PipeCol {
@@ -1542,7 +1549,9 @@ impl PipeCol {
             PipeCol::Branch => Some("Branch"),
             PipeCol::Commit => Some("Commit"),
             PipeCol::Started => Some("Started"),
-            PipeCol::Approval => Some("Approval"),
+            PipeCol::Now => Some("Now"),
+            PipeCol::Stages => Some("Stages"),
+            PipeCol::Took => Some("Took"),
         }
     }
 
@@ -1552,23 +1561,121 @@ impl PipeCol {
             PipeCol::Provider => "Provider".into(),
             PipeCol::Repository => "Repository".into(),
             PipeCol::Subject => app.pipe_subject_heading(any_open).into(),
-            // Ungrouped, the cell is one run's number, not a count of them.
-            PipeCol::Runs => if app.pipe_group == PipeGroup::Off { "Run" } else { "Runs" }.into(),
+            // Ungrouped, the cell is one run's number, not a count of them. Grouped by pipeline,
+            // an open group's runs carry their branch here (the run itself is in Subject).
+            PipeCol::Runs => match (app.pipe_group, any_open) {
+                (PipeGroup::Off, _) => "Run",
+                (PipeGroup::Pipeline, true) => "Runs / Branch",
+                _ => "Runs",
+            }
+            .into(),
             PipeCol::Branch => "Branch".into(),
             PipeCol::Commit => "Commit".into(),
             PipeCol::Started => "Started".into(),
-            PipeCol::Approval => "Approval".into(),
+            PipeCol::Now => "Now".into(),
+            PipeCol::Stages => "Stages".into(),
+            PipeCol::Took => "Took".into(),
         }
     }
 }
 
+/// What one list line says about where its run stands — computed once per line, both to pick
+/// the columns and to fill them. A header speaks for its newest run.
+struct PipeLive {
+    now: (String, Style),
+    strip: Vec<PipelineRunStatus>,
+    took: String,
+}
+
+fn pipe_live(app: &App, line: &PipeLine, now: DateTime<Utc>) -> PipeLive {
+    let (p, approval) = match line {
+        PipeLine::Head(h) => (&app.pipes[h.latest], h.approval),
+        PipeLine::Run(i) => (&app.pipes[*i], app.pipes[*i].awaiting_approval),
+    };
+    let run = app.pipe_staged_run(p);
+    let shown = p.shown_status();
+    let gate = gate_stage(run, shown, &p.gates);
+    PipeLive {
+        now: pipe_now(&app.theme, p, run, approval, now),
+        strip: run.stages.iter().enumerate().map(|(i, s)| if gate == Some(i) { PipelineRunStatus::Waiting } else { s.status }).collect(),
+        took: run_secs(&p.run, now).map(fmt_secs).unwrap_or_default(),
+    }
+}
+
+/// The Now cell: what a run is doing or stuck on, from whatever the list knows of it — the gates
+/// on the row, and the stages on it (or on a detail fetched this session). Blank when there is
+/// nothing to add to the status.
+fn pipe_now(theme: &Theme, p: &PipeRow, run: &PipelineRun, approval: bool, now: DateTime<Utc>) -> (String, Style) {
+    const NOW_MAX: usize = 40;
+    let shown = p.shown_status();
+    let stages = &run.stages;
+    // `Stage › job`, or the job alone where the run has one stage (GitHub's synthetic `jobs`).
+    let place = |si: usize, ji: usize| {
+        let job = &stages[si].jobs[ji].name;
+        if stages.len() > 1 { format!("{} › {job}", stages[si].name) } else { job.clone() }
+    };
+    let with_problem = |si: usize, ji: usize| match &stages[si].jobs[ji].problem {
+        Some(problem) => format!("{} · {problem}", place(si, ji)),
+        None => place(si, ji),
+    };
+    let find_job = |want: PipelineRunStatus| {
+        stages.iter().enumerate().find_map(|(si, s)| s.jobs.iter().position(|j| j.status == want).map(|ji| (si, ji)))
+    };
+    let yellow = Style::default().fg(theme.yellow);
+    let (text, style) = match shown {
+        PipelineRunStatus::Waiting => {
+            let gate = if p.gates.is_empty() {
+                gate_stage(run, shown, &p.gates).map(|si| stages[si].name.clone())
+            } else {
+                Some(p.gates.join(", "))
+            };
+            let mut text = gate.map_or_else(|| "approval needed".to_string(), |g| format!("{g} approval"));
+            if let Some(wait) = waiting_secs(run, now) {
+                text.push_str(&format!(" · {}", fmt_secs(wait)));
+            }
+            (text, yellow)
+        }
+        PipelineRunStatus::Failed => (
+            first_failed_node(run).map(|(si, ji, _)| with_problem(si, ji)).unwrap_or_default(),
+            Style::default().fg(theme.red),
+        ),
+        PipelineRunStatus::Running => {
+            let what = find_job(PipelineRunStatus::Running)
+                .map(|(si, ji)| place(si, ji))
+                .or_else(|| stages.iter().find(|s| s.status == PipelineRunStatus::Running).map(|s| s.name.clone()));
+            (what.map(|w| format!("running {w}")).unwrap_or_default(), Style::default().fg(theme.pipeline_color(shown)))
+        }
+        PipelineRunStatus::PartiallySucceeded => (
+            find_job(PipelineRunStatus::PartiallySucceeded).map(|(si, ji)| with_problem(si, ji)).unwrap_or_default(),
+            yellow,
+        ),
+        _ => (String::new(), Style::default().fg(theme.dim)),
+    };
+    if text.is_empty() && approval {
+        return ("approval needed".to_string(), yellow.add_modifier(Modifier::BOLD));
+    }
+    (truncate(&text, NOW_MAX), style)
+}
+
+/// Repaints a [`columnize`]d row's Stages cell one glyph at a time, each in its stage's colour —
+/// a cell is one style, and a strip needs one per stage. Only columns right of the flex column
+/// may be split like this: the marquee addresses cells by span index up to that one.
+fn paint_stage_strip(row: &mut Line<'static>, col: usize, strip: &[PipelineRunStatus], theme: &Theme, anim: usize) {
+    let at = 1 + 2 * col; // the lead span, then each cell after a gap span
+    let Some(span) = row.spans.get(at) else { return };
+    let width = span.content.chars().count();
+    let mut spans: Vec<Span<'static>> = strip
+        .iter()
+        .take(width)
+        .map(|s| Span::styled(pipeline_glyph(*s, anim), Style::default().fg(theme.pipeline_color(*s))))
+        .collect();
+    spans.push(Span::raw(" ".repeat(width.saturating_sub(strip.len()))));
+    row.spans.splice(at..=at, spans);
+}
+
 /// Picks the columns for what is currently on screen.
-fn pipe_columns(app: &App, lines: &[PipeLine]) -> Vec<PipeCol> {
+fn pipe_columns(app: &App, live: &[PipeLive]) -> Vec<PipeCol> {
     let grouped = app.pipe_group != PipeGroup::Off;
-    let approvals = lines.iter().any(|l| match l {
-        PipeLine::Head(h) => h.approval,
-        PipeLine::Run(i) => app.pipes[*i].awaiting_approval,
-    });
 
     let mut cols = Vec::new();
     if grouped {
@@ -1590,10 +1697,18 @@ fn pipe_columns(app: &App, lines: &[PipeLine]) -> Vec<PipeCol> {
     if app.pipe_group == PipeGroup::Trigger {
         cols.push(PipeCol::Commit);
     }
-    cols.push(PipeCol::Started);
-    if approvals {
-        cols.push(PipeCol::Approval);
+    // Now replaces the old Approval column and, like it, is there only when it has something
+    // to say. The strip needs a run that carries its stages; most rows have a duration.
+    if live.iter().any(|l| !l.now.0.is_empty()) {
+        cols.push(PipeCol::Now);
     }
+    if live.iter().any(|l| !l.strip.is_empty()) {
+        cols.push(PipeCol::Stages);
+    }
+    if live.iter().any(|l| !l.took.is_empty()) {
+        cols.push(PipeCol::Took);
+    }
+    cols.push(PipeCol::Started);
     cols.retain(|c| c.pick_name().is_none_or(|n| app.col_shown(2, n)));
     cols
 }
@@ -1631,9 +1746,9 @@ fn pipe_sort_marker(app: &App, cols: &[PipeCol]) -> Option<(usize, bool)> {
 ///
 /// `columnize` clamps only its flexible column and never drops one, so an unusually wide set
 /// — two providers, a commit and a waiting gate all at once — pushes the rightmost columns
-/// off the edge. Approval is the one column that is only ever present *because* something
-/// needs attention, so it must not be the thing that falls off; Repository, Commit and
-/// Provider are context and give way first.
+/// off the edge. Now is the column that says what needs attention, so it must not be the thing
+/// that falls off; the stage strip and the duration go first (the status already says how the
+/// run stands), then Repository, Commit and Provider, which are context.
 fn fit_columns(cols: &mut Vec<PipeCol>, cells: &mut [Vec<(String, Style)>], headings: &[String], inner_w: usize) {
     let mut headings = headings.to_vec();
     let widths = |headings: &[String], cells: &[Vec<(String, Style)>]| -> Vec<usize> {
@@ -1657,7 +1772,7 @@ fn fit_columns(cols: &mut Vec<PipeCol>, cells: &mut [Vec<(String, Style)>], head
     };
 
     // The repository goes last: it is the column the list leads with.
-    for droppable in [PipeCol::Provider, PipeCol::Commit, PipeCol::Repository] {
+    for droppable in [PipeCol::Stages, PipeCol::Took, PipeCol::Provider, PipeCol::Commit, PipeCol::Repository] {
         if widths(&headings, cells).iter().sum::<usize>() + padding(cols.len()) <= inner_w {
             return;
         }
@@ -1761,7 +1876,9 @@ fn render_pipes(frame: &mut Frame, area: Rect, app: &mut App) {
     let lines = app.pipe_lines();
     let any_open = lines.iter().any(|l| matches!(l, PipeLine::Head(h) if h.expanded));
 
-    let cols = pipe_columns(app, &lines);
+    let now = Utc::now();
+    let live: Vec<PipeLive> = lines.iter().map(|l| pipe_live(app, l, now)).collect();
+    let cols = pipe_columns(app, &live);
     let owner = shared_owner(app, &idxs);
 
     // Headers and runs are the same shape now, so they go through `columnize` together and
@@ -1769,17 +1886,26 @@ fn render_pipes(frame: &mut Frame, area: Rect, app: &mut App) {
     // roll-up drift to the right edge, under no heading at all.
     let cells: Vec<Vec<(String, Style)>> = lines
         .iter()
+        .zip(&live)
         .enumerate()
-        .map(|(n, line)| match line {
-            PipeLine::Head(h) => cols.iter().map(|c| head_cell(*c, h, theme, app.anim, owner.as_ref())).collect(),
+        .map(|(n, (line, live))| match line {
+            PipeLine::Head(h) => cols
+                .iter()
+                .map(|c| live_cell(*c, live, theme).unwrap_or_else(|| head_cell(*c, h, theme, app.anim, owner.as_ref())))
+                .collect(),
             PipeLine::Run(i) => {
                 let p = &app.pipes[*i];
                 let child = app.pipe_group != PipeGroup::Off;
-                let subject = if child { format!("─ {}", app.pipe_child_subject(p)) } else { pipe_definition_name(p) };
+                let (subject, runs) = run_naming(app, p, theme);
                 // The next line tells us whether this run closes its group, so `└` costs a
                 // peek rather than a scan back through the list for every row.
                 let last = !matches!(lines.get(n + 1), Some(PipeLine::Run(_)));
-                cols.iter().map(|c| run_cell(*c, p, &subject, last, child, theme, app.anim, owner.as_ref())).collect()
+                cols.iter()
+                    .map(|c| {
+                        live_cell(*c, live, theme)
+                            .unwrap_or_else(|| run_cell(*c, p, &subject, &runs, last, child, theme, app.anim, owner.as_ref()))
+                    })
+                    .collect()
             }
         })
         .collect();
@@ -1792,9 +1918,54 @@ fn render_pipes(frame: &mut Frame, area: Rect, app: &mut App) {
     let headings: Vec<String> = cols.iter().map(|c| c.heading(app, any_open)).collect();
     let heading_refs: Vec<&str> = headings.iter().map(String::as_str).collect();
     let flex = cols.iter().position(|c| *c == PipeCol::Subject).unwrap_or(0);
-    let (header, rows) = columnize(dim, &heading_refs, &cells, flex, inner_w, pipe_sort_marker(app, &cols));
+    let (header, mut rows) = columnize(dim, &heading_refs, &cells, flex, inner_w, pipe_sort_marker(app, &cols));
+    if let Some(at) = cols.iter().position(|c| *c == PipeCol::Stages).filter(|&at| at > flex) {
+        for (row, live) in rows.iter_mut().zip(&live) {
+            paint_stage_strip(row, at, &live.strip, &app.theme, app.anim);
+        }
+    }
     let selected = app.selected().and_then(|i| cells.get(i)).map(|r| (flex, r[flex].0.clone()));
     render_inline_list(frame, area, app, &title, header, rows, selected);
+}
+
+/// The cells a header and a run fill the same way, from what the line says about its run.
+fn live_cell(col: PipeCol, live: &PipeLive, theme: &Theme) -> Option<(String, Style)> {
+    let dim = Style::default().fg(theme.dim);
+    match col {
+        PipeCol::Now => Some(live.now.clone()),
+        // Plain glyphs here, for measuring; `paint_stage_strip` colours them once laid out.
+        PipeCol::Stages => Some((live.strip.iter().map(|s| crate::theme::pipeline_icon(*s)).collect(), dim)),
+        PipeCol::Took => Some((live.took.clone(), dim)),
+        _ => None,
+    }
+}
+
+/// How a run names itself in a list row: its Subject text, and what goes in the Runs column.
+///
+/// Grouped by pipeline the run is the thing that varies, so Subject carries its own name or
+/// number, and Runs its branch (in the branch colour) — once, not again when the run is named
+/// after it (a tag build). Grouped otherwise, Subject carries what varies there (the pipeline)
+/// and Runs the run's number, as before.
+fn run_naming(app: &App, p: &PipeRow, theme: &Theme) -> (String, (String, Style)) {
+    let dim = Style::default().fg(theme.dim);
+    // The run/release name ("20261005.3"), or the run number when it has no name of its own.
+    let num = p.run.number.map(|n| format!("#{n}")).unwrap_or_default();
+    let label = match (&p.definition_name, p.run.name.as_deref().filter(|n| !n.is_empty())) {
+        (Some(def), Some(name)) if name != def => name.to_string(),
+        _ => num,
+    };
+    match app.pipe_group {
+        PipeGroup::Off => (pipe_definition_name(p), (label, dim)),
+        PipeGroup::Pipeline => {
+            let branch = app.pipe_child_subject(p);
+            if label.is_empty() || label == branch {
+                (format!("─ {branch}"), (String::new(), dim))
+            } else {
+                (format!("─ {label}"), (branch, Style::default().fg(theme.cyan)))
+            }
+        }
+        _ => (format!("─ {}", app.pipe_child_subject(p)), (label, dim)),
+    }
 }
 
 fn head_cell(col: PipeCol, h: &PipeHead, theme: &Theme, anim: usize, owner: Option<&String>) -> (String, Style) {
@@ -1827,13 +1998,9 @@ fn head_cell(col: PipeCol, h: &PipeHead, theme: &Theme, anim: usize, owner: Opti
         PipeCol::Commit => (h.commit.clone(), dim),
         PipeCol::Started => (rel_age(h.started), dim),
         PipeCol::Repository => (strip_owner(&h.repo, owner), dim),
-        PipeCol::Approval => {
-            if h.approval {
-                ("approval needed".to_string(), Style::default().fg(theme.red).add_modifier(Modifier::BOLD))
-            } else {
-                (String::new(), dim)
-            }
-        }
+        // Filled from the header's newest run by `live_cell`; kept total so the cell count can
+        // never disagree with the heading count.
+        PipeCol::Now | PipeCol::Stages | PipeCol::Took => (String::new(), dim),
     }
 }
 
@@ -1842,6 +2009,7 @@ fn run_cell(
     col: PipeCol,
     p: &PipeRow,
     subject: &str,
+    runs: &(String, Style),
     last: bool,
     child: bool,
     theme: &Theme,
@@ -1852,24 +2020,12 @@ fn run_cell(
     match col {
         // Tree is only in the set when grouped, and every run is then a child.
         PipeCol::Tree => ((if last { "└" } else { "├" }).to_string(), Style::default().fg(theme.dim)),
-        // Inside a group a run is only its glyph: the header already says in words where the
-        // pipeline stands, and ✓ / ✗ down the children is what the eye scans for. Ungrouped,
-        // with no header above, each run keeps its word.
-        PipeCol::Status => (
-            if child { pipeline_glyph(p.run.status, anim).to_string() } else { pipe_status_cell(p.run.status, anim) },
-            Style::default().fg(theme.pipeline_color(p.run.status)),
-        ),
+        // Every run names its state, inside a group too: a column of bare ✓ beside an empty
+        // word slot read as missing data, and says nothing once colour is gone.
+        PipeCol::Status => (pipe_status_cell(p.shown_status(), anim), Style::default().fg(theme.pipeline_color(p.shown_status()))),
         PipeCol::Provider => (provider_tag(p.provider, &p.connection), Style::default().fg(theme.cyan)),
         PipeCol::Subject => (subject.to_string(), Style::default().fg(theme.fg)),
-        PipeCol::Runs => {
-            // Run = the run/release name ("10.1.100"), or the run number when it has no name.
-            let num = || p.run.number.map(|n| format!("#{n}")).unwrap_or_default();
-            let text = match &p.definition_name {
-                Some(_) => p.run.name.clone().unwrap_or_else(num),
-                None => num(),
-            };
-            (text, dim)
-        }
+        PipeCol::Runs => runs.clone(),
         PipeCol::Branch => (p.run.branch.clone().unwrap_or_default(), dim),
         PipeCol::Commit => (p.run.commit_sha.as_deref().unwrap_or_default().chars().take(7).collect(), dim),
         PipeCol::Started => (rel_age(p.run.started_at), dim),
@@ -1879,13 +2035,8 @@ fn run_cell(
             if child { String::new() } else { strip_owner(&p.run.repository.clone().unwrap_or_default(), owner) },
             dim,
         ),
-        PipeCol::Approval => {
-            if p.awaiting_approval {
-                ("approval needed".to_string(), Style::default().fg(theme.red).add_modifier(Modifier::BOLD))
-            } else {
-                (String::new(), dim)
-            }
-        }
+        // Filled by `live_cell`; kept total so the cell count matches the headings.
+        PipeCol::Now | PipeCol::Stages | PipeCol::Took => (String::new(), dim),
     }
 }
 
@@ -2409,7 +2560,9 @@ fn base_footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
         if v.run.commit_sha.as_deref().is_some_and(|s| !s.is_empty()) {
             keys.push(("c", "copy sha"));
         }
-        keys.extend([("T", "trigger"), ("o", "open"), ("Esc/q", "back")]);
+        // Where the gate can't be answered here, `o` is how to answer it.
+        let open = if !v.approvals.is_empty() && !v.can_respond_approvals { "open approval" } else { "open" };
+        keys.extend([("T", "trigger"), ("o", open), ("Esc/q", "back")]);
         return keys;
     }
     if matches!(app.screen, Screen::Config(_)) {
@@ -3233,11 +3386,13 @@ fn render_pipeline(frame: &mut Frame, area: Rect, theme: &Theme, view: &Pipeline
 /// The header: status, total time and trigger; commit and title; who, when, attempt and PR.
 fn pipeline_header(theme: &Theme, view: &PipelineView, anim: usize, now: DateTime<Utc>) -> Vec<Line<'static>> {
     let run = &view.run;
-    let color = theme.pipeline_color(run.status);
+    let shown = view.shown_status();
+    let color = theme.pipeline_color(shown);
     let dim = Style::default().fg(theme.dim);
+    let word = if shown == PipelineRunStatus::Waiting { "Waiting for approval" } else { pipe_status_word(shown) };
     let mut first = vec![
-        Span::styled(format!("{} ", pipeline_glyph(run.status, anim)), Style::default().fg(color)),
-        Span::styled(pipe_status_word(run.status), Style::default().fg(color).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("{} ", pipeline_glyph(shown, anim)), Style::default().fg(color)),
+        Span::styled(word, Style::default().fg(color).add_modifier(Modifier::BOLD)),
     ];
     // A cache-seeded run's status is whatever it was when the view was last open — it may have
     // gone red since. Say so until the refetch confirms it, rather than painting remembered
@@ -3292,7 +3447,14 @@ fn pipeline_header(theme: &Theme, view: &PipelineView, anim: usize, now: DateTim
         parts.push(format!("attempt {n}"));
     }
     let mut third = vec![Span::styled(format!("  {}", parts.join(" · ")), dim)];
-    let estimate = view.estimates.run_median.filter(|_| run.status == PipelineRunStatus::Running).map(|median| {
+    // An estimate only means something while work is running: a run parked on a gate says how
+    // long it worked and how long it has waited instead.
+    let parked = (shown == PipelineRunStatus::Waiting).then(|| parked_split(run, now)).flatten();
+    if let Some((ran, wait)) = parked {
+        third.push(Span::styled(if parts.is_empty() { "" } else { " · " }, dim));
+        third.push(Span::styled(format!("ran {}, then waiting {}", fmt_secs(ran), fmt_secs(wait)), Style::default().fg(theme.yellow)));
+    }
+    let estimate = view.estimates.run_median.filter(|_| shown == PipelineRunStatus::Running).map(|median| {
         let elapsed = run_secs(run, now).unwrap_or(0);
         (median - elapsed, median)
     });
@@ -3306,14 +3468,21 @@ fn pipeline_header(theme: &Theme, view: &PipelineView, anim: usize, now: DateTim
         third.push(Span::styled(format!(" (median of last {})", view.estimates.run_n), dim));
     }
     if let Some(pr) = run.pull_request {
-        let lead = if parts.is_empty() && estimate.is_none() { "" } else { " · " };
+        let lead = if parts.is_empty() && estimate.is_none() && parked.is_none() { "" } else { " · " };
         third.push(Span::styled(lead, dim));
         third.push(Span::styled(format!("PR #{pr} ↗"), Style::default().fg(theme.accent)));
     }
-    if !parts.is_empty() || estimate.is_some() || run.pull_request.is_some() {
+    if !parts.is_empty() || estimate.is_some() || parked.is_some() || run.pull_request.is_some() {
         lines.push(Line::from(third));
     }
     lines
+}
+
+/// A parked run's `(worked, waited)` seconds: run start to its last activity, then that to `now`.
+/// `None` when either end isn't known.
+fn parked_split(run: &PipelineRun, now: DateTime<Utc>) -> Option<(i64, i64)> {
+    let (start, last) = (run.started_at?, last_activity(run)?);
+    Some(((last - start).num_seconds().max(0), (now - last).num_seconds().max(0)))
 }
 
 /// The red line under a failed run's header: the failed step, the test and where it broke —
@@ -3553,7 +3722,8 @@ fn first_word(name: &str) -> &str {
 /// matrix (`build (…)`) starts after that matrix, and any other once the running jobs are done.
 fn job_ghosts(view: &PipelineView, now: DateTime<Utc>) -> HashMap<(usize, usize), Ghost> {
     let mut out = HashMap::new();
-    if !view.run.status.is_active() || view.estimates.jobs.is_empty() {
+    // Nothing is running behind a gate, so nothing can be estimated past it.
+    if !matches!(view.shown_status(), PipelineRunStatus::Queued | PipelineRunStatus::Running) || view.estimates.jobs.is_empty() {
         return out;
     }
     let secs = |s: i64| chrono::Duration::seconds(s);
@@ -3619,6 +3789,83 @@ fn render_pipeline_tree(frame: &mut Frame, tree_area: Rect, theme: &Theme, view:
     }
 }
 
+/// A tree row's marker, glyph and label style, shared by the plain tree and the timeline.
+fn node_marker(n: &FlatNode) -> &'static str {
+    match n.key {
+        Some(_) if n.expanded => "▾ ",
+        Some(_) => "▸ ",
+        None => "· ",
+    }
+}
+
+/// How a node's label reads: dim for what didn't (or hasn't yet) run, yellow for a gate, red
+/// for a failure, bold for a stage.
+fn node_label_style(theme: &Theme, n: &FlatNode) -> Style {
+    if n.group || matches!(n.status, PipelineRunStatus::Queued | PipelineRunStatus::Canceled | PipelineRunStatus::Skipped) {
+        Style::default().fg(theme.dim)
+    } else if n.status == PipelineRunStatus::Waiting {
+        Style::default().fg(theme.yellow).add_modifier(Modifier::BOLD)
+    } else if n.status == PipelineRunStatus::Failed {
+        Style::default().fg(theme.red)
+    } else if n.depth == 0 && n.job.is_none() {
+        Style::default().fg(theme.fg).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme.fg)
+    }
+}
+
+/// An explanatory row (the line under a gated stage): its text, with an `o` hint's key lit.
+fn info_spans(theme: &Theme, n: &FlatNode) -> Vec<Span<'static>> {
+    let dim = Style::default().fg(theme.dim);
+    let mut spans = vec![Span::raw("  ".repeat(n.depth)), Span::raw("  ")];
+    match n.label.strip_prefix("o  ") {
+        Some(rest) => {
+            spans.push(Span::styled("o", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)));
+            spans.push(Span::styled(format!("  {rest}"), dim));
+        }
+        None => spans.push(Span::styled(n.label.clone(), dim)),
+    }
+    spans
+}
+
+/// The label fitted to `w` columns, with the node's summary after it when both fit.
+fn label_spans(theme: &Theme, n: &FlatNode, w: usize) -> Vec<Span<'static>> {
+    let style = node_label_style(theme, n);
+    if let Some((text, tone)) = &n.summary {
+        let used = n.label.chars().count() + 2 + text.chars().count();
+        if used <= w {
+            return vec![
+                Span::styled(n.label.clone(), style),
+                Span::raw("  "),
+                Span::styled(text.clone(), Style::default().fg(tone_color(theme, *tone))),
+                Span::raw(" ".repeat(w - used)),
+            ];
+        }
+    }
+    vec![Span::styled(fit(&n.label, w), style)]
+}
+
+/// The duration cell for a node with no finished span of its own: how long a gated stage has
+/// waited, a running node's time so far, `skipped`, `queued`, or nothing for a row whose note
+/// says it instead.
+fn open_duration(theme: &Theme, n: &FlatNode, wait: Option<i64>, now: DateTime<Utc>) -> (String, Style) {
+    let dim = Style::default().fg(theme.dim);
+    if let Some(d) = &n.duration {
+        return (d.clone(), dim);
+    }
+    match (n.status, n.started_at) {
+        (PipelineRunStatus::Waiting, _) if n.job.is_none() => {
+            (wait.map(fmt_secs).unwrap_or_else(|| "—".into()), Style::default().fg(theme.yellow))
+        }
+        (PipelineRunStatus::Running, Some(s)) => (fmt_secs((now - s).num_seconds()), Style::default().fg(theme.accent)),
+        (PipelineRunStatus::Skipped, _) if n.group => (String::new(), dim),
+        (PipelineRunStatus::Skipped, _) => ("skipped".to_string(), dim),
+        _ if n.note.is_some() => (String::new(), dim),
+        (PipelineRunStatus::Queued, None) => ("queued".to_string(), dim),
+        _ => ("—".to_string(), dim),
+    }
+}
+
 /// The tree without bars, as it has always read.
 fn render_plain_tree(
     frame: &mut Frame,
@@ -3629,30 +3876,33 @@ fn render_plain_tree(
     anim: usize,
     tree_block: Block,
 ) {
+    let now = Utc::now();
+    let wait = (view.shown_status() == PipelineRunStatus::Waiting).then(|| waiting_secs(&view.run, now)).flatten();
+    let dim = Style::default().fg(theme.dim);
     let items: Vec<ListItem> = nodes
         .iter()
         .map(|n| {
-            let indent = "  ".repeat(n.depth);
-            let marker = match n.key {
-                Some(_) if n.expanded => "▾ ",
-                Some(_) => "▸ ",
-                None => "· ",
-            };
-            let label_style = if n.group {
-                Style::default().fg(theme.dim)
-            } else if n.depth == 0 && n.job.is_none() {
-                Style::default().fg(theme.fg).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(theme.fg)
-            };
+            if n.info {
+                return ListItem::new(Line::from(info_spans(theme, n)));
+            }
             let mut spans = vec![
-                Span::raw(indent),
-                Span::styled(marker, Style::default().fg(theme.dim)),
+                Span::raw("  ".repeat(n.depth)),
+                Span::styled(node_marker(n), dim),
                 Span::styled(format!("{} ", pipeline_glyph(n.status, anim)), Style::default().fg(theme.pipeline_color(n.status))),
-                Span::styled(n.label.clone(), label_style),
+                Span::styled(n.label.clone(), node_label_style(theme, n)),
             ];
-            if let Some(d) = &n.duration {
-                spans.push(Span::styled(format!("  {d}"), Style::default().fg(theme.dim)));
+            if let Some((text, tone)) = &n.summary {
+                spans.push(Span::styled(format!("  {text}"), Style::default().fg(tone_color(theme, *tone))));
+            }
+            // Finished times, plus the two states with no time of their own to show: how long a
+            // gate has held its stage, and a stage that never ran.
+            let (d, d_style) = open_duration(theme, n, wait, now);
+            let parked = n.status == PipelineRunStatus::Waiting && n.job.is_none() && wait.is_some();
+            if n.duration.is_some() || parked || d == "skipped" {
+                spans.push(Span::styled(format!("  {d}"), d_style));
+            }
+            if let Some(note) = &n.note {
+                spans.push(Span::styled(format!("  {note}"), dim));
             }
             if let Some(p) = &n.problem {
                 spans.push(Span::styled(format!("  ⚠ {p}"), Style::default().fg(theme.red)));
@@ -3667,6 +3917,60 @@ fn render_plain_tree(
     frame.render_stateful_widget(list, tree_area, &mut state);
     let body = tree_area.inner(ratatui::layout::Margin::new(1, 1));
     hit_rows(body, state.offset(), (0..nodes.len()).map(|i| Some(Hit::PipeNode(i))));
+}
+
+/// Where times land on the timeline's bars, as fractional columns from the axis start.
+///
+/// Usually linear over the whole span. A run parked on a gate for longer than it worked would
+/// spend the bar on empty track — eleven minutes of work in three columns, an hour and a half of
+/// nothing after — so its axis is squeezed: the work (start to last activity) gets the first
+/// [`TimeAxis::WORK_SHARE`] of the width, and the wait a fixed segment that ends on `now`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct TimeAxis {
+    /// Seconds from the axis start to its end.
+    total: f64,
+    width: usize,
+    /// When squeezed: the seconds of work, and the columns they get.
+    squeeze: Option<(f64, usize)>,
+}
+
+impl TimeAxis {
+    /// The share of the bar a squeezed axis gives to the work before the wait.
+    const WORK_SHARE: f64 = 0.65;
+
+    fn linear(total: f64, width: usize) -> Self {
+        TimeAxis { total, width, squeeze: None }
+    }
+
+    /// The axis for a parked run whose work ended `worked` seconds in: squeezed when the idle
+    /// gap after it is more than half the span, linear otherwise.
+    fn parked(total: f64, worked: f64, width: usize) -> Self {
+        let work_w = (width as f64 * Self::WORK_SHARE).round() as usize;
+        let squeeze = (total - worked > total / 2.0 && worked > 0.0 && work_w >= 1 && width > work_w + 2).then_some((worked, work_w));
+        TimeAxis { total, width, squeeze }
+    }
+
+    /// The fractional column of `secs` after the axis start.
+    fn pos(&self, secs: f64) -> f64 {
+        match self.squeeze {
+            None => secs / self.total * self.width as f64,
+            Some((worked, work_w)) if secs <= worked => secs / worked * work_w as f64,
+            Some((worked, work_w)) => {
+                // The wait fills the columns after the work, with `now` on the last one.
+                let wait_w = (self.width - 1 - work_w) as f64;
+                work_w as f64 + (secs - worked) / (self.total - worked).max(1.0) * wait_w
+            }
+        }
+    }
+
+    fn col(&self, secs: f64) -> usize {
+        self.pos(secs).round().max(0.0) as usize
+    }
+
+    /// The seconds and columns the round-number ticks are spread over: the work, when squeezed.
+    fn ticked(&self) -> (f64, usize) {
+        self.squeeze.unwrap_or((self.total, self.width))
+    }
 }
 
 /// The tree with every node's bar on one time axis. Returns false (drawing nothing) when the
@@ -3704,6 +4008,9 @@ fn render_timeline(
         t_end = t_end.max(g.end);
     }
     let total = ((t_end - t0).num_milliseconds() as f64 / 1000.0).max(1.0);
+    // A parked run's wait begins where its work last finished.
+    let last = (view.shown_status() == PipelineRunStatus::Waiting).then(|| last_activity(run)).flatten().filter(|l| *l >= t0);
+    let wait = last.map(|l| (now - l).num_seconds().max(0));
 
     let inner_w = tree_area.width.saturating_sub(2) as usize;
     let lw = if inner_w >= 98 { 34 } else { 26 };
@@ -3713,87 +4020,88 @@ fn render_timeline(
     let Some(bar_w) = inner_w.checked_sub(prefix + 1 + extra_w).filter(|w| *w >= 10) else { return false };
 
     let secs_of = |t: DateTime<Utc>| (t - t0).num_milliseconds() as f64 / 1000.0;
-    let col = |t: DateTime<Utc>| ((secs_of(t) / total) * bar_w as f64).round().max(0.0) as usize;
+    let axis = match last {
+        Some(l) => TimeAxis::parked(total, secs_of(l), bar_w),
+        None => TimeAxis::linear(total, bar_w),
+    };
+    let col = |t: DateTime<Utc>| axis.col(secs_of(t));
     let now_col = active.then(|| col(now)).filter(|&x| x < bar_w);
     let dim = Style::default().fg(theme.dim);
+    let yellow = Style::default().fg(theme.yellow);
 
     // Axis: ticks at a round step, and `now` while the run is in flight.
+    let (tick_total, tick_w) = axis.ticked();
     let steps = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400];
-    let max_ticks = (bar_w / 7).clamp(2, 5);
-    let step = steps.iter().copied().find(|s| ((total / *s as f64).floor() as usize) < max_ticks).unwrap_or(86400);
-    let mut axis: Vec<(char, Style)> = vec![(' ', dim); bar_w];
+    let max_ticks = (tick_w / 7).clamp(2, 5);
+    let step = steps.iter().copied().find(|s| ((tick_total / *s as f64).floor() as usize) < max_ticks).unwrap_or(86400);
+    let mut axis_cells: Vec<(char, Style)> = vec![(' ', dim); bar_w];
     // `now` goes down first; a tick that would touch it gives way.
     let now_at = now_col.map(|x| x.min(bar_w.saturating_sub(3)));
     if let Some(x) = now_at {
         for (i, c) in "now".chars().enumerate() {
             if x + i < bar_w {
-                axis[x + i] = (c, Style::default().fg(theme.accent).add_modifier(Modifier::BOLD));
+                axis_cells[x + i] = (c, Style::default().fg(theme.accent).add_modifier(Modifier::BOLD));
             }
         }
     }
     let mut free_from = 0;
     let mut t = 0;
-    while (t as f64) <= total {
+    while (t as f64) <= tick_total {
         let label = axis_label(t);
         let len = label.chars().count();
-        let x = (((t as f64) / total) * bar_w as f64).round() as usize;
-        let x = x.min(bar_w.saturating_sub(len));
+        let x = (((t as f64) / tick_total) * tick_w as f64).round() as usize;
+        let x = x.min(tick_w.saturating_sub(len));
         let clear_of_now = now_at.is_none_or(|n| x + len < n || x > n + 3);
-        if x >= free_from && x + len <= bar_w && clear_of_now {
+        if x >= free_from && x + len <= tick_w && clear_of_now {
             for (i, c) in label.chars().enumerate() {
-                axis[x + i] = (c, dim);
+                axis_cells[x + i] = (c, dim);
             }
             free_from = x + len + 1;
         }
         t += step;
     }
+    // A squeezed wait is labelled with how long it is, between the work and `now`.
+    if let (Some((_, work_w)), Some(w)) = (axis.squeeze, wait) {
+        let room = now_at.unwrap_or(bar_w).saturating_sub(work_w + 2);
+        let label = [format!("╌ waited {} ╌", fmt_secs(w)), format!("╌ {} ╌", fmt_secs(w))].into_iter().find(|l| l.chars().count() <= room);
+        if let Some(label) = label {
+            for (i, c) in label.chars().enumerate() {
+                axis_cells[work_w + 1 + i] = (c, yellow);
+            }
+        }
+    }
     let mut axis_spans = vec![Span::raw(" ".repeat(prefix))];
-    axis_spans.extend(cells_to_spans(axis));
+    axis_spans.extend(cells_to_spans(axis_cells));
 
     // The in-flight job furthest from done is the one to watch.
     let longest = ghosts.values().filter_map(|g| g.left).max();
     let items: Vec<ListItem> = nodes
         .iter()
         .map(|n| {
+            if n.info {
+                return ListItem::new(Line::from(info_spans(theme, n)));
+            }
             let indent = "  ".repeat(n.depth);
-            let marker = match n.key {
-                Some(_) if n.expanded => "▾ ",
-                Some(_) => "▸ ",
-                None => "· ",
-            };
             let color = theme.pipeline_color(n.status);
-            let label_style = if n.group || matches!(n.status, PipelineRunStatus::Queued | PipelineRunStatus::Canceled) {
-                Style::default().fg(theme.dim)
-            } else if n.status == PipelineRunStatus::Failed {
-                Style::default().fg(theme.red)
-            } else if n.depth == 0 && n.job.is_none() {
-                Style::default().fg(theme.fg).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(theme.fg)
-            };
             let running = n.status == PipelineRunStatus::Running;
-            let (duration, dur_style) = match (&n.duration, n.started_at) {
-                (Some(d), _) => (d.clone(), dim),
-                (None, Some(s)) if running => (fmt_secs((now - s).num_seconds()), Style::default().fg(theme.accent)),
-                (None, None) if n.status == PipelineRunStatus::Queued => ("queued".to_string(), dim),
-                _ => ("—".to_string(), dim),
-            };
+            let (duration, dur_style) = open_duration(theme, n, wait, now);
             let label_w = lw.saturating_sub(indent.chars().count());
             let mut spans = vec![
                 Span::raw(indent),
-                Span::styled(marker, dim),
+                Span::styled(node_marker(n), dim),
                 Span::styled(format!("{} ", pipeline_glyph(n.status, anim)), Style::default().fg(color)),
-                Span::styled(fit(&n.label, label_w), label_style),
-                Span::styled(format!("{duration:>7}"), dur_style),
-                Span::raw("  "),
             ];
+            spans.extend(label_spans(theme, n, label_w));
+            spans.push(Span::styled(format!("{duration:>7}"), dur_style));
+            spans.push(Span::raw("  "));
 
             let mut cells: Vec<(char, Style)> = vec![(' ', dim); bar_w];
             let end = n.finished_at.or_else(|| running.then_some(now));
             if let (Some(s), Some(e)) = (n.started_at, end.filter(|e| *e >= t0)) {
                 let s = s.max(t0);
-                let x0 = col(s).min(bar_w - 1);
-                let len = (secs_of(e) - secs_of(s)).max(0.0) / total * bar_w as f64;
+                let p0 = axis.pos(secs_of(s));
+                let x0 = (p0.round().max(0.0) as usize).min(bar_w - 1);
+                let len = (axis.pos(secs_of(e)) - p0).max(0.0);
                 let bar = Style::default().fg(color);
                 if len < 0.5 {
                     cells[x0] = ('▏', bar);
@@ -3802,6 +4110,14 @@ fn render_timeline(
                 } else {
                     for cell in cells.iter_mut().take((x0 + len.round() as usize).min(bar_w)).skip(x0) {
                         *cell = ('█', bar);
+                    }
+                }
+            }
+            // The gated stage's bar is the wait itself: from the last activity to now.
+            if n.status == PipelineRunStatus::Waiting && n.job.is_none() {
+                if let Some(l) = last {
+                    for cell in cells.iter_mut().take(now_col.unwrap_or(bar_w)).skip(col(l) + 1) {
+                        *cell = ('░', yellow);
                     }
                 }
             }
@@ -3814,6 +4130,12 @@ fn render_timeline(
                     if cell.0 == ' ' {
                         *cell = ('░', dim);
                     }
+                }
+            }
+            // A row with no span of its own says in words what the bar can't.
+            if let Some(note) = n.note.as_ref().filter(|_| cells.iter().all(|c| c.0 == ' ')) {
+                for (cell, c) in cells.iter_mut().zip(note.chars()) {
+                    *cell = (c, dim);
                 }
             }
             if let Some(x) = now_col {
@@ -4168,7 +4490,14 @@ fn render_log_pane(frame: &mut Frame, area: Rect, theme: &Theme, log: &LogView) 
 /// The approvals banner for the drill-in: pending gates you can act on, a
 /// waiting-on-others note, or an explicit "unsupported" note (e.g. Bitbucket).
 /// `None` when the provider supports approvals and there's nothing pending.
+///
+/// A pending gate is not a failure, so it is yellow, says how long the run has waited, and how
+/// to answer it here — or, where the provider is view-only, where to answer it.
 fn approval_banner<'a>(theme: &Theme, view: &PipelineView) -> Option<Line<'a>> {
+    approval_banner_at(theme, view, Utc::now())
+}
+
+fn approval_banner_at<'a>(theme: &Theme, view: &PipelineView, now: DateTime<Utc>) -> Option<Line<'a>> {
     if !view.supports_approvals {
         return Some(Line::from(Span::styled(
             format!("  Approvals not supported on {}", view.provider.as_str()),
@@ -4178,21 +4507,31 @@ fn approval_banner<'a>(theme: &Theme, view: &PipelineView) -> Option<Line<'a>> {
     if view.approvals.is_empty() {
         return None;
     }
+    // How long the gate has held the run — only once it does: while jobs still run, the time
+    // since the last one finished is no wait at all.
+    let parked = view.shown_status() == PipelineRunStatus::Waiting;
+    let waited = waiting_secs(&view.run, now)
+        .filter(|_| parked)
+        .map(|w| format!(" · waiting {}", fmt_secs(w)))
+        .unwrap_or_default();
     let actionable = view.actionable_approvals();
     if actionable.is_empty() {
         let names = view.approvals.iter().map(|a| a.name.clone()).collect::<Vec<_>>().join(", ");
-        return Some(Line::from(Span::styled(format!("  ⏸ Waiting on others: {names}"), Style::default().fg(theme.dim))));
+        return Some(Line::from(Span::styled(format!("  ⏸ Waiting on others: {names}{waited}"), Style::default().fg(theme.dim))));
     }
     let names = actionable.iter().map(|a| a.name.clone()).collect::<Vec<_>>().join(", ");
-    // The gate is still surfaced when the provider is view-only (Azure) — just
-    // without the "press A" hint, since we can't submit the decision here.
+    let verb = if actionable.len() == 1 { "needs" } else { "need" };
+    // The gate is still surfaced when the provider is view-only (Azure) — with the way to the
+    // provider's own page instead of the "press A" hint, since we can't submit the decision here.
     let hint = if view.can_respond_approvals {
-        "   press A to approve / reject"
+        "   press A to approve / reject".to_string()
     } else {
-        "   view-only — approve in the provider's UI"
+        format!("   o  open in {} to approve", provider_label(view.provider))
     };
+    let yellow = Style::default().fg(theme.yellow);
     Some(Line::from(vec![
-        Span::styled(format!("  ⏸ Approval needed: {names}"), Style::default().fg(theme.red).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("  ⏸ {names} {verb} approval"), yellow.add_modifier(Modifier::BOLD)),
+        Span::styled(waited, yellow),
         Span::styled(hint, Style::default().fg(theme.dim)),
     ]))
 }
@@ -5758,12 +6097,19 @@ mod tests {
         assert_eq!((flat[0].label.as_str(), flat[0].depth, flat[0].step), ("cargo build", 0, Some(0)));
         assert_eq!(flat[0].job_id.as_deref(), Some("j1"), "the step still knows its job");
 
-        // Two stages keep every level.
+        // Two stages keep every level — but finished stages start folded, one line each.
         let mut run = sample_run();
         run.stages.push(run.stages[0].clone());
-        let view = PipelineView::new("CI #101".into(), run, "demo".into(), ProviderType::GitHub, "ci".into(), None);
+        let mut view = PipelineView::new("CI #101".into(), run, "demo".into(), ProviderType::GitHub, "ci".into(), None);
         let flat = view.flatten();
-        assert_eq!(flat.len(), 6, "stage + job + step, twice");
+        assert_eq!(flat.len(), 2, "two folded stages");
+        assert!(!flat[0].expanded && flat[0].summary.as_ref().is_some_and(|(t, _)| t == "1 job"), "{:?}", flat[0].summary);
+        for at in [1, 0] {
+            view.selected = at;
+            view.toggle_selected();
+        }
+        let flat = view.flatten();
+        assert_eq!(flat.len(), 6, "stage + job + step, twice, once unfolded");
         assert_eq!(flat[0].depth, 0);
         assert_eq!(flat[2].depth, 2);
     }
@@ -5863,16 +6209,17 @@ mod tests {
     fn drill_in_banner_flags_approval_needed_and_unsupported() {
         use crate::app::Screen;
 
-        // A GitHub run with a gate I can action → red "Approval needed" banner + A key.
+        // A GitHub run with a gate I can action → yellow "needs approval" banner + A key.
         let mut app = App::new("slate");
         let mut view = PipelineView::new("CI #101".into(), sample_run(), "demo".into(), ProviderType::GitHub, "ci".into(), None);
         view.supports_approvals = true;
         view.can_respond_approvals = true;
-        view.approvals = vec![PipelineApproval { id: "prod".into(), name: "production".into(), can_respond: true }];
+        view.approvals = vec![PipelineApproval { id: "prod".into(), name: "production".into(), can_respond: true, blocks_run: true }];
         app.screen = Screen::Pipeline(Box::new(view));
         let out = render_to_string(&mut app, 120, 30);
-        assert!(out.contains("Approval needed") && out.contains("production"), "actionable gate banner");
+        assert!(out.contains("⏸ production needs approval"), "actionable gate banner");
         assert!(out.contains("press A") && out.contains("approve"), "actionable footer + press-A hint");
+        assert!(out.contains("Waiting for approval"), "a gated run reads as waiting, not running");
 
         // A Bitbucket run → explicit unsupported note.
         let mut app = App::new("slate");
@@ -5889,11 +6236,11 @@ mod tests {
         let mut view = PipelineView::new("Deploy".into(), sample_run(), "az".into(), ProviderType::AzureDevOps, "ci".into(), None);
         view.supports_approvals = true;
         view.can_respond_approvals = false;
-        view.approvals = vec![PipelineApproval { id: "prod".into(), name: "production".into(), can_respond: true }];
+        view.approvals = vec![PipelineApproval { id: "prod".into(), name: "production".into(), can_respond: true, blocks_run: true }];
         app.screen = Screen::Pipeline(Box::new(view));
         let out = render_to_string(&mut app, 120, 30);
-        assert!(out.contains("Approval needed") && out.contains("production"), "gate still surfaced");
-        assert!(out.contains("view-only"), "banner marks it view-only");
+        assert!(out.contains("production needs approval"), "gate still surfaced");
+        assert!(out.contains("o  open in Azure DevOps to approve"), "banner says where to answer it");
         assert!(!out.contains("press A"), "no press-A hint when view-only");
     }
 
@@ -5909,6 +6256,7 @@ mod tests {
             definition_name: Some("CI Build".into()),
             awaiting_approval: true,
             triggered_by_me: true,
+            gates: vec!["production".into()],
             run: sample_run(),
         });
         app.pipe_state.select(Some(0));
@@ -5918,8 +6266,9 @@ mod tests {
         // The tree glyph `└` closes a group, so it appears on a child row and nowhere else —
         // the precise test for whether the run itself is on screen.
         let out = render_to_string(&mut app, 150, 24);
-        assert!(out.contains("Approval"), "approval column header present");
-        assert!(out.contains("approval needed"), "the collapsed group announces the gate");
+        assert!(out.contains("Now"), "the Now column header present");
+        assert!(out.contains("production approval"), "the collapsed group announces the gate");
+        assert!(out.contains("Waiting"), "and the group reads as its gated newest run");
         assert!(!out.contains('└'), "and the run row is put away");
 
         // Expanded, the run's own Approval cell carries it. This is the assertion the test
@@ -5931,13 +6280,13 @@ mod tests {
         app.pipe_expanded.insert(key);
         let out = render_to_string(&mut app, 150, 24);
         assert!(out.contains('└'), "the run row itself is rendered, hanging off the group");
-        assert!(out.contains("approval needed"), "and the row's Approval cell is flagged");
+        assert!(out.contains("production approval"), "and the row's Now cell is flagged");
 
         // Ungrouped, the row stands alone and must still be flagged.
         app.pipe_group = crate::app::PipeGroup::Off;
         let out = render_to_string(&mut app, 150, 24);
         assert!(!out.contains('└') && !out.contains('▸'), "no tree glyphs when grouping is off");
-        assert!(out.contains("approval needed"), "and the run is still flagged");
+        assert!(out.contains("production approval"), "and the run is still flagged");
     }
 
     /// The default landing for the tab: one line per pipeline, carrying the repository the
@@ -5959,6 +6308,7 @@ mod tests {
                 definition_name: Some(def.into()),
                 awaiting_approval: false,
                 triggered_by_me: true,
+                gates: Vec::new(),
                 run,
             }
         };
@@ -6027,6 +6377,7 @@ mod tests {
                     definition_name: Some((*def).into()),
                     awaiting_approval: false,
                     triggered_by_me: true,
+                    gates: Vec::new(),
                     run,
                 }
             })
@@ -6098,8 +6449,11 @@ mod tests {
         };
         app.pipe_expanded.insert(key);
         let out = render_to_string(&mut app, 150, 16);
-        assert!(out.contains("Pipeline / Branch"), "the heading names both kinds of value");
-        assert!(out.contains("─ main") && out.contains("─ v2.0"), "each run names its own branch");
+        assert!(out.contains("Pipeline / Run") && out.contains("Runs / Branch"), "the headings name both kinds of value");
+        assert!(out.contains("─ #1") && out.contains("─ #2"), "each run names itself");
+        let row = |n: &str| out.lines().find(|l| l.contains(n)).unwrap_or_default().to_string();
+        assert!(row("─ #1").contains("main") && row("─ #2").contains("v2.0"), "beside its own branch, once");
+        assert_eq!(out.matches("main").count(), 1, "the branch isn't repeated");
         assert!(out.contains('├') && out.contains('└'), "and hangs off the tree gutter");
     }
 
@@ -6146,15 +6500,13 @@ mod tests {
         app.pipes[0].run.status = Failed;
         let out = render_to_string(&mut app, 150, 16);
         assert!(out.contains('└'), "the child is on screen");
-        // Its header says "Failed" one line up, so the child shows the glyph alone — see
-        // `a_groups_runs_carry_only_their_glyph`.
-        assert_eq!(out.matches("Failed").count(), 1, "the state is named once for the group");
+        assert_eq!(out.matches("Failed").count(), 2, "the header and the run beneath it both name it");
     }
 
-    /// The header names where the pipeline stands; beneath it, ✓ / ✗ is what the eye scans
-    /// for, so a group's runs carry only their glyph — no word, even where the state changes.
+    /// A group's runs name their state as the header does: a column of bare ✓ beside an empty
+    /// status word read as missing data, and a glyph alone says nothing once colour is gone.
     #[test]
-    fn a_groups_runs_carry_only_their_glyph() {
+    fn a_groups_runs_name_their_state_too() {
         use PipelineRunStatus::{Failed, Succeeded};
         let mut app = pipe_list(&[
             ("CI", "nz/app", "main", "aaa", 10, Succeeded),
@@ -6168,31 +6520,23 @@ mod tests {
         app.pipe_expanded.insert(key);
 
         let out = render_to_string(&mut app, 150, 16);
-        // The newest run passed, so the header reads "Succeeded"; nothing beneath it has a word.
-        assert_eq!(out.matches("Succeeded").count(), 1, "only the header names the state");
-        assert_eq!(out.matches("Failed").count(), 0, "not even the run that broke the streak");
-        assert_eq!(out.matches('✓').count(), 3, "header plus the two passing runs, glyph each");
-        assert_eq!(out.matches('✗').count(), 1, "the failed run is marked by its glyph");
-
-        // Ungrouped, neighbouring runs are unrelated — an elided word would read as a missing
-        // one, so every row spells its state out.
-        app.pipe_group = crate::app::PipeGroup::Off;
-        let out = render_to_string(&mut app, 150, 16);
-        assert_eq!(out.matches("Succeeded").count(), 2, "a flat list repeats");
+        assert_eq!(out.matches("Succeeded").count(), 3, "the header and both passing runs");
+        assert_eq!(out.matches("Failed").count(), 1, "the run that broke the streak says so");
+        assert_eq!(out.matches('✗').count(), 1, "beside its glyph");
     }
 
-    /// Approval is the rarest column of all — it should not hold the table open when nothing
-    /// anywhere is waiting.
+    /// The Now column, like the Approval column it replaced, holds the table open only while
+    /// some row has something to say.
     #[test]
-    fn the_approval_column_appears_only_when_a_gate_is_waiting() {
+    fn the_now_column_appears_only_when_a_row_has_something_to_say() {
         use PipelineRunStatus::Succeeded as S;
         let mut app = pipe_list(&[("CI", "nz/app", "main", "aaa", 10, S)]);
         let out = render_to_string(&mut app, 150, 16);
-        assert!(!out.contains("Approval"), "nothing waiting, so no column");
+        assert!(!out.contains("Now"), "nothing to say, so no column");
 
         app.pipes[0].awaiting_approval = true;
         let out = render_to_string(&mut app, 150, 16);
-        assert!(out.contains("Approval") && out.contains("approval needed"), "a gate brings it back");
+        assert!(out.contains("Now") && out.contains("approval needed"), "a gate brings it back");
     }
 
     /// The arrow has to mark the column the sort actually applies to. The columns are picked
@@ -7495,6 +7839,7 @@ mod tests {
             definition_name: Some("CI".into()),
             awaiting_approval: false,
             triggered_by_me: true,
+            gates: Vec::new(),
         }
     }
 
@@ -7904,6 +8249,213 @@ mod tests {
         assert!(retried.contains("███"), "the running job's bar is readable: {retried}");
         let passed = rows.iter().find(|r| r.contains("passed")).unwrap();
         assert!(passed.contains("40s"), "the kept job keeps its own duration: {passed}");
+    }
+
+    // ---- a run parked on an approval gate, and one whose later stages never ran ----
+
+    /// A job of one step, `a`..`b` seconds into a run that started `base` seconds ago.
+    fn timed_job(base: i64, id: &str, status: PipelineRunStatus, a: i64, b: i64, problem: Option<&str>) -> PipelineJob {
+        PipelineJob {
+            id: id.into(),
+            name: id.into(),
+            status,
+            started_at: Some(at(base, a)),
+            finished_at: Some(at(base, b)),
+            steps: vec![step("Initialize job", PipelineRunStatus::Succeeded, Some((at(base, a), Some(at(base, a + 1))))), step("work", status, Some((at(base, a + 1), Some(at(base, b)))))],
+            url: None,
+            problem: problem.map(Into::into),
+        }
+    }
+
+    /// payments-api 20261005.3 from the mockup: Build, Deploy Dev and Deploy Staging (with
+    /// warnings) done in 11m25s, then parked 1h47m on the Deploy Prod gate. The provider still
+    /// says Running and lists Deploy Prod as queued — the pending gate is what makes it wait.
+    fn gated_run() -> PipelineRun {
+        const BASE: i64 = 7140;
+        let stage = |name: &str, status, jobs| PipelineStage { name: name.into(), status, jobs };
+        let mut run = ci443();
+        run.id = "r3".into();
+        run.name = Some("20261005.3".into());
+        run.status = PipelineRunStatus::Running;
+        run.started_at = Some(at(BASE, 0));
+        run.finished_at = None;
+        run.pull_request = None;
+        run.stages = vec![
+            stage(
+                "Build",
+                PipelineRunStatus::Succeeded,
+                vec![
+                    timed_job(BASE, "compile", PipelineRunStatus::Succeeded, 0, 130, None),
+                    timed_job(BASE, "unit tests", PipelineRunStatus::Succeeded, 130, 350, None),
+                    timed_job(BASE, "publish artifact", PipelineRunStatus::Succeeded, 350, 375, None),
+                ],
+            ),
+            stage("Deploy Dev", PipelineRunStatus::Succeeded, vec![timed_job(BASE, "deploy dev", PipelineRunStatus::Succeeded, 390, 462, None)]),
+            stage(
+                "Deploy Staging",
+                PipelineRunStatus::PartiallySucceeded,
+                vec![
+                    timed_job(BASE, "deploy staging", PipelineRunStatus::Succeeded, 470, 560, None),
+                    timed_job(BASE, "smoke tests", PipelineRunStatus::PartiallySucceeded, 560, 685, Some("2 warnings")),
+                ],
+            ),
+            stage("Deploy Prod", PipelineRunStatus::Queued, vec![]),
+            stage("Post-deploy checks", PipelineRunStatus::Queued, vec![]),
+        ];
+        run
+    }
+
+    fn gated_view() -> PipelineView {
+        let mut view = PipelineView::new("payments-api 20261005.3".into(), gated_run(), "az".into(), ProviderType::AzureDevOps, "pay".into(), None);
+        view.supports_approvals = true;
+        view.can_respond_approvals = false;
+        view.approvals = vec![PipelineApproval { id: "prod".into(), name: "Deploy Prod".into(), can_respond: true, blocks_run: true }];
+        view
+    }
+
+    #[test]
+    fn a_run_parked_on_a_gate_reads_as_waiting_with_its_wait_squeezed() {
+        let app = pane_app(gated_view());
+        for w in [104u16, 140] {
+            let rows = pane_rows(&app, w, 34);
+            let all = rows.join("\n");
+            assert!(rows[1].contains("⏸ Waiting for approval") && rows[1].contains("1h59m"), "{}", rows[1]);
+            assert!(all.contains("ran 11m25s, then waiting 1h47m"), "the ETA gives way to the split: {all}");
+            assert!(!all.contains("past the usual") && !all.contains("done in"), "{all}");
+            assert!(all.contains("⏸ Deploy Prod needs approval · waiting 1h47m"), "a yellow banner, not a red one: {all}");
+            assert!(all.contains("o  open in Azure DevOps to approve"), "{all}");
+            // Finished stages fold to a line; the gate is a row of its own, open on why.
+            assert!(all.contains("▸ ✓ Build  3 jobs") && all.contains("▸ ✓ Deploy Dev  1 job"), "{all}");
+            assert!(all.contains("▸ ▲ Deploy Staging  2 warnings"), "{all}");
+            assert!(!all.contains("compile"), "folded away: {all}");
+            assert!(all.contains("▾ ⏸ Deploy Prod") && all.contains("1h47m"), "{all}");
+            assert!(all.contains("approval required · its jobs start once approved"), "{all}");
+            assert!(all.contains("after Deploy Prod"), "the stage behind the gate says what it waits on: {all}");
+            assert!(all.contains("╌ waited 1h47m ╌") || all.contains("╌ 1h47m ╌"), "the wait is a labelled segment: {all}");
+            assert!(all.contains('░'), "the gate's bar fills the wait: {all}");
+            assert!(all.contains("10m") && !all.contains("1h30"), "ticks cover the work, not the idle hour: {all}");
+        }
+    }
+
+    #[test]
+    fn a_gate_the_user_can_answer_points_at_a() {
+        let mut view = gated_view();
+        view.provider = ProviderType::GitHub;
+        view.can_respond_approvals = true;
+        let line = approval_banner_at(&Theme::by_name("slate"), &view, Utc::now()).expect("a banner");
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("⏸ Deploy Prod needs approval · waiting 1h4") && text.contains("press A to approve / reject"), "{text}");
+        let theme = Theme::by_name("slate");
+        assert_eq!(line.spans[1].style.fg, Some(theme.yellow), "a pending gate is not a failure");
+
+        // Someone else's gate keeps its quieter note.
+        view.approvals[0].can_respond = false;
+        let line = approval_banner_at(&theme, &view, Utc::now()).expect("a banner");
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("Waiting on others: Deploy Prod · waiting 1h4"), "{text}");
+    }
+
+    /// payments-api 20261004.9: unit tests broke in Build, so the four stages after it never ran.
+    fn skipped_run() -> PipelineRun {
+        const BASE: i64 = 86_400;
+        let mut run = gated_run();
+        run.id = "r9".into();
+        run.status = PipelineRunStatus::Failed;
+        run.finished_at = Some(at(BASE, 242));
+        run.started_at = Some(at(BASE, 0));
+        run.stages = vec![PipelineStage {
+            name: "Build".into(),
+            status: PipelineRunStatus::Failed,
+            jobs: vec![
+                timed_job(BASE, "compile", PipelineRunStatus::Succeeded, 0, 124, None),
+                timed_job(BASE, "unit tests", PipelineRunStatus::Failed, 124, 242, Some("3 errors")),
+            ],
+        }];
+        for name in ["Deploy Dev", "Deploy Staging", "Deploy Prod", "Post-deploy checks"] {
+            run.stages.push(PipelineStage { name: name.into(), status: PipelineRunStatus::Skipped, jobs: vec![] });
+        }
+        run
+    }
+
+    #[test]
+    fn stages_that_never_ran_fold_into_one_dim_row() {
+        let view = PipelineView::new("payments-api 20261004.9".into(), skipped_run(), "az".into(), ProviderType::AzureDevOps, "pay".into(), None);
+        let app = pane_app(view);
+        let all = pane_rows(&app, 104, 30).join("\n");
+        assert!(all.contains("▸ ⊘ 4 stages skipped") && all.contains("Build failed"), "{all}");
+        assert!(!all.contains("Deploy Prod"), "the stages themselves are folded away: {all}");
+        assert!(all.contains("▸ ✓ compile"), "a passed job of a failed run starts folded: {all}");
+        assert!(all.contains("▾ ✗ unit tests"), "the broken one is open: {all}");
+
+        // A lone skipped stage reads as itself, `skipped` where its time would be.
+        let mut run = skipped_run();
+        run.stages.truncate(2);
+        let app = pane_app(PipelineView::new("x".into(), run, "az".into(), ProviderType::AzureDevOps, "pay".into(), None));
+        let all = pane_rows(&app, 104, 30).join("\n");
+        let row = all.lines().find(|l| l.contains("Deploy Dev")).unwrap_or_default();
+        assert!(row.contains("⊘ Deploy Dev") && row.contains("skipped"), "{row}");
+        let narrow = pane_rows(&app, 60, 30).join("\n");
+        assert!(narrow.contains("⊘ Deploy Dev  skipped"), "the plain tree too: {narrow}");
+    }
+
+    #[test]
+    fn a_squeezed_axis_gives_the_work_most_of_the_bar_and_the_wait_a_fixed_tail() {
+        // 685s of work, then waiting until 7140s, on a 60-column bar.
+        let axis = TimeAxis::parked(7140.0, 685.0, 60);
+        let (worked, work_w) = axis.squeeze.expect("a wait over half the span squeezes");
+        assert_eq!((worked, work_w), (685.0, 39), "65% of the bar for the work");
+        assert_eq!(axis.col(0.0), 0);
+        assert_eq!(axis.col(342.5), 20, "halfway through the work is halfway across its share");
+        assert_eq!(axis.col(685.0), 39, "the last activity ends the work's share");
+        assert_eq!(axis.col(685.0 + (7140.0 - 685.0) / 2.0), 49, "the wait spreads over the tail");
+        assert_eq!(axis.col(7140.0), 59, "now is the last column");
+        assert_eq!(axis.ticked(), (685.0, 39), "ticks span the work only");
+
+        // A short wait isn't squeezed, and the axis is exactly the linear one.
+        let axis = TimeAxis::parked(1000.0, 600.0, 60);
+        assert_eq!(axis, TimeAxis::linear(1000.0, 60));
+        assert_eq!(axis.col(500.0), 30);
+        assert_eq!(axis.col(1000.0), 60);
+    }
+
+    #[test]
+    fn a_runs_row_names_its_state_what_it_waits_on_and_each_stage() {
+        use PipelineRunStatus::Succeeded as S;
+        let mut app = pipe_list(&[("payments-api", "nz/app", "main", "aaa", 120, S), ("payments-api", "nz/app", "feat/refunds", "bbb", 1440, S)]);
+        app.pipes[0].run.name = Some("20261005.3".into());
+        app.pipes[0].run.stages = gated_run().stages;
+        app.pipes[0].run.status = PipelineRunStatus::Running;
+        app.pipes[0].run.started_at = gated_run().started_at;
+        app.pipes[0].gates = vec!["Deploy Prod".into()];
+        let broken = skipped_run();
+        app.pipes[1].run.name = Some("20261004.9".into());
+        app.pipes[1].run.stages = broken.stages;
+        app.pipes[1].run.status = PipelineRunStatus::Failed;
+        app.pipes[1].run.finished_at = Some(app.pipes[1].run.started_at.unwrap() + chrono::Duration::seconds(242));
+        let key = match &app.pipe_lines()[0] {
+            crate::app::PipeLine::Head(h) => h.key.clone(),
+            crate::app::PipeLine::Run(_) => panic!("header"),
+        };
+        app.pipe_expanded.insert(key);
+        let out = render_to_string(&mut app, 150, 16);
+        let row = |n: &str| out.lines().find(|l| l.contains(n)).unwrap_or_default().to_string();
+        let head = out.lines().find(|l| l.contains("▾")).unwrap_or_default().to_string();
+        assert!(head.contains("⏸ Waiting"), "the group mirrors its newest run: {head}");
+        let waiting = row("20261005.3");
+        assert!(waiting.contains("⏸ Waiting") && waiting.contains("main"), "{waiting}");
+        assert!(waiting.contains("Deploy Prod approval · 1h4"), "{waiting}");
+        assert!(waiting.contains("✓✓▲⏸◔"), "one glyph per stage: {waiting}");
+        assert!(waiting.contains("1h59m"), "took so far: {waiting}");
+        let failed = row("20261004.9");
+        assert!(failed.contains("✗ Failed") && failed.contains("feat/refunds"), "{failed}");
+        assert!(failed.contains("Build › unit tests · 3 errors"), "{failed}");
+        assert!(failed.contains("✗⊘⊘⊘⊘"), "{failed}");
+        assert!(out.contains("Now") && out.contains("Stages") && out.contains("Took"), "{out}");
+
+        // Narrow, the new context columns give way before Now does.
+        let narrow = render_to_string(&mut app, 90, 16);
+        assert!(narrow.contains("Deploy Prod approval"), "{narrow}");
+        assert!(!narrow.contains("Stages"), "{narrow}");
     }
 
     /// A wrapped help description continues in the description column, never back under the

@@ -436,6 +436,19 @@ pub struct PipeRow {
     /// Defaults to `false` for rows cached before it existed; the next reload sets it.
     #[serde(default)]
     pub triggered_by_me: bool,
+    /// The pending gates that hold this run, by name, whoever may answer them. `awaiting_approval`
+    /// is the narrower "this user can answer one". An optional gate the run carries on past (a
+    /// GitLab manual job allowed to fail) isn't listed: it doesn't park the run as Waiting.
+    #[serde(default)]
+    pub gates: Vec<String>,
+}
+
+impl PipeRow {
+    /// The status to show: an in-flight run held on any gate reads as Waiting. Derived at display
+    /// time so the stored run stays exactly what the provider said (refresh and cache compare it).
+    pub fn shown_status(&self) -> PipelineRunStatus {
+        self.run.shown_status(!self.gates.is_empty())
+    }
 }
 
 /// How the Pipelines list groups its runs.
@@ -1208,8 +1221,109 @@ pub struct FlatNode {
     pub stage: usize,
     pub job: Option<usize>,
     pub step: Option<usize>,
-    /// A folded run of steps ("8 steps passed", "4 post & cleanup steps"), not a single step.
+    /// A folded run of steps ("8 steps passed", "4 post & cleanup steps") or of skipped stages
+    /// ("4 stages skipped"), not a single node.
     pub group: bool,
+    /// A short roll-up drawn after the label when there's room — a folded stage's `3 jobs`, or
+    /// the problem its jobs report — and how to colour it.
+    pub summary: Option<(String, palette::Tone)>,
+    /// Text drawn where the bar would be, for a row with no span of its own: what a queued stage
+    /// waits on (`after Deploy Prod`), what made a run of stages skip (`Build failed`).
+    pub note: Option<String>,
+    /// An explanatory line, not a node of the run: the row under a gated stage that says why
+    /// it has no jobs. The label is the whole text.
+    pub info: bool,
+}
+
+impl FlatNode {
+    /// A row with nothing but its place, name and status; the rest is filled in by the caller.
+    fn bare(depth: usize, label: String, status: PipelineRunStatus, stage: usize) -> Self {
+        FlatNode {
+            depth,
+            label,
+            status,
+            key: None,
+            expanded: false,
+            duration: None,
+            problem: None,
+            url: None,
+            job_id: None,
+            started_at: None,
+            finished_at: None,
+            stage,
+            job: None,
+            step: None,
+            group: false,
+            summary: None,
+            note: None,
+            info: false,
+        }
+    }
+}
+
+/// When a run last did anything: the latest finish among its jobs and steps. For a run parked on
+/// a gate, this is where the work stopped and the wait began.
+pub fn last_activity(run: &PipelineRun) -> Option<DateTime<Utc>> {
+    run.stages
+        .iter()
+        .flat_map(|s| &s.jobs)
+        .flat_map(|j| j.finished_at.into_iter().chain(j.steps.iter().filter_map(|s| s.finished_at)))
+        .max()
+}
+
+/// How long a parked run has waited: `now` less its last activity. `None` when nothing in it has
+/// finished, so there's no telling when the wait began.
+pub fn waiting_secs(run: &PipelineRun, now: DateTime<Utc>) -> Option<i64> {
+    last_activity(run).map(|last| (now - last).num_seconds().max(0))
+}
+
+/// The stage a parked run is held at: one the provider already reports as Waiting, else — when
+/// the run reads as Waiting only through its pending gates (`shown`) — the queued stage a gate is
+/// named after, or the first queued one. `None` when the run isn't waiting — finished, cancelled,
+/// or still running — whatever its stages last said.
+pub fn gate_stage(run: &PipelineRun, shown: PipelineRunStatus, gates: &[String]) -> Option<usize> {
+    if shown != PipelineRunStatus::Waiting {
+        return None;
+    }
+    if let Some(i) = run.stages.iter().position(|s| s.status == PipelineRunStatus::Waiting) {
+        return Some(i);
+    }
+    let queued = |s: &PipelineStage| s.status == PipelineRunStatus::Queued;
+    run.stages
+        .iter()
+        .position(|s| queued(s) && gates.iter().any(|g| g.eq_ignore_ascii_case(&s.name)))
+        .or_else(|| run.stages.iter().position(queued))
+}
+
+/// A provider's name as a person writes it — `as_str` is the serialised form (`AzureDevOps`).
+pub fn provider_label(p: ProviderType) -> &'static str {
+    match p {
+        ProviderType::AzureDevOps => "Azure DevOps",
+        other => other.as_str(),
+    }
+}
+
+/// What a folded stage says after its label: the problem its jobs report when it didn't pass
+/// cleanly, else how many jobs it ran.
+fn stage_summary(stage: &PipelineStage, status: PipelineRunStatus) -> Option<(String, palette::Tone)> {
+    use palette::Tone;
+    let problem = |want: PipelineRunStatus| stage.jobs.iter().filter(|j| j.status == want).find_map(|j| j.problem.clone());
+    match status {
+        PipelineRunStatus::Waiting => return Some(("needs approval".into(), Tone::Warn)),
+        PipelineRunStatus::PartiallySucceeded => {
+            if let Some(p) = problem(PipelineRunStatus::PartiallySucceeded) {
+                return Some((p, Tone::Warn));
+            }
+        }
+        PipelineRunStatus::Failed => {
+            if let Some(p) = problem(PipelineRunStatus::Failed) {
+                return Some((p, Tone::Bad));
+            }
+        }
+        _ => {}
+    }
+    let n = stage.jobs.len();
+    (n > 0).then(|| (format!("{n} {}", if n == 1 { "job" } else { "jobs" }), Tone::Neutral))
 }
 
 /// Trailing steps that only tidy up after a job: `Post …` hooks and `Complete job`.
@@ -1993,7 +2107,7 @@ pub fn next_match_index(len: usize, cur: Option<usize>, forward: bool) -> Option
 
 /// The first failed node of a run as `(stage, job, step)`: a failed step when a job has one
 /// (its log names the failure most precisely), else a failed job.
-fn first_failed_node(run: &PipelineRun) -> Option<(usize, usize, Option<usize>)> {
+pub fn first_failed_node(run: &PipelineRun) -> Option<(usize, usize, Option<usize>)> {
     for (si, stage) in run.stages.iter().enumerate() {
         for (ji, job) in stage.jobs.iter().enumerate() {
             if let Some(k) = job.steps.iter().position(|s| s.status == PipelineRunStatus::Failed) {
@@ -2039,7 +2153,11 @@ pub struct PipelineView {
     pub provider: ProviderType,
     pub definition_id: String,
     pub branch: Option<String>,
-    collapsed: HashSet<String>,
+    /// Fold state the user chose, by node key (`s0`, `s0.j1`, `s0.j1.pass`, `s2.skip`): `true`
+    /// open. A node absent here takes its default — finished stages folded, the stage needing
+    /// attention open, passed jobs of a failed run folded, step groups folded — so a refresh that
+    /// moves a stage on re-decides only what the user hasn't touched.
+    folds: HashMap<String, bool>,
     pub selected: usize,
     /// Open log pane over a selected job, if any.
     pub logs: Option<LogView>,
@@ -2085,9 +2203,6 @@ pub struct PipelineView {
     pub history: Option<RunHistory>,
     /// Estimated durations for an in-flight run. Rebuilt by the app.
     pub estimates: Estimates,
-    /// Folded step groups (`….pass` / `….post` keys) the user opened. They start folded, so
-    /// unlike `collapsed` this records the exceptions.
-    unfolded: HashSet<String>,
     /// The artifacts overlay, while open.
     pub artifacts: Option<ArtifactsPanel>,
     /// What the failed job's log says went wrong, read when that log loads: `(job id, summary)`.
@@ -2103,7 +2218,7 @@ impl PipelineView {
             provider,
             definition_id,
             branch,
-            collapsed: HashSet::new(),
+            folds: HashMap::new(),
             selected: 0,
             logs: None,
             log_focus: true,
@@ -2125,7 +2240,6 @@ impl PipelineView {
             problem_sel: 0,
             history: None,
             estimates: Estimates::default(),
-            unfolded: HashSet::new(),
             artifacts: None,
             log_failure: None,
         }
@@ -2134,7 +2248,7 @@ impl PipelineView {
     /// Patches in a freshly-fetched run, preserving what the user is doing: the open log pane
     /// and the expand/collapse tree state are untouched (this never rebuilds the view), and the
     /// selection is clamped rather than reset, since the new run's flattened node count may be
-    /// shorter. `collapsed` is private, so this is how a caller outside the impl block patches
+    /// shorter. `folds` is private, so this is how a caller outside the impl block patches
     /// it without reaching in. Called only once a real `get_run` has confirmed the run, which is
     /// also the moment `stale` clears.
     ///
@@ -2161,26 +2275,71 @@ impl PipelineView {
     }
 
     fn apply_fresh_run(&mut self, run: PipelineRun, approvals: Option<Vec<PipelineApproval>>) {
+        // Fold defaults follow live status — a stage folds once it passes — so a row index from
+        // before the refresh can point at a different node after it. Hold on to the node instead.
+        let anchor = self.flatten().get(self.selected).map(|n| (n.stage, n.job, n.step, n.key.clone()));
         self.run = run;
         self.apply_confirmed_approvals(approvals);
         self.stale = false;
+        if let Some(anchor) = anchor {
+            self.reselect(anchor);
+        }
         self.clamp_selection();
-        self.auto_select_failed();
+        self.auto_select();
     }
 
-    /// First load of a failed run: selects its first failed step (or, lacking one, its first
-    /// failed job), expanding the parents, and asks for its logs to open. Runs until the first
-    /// load has decided — a cache-seeded run with no stages yet waits for the live one — and
-    /// never once the user has moved the cursor.
-    fn auto_select_failed(&mut self) {
+    /// Puts the cursor back on the node it was on. When the run moved on and folded that node's
+    /// stage (or job) away, the fold is pinned open rather than the cursor jumping — the user was
+    /// looking at it, and an open log pane is still showing it.
+    fn reselect(&mut self, (stage, job, step, key): (usize, Option<usize>, Option<usize>, Option<String>)) {
+        let find = |v: &Self| v.flatten().iter().position(|n| n.stage == stage && n.job == job && n.step == step && n.key == key);
+        let mut at = find(self);
+        if at.is_none() {
+            if let Some(j) = job {
+                self.folds.entry(format!("s{stage}")).or_insert(true);
+                if step.is_some() {
+                    self.folds.entry(format!("s{stage}.j{j}")).or_insert(true);
+                }
+                at = find(self);
+            }
+        }
+        if let Some(i) = at {
+            self.selected = i;
+        }
+    }
+
+    /// What the run reads as: Waiting while a gate holds it (whoever may answer the gate) and
+    /// nothing is still running — see [`PipelineRun::shown_status`]. Derived rather than written
+    /// into `run`, which stays what the provider said.
+    pub fn shown_status(&self) -> PipelineRunStatus {
+        self.run.shown_status(self.approvals.iter().any(|a| a.blocks_run))
+    }
+
+    /// The stage this run is parked at, when it is waiting (see [`gate_stage`]).
+    pub fn gate_stage(&self) -> Option<usize> {
+        let names: Vec<String> = self.approvals.iter().filter(|a| a.blocks_run).map(|a| a.name.clone()).collect();
+        gate_stage(&self.run, self.shown_status(), &names)
+    }
+
+    /// Whether a foldable node is open: the user's choice when they made one, else `default`.
+    fn is_open(&self, key: &str, default: bool) -> bool {
+        self.folds.get(key).copied().unwrap_or(default)
+    }
+
+    /// First load: puts the cursor on what needs attention. A failed run selects its first failed
+    /// step (or, lacking one, its first failed job), expanding the parents, and asks for its logs
+    /// to open; a parked run selects the stage it waits at; a running one its first running job.
+    /// Runs until the first load has decided — a cache-seeded run with no stages (or gates) yet
+    /// waits for the live one — and never once the user has moved the cursor.
+    fn auto_select(&mut self) {
         if self.auto_checked || self.user_moved {
             return;
         }
         if self.run.status == PipelineRunStatus::Failed {
             if let Some((si, ji, step)) = first_failed_node(&self.run) {
-                self.collapsed.remove(&format!("s{si}"));
+                self.folds.insert(format!("s{si}"), true);
                 if step.is_some() {
-                    self.collapsed.remove(&format!("s{si}.j{ji}"));
+                    self.folds.insert(format!("s{si}.j{ji}"), true);
                 }
                 self.selected = self.node_index(si, ji, step);
                 self.auto_logs = true;
@@ -2188,8 +2347,30 @@ impl PipelineView {
                 return;
             }
         }
+        if let Some(i) = self.attention_row() {
+            self.selected = i;
+        }
         if !self.stale {
             self.auto_checked = true;
+        }
+    }
+
+    /// The row of an in-flight run that wants watching: the stage a parked run waits at, or a
+    /// running run's first running job. `None` when there is no such row on screen.
+    fn attention_row(&self) -> Option<usize> {
+        let nodes = self.flatten();
+        match self.shown_status() {
+            PipelineRunStatus::Waiting => {
+                let si = self.gate_stage()?;
+                nodes.iter().position(|n| n.stage == si && n.job.is_none() && !n.info && !n.group)
+            }
+            PipelineRunStatus::Running => {
+                let (si, ji) = self.run.stages.iter().enumerate().find_map(|(si, s)| {
+                    s.jobs.iter().position(|j| j.status == PipelineRunStatus::Running).map(|ji| (si, ji))
+                })?;
+                nodes.iter().position(|n| n.stage == si && n.job == Some(ji) && n.step.is_none() && !n.group)
+            }
+            _ => None,
         }
     }
 
@@ -2203,8 +2384,8 @@ impl PipelineView {
         if let Some(i) = find(&self.flatten()) {
             return i;
         }
-        self.unfolded.insert(format!("s{si}.j{ji}.pass"));
-        self.unfolded.insert(format!("s{si}.j{ji}.post"));
+        self.folds.insert(format!("s{si}.j{ji}.pass"), true);
+        self.folds.insert(format!("s{si}.j{ji}.post"), true);
         let nodes = self.flatten();
         find(&nodes)
             .or_else(|| nodes.iter().position(|n| n.stage == si && n.job == Some(ji)))
@@ -2292,78 +2473,171 @@ impl PipelineView {
         self.approvals.iter().filter(|a| a.can_respond).collect()
     }
 
-    /// Flattens stages/jobs/steps into visible rows, honouring collapsed nodes.
+    /// Flattens stages/jobs/steps into visible rows, honouring folded nodes.
     ///
     /// A run with a single stage drops the stage row (GitHub's synthetic `jobs`), and a single
     /// stage with a single job drops the job row too, so the steps sit at the top. Leading passed
     /// steps of a failed run and trailing cleanup steps fold into one row each (see
     /// [`step_folds`]); those start folded and open on ↵.
+    ///
+    /// What starts open is what needs attention: finished stages fold to one line each, the stage
+    /// that is running, failed or waiting on a gate stays open, and in a failed run the jobs that
+    /// passed fold so the broken one is what you see. Two or more stages in a row that never ran
+    /// fold into one `N stages skipped` row. Whatever the user folds or opens stays that way.
     pub fn flatten(&self) -> Vec<FlatNode> {
         let mut out = Vec::new();
-        let single_stage = self.run.stages.len() == 1;
+        let stages = &self.run.stages;
+        let single_stage = stages.len() == 1;
         let failed = self.run.status == PipelineRunStatus::Failed;
-        for (si, stage) in self.run.stages.iter().enumerate() {
-            let key = format!("s{si}");
-            let expanded = !self.collapsed.contains(&key);
-            if !single_stage {
-                let start = stage.jobs.iter().filter_map(|j| j.started_at).min();
-                let finish = if stage.jobs.iter().all(|j| j.finished_at.is_some()) {
-                    stage.jobs.iter().filter_map(|j| j.finished_at).max()
-                } else {
-                    None
-                };
-                out.push(FlatNode {
-                    depth: 0,
-                    label: stage.name.clone(),
-                    status: stage.status,
-                    key: (!stage.jobs.is_empty()).then(|| key.clone()),
-                    expanded,
-                    duration: stage_duration(&stage.jobs),
-                    problem: None,
-                    url: None,
-                    job_id: None,
-                    started_at: start,
-                    finished_at: finish,
-                    stage: si,
-                    job: None,
-                    step: None,
-                    group: false,
-                });
-                if !expanded {
+        let gate = self.gate_stage();
+        let live = self.run.status.is_active();
+        let shown = |si: usize| match stages[si].status {
+            _ if gate == Some(si) => PipelineRunStatus::Waiting,
+            // A gate on a run that has since finished (cancelled, say) never opened: the stage
+            // didn't run. Still in flight, a stage the provider says is gated really is — even
+            // while a parallel stage runs and the run as a whole reads Running.
+            PipelineRunStatus::Waiting if !live => PipelineRunStatus::Canceled,
+            other => other,
+        };
+        let mut si = 0;
+        while si < stages.len() {
+            if !single_stage && shown(si) == PipelineRunStatus::Skipped {
+                let n = (si..stages.len()).take_while(|&k| shown(k) == PipelineRunStatus::Skipped).count();
+                if n >= 2 {
+                    self.push_skipped_run(&mut out, si, n);
+                    si += n;
                     continue;
                 }
             }
-            let job_depth = usize::from(!single_stage);
-            let single_job = single_stage && stage.jobs.len() == 1 && !stage.jobs[0].steps.is_empty();
-            for (ji, job) in stage.jobs.iter().enumerate() {
-                let jkey = format!("s{si}.j{ji}");
-                let jexpanded = single_job || !self.collapsed.contains(&jkey);
-                if !single_job {
-                    out.push(FlatNode {
-                        depth: job_depth,
-                        label: job.name.clone(),
-                        status: job.status,
-                        key: (!job.steps.is_empty()).then(|| jkey.clone()),
-                        expanded: jexpanded,
-                        duration: fmt_duration(job.started_at, job.finished_at),
-                        problem: job.problem.clone(),
-                        url: job.url.clone(),
-                        job_id: Some(job.id.clone()),
-                        started_at: job.started_at,
-                        finished_at: job.finished_at,
-                        stage: si,
-                        job: Some(ji),
-                        step: None,
-                        group: false,
-                    });
-                }
-                if jexpanded {
-                    let depth = if single_job { job_depth } else { job_depth + 1 };
-                    self.flatten_steps(&mut out, si, ji, job, depth, failed);
-                }
-            }
+            self.flatten_stage(&mut out, si, shown(si), &shown, single_stage, failed);
+            si += 1;
         }
         out
+    }
+
+    /// `n` consecutive skipped stages from `first` as one foldable row, naming the failure that
+    /// stopped them; opened, it lists the stages.
+    fn push_skipped_run(&self, out: &mut Vec<FlatNode>, first: usize, n: usize) {
+        let stages = &self.run.stages;
+        let key = format!("s{first}.skip");
+        let open = self.is_open(&key, false);
+        let cause = stages[..first].iter().rev().find(|s| s.status == PipelineRunStatus::Failed).map(|s| format!("{} failed", s.name));
+        out.push(FlatNode {
+            key: Some(key),
+            expanded: open,
+            note: cause,
+            group: true,
+            ..FlatNode::bare(0, format!("{n} stages skipped"), PipelineRunStatus::Skipped, first)
+        });
+        if open {
+            for (k, stage) in stages.iter().enumerate().skip(first).take(n) {
+                out.push(FlatNode::bare(1, stage.name.clone(), PipelineRunStatus::Skipped, k));
+            }
+        }
+    }
+
+    /// One stage's rows: its own (unless it is the run's only stage), then — when open — its jobs
+    /// and their steps, or for a gated stage with no jobs yet, a line saying why.
+    fn flatten_stage(
+        &self,
+        out: &mut Vec<FlatNode>,
+        si: usize,
+        status: PipelineRunStatus,
+        shown: &dyn Fn(usize) -> PipelineRunStatus,
+        single_stage: bool,
+        failed: bool,
+    ) {
+        let stage = &self.run.stages[si];
+        let key = format!("s{si}");
+        let default_open = !matches!(
+            status,
+            PipelineRunStatus::Succeeded | PipelineRunStatus::PartiallySucceeded | PipelineRunStatus::Skipped
+        );
+        let expanded = single_stage || self.is_open(&key, default_open);
+        if !single_stage {
+            let start = stage.jobs.iter().filter_map(|j| j.started_at).min();
+            let finish = if stage.jobs.iter().all(|j| j.finished_at.is_some()) {
+                stage.jobs.iter().filter_map(|j| j.finished_at).max()
+            } else {
+                None
+            };
+            // A gated stage with no jobs yet still opens, onto the line explaining why.
+            let gate_info = status == PipelineRunStatus::Waiting && stage.jobs.is_empty();
+            // A queued stage with nothing in it yet says what it waits on: the nearest stage
+            // before it that hasn't finished.
+            let note = (status == PipelineRunStatus::Queued && stage.jobs.is_empty())
+                .then(|| (0..si).rev().find(|&k| shown(k).is_active()))
+                .flatten()
+                .map(|k| format!("after {}", self.run.stages[k].name));
+            out.push(FlatNode {
+                depth: 0,
+                label: stage.name.clone(),
+                status,
+                key: (!stage.jobs.is_empty() || gate_info).then(|| key.clone()),
+                expanded,
+                duration: stage_duration(&stage.jobs),
+                problem: None,
+                url: None,
+                job_id: None,
+                started_at: start,
+                finished_at: finish,
+                stage: si,
+                job: None,
+                step: None,
+                group: false,
+                summary: if expanded { None } else { stage_summary(stage, status) },
+                note,
+                info: false,
+            });
+            if !expanded {
+                return;
+            }
+            if gate_info {
+                out.push(FlatNode {
+                    info: true,
+                    ..FlatNode::bare(1, "approval required · its jobs start once approved".into(), status, si)
+                });
+                if !self.can_respond_approvals {
+                    let hint = format!("o  open in {} to approve", provider_label(self.provider));
+                    out.push(FlatNode { info: true, ..FlatNode::bare(1, hint, status, si) });
+                }
+                return;
+            }
+        }
+        let job_depth = usize::from(!single_stage);
+        let single_job = single_stage && stage.jobs.len() == 1 && !stage.jobs[0].steps.is_empty();
+        for (ji, job) in stage.jobs.iter().enumerate() {
+            let jkey = format!("s{si}.j{ji}");
+            // In a failed run, the jobs that passed fold so the one that broke is what you see.
+            let jdefault = !(failed && job.status == PipelineRunStatus::Succeeded);
+            let jexpanded = single_job || self.is_open(&jkey, jdefault);
+            if !single_job {
+                out.push(FlatNode {
+                    depth: job_depth,
+                    label: job.name.clone(),
+                    status: job.status,
+                    key: (!job.steps.is_empty()).then(|| jkey.clone()),
+                    expanded: jexpanded,
+                    duration: fmt_duration(job.started_at, job.finished_at),
+                    problem: job.problem.clone(),
+                    url: job.url.clone(),
+                    job_id: Some(job.id.clone()),
+                    started_at: job.started_at,
+                    finished_at: job.finished_at,
+                    stage: si,
+                    job: Some(ji),
+                    step: None,
+                    group: false,
+                    summary: None,
+                    note: None,
+                    info: false,
+                });
+            }
+            if jexpanded {
+                let depth = if single_job { job_depth } else { job_depth + 1 };
+                self.flatten_steps(out, si, ji, job, depth, failed);
+            }
+        }
     }
 
     /// A job's step rows, with its passed and cleanup runs folded into group rows.
@@ -2385,10 +2659,13 @@ impl PipelineView {
             job: Some(ji),
             step: Some(k),
             group: false,
+            summary: None,
+            note: None,
+            info: false,
         };
         let group = |out: &mut Vec<FlatNode>, range: std::ops::Range<usize>, label: String, suffix: &str| {
             let key = format!("s{si}.j{ji}.{suffix}");
-            let open = self.unfolded.contains(&key);
+            let open = self.is_open(&key, false);
             let steps = &job.steps[range.clone()];
             let (start, finish) = steps_span(steps);
             out.push(FlatNode {
@@ -2407,6 +2684,9 @@ impl PipelineView {
                 job: Some(ji),
                 step: None,
                 group: true,
+                summary: None,
+                note: None,
+                info: false,
             });
             if open {
                 for k in range {
@@ -2445,13 +2725,10 @@ impl PipelineView {
     }
 
     /// Expands/collapses the node under the cursor (no-op on leaf steps).
-    fn toggle_selected(&mut self) {
-        if let Some(Some(key)) = self.flatten().get(self.selected).map(|n| n.key.clone()) {
-            // Folded step groups start closed, so they record the opened ones instead.
-            let set = if key.ends_with(".pass") || key.ends_with(".post") { &mut self.unfolded } else { &mut self.collapsed };
-            if !set.remove(&key) {
-                set.insert(key);
-            }
+    pub(crate) fn toggle_selected(&mut self) {
+        if let Some((Some(key), open)) = self.flatten().get(self.selected).map(|n| (n.key.clone(), n.expanded)) {
+            // Recorded as the user's choice, so it outlives a refresh that changes the default.
+            self.folds.insert(key, !open);
             let len = self.flatten().len();
             if self.selected >= len {
                 self.selected = len.saturating_sub(1);
@@ -2805,12 +3082,26 @@ impl App {
         }
     }
 
+    /// The copy of a row's run that carries its stages: the row's own when the list call brought
+    /// them, else a detail already fetched this session for the same run in the same state (a
+    /// detail from while it ran says nothing true about it once finished). Never a fetch.
+    pub fn pipe_staged_run<'a>(&'a self, p: &'a PipeRow) -> &'a PipelineRun {
+        if !p.run.stages.is_empty() {
+            return &p.run;
+        }
+        let key = pipeline_detail_cache_key(&p.connection_id, &p.run.item_ref());
+        self.run_details
+            .get(&key)
+            .filter(|d| d.status == p.run.status || (d.status.is_active() && p.run.status.is_active()))
+            .unwrap_or(&p.run)
+    }
+
     /// The heading for the subject column. Once a group is open that column carries both kinds
     /// of value, so the heading says so rather than naming only half of what sits under it.
     pub fn pipe_subject_heading(&self, any_open: bool) -> &'static str {
         match (self.pipe_group, any_open) {
             (PipeGroup::Off, _) | (PipeGroup::Pipeline, false) => "Pipeline",
-            (PipeGroup::Pipeline, true) => "Pipeline / Branch",
+            (PipeGroup::Pipeline, true) => "Pipeline / Run",
             (_, false) => "Branch",
             (_, true) => "Branch / Pipeline",
         }
@@ -2892,7 +3183,7 @@ impl App {
                 },
                 runs: members.len(),
                 failed: members.iter().filter(|&&i| self.pipes[i].run.status == PipelineRunStatus::Failed).count(),
-                status: latest.run.status,
+                status: latest.shown_status(),
                 started: latest.run.started_at,
                 approval: members.iter().any(|&i| self.pipes[i].awaiting_approval),
                 provider: first.provider,
@@ -3476,6 +3767,15 @@ impl App {
         let built = launchpad::build(&self.lp_prs_review, &self.lp_prs_mine, &self.wis, &self.pipes);
         self.lp = built.entries;
         self.lp_overflow = built.overflow;
+        // A run held on a gate reads as Waiting here too. Only the row knows its gates, so the
+        // entry's copy of the run takes the row's shown status (the row itself is untouched).
+        for e in &mut self.lp {
+            if let launchpad::EntryItem::Pipe { run, .. } = &mut e.item {
+                if let Some(row) = self.pipes.iter().find(|r| r.connection_id == e.connection_id && r.run.id == run.id) {
+                    run.status = row.shown_status();
+                }
+            }
+        }
         // Drop anything already acted on this session (e.g. a PR you've reviewed), or
         // explicitly dismissed by the user via the `D` key.
         self.lp.retain(|e| {
@@ -5230,6 +5530,8 @@ impl App {
             v.apply_confirmed_approvals(approvals);
             v.supports_approvals = detail.supports_approvals;
             v.can_respond_approvals = detail.can_respond_approvals;
+            // A gate arriving or clearing adds or removes the gate stage's rows.
+            v.clamp_selection();
         }
     }
 
@@ -5463,14 +5765,16 @@ impl App {
                                 for run in runs {
                                     // Only in-flight runs can be waiting on a gate — bound the
                                     // extra per-run approval calls to those.
-                                    let awaiting_approval = supports
-                                        && run.status.is_active()
-                                        && detail_or_default(
+                                    let pending = if supports && run.status.is_active() {
+                                        detail_or_default(
                                             feed.source.pending_approvals(&run.item_ref()).await,
                                             DIAG_PIPELINE_APPROVALS,
                                         )
-                                        .iter()
-                                        .any(|approval| approval.can_respond);
+                                    } else {
+                                        Vec::new()
+                                    };
+                                    let awaiting_approval = pending.iter().any(|approval| approval.can_respond);
+                                    let gates = pending.into_iter().filter(|a| a.blocks_run).map(|approval| approval.name).collect();
                                     let definition_name = def_names.get(&run.definition_id).cloned();
                                     let triggered_by_me = run_triggered_by(&run, me.as_deref());
                                     rows.push(PipeRow {
@@ -5481,6 +5785,7 @@ impl App {
                                         definition_name,
                                         awaiting_approval,
                                         triggered_by_me,
+                                        gates,
                                     });
                                 }
                             }
@@ -6803,7 +7108,7 @@ impl App {
             view.apply_extras(d);
         }
         view.stale = true;
-        view.auto_select_failed();
+        view.auto_select();
         (Screen::Pipeline(Box::new(view)), DetailRequest::Pipeline { conn_id, item, key })
     }
 
@@ -6954,21 +7259,25 @@ impl App {
     /// is what settles it. Guarded on the run, because the view may have moved on while the
     /// decision was in flight.
     fn drop_decided_approval(&mut self, conn_id: &str, run: &ItemRef, approval_id: &str) {
-        let mut still_gated = None;
+        let mut left = None;
         if let Screen::Pipeline(v) = &mut self.screen {
             if v.connection_id == conn_id && v.run.id == run.id {
                 v.approvals.retain(|a| a.id != approval_id);
-                still_gated = Some(v.approvals.iter().any(|a| a.can_respond));
+                // The gate's rows leave the tree with it.
+                v.clamp_selection();
+                let holding = v.approvals.iter().filter(|a| a.blocks_run).map(|a| a.name.clone()).collect::<Vec<_>>();
+                left = Some((v.approvals.iter().any(|a| a.can_respond), holding));
             }
         }
         // No open view means no local knowledge of what is left on the run, so the row keeps its
         // badge until the reload says otherwise: a badge that lingers a second is recoverable, a
         // missing one hides a gate that still wants the user.
-        let Some(still_gated) = still_gated else { return };
-        if !still_gated {
-            for row in self.pipes.iter_mut().filter(|r| r.connection_id == conn_id && r.run.id == run.id) {
+        let Some((still_gated, gates)) = left else { return };
+        for row in self.pipes.iter_mut().filter(|r| r.connection_id == conn_id && r.run.id == run.id) {
+            if !still_gated {
                 row.awaiting_approval = false;
             }
+            row.gates = gates.clone();
         }
         // `awaiting_approval` is what puts a run in the Command Center's Approvals bucket.
         self.rebuild_launchpad();
@@ -7022,10 +7331,11 @@ impl App {
             .iter()
             .map(|&i| {
                 let run = run_of(i);
+                let status = if run.id == v.run.id { v.shown_status() } else { self.pipes[i].shown_status() };
                 HistEntry {
                     run_id: run.id.clone(),
                     number: run.number,
-                    status: run.status,
+                    status,
                     secs: run_secs(run, now),
                     started_at: run.started_at,
                     row: i,
@@ -7160,7 +7470,8 @@ impl App {
         let preview = self.preview.as_ref().filter(|p| p.sent).map(|p| &p.view);
         for screen in [Some(&self.screen), preview].into_iter().flatten() {
             let Screen::Pipeline(v) = screen else { continue };
-            if !v.run.status.is_active() {
+            // A run parked on a gate has nothing running to estimate.
+            if !v.run.status.is_active() || v.shown_status() == PipelineRunStatus::Waiting {
                 continue;
             }
             for (key, row) in self.estimate_candidates(v) {
@@ -9491,7 +9802,7 @@ fn pipe_matches(p: &PipeRow, q: &str) -> bool {
         p.provider.as_str(),
         p.connection,
         p.run.branch.clone().unwrap_or_default(),
-        p.run.status,
+        p.shown_status(),
     )
     .to_lowercase();
     q.split_whitespace().all(|t| hay.contains(t))
@@ -9503,7 +9814,7 @@ fn pipe_matches(p: &PipeRow, q: &str) -> bool {
 pub const LIST_COLUMNS: [&[&str]; 3] = [
     &["Provider", "Repository", "#", "Author", "State", "±", "Updated"],
     &["Provider", "ID", "Type", "Assignee", "Updated"],
-    &["Provider", "Repository", "Runs", "Branch", "Commit", "Started", "Approval"],
+    &["Provider", "Repository", "Runs", "Branch", "Commit", "Now", "Stages", "Took", "Started"],
 ];
 
 /// Provider starts off everywhere: the repository already says where a row lives, and the
@@ -9644,7 +9955,7 @@ fn wi_cmp(a: &WorkItem, b: &WorkItem, key: &str) -> Ordering {
 fn pipe_cmp(a: &PipeRow, b: &PipeRow, key: &str) -> Ordering {
     match key {
         "started" => a.run.started_at.cmp(&b.run.started_at),
-        "status" => pipe_status_rank(a.run.status).cmp(&pipe_status_rank(b.run.status)),
+        "status" => pipe_status_rank(a.shown_status()).cmp(&pipe_status_rank(b.shown_status())),
         // Sorts by the same string the column shows, via the one helper that defines it.
         "pipeline" => ci(&pipe_definition_name(a)).cmp(&ci(&pipe_definition_name(b))),
         "repository" => ci(a.run.repository.as_deref().unwrap_or("")).cmp(&ci(b.run.repository.as_deref().unwrap_or(""))),
@@ -9851,20 +10162,23 @@ async fn fetch_pipelines(
                                 // A failed gate check is not "no gate": caching the row as clear
                                 // would hide a pending approval until the next whole reload, so
                                 // it clears the section flag like discovery's failure does.
-                                let (awaiting_approval, gate_ok) = if supports && run.status.is_active() {
-                                    gate_from_approvals(detail_or_none(
+                                let checked = if supports && run.status.is_active() {
+                                    Some(detail_or_none(
                                         feed.source.pending_approvals(&run.item_ref()).await,
                                         DIAG_PIPELINE_APPROVALS,
                                     ))
                                 } else {
-                                    (false, true)
+                                    None
                                 };
+                                let gates: Vec<String> =
+                                    checked.iter().flatten().flatten().filter(|a| a.blocks_run).map(|approval| approval.name.clone()).collect();
+                                let (awaiting_approval, gate_ok) = checked.map_or((false, true), gate_from_approvals);
                                 if !gate_ok {
                                     ok = false;
                                 }
                                 let definition_name = def_names.get(&run.definition_id).cloned();
                                 let triggered_by_me = run_triggered_by(&run, me.as_deref());
-                                out.push(PipeRow { connection_id: conn_id.clone(), connection: name.clone(), provider, run, definition_name, awaiting_approval, triggered_by_me });
+                                out.push(PipeRow { connection_id: conn_id.clone(), connection: name.clone(), provider, run, definition_name, awaiting_approval, triggered_by_me, gates });
                             }
                         }
                         Err(e) => {
@@ -12218,7 +12532,7 @@ mod tests {
         let mut app = App::new("slate");
         let mut view = PipelineView::new("CI".into(), failed_run(), "c".into(), ProviderType::GitHub, "ci".into(), None);
         view.supports_approvals = true;
-        view.approvals = vec![PipelineApproval { id: "prod".into(), name: "production".into(), can_respond: true }];
+        view.approvals = vec![PipelineApproval { id: "prod".into(), name: "production".into(), can_respond: true, blocks_run: true }];
         app.screen = Screen::Pipeline(Box::new(view));
 
         let mut r = reloaded_with_health(Vec::new());
@@ -12254,8 +12568,8 @@ mod tests {
         view.supports_approvals = true;
         view.can_respond_approvals = true;
         view.approvals = vec![
-            PipelineApproval { id: "prod".into(), name: "production".into(), can_respond: true },
-            PipelineApproval { id: "stg".into(), name: "staging".into(), can_respond: false },
+            PipelineApproval { id: "prod".into(), name: "production".into(), can_respond: true, blocks_run: true },
+            PipelineApproval { id: "stg".into(), name: "staging".into(), can_respond: false, blocks_run: true },
         ];
         app.screen = Screen::Pipeline(Box::new(view));
 
@@ -12318,6 +12632,7 @@ mod tests {
             definition_name: None,
             awaiting_approval: awaiting,
             triggered_by_me: true,
+            gates: Vec::new(),
             run: PipelineRun {
                 event: None,
                 attempt: None,
@@ -12414,6 +12729,7 @@ mod tests {
             definition_name: None,
             awaiting_approval: false,
             triggered_by_me: true,
+            gates: Vec::new(),
             run: PipelineRun {
                 event: None,
                 attempt: None,
@@ -12457,6 +12773,7 @@ mod tests {
             definition_name: None,
             awaiting_approval: awaiting,
             triggered_by_me: true,
+            gates: Vec::new(),
             run: PipelineRun {
                 event: None,
                 attempt: None,
@@ -13385,7 +13702,7 @@ mod tests {
     }
 
     fn approval(id: &str, can_respond: bool) -> PipelineApproval {
-        PipelineApproval { id: id.into(), name: format!("gate-{id}"), can_respond }
+        PipelineApproval { id: id.into(), name: format!("gate-{id}"), can_respond, blocks_run: true }
     }
 
     #[test]
@@ -13738,7 +14055,7 @@ mod tests {
         let mut view = PipelineView::new("CI".into(), run.clone(), "c".into(), ProviderType::GitHub, "ci".into(), None);
         view.logs = Some(LogView::with_lines("Logs · j1", "j1", vec!["hello".into()]));
         view.toggle_selected(); // collapses the "build" stage row (selected starts at 0)
-        assert!(view.collapsed.contains("s0"), "sanity: the stage collapsed");
+        assert_eq!(view.folds.get("s0"), Some(&false), "sanity: the stage collapsed");
         app.screen = Screen::Pipeline(Box::new(view));
 
         let fresh = pipeline_run(
@@ -13766,7 +14083,8 @@ mod tests {
 
         let Screen::Pipeline(v) = &app.screen else { panic!("expected Pipeline") };
         assert!(v.logs.is_some(), "an open log pane must not be torn down by a background refresh");
-        assert!(v.collapsed.contains("s0"), "the expand/collapse tree state survives the patch");
+        assert_eq!(v.folds.get("s0"), Some(&false), "the expand/collapse tree state survives the patch");
+        assert!(!v.flatten()[0].expanded, "and the stage still draws folded");
         assert_eq!(v.run.status, PipelineRunStatus::Succeeded, "fresh run applied");
     }
 
@@ -14235,6 +14553,7 @@ mod tests {
             definition_name: Some(def.into()),
             awaiting_approval: false,
             triggered_by_me: true,
+            gates: Vec::new(),
             run: PipelineRun {
                 event: None,
                 attempt: None,
@@ -15222,10 +15541,10 @@ mod tests {
             ],
         );
         let mut view = PipelineView::new("CI".into(), run.clone(), "c".into(), ProviderType::GitHub, "ci".into(), None);
-        view.collapsed.insert("s1".into());
-        view.collapsed.insert("s1.j0".into());
+        view.folds.insert("s1".into(), false);
+        view.folds.insert("s1.j0".into(), false);
         view.stale = true;
-        view.auto_select_failed();
+        view.auto_select();
         let nodes = view.flatten();
         assert_eq!(nodes[view.selected].label, "test", "the failed step, parents expanded");
         assert_eq!(nodes[view.selected].depth, 2);
@@ -15242,11 +15561,182 @@ mod tests {
         running.status = PipelineRunStatus::Running;
         let mut view = PipelineView::new("CI".into(), running.clone(), "c".into(), ProviderType::GitHub, "ci".into(), None);
         view.stale = true;
-        view.auto_select_failed(); // the cache-seeded open
+        view.auto_select(); // the cache-seeded open
         view.apply_fresh_run(running, None); // the first live load
         view.apply_fresh_run(run, None); // a later refresh finds it failed
         assert_eq!(view.selected, 0);
         assert!(!view.auto_logs);
+    }
+
+    /// Build ✓ · Deploy Dev ✓ · Deploy Prod (queued, but held by a gate) · Post-deploy (queued):
+    /// what the provider says while a run sits on its Prod approval.
+    fn gated_pipeline() -> PipelineRun {
+        let done = |id: &str| {
+            let mut j = pipeline_job(id, PipelineRunStatus::Succeeded);
+            j.steps = vec![PipelineStep { name: "work".into(), status: PipelineRunStatus::Succeeded, started_at: None, finished_at: None }];
+            j
+        };
+        pipeline_run(
+            "1",
+            PipelineRunStatus::Running,
+            vec![
+                pipeline_stage("Build", PipelineRunStatus::Succeeded, vec![done("compile"), done("test")]),
+                pipeline_stage("Deploy Dev", PipelineRunStatus::Succeeded, vec![done("dev")]),
+                pipeline_stage("Deploy Prod", PipelineRunStatus::Queued, vec![]),
+                pipeline_stage("Post-deploy", PipelineRunStatus::Queued, vec![]),
+            ],
+        )
+    }
+
+    fn prod_gate() -> Vec<PipelineApproval> {
+        vec![PipelineApproval { id: "g".into(), name: "Deploy Prod".into(), can_respond: true, blocks_run: true }]
+    }
+
+    #[test]
+    fn finished_stages_start_folded_and_the_gate_takes_the_cursor() {
+        let mut view = PipelineView::new("CI".into(), gated_pipeline(), "c".into(), ProviderType::AzureDevOps, "ci".into(), None);
+        view.supports_approvals = true;
+        view.apply_fresh_run(gated_pipeline(), Some(prod_gate()));
+        assert_eq!(view.shown_status(), PipelineRunStatus::Waiting, "a pending gate parks the run");
+        assert_eq!(view.run.status, PipelineRunStatus::Running, "the stored run stays what the provider said");
+
+        let nodes = view.flatten();
+        let labels: Vec<&str> = nodes.iter().map(|n| n.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec![
+                "Build",
+                "Deploy Dev",
+                "Deploy Prod",
+                "approval required · its jobs start once approved",
+                "o  open in Azure DevOps to approve",
+                "Post-deploy"
+            ],
+            "finished stages fold, the gated stage opens on why it has no jobs"
+        );
+        assert!(!nodes[0].expanded && nodes[0].summary.as_ref().is_some_and(|(t, _)| t == "2 jobs"));
+        assert_eq!(nodes[2].status, PipelineRunStatus::Waiting, "the gate's stage reads as waiting, not queued");
+        assert!(nodes[3].info && nodes[4].info);
+        assert_eq!(nodes[5].note.as_deref(), Some("after Deploy Prod"), "a queued stage says what it waits on");
+        assert_eq!(view.selected, 2, "the cursor opens on the gate");
+
+        // `o` on the gate (or its explanation) opens the run, since neither has a page of its own.
+        let mut app = App::new("slate");
+        view.run.url = Some("https://dev.azure.com/run/1".into());
+        view.selected = 3;
+        app.screen = Screen::Pipeline(Box::new(view));
+        assert_eq!(app.selected_url().as_deref(), Some("https://dev.azure.com/run/1"));
+    }
+
+    #[test]
+    fn a_gate_further_on_doesnt_park_a_run_that_is_still_running() {
+        // Prod is gated, but a Dev job is still executing (parallel stages, or a GitLab manual job
+        // later in the pipeline): the run is running, not waiting.
+        let mut run = gated_pipeline();
+        run.stages[1].status = PipelineRunStatus::Running;
+        run.stages[1].jobs = vec![pipeline_job("dev", PipelineRunStatus::Running)];
+        let mut view = PipelineView::new("CI".into(), run.clone(), "c".into(), ProviderType::AzureDevOps, "ci".into(), None);
+        view.apply_fresh_run(run, Some(prod_gate()));
+        assert_eq!(view.shown_status(), PipelineRunStatus::Running);
+        assert_eq!(view.gate_stage(), None, "no gate row while work is still running");
+    }
+
+    #[test]
+    fn a_cancelled_run_keeps_no_gate_row_even_if_a_stage_still_says_waiting() {
+        let mut run = gated_pipeline();
+        run.status = PipelineRunStatus::Canceled;
+        run.stages[2].status = PipelineRunStatus::Waiting; // what the provider last reported
+        let mut view = PipelineView::new("CI".into(), run.clone(), "c".into(), ProviderType::AzureDevOps, "ci".into(), None);
+        view.apply_fresh_run(run, Some(vec![]));
+        assert_eq!(view.gate_stage(), None);
+        assert!(!view.flatten().iter().any(|n| n.info), "no 'approval required' row on a cancelled run");
+    }
+
+    #[test]
+    fn the_cursor_stays_on_its_job_when_that_stage_finishes_and_folds() {
+        // Build is running with the cursor on its `test` job; then Build passes and Deploy starts.
+        let mut run = gated_pipeline();
+        run.stages[0].status = PipelineRunStatus::Running;
+        run.stages[0].jobs[1].status = PipelineRunStatus::Running;
+        let mut view = PipelineView::new("CI".into(), run.clone(), "c".into(), ProviderType::AzureDevOps, "ci".into(), None);
+        view.apply_fresh_run(run, Some(vec![]));
+        let at = view.flatten().iter().position(|n| n.label == "test").expect("Build is open while it runs");
+        view.selected = at;
+        view.user_moved = true;
+
+        let mut next = gated_pipeline();
+        next.stages[1].status = PipelineRunStatus::Running;
+        view.apply_fresh_run(next, Some(vec![]));
+        let nodes = view.flatten();
+        assert_eq!(nodes[view.selected].label, "test", "the cursor follows the node, not the row number");
+        assert_eq!(view.folds.get("s0"), Some(&true), "Build is pinned open under the cursor");
+    }
+
+    #[test]
+    fn sorting_and_filtering_the_list_go_by_the_status_it_shows() {
+        let mut gated = pipe_row("1", PipelineRunStatus::Running, false);
+        gated.gates = vec!["Deploy Prod".into()];
+        let running = pipe_row("2", PipelineRunStatus::Running, false);
+        assert_eq!(gated.shown_status(), PipelineRunStatus::Waiting);
+        assert!(pipe_matches(&gated, "waiting") && !pipe_matches(&running, "waiting"));
+        assert_eq!(pipe_cmp(&gated, &running, "status"), Ordering::Less, "waiting sorts ahead of running");
+    }
+
+    #[test]
+    fn a_users_fold_survives_a_refresh_that_changes_the_default() {
+        let mut view = PipelineView::new("CI".into(), gated_pipeline(), "c".into(), ProviderType::AzureDevOps, "ci".into(), None);
+        view.apply_fresh_run(gated_pipeline(), Some(prod_gate()));
+        view.selected = 0;
+        view.toggle_selected(); // opens the folded Build stage
+        assert_eq!(view.flatten()[1].label, "compile", "Build opened");
+
+        // The gate is approved and Prod starts: the defaults move on, the user's choice doesn't.
+        let mut next = gated_pipeline();
+        next.stages[2].status = PipelineRunStatus::Running;
+        next.stages[2].jobs = vec![pipeline_job("prod", PipelineRunStatus::Running)];
+        view.apply_fresh_run(next.clone(), Some(vec![]));
+        let nodes = view.flatten();
+        assert!(nodes[0].expanded && nodes[1].label == "compile", "Build stays open");
+        assert!(nodes.iter().any(|n| n.label == "prod"), "the running stage is open by default");
+
+        // And a stage the user folded stays folded once it finishes.
+        let at = nodes.iter().position(|n| n.label == "Deploy Prod").unwrap();
+        view.selected = at;
+        view.toggle_selected();
+        next.stages[2].status = PipelineRunStatus::Succeeded;
+        view.apply_fresh_run(next, Some(vec![]));
+        let prod = view.flatten().into_iter().find(|n| n.label == "Deploy Prod").unwrap();
+        assert!(!prod.expanded);
+        assert_eq!(view.folds.get("s2"), Some(&false));
+    }
+
+    #[test]
+    fn a_failed_run_folds_its_passed_jobs_and_its_skipped_stages() {
+        let mut ok = pipeline_job("compile", PipelineRunStatus::Succeeded);
+        ok.steps = vec![PipelineStep { name: "build".into(), status: PipelineRunStatus::Succeeded, started_at: None, finished_at: None }];
+        let mut broken = pipeline_job("unit", PipelineRunStatus::Failed);
+        broken.steps = vec![PipelineStep { name: "dotnet test".into(), status: PipelineRunStatus::Failed, started_at: None, finished_at: None }];
+        let mut stages = vec![pipeline_stage("Build", PipelineRunStatus::Failed, vec![ok, broken])];
+        for name in ["Dev", "Staging", "Prod"] {
+            stages.push(pipeline_stage(name, PipelineRunStatus::Skipped, vec![]));
+        }
+        let mut view = PipelineView::new("CI".into(), pipeline_run("1", PipelineRunStatus::Failed, stages), "c".into(), ProviderType::AzureDevOps, "ci".into(), None);
+        let nodes = view.flatten();
+        let labels: Vec<&str> = nodes.iter().map(|n| n.label.as_str()).collect();
+        assert_eq!(labels, vec!["Build", "compile", "unit", "dotnet test", "3 stages skipped"]);
+        assert!(!nodes[1].expanded, "the passed job starts folded");
+        assert_eq!(nodes[4].note.as_deref(), Some("Build failed"));
+        assert_eq!(nodes[4].status, PipelineRunStatus::Skipped);
+
+        view.selected = 4;
+        view.toggle_selected();
+        let nodes = view.flatten();
+        assert_eq!(nodes.iter().skip(5).map(|n| (n.label.as_str(), n.depth)).collect::<Vec<_>>(), vec![("Dev", 1), ("Staging", 1), ("Prod", 1)]);
+
+        // One skipped stage on its own is just itself.
+        view.run.stages.truncate(2);
+        let last = view.flatten().pop().unwrap();
+        assert_eq!((last.label.as_str(), last.status, last.group), ("Dev", PipelineRunStatus::Skipped, false));
     }
 
     #[tokio::test]
@@ -15935,6 +16425,7 @@ mod tests {
             definition_name: Some("CI".into()),
             awaiting_approval: false,
             triggered_by_me: true,
+            gates: Vec::new(),
         }
     }
 
@@ -16303,7 +16794,7 @@ mod tests {
         // First load lands on the failed step.
         let mut view = PipelineView::new("CI".into(), run.clone(), "c".into(), ProviderType::GitHub, "ci".into(), None);
         view.stale = true;
-        view.auto_select_failed();
+        view.auto_select();
         assert_eq!(view.flatten()[view.selected].label, "Test");
 
         // A passing run folds only its cleanup.

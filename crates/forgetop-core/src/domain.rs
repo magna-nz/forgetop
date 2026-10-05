@@ -89,9 +89,8 @@ impl PipelineRunStatus {
         matches!(self, Self::Queued | Self::Running | Self::Waiting)
     }
 
-    /// The status to show for a run that may be held on approvals. An active run with a pending
-    /// gate is [`Waiting`](Self::Waiting) — the run list can't see the gate, only the approvals
-    /// lookup can, so every surface asks here rather than deciding for itself.
+    /// An active status, held: [`Waiting`](Self::Waiting). Callers with a whole run should use
+    /// [`PipelineRun::shown_status`], which also checks nothing is still executing.
     pub fn with_pending_approval(self, pending: bool) -> Self {
         if pending && self.is_active() {
             Self::Waiting
@@ -429,6 +428,15 @@ pub struct PipelineApproval {
     pub name: String,
     /// Whether the authenticated user is allowed to respond to this gate.
     pub can_respond: bool,
+    /// Whether the run is held until this gate is answered. An environment approval or an Azure
+    /// check is; an optional GitLab manual job (`allow_failure: true`) isn't — the pipeline runs
+    /// on without it, so it mustn't make the run read as [`PipelineRunStatus::Waiting`].
+    #[serde(default = "holds_by_default")]
+    pub blocks_run: bool,
+}
+
+fn holds_by_default() -> bool {
+    true
 }
 
 /// Addressing helpers: each item knows the repository it came from, so a call site never has to
@@ -453,6 +461,25 @@ impl PipelineRun {
     /// Addresses this run's *definition* (for a re-run/trigger), not the run itself.
     pub fn definition_ref(&self) -> crate::provider::ItemRef {
         crate::provider::ItemRef::maybe(self.repository.clone(), self.definition_id.clone())
+    }
+
+    /// Whether any stage, job or step of this run is executing right now. A list row usually
+    /// carries no stages, so this is only ever evidence *for* running, never against.
+    pub fn has_running_work(&self) -> bool {
+        let running = PipelineRunStatus::Running;
+        self.stages.iter().any(|s| {
+            s.status == running || s.jobs.iter().any(|j| j.status == running || j.steps.iter().any(|t| t.status == running))
+        })
+    }
+
+    /// The status to show for this run. It reads [`Waiting`](PipelineRunStatus::Waiting) when it
+    /// is in flight, held on a gate — a pending approval that `blocks_run`, or a stage the
+    /// provider itself reports as waiting — and nothing in it is still executing: a gate further
+    /// on doesn't make a run that's still building "waiting". Every surface asks here, so the
+    /// list, the run view, the Command Center and the dashboard can't disagree.
+    pub fn shown_status(&self, blocking_gate: bool) -> PipelineRunStatus {
+        let held = blocking_gate || self.stages.iter().any(|s| s.status == PipelineRunStatus::Waiting);
+        self.status.with_pending_approval(held && !self.has_running_work())
     }
 }
 
@@ -543,6 +570,37 @@ mod pipeline_status_tests {
         // A finished run's leftover gate doesn't rewrite its outcome.
         assert_eq!(Succeeded.with_pending_approval(true), Succeeded);
         assert_eq!(Failed.with_pending_approval(true), Failed);
+    }
+
+    fn run_with(status: PipelineRunStatus, stages: Vec<super::PipelineStage>) -> super::PipelineRun {
+        super::PipelineRun {
+            event: None, attempt: None, pull_request: None, repository: None, id: "1".into(), definition_id: "d".into(),
+            number: None, name: None, title: None, status, triggered_by: None, branch: None, commit_sha: None,
+            started_at: None, finished_at: None, url: None, stages,
+        }
+    }
+
+    fn stage(status: PipelineRunStatus) -> super::PipelineStage {
+        super::PipelineStage { name: "s".into(), status, jobs: vec![] }
+    }
+
+    #[test]
+    fn a_run_reads_waiting_only_when_a_gate_holds_it_and_nothing_runs() {
+        // A list row: no stages to say otherwise, so a blocking gate parks it.
+        assert_eq!(run_with(Running, vec![]).shown_status(true), Waiting);
+        assert_eq!(run_with(Running, vec![]).shown_status(false), Running);
+        // A stage still executing keeps the run Running whatever is gated further on.
+        assert_eq!(run_with(Running, vec![stage(Succeeded), stage(Running), stage(Queued)]).shown_status(true), Running);
+        // The provider's own Waiting stage holds the run even before the approvals call answers.
+        assert_eq!(run_with(Running, vec![stage(Succeeded), stage(Waiting)]).shown_status(false), Waiting);
+        // A finished run is never rewritten.
+        assert_eq!(run_with(Canceled, vec![stage(Waiting)]).shown_status(true), Canceled);
+    }
+
+    #[test]
+    fn an_approval_from_an_older_cache_still_holds_its_run() {
+        let a: super::PipelineApproval = serde_json::from_str(r#"{ "id": "g", "name": "Prod", "can_respond": true }"#).unwrap();
+        assert!(a.blocks_run);
     }
 
     #[test]

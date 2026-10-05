@@ -617,7 +617,7 @@ fn approval_gates_from_timeline(records: &[Value]) -> Vec<PipelineApproval> {
         .filter_map(|r| {
             let id = get_str(r, "id")?;
             let name = enclosing_stage_name(&by_id, r).unwrap_or_else(|| "approval".into());
-            Some(PipelineApproval { id, name, can_respond: true })
+            Some(PipelineApproval { id, name, can_respond: true, blocks_run: true })
         })
         .collect()
 }

@@ -239,10 +239,14 @@ fn worst_status(jobs: &[PipelineJob]) -> PipelineRunStatus {
         Running
     } else if jobs.iter().any(|j| j.status == Queued) {
         Queued
-    } else if jobs.iter().all(|j| j.status == Succeeded) && !jobs.is_empty() {
-        Succeeded
-    } else {
+    } else if jobs.iter().any(|j| j.status == Canceled) || jobs.is_empty() {
         Canceled
+    } else if jobs.iter().all(|j| j.status == Skipped) {
+        // Never ran — after an earlier stage failed, or by its rules.
+        Skipped
+    } else {
+        // Every job either passed or was skipped: the stage passed.
+        Succeeded
     }
 }
 
@@ -1056,7 +1060,10 @@ impl PipelineSource for GitLabPipe {
             .filter(|j| get_str(j, "status").as_deref() == Some("manual"))
             .filter_map(|j| {
                 let id = get_i64(j, "id")?.to_string();
-                Some(PipelineApproval { id, name: get_str(j, "name").unwrap_or_else(|| "(job)".into()), can_respond: true })
+                // Only a manual job that may not fail (`allow_failure: false`) holds the pipeline;
+                // an optional one is a button the pipeline runs on past.
+                let blocks_run = !get_bool(j, "allow_failure");
+                Some(PipelineApproval { id, name: get_str(j, "name").unwrap_or_else(|| "(job)".into()), can_respond: true, blocks_run })
             })
             .collect())
     }
@@ -1217,6 +1224,16 @@ mod tests {
         assert_eq!(gl_pipeline_status(Some("running")), PipelineRunStatus::Running);
         // Never ran — not a failure in its own right, distinct from a cancelled one.
         assert_eq!(gl_pipeline_status(Some("skipped")), PipelineRunStatus::Skipped);
+    }
+
+    #[test]
+    fn a_stage_rolls_up_skipped_jobs_as_skipped_not_canceled() {
+        let job = |status| PipelineJob { id: "j".into(), name: "j".into(), status, started_at: None, finished_at: None, steps: vec![], url: None, problem: None };
+        use PipelineRunStatus::*;
+        assert_eq!(worst_status(&[job(Skipped), job(Skipped)]), Skipped);
+        assert_eq!(worst_status(&[job(Succeeded), job(Skipped)]), Succeeded, "an optional job skipped doesn't sink the stage");
+        assert_eq!(worst_status(&[job(Succeeded), job(Canceled)]), Canceled);
+        assert_eq!(worst_status(&[]), Canceled);
     }
 
     #[test]

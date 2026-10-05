@@ -167,6 +167,7 @@ export interface PipelineApproval {
   id: string;
   name: string;
   can_respond: boolean;
+  blocks_run: boolean;
 }
 
 export interface PipeRow {

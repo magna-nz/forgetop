@@ -2041,8 +2041,8 @@ impl PipelineSource for DemoPipe {
         // `can_respond: false` — like Azure, a provider can surface a pending gate without being
         // able to submit a decision on it (view-only).
         Ok(match run_id {
-            "r501" => vec![PipelineApproval { id: "production".into(), name: "production".into(), can_respond: true }],
-            DEPLOY_RUN_GATED => vec![PipelineApproval { id: "deploy-prod".into(), name: "Deploy Prod".into(), can_respond: false }],
+            "r501" => vec![PipelineApproval { id: "production".into(), name: "production".into(), can_respond: true, blocks_run: true }],
+            DEPLOY_RUN_GATED => vec![PipelineApproval { id: "deploy-prod".into(), name: "Deploy Prod".into(), can_respond: false, blocks_run: true }],
             _ => Vec::new(),
         })
     }

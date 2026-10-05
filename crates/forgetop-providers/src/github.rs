@@ -1159,7 +1159,7 @@ fn map_pending_deployment(v: &Value) -> Option<PipelineApproval> {
     let env = get_obj(v, "environment")?;
     let id = get_i64(env, "id")?.to_string();
     let name = get_str(env, "name").unwrap_or_else(|| "environment".into());
-    Some(PipelineApproval { id, name, can_respond: get_bool(v, "current_user_can_approve") })
+    Some(PipelineApproval { id, name, can_respond: get_bool(v, "current_user_can_approve"), blocks_run: true })
 }
 
 pub struct GitHubConnection {
