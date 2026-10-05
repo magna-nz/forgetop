@@ -294,6 +294,10 @@ fn pipeline_defs() -> Vec<PipelineDefinition> {
     vec![
         PipelineDefinition { repository: None, id: "ci".into(), name: "CI Build".into(), path: Some(".github/workflows/ci.yml".into()), url: None },
         PipelineDefinition { repository: None, id: "release".into(), name: "CD (Release)".into(), path: Some(".github/workflows/release.yml".into()), url: None },
+        // Azure-style multi-stage runs (Build -> Deploy Dev -> Deploy Staging -> Deploy Prod ->
+        // Post-deploy checks) — see `deploy_runs()` — so the Waiting/Skipped stage tree has
+        // believable, deterministic data to verify against in `--demo`.
+        PipelineDefinition { repository: None, id: "deploy".into(), name: "payments-api".into(), path: Some("azure-pipelines.yml".into()), url: None },
     ]
 }
 
@@ -756,7 +760,293 @@ fn pipeline_runs() -> Vec<PipelineRun> {
         }],
     };
 
-    ci_runs.into_iter().chain([r501, r207, r206, r205]).collect()
+    ci_runs.into_iter().chain([r501, r207, r206, r205]).chain(deploy_runs()).collect()
+}
+
+// ---- `payments-api` deploy pipeline — Azure-style multi-stage runs ----
+//
+// The `CI`/`CD (Release)` runs above are GitHub-shaped: one job, no stages worth separating.
+// This definition gives the stage/job/step tree real breadth — Build, Deploy Dev,
+// Deploy Staging, Deploy Prod (gated), Post-deploy checks — so the Waiting/Skipped redesign has
+// something believable to verify against in `--demo`.
+
+const DEPLOY_RUN_GATED: &str = "r610";
+const DEPLOY_RUN_FAILED: &str = "r609";
+const DEPLOY_RUN_PASSED_1: &str = "r608";
+const DEPLOY_RUN_PASSED_2: &str = "r607";
+
+/// One timestamped step in a `payments-api` deploy job, advancing `cursor` by its duration.
+/// Azure-pipelines-shaped names (`Initialize job`, `Checkout payments-api`, `dotnet build`/
+/// `dotnet test`, …) — mirrors how [`gh_stage`] timestamps a GitHub-style job's steps.
+fn deploy_step(cursor: &mut DateTime<Utc>, name: &str, dur_secs: i64, status: PipelineRunStatus) -> PipelineStep {
+    let started = *cursor;
+    let finished = started + chrono::Duration::seconds(dur_secs);
+    *cursor = finished;
+    PipelineStep { name: name.into(), status, started_at: Some(started), finished_at: Some(finished) }
+}
+
+/// A `payments-api` deploy job: its steps (see [`deploy_step`]) rolled into one [`PipelineJob`].
+fn deploy_job(id: &str, name: &str, start: DateTime<Utc>, status: PipelineRunStatus, problem: Option<&str>, steps: &[(&str, i64, PipelineRunStatus)]) -> PipelineJob {
+    let mut cursor = start;
+    let pl_steps: Vec<PipelineStep> = steps.iter().map(|(n, d, st)| deploy_step(&mut cursor, n, *d, *st)).collect();
+    PipelineJob {
+        id: id.into(),
+        name: name.into(),
+        status,
+        started_at: Some(start),
+        finished_at: Some(cursor),
+        steps: pl_steps,
+        url: Some(format!("https://example.test/job/{id}")),
+        problem: problem.map(str::to_string),
+    }
+}
+
+/// The `Build` stage's jobs — compile, unit tests, and (when `with_publish`) publish artifact —
+/// run sequentially from `start`. Returns the stage plus the timestamp its last job finished, so
+/// the caller can chain the next stage straight on. `build_dur`/`test_dur` size the `dotnet
+/// build`/`dotnet test` steps (shorter on the run that fails before publishing ever runs).
+#[allow(clippy::too_many_arguments)]
+fn deploy_build_stage(
+    start: DateTime<Utc>,
+    build_dur: i64,
+    test_dur: i64,
+    unit_tests_status: PipelineRunStatus,
+    unit_tests_problem: Option<&str>,
+    with_publish: bool,
+) -> (PipelineStage, DateTime<Utc>) {
+    let compile = deploy_job(
+        "dpj-compile",
+        "compile",
+        start,
+        PipelineRunStatus::Succeeded,
+        None,
+        &[
+            ("Initialize job", 5, PipelineRunStatus::Succeeded),
+            ("Checkout payments-api", 3, PipelineRunStatus::Succeeded),
+            ("dotnet build", build_dur, PipelineRunStatus::Succeeded),
+            ("Post-job: Checkout payments-api", 2, PipelineRunStatus::Succeeded),
+            ("Finalize Job", 10, PipelineRunStatus::Succeeded),
+        ],
+    );
+    let unit_tests_start = compile.finished_at.unwrap();
+    let dotnet_test_status = if unit_tests_status == PipelineRunStatus::Failed { PipelineRunStatus::Failed } else { PipelineRunStatus::Succeeded };
+    let unit_tests = deploy_job(
+        "dpj-unit",
+        "unit tests",
+        unit_tests_start,
+        unit_tests_status,
+        unit_tests_problem,
+        &[
+            ("Initialize job", 5, PipelineRunStatus::Succeeded),
+            ("Checkout payments-api", 3, PipelineRunStatus::Succeeded),
+            ("dotnet test", test_dur, dotnet_test_status),
+            ("Post-job: Checkout payments-api", 2, PipelineRunStatus::Succeeded),
+            ("Finalize Job", 10, PipelineRunStatus::Succeeded),
+        ],
+    );
+    let mut jobs = vec![compile, unit_tests];
+    let mut end = jobs.last().unwrap().finished_at.unwrap();
+    if with_publish {
+        let publish = deploy_job(
+            "dpj-publish",
+            "publish artifact",
+            end,
+            PipelineRunStatus::Succeeded,
+            None,
+            &[
+                ("Initialize job", 5, PipelineRunStatus::Succeeded),
+                ("Publish artifact: drop", 15, PipelineRunStatus::Succeeded),
+                ("Finalize Job", 5, PipelineRunStatus::Succeeded),
+            ],
+        );
+        end = publish.finished_at.unwrap();
+        jobs.push(publish);
+    }
+    let status = if jobs.iter().any(|j| j.status == PipelineRunStatus::Failed) { PipelineRunStatus::Failed } else { PipelineRunStatus::Succeeded };
+    (PipelineStage { name: "Build".into(), status, jobs }, end)
+}
+
+/// The `Deploy Dev` stage: one `deploy webapp` job, ~72s.
+fn deploy_dev_stage(start: DateTime<Utc>) -> (PipelineStage, DateTime<Utc>) {
+    let job = deploy_job(
+        "dpj-dev",
+        "deploy webapp",
+        start,
+        PipelineRunStatus::Succeeded,
+        None,
+        &[
+            ("Initialize job", 5, PipelineRunStatus::Succeeded),
+            ("Azure App Service Deploy: payments-api-dev", 60, PipelineRunStatus::Succeeded),
+            ("Finalize Job", 7, PipelineRunStatus::Succeeded),
+        ],
+    );
+    let end = job.finished_at.unwrap();
+    (PipelineStage { name: "Deploy Dev".into(), status: PipelineRunStatus::Succeeded, jobs: vec![job] }, end)
+}
+
+/// The `Deploy Staging` stage: `deploy webapp` (always clean) plus `smoke tests` — clean when
+/// `smoke_warnings` is `false`, `PartiallySucceeded` with two warnings when `true` (the gated
+/// run).
+fn deploy_staging_stage(start: DateTime<Utc>, smoke_warnings: bool) -> (PipelineStage, DateTime<Utc>) {
+    let web = deploy_job(
+        "dpj-staging-web",
+        "deploy webapp",
+        start,
+        PipelineRunStatus::Succeeded,
+        None,
+        &[
+            ("Initialize job", 5, PipelineRunStatus::Succeeded),
+            ("Azure App Service Deploy: payments-api-staging", 50, PipelineRunStatus::Succeeded),
+            ("Finalize Job", 5, PipelineRunStatus::Succeeded),
+        ],
+    );
+    let smoke_start = web.finished_at.unwrap();
+    let (smoke_status, smoke_problem, smoke_dur) =
+        if smoke_warnings { (PipelineRunStatus::PartiallySucceeded, Some("2 warnings"), 145) } else { (PipelineRunStatus::Succeeded, None, 115) };
+    let smoke = deploy_job(
+        "dpj-staging-smoke",
+        "smoke tests",
+        smoke_start,
+        smoke_status,
+        smoke_problem,
+        &[("Initialize job", 5, PipelineRunStatus::Succeeded), ("Run smoke tests", smoke_dur, smoke_status), ("Finalize Job", 10, PipelineRunStatus::Succeeded)],
+    );
+    let end = smoke.finished_at.unwrap();
+    (PipelineStage { name: "Deploy Staging".into(), status: smoke_status, jobs: vec![web, smoke] }, end)
+}
+
+/// The `Deploy Prod` stage on a run that actually got through the gate (the two earlier passed
+/// runs) — on the gated/failed runs this stage is built directly as Waiting/Skipped with no jobs.
+fn deploy_prod_stage(start: DateTime<Utc>) -> (PipelineStage, DateTime<Utc>) {
+    let job = deploy_job(
+        "dpj-prod",
+        "deploy webapp",
+        start,
+        PipelineRunStatus::Succeeded,
+        None,
+        &[
+            ("Initialize job", 5, PipelineRunStatus::Succeeded),
+            ("Azure App Service Deploy: payments-api-prod", 60, PipelineRunStatus::Succeeded),
+            ("Finalize Job", 5, PipelineRunStatus::Succeeded),
+        ],
+    );
+    let end = job.finished_at.unwrap();
+    (PipelineStage { name: "Deploy Prod".into(), status: PipelineRunStatus::Succeeded, jobs: vec![job] }, end)
+}
+
+/// The `Post-deploy checks` stage on a passed run: one `health check` job.
+fn deploy_postdeploy_stage(start: DateTime<Utc>) -> (PipelineStage, DateTime<Utc>) {
+    let job = deploy_job(
+        "dpj-postdeploy",
+        "health check",
+        start,
+        PipelineRunStatus::Succeeded,
+        None,
+        &[("Initialize job", 5, PipelineRunStatus::Succeeded), ("Run health check", 8, PipelineRunStatus::Succeeded), ("Finalize Job", 2, PipelineRunStatus::Succeeded)],
+    );
+    let end = job.finished_at.unwrap();
+    (PipelineStage { name: "Post-deploy checks".into(), status: PipelineRunStatus::Succeeded, jobs: vec![job] }, end)
+}
+
+/// The `payments-api` deploy pipeline's runs: the newest, running and gated on the production
+/// approval (~11-12 minutes of real work, then stuck waiting); a failed run from ~a day ago that
+/// never got past `Build`; and two earlier passed runs (all five stages green, ~12m each) so run
+/// history/sparkline has something to show.
+fn deploy_runs() -> Vec<PipelineRun> {
+    let now = base();
+
+    let gated_started = now - chrono::Duration::hours(1) - chrono::Duration::minutes(59);
+    let (build, after_build) = deploy_build_stage(gated_started, 110, 200, PipelineRunStatus::Succeeded, None, true);
+    let (dev, after_dev) = deploy_dev_stage(after_build);
+    let (staging, _after_staging) = deploy_staging_stage(after_dev, true);
+    let gated = PipelineRun {
+        event: Some("push".into()),
+        attempt: Some(1),
+        pull_request: None,
+        repository: None,
+        id: DEPLOY_RUN_GATED.into(),
+        definition_id: "deploy".into(),
+        number: Some(12),
+        name: Some("payments-api".into()),
+        title: Some("Add Idempotency-Key replay store for refunds".into()),
+        status: PipelineRunStatus::Running,
+        triggered_by: Some(me()),
+        branch: Some("main".into()),
+        commit_sha: Some("d41f9a2".into()),
+        started_at: Some(gated_started),
+        finished_at: None,
+        url: Some("https://ci.example.com/runs/demo".into()),
+        stages: vec![
+            build,
+            dev,
+            staging,
+            PipelineStage { name: "Deploy Prod".into(), status: PipelineRunStatus::Waiting, jobs: vec![] },
+            PipelineStage { name: "Post-deploy checks".into(), status: PipelineRunStatus::Queued, jobs: vec![] },
+        ],
+    };
+
+    let failed_started = now - chrono::Duration::days(1);
+    let (build_f, _after_build_f) = deploy_build_stage(failed_started, 100, 100, PipelineRunStatus::Failed, Some("3 errors"), false);
+    let failed = PipelineRun {
+        event: Some("push".into()),
+        attempt: Some(1),
+        pull_request: None,
+        repository: None,
+        id: DEPLOY_RUN_FAILED.into(),
+        definition_id: "deploy".into(),
+        number: Some(11),
+        name: Some("payments-api".into()),
+        title: Some("Add retry jitter to payment webhook delivery".into()),
+        status: PipelineRunStatus::Failed,
+        triggered_by: Some(bob()),
+        branch: Some("main".into()),
+        commit_sha: Some("9b2e7c0".into()),
+        started_at: Some(failed_started),
+        finished_at: Some(failed_started + chrono::Duration::seconds(240)),
+        url: Some("https://ci.example.com/runs/demo".into()),
+        stages: vec![
+            build_f,
+            PipelineStage { name: "Deploy Dev".into(), status: PipelineRunStatus::Skipped, jobs: vec![] },
+            PipelineStage { name: "Deploy Staging".into(), status: PipelineRunStatus::Skipped, jobs: vec![] },
+            PipelineStage { name: "Deploy Prod".into(), status: PipelineRunStatus::Skipped, jobs: vec![] },
+            PipelineStage { name: "Post-deploy checks".into(), status: PipelineRunStatus::Skipped, jobs: vec![] },
+        ],
+    };
+
+    let passed = |id: &str, number: i64, title: &str, who: User, commit: &str, started_ago: chrono::Duration| {
+        let started = now - started_ago;
+        let (build, after_build) = deploy_build_stage(started, 110, 200, PipelineRunStatus::Succeeded, None, true);
+        let (dev, after_dev) = deploy_dev_stage(after_build);
+        let (staging, after_staging) = deploy_staging_stage(after_dev, false);
+        let (prod, after_prod) = deploy_prod_stage(after_staging);
+        let (post, after_post) = deploy_postdeploy_stage(after_prod);
+        PipelineRun {
+            event: Some("push".into()),
+            attempt: Some(1),
+            pull_request: None,
+            repository: None,
+            id: id.into(),
+            definition_id: "deploy".into(),
+            number: Some(number),
+            name: Some("payments-api".into()),
+            title: Some(title.into()),
+            status: PipelineRunStatus::Succeeded,
+            triggered_by: Some(who),
+            branch: Some("main".into()),
+            commit_sha: Some(commit.into()),
+            started_at: Some(started),
+            finished_at: Some(after_post),
+            url: Some("https://ci.example.com/runs/demo".into()),
+            stages: vec![build, dev, staging, prod, post],
+        }
+    };
+
+    vec![
+        gated,
+        failed,
+        passed(DEPLOY_RUN_PASSED_1, 10, "Cache the computed customer risk score", carol(), "71a0c4e", chrono::Duration::days(5)),
+        passed(DEPLOY_RUN_PASSED_2, 9, "Reconcile the ledger against processor settlements nightly", alice(), "2f90ab3", chrono::Duration::days(9)),
+    ]
 }
 
 /// Session-global store of review comments submitted during this `--demo` run, keyed by PR
@@ -1345,6 +1635,17 @@ fn job_log(run_id: &str, job_id: &str) -> String {
         "mj-host" => release_downstream_log("host"),
         "mj-homebrew" => release_downstream_log("publish-homebrew-formula"),
         "mj-announce" => release_downstream_log("announce"),
+        "dpj-compile" if run_id == DEPLOY_RUN_FAILED => deploy_compile_log(100),
+        "dpj-compile" => deploy_compile_log(110),
+        "dpj-unit" if run_id == DEPLOY_RUN_FAILED => deploy_unit_test_failure_log(),
+        "dpj-unit" => deploy_unit_test_log(),
+        "dpj-publish" => deploy_publish_log(),
+        "dpj-dev" => deploy_webapp_log("dev"),
+        "dpj-staging-web" => deploy_webapp_log("staging"),
+        "dpj-staging-smoke" if run_id == DEPLOY_RUN_GATED => deploy_smoke_log_with_warnings(),
+        "dpj-staging-smoke" => deploy_smoke_log_clean(),
+        "dpj-prod" => deploy_webapp_log("prod"),
+        "dpj-postdeploy" => deploy_postdeploy_log(),
         other => generic_log(other),
     }
 }
@@ -1440,6 +1741,63 @@ fn matrix_leg_log_failed(target: &str) -> String {
 
 fn release_downstream_log(name: &str) -> String {
     format!("Waiting on the build-local-artifacts matrix...\nRunning {name}...\nDone.\n")
+}
+
+/// The `compile` job's log for the `payments-api` deploy pipeline (`dotnet build`), scaled to
+/// `build_secs` so the failed run's shorter build reads consistently with its job duration.
+fn deploy_compile_log(build_secs: i64) -> String {
+    format!(
+        "Restoring NuGet packages...\nRestore complete.\n  Northwind.Payments.Api -> bin/Release/net8.0/Northwind.Payments.Api.dll\nBuild succeeded in {build_secs}s.\n"
+    )
+}
+
+/// The `unit tests` job's log on a run where `dotnet test` passes clean.
+fn deploy_unit_test_log() -> String {
+    "Restoring NuGet packages...\nNorthwind.Payments.Api.Tests -> bin/Release/net8.0/Northwind.Payments.Api.Tests.dll\nStarting test execution, please wait...\n  Passed PaymentServiceTests.CreatesCharge_WithValidToken [14 ms]\n  Passed PaymentServiceTests.RefundsFullAmount_WhenAuthorized [22 ms]\n  Passed PaymentServiceTests.RejectsDuplicateIdempotencyKey [9 ms]\n  Passed WebhookRetryQueueTests.BackoffIsExponential [6 ms]\n\nPassed!  - Failed: 0, Passed: 44, Skipped: 0, Total: 44\n".into()
+}
+
+/// `##[error]`-marked `dotnet test` failure output for the `payments-api` deploy pipeline's
+/// failed run — mirrors [`rust_test_failure_block`] for the GitHub-style `CI` job, but for the
+/// Azure-style `unit tests` job (whose `problem` reports "3 errors").
+fn deploy_unit_test_failure_log() -> String {
+    concat!(
+        "Restoring NuGet packages...\n",
+        "Northwind.Payments.Api.Tests -> bin/Release/net8.0/Northwind.Payments.Api.Tests.dll\n",
+        "Starting test execution, please wait...\n",
+        "  Passed PaymentServiceTests.CreatesCharge_WithValidToken [14 ms]\n",
+        "  Failed PaymentServiceTests.RefundsFullAmount_WhenAuthorized [41 ms]\n",
+        "  Error Message:\n",
+        "   Assert.Equal() Failure\n",
+        "   Expected: 20000\n",
+        "   Actual:   0\n",
+        "  Failed PaymentServiceTests.RejectsDuplicateIdempotencyKey [9 ms]\n",
+        "  Failed WebhookRetryQueueTests.BackoffIsExponential [6 ms]\n",
+        "\n",
+        "Failed!  - Failed: 3, Passed: 41, Skipped: 0, Total: 44\n",
+        "##[error]dotnet test failed with exit code 1.\n",
+    )
+    .to_string()
+}
+
+fn deploy_publish_log() -> String {
+    "Publishing drop...\nPackaging payments-api.zip\nUploading payments-api.zip\n".into()
+}
+
+/// The `deploy webapp` job's log for one environment (`dev`/`staging`/`prod`).
+fn deploy_webapp_log(environment: &str) -> String {
+    format!("Starting deployment to payments-api-{environment}...\nDeploying webapp...\nDeployment to payments-api-{environment} succeeded.\n")
+}
+
+fn deploy_smoke_log_clean() -> String {
+    "GET /healthz -> 200\nGET /v1/charges/ping -> 200\nPOST /v1/charges (dry run) -> 200\n\nSuite passed: 0 warnings\n".into()
+}
+
+fn deploy_smoke_log_with_warnings() -> String {
+    "GET /healthz -> 200\n##[warning]GET /v1/charges/ping -> 200 (412ms, above the 300ms budget)\nPOST /v1/charges (dry run) -> 200\n##[warning]Response missing Idempotency-Key echo header\n\nSuite passed with warnings: 2 warnings\n".into()
+}
+
+fn deploy_postdeploy_log() -> String {
+    "GET /healthz -> 200\nAll post-deploy checks passed.\n".into()
 }
 
 /// A plausible-but-generic log for a job id we don't have a scripted log for.
@@ -1678,11 +2036,14 @@ impl PipelineSource for DemoPipe {
         if canceled_runs().lock().unwrap().contains(run_id) {
             return Ok(Vec::new());
         }
-        // The running release (#57) waits on a production deployment gate you can act on.
-        Ok(if run_id == "r501" {
-            vec![PipelineApproval { id: "production".into(), name: "production".into(), can_respond: true }]
-        } else {
-            Vec::new()
+        // The running release (#57) waits on a production deployment gate you can act on. The
+        // gated `payments-api` deploy run (#12) waits on a `Deploy Prod` gate too, but
+        // `can_respond: false` — like Azure, a provider can surface a pending gate without being
+        // able to submit a decision on it (view-only).
+        Ok(match run_id {
+            "r501" => vec![PipelineApproval { id: "production".into(), name: "production".into(), can_respond: true, blocks_run: true }],
+            DEPLOY_RUN_GATED => vec![PipelineApproval { id: "deploy-prod".into(), name: "Deploy Prod".into(), can_respond: false, blocks_run: true }],
+            _ => Vec::new(),
         })
     }
     async fn respond_approval(&self, _run: &ItemRef, _approval_id: &str, _decision: ApprovalDecision, _comment: Option<&str>) -> Result<()> {
@@ -2063,6 +2424,50 @@ mod tests {
         assert!(log.contains("rewrite_edits_in_place"), "keeps the gist of the original failure");
         assert!(log.contains("test result: FAILED. 183 passed; 1 failed"), "a realistic failure summary line");
         assert!(log.contains("crates/forgetop-core/src/cache.rs:212:9"), "the panic location is in the log");
+    }
+
+    #[tokio::test]
+    async fn deploy_failed_job_log_has_an_error_marker() {
+        let src = conn().pipelines().unwrap();
+        let log = src.logs(&ItemRef::new(DEPLOY_RUN_FAILED), Some("dpj-unit")).await.unwrap();
+        assert!(log.contains("##[error]"), "failing deploy job's log should carry an error marker: {log}");
+        assert!(log.contains("RefundsFullAmount_WhenAuthorized"), "keeps the gist of the original failure");
+    }
+
+    #[tokio::test]
+    async fn deploy_pipeline_shows_waiting_and_skipped_stages() {
+        let src = conn().pipelines().unwrap();
+        let defs = src.discover().await.unwrap();
+        assert!(defs.iter().any(|d| d.id == "deploy" && d.name == "payments-api"));
+
+        let stage_status = |run: &PipelineRun, name: &str| run.stages.iter().find(|s| s.name == name).map(|s| s.status);
+
+        // Gated: Running overall, but Deploy Prod reads Waiting and Post-deploy checks (queued
+        // behind it) stays Queued, never finished.
+        let gated = src.get_run(&ItemRef::new(DEPLOY_RUN_GATED)).await.unwrap();
+        assert_eq!(gated.status, PipelineRunStatus::Running);
+        assert_eq!(stage_status(&gated, "Build"), Some(PipelineRunStatus::Succeeded));
+        assert_eq!(stage_status(&gated, "Deploy Prod"), Some(PipelineRunStatus::Waiting));
+        assert_eq!(stage_status(&gated, "Post-deploy checks"), Some(PipelineRunStatus::Queued));
+        let gates = src.pending_approvals(&ItemRef::new(DEPLOY_RUN_GATED)).await.unwrap();
+        assert_eq!(gates.len(), 1);
+        assert_eq!(gates[0].name, "Deploy Prod");
+        assert!(!gates[0].can_respond, "Azure-style: surfaced, but view-only");
+
+        // Failed: Build fails, so every later stage never ran — Skipped, not Canceled or Queued.
+        let failed = src.get_run(&ItemRef::new(DEPLOY_RUN_FAILED)).await.unwrap();
+        assert_eq!(failed.status, PipelineRunStatus::Failed);
+        assert_eq!(stage_status(&failed, "Build"), Some(PipelineRunStatus::Failed));
+        for later in ["Deploy Dev", "Deploy Staging", "Deploy Prod", "Post-deploy checks"] {
+            assert_eq!(stage_status(&failed, later), Some(PipelineRunStatus::Skipped), "{later} never ran");
+        }
+
+        // Two earlier passed runs: every stage Succeeded, for run history to have something.
+        for id in [DEPLOY_RUN_PASSED_1, DEPLOY_RUN_PASSED_2] {
+            let run = src.get_run(&ItemRef::new(id)).await.unwrap();
+            assert_eq!(run.status, PipelineRunStatus::Succeeded);
+            assert!(run.stages.iter().all(|s| s.status == PipelineRunStatus::Succeeded), "{id}: every stage should be Succeeded");
+        }
     }
 
     #[tokio::test]

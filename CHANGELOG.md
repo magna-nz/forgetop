@@ -19,6 +19,28 @@ Fixed
   skipped (⊘) rather than failed (✗), and a stage that passed with warnings shows ▲.
   ([#214](https://github.com/magna-nz/forgetop/pull/214))
 
+Changed
+
+- **Pipelines say what they're waiting on.** A run held on an approval gate reads ⏸ Waiting,
+  not ◐ Running — everywhere: the terminal UI, the Command Center and the dashboard — and only
+  while nothing in it is still running. Stages that never ran read ⊘ Skipped instead of failed or
+  cancelled (Azure DevOps, GitHub, GitLab). In the terminal UI:
+  - The run view opens on what needs you: finished stages fold to one line, the gated stage says
+    it's waiting on approval and for how long, stages that never ran fold into one row, and the
+    time axis squeezes a long wait so the work keeps its width.
+  - The Pipelines list names each run's state, shows its run number, what it's stuck on (a Now
+    column), a glyph per stage and how long it took — an expanded pipeline is no longer a column
+    of bare ticks. ([#215](https://github.com/magna-nz/forgetop/pull/215))
+
+Docs
+
+- Every Terminal/Dashboard switch on the docs site has a demo for each surface.
+  ([#213](https://github.com/magna-nz/forgetop/pull/213))
+
+Build
+
+- `async-trait` 0.1.92, so clippy passes on Rust 1.99. ([#216](https://github.com/magna-nz/forgetop/pull/216))
+
 ## 1.5.1 — 2026-09-29
 
 Fixed

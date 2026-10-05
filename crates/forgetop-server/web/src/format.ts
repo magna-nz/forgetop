@@ -92,6 +92,8 @@ const PIPE_ICON: Record<PipelineRunStatus, string> = {
   Failed: "✗",
   PartiallySucceeded: "▲",
   Canceled: "⊘",
+  Waiting: "⏸",
+  Skipped: "⊘",
 };
 
 export function pipeMeta(status: PipelineRunStatus): Meta & { running: boolean } {
@@ -109,6 +111,10 @@ export function pipeMeta(status: PipelineRunStatus): Meta & { running: boolean }
       return { label: "queued", icon, color: V("dim"), running: false };
     case "Canceled":
       return { label: "canceled", icon, color: V("dim"), running: false };
+    case "Waiting":
+      return { label: "waiting", icon, color: V("yellow"), running: false };
+    case "Skipped":
+      return { label: "skipped", icon, color: V("dim"), running: false };
   }
 }
 

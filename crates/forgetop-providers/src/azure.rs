@@ -272,9 +272,10 @@ fn record_status(v: &Value) -> PipelineRunStatus {
         match get_str(v, "result").as_deref() {
             Some("succeeded") => PipelineRunStatus::Succeeded,
             Some("succeededWithIssues") => PipelineRunStatus::PartiallySucceeded,
-            // A stage skipped by its condition (or a gate that timed out) didn't fail — it reads
-            // as not-run, the same as GitHub's and GitLab's `skipped`.
-            Some("canceled") | Some("skipped") | Some("abandoned") => PipelineRunStatus::Canceled,
+            // A stage skipped by its condition (or because something before it failed) never
+            // ran — not a failure in its own right, the same as GitHub's and GitLab's `skipped`.
+            Some("skipped") => PipelineRunStatus::Skipped,
+            Some("canceled") | Some("abandoned") => PipelineRunStatus::Canceled,
             _ => PipelineRunStatus::Failed,
         }
     } else if get_str(v, "state").as_deref() == Some("inProgress") {
@@ -616,7 +617,7 @@ fn approval_gates_from_timeline(records: &[Value]) -> Vec<PipelineApproval> {
         .filter_map(|r| {
             let id = get_str(r, "id")?;
             let name = enclosing_stage_name(&by_id, r).unwrap_or_else(|| "approval".into());
-            Some(PipelineApproval { id, name, can_respond: true })
+            Some(PipelineApproval { id, name, can_respond: true, blocks_run: true })
         })
         .collect()
 }
@@ -628,6 +629,15 @@ fn approval_gates_from_timeline(records: &[Value]) -> Vec<PipelineApproval> {
 fn stages_from_timeline(records: &[Value]) -> Vec<PipelineStage> {
     let by_id: std::collections::HashMap<String, &Value> =
         records.iter().filter_map(|r| Some((get_str(r, "id")?, r))).collect();
+    // Stages sitting behind a pending `Checkpoint.Approval` read as Waiting rather than whatever
+    // `record_status` would otherwise say (Queued, most of the time) — the run isn't merely
+    // unstarted, it's held on a gate someone has to act on.
+    let waiting_stage_ids: std::collections::HashSet<String> = records
+        .iter()
+        .filter(|r| get_str(r, "type").as_deref() == Some("Checkpoint.Approval"))
+        .filter(|r| get_str(r, "state").as_deref() != Some("completed"))
+        .filter_map(|r| enclosing_stage_id(&by_id, r))
+        .collect();
     let order = |r: &Value| r.get("order").and_then(Value::as_i64).unwrap_or(i64::MAX);
     let of_type = |ty: &str| {
         let mut v: Vec<&Value> = records.iter().filter(|r| get_str(r, "type").as_deref() == Some(ty)).collect();
@@ -667,17 +677,30 @@ fn stages_from_timeline(records: &[Value]) -> Vec<PipelineStage> {
             let stage_id = get_str(stage, "id");
             let name = get_str(stage, "name").filter(|n| n != "__default").unwrap_or_else(|| "Jobs".into());
             let jobs = jobs.iter().filter(|j| enclosing_stage_id(&by_id, j) == stage_id).map(|j| map_job(j)).collect();
-            PipelineStage { name, status: record_status(stage), jobs }
+            let mut status = record_status(stage);
+            let behind_a_gate = stage_id.as_deref().is_some_and(|id| waiting_stage_ids.contains(id));
+            if get_str(stage, "state").as_deref() != Some("completed") && behind_a_gate {
+                status = PipelineRunStatus::Waiting;
+            }
+            PipelineStage { name, status, jobs }
         })
         .collect();
     let orphans: Vec<&&Value> = jobs.iter().filter(|j| enclosing_stage_id(&by_id, j).is_none()).collect();
     if !orphans.is_empty() {
         let jobs: Vec<PipelineJob> = orphans.iter().map(|j| map_job(j)).collect();
         let has = |st: PipelineRunStatus| jobs.iter().any(|j| j.status == st);
-        let status = [PipelineRunStatus::Failed, PipelineRunStatus::Running, PipelineRunStatus::Queued, PipelineRunStatus::Canceled]
+        let status = [PipelineRunStatus::Failed, PipelineRunStatus::Waiting, PipelineRunStatus::Running, PipelineRunStatus::Queued, PipelineRunStatus::Canceled]
             .into_iter()
             .find(|st| has(*st))
-            .unwrap_or(PipelineRunStatus::Succeeded);
+            .unwrap_or_else(|| {
+                // No active/failed/cancelled job in the set: either everything succeeded, or
+                // (a stage-less pipeline's jobs can be skipped too) everything was skipped.
+                if !jobs.is_empty() && jobs.iter().all(|j| j.status == PipelineRunStatus::Skipped) {
+                    PipelineRunStatus::Skipped
+                } else {
+                    PipelineRunStatus::Succeeded
+                }
+            });
         stages.push(PipelineStage { name: "Jobs".into(), status, jobs });
     }
     stages
@@ -1662,6 +1685,48 @@ mod tests {
     }
 
     #[test]
+    fn stages_from_timeline_marks_a_stage_behind_a_pending_approval_as_waiting() {
+        // Build (completed/succeeded) -> Deploy Prod (pending, gated by a pending
+        // Checkpoint.Approval) -> Post-deploy (pending, no gate) -> a stage skipped outright.
+        let records: Value = serde_json::from_str(
+            r#"[
+                { "id": "s1", "type": "Stage", "name": "Build", "order": 1, "state": "completed", "result": "succeeded" },
+                { "id": "s2", "type": "Stage", "name": "Deploy Prod", "order": 2, "state": "pending" },
+                { "id": "chk1", "type": "Checkpoint", "parentId": "s2" },
+                { "id": "appr-1", "type": "Checkpoint.Approval", "state": "inProgress", "parentId": "chk1" },
+                { "id": "s3", "type": "Stage", "name": "Post-deploy", "order": 3, "state": "pending" },
+                { "id": "s4", "type": "Stage", "name": "Cleanup", "order": 4, "state": "completed", "result": "skipped" }
+            ]"#,
+        )
+        .unwrap();
+        let stages = stages_from_timeline(records.as_array().unwrap());
+        let shape: Vec<(String, PipelineRunStatus)> = stages.iter().map(|s| (s.name.clone(), s.status)).collect();
+        assert_eq!(
+            shape,
+            vec![
+                ("Build".into(), PipelineRunStatus::Succeeded),
+                ("Deploy Prod".into(), PipelineRunStatus::Waiting),
+                ("Post-deploy".into(), PipelineRunStatus::Queued),
+                ("Cleanup".into(), PipelineRunStatus::Skipped),
+            ]
+        );
+    }
+
+    #[test]
+    fn orphan_jobs_stage_reads_an_all_skipped_set_as_skipped_not_succeeded() {
+        let all_skipped: Value = serde_json::from_str(
+            r#"[
+                { "id": "j1", "type": "Job", "name": "a", "state": "completed", "result": "skipped" },
+                { "id": "j2", "type": "Job", "name": "b", "state": "completed", "result": "skipped" }
+            ]"#,
+        )
+        .unwrap();
+        let stages = stages_from_timeline(all_skipped.as_array().unwrap());
+        assert_eq!(stages.len(), 1);
+        assert_eq!(stages[0].status, PipelineRunStatus::Skipped, "an all-skipped orphan job set reads Skipped, not Succeeded");
+    }
+
+    #[test]
     fn list_builds_url_orders_by_queue_time_so_in_flight_runs_stay_on_the_page() {
         let url = list_builds_url("https://dev.azure.com/acme", "Pay", 10, Some("3"));
         assert!(url.starts_with("https://dev.azure.com/acme/Pay/_apis/build/builds?"), "{url}");
@@ -1682,7 +1747,8 @@ mod tests {
         };
         assert_eq!(rec("completed", Some("succeeded")), PipelineRunStatus::Succeeded);
         assert_eq!(rec("completed", Some("succeededWithIssues")), PipelineRunStatus::PartiallySucceeded);
-        assert_eq!(rec("completed", Some("skipped")), PipelineRunStatus::Canceled);
+        // Never ran — not a failure in its own right, distinct from a cancelled one.
+        assert_eq!(rec("completed", Some("skipped")), PipelineRunStatus::Skipped);
         assert_eq!(rec("completed", Some("canceled")), PipelineRunStatus::Canceled);
         assert_eq!(rec("completed", Some("failed")), PipelineRunStatus::Failed);
         assert_eq!(rec("inProgress", None), PipelineRunStatus::Running);
