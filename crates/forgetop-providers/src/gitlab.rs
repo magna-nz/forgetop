@@ -126,7 +126,9 @@ pub fn gl_pipeline_status(status: Option<&str>) -> PipelineRunStatus {
         Some("success") => PipelineRunStatus::Succeeded,
         Some("failed") => PipelineRunStatus::Failed,
         Some("running") => PipelineRunStatus::Running,
-        Some("canceled") | Some("skipped") => PipelineRunStatus::Canceled,
+        Some("canceled") => PipelineRunStatus::Canceled,
+        // Never ran — not a failure in its own right, distinct from a cancelled one.
+        Some("skipped") => PipelineRunStatus::Skipped,
         // A `manual` pipeline/job is blocked awaiting a manual action — surface it as
         // pending (Queued) so it reads as in-flight and its gate can be actioned.
         Some("manual") => PipelineRunStatus::Queued,
@@ -1213,6 +1215,8 @@ mod tests {
         assert_eq!(gl_pipeline_status(Some("manual")), PipelineRunStatus::Queued);
         assert_eq!(gl_pipeline_status(Some("canceled")), PipelineRunStatus::Canceled);
         assert_eq!(gl_pipeline_status(Some("running")), PipelineRunStatus::Running);
+        // Never ran — not a failure in its own right, distinct from a cancelled one.
+        assert_eq!(gl_pipeline_status(Some("skipped")), PipelineRunStatus::Skipped);
     }
 
     #[test]

@@ -190,10 +190,15 @@ fn status_of(v: &Value) -> PipelineRunStatus {
     match status.as_deref() {
         Some("completed") => match conclusion.as_deref() {
             Some("success") => PipelineRunStatus::Succeeded,
-            Some("cancelled") | Some("skipped") => PipelineRunStatus::Canceled,
+            // Never ran — not a failure in its own right, distinct from a cancelled one.
+            Some("skipped") => PipelineRunStatus::Skipped,
+            Some("cancelled") => PipelineRunStatus::Canceled,
             _ => PipelineRunStatus::Failed,
         },
-        Some("queued") | Some("requested") | Some("waiting") | Some("pending") => PipelineRunStatus::Queued,
+        // Held on an environment protection rule — in flight but parked, same idea as Azure's
+        // approval gate.
+        Some("waiting") => PipelineRunStatus::Waiting,
+        Some("queued") | Some("requested") | Some("pending") => PipelineRunStatus::Queued,
         _ => PipelineRunStatus::Running,
     }
 }
@@ -1463,6 +1468,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(map_job(&job).steps.len(), 1);
+    }
+
+    #[test]
+    fn status_of_reads_skipped_and_waiting() {
+        let completed = |conclusion: &str| status_of(&json!({ "status": "completed", "conclusion": conclusion }));
+        // Never ran — not a failure in its own right, distinct from a cancelled one.
+        assert_eq!(completed("skipped"), PipelineRunStatus::Skipped);
+        assert_eq!(completed("cancelled"), PipelineRunStatus::Canceled);
+        assert_eq!(completed("failure"), PipelineRunStatus::Failed);
+        // Held on an environment protection rule: in flight but parked, not merely unstarted.
+        assert_eq!(status_of(&json!({ "status": "waiting" })), PipelineRunStatus::Waiting);
+        assert_eq!(status_of(&json!({ "status": "queued" })), PipelineRunStatus::Queued);
+        assert_eq!(status_of(&json!({ "status": "requested" })), PipelineRunStatus::Queued);
+        assert_eq!(status_of(&json!({ "status": "pending" })), PipelineRunStatus::Queued);
+        assert_eq!(status_of(&json!({ "status": "in_progress" })), PipelineRunStatus::Running);
     }
 
     #[test]
