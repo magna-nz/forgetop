@@ -207,6 +207,18 @@ pub fn map_build(v: &Value, project: Option<&str>) -> PipelineRun {
     }
 }
 
+/// The builds-list URL for one project. The order is explicit: left to Azure's default, `$top`
+/// fills with *finished* builds first, so a run still in progress — or parked on an approval gate
+/// — falls off the page and the previous success is all that shows. Every build has a queue time
+/// (a `notStarted` one has no start time), so queue order keeps queued, running and gated runs in.
+fn list_builds_url(base: &str, project: &str, top: u32, definition_id: Option<&str>) -> String {
+    let mut url = format!("{base}/{project}/_apis/build/builds?$top={top}&queryOrder=queueTimeDescending&{API}");
+    if let Some(def) = definition_id {
+        url.push_str(&format!("&definitions={def}"));
+    }
+    url
+}
+
 pub fn map_change_entry(v: &Value) -> FileChange {
     let kind = match get_str(v, "changeType").as_deref() {
         Some("add") => FileChangeKind::Added,
@@ -259,7 +271,10 @@ fn record_status(v: &Value) -> PipelineRunStatus {
     if get_str(v, "state").as_deref() == Some("completed") {
         match get_str(v, "result").as_deref() {
             Some("succeeded") => PipelineRunStatus::Succeeded,
-            Some("canceled") => PipelineRunStatus::Canceled,
+            Some("succeededWithIssues") => PipelineRunStatus::PartiallySucceeded,
+            // A stage skipped by its condition (or a gate that timed out) didn't fail — it reads
+            // as not-run, the same as GitHub's and GitLab's `skipped`.
+            Some("canceled") | Some("skipped") | Some("abandoned") => PipelineRunStatus::Canceled,
             _ => PipelineRunStatus::Failed,
         }
     } else if get_str(v, "state").as_deref() == Some("inProgress") {
@@ -1182,10 +1197,7 @@ impl PipelineSource for AzurePipe {
         }
         let top = query.limit.unwrap_or(25);
         let rows = fan_out(&projects, "azure.pipelines.list_runs", |project| async move {
-            let mut url = format!("{}/{project}/_apis/build/builds?$top={top}&{API}", self.0.base);
-            if let Some(def) = &query.definition_id {
-                url.push_str(&format!("&definitions={def}"));
-            }
+            let url = list_builds_url(&self.0.base, &project, top, query.definition_id.as_deref());
             let v = self.0.get_json(&url).await?;
             Ok(get_arr(&v, "value").iter().map(|b| map_build(b, Some(&project))).collect())
         })
@@ -1647,6 +1659,35 @@ mod tests {
         assert_eq!(stages.len(), 1);
         assert_eq!(stages[0].name, "Jobs");
         assert_eq!(stages[0].status, PipelineRunStatus::Failed);
+    }
+
+    #[test]
+    fn list_builds_url_orders_by_queue_time_so_in_flight_runs_stay_on_the_page() {
+        let url = list_builds_url("https://dev.azure.com/acme", "Pay", 10, Some("3"));
+        assert!(url.starts_with("https://dev.azure.com/acme/Pay/_apis/build/builds?"), "{url}");
+        assert!(url.contains("$top=10"), "{url}");
+        assert!(url.contains("queryOrder=queueTimeDescending"), "{url}");
+        assert!(url.contains("&definitions=3"), "{url}");
+        assert!(!list_builds_url("https://dev.azure.com/acme", "Pay", 10, None).contains("definitions="));
+    }
+
+    #[test]
+    fn record_status_reads_skipped_as_not_run_and_issues_as_partial() {
+        let rec = |state: &str, result: Option<&str>| {
+            let mut v = json!({ "state": state });
+            if let Some(r) = result {
+                v["result"] = json!(r);
+            }
+            record_status(&v)
+        };
+        assert_eq!(rec("completed", Some("succeeded")), PipelineRunStatus::Succeeded);
+        assert_eq!(rec("completed", Some("succeededWithIssues")), PipelineRunStatus::PartiallySucceeded);
+        assert_eq!(rec("completed", Some("skipped")), PipelineRunStatus::Canceled);
+        assert_eq!(rec("completed", Some("canceled")), PipelineRunStatus::Canceled);
+        assert_eq!(rec("completed", Some("failed")), PipelineRunStatus::Failed);
+        assert_eq!(rec("inProgress", None), PipelineRunStatus::Running);
+        // A stage parked behind an approval hasn't started: pending, never a tick.
+        assert_eq!(rec("pending", None), PipelineRunStatus::Queued);
     }
 
     #[test]
