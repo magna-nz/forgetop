@@ -9,6 +9,7 @@ import type {
   NotificationKind,
   PipelineRun,
   PipelineRunStatus,
+  PipeRow,
   ProviderType,
   PullRequest,
   Reviewer,
@@ -130,6 +131,13 @@ export function pipeTitle(run: PipelineRun, definitionName?: string | null): str
 /** The pipeline a run belongs to — mirrors `launchpad::pipe_workflow` in forgetop-core. */
 export function pipeWorkflow(run: PipelineRun, definitionName?: string | null): string {
   return definitionName || run.name || run.definition_id;
+}
+
+/** How many distinct pipelines the runs belong to — the sidebar badge counts pipelines, not runs
+ *  (one busy pipeline fetches many). Keyed on connection + repository + `definition_id`, never the
+ *  display name, exactly as the TUI's `App::pipeline_count` keys it. */
+export function pipelineCount(rows: PipeRow[]): number {
+  return new Set(rows.map((r) => `${r.connection_id}\u0001${r.run.repository ?? ""}\u0001${r.run.definition_id}`)).size;
 }
 
 /** What stands between a pull request and its merge. Mirrors `launchpad::PrBlocker`. */
