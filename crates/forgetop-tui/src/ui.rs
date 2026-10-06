@@ -6164,6 +6164,13 @@ mod tests {
             view.toggle_selected();
         }
         let flat = view.flatten();
+        assert_eq!(flat.len(), 4, "stage + job, twice: a passed job starts folded too");
+        assert!(!flat[1].expanded);
+        for at in [3, 1] {
+            view.selected = at;
+            view.toggle_selected();
+        }
+        let flat = view.flatten();
         assert_eq!(flat.len(), 6, "stage + job + step, twice, once unfolded");
         assert_eq!(flat[0].depth, 0);
         assert_eq!(flat[2].depth, 2);
