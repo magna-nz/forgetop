@@ -9,6 +9,29 @@ Adding a release: one `## <version> — <date>` section, a line per user-visible
 and the pull request each one came from. `git log v<previous>..HEAD --merges` lists the
 candidates.
 
+## 1.6.0 — 2026-10-06
+
+Changed
+
+- **The pipeline pane keeps its size.** In the terminal UI, Enter on a pipeline run moves the
+  keys into the pane instead of widening it; pull requests and work items still open wide for
+  their diffs and threads. ([#218](https://github.com/magna-nz/forgetop/pull/218))
+- **Logs get more room.** The step tree beside an open log is narrower, and a long step name
+  gives up its middle (`Run dto…stable  6s`) so its time stays in view.
+  ([#218](https://github.com/magna-nz/forgetop/pull/218))
+
+Added
+
+- **Pan long log lines.** With the log pane focused, ← / → (or h / l) scroll a long line
+  across; the time column stays put and the pane's title says how far across you are.
+  ([#218](https://github.com/magna-nz/forgetop/pull/218))
+
+Fixed
+
+- **The Pipelines badge counts pipelines, not runs.** The tab strip and the dashboard sidebar
+  read `Pipelines (74)` for a list of 8 pipelines; both now count distinct pipelines.
+  ([#217](https://github.com/magna-nz/forgetop/pull/217))
+
 ## 1.5.2 — 2026-10-05
 
 Fixed
