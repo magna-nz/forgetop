@@ -16,11 +16,11 @@ Changed
 - **No more Runs column on Pipelines.** In the terminal UI, what it said now sits beside the
   name: a pipeline reads `PatchLine · 2 failed`, an expanded run `─ 20261005.3 · develop`, and
   an ungrouped run `CI · #42`. The run count is gone — it was the fetch cap on almost every row.
-  (PR_LINK)
+  ([#220](https://github.com/magna-nz/forgetop/pull/220))
 - **The Pipeline / Run column stops at 48 characters.** A release named with a sentence no
   longer pushes every column after it to the far edge; the name gives way with `…`, the branch
   or failure tally stays in view, and the selected row scrolls through the full name.
-  (PR_LINK)
+  ([#220](https://github.com/magna-nz/forgetop/pull/220))
 
 ## 1.6.0 — 2026-10-06
 
