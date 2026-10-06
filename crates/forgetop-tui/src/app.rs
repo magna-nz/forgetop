@@ -1476,7 +1476,7 @@ const LOG_INFLIGHT_TIMEOUT_TICKS: u16 = 400;
 /// Below this width the drill-in shows the log pane alone rather than beside the tree.
 pub const LOG_SPLIT_MIN_WIDTH: u16 = 90;
 /// Width of the stages/jobs/steps tree beside an open log pane.
-pub const LOG_TREE_WIDTH: u16 = 38;
+pub const LOG_TREE_WIDTH: u16 = 26;
 
 /// One row of a log pane: a log line, or a step section's fold header — which stands in for the
 /// section's own marker line.
@@ -1519,6 +1519,10 @@ pub struct LogView {
     pub live: bool,
     /// Visible row count of the last frame, written by the renderer so scrolling can clamp.
     pub viewport: Cell<u16>,
+    /// Columns the text is panned right by (`←`/`→`). A line's time gutter stays put.
+    pub hscroll: usize,
+    /// Body width of the last frame, written by the renderer so panning can clamp.
+    pub viewport_w: Cell<u16>,
     /// The `/` prompt's text while it is open.
     pub search_input: Option<String>,
     /// The committed search, and the lines that match it.
@@ -1571,6 +1575,8 @@ impl LogView {
             follow: live,
             live,
             viewport: Cell::new(0),
+            hscroll: 0,
+            viewport_w: Cell::new(0),
             search_input: None,
             query: None,
             matches: Vec::new(),
@@ -1817,6 +1823,26 @@ impl LogView {
         if delta < 0 {
             self.follow = false;
         }
+    }
+
+    /// Pans by half the pane's width, so a long line reads in a few presses, and stops once
+    /// the widest line's end is in view.
+    fn pan_by(&mut self, dir: i32) {
+        let vw = self.viewport_w.get() as usize;
+        let step = (vw / 2).max(8);
+        let lead = if self.sectioned() { 3 } else { 0 };
+        let widest = self.rows.iter().filter_map(|r| match r {
+            LogRow::Line(l) => Some(lead + self.row_text(*l).chars().count()),
+            _ => None,
+        });
+        let max = widest.max().unwrap_or(0).saturating_sub(vw);
+        self.hscroll = if dir < 0 { self.hscroll.saturating_sub(step) } else { (self.hscroll + step).min(max) };
+    }
+
+    /// The text a log line draws: a sectioned log leaves the ISO timestamp out.
+    pub fn row_text(&self, line: usize) -> &str {
+        let text = &self.lines[line];
+        if self.sectioned() { runlog::strip_timestamp(text) } else { text }
     }
 
     fn scroll_top(&mut self) {
@@ -4425,7 +4451,7 @@ impl App {
                         if split {
                             out.push(("Move the keys to the tree", c('w')));
                         }
-                        out.push(("Search the log", c('/')));
+                        out.extend([("Search the log", c('/')), ("Pan left", Key::Left), ("Pan right", Key::Right)]);
                         if log.query.is_some() {
                             out.extend([("Next match", c('n')), ("Previous match", c('N'))]);
                         }
@@ -8113,6 +8139,8 @@ impl App {
             Key::Down | Key::Char('j') => log.scroll_by(1),
             Key::PageUp | Key::Char('b') => log.scroll_by(-15),
             Key::PageDown | Key::Char(' ') => log.scroll_by(15),
+            Key::Left | Key::Char('h') => log.pan_by(-1),
+            Key::Right | Key::Char('l') => log.pan_by(1),
             Key::Home | Key::Char('g') => log.scroll_top(),
             Key::End | Key::Char('G') => log.scroll_bottom(),
             Key::Char('f') => {
@@ -15430,6 +15458,30 @@ mod tests {
         log.set_text(&big);
         assert_eq!(log.lines.len(), LOG_MAX_LINES);
         assert_eq!(log.lines.last().map(String::as_str), Some(format!("line {}", LOG_MAX_LINES + 4).as_str()));
+    }
+
+    #[tokio::test]
+    async fn left_and_right_pan_the_focused_log_and_stop_at_the_widest_line() {
+        let deps = test_deps();
+        let long = format!("10:40:36  {}", "x".repeat(90));
+        let mut app = log_app(LogView::with_lines("Logs", "j1", vec!["10:40:36  short".into(), long]), PipelineRunStatus::Succeeded);
+        let pan = |app: &App| open_log(app).hscroll;
+        if let Screen::Pipeline(v) = &mut app.screen {
+            v.logs.as_mut().unwrap().viewport_w.set(40);
+        }
+        app.on_key(Key::Right, &deps).await;
+        assert_eq!(pan(&app), 20, "half the pane per press");
+        for _ in 0..5 {
+            app.on_key(Key::Right, &deps).await;
+        }
+        assert_eq!(pan(&app), 60, "no further than brings the longest line's end into view");
+        app.on_key(Key::Char('h'), &deps).await;
+        assert_eq!(pan(&app), 40);
+        for _ in 0..5 {
+            app.on_key(Key::Left, &deps).await;
+        }
+        assert_eq!(pan(&app), 0);
+        assert!(open_log(&app).effective_scroll() == 0 && matches!(app.screen, Screen::Pipeline(_)), "panning moves nothing else");
     }
 
     #[test]

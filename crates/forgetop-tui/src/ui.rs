@@ -391,9 +391,11 @@ fn render_content(frame: &mut Frame, area: Rect, app: &mut App) {
 ///
 /// The list is laid out at full width whether or not the pane is up, and the pane is drawn over
 /// its right-hand side — opening and closing it never moves a column. Browsing, the pane leaves
-/// the list most of the width; an open item takes the room a diff, a thread or a log needs.
+/// the list most of the width; an open PR or work item takes the room a diff or a thread needs.
+/// A pipeline keeps its preview's width: Enter just moves the keys into the pane.
 fn render_split(frame: &mut Frame, area: Rect, app: &mut App, focused: bool) {
-    let pane_w = area.width * if focused { 70 } else { 45 } / 100;
+    let wide = focused && !matches!(app.screen, Screen::Pipeline(_));
+    let pane_w = area.width * if wide { 70 } else { 45 } / 100;
     let pane = Rect { x: area.right() - pane_w, width: pane_w, ..area };
     let list = Rect { width: area.width - pane_w, ..area };
 
@@ -2513,7 +2515,7 @@ fn base_footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
                 return vec![("type", "search"), ("↵", "find"), ("Esc", "cancel")];
             }
             if v.logs_have_keys() {
-                let mut keys = vec![("↑↓", "scroll")];
+                let mut keys = vec![("↑↓", "scroll"), ("←→", "pan")];
                 if log.sectioned() {
                     keys.push(("z/Z", "fold"));
                 }
@@ -3866,6 +3868,11 @@ fn open_duration(theme: &Theme, n: &FlatNode, wait: Option<i64>, now: DateTime<U
     }
 }
 
+/// The tree's `▐ ` highlight symbol; the list keeps its column on every row.
+const TREE_HIGHLIGHT_W: usize = 2;
+/// The fewest columns a step name is shortened to before the plain tree lets the row clip.
+const TREE_LABEL_MIN: usize = 8;
+
 /// The tree without bars, as it has always read.
 fn render_plain_tree(
     frame: &mut Frame,
@@ -3879,6 +3886,7 @@ fn render_plain_tree(
     let now = Utc::now();
     let wait = (view.shown_status() == PipelineRunStatus::Waiting).then(|| waiting_secs(&view.run, now)).flatten();
     let dim = Style::default().fg(theme.dim);
+    let inner_w = tree_area.width.saturating_sub(2) as usize;
     let items: Vec<ListItem> = nodes
         .iter()
         .map(|n| {
@@ -3891,6 +3899,7 @@ fn render_plain_tree(
                 Span::styled(format!("{} ", pipeline_glyph(n.status, anim)), Style::default().fg(theme.pipeline_color(n.status))),
                 Span::styled(n.label.clone(), node_label_style(theme, n)),
             ];
+            let label_at = spans.len() - 1;
             if let Some((text, tone)) = &n.summary {
                 spans.push(Span::styled(format!("  {text}"), Style::default().fg(tone_color(theme, *tone))));
             }
@@ -3906,6 +3915,17 @@ fn render_plain_tree(
             }
             if let Some(p) = &n.problem {
                 spans.push(Span::styled(format!("  ⚠ {p}"), Style::default().fg(theme.red)));
+            }
+            // Beside the logs the tree is narrow: a long name gives up its middle so the time
+            // after it still shows. Unless what follows wouldn't fit either — then it clips.
+            let used = TREE_HIGHLIGHT_W + spans.iter().map(|s| s.content.chars().count()).sum::<usize>();
+            if used > inner_w {
+                let label_w = spans[label_at].content.chars().count();
+                let room = label_w.saturating_sub(used - inner_w);
+                // A step or job is told apart by its end; a folded group ("8 steps passed") by its start.
+                if room >= TREE_LABEL_MIN {
+                    spans[label_at].content = if n.group { truncate(&n.label, room) } else { fit(&n.label, room) }.into();
+                }
             }
             ListItem::new(Line::from(spans))
         })
@@ -4378,6 +4398,34 @@ fn log_line<'a>(theme: &Theme, text: &str, query: Option<&str>, current: bool) -
     Line::from(spans)
 }
 
+/// The `HH:MM:SS  ` gutter the providers lead a log line with, in columns; 0 without one.
+fn log_gutter(text: &str) -> usize {
+    let b = text.as_bytes();
+    let digits = |i: usize| b[i].is_ascii_digit() && b[i + 1].is_ascii_digit();
+    let timed = b.len() >= 10 && digits(0) && b[2] == b':' && digits(3) && b[5] == b':' && digits(6) && &b[8..10] == b"  ";
+    if timed { 10 } else { 0 }
+}
+
+/// `line` panned `skip` columns right, its first `keep` columns (the time gutter) held in place.
+fn pan_line(line: Line<'static>, keep: usize, skip: usize) -> Line<'static> {
+    if skip == 0 {
+        return line;
+    }
+    let mut at = 0;
+    let spans = line
+        .spans
+        .into_iter()
+        .filter_map(|span| {
+            let start = at;
+            at += span.content.chars().count();
+            let shown = |i: usize| start + i < keep || start + i >= keep + skip;
+            let text: String = span.content.chars().enumerate().filter(|(i, _)| shown(*i)).map(|(_, c)| c).collect();
+            (!text.is_empty()).then(|| Span::styled(text, span.style))
+        })
+        .collect::<Vec<_>>();
+    Line::from(spans)
+}
+
 /// A step section's fold header: `▸ name … N lines` folded, `▾ name … line N` open.
 fn section_header<'a>(theme: &Theme, log: &LogView, section: usize, width: usize, cursor: bool) -> Line<'a> {
     let sec = &log.sections[section];
@@ -4429,8 +4477,10 @@ fn render_log_pane(frame: &mut Frame, area: Rect, theme: &Theme, log: &LogView) 
     let title = log_title(log);
     let mut block = section_block(theme, &title);
     if log.loaded {
+        let panned = if log.hscroll > 0 { format!(" · col {}", log.hscroll + 1) } else { String::new() };
         block = block.title_top(
-            Line::from(Span::styled(format!(" {} lines ", thousands(log.lines.len())), Style::default().fg(theme.dim))).right_aligned(),
+            Line::from(Span::styled(format!(" {} lines{panned} ", thousands(log.lines.len())), Style::default().fg(theme.dim)))
+                .right_aligned(),
         );
         if let Some(e) = log.first_error {
             block = block.title_bottom(Line::from(Span::styled(
@@ -4444,6 +4494,7 @@ fn render_log_pane(frame: &mut Frame, area: Rect, theme: &Theme, log: &LogView) 
     let status = log_status_line(theme, log);
     let body_h = inner.height.saturating_sub(u16::from(status.is_some() && inner.height > 1));
     log.viewport.set(body_h);
+    log.viewport_w.set(inner.width);
     let top = log.effective_scroll() as usize;
     let current = log.match_idx.and_then(|i| log.matches.get(i).copied());
     let sectioned = log.sectioned();
@@ -4458,8 +4509,8 @@ fn render_log_pane(frame: &mut Frame, area: Rect, theme: &Theme, log: &LogView) 
             LogRow::Header(s) => section_header(theme, log, s, inner.width as usize, cursor == Some(r)),
             LogRow::Group(a, b) => group_header(theme, log, a, b, inner.width as usize, cursor == Some(r)),
             LogRow::Line(l) if sectioned => {
-                let text = runlog::strip_timestamp(&log.lines[l]);
-                let mut line = log_line(theme, text, log.query.as_deref(), current == Some(l));
+                let text = log.row_text(l);
+                let mut line = pan_line(log_line(theme, text, log.query.as_deref(), current == Some(l)), log_gutter(text), log.hscroll);
                 let at = cursor == Some(r);
                 let lead = if at {
                     let color = if is_error_line(text) { theme.red } else { theme.accent };
@@ -4475,7 +4526,10 @@ fn render_log_pane(frame: &mut Frame, area: Rect, theme: &Theme, log: &LogView) 
                 }
                 line
             }
-            LogRow::Line(l) => log_line(theme, &log.lines[l], log.query.as_deref(), current == Some(l)),
+            LogRow::Line(l) => {
+                let text = &log.lines[l];
+                pan_line(log_line(theme, text, log.query.as_deref(), current == Some(l)), log_gutter(text), log.hscroll)
+            }
         })
         .collect();
     frame.render_widget(Paragraph::new(lines), Rect { height: body_h, ..inner });
@@ -4983,6 +5037,7 @@ pub(crate) fn help_sections() -> Vec<(&'static str, Vec<(&'static str, &'static 
                 ("w (logs open)", "Move the keys between the tree and the log pane"),
                 ("z  Z (logs)", "Fold / unfold the step section under the cursor / all of them"),
                 ("f  g  G", "Logs: toggle follow / top / bottom (and follow)"),
+                ("←  →  (logs)", "Pan a long line across; the time column stays put"),
                 ("E", "Jump to the first error (from the tree: in the failed job's log)"),
                 ("/  n  N", "Logs: search, next / previous match"),
                 ("e", "Problems panel: move the keys in and out; Enter jumps to the line"),
@@ -6147,6 +6202,59 @@ mod tests {
         }
         render_to_string(&mut app, 20, 6);
         render_to_string(&mut app, 120, 8);
+    }
+
+    #[test]
+    fn beside_the_logs_a_long_step_name_gives_way_to_its_time() {
+        use crate::app::{LogView, Screen};
+        let mut run = sample_run();
+        let t0 = Utc::now() - chrono::Duration::minutes(5);
+        let step = &mut run.stages[0].jobs[0].steps[0];
+        step.name = "Run dtolnay/rust-toolchain@stable".into();
+        (step.started_at, step.finished_at) = (Some(t0), Some(t0 + chrono::Duration::seconds(6)));
+        let mut view = PipelineView::new("CI #101".into(), run, "demo".into(), ProviderType::GitHub, "ci".into(), None);
+        view.logs = Some(LogView::with_lines("Logs · compile", "j1", vec![]));
+        let mut app = App::new("slate");
+        app.screen = Screen::Pipeline(Box::new(view));
+
+        let rows = render_to_rows(&mut app, 160, 30);
+        let Screen::Pipeline(v) = &app.screen else { panic!() };
+        assert!(v.log_split.get(), "the tree sits beside the logs");
+        let row = rows.iter().find(|l| l.contains("Run dto")).expect("the step's row");
+        assert!(row.contains("Run dto…stable"), "the middle goes, both ends stay: {row}");
+        assert!(row.contains("6s"), "and its time still shows: {row}");
+    }
+
+    #[test]
+    fn a_panned_log_keeps_its_time_column_and_shifts_the_text() {
+        use crate::app::{LogView, Screen};
+        let text = "Download action repository 'actions/checkout@v4' (SHA:11d5960a326750d58)";
+        let mut log = LogView::with_lines("Logs", "j1", vec![format!("10:40:36  {text}"), "no time here at all".into()]);
+        log.hscroll = 9;
+        let mut view = PipelineView::new("CI #101".into(), sample_run(), "demo".into(), ProviderType::GitHub, "ci".into(), None);
+        view.logs = Some(log);
+        let mut app = App::new("slate");
+        app.screen = Screen::Pipeline(Box::new(view));
+
+        let rows = render_to_rows(&mut app, 120, 24);
+        let all = rows.join("\n");
+        assert!(all.contains("10:40:36  action repository 'actions/checkout@v4'"), "the time stays, the text moves: {all}");
+        assert!(all.contains("│ere at all") || all.contains("┃ere at all"), "an untimed line pans whole: {all}");
+        assert!(all.contains("lines · col 10"), "the title says how far across: {all}");
+    }
+
+    #[test]
+    fn a_focused_pipeline_keeps_the_previews_width() {
+        use crate::app::Screen;
+        let mut app = App::new("slate");
+        app.active = 2;
+        let view = PipelineView::new("CI #101".into(), sample_run(), "demo".into(), ProviderType::GitHub, "ci".into(), None);
+        app.screen = Screen::Pipeline(Box::new(view));
+        app.preview_focus = true;
+        let rows = render_to_rows(&mut app, 200, 24);
+        let top = rows.iter().find(|r| r.contains("CI #101")).expect("the pane's title row");
+        let left = top.chars().position(|c| c == '┏').expect("the focused pane's heavy corner");
+        assert_eq!(left, 200 - 200 * 45 / 100, "Enter moves the keys into the pane without widening it");
     }
 
     /// A cache-seeded run must not present remembered status as live — the user waits on runs
@@ -8104,7 +8212,7 @@ mod tests {
         assert!(all.contains("10 lines") && all.contains("first error · line 9"), "{all}");
         // Full screen keeps the tree beside the log.
         let all = pane_rows(&app, 112, 30).join("\n");
-        assert!(all.contains("Logs · Test") && all.contains("8 steps passed"), "{all}");
+        assert!(all.contains("Logs · Test") && all.contains("8 steps pass…  42s"), "a folded group keeps its start and its time: {all}");
     }
 
     #[test]
