@@ -1522,10 +1522,9 @@ enum PipeCol {
     Status,
     Provider,
     Repository,
-    /// The group's name on a header; on a run, whatever varies inside its group.
+    /// The group's name on a header; on a run, whatever varies inside its group. Each carries
+    /// a tail in its own colour — see [`Subject`].
     Subject,
-    /// "5 runs · 3 failed" on a header, the run's own number on a run.
-    Runs,
     /// Only when ungrouped. Every grouped mode carries the branch in Subject instead —
     /// on the header when it is the key, on the child when it is what varies.
     Branch,
@@ -1547,7 +1546,6 @@ impl PipeCol {
             PipeCol::Tree | PipeCol::Status | PipeCol::Subject => None,
             PipeCol::Provider => Some("Provider"),
             PipeCol::Repository => Some("Repository"),
-            PipeCol::Runs => Some("Runs"),
             PipeCol::Branch => Some("Branch"),
             PipeCol::Commit => Some("Commit"),
             PipeCol::Started => Some("Started"),
@@ -1563,14 +1561,6 @@ impl PipeCol {
             PipeCol::Provider => "Provider".into(),
             PipeCol::Repository => "Repository".into(),
             PipeCol::Subject => app.pipe_subject_heading(any_open).into(),
-            // Ungrouped, the cell is one run's number, not a count of them. Grouped by pipeline,
-            // an open group's runs carry their branch here (the run itself is in Subject).
-            PipeCol::Runs => match (app.pipe_group, any_open) {
-                (PipeGroup::Off, _) => "Run",
-                (PipeGroup::Pipeline, true) => "Runs / Branch",
-                _ => "Runs",
-            }
-            .into(),
             PipeCol::Branch => "Branch".into(),
             PipeCol::Commit => "Commit".into(),
             PipeCol::Started => "Started".into(),
@@ -1690,7 +1680,6 @@ fn pipe_columns(app: &App, live: &[PipeLive]) -> Vec<PipeCol> {
     // timings left the one fact that says *where* this is happening at the far edge.
     cols.push(PipeCol::Repository);
     cols.push(PipeCol::Subject);
-    cols.push(PipeCol::Runs);
     // Ungrouped there is no header to carry the branch and no child to put it in Subject,
     // so it needs its own column — this mode must stay the list the tab had before grouping.
     if !grouped {
@@ -1898,22 +1887,37 @@ fn render_pipes(frame: &mut Frame, area: Rect, app: &mut App) {
             PipeLine::Run(i) => {
                 let p = &app.pipes[*i];
                 let child = app.pipe_group != PipeGroup::Off;
-                let (subject, runs) = run_naming(app, p, theme);
+                let subject = run_subject(app, p, theme);
                 // The next line tells us whether this run closes its group, so `└` costs a
                 // peek rather than a scan back through the list for every row.
                 let last = !matches!(lines.get(n + 1), Some(PipeLine::Run(_)));
                 cols.iter()
                     .map(|c| {
                         live_cell(*c, live, theme)
-                            .unwrap_or_else(|| run_cell(*c, p, &subject, &runs, last, child, theme, app.anim, owner.as_ref()))
+                            .unwrap_or_else(|| run_cell(*c, p, &subject.name, last, child, theme, app.anim, owner.as_ref()))
                     })
                     .collect()
             }
         })
         .collect();
 
-    let mut cols = cols;
+    // The Subject cell is measured and drawn capped, with its tail kept in sight.
+    let subjects: Vec<Subject> = lines
+        .iter()
+        .map(|line| match line {
+            PipeLine::Head(h) => head_subject(h, theme),
+            PipeLine::Run(i) => run_subject(app, &app.pipes[*i], theme),
+        })
+        .collect();
+    let fitted: Vec<(String, usize)> = subjects.iter().map(Subject::fitted).collect();
     let mut cells = cells;
+    if let Some(at) = cols.iter().position(|c| *c == PipeCol::Subject) {
+        for (row, f) in cells.iter_mut().zip(&fitted) {
+            row[at].0 = f.0.clone();
+        }
+    }
+
+    let mut cols = cols;
     let headings: Vec<String> = cols.iter().map(|c| c.heading(app, any_open)).collect();
     fit_columns(&mut cols, &mut cells, &headings, inner_w);
 
@@ -1926,7 +1930,21 @@ fn render_pipes(frame: &mut Frame, area: Rect, app: &mut App) {
             paint_stage_strip(row, at, &live.strip, &app.theme, app.anim);
         }
     }
-    let selected = app.selected().and_then(|i| cells.get(i)).map(|r| (flex, r[flex].0.clone()));
+    // After the strip, which addresses its cell by span index past this one.
+    let selected_line = app.selected();
+    for (n, row) in rows.iter_mut().enumerate() {
+        let Some(subject) = subjects.get(n) else { continue };
+        if selected_line == Some(n) {
+            // A capped name scrolls on the selected row, so it can be read in full.
+            if let Some(span) = row.spans.get_mut(1 + 2 * flex) {
+                let width = span.content.chars().count();
+                span.content = format!("{:<width$}", marquee_window(&subject.full(), width, app.anim / 2)).into();
+            }
+        } else if let Some((_, style)) = subject.tail {
+            paint_subject_tail(row, flex, &fitted[n], style);
+        }
+    }
+    let selected = selected_line.and_then(|i| subjects.get(i)).map(|s| (flex, s.full()));
     render_inline_list(frame, area, app, &title, header, rows, selected);
 }
 
@@ -1942,13 +1960,58 @@ fn live_cell(col: PipeCol, live: &PipeLive, theme: &Theme) -> Option<(String, St
     }
 }
 
-/// How a run names itself in a list row: its Subject text, and what goes in the Runs column.
+/// The widest the Pipeline / Run column grows. A release can be named with a sentence
+/// ("Initializing the Next Empower API, Webjobs & Database Migration Deployment"), and one such
+/// run pushed every column after it out to the far edge.
+const PIPE_SUBJECT_MAX: usize = 48;
+
+/// What a list line puts in the Subject column: its name, then a tail in its own colour — a
+/// header's failure tally, a run's branch or number.
 ///
-/// Grouped by pipeline the run is the thing that varies, so Subject carries its own name or
-/// number, and Runs its branch (in the branch colour) — once, not again when the run is named
-/// after it (a tag build). Grouped otherwise, Subject carries what varies there (the pipeline)
-/// and Runs the run's number, as before.
-fn run_naming(app: &App, p: &PipeRow, theme: &Theme) -> (String, (String, Style)) {
+/// The tail used to be a Runs column of its own. Folded in, it costs no column and no gap, and
+/// sits beside the name it qualifies.
+struct Subject {
+    name: String,
+    tail: Option<(String, Style)>,
+}
+
+impl Subject {
+    fn tail_text(&self) -> Option<String> {
+        self.tail.as_ref().map(|(t, _)| format!(" · {t}"))
+    }
+
+    /// The whole text, for the selected row to scroll through.
+    fn full(&self) -> String {
+        format!("{}{}", self.name, self.tail_text().unwrap_or_default())
+    }
+
+    /// The text capped at [`PIPE_SUBJECT_MAX`], and how many of its trailing characters are the
+    /// tail. The name gives way first, so a long release name can't push the failure tally or
+    /// the branch out of sight — but a long branch only takes half.
+    fn fitted(&self) -> (String, usize) {
+        let Some(tail) = self.tail_text() else { return (truncate(&self.name, PIPE_SUBJECT_MAX), 0) };
+        let room = PIPE_SUBJECT_MAX.saturating_sub(self.name.chars().count()).max(PIPE_SUBJECT_MAX / 2);
+        let tail = truncate(&tail, room);
+        let n = tail.chars().count();
+        (format!("{}{tail}", truncate(&self.name, PIPE_SUBJECT_MAX - n)), n)
+    }
+}
+
+/// A header names its group; its tail is how many of the runs underneath failed.
+fn head_subject(h: &PipeHead, theme: &Theme) -> Subject {
+    Subject {
+        name: h.subject.clone(),
+        tail: (h.failed > 0).then(|| (format!("{} failed", h.failed), Style::default().fg(theme.red))),
+    }
+}
+
+/// How a run names itself in a list row.
+///
+/// Grouped by pipeline the run is the thing that varies, so it is named by its own name or
+/// number, with its branch as the tail (in the branch colour) — once, not again when the run is
+/// named after it (a tag build). Ungrouped or grouped otherwise, it is named by what varies
+/// there (the pipeline), and the tail is the run's number.
+fn run_subject(app: &App, p: &PipeRow, theme: &Theme) -> Subject {
     let dim = Style::default().fg(theme.dim);
     // The run/release name ("20261005.3"), or the run number when it has no name of its own.
     let num = p.run.number.map(|n| format!("#{n}")).unwrap_or_default();
@@ -1956,18 +2019,36 @@ fn run_naming(app: &App, p: &PipeRow, theme: &Theme) -> (String, (String, Style)
         (Some(def), Some(name)) if name != def => name.to_string(),
         _ => num,
     };
+    let tail = |text: String, style: Style| (!text.is_empty()).then_some((text, style));
     match app.pipe_group {
-        PipeGroup::Off => (pipe_definition_name(p), (label, dim)),
+        PipeGroup::Off => Subject { name: pipe_definition_name(p), tail: tail(label, dim) },
         PipeGroup::Pipeline => {
             let branch = app.pipe_child_subject(p);
             if label.is_empty() || label == branch {
-                (format!("─ {branch}"), (String::new(), dim))
+                Subject { name: format!("─ {branch}"), tail: None }
             } else {
-                (format!("─ {label}"), (branch, Style::default().fg(theme.cyan)))
+                Subject { name: format!("─ {label}"), tail: tail(branch, Style::default().fg(theme.cyan)) }
             }
         }
-        _ => (format!("─ {}", app.pipe_child_subject(p)), (label, dim)),
+        _ => Subject { name: format!("─ {}", app.pipe_child_subject(p)), tail: tail(label, dim) },
     }
+}
+
+/// Paints a [`columnize`]d row's Subject tail in its own colour — a cell is one style. Only the
+/// unselected rows: the selected one's cell must stay a single span for the marquee.
+fn paint_subject_tail(row: &mut Line<'static>, col: usize, fitted: &(String, usize), style: Style) {
+    let at = 1 + 2 * col; // the lead span, then each cell after a gap span
+    let Some(span) = row.spans.get(at) else { return };
+    let chars: Vec<char> = span.content.chars().collect();
+    let end = fitted.0.chars().count().min(chars.len());
+    let start = fitted.0.chars().count().saturating_sub(fitted.1).min(end);
+    if start == end {
+        return;
+    }
+    let base = span.style;
+    let part = |r: std::ops::Range<usize>, style: Style| Span::styled(chars[r].iter().collect::<String>(), style);
+    let spans = vec![part(0..start, base), part(start..end, style), part(end..chars.len(), base)];
+    row.spans.splice(at..=at, spans);
 }
 
 fn head_cell(col: PipeCol, h: &PipeHead, theme: &Theme, anim: usize, owner: Option<&String>) -> (String, Style) {
@@ -1984,16 +2065,6 @@ fn head_cell(col: PipeCol, h: &PipeHead, theme: &Theme, anim: usize, owner: Opti
         // row content made the Pipelines table read as a different application. Bold is what
         // keeps a roll-up apart from the runs underneath it; the colour was never doing that.
         PipeCol::Subject => (h.subject.clone(), Style::default().fg(theme.fg).add_modifier(Modifier::BOLD)),
-        PipeCol::Runs => {
-            let text = format!(
-                "{} {}{}",
-                h.runs,
-                if h.runs == 1 { "run" } else { "runs" },
-                if h.failed > 0 { format!(" · {} failed", h.failed) } else { String::new() }
-            );
-            let style = if h.failed > 0 { Style::default().fg(theme.red) } else { dim };
-            (text, style)
-        }
         // Only ever present when ungrouped, where there are no headers — kept total so the
         // cell count can never disagree with the heading count.
         PipeCol::Branch => (String::new(), dim),
@@ -2011,7 +2082,6 @@ fn run_cell(
     col: PipeCol,
     p: &PipeRow,
     subject: &str,
-    runs: &(String, Style),
     last: bool,
     child: bool,
     theme: &Theme,
@@ -2027,7 +2097,6 @@ fn run_cell(
         PipeCol::Status => (pipe_status_cell(p.shown_status(), anim), Style::default().fg(theme.pipeline_color(p.shown_status()))),
         PipeCol::Provider => (provider_tag(p.provider, &p.connection), Style::default().fg(theme.cyan)),
         PipeCol::Subject => (subject.to_string(), Style::default().fg(theme.fg)),
-        PipeCol::Runs => runs.clone(),
         PipeCol::Branch => (p.run.branch.clone().unwrap_or_default(), dim),
         PipeCol::Commit => (p.run.commit_sha.as_deref().unwrap_or_default().chars().take(7).collect(), dim),
         PipeCol::Started => (rel_age(p.run.started_at), dim),
@@ -6433,8 +6502,8 @@ mod tests {
 
         let out = render_to_string(&mut app, 150, 24);
         assert!(out.contains("by pipeline"), "the title says how the list is arranged");
-        assert!(out.contains("2 runs"), "the CI header counts what is underneath it");
-        assert!(out.contains("1 failed"), "a failure inside a collapsed group is still announced");
+        assert!(out.contains("CI · 1 failed"), "a failure inside a collapsed group is still announced, beside its name");
+        assert!(!out.contains("Runs"), "and there is no column counting runs");
         // The owner prefix is shared by every row, so it is elided: `nz/app` reads as `app`.
         // Asserting on "app" alone would pass either way — it is a substring of "nz/app".
         assert!(out.contains("Repository"), "the repository has a column of its own");
@@ -6557,10 +6626,10 @@ mod tests {
         };
         app.pipe_expanded.insert(key);
         let out = render_to_string(&mut app, 150, 16);
-        assert!(out.contains("Pipeline / Run") && out.contains("Runs / Branch"), "the headings name both kinds of value");
+        assert!(out.contains("Pipeline / Run"), "the heading names both kinds of value");
         assert!(out.contains("─ #1") && out.contains("─ #2"), "each run names itself");
         let row = |n: &str| out.lines().find(|l| l.contains(n)).unwrap_or_default().to_string();
-        assert!(row("─ #1").contains("main") && row("─ #2").contains("v2.0"), "beside its own branch, once");
+        assert!(row("─ #1").contains("─ #1 · main") && row("─ #2").contains("─ #2 · v2.0"), "beside its own branch, once");
         assert_eq!(out.matches("main").count(), 1, "the branch isn't repeated");
         assert!(out.contains('├') && out.contains('└'), "and hangs off the tree gutter");
     }
@@ -6700,7 +6769,46 @@ mod tests {
         let out = render_to_string(&mut app, 150, 16);
         assert!(out.contains("Branch"), "the column is there");
         assert!(out.contains("release/2.0"), "and the run's branch is in it");
-        assert!(out.contains("Run ") || out.contains("Run\n"), "one run's number, so the heading is singular");
+        assert!(out.contains("CI · #"), "the run's number rides on the pipeline name");
+    }
+
+    /// A release named with a sentence must not shove every column after it to the far edge:
+    /// the Subject column stops at its cap, the name gives way, and the branch stays in sight.
+    #[test]
+    fn a_long_run_name_is_capped_and_keeps_its_branch() {
+        use PipelineRunStatus::Succeeded as S;
+        let long = "Initializing the Next Empower API, Webjobs & Database Migration Deployment";
+        let mut app = pipe_list(&[("CI", "nz/app", "develop", "aaa", 10, S), ("CI", "nz/app", "main", "bbb", 20, S)]);
+        app.pipes[0].run.name = Some(long.into());
+        let key = match &app.pipe_lines()[0] {
+            crate::app::PipeLine::Head(h) => h.key.clone(),
+            crate::app::PipeLine::Run(_) => panic!("header"),
+        };
+        app.pipe_expanded.insert(key);
+        // Select the other run: the selected row scrolls its full name.
+        app.pipe_state.select(Some(2));
+        let out = render_to_string(&mut app, 200, 16);
+        let row = out.lines().find(|l| l.contains("─ Initializing")).expect("the long run is listed").to_string();
+        assert!(!row.contains(long), "the name is cut: {row}");
+        assert!(row.contains("… · develop"), "with an ellipsis, and the branch kept: {row}");
+        let start = row.find("─ Initializing").unwrap();
+        let cell: String = row[start..].chars().take(PIPE_SUBJECT_MAX).collect();
+        assert!(cell.ends_with("develop"), "inside the cap: {cell:?}");
+    }
+
+    #[test]
+    fn subject_fitting_gives_way_with_the_name_first() {
+        let red = Style::default();
+        let short = Subject { name: "CI".into(), tail: Some(("2 failed".into(), red)) };
+        assert_eq!(short.fitted(), ("CI · 2 failed".to_string(), " · 2 failed".chars().count()));
+        let long = Subject { name: "x".repeat(80), tail: Some(("main".into(), red)) };
+        let (text, n) = long.fitted();
+        assert_eq!(text.chars().count(), PIPE_SUBJECT_MAX);
+        assert!(text.ends_with("… · main") && n == 7, "{text}");
+        let wide_tail = Subject { name: "x".repeat(80), tail: Some(("b".repeat(80), red)) };
+        let (text, n) = wide_tail.fitted();
+        assert_eq!((text.chars().count(), n), (PIPE_SUBJECT_MAX, PIPE_SUBJECT_MAX / 2), "a long branch takes only half");
+        assert_eq!(Subject { name: "y".repeat(80), tail: None }.fitted().0.chars().count(), PIPE_SUBJECT_MAX);
     }
 
     /// The repository reads first, immediately left of the pipeline/branch column — it was

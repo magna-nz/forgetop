@@ -9853,7 +9853,7 @@ fn pipe_matches(p: &PipeRow, q: &str) -> bool {
 pub const LIST_COLUMNS: [&[&str]; 3] = [
     &["Provider", "Repository", "#", "Author", "State", "±", "Updated"],
     &["Provider", "ID", "Type", "Assignee", "Updated"],
-    &["Provider", "Repository", "Runs", "Branch", "Commit", "Now", "Stages", "Took", "Started"],
+    &["Provider", "Repository", "Branch", "Commit", "Now", "Stages", "Took", "Started"],
 ];
 
 /// Provider starts off everywhere: the repository already says where a row lives, and the
