@@ -2507,9 +2507,10 @@ impl PipelineView {
     /// [`step_folds`]); those start folded and open on ↵.
     ///
     /// What starts open is what needs attention: finished stages fold to one line each, the stage
-    /// that is running, failed or waiting on a gate stays open, and in a failed run the jobs that
-    /// passed fold so the broken one is what you see. Two or more stages in a row that never ran
-    /// fold into one `N stages skipped` row. Whatever the user folds or opens stays that way.
+    /// that is running, failed or waiting on a gate stays open, and jobs follow the same rule: the
+    /// ones that finished cleanly fold, so the broken or running one is what you see. Two or more
+    /// stages in a row that never ran fold into one `N stages skipped` row. Whatever the user folds
+    /// or opens stays that way.
     pub fn flatten(&self) -> Vec<FlatNode> {
         let mut out = Vec::new();
         let stages = &self.run.stages;
@@ -2634,8 +2635,12 @@ impl PipelineView {
         let single_job = single_stage && stage.jobs.len() == 1 && !stage.jobs[0].steps.is_empty();
         for (ji, job) in stage.jobs.iter().enumerate() {
             let jkey = format!("s{si}.j{ji}");
-            // In a failed run, the jobs that passed fold so the one that broke is what you see.
-            let jdefault = !(failed && job.status == PipelineRunStatus::Succeeded);
+            // Like stages, a job that finished cleanly folds to its one line; the one running,
+            // failed or waiting is what you see.
+            let jdefault = !matches!(
+                job.status,
+                PipelineRunStatus::Succeeded | PipelineRunStatus::PartiallySucceeded | PipelineRunStatus::Skipped
+            );
             let jexpanded = single_job || self.is_open(&jkey, jdefault);
             if !single_job {
                 out.push(FlatNode {
@@ -15583,7 +15588,9 @@ mod tests {
         let job2 = pipeline_job("j2", PipelineRunStatus::Running);
         let run = pipeline_run("1", PipelineRunStatus::Running, vec![pipeline_stage("build", PipelineRunStatus::Running, vec![job1, job2])]);
         let mut app = App::new("slate");
-        app.screen = Screen::Pipeline(Box::new(PipelineView::new("CI".into(), run, "c".into(), ProviderType::GitHub, "ci".into(), None)));
+        let mut view = PipelineView::new("CI".into(), run, "c".into(), ProviderType::GitHub, "ci".into(), None);
+        view.folds.insert("s0.j0".into(), true); // a passed job starts folded; open it to reach its step
+        app.screen = Screen::Pipeline(Box::new(view));
         // One stage: no stage row, so the cursor starts on job j1.
         app.on_pipeline_screen_key(Key::Char('L'));
         assert_eq!(open_log(&app).job_id, "j1");
