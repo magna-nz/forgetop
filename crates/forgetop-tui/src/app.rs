@@ -3049,6 +3049,17 @@ impl App {
         }
     }
 
+    /// How many distinct pipelines the fetched runs belong to — the tab's badge. The section
+    /// counts pipelines (as its header does), not runs: one busy pipeline fetches many runs.
+    /// Keyed as [`PipeGroup::Pipeline`] keys a group, whatever grouping is active.
+    pub fn pipeline_count(&self) -> usize {
+        self.pipes
+            .iter()
+            .map(|p| (&p.connection_id, &p.run.repository, &p.run.definition_id))
+            .collect::<HashSet<_>>()
+            .len()
+    }
+
     /// What names a group, for the active mode — the value in the subject column.
     ///
     /// A run beneath the header fills that same column with whatever *varies* inside the group
@@ -14623,6 +14634,20 @@ mod tests {
             heads(&app),
             vec![("CI".to_string(), 2, 0), ("Integration".to_string(), 1, 1), ("Release".to_string(), 1, 0)]
         );
+    }
+
+    /// The tab badge counts pipelines, not runs, and doesn't move with the grouping mode.
+    #[test]
+    fn pipeline_count_counts_pipelines_not_runs() {
+        let mut app = App::new("slate");
+        app.pipes = fanned_out();
+        assert_eq!(app.pipes.len(), 4);
+        assert_eq!(app.pipeline_count(), 3, "CI ran twice but is one pipeline");
+        app.pipe_group = PipeGroup::Off;
+        assert_eq!(app.pipeline_count(), 3);
+        // Same definition in another repository is another pipeline.
+        app.pipes.push(grouped_row("CI", "nz/other", "main", "ccc", "2026-09-24T08:00:00Z", PipelineRunStatus::Succeeded));
+        assert_eq!(app.pipeline_count(), 4);
     }
 
     /// Nothing is expanded until asked: the roll-up is the view, so four runs render as

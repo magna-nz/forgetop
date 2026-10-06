@@ -1,5 +1,6 @@
 import { motion } from "framer-motion";
 import { useHealth, useLaunchpad, usePipelines, usePullRequests, useWorkItems } from "../api";
+import { pipelineCount } from "../format";
 import { useTheme } from "../theme";
 import type { SectionId } from "../types";
 
@@ -33,7 +34,7 @@ export function Sidebar({
     launchpad: lp.data?.rows.filter((r) => !r.muted).length,
     prs: prs.data?.length,
     "work-items": wis.data?.length,
-    pipelines: pipes.data?.length,
+    pipelines: pipes.data && pipelineCount(pipes.data),
     settings: undefined,
   };
 

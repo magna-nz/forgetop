@@ -271,7 +271,7 @@ fn tab_titles(app: &App) -> Vec<String> {
         let count = match i {
             0 => app.prs.len(),
             1 => app.wis.len(),
-            _ => app.pipes.len(),
+            _ => app.pipeline_count(),
         };
         format!(" {} ({count}) ", TABS[i])
     }));
