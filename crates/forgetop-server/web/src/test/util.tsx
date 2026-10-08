@@ -11,11 +11,12 @@ export function renderWithClient(ui: ReactElement) {
 
 /**
  * Stubs global `fetch`, routing GETs to JSON fixtures (by URL substring) and recording POSTs.
- * `onPost` may return the JSON body to answer with. Returns the recorded POSTs for assertions.
+ * `onPost` may return the JSON body to answer with — or a promise of it, to hold the answer back
+ * and look at the screen while the request is still out. Returns the recorded POSTs for assertions.
  */
 export function mockFetch(routes: {
   get?: Record<string, unknown>;
-  onPost?: (url: string, body: unknown) => unknown;
+  onPost?: (url: string, body: unknown) => unknown | Promise<unknown>;
 }) {
   const posts: { url: string; body: unknown }[] = [];
   const fn = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -24,7 +25,7 @@ export function mockFetch(routes: {
     if (method === "POST") {
       const body = init?.body ? JSON.parse(String(init.body)) : undefined;
       posts.push({ url, body });
-      const answer = routes.onPost?.(url, body);
+      const answer = await routes.onPost?.(url, body);
       return new Response(JSON.stringify(answer ?? { ok: true }), {
         status: 200,
         headers: { "content-type": "application/json" },

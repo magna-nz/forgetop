@@ -9,6 +9,19 @@ Adding a release: one `## <version> — <date>` section, a line per user-visible
 and the pull request each one came from. `git log v<previous>..HEAD --merges` lists the
 candidates.
 
+## 1.6.2 — 2026-10-08
+
+Changed
+
+- **Approving, commenting and editing no longer wait on the provider.** In the terminal UI,
+  your vote, comment, reply or submitted review shows on the pull request straight away, and a
+  work item's new state, assignee, title, description or comment does too — the write goes out
+  in the background instead of freezing the screen until the provider and a full refresh have
+  answered. A refusal takes the change back and says why; a merge or revert still waits for the
+  provider's answer, but no longer holds the screen while it does. The dashboard's pull-request
+  and work-item panes show the same writes on the click.
+  ([#222](https://github.com/magna-nz/forgetop/pull/222))
+
 ## 1.6.1 — 2026-10-06
 
 Changed

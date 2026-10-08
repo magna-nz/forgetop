@@ -418,6 +418,10 @@ pub struct PrDetail {
     pub changes: Vec<FileChange>,
     pub checks: Vec<CheckRun>,
     pub commits: Vec<Commit>,
+    /// The signed-in user's handle on this connection, when it can be established — what the
+    /// pane shows your vote and comments as before the provider lists them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub me: Option<String>,
 }
 
 /// Resolves the PR source for a connection id (the one the action/detail is scoped to).
@@ -486,6 +490,12 @@ pub async fn pr_detail(sections: &SectionService, conn: &str, item: &ItemRef) ->
             .await
             .inspect_err(|_| log_fetch_failure("dashboard.pr_detail.commits"))
             .unwrap_or_default(),
+        me: source
+            .current_user()
+            .await
+            .inspect_err(|_| log_fetch_failure("dashboard.pr_detail.current_user"))
+            .ok()
+            .flatten(),
     })
 }
 
