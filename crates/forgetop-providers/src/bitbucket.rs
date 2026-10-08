@@ -27,6 +27,30 @@ fn enc_uuid(s: &str) -> String {
     s.replace('{', "%7B").replace('}', "%7D")
 }
 
+/// Percent-encodes a Bitbucket query-language expression for the `q` parameter (quotes, spaces,
+/// braces and `=` all need it).
+fn enc_query(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') { c.to_string() } else { format!("%{:02X}", c as u32) })
+        .collect()
+}
+
+/// The `q` parameter that makes Bitbucket return `filter`'s pull requests for `me` (an account
+/// uuid, braces included), or `None` for `All`.
+///
+/// A repository's `/pullrequests` page is its newest `pagelen`; filtering that page in memory
+/// makes "Mine" a filter over a *window*, and on a busy repository your own pull request leaves
+/// it as soon as that many newer ones exist. Asking Bitbucket for the author or reviewer instead
+/// returns them however old they are.
+pub fn pr_filter_params(filter: PullRequestFilter, me: &str) -> Option<String> {
+    let field = match filter {
+        PullRequestFilter::All => return None,
+        PullRequestFilter::Mine => "author.uuid",
+        PullRequestFilter::ReviewRequested => "reviewers.uuid",
+    };
+    Some(format!("&q={}", enc_query(&format!("{field}=\"{me}\""))))
+}
+
 // ---- mappers ----
 
 pub fn map_user(v: &Value) -> User {
@@ -377,7 +401,8 @@ pub struct BitbucketClient {
     workspace: String,
     /// The repositories this connection fetches from, **connection-relative** (`workspace/slug`).
     scope: Vec<String>,
-    self_name: tokio::sync::Mutex<Option<String>>,
+    /// The signed-in account's (display name or nickname, uuid), fetched once from `/user`.
+    self_user: tokio::sync::Mutex<Option<(Option<String>, Option<String>)>>,
 }
 
 impl BitbucketClient {
@@ -471,13 +496,17 @@ impl BitbucketClient {
         Ok((name, body))
     }
 
-    async fn self_name(&self) -> Result<Option<String>> {
-        let mut guard = self.self_name.lock().await;
+    async fn self_user(&self) -> Result<(Option<String>, Option<String>)> {
+        let mut guard = self.self_user.lock().await;
         if guard.is_none() {
             let v = self.get_json(&format!("{}/user", self.base)).await?;
-            *guard = get_str(&v, "display_name").or_else(|| get_str(&v, "nickname"));
+            *guard = Some((get_str(&v, "display_name").or_else(|| get_str(&v, "nickname")), get_str(&v, "uuid")));
         }
-        Ok(guard.clone())
+        Ok(guard.clone().unwrap_or_default())
+    }
+
+    async fn self_name(&self) -> Result<Option<String>> {
+        Ok(self.self_user().await?.0)
     }
 }
 
@@ -498,18 +527,27 @@ impl PullRequestSource for BitbucketPr {
         }
         let state = if query.include_completed { "MERGED" } else { "OPEN" };
         let pagelen = query.limit.unwrap_or(50);
+        let (me, uuid) = if query.filter == PullRequestFilter::All { (None, None) } else { self.0.self_user().await? };
+        // Bitbucket filters when it knows your uuid; an identity it could not establish falls
+        // back to the page, where `apply_pull_request_filter` passes every row through.
+        let params = uuid.as_deref().and_then(|uuid| pr_filter_params(query.filter, uuid));
+        let params_ref = params.as_deref().unwrap_or("");
         let rows = fan_out(scope, "bitbucket.pull_requests.list", |repo| async move {
-            let url = self.0.repo_path(&repo, &format!("/pullrequests?state={state}&pagelen={pagelen}"));
+            let url = self.0.repo_path(&repo, &format!("/pullrequests?state={state}&pagelen={pagelen}{params_ref}"));
             let v = self.0.get_json(&url).await?;
             Ok(get_arr(&v, "values").iter().map(|pr| map_pull_request(pr, Some(&repo))).collect())
         })
         .await;
-        let me = if query.filter == PullRequestFilter::All { None } else { self.0.self_name().await? };
-        let filtered = apply_pull_request_filter(rows, query.filter, me.as_deref());
+        let filtered = if params.is_some() { rows } else { apply_pull_request_filter(rows, query.filter, me.as_deref()) };
         Ok(sort_and_cap(filtered, scope.len(), query.limit, |pr| pr.updated_at))
     }
     async fn current_user(&self) -> Result<Option<String>> {
         self.0.self_name().await
+    }
+    fn list_targets_filter(&self) -> bool {
+        // `Mine` and `ReviewRequested` are `q=author.uuid=…` / `reviewers.uuid=…` queries per
+        // repository, not a page filtered afterwards — see `pr_filter_params`.
+        true
     }
     async fn get(&self, item: &ItemRef) -> Result<PullRequest> {
         let repo = self.0.resolve(item)?;
@@ -812,7 +850,7 @@ impl ProviderFactory for BitbucketFactory {
             base: connection.base_url.clone().unwrap_or_else(|| "https://api.bitbucket.org/2.0".into()),
             workspace,
             scope,
-            self_name: tokio::sync::Mutex::new(None),
+            self_user: tokio::sync::Mutex::new(None),
         });
         Ok(Arc::new(BitbucketConnection {
             id: connection.id.clone(),
@@ -825,6 +863,19 @@ impl ProviderFactory for BitbucketFactory {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn filtered_pull_requests_are_asked_for_by_author_or_reviewer_uuid() {
+        use super::*;
+        let me = "{1b2c3d4e-0000-4000-8000-000000000001}";
+        assert_eq!(pr_filter_params(PullRequestFilter::All, me), None);
+        // `author.uuid="{…}"`, with the quotes, braces and `=` percent-encoded for the URL.
+        assert_eq!(
+            pr_filter_params(PullRequestFilter::Mine, me).unwrap(),
+            "&q=author.uuid%3D%22%7B1b2c3d4e-0000-4000-8000-000000000001%7D%22"
+        );
+        assert!(pr_filter_params(PullRequestFilter::ReviewRequested, me).unwrap().starts_with("&q=reviewers.uuid%3D%22%7B"));
+    }
+
     use super::*;
 
     /// Bitbucket is the one provider with **no** credentials anywhere — not in `.env`, not in CI —

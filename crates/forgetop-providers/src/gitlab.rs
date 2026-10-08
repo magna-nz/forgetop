@@ -632,6 +632,22 @@ impl NotificationSource for GitLabNotif {
     }
 }
 
+/// The query-string parameters that make GitLab return `filter`'s merge requests for `me`
+/// (a username), or `None` for `All`.
+///
+/// A project's `/merge_requests` page is its newest 50; filtering that page in memory makes
+/// "Mine" a filter over a *window*, and on a busy project your own merge request leaves it as
+/// soon as 50 newer ones exist. Asking GitLab for the author or reviewer instead returns them
+/// however old they are, newest-updated first so the cap keeps the live ones.
+pub fn mr_filter_params(filter: PullRequestFilter, me: &str) -> Option<String> {
+    let who = match filter {
+        PullRequestFilter::All => return None,
+        PullRequestFilter::Mine => "author_username",
+        PullRequestFilter::ReviewRequested => "reviewer_username",
+    };
+    Some(format!("&scope=all&{who}={me}&order_by=updated_at&sort=desc"))
+}
+
 #[async_trait]
 impl PullRequestSource for GitLabPr {
     async fn list(&self, query: &PullRequestQuery) -> Result<Vec<PullRequest>> {
@@ -642,18 +658,27 @@ impl PullRequestSource for GitLabPr {
         }
         let state = if query.include_completed { "all" } else { "opened" };
         let per_page = query.limit.unwrap_or(50);
+        let me = if query.filter == PullRequestFilter::All { None } else { self.0.self_username().await? };
+        // GitLab filters when it knows who you are; an identity it could not establish falls
+        // back to the page, where `apply_pull_request_filter` passes every row through.
+        let params = me.as_deref().and_then(|me| mr_filter_params(query.filter, me));
+        let params_ref = params.as_deref().unwrap_or("");
         let rows = fan_out(scope, "gitlab.pull_requests.list", |project| async move {
-            let url = self.0.project_path(&project, &format!("/merge_requests?state={state}&per_page={per_page}"));
+            let url = self.0.project_path(&project, &format!("/merge_requests?state={state}&per_page={per_page}{params_ref}"));
             let v = self.0.get_json(&url).await?;
             Ok(v.as_array().unwrap_or(&vec![]).iter().map(|mr| map_merge_request(mr, Some(&project))).collect())
         })
         .await;
-        let me = if query.filter == PullRequestFilter::All { None } else { self.0.self_username().await? };
-        let filtered = apply_pull_request_filter(rows, query.filter, me.as_deref());
+        let filtered = if params.is_some() { rows } else { apply_pull_request_filter(rows, query.filter, me.as_deref()) };
         Ok(sort_and_cap(filtered, scope.len(), query.limit, |pr| pr.updated_at))
     }
     async fn current_user(&self) -> Result<Option<String>> {
         self.0.self_username().await
+    }
+    fn list_targets_filter(&self) -> bool {
+        // `Mine` and `ReviewRequested` are `author_username` / `reviewer_username` queries per
+        // project, not a page filtered afterwards — see `mr_filter_params`.
+        true
     }
     async fn get(&self, item: &ItemRef) -> Result<PullRequest> {
         let project = self.0.resolve(item)?;
@@ -1175,6 +1200,14 @@ impl ProviderFactory for GitLabFactory {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn filtered_merge_requests_are_asked_for_by_author_or_reviewer() {
+        use super::*;
+        assert_eq!(mr_filter_params(PullRequestFilter::All, "dan"), None);
+        assert_eq!(mr_filter_params(PullRequestFilter::Mine, "dan").as_deref(), Some("&scope=all&author_username=dan&order_by=updated_at&sort=desc"));
+        assert_eq!(mr_filter_params(PullRequestFilter::ReviewRequested, "dan").as_deref(), Some("&scope=all&reviewer_username=dan&order_by=updated_at&sort=desc"));
+    }
+
     use super::*;
 
     #[test]

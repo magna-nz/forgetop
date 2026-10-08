@@ -13,14 +13,15 @@ candidates.
 
 Fixed
 
-- **Your pull requests no longer vanish from "Mine" on a busy repository.** GitHub's list
+- **Your pull requests no longer vanish from "Mine" on a busy repository.** Every forge's list
   endpoint returns a repository's newest 50 pull requests, and "Mine" and "Review" were picked
   out of that page — so on a repository that opens 50 pull requests in a few days, yours dropped
   off the list (and out of the Command Center) although nothing about them had changed, and came
-  back only when the repository went quiet. Both views are now found with GitHub's search
-  (`author:@me`, `review-requested:@me`) across every repository in scope, however old the pull
-  request is, in the terminal UI and the dashboard alike. A reload that finds them unchanged
-  costs the search and nothing per row.
+  back only when the repository went quiet. Both views are now asked of the forge itself,
+  however old the pull request is: GitHub searches `author:@me` / `review-requested:@me` across
+  every repository in scope, and GitLab, Azure DevOps and Bitbucket pass the author or reviewer
+  to each repository's list. The terminal UI and the dashboard alike; a GitHub reload that finds
+  them unchanged costs the search and nothing per row.
   ([#224](https://github.com/magna-nz/forgetop/pull/224))
 
 ## 1.6.3 — 2026-10-08

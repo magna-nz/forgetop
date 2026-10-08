@@ -602,12 +602,13 @@ pub struct PrRow {
 /// three PR views (All / Mine / Review requested) and both Launchpad PR buckets are derived
 /// locally.
 ///
-/// Most providers build their list URL from `include_completed` and `limit` alone — the filter is
-/// applied in memory afterwards — so a `list` per filter re-fetched identical rows. This used to
-/// mean four calls per connection per reload (the list section, the two Launchpad buckets, and
+/// Providers used to build their list URL from `include_completed` and `limit` alone — the filter
+/// was applied in memory afterwards — so a `list` per filter re-fetched identical rows. This
+/// meant four calls per connection per reload (the list section, the two Launchpad buckets, and
 /// the notification scan), and a fifth, blocking, every time `[`/`]` moved between views. A
-/// provider that targets its filters instead (GitHub searches for them) contributes the rows its
-/// filtered `list` finds beyond the page, merged in by [`fetch_pr_pool`].
+/// provider that targets its filters instead (all four repository forges now do; the demo does
+/// not) contributes the rows its filtered `list` finds beyond the page, merged in by
+/// [`fetch_pr_pool`].
 #[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PrPool {
     /// Rows fetched with `include_completed: false`.

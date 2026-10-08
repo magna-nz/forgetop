@@ -820,6 +820,22 @@ impl AzureWi {
     }
 }
 
+/// The `searchCriteria` that make Azure return `filter`'s pull requests for `me` (an identity
+/// id), or `None` for `All`.
+///
+/// A repository's `pullrequests` page is its newest `$top`; filtering that page in memory makes
+/// "Mine" a filter over a *window*, and on a busy repository your own pull request leaves it as
+/// soon as that many newer ones exist. Asking Azure for the creator or reviewer instead returns
+/// them however old they are.
+pub fn pr_filter_params(filter: PullRequestFilter, me: &str) -> Option<String> {
+    let who = match filter {
+        PullRequestFilter::All => return None,
+        PullRequestFilter::Mine => "creatorId",
+        PullRequestFilter::ReviewRequested => "reviewerId",
+    };
+    Some(format!("&searchCriteria.{who}={me}"))
+}
+
 #[async_trait]
 impl PullRequestSource for AzurePr {
     async fn list(&self, query: &PullRequestQuery) -> Result<Vec<PullRequest>> {
@@ -829,23 +845,32 @@ impl PullRequestSource for AzurePr {
         }
         let status = if query.include_completed { "all" } else { "active" };
         let top = query.limit.unwrap_or(50);
+        let me = if query.filter == PullRequestFilter::All { None } else { self.0.self_id().await? };
+        // Azure filters when it knows who you are; an identity it could not establish falls back
+        // to the page, where `apply_pull_request_filter` passes every row through.
+        let params = me.as_deref().and_then(|me| pr_filter_params(query.filter, me));
+        let params_ref = params.as_deref().unwrap_or("");
         let rows = fan_out(scope, "azure.pull_requests.list", |repo| async move {
             let (project, repository) = split_project_repo(&repo);
             let url = format!(
-                "{}/{project}/_apis/git/repositories/{repository}/pullrequests?searchCriteria.status={status}&$top={top}&{API}",
+                "{}/{project}/_apis/git/repositories/{repository}/pullrequests?searchCriteria.status={status}{params_ref}&$top={top}&{API}",
                 self.0.base
             );
             let v = self.0.get_json(&url).await?;
             Ok(get_arr(&v, "value").iter().map(|pr| map_pull_request(pr, Some(&repo))).collect())
         })
         .await;
-        let me = if query.filter == PullRequestFilter::All { None } else { self.0.self_id().await? };
-        let filtered = apply_pull_request_filter(rows, query.filter, me.as_deref());
+        let filtered = if params.is_some() { rows } else { apply_pull_request_filter(rows, query.filter, me.as_deref()) };
         // Azure's PR payload carries no `updated_at`, so creation date is the best recency key.
         Ok(sort_and_cap(filtered, scope.len(), query.limit, |pr| pr.created_at))
     }
     async fn current_user(&self) -> Result<Option<String>> {
         self.0.self_id().await
+    }
+    fn list_targets_filter(&self) -> bool {
+        // `Mine` and `ReviewRequested` are `searchCriteria.creatorId` / `reviewerId` queries per
+        // repository, not a page filtered afterwards — see `pr_filter_params`.
+        true
     }
     async fn get(&self, item: &ItemRef) -> Result<PullRequest> {
         let repo = self.0.resolve(item)?;
@@ -1441,6 +1466,15 @@ impl ProviderFactory for AzureDevOpsFactory {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn filtered_pull_requests_are_asked_for_by_creator_or_reviewer() {
+        use super::*;
+        let me = "5c3a6b3e-0000-4000-8000-000000000001";
+        assert_eq!(pr_filter_params(PullRequestFilter::All, me), None);
+        assert_eq!(pr_filter_params(PullRequestFilter::Mine, me).unwrap(), format!("&searchCriteria.creatorId={me}"));
+        assert_eq!(pr_filter_params(PullRequestFilter::ReviewRequested, me).unwrap(), format!("&searchCriteria.reviewerId={me}"));
+    }
+
     use super::*;
 
     #[test]
