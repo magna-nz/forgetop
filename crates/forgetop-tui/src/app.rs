@@ -977,6 +977,10 @@ pub struct App {
     /// Per section, whether the list's automatic preview is off. `P` switches it; until the user
     /// has, [`DEFAULT_PREVIEW_HIDDEN`] decides.
     pub preview_hidden: [bool; 3],
+    /// Files marked "viewed" (`v`), per PR detail cache key, each pinned to the fingerprint of
+    /// its diff when marked — so closing a PR and coming back finds the marks where they were,
+    /// and a file whose diff has changed since has to be looked at again. Kept for the session.
+    pub pr_viewed: HashMap<String, HashMap<String, u64>>,
     /// True while the preview is focused: its view is `screen`, drawn beside the list.
     pub preview_focus: bool,
     /// Width of the content area in the last frame, which decides whether the split fits.
@@ -2807,7 +2811,8 @@ pub struct DiffView {
     /// When set, the diff shows a single commit's changes (label shown in the
     /// file-list title); `None` means the whole-PR diff.
     pub commit_label: Option<String>,
-    /// Paths the reviewer has marked "viewed" this session (per open PR, not persisted).
+    /// Paths the reviewer has marked "viewed". The view's copy; [`App::pr_viewed`] keeps them
+    /// across closing and reopening the PR.
     pub viewed: HashSet<String>,
 }
 
@@ -2997,6 +3002,7 @@ impl App {
             should_quit: false,
             preview: None,
             preview_hidden: DEFAULT_PREVIEW_HIDDEN,
+            pr_viewed: HashMap::new(),
             preview_focus: false,
             content_w: 0,
             log_inflight: None,
@@ -3992,7 +3998,7 @@ impl App {
         match self.active {
             0 => {
                 let row = self.selected_pr_row()?;
-                Some(Self::build_pr_view(deps, 0, pr_label(&row.pr), row.pr.url.clone(), row.connection_id.clone(), row.pr.clone()))
+                Some(Self::build_pr_view(deps, &self.pr_viewed, 0, pr_label(&row.pr), row.pr.url.clone(), row.connection_id.clone(), row.pr.clone()))
             }
             1 => {
                 let row = self.selected_wi_row()?;
@@ -5364,6 +5370,12 @@ impl App {
             v.commit_sel = v.commits.len().saturating_sub(1);
         }
         v.pr_files = files.clone();
+        // A mark stands only while the file's diff is the one that was marked: fresh files can
+        // clear some, and they restore the marks a view built before any files were known lacks.
+        if let Some(marks) = self.pr_viewed.get_mut(&key) {
+            marks.retain(|path, mark| v.pr_files.iter().find(|f| &f.path == path).is_none_or(|f| file_fingerprint(f) == *mark));
+            v.diff.viewed = still_viewed(Some(marks), &v.pr_files);
+        }
         // A per-commit drill-in (`commit_label` set) is showing that commit's own file list, not
         // the whole-PR one — overwriting `diff.files` here would silently swap the user's current
         // diff out from under them mid-read. It picks up these fresh whole-PR files the next time
@@ -6305,17 +6317,48 @@ impl App {
     /// for as long as the network took (see commit 8fc2117 for the same fix on the refresh path).
     #[allow(clippy::too_many_arguments)]
     fn open_pr_view_for(&mut self, deps: &AppDeps, tab: usize, label: String, url: Option<String>, conn_id: String, pr: PullRequest) {
-        let (view, fetch) = Self::build_pr_view(deps, tab, label, url, conn_id, pr);
+        let (view, fetch) = Self::build_pr_view(deps, &self.pr_viewed, tab, label, url, conn_id, pr);
         self.screen = view;
         // The view is on screen now; the fetch that keeps it fresh runs in the background and
         // patches it in place via `AppEvent::PrDetailLoaded` (see `apply_pr_detail`).
         self.send_detail_request(deps, fetch);
     }
 
+    /// Copies the open PR's "viewed" marks into [`App::pr_viewed`], each pinned to the diff it
+    /// was marked against — the whole-PR file where there is one, so a mark made while drilled
+    /// into a commit still holds once back on the full diff.
+    fn record_viewed(&mut self) {
+        let Screen::PrView(v) = &self.screen else { return };
+        let key = pr_detail_cache_key(&v.connection_id, &v.pr.item_ref());
+        let marks: HashMap<String, u64> = v
+            .diff
+            .viewed
+            .iter()
+            .filter_map(|path| {
+                let file = v.pr_files.iter().chain(&v.diff.files).find(|f| &f.path == path)?;
+                Some((path.clone(), file_fingerprint(file)))
+            })
+            .collect();
+        if marks.is_empty() {
+            self.pr_viewed.remove(&key);
+        } else {
+            self.pr_viewed.insert(key, marks);
+        }
+    }
+
     /// Builds the PR view from the row plus whatever the cache holds, without any I/O. The
     /// returned request is what keeps it fresh; [`open_pr_view_for`] sends it at once, the
     /// preview pane only once the cursor has settled.
-    fn build_pr_view(deps: &AppDeps, tab: usize, label: String, url: Option<String>, conn_id: String, pr: PullRequest) -> (Screen, DetailRequest) {
+    #[allow(clippy::too_many_arguments)]
+    fn build_pr_view(
+        deps: &AppDeps,
+        pr_viewed: &HashMap<String, HashMap<String, u64>>,
+        tab: usize,
+        label: String,
+        url: Option<String>,
+        conn_id: String,
+        pr: PullRequest,
+    ) -> (Screen, DetailRequest) {
         // Address the cache and every detail call at the PR's own repository, not just its id:
         // on a connection spanning several, `#7` alone names more than one pull request.
         let item = pr.item_ref();
@@ -6338,7 +6381,7 @@ impl App {
             focus: DiffFocus::FileList,
             cursor: 0,
             commit_label: None,
-            viewed: HashSet::new(),
+            viewed: still_viewed(pr_viewed.get(&key), &files),
         };
         let view = Screen::PrView(Box::new(PrView {
             label,
@@ -6845,7 +6888,10 @@ impl App {
             // Enter on a file drops into a line cursor within its patch.
             Key::Enter if v.tab == 3 => v.diff.enter_patch(),
             // Diff-tab review ergonomics: mark viewed, jump between threads.
-            Key::Char('v') if v.tab == 3 => v.diff.toggle_viewed(),
+            Key::Char('v') if v.tab == 3 => {
+                v.diff.toggle_viewed();
+                self.record_viewed();
+            }
             Key::Char(']') if v.tab == 3 => v.diff.jump_thread(1),
             Key::Char('[') if v.tab == 3 => v.diff.jump_thread(-1),
             Key::Up | Key::Char('k') => {
@@ -10975,6 +11021,20 @@ async fn fetch_pipeline_detail(deps: &AppDeps, conn_id: &str, run_ref: &ItemRef)
     }
 }
 
+/// What a "viewed" mark is pinned to: the file's diff as it stood when it was marked.
+fn file_fingerprint(f: &FileChange) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (f.additions, f.deletions, &f.patch).hash(&mut h);
+    h.finish()
+}
+
+/// The marked paths still true of `files`: listed, with the same diff they were marked against.
+fn still_viewed(marks: Option<&HashMap<String, u64>>, files: &[FileChange]) -> HashSet<String> {
+    let Some(marks) = marks else { return HashSet::new() };
+    files.iter().filter(|f| marks.get(&f.path) == Some(&file_fingerprint(f))).map(|f| f.path.clone()).collect()
+}
+
 /// Cheap "did anything actually change" check for a landed [`PrDetail`] against what the open
 /// view already holds, so a revalidation that finds nothing new causes no repaint (no scroll
 /// jump, no flicker). None of `CommentThread`, `FileChange`, `CheckRun` or `Commit` derive
@@ -10982,8 +11042,8 @@ async fn fetch_pipeline_detail(deps: &AppDeps, conn_id: &str, run_ref: &ItemRef)
 /// most likely to actually move:
 /// - threads: count, plus total comment count, plus resolved count (misses an edited comment
 ///   body, or a same-size swap of which threads are resolved)
-/// - files: count, plus (path, kind, additions, deletions) per file (misses a patch-text-only
-///   change with unchanged add/delete counts — not achievable from a real diff)
+/// - files: count, plus (path, kind, additions, deletions, patch) per file (a commit can rewrite
+///   a line without moving the counts, and the open diff — and its "viewed" marks — must see it)
 /// - checks: count, plus (name, status) per check (misses a check's URL alone changing)
 /// - commits: the sequence of shas (an amend or force-push always changes a sha, so this is
 ///   exact for reordering/rewriting; misses an in-place message edit on a provider that allows it)
@@ -11014,7 +11074,7 @@ fn threads_match(a: &[CommentThread], b: &[CommentThread]) -> bool {
 fn files_match(a: &[FileChange], b: &[FileChange]) -> bool {
     a.len() == b.len()
         && a.iter().zip(b).all(|(x, y)| {
-            x.path == y.path && x.kind == y.kind && x.additions == y.additions && x.deletions == y.deletions
+            x.path == y.path && x.kind == y.kind && x.additions == y.additions && x.deletions == y.deletions && x.patch == y.patch
         })
 }
 
@@ -14045,6 +14105,103 @@ mod tests {
     }
 
     /// A detail as it was last known: two files, a thread, a check and a commit.
+    fn files_detail(files: Vec<FileChange>) -> PrDetail {
+        PrDetail { timeline: Vec::new(), threads: vec![], files, checks: vec![], commits: vec![] }
+    }
+
+    fn pr_id(id: &str) -> PullRequest {
+        PullRequest { id: id.into(), number: id.parse().ok(), ..pr(None) }
+    }
+
+    /// Opens `pr` on its Diff tab, selects file `selected`, and presses `v`.
+    async fn open_and_mark(app: &mut App, deps: &AppDeps, pr: PullRequest, selected: usize) {
+        app.open_pr_view_for(deps, 3, "PR".into(), None, "c".into(), pr);
+        if let Screen::PrView(v) = &mut app.screen {
+            v.diff.selected = selected;
+        }
+        app.on_key(Key::Char('v'), deps).await;
+    }
+
+    fn viewed(app: &App) -> Vec<String> {
+        let Screen::PrView(v) = &app.screen else { panic!("expected PrView") };
+        let mut paths: Vec<String> = v.diff.files.iter().filter(|f| v.diff.is_viewed(&f.path)).map(|f| f.path.clone()).collect();
+        paths.sort();
+        paths
+    }
+
+    #[tokio::test]
+    async fn viewed_marks_survive_closing_and_reopening_the_pr() {
+        let cache = memory_cache();
+        let deps = deps_with_cache(cache.clone());
+        let mut app = App::new("slate");
+        let files = vec![changed("a.rs", Some("@@ -1 +1 @@\n-x\n+y")), changed("b.rs", Some("@@ -1 +1 @@\n-p\n+q"))];
+        for id in ["1", "2"] {
+            cache.put(&pr_detail_cache_key("c", &pr_id(id).item_ref()), &files_detail(files.clone()), Utc::now());
+        }
+
+        open_and_mark(&mut app, &deps, pr_id("1"), 1).await;
+        assert_eq!(viewed(&app), ["b.rs"]);
+        app.screen = Screen::List; // closed
+
+        app.open_pr_view_for(&deps, 3, "PR".into(), None, "c".into(), pr_id("1"));
+        assert_eq!(viewed(&app), ["b.rs"], "reopened where it was left");
+        app.open_pr_view_for(&deps, 3, "PR".into(), None, "c".into(), pr_id("2"));
+        assert!(viewed(&app).is_empty(), "another PR keeps its own marks");
+
+        // Unmarking is remembered too.
+        open_and_mark(&mut app, &deps, pr_id("1"), 1).await;
+        app.open_pr_view_for(&deps, 3, "PR".into(), None, "c".into(), pr_id("1"));
+        assert!(viewed(&app).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_file_whose_diff_changed_since_it_was_viewed_is_unmarked() {
+        let cache = memory_cache();
+        let deps = deps_with_cache(cache.clone());
+        let mut app = App::new("slate");
+        let p = pr_id("1");
+        let key = pr_detail_cache_key("c", &p.item_ref());
+        let b = changed("b.rs", Some("@@ -1 +1 @@\n-p\n+q"));
+        cache.put(&key, &files_detail(vec![changed("a.rs", Some("@@ -1 +1 @@\n-x\n+y")), b.clone()]), Utc::now());
+        open_and_mark(&mut app, &deps, p.clone(), 0).await;
+        open_and_mark(&mut app, &deps, p.clone(), 1).await;
+        assert_eq!(viewed(&app), ["a.rs", "b.rs"]);
+
+        // A new commit rewrites a.rs; b.rs is untouched.
+        let fresh = files_detail(vec![changed("a.rs", Some("@@ -1 +1 @@\n-x\n+z")), b]);
+        app.on_event(AppEvent::PrDetailLoaded { key, detail: all_answered(fresh), fetched_at: Utc::now() }, &deps);
+        assert_eq!(viewed(&app), ["b.rs"], "the changed file has to be looked at again");
+
+        app.screen = Screen::List;
+        app.open_pr_view_for(&deps, 3, "PR".into(), None, "c".into(), p);
+        assert_eq!(viewed(&app), ["b.rs"], "and stays unmarked once reopened");
+    }
+
+    /// With no cached files (`--demo`, a cold start) the view opens empty; the marks come back
+    /// once the fetch lists the files.
+    #[tokio::test]
+    async fn viewed_marks_return_when_the_files_arrive() {
+        let deps = test_deps();
+        let mut app = App::new("slate");
+        let p = pr_id("1");
+        let key = pr_detail_cache_key("c", &p.item_ref());
+        let files = vec![changed("a.rs", Some("@@ -1 +1 @@\n-x\n+y")), changed("b.rs", None)];
+        let load = |app: &mut App| {
+            let detail = all_answered(files_detail(files.clone()));
+            app.on_event(AppEvent::PrDetailLoaded { key: key.clone(), detail, fetched_at: Utc::now() }, &deps);
+        };
+
+        app.open_pr_view_for(&deps, 3, "PR".into(), None, "c".into(), p.clone());
+        load(&mut app);
+        app.on_key(Key::Char('v'), &deps).await;
+        app.screen = Screen::List;
+
+        app.open_pr_view_for(&deps, 3, "PR".into(), None, "c".into(), p);
+        assert!(viewed(&app).is_empty(), "no files known yet");
+        load(&mut app);
+        assert_eq!(viewed(&app), ["a.rs"]);
+    }
+
     fn known_detail() -> PrDetail {
         PrDetail {
             timeline: Vec::new(),
