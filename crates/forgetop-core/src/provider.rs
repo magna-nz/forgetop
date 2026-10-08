@@ -323,6 +323,19 @@ pub trait PullRequestSource: Send + Sync {
     fn list_omits_decoration(&self) -> bool {
         false
     }
+    /// Whether [`list`](Self::list) asks the provider for the rows of a `Mine` or
+    /// `ReviewRequested` filter, rather than fetching a page per repository and filtering it.
+    ///
+    /// `false` by default: most providers fetch the newest page of each repository in scope and
+    /// keep the rows that match, so a filtered `list` returns a subset of what an unfiltered one
+    /// would have, and a caller holding the unfiltered rows gains nothing by asking again. On a
+    /// busy repository that page is a window — the newest 50 pull requests — and your own fall
+    /// out of it as soon as 50 newer ones exist. A provider that can address the filter itself
+    /// (GitHub searches `author:@me` / `review-requested:@me` across the scope) overrides this, so
+    /// a caller that pools the unfiltered rows knows those views are worth fetching on their own.
+    fn list_targets_filter(&self) -> bool {
+        false
+    }
     /// The fields the list endpoint omits, for one pull request. Defaults to projecting them out
     /// of a full [`get`](Self::get) — providers with a cheaper route override it.
     async fn decorate(&self, item: &ItemRef) -> Result<PrDecoration> {
