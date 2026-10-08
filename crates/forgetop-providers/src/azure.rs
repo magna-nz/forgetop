@@ -1894,4 +1894,70 @@ mod tests {
         assert_eq!(annotations[1].line, Some(3));
         assert_eq!(annotations[2].level, AnnotationLevel::Notice);
     }
+
+    /// A client against a fake Azure org whose one repository, `Payments/pay`, lists a pull
+    /// request by someone else — whatever was asked. Returned under "Mine", that proves the rows
+    /// are the forge's answer to the filter, not a page filtered again in memory.
+    fn forge_and_client() -> (crate::test_http::FakeForge, AzurePr) {
+        let forge = crate::test_http::FakeForge::start();
+        forge.route(
+            "/Payments/_apis/git/repositories/pay/pullrequests",
+            serde_json::json!({ "value": [ { "pullRequestId": 7, "title": "old but mine", "status": "active",
+                                             "createdBy": { "id": "someone-else", "displayName": "Sam" },
+                                             "creationDate": "2026-09-01T00:00:00Z" } ] }),
+        );
+        let client = Arc::new(AzureClient {
+            http: reqwest::Client::new(),
+            base: forge.base().to_string(),
+            scope: vec!["Payments/pay".into()],
+            self_id: tokio::sync::Mutex::new(None),
+        });
+        (forge, AzurePr(client))
+    }
+
+    fn pr_query(filter: PullRequestFilter, include_completed: bool) -> PullRequestQuery {
+        PullRequestQuery { filter, include_completed, limit: None, decorate: false }
+    }
+
+    #[tokio::test]
+    async fn mine_and_review_are_asked_of_azure_by_identity_id() {
+        let (forge, pr) = forge_and_client();
+        forge.route("/_apis/connectionData", serde_json::json!({ "authenticatedUser": { "id": "guid-1" } }));
+        assert!(pr.list_targets_filter());
+
+        let rows = pr.list(&pr_query(PullRequestFilter::Mine, false)).await.unwrap();
+        assert_eq!(rows.iter().map(|r| r.title.as_str()).collect::<Vec<_>>(), vec!["old but mine"], "the forge's answer is trusted");
+        let list = forge.requests_to("/Payments/");
+        assert_eq!(list.len(), 1, "{list:?}");
+        for needle in ["searchCriteria.status=active", "searchCriteria.creatorId=guid-1", "$top=50", API] {
+            assert!(list[0].contains(needle), "{needle} missing from {}", list[0]);
+        }
+        assert_eq!(forge.requests_to("/_apis/connectionData").len(), 1, "identity fetched once");
+
+        pr.list(&pr_query(PullRequestFilter::ReviewRequested, true)).await.unwrap();
+        let list = forge.requests_to("/Payments/");
+        assert!(list[1].contains("searchCriteria.reviewerId=guid-1") && list[1].contains("searchCriteria.status=all"), "{}", list[1]);
+        assert!(!list[1].contains("creatorId"), "{}", list[1]);
+        assert_eq!(forge.requests_to("/_apis/connectionData").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn all_is_the_plain_page_and_needs_no_identity() {
+        let (forge, pr) = forge_and_client();
+        pr.list(&pr_query(PullRequestFilter::All, false)).await.unwrap();
+        let list = forge.requests_to("/Payments/");
+        assert_eq!(list.len(), 1);
+        assert!(!list[0].contains("creatorId") && !list[0].contains("reviewerId"), "{}", list[0]);
+        assert!(forge.requests_to("/_apis/connectionData").is_empty(), "All never asks who you are");
+    }
+
+    #[tokio::test]
+    async fn an_identity_azure_cannot_name_falls_back_to_the_page() {
+        let (forge, pr) = forge_and_client();
+        forge.route("/_apis/connectionData", serde_json::json!({ "authenticatedUser": {} })); // no id
+        let rows = pr.list(&pr_query(PullRequestFilter::Mine, false)).await.unwrap();
+        let list = forge.requests_to("/Payments/");
+        assert!(!list[0].contains("creatorId"), "no id to filter by: {}", list[0]);
+        assert_eq!(rows.len(), 1, "an unknown identity passes every row through, as before");
+    }
 }

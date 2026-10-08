@@ -14,6 +14,8 @@ pub mod jira;
 pub mod json;
 pub mod linear;
 pub mod scope;
+#[cfg(test)]
+pub(crate) mod test_http;
 
 /// An HTTP client for a provider, with its auth headers and a ceiling on every request.
 ///

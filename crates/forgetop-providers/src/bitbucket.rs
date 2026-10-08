@@ -1101,4 +1101,81 @@ mod tests {
         assert_eq!(low_a.line, Some(1));
         assert_eq!(low_a.job_id, None);
     }
+
+    /// A client against a fake Bitbucket whose one repository, `acme/pay`, lists a pull request
+    /// by someone else — whatever was asked. Returned under "Mine", that proves the rows are the
+    /// forge's answer to the filter, not a page filtered again in memory.
+    fn forge_and_client() -> (crate::test_http::FakeForge, BitbucketPr) {
+        let forge = crate::test_http::FakeForge::start();
+        forge.route(
+            "/repositories/acme/pay/pullrequests",
+            serde_json::json!({ "values": [ { "id": 7, "title": "old but mine", "state": "OPEN",
+                                              "author": { "display_name": "Sam", "uuid": "{u-2}" },
+                                              "updated_on": "2026-09-01T00:00:00Z" } ] }),
+        );
+        let client = Arc::new(BitbucketClient {
+            http: reqwest::Client::new(),
+            base: forge.base().to_string(),
+            workspace: "acme".into(),
+            scope: vec!["acme/pay".into()],
+            self_user: tokio::sync::Mutex::new(None),
+        });
+        (forge, BitbucketPr(client))
+    }
+
+    fn pr_query(filter: PullRequestFilter, include_completed: bool) -> PullRequestQuery {
+        PullRequestQuery { filter, include_completed, limit: None, decorate: false }
+    }
+
+    #[tokio::test]
+    async fn mine_and_review_are_asked_of_bitbucket_by_uuid() {
+        let (forge, pr) = forge_and_client();
+        forge.route("/user", serde_json::json!({ "display_name": "Dan", "uuid": "{u-1}" }));
+        assert!(pr.list_targets_filter());
+
+        let rows = pr.list(&pr_query(PullRequestFilter::Mine, false)).await.unwrap();
+        assert_eq!(rows.iter().map(|r| r.title.as_str()).collect::<Vec<_>>(), vec!["old but mine"], "the forge's answer is trusted");
+        let list = forge.requests_to("/repositories/");
+        assert_eq!(list.len(), 1, "{list:?}");
+        for needle in ["state=OPEN", "pagelen=50", "q=author.uuid%3D%22%7Bu-1%7D%22"] {
+            assert!(list[0].contains(needle), "{needle} missing from {}", list[0]);
+        }
+        assert_eq!(forge.requests_to("/user").len(), 1, "identity fetched once");
+
+        pr.list(&pr_query(PullRequestFilter::ReviewRequested, true)).await.unwrap();
+        let list = forge.requests_to("/repositories/");
+        assert!(list[1].contains("q=reviewers.uuid%3D%22%7Bu-1%7D%22") && list[1].contains("state=MERGED"), "{}", list[1]);
+        assert!(!list[1].contains("author.uuid"), "{}", list[1]);
+        assert_eq!(forge.requests_to("/user").len(), 1);
+        // `current_user` still answers with the name the rows are matched on, from the same call.
+        assert_eq!(pr.current_user().await.unwrap().as_deref(), Some("Dan"));
+        assert_eq!(forge.requests_to("/user").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn all_is_the_plain_page_and_needs_no_identity() {
+        let (forge, pr) = forge_and_client();
+        pr.list(&pr_query(PullRequestFilter::All, false)).await.unwrap();
+        let list = forge.requests_to("/repositories/");
+        assert_eq!(list.len(), 1);
+        assert!(!list[0].contains("q="), "{}", list[0]);
+        assert!(forge.requests_to("/user").is_empty(), "All never asks who you are");
+    }
+
+    #[tokio::test]
+    async fn an_account_without_a_uuid_falls_back_to_the_page_filtered_by_name() {
+        let (forge, pr) = forge_and_client();
+        forge.route("/user", serde_json::json!({ "display_name": "Dan" })); // no uuid
+        forge.route(
+            "/repositories/acme/pay/pullrequests",
+            serde_json::json!({ "values": [
+                { "id": 7, "title": "sam's", "state": "OPEN", "author": { "display_name": "Sam", "uuid": "{u-2}" } },
+                { "id": 8, "title": "dan's", "state": "OPEN", "author": { "display_name": "Dan" } } ] }),
+        );
+        let rows = pr.list(&pr_query(PullRequestFilter::Mine, false)).await.unwrap();
+        let list = forge.requests_to("/repositories/");
+        assert!(!list[0].contains("q="), "no uuid to filter by: {}", list[0]);
+        // The page is filtered in memory by the name that *was* established — exactly as before.
+        assert_eq!(rows.iter().map(|r| r.title.as_str()).collect::<Vec<_>>(), vec!["dan's"]);
+    }
 }

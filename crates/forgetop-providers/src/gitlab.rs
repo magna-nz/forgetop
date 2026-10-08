@@ -1501,4 +1501,72 @@ mod tests {
         let raw = "hello world\nsecond line\nthird line";
         assert_eq!(strip_ci_log(raw), raw);
     }
+
+    /// A client against a fake GitLab whose one project, `acme/pay`, lists a merge request by
+    /// `sam` — whatever was asked. Returned under "Mine", that proves the rows are the forge's
+    /// answer to the filter, not a page filtered again in memory.
+    fn forge_and_client() -> (crate::test_http::FakeForge, GitLabPr) {
+        let forge = crate::test_http::FakeForge::start();
+        forge.route(
+            &format!("/projects/{}/merge_requests", encode_project("acme/pay")),
+            serde_json::json!([{ "iid": 7, "title": "old but mine", "state": "opened",
+                                 "author": { "username": "sam", "name": "Sam" },
+                                 "updated_at": "2026-09-01T00:00:00Z" }]),
+        );
+        let client = Arc::new(GitLabClient {
+            http: reqwest::Client::new(),
+            base: forge.base().to_string(),
+            scope: vec!["acme/pay".into()],
+            self_username: tokio::sync::Mutex::new(None),
+        });
+        (forge, GitLabPr(client))
+    }
+
+    fn query(filter: PullRequestFilter, include_completed: bool) -> PullRequestQuery {
+        PullRequestQuery { filter, include_completed, limit: None, decorate: false }
+    }
+
+    #[tokio::test]
+    async fn mine_and_review_are_asked_of_gitlab_by_username() {
+        let (forge, pr) = forge_and_client();
+        forge.route("/user", serde_json::json!({ "username": "dan" }));
+        assert!(pr.list_targets_filter());
+
+        let rows = pr.list(&query(PullRequestFilter::Mine, false)).await.unwrap();
+        assert_eq!(rows.iter().map(|r| r.title.as_str()).collect::<Vec<_>>(), vec!["old but mine"], "the forge's answer is trusted");
+        let list = forge.requests_to("/projects/");
+        assert_eq!(list.len(), 1, "{list:?}");
+        for needle in ["state=opened", "scope=all", "author_username=dan", "order_by=updated_at", "sort=desc"] {
+            assert!(list[0].contains(needle), "{needle} missing from {}", list[0]);
+        }
+        assert_eq!(forge.requests_to("/user").len(), 1, "identity fetched once");
+
+        // Review asks for the reviewer; the completed variant asks for every state. The username
+        // is cached, so no second `/user`.
+        pr.list(&query(PullRequestFilter::ReviewRequested, true)).await.unwrap();
+        let list = forge.requests_to("/projects/");
+        assert!(list[1].contains("reviewer_username=dan") && list[1].contains("state=all"), "{}", list[1]);
+        assert!(!list[1].contains("author_username"), "{}", list[1]);
+        assert_eq!(forge.requests_to("/user").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn all_is_the_plain_page_and_needs_no_identity() {
+        let (forge, pr) = forge_and_client();
+        pr.list(&query(PullRequestFilter::All, false)).await.unwrap();
+        let list = forge.requests_to("/projects/");
+        assert_eq!(list.len(), 1);
+        assert!(!list[0].contains("username") && !list[0].contains("scope="), "{}", list[0]);
+        assert!(forge.requests_to("/user").is_empty(), "All never asks who you are");
+    }
+
+    #[tokio::test]
+    async fn an_identity_gitlab_cannot_name_falls_back_to_the_page() {
+        let (forge, pr) = forge_and_client();
+        forge.route("/user", serde_json::json!({ "id": 1 })); // no username
+        let rows = pr.list(&query(PullRequestFilter::Mine, false)).await.unwrap();
+        let list = forge.requests_to("/projects/");
+        assert!(!list[0].contains("author_username"), "no username to filter by: {}", list[0]);
+        assert_eq!(rows.len(), 1, "an unknown identity passes every row through, as before");
+    }
 }

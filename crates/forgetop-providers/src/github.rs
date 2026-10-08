@@ -1895,4 +1895,100 @@ mod tests {
         let query = PullRequestQuery { filter: PullRequestFilter::Mine, ..PullRequestQuery::default() };
         assert!(pr.list(&query).await.unwrap().is_empty());
     }
+
+    /// A client against a fake GitHub whose search finds `acme/pay#7`, and whose `/pulls/7` is
+    /// the full pull request (branches, reviewers) the search item lacks.
+    fn forge_and_client(scope: &[&str]) -> (crate::test_http::FakeForge, GitHubPr) {
+        let forge = crate::test_http::FakeForge::start();
+        forge.route(
+            "/search/issues",
+            serde_json::json!({ "total_count": 1, "incomplete_results": false, "items": [ {
+                "number": 7, "title": "from search", "state": "open", "draft": false,
+                "user": { "login": "dan" }, "updated_at": "2026-09-01T00:00:00Z",
+                "repository_url": format!("{}/repos/acme/pay", forge.base()),
+                "pull_request": { "merged_at": null } } ] }),
+        );
+        forge.route(
+            "/repos/acme/pay/pulls/7",
+            serde_json::json!({ "number": 7, "title": "from pulls", "state": "open", "draft": false,
+                "user": { "login": "dan" }, "updated_at": "2026-09-01T00:00:00Z",
+                "head": { "ref": "feat/user-key" }, "base": { "ref": "main", "repo": { "full_name": "acme/pay" } },
+                "requested_reviewers": [ { "login": "sam" } ] }),
+        );
+        let client = Arc::new(GitHubClient {
+            http: reqwest::Client::new(),
+            base: forge.base().to_string(),
+            scope: scope.iter().map(|s| s.to_string()).collect(),
+            self_login: tokio::sync::Mutex::new(None),
+            hydrated: tokio::sync::Mutex::new(HashMap::new()),
+        });
+        (forge, GitHubPr(client))
+    }
+
+    fn pr_query(filter: PullRequestFilter, include_completed: bool) -> PullRequestQuery {
+        PullRequestQuery { filter, include_completed, limit: None, decorate: false }
+    }
+
+    #[tokio::test]
+    async fn mine_is_one_search_over_the_scope_and_a_full_fetch_per_hit_once() {
+        let (forge, pr) = forge_and_client(&["acme/pay", "acme/ledger"]);
+
+        let rows = pr.list(&pr_query(PullRequestFilter::Mine, false)).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!((row.repository.as_deref(), row.number, row.title.as_str()), (Some("acme/pay"), Some(7), "from pulls"));
+        assert_eq!(row.source_ref.as_deref(), Some("feat/user-key"), "the row is the full pull request");
+        assert_eq!(row.reviewers[0].user.handle.as_deref(), Some("sam"), "with the reviewers the review view is derived from");
+
+        let searches = forge.requests_to("/search/issues");
+        assert_eq!(searches.len(), 1, "two repositories, one query: {searches:?}");
+        for needle in ["q=is:pr+is:open+author:@me+(repo:acme/pay+OR+repo:acme/ledger)", "advanced_search=true", "sort=updated", "per_page=50"] {
+            assert!(searches[0].contains(needle), "{needle} missing from {}", searches[0]);
+        }
+        assert_eq!(forge.requests_to("/repos/acme/pay/pulls/7").len(), 1);
+        assert!(forge.requests_to("/user").is_empty(), "`@me` needs no /user call");
+        assert!(forge.requests_to("/repos/acme/pay/pulls?").is_empty(), "and no page is listed");
+
+        // The same hit, unchanged: served from the cache, not fetched again.
+        let again = pr.list(&pr_query(PullRequestFilter::Mine, false)).await.unwrap();
+        assert_eq!(again[0].title, "from pulls");
+        assert_eq!(forge.requests_to("/search/issues").len(), 2);
+        assert_eq!(forge.requests_to("/repos/acme/pay/pulls/7").len(), 1, "cached at the same updated_at");
+    }
+
+    #[tokio::test]
+    async fn review_and_completed_change_only_the_query() {
+        let (forge, pr) = forge_and_client(&["acme/pay"]);
+        pr.list(&pr_query(PullRequestFilter::ReviewRequested, true)).await.unwrap();
+        let searches = forge.requests_to("/search/issues");
+        assert!(searches[0].contains("q=is:pr+review-requested:@me+repo:acme/pay&"), "{}", searches[0]);
+        assert!(!searches[0].contains("is:open"), "completed searches every state: {}", searches[0]);
+    }
+
+    #[tokio::test]
+    async fn all_is_still_the_page_per_repository() {
+        let (forge, pr) = forge_and_client(&["acme/pay"]);
+        forge.route("/repos/acme/pay/pulls", serde_json::json!([ { "number": 100, "title": "newest", "state": "open", "user": { "login": "sam" } } ]));
+        let rows = pr.list(&pr_query(PullRequestFilter::All, false)).await.unwrap();
+        assert_eq!(rows[0].title, "newest");
+        assert!(forge.requests_to("/search/issues").is_empty());
+        assert!(forge.requests_to("/repos/acme/pay/pulls?state=open&per_page=50").len() == 1, "{:?}", forge.requests());
+    }
+
+    #[tokio::test]
+    async fn a_hit_whose_full_fetch_fails_still_shows_from_the_search_item() {
+        let (forge, pr) = forge_and_client(&["acme/pay"]);
+        forge.route(
+            "/search/issues",
+            serde_json::json!({ "items": [ {
+                "number": 9, "title": "only in search", "state": "closed", "user": { "login": "dan" },
+                "updated_at": "2026-09-02T00:00:00Z",
+                "repository_url": format!("{}/repos/acme/pay", forge.base()),
+                "pull_request": { "merged_at": "2026-09-02T00:00:00Z" } } ] }),
+        );
+        // `/repos/acme/pay/pulls/9` is not routed: a 404, as a deleted or forbidden PR would be.
+        let rows = pr.list(&pr_query(PullRequestFilter::Mine, true)).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].title.as_str(), rows[0].repository.as_deref(), rows[0].status), ("only in search", Some("acme/pay"), PullRequestStatus::Merged));
+    }
 }
