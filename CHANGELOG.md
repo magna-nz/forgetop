@@ -9,6 +9,20 @@ Adding a release: one `## <version> — <date>` section, a line per user-visible
 and the pull request each one came from. `git log v<previous>..HEAD --merges` lists the
 candidates.
 
+## 1.6.4 — 2026-10-09
+
+Fixed
+
+- **Your pull requests no longer vanish from "Mine" on a busy repository.** GitHub's list
+  endpoint returns a repository's newest 50 pull requests, and "Mine" and "Review" were picked
+  out of that page — so on a repository that opens 50 pull requests in a few days, yours dropped
+  off the list (and out of the Command Center) although nothing about them had changed, and came
+  back only when the repository went quiet. Both views are now found with GitHub's search
+  (`author:@me`, `review-requested:@me`) across every repository in scope, however old the pull
+  request is, in the terminal UI and the dashboard alike. A reload that finds them unchanged
+  costs the search and nothing per row.
+  ([#224](https://github.com/magna-nz/forgetop/pull/224))
+
 ## 1.6.3 — 2026-10-08
 
 Changed
