@@ -9,6 +9,21 @@ Adding a release: one `## <version> — <date>` section, a line per user-visible
 and the pull request each one came from. `git log v<previous>..HEAD --merges` lists the
 candidates.
 
+## 1.6.3 — 2026-10-08
+
+Changed
+
+- **Files you mark viewed stay marked.** In the terminal UI, the files you tick with `v` on a
+  pull request's Diff tab are still ticked when you close the pull request and come back to
+  it, for as long as forgetop is running. A file whose diff has changed since you marked it
+  (a new commit, say) comes back unticked so it gets looked at again. The open Diff tab also
+  now picks up a file rewritten with the same number of added and removed lines, rather than
+  showing the old text until you reopen it.
+  ([#223](https://github.com/magna-nz/forgetop/pull/223))
+- **The terminal README GIF opens a pull request in the pane beside its list**, the way
+  opening one from Pull Requests actually looks.
+  ([#223](https://github.com/magna-nz/forgetop/pull/223))
+
 ## 1.6.2 — 2026-10-08
 
 Changed
