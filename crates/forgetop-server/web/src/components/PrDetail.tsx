@@ -5,7 +5,8 @@ import { apiPost, prDetailKey, useConnections, usePrCommitChanges, usePrDetail }
 import { checkMeta, checkSummaryOf, prStateLine, prStatusMeta, relativeTime, voteMeta } from "../format";
 import { providerSupports, unsupportedMessage } from "../capabilities";
 import { parsePatch } from "../diff";
-import type { CheckRun, CommentThread, Commit, FileChange, FileChangeKind, LineComment, PrRef, ProviderType, PullRequest, Reviewer, TimelineEvent } from "../types";
+import { addPrReply, addPrThreads, isLocalId, localComment, localThread, meAsUser, patchPullRequest, withVote } from "../optimistic";
+import type { CheckRun, CommentThread, Commit, FileChange, FileChangeKind, LineComment, PrRef, ProviderType, PullRequest, ReviewVote, Reviewer, TimelineEvent } from "../types";
 import { Avatar, Chip, Pill, Timeline } from "./ui";
 
 // ---- opener context ----
@@ -71,50 +72,100 @@ function PrDetailPanel({ prRef, onClose }: { prRef: PrRef; onClose: () => void }
     qc.invalidateQueries({ queryKey: ["notifications"] });
   };
 
-  const act = async (label: string, fn: () => Promise<void>) => {
+  // Who you are on this connection, for showing your vote and comments before the provider does.
+  const me = data?.me ?? null;
+  const you = meAsUser(me);
+
+  /**
+   * Runs a write. With `optimistic`, what the write decides on its own shows at once — the
+   * caches are patched and the note says it's done — then the request goes out. Without it (a
+   * merge or revert: the provider decides whether it happens) the note says it's under way.
+   * Refreshed on both paths: after a success it confirms the optimistic patch, after a failure it
+   * is the rollback — the server's truth replaces it.
+   */
+  const act = async (
+    label: string,
+    fn: () => Promise<void>,
+    opts: { optimistic?: () => void; progress?: string; onError?: () => void } = {},
+  ) => {
     setBusy(true);
-    setNote(null);
+    if (opts.optimistic) {
+      opts.optimistic();
+      setNote(`${label} ✓`);
+    } else {
+      setNote(opts.progress ?? null);
+    }
     try {
       await fn();
       setNote(`${label} ✓`);
-      refresh();
     } catch (e) {
+      opts.onError?.();
       setNote(e instanceof Error ? e.message : String(e));
     } finally {
+      refresh();
       setBusy(false);
     }
   };
 
   // A verdict/merge action from the action bar closes the pane once it lands (brief delay so the
   // "✓" note flashes first), matching Merge — you've acted on this PR, so return to the list.
+  // Only once it lands: a refusal has to stay on screen to be read.
   const closeSoon = () => setTimeout(onClose, 500);
+  const markVote = (v: ReviewVote) => {
+    if (me) patchPullRequest(qc, prRef, (p) => withVote(p, me, v));
+  };
   const vote = (v: "Approved" | "Rejected") =>
-    act(v === "Approved" ? "Approved" : "Requested changes", async () => {
-      await apiPost("/api/pr/vote", { conn: prRef.conn, repo: prRef.repo, id: prRef.id, vote: v });
-      closeSoon();
-    });
+    act(
+      v === "Approved" ? "Approved" : "Requested changes",
+      async () => {
+        await apiPost("/api/pr/vote", { conn: prRef.conn, repo: prRef.repo, id: prRef.id, vote: v });
+        closeSoon();
+      },
+      { optimistic: () => markVote(v) },
+    );
   const merge = () =>
-    act("Merged", async () => {
-      try {
-        await apiPost("/api/pr/merge", { conn: prRef.conn, repo: prRef.repo, id: prRef.id, strategy: "Merge" });
-      } catch {
-        // Providers without a mergeable flag (e.g. Bitbucket) let you try — the API decides.
-        throw new Error("Couldn't merge — the PR may not be mergeable.");
-      }
-      closeSoon();
-    });
+    act(
+      "Merged",
+      async () => {
+        try {
+          await apiPost("/api/pr/merge", { conn: prRef.conn, repo: prRef.repo, id: prRef.id, strategy: "Merge" });
+        } catch {
+          // Providers without a mergeable flag (e.g. Bitbucket) let you try — the API decides.
+          throw new Error("Couldn't merge — the PR may not be mergeable.");
+        }
+        closeSoon();
+      },
+      { progress: "Merging…" },
+    );
   const revert = () =>
-    act("Revert requested", async () => {
-      await apiPost("/api/pr/revert", { conn: prRef.conn, repo: prRef.repo, id: prRef.id });
-      closeSoon();
+    act(
+      "Revert requested",
+      async () => {
+        await apiPost("/api/pr/revert", { conn: prRef.conn, repo: prRef.repo, id: prRef.id });
+        closeSoon();
+      },
+      { progress: "Requesting a revert…" },
+    );
+  const comment = (body: string) =>
+    act("Comment posted", () => apiPost("/api/pr/comment", { conn: prRef.conn, repo: prRef.repo, id: prRef.id, body }), {
+      optimistic: () => addPrThreads(qc, prRef, [localThread(you, body)]),
     });
   const reply = (threadId: string, body: string) =>
-    act("Reply posted", () => apiPost("/api/pr/reply", { conn: prRef.conn, repo: prRef.repo, id: prRef.id, thread_id: threadId, body }));
-  const submitReview = (event: "Approved" | "Rejected" | "NoVote") =>
-    act("Review submitted", async () => {
-      await apiPost("/api/pr/review", { conn: prRef.conn, repo: prRef.repo, id: prRef.id, event, comments: pending });
-      setPending([]);
+    act("Reply posted", () => apiPost("/api/pr/reply", { conn: prRef.conn, repo: prRef.repo, id: prRef.id, thread_id: threadId, body }), {
+      optimistic: () => addPrReply(qc, prRef, threadId, localComment(you, body)),
     });
+  const submitReview = (event: "Approved" | "Rejected" | "NoVote") => {
+    const sent = pending;
+    return act("Review submitted", () => apiPost("/api/pr/review", { conn: prRef.conn, repo: prRef.repo, id: prRef.id, event, comments: sent }), {
+      optimistic: () => {
+        setPending([]);
+        addPrThreads(qc, prRef, sent.map((c) => localThread(you, c.body, { path: c.path, line: c.line })));
+        if (event !== "NoVote") markVote(event);
+      },
+      // A refused review's comments go back in the buffer, ahead of any added since.
+      onError: () => setPending((p) => [...sent, ...p]),
+    });
+  };
 
   const pr = data?.pull_request;
 
@@ -226,7 +277,7 @@ function PrDetailPanel({ prRef, onClose }: { prRef: PrRef; onClose: () => void }
                   timeline={data.timeline}
                   busy={busy}
                   onReply={reply}
-                  onComment={(body) => act("Comment posted", () => apiPost("/api/pr/comment", { conn: prRef.conn, repo: prRef.repo, id: prRef.id, body }))}
+                  onComment={comment}
                 />
               )}
               {tab === "commits" && (
@@ -284,7 +335,7 @@ function PrDetailPanel({ prRef, onClose }: { prRef: PrRef; onClose: () => void }
               )}
             </div>
             {note && (
-              <div className="px-4 pb-2 text-xs" style={{ color: note.endsWith("✓") ? "var(--green)" : "var(--red)" }}>
+              <div className="px-4 pb-2 text-xs" style={{ color: noteColor(note) }}>
                 {note}
               </div>
             )}
@@ -294,6 +345,9 @@ function PrDetailPanel({ prRef, onClose }: { prRef: PrRef; onClose: () => void }
     </motion.div>
   );
 }
+
+/** A done note is green, one still under way dim, anything else is an error. */
+const noteColor = (note: string) => (note.endsWith("✓") ? "var(--green)" : note.endsWith("…") ? "var(--dim)" : "var(--red)");
 
 function ActionButton({
   label,
@@ -663,7 +717,11 @@ function ThreadBox({ thread, busy, onReply }: { thread: CommentThread; busy: boo
           </span>
         </div>
       ))}
-      {replying ? (
+      {isLocalId(thread.id) ? (
+        <div className="mt-1 text-xs" style={{ color: "var(--dim)" }}>
+          Posting…
+        </div>
+      ) : replying ? (
         <div className="mt-1.5 flex flex-col gap-1.5">
           <textarea
             value={draft}

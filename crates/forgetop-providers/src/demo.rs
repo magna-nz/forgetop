@@ -1173,20 +1173,20 @@ fn apply_session_merge(mut pr: PullRequest) -> PullRequest {
     pr
 }
 
-/// PR ids you've requested changes on this run. `vote(Rejected)` records them; approving clears
-/// them — so a re-fetch reflects your review exactly like a real provider would.
-fn changes_requested_prs() -> &'static Mutex<HashSet<String>> {
-    static STORE: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-    STORE.get_or_init(|| Mutex::new(HashSet::new()))
+/// Your verdict on each PR you've reviewed this run, by PR id. `vote` records it — the latest
+/// verdict wins — so a re-fetch reflects your review exactly like a real provider would.
+fn session_votes() -> &'static Mutex<HashMap<String, ReviewVote>> {
+    static STORE: OnceLock<Mutex<HashMap<String, ReviewVote>>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Reflect a session "request changes": your reviewer entry reads as Rejected (added if you
-/// weren't already a reviewer) until you approve — exactly what re-fetching the PR would show.
+/// Reflect a session review: your reviewer entry reads as your latest verdict (added if you
+/// weren't already a reviewer) — exactly what re-fetching the PR would show.
 fn apply_session_review(mut pr: PullRequest) -> PullRequest {
-    if changes_requested_prs().lock().unwrap().contains(&pr.id) {
+    if let Some(vote) = session_votes().lock().unwrap().get(&pr.id).copied() {
         match pr.reviewers.iter_mut().find(|r| r.user.id == me().id) {
-            Some(r) => r.vote = ReviewVote::Rejected,
-            None => pr.reviewers.push(rev(me(), ReviewVote::Rejected)),
+            Some(r) => r.vote = vote,
+            None => pr.reviewers.push(rev(me(), vote)),
         }
         pr.updated_at = Some(base());
     }
@@ -1306,8 +1306,14 @@ impl PullRequestSource for DemoPr {
             }
         }
         // Actions taken this session, like re-fetching after acting.
-        if changes_requested_prs().lock().unwrap().contains(id) {
-            events.push(TimelineEvent { actor: Some(me()), kind: K::ChangesRequested, summary: "requested changes".into(), at: Some(base()) });
+        match session_votes().lock().unwrap().get(id) {
+            Some(ReviewVote::Rejected) => {
+                events.push(TimelineEvent { actor: Some(me()), kind: K::ChangesRequested, summary: "requested changes".into(), at: Some(base()) });
+            }
+            Some(ReviewVote::Approved | ReviewVote::ApprovedWithSuggestions) => {
+                events.push(TimelineEvent { actor: Some(me()), kind: K::Approved, summary: "approved these changes".into(), at: Some(base()) });
+            }
+            _ => {}
         }
         if merged_prs().lock().unwrap().contains(id) {
             events.push(TimelineEvent { actor: Some(me()), kind: K::Merged, summary: "merged this pull request".into(), at: Some(base()) });
@@ -1468,18 +1474,8 @@ impl PullRequestSource for DemoPr {
     }
     async fn vote(&self, item: &ItemRef, vote: ReviewVote) -> Result<()> {
         let id: &str = &item.id;
-        // Record your review so list()/get() reflect it on the next fetch, like a real provider:
-        // requesting changes marks the PR, approving clears it.
-        let mut cr = changes_requested_prs().lock().unwrap();
-        match vote {
-            ReviewVote::Rejected => {
-                cr.insert(id.to_string());
-            }
-            ReviewVote::Approved | ReviewVote::ApprovedWithSuggestions => {
-                cr.remove(id);
-            }
-            _ => {}
-        }
+        // Record your review so list()/get() reflect it on the next fetch, like a real provider.
+        session_votes().lock().unwrap().insert(id.to_string(), vote);
         Ok(())
     }
     async fn merge(&self, item: &ItemRef, _options: &MergeOptions) -> Result<()> {

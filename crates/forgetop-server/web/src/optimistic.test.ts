@@ -1,13 +1,31 @@
 import { describe, expect, it } from "vitest";
 import { QueryClient } from "@tanstack/react-query";
-import { wiDetailKey } from "./api";
+import { prDetailKey, wiDetailKey } from "./api";
 import {
+  addPrReply,
+  addPrThreads,
   dropConnectionFromCache,
+  isLocalId,
+  localComment,
+  localThread,
   markNotificationReadInCache,
+  meAsUser,
+  patchPullRequest,
   patchWorkItem,
   setConnectionScopeInCache,
+  withVote,
 } from "./optimistic";
-import type { ConnectionRow, LaunchpadResponse, NotifRow, WiDetail as WiDetailData, WiRow, WorkItem } from "./types";
+import type {
+  ConnectionRow,
+  LaunchpadResponse,
+  NotifRow,
+  PrDetail as PrDetailData,
+  PrRow,
+  PullRequest,
+  WiDetail as WiDetailData,
+  WiRow,
+  WorkItem,
+} from "./types";
 
 const row = (connection_id: string, id: string) => ({ connection_id, id });
 
@@ -260,5 +278,85 @@ describe("setConnectionScopeInCache", () => {
 
     expect(() => setConnectionScopeInCache(qc, "c1", ["acme/pay"])).not.toThrow();
     expect(qc.getQueryData(["connections"])).toBeUndefined();
+  });
+});
+
+describe("patchPullRequest / withVote", () => {
+  const priya = { id: "u1", display_name: "Priya Nair", handle: "priya", avatar_url: null };
+  const pr = (id: string, repository = "acme/pay"): PullRequest =>
+    ({ id, repository, title: "t", reviewers: [{ user: priya, vote: "NoVote", is_required: true }] }) as unknown as PullRequest;
+  const ref = { conn: "c", repo: "acme/pay", id: "7" };
+
+  const seed = () => {
+    const qc = new QueryClient();
+    qc.setQueryData(prDetailKey(ref), { pull_request: pr("7"), threads: [] } as unknown as PrDetailData);
+    qc.setQueryData(["prs", "review"], [
+      { connection_id: "c", pull_request: pr("7") },
+      { connection_id: "c", pull_request: pr("7", "acme/other") },
+    ] as unknown as PrRow[]);
+    qc.setQueryData(["launchpad"], {
+      rows: [{ kind: "pr", connection_id: "c", pull_request: pr("7") }],
+      more: {},
+    } as unknown as LaunchpadResponse);
+    return qc;
+  };
+  const myVote = (p: PullRequest) => p.reviewers.find((r) => r.user.handle === "me")?.vote;
+
+  it("shows your vote on the pane, every PR list and the Command Center — only on that repository's PR", () => {
+    const qc = seed();
+
+    patchPullRequest(qc, ref, (p) => withVote(p, "me", "Approved"));
+
+    expect(myVote((qc.getQueryData(prDetailKey(ref)) as PrDetailData).pull_request)).toBe("Approved");
+    const rows = qc.getQueryData(["prs", "review"]) as PrRow[];
+    expect(myVote(rows[0].pull_request)).toBe("Approved");
+    expect(myVote(rows[1].pull_request)).toBeUndefined();
+    const lp = qc.getQueryData(["launchpad"]) as LaunchpadResponse;
+    expect(lp.rows[0].kind === "pr" && myVote(lp.rows[0].pull_request)).toBe("Approved");
+  });
+
+  it("updates your existing reviewer entry rather than adding a second one", () => {
+    const asReviewer = { ...pr("7"), reviewers: [{ user: { ...priya, id: "u9", display_name: "Sam", handle: "me" }, vote: "NoVote", is_required: true }] } as PullRequest;
+
+    const voted = withVote(asReviewer, "me", "Rejected");
+
+    expect(voted.reviewers).toHaveLength(1);
+    expect(voted.reviewers[0]).toMatchObject({ vote: "Rejected", is_required: true });
+  });
+});
+
+describe("placeholder comments", () => {
+  const ref = { conn: "c", id: "7" };
+  const seed = () => {
+    const qc = new QueryClient();
+    qc.setQueryData(prDetailKey(ref), {
+      pull_request: {},
+      threads: [{ id: "t1", comments: [{ id: "c1", author: meAsUser("bob"), body: "why?" }], is_resolved: false }],
+    } as unknown as PrDetailData);
+    return qc;
+  };
+  const threads = (qc: QueryClient) => (qc.getQueryData(prDetailKey(ref)) as PrDetailData).threads;
+
+  it("adds a comment and a review's line comments as new threads, marked as local", () => {
+    const qc = seed();
+
+    addPrThreads(qc, ref, [localThread(meAsUser("me"), "LGTM"), localThread(meAsUser("me"), "nit", { path: "a.rs", line: 3 })]);
+
+    const [, top, line] = threads(qc);
+    expect(top).toMatchObject({ file_path: null, comments: [{ body: "LGTM", author: { handle: "me" } }] });
+    expect(line).toMatchObject({ file_path: "a.rs", line: 3 });
+    expect(isLocalId(top.id) && isLocalId(line.id)).toBe(true);
+    expect(top.id).not.toBe(line.id);
+  });
+
+  it("adds a reply to its own thread", () => {
+    const qc = seed();
+
+    addPrReply(qc, ref, "t1", localComment(meAsUser(), "because"));
+
+    expect(threads(qc)[0].comments.map((c) => [c.body, c.author.display_name])).toEqual([
+      ["why?", "bob"],
+      ["because", "You"],
+    ]);
   });
 });

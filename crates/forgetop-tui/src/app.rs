@@ -35,7 +35,6 @@ const DIAG_FAILURE_MESSAGE: &str = "operation failed";
 const DIAG_REFRESH: &str = "tui.refresh";
 const DIAG_ACTION: &str = "tui.action";
 const DIAG_RELOAD_PULL_REQUESTS: &str = "tui.reload.pull_requests";
-const DIAG_RELOAD_WORK_ITEMS: &str = "tui.reload.work_items";
 const DIAG_RELOAD_PIPELINES: &str = "tui.reload.pipelines";
 const DIAG_PR_FEEDS: &str = "tui.pr.feeds";
 const DIAG_PR_DETAIL: &str = "tui.pr.detail";
@@ -46,6 +45,7 @@ const DIAG_PR_COMMITS: &str = "tui.pr.commits";
 const DIAG_PR_COMMIT_CHANGES: &str = "tui.pr.commit_changes";
 const DIAG_PR_TIMELINE: &str = "tui.pr.timeline";
 const DIAG_WI_FEEDS: &str = "tui.work_item.feeds";
+const DIAG_WI_DETAIL: &str = "tui.work_item.detail";
 const DIAG_WI_THREADS: &str = "tui.work_item.threads";
 const DIAG_WI_STATES: &str = "tui.work_item.states";
 const DIAG_WI_TIMELINE: &str = "tui.work_item.timeline";
@@ -328,6 +328,12 @@ pub enum AppEvent {
     /// The provider answered a rerun or cancel sent by [`App::execute_pipeline_run_action`]:
     /// the new run's id when it started one.
     PipelineRunActionDone { token: u64, result: std::result::Result<Option<String>, String> },
+    /// The provider answered a PR write sent by [`App::execute_pr_action`] or
+    /// [`App::submit_review`], with the PR re-read after an accepted one.
+    PrActionDone { token: u64, result: std::result::Result<(), String>, fresh: Option<Box<PullRequest>> },
+    /// The provider answered a work-item write sent by [`App::execute_wi_action`], with the item
+    /// re-read after an accepted one.
+    WiActionDone { token: u64, result: std::result::Result<(), String>, fresh: Option<Box<WorkItem>> },
     /// A finished run's problems, fetched apart from its detail. `None` means the call failed.
     PipelineAnnotationsLoaded { key: String, annotations: Option<Vec<PipelineAnnotation>> },
 }
@@ -991,6 +997,15 @@ pub struct App {
     next_run_action: u64,
     /// Optimistic run changes held against stale refreshes, by `(connection, run id)`.
     held_runs: HashMap<(String, String), RunHold>,
+    /// PR and work-item writes waiting on the provider, by token.
+    item_actions: HashMap<u64, PendingItemAction>,
+    next_item_action: u64,
+    /// Optimistic PR and work-item changes held against stale refreshes, by the item's detail
+    /// cache key.
+    held_items: HashMap<String, ItemHold>,
+    /// A write landed while a refresh was already out: that refresh was asked for before the
+    /// write, so another one follows it.
+    reload_again: bool,
     /// A run a rerun started, to open once it shows up in the list: `(connection, run id)`.
     follow_new_run: Option<(String, String)>,
     /// Detail keys whose annotations were asked for, and the run status they were asked at —
@@ -2991,6 +3006,10 @@ impl App {
             run_actions: HashMap::new(),
             next_run_action: 0,
             held_runs: HashMap::new(),
+            item_actions: HashMap::new(),
+            next_item_action: 0,
+            held_items: HashMap::new(),
+            reload_again: false,
             follow_new_run: None,
             annotations_asked: std::cell::RefCell::new(HashMap::new()),
             annotations_by_key: HashMap::new(),
@@ -3767,6 +3786,9 @@ impl App {
             }
             AppEvent::Reloaded(r) => {
                 self.apply_reloaded(*r, deps);
+                if std::mem::take(&mut self.reload_again) {
+                    self.request_reload(deps);
+                }
                 self.follow_started_run(deps);
                 self.refresh_preview_row();
                 // The scope indicator's denominator depends on the catalog the fetch may have
@@ -3796,6 +3818,8 @@ impl App {
                 self.apply_pipeline_artifacts(&conn_id, &run_id, result);
             }
             AppEvent::PipelineRunActionDone { token, result } => self.finish_run_action(token, result, deps),
+            AppEvent::PrActionDone { token, result, fresh } => self.finish_pr_action(token, result, fresh.map(|p| *p), deps),
+            AppEvent::WiActionDone { token, result, fresh } => self.finish_wi_action(token, result, fresh.map(|w| *w), deps),
             AppEvent::PipelineAnnotationsLoaded { key, annotations } => self.apply_pipeline_annotations(deps, key, annotations),
         }
         self.drive_logs(deps);
@@ -5111,6 +5135,7 @@ impl App {
         // because a pool kept from an earlier reload still has to repaint what is on screen.
         self.take_pr_pool(r.pr_pool, sections_ok, deps);
         take_section(&mut self.wis, r.wis, sections_ok.wis);
+        self.settle_held_edits();
         take_section(&mut self.pipes, r.pipes, sections_ok.pipes);
         if !self.held_runs.is_empty() {
             for i in 0..self.pipes.len() {
@@ -5210,6 +5235,7 @@ impl App {
         if ok.prs || pool_incoming {
             self.pr_pool = pool;
             self.pr_pool_loaded = true;
+            self.settle_held_votes();
             self.pr_decor_failed.clear();
             // Rows this reload no longer returns must not keep a stale decoration alive; the
             // map is only meaningful for rows the pool still holds.
@@ -5319,6 +5345,10 @@ impl App {
         if deps.cache.put(&key, &detail, fetched_at) == CachePut::Stale {
             return;
         }
+        // Comments posted from here that the provider hasn't listed yet stay on screen. After
+        // the write-through: the cache holds only what the provider said.
+        let mut detail = detail;
+        self.settle_held_comments(&key, &mut detail.threads);
         let Screen::PrView(v) = &mut self.screen else { return };
         if pr_detail_cache_key(&v.connection_id, &v.pr.item_ref()) != key {
             return;
@@ -5443,6 +5473,8 @@ impl App {
             // See `apply_pr_detail`: a newer entry already won, so the screen must not go back.
             return;
         }
+        let mut detail = detail;
+        self.settle_held_comments(&key, &mut detail.threads);
         let Screen::WiView(v) = &mut self.screen else { return };
         if wi_detail_cache_key(&v.connection_id, &v.wi.item_ref()) != key {
             return;
@@ -5633,19 +5665,6 @@ impl App {
         });
     }
 
-    /// Refetches the pool and repaints every derived PR view. Used after a mutation the
-    /// provider has already accepted, where the rows on screen are known to be behind.
-    ///
-    /// A failed fetch leaves the existing pool alone rather than blanking the lists — the rows
-    /// are stale, not wrong, and the error is surfaced separately.
-    async fn reload_pr_pool(&mut self, deps: &AppDeps, errors: &mut Vec<String>) {
-        let (pool, ok) = fetch_pr_pool(deps, errors).await;
-        if ok {
-            self.pr_pool = pool;
-        }
-        self.refresh_derived_prs(deps);
-    }
-
     /// The rows one PR view shows, derived from the pool and decorated from what we hold.
     fn derive_pr_rows(&self, filter: PullRequestFilter, completed: bool) -> Vec<PrRow> {
         let mut rows = derive_pool_rows(&self.pr_pool, filter, completed);
@@ -5748,37 +5767,6 @@ impl App {
             }
         }
         self.refresh_derived_prs(deps);
-    }
-
-    async fn reload_work_items(&mut self, deps: &AppDeps, errors: &mut Vec<String>) {
-        let before = errors.len();
-        let mut rows = Vec::new();
-        match deps.sections.work_item_feeds().await {
-            Ok(feeds) => {
-                for feed in feeds {
-                    let (provider, name, conn_id) = feed_tag(&feed.connection);
-                    match feed.source.list(&wi_query()).await {
-                        Ok(list) => rows.extend(list.into_iter().map(|wi| WiRow {
-                            connection_id: conn_id.clone(),
-                            connection: name.clone(),
-                            provider,
-                            wi,
-                        })),
-                        Err(e) => push_reload_error(
-                            errors,
-                            format!("Work items ({name}): {e}"),
-                            DIAG_RELOAD_WORK_ITEMS,
-                        ),
-                    }
-                }
-            }
-            Err(e) => push_reload_error(
-                errors,
-                format!("Work items: {e}"),
-                DIAG_RELOAD_WORK_ITEMS,
-            ),
-        }
-        take_inline_section(&mut self.wis, rows, errors, before);
     }
 
     async fn reload_pipelines(&mut self, deps: &AppDeps, errors: &mut Vec<String>) {
@@ -6420,6 +6408,8 @@ impl App {
                 _ => Err("Switch to the Conversation or Diff tab to reply to a comment"),
             }
         };
+        // A comment still on its way to the provider has no thread there to reply to yet.
+        let target = target.and_then(|id| if is_local(&id) { Err("That comment is still being posted — reply in a moment") } else { Ok(id) });
         match target {
             Ok(thread_id) => {
                 if let Screen::PrView(v) = &mut self.screen {
@@ -6479,37 +6469,17 @@ impl App {
         }
     }
 
-    /// Submits the buffered line comments as one review with `event`.
+    /// Submits the buffered line comments as one review with `event`. Optimistic, like
+    /// [`App::execute_pr_action`]: the comments leave the buffer and show on the diff at once.
     async fn submit_review(&mut self, event: ReviewVote, deps: &AppDeps) {
         let (item, comments, conn_id) = match &self.screen {
             Screen::PrView(v) => (v.pr.item_ref(), v.pending.clone(), v.connection_id.clone()),
             _ => return,
         };
-        let pr_id = item.id.clone();
         if comments.is_empty() {
             return;
         }
-        let source = match self.pr_source_for(&conn_id, deps).await {
-            Some(s) => s,
-            None => {
-                self.toast = Some("No pull-request provider is bound".into());
-                return;
-            }
-        };
-        match source.submit_review(&item, event, &comments).await {
-            Ok(()) => {
-                let threads = detail_or_default(source.threads(&item).await, DIAG_PR_THREADS);
-                if let Screen::PrView(v) = &mut self.screen {
-                    v.pending.clear();
-                    v.review_draft = None;
-                    v.diff.threads = threads;
-                }
-                // You've reviewed it — it no longer needs you on the Launchpad.
-                self.dismiss_from_launchpad(&conn_id, &pr_id);
-                self.toast = Some(format!("Review submitted ({} comment(s))", comments.len()));
-            }
-            Err(e) => self.toast_error(format!("Submit failed: {e}")),
-        }
+        self.send_pr_call(conn_id, item, PrCall::Review { event, comments }, deps).await;
     }
 
     /// Loads the selected commit's diff into the diff view and jumps to the Diff tab.
@@ -9138,6 +9108,11 @@ impl App {
         }
     }
 
+    /// Runs a confirmed PR write. Optimistic: what the write decides on its own — your vote, your
+    /// comment or reply — shows on the open PR and its list rows straight away, the provider is
+    /// asked in the background (its answer comes back as [`AppEvent::PrActionDone`]), and a
+    /// refusal takes it back. A merge or revert changes nothing up front: whether it happens is
+    /// the provider's call, so it is reported once the provider has made it.
     async fn execute_pr_action(&mut self, action: Action, deps: &AppDeps) {
         // Resolve the PR + its connection from the open view, else the selected row.
         // Address the PR by repository + id: `#7` alone doesn't say which repository's #7 to
@@ -9150,79 +9125,202 @@ impl App {
             self.toast = Some("Nothing selected".into());
             return;
         };
-        let id = item.id.clone();
-        let source = match self.pr_source_for(&conn_id, deps).await {
-            Some(s) => s,
-            None => {
-                self.toast = Some("No pull-request provider is bound".into());
-                return;
-            }
-        };
-
-        let result = match &action {
-            Action::PrVote(vote) => source.vote(&item, *vote).await.map(|_| vote_message(*vote).to_string()),
-            Action::PrMerge(strategy) => source
-                .merge(&item, &MergeOptions { strategy: *strategy, delete_source_ref: false })
-                .await
-                .map(|_| format!("Merged ({strategy:?})")),
-            Action::PrRevert => source.revert(&item).await.map(|_| "Revert requested".to_string()),
+        let call = match action {
+            Action::PrVote(vote) => PrCall::Vote(vote),
+            Action::PrMerge(strategy) => PrCall::Merge(strategy),
+            Action::PrRevert => PrCall::Revert,
             Action::PrComment(text) => {
                 if text.trim().is_empty() {
                     self.toast = Some("Empty comment — nothing sent".into());
                     return;
                 }
-                source.add_comment(&item, text).await.map(|_| "Comment added".to_string())
+                PrCall::Comment(text)
             }
             Action::PrReply(text) => {
                 if text.trim().is_empty() {
                     self.toast = Some("Empty reply — nothing sent".into());
                     return;
                 }
-                let thread_id = match &self.screen {
-                    Screen::PrView(v) => v.reply_target.clone(),
+                let thread_id = match &mut self.screen {
+                    Screen::PrView(v) => v.reply_target.take(),
                     _ => None,
                 };
                 let Some(thread_id) = thread_id else {
                     self.toast = Some("No thread selected to reply to".into());
                     return;
                 };
-                source.reply_to_thread(&item, &thread_id, text).await.map(|_| "Reply posted".to_string())
+                PrCall::Reply { thread_id, body: text }
             }
             _ => return,
         };
+        self.send_pr_call(conn_id, item, call, deps).await;
+    }
 
-        match result {
-            Ok(msg) => {
-                self.toast = Some(msg);
-                // Voting on (reviewing) or merging a PR clears it from the Launchpad now.
-                if matches!(action, Action::PrVote(_) | Action::PrMerge(_)) {
-                    self.dismiss_from_launchpad(&conn_id, &id);
+    /// Shows `call`'s outcome where it is the user's to decide, then sends it in the background.
+    async fn send_pr_call(&mut self, conn_id: String, item: ItemRef, call: PrCall, deps: &AppDeps) {
+        let token = self.next_item_action;
+        self.next_item_action += 1;
+        let key = pr_detail_cache_key(&conn_id, &item);
+        let me = self.me_on(&conn_id);
+        let mut pending = PendingItemAction::new(conn_id.clone(), item.clone(), key.clone());
+        let (now_msg, done) = match &call {
+            PrCall::Vote(vote) => (Some(vote_message(*vote).to_string()), vote_message(*vote).to_string()),
+            PrCall::Merge(strategy) => (Some("Merging…".to_string()), format!("Merged ({strategy:?})")),
+            PrCall::Revert => (Some("Requesting a revert…".to_string()), "Revert requested".to_string()),
+            PrCall::Comment(_) => (Some("Comment added".to_string()), "Comment added".to_string()),
+            PrCall::Reply { .. } => (Some("Reply posted".to_string()), "Reply posted".to_string()),
+            PrCall::Review { comments, .. } => {
+                let msg = format!("Review submitted ({} comment(s))", comments.len());
+                (Some(msg.clone()), msg)
+            }
+        };
+        pending.done = done;
+        pending.merge = matches!(call, PrCall::Merge(_));
+        if matches!(call, PrCall::Review { .. }) {
+            pending.failed = "Submit failed";
+        }
+
+        // Your verdict: a vote, or the event a review is submitted with.
+        let vote = match &call {
+            PrCall::Vote(vote) => Some(*vote),
+            PrCall::Review { event, .. } if *event != ReviewVote::NoVote => Some(*event),
+            _ => None,
+        };
+        if let (Some(vote), Some(me)) = (vote, me.as_deref()) {
+            pending.reviewers = self.shown_pr(&conn_id, &item).map(|pr| pr.reviewers.clone());
+            self.patch_pr(&conn_id, &item, |pr| set_vote(pr, me, vote));
+            self.hold(&key).vote = Some((token, me.to_string(), vote));
+        }
+        // Reviewing a PR clears it from the Launchpad now; a merge waits for the provider.
+        if matches!(call, PrCall::Vote(_) | PrCall::Review { .. }) {
+            pending.dismissed = self.lp_dismissed.insert(launchpad::Entry::key(&conn_id, &item.id));
+            self.rebuild_launchpad();
+        }
+
+        let author = me_user(me.as_deref());
+        let local = |n: usize| format!("{}{n}", local_prefix(token));
+        let held: Vec<HeldComment> = match &call {
+            PrCall::Comment(body) => vec![HeldComment::Thread(CommentThread {
+                id: local(0),
+                comments: vec![Comment { id: local(0), author: author.clone(), body: body.clone(), created_at: Some(Utc::now()) }],
+                file_path: None,
+                line: None,
+                is_resolved: false,
+            })],
+            PrCall::Reply { thread_id, body } => vec![HeldComment::Reply {
+                thread_id: thread_id.clone(),
+                comment: Comment { id: local(0), author: author.clone(), body: body.clone(), created_at: Some(Utc::now()) },
+            }],
+            PrCall::Review { comments, .. } => comments
+                .iter()
+                .enumerate()
+                .map(|(n, c)| {
+                    HeldComment::Thread(CommentThread {
+                        id: local(n),
+                        comments: vec![Comment { id: local(n), author: author.clone(), body: c.body.clone(), created_at: Some(Utc::now()) }],
+                        file_path: Some(c.path.clone()),
+                        line: Some(c.line),
+                        is_resolved: false,
+                    })
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        if let PrCall::Review { .. } = &call {
+            for v in self.item_views_mut() {
+                if let Screen::PrView(v) = v {
+                    if v.connection_id == conn_id && v.pr.item_ref() == item {
+                        pending.pending = std::mem::take(&mut v.pending);
+                        v.review_draft = None;
+                    }
                 }
-                // Reflect the change in the open PR view: re-fetch the PR (status / reviewers
-                // / mergeable) and its threads (a new comment), like the work-item handler.
-                if matches!(&self.screen, Screen::PrView(v) if v.pr.id == id) {
-                    let fresh = detail_or_none(source.get(&item).await, DIAG_PR_DETAIL);
-                    let threads = detail_or_default(source.threads(&item).await, DIAG_PR_THREADS);
-                    let timeline = detail_or_none(source.timeline(&item).await, DIAG_PR_TIMELINE);
-                    if let Screen::PrView(v) = &mut self.screen {
-                        if let Some(pr) = fresh {
-                            v.pr = pr;
-                        }
-                        v.diff.threads = threads;
-                        v.reply_target = None;
-                        if let Some(timeline) = timeline {
-                            v.timeline = timeline;
+            }
+        }
+        if !held.is_empty() {
+            for v in self.item_views_mut() {
+                if let Screen::PrView(v) = v {
+                    if v.connection_id == conn_id && v.pr.item_ref() == item {
+                        for h in &held {
+                            h.show_on(&mut v.diff.threads);
                         }
                     }
                 }
-                let mut errors = Vec::new();
-                self.reload_pr_pool(deps, &mut errors).await;
-                self.fix_selection();
-                if let Some(e) = errors.first() {
-                    self.toast = Some(e.clone());
-                }
             }
-            Err(e) => self.toast_error(format!("Failed: {e}")),
+            let seen = self.shown_threads(&key);
+            let hold = self.hold(&key);
+            hold.comments.extend(held.into_iter().map(|h| h.counted(&seen)));
+        }
+        if let Some(msg) = now_msg {
+            self.toast = Some(msg);
+        }
+        self.item_actions.insert(token, pending);
+
+        let Some(tx) = self.job_tx.clone() else {
+            // No event loop to answer on (a bare harness): ask inline.
+            let (result, fresh) = pr_action_call(deps, &conn_id, &item, &call).await;
+            self.finish_pr_action(token, result, fresh, deps);
+            return;
+        };
+        let deps = deps.clone();
+        tokio::spawn(async move {
+            let (result, fresh) = pr_action_call(&deps, &conn_id, &item, &call).await;
+            let _ = tx.send(AppEvent::PrActionDone { token, result, fresh: fresh.map(Box::new) });
+        });
+    }
+
+    /// Folds in the provider's answer to a PR write.
+    fn finish_pr_action(&mut self, token: u64, result: std::result::Result<(), String>, fresh: Option<PullRequest>, deps: &AppDeps) {
+        let Some(pending) = self.item_actions.remove(&token) else { return };
+        let PendingItemAction { conn_id, item, key, done, failed, reviewers, pending: comments, dismissed, merge, .. } = pending;
+        match result {
+            Err(e) => {
+                let prefix = local_prefix(token);
+                if let Some(hold) = self.held_items.get_mut(&key) {
+                    hold.forget(token);
+                }
+                self.prune_holds();
+                if let Some(reviewers) = reviewers {
+                    self.patch_pr(&conn_id, &item, |pr| pr.reviewers = reviewers.clone());
+                }
+                for v in self.item_views_mut() {
+                    if let Screen::PrView(v) = v {
+                        if v.connection_id == conn_id && v.pr.item_ref() == item {
+                            drop_local(&mut v.diff.threads, &prefix);
+                            // The review's comments go back in the buffer, ahead of any added since.
+                            if !comments.is_empty() {
+                                let added = std::mem::take(&mut v.pending);
+                                v.pending = comments.iter().cloned().chain(added).collect();
+                            }
+                        }
+                    }
+                }
+                if dismissed {
+                    self.lp_dismissed.remove(&launchpad::Entry::key(&conn_id, &item.id));
+                    self.rebuild_launchpad();
+                }
+                self.toast_error(format!("{failed}: {e}"));
+            }
+            Ok(()) => {
+                if merge {
+                    self.dismiss_from_launchpad(&conn_id, &item.id);
+                }
+                self.toast = Some(done);
+                // The provider's own copy of the PR (status / reviewers / mergeable), with any
+                // vote it hasn't caught up with yet still showing.
+                if let Some(mut fresh) = fresh {
+                    self.settle_vote(&key, &mut fresh);
+                    for v in self.item_views_mut() {
+                        if let Screen::PrView(v) = v {
+                            if v.connection_id == conn_id && v.pr.item_ref() == item {
+                                v.pr = fresh.clone();
+                            }
+                        }
+                    }
+                }
+                // Threads (the new comment) and the timeline come back with the view's detail.
+                self.refresh_item_views(&key, deps);
+                self.reload_after_write(deps);
+            }
         }
     }
 
@@ -9238,26 +9336,6 @@ impl App {
 
     fn selected_wi(&self) -> Option<&WorkItem> {
         self.selected_wi_row().map(|r| &r.wi)
-    }
-
-    /// Reflects an accepted state change on the open work item *and* the list row behind it.
-    ///
-    /// Both, because an action taken from the drill-in that only patched the view would be undone
-    /// on the screen the user presses Esc back to. `state_category` is deliberately left alone:
-    /// which bucket a state name falls in (Backlog/Active/Done) is decided by each provider's
-    /// mapper, not derivable from the name here — the reload that follows is what settles it, and
-    /// is also the resync if the write turns out to have been rejected.
-    fn apply_wi_state(&mut self, conn_id: &str, item: &ItemRef, state: &str) {
-        if let Screen::WiView(v) = &mut self.screen {
-            v.wi.state = state.to_string();
-        }
-        // Matched on the whole `ItemRef`, not the bare id: across a multi-repository connection
-        // the same id names more than one item.
-        for row in self.wis.iter_mut().filter(|r| r.connection_id == conn_id && &r.wi.item_ref() == item) {
-            row.wi.state = state.to_string();
-        }
-        // The Command Center's YourWork bucket reads the work-item rows, so it has to be rebuilt.
-        self.rebuild_launchpad();
     }
 
     /// Resolves the work-item source backing a specific connection (per-row actions).
@@ -9381,12 +9459,19 @@ impl App {
         }
     }
 
-    /// Reflects an accepted edit on the open work item and on the list row behind it, like
-    /// [`App::apply_wi_state`] does for a state change.
+    /// Reflects an edit on the open work item (or its preview) *and* the list row behind it.
+    ///
+    /// Both, because an action taken from the drill-in that only patched the view would be undone
+    /// on the screen the user presses Esc back to. A state change leaves `state_category` alone:
+    /// which bucket a state name falls in (Backlog/Active/Done) is decided by each provider's
+    /// mapper, not derivable from the name here — the provider's copy re-read after the write is
+    /// what settles it.
     fn patch_wi(&mut self, conn_id: &str, item: &ItemRef, edit: impl Fn(&mut WorkItem)) {
-        if let Screen::WiView(v) = &mut self.screen {
-            if v.connection_id == conn_id && &v.wi.item_ref() == item {
-                edit(&mut v.wi);
+        for v in self.item_views_mut() {
+            if let Screen::WiView(v) = v {
+                if v.connection_id == conn_id && &v.wi.item_ref() == item {
+                    edit(&mut v.wi);
+                }
             }
         }
         for row in self.wis.iter_mut().filter(|r| r.connection_id == conn_id && &r.wi.item_ref() == item) {
@@ -9395,6 +9480,10 @@ impl App {
         self.rebuild_launchpad();
     }
 
+    /// Runs a work-item write. Optimistic, like [`App::execute_pr_action`]: the edit or comment
+    /// shows on the open item and its list row straight away, the provider is asked in the
+    /// background (its answer comes back as [`AppEvent::WiActionDone`]), and a refusal puts the
+    /// item back as it was.
     async fn execute_wi_action(&mut self, action: Action, deps: &AppDeps) {
         let target = match &self.screen {
             Screen::WiView(v) => Some((v.wi.item_ref(), v.connection_id.clone())),
@@ -9404,84 +9493,316 @@ impl App {
             self.toast = Some("Nothing selected".into());
             return;
         };
-        let source = match self.wi_source_for(&conn_id, deps).await {
-            Some(s) => s,
-            None => {
-                self.toast = Some("No work-item provider is bound".into());
-                return;
-            }
-        };
-
-        let result = match &action {
-            Action::WiSetState(state) => source.set_state(&item, state).await.map(|_| format!("State → {state}")),
+        let (call, done) = match action {
+            Action::WiSetState(state) => (WiCall::Edit(WiEdit::State(state.clone())), format!("State → {state}")),
             Action::WiComment(text) => {
                 if text.trim().is_empty() {
                     self.toast = Some("Empty comment — nothing sent".into());
                     return;
                 }
-                source.add_comment(&item, text).await.map(|_| "Comment added".to_string())
+                (WiCall::Comment(text), "Comment added".to_string())
             }
-            Action::WiAssign { id, label } => source.set_assignee(&item, id.as_deref()).await.map(|_| match id {
-                Some(_) => format!("Assigned to {label}"),
-                None => "Unassigned".to_string(),
-            }),
+            Action::WiAssign { id, label } => {
+                let done = match &id {
+                    Some(_) => format!("Assigned to {label}"),
+                    None => "Unassigned".to_string(),
+                };
+                let assignee = id.map(|id| User { id, display_name: label, handle: None, avatar_url: None });
+                (WiCall::Edit(WiEdit::Assignee(assignee)), done)
+            }
             Action::WiSetTitle(title) => {
                 let title = title.trim();
                 if title.is_empty() {
                     self.toast = Some("A title can't be empty — nothing sent".into());
                     return;
                 }
-                source.update_fields(&item, Some(title), None).await.map(|_| "Title updated".to_string())
+                (WiCall::Edit(WiEdit::Title(title.to_string())), "Title updated".to_string())
             }
-            Action::WiSetDescription(text) => {
-                source.update_fields(&item, None, Some(text)).await.map(|_| "Description updated".to_string())
-            }
+            Action::WiSetDescription(text) => (WiCall::Edit(WiEdit::Description(text)), "Description updated".to_string()),
             _ => return,
         };
 
+        let token = self.next_item_action;
+        self.next_item_action += 1;
+        let key = wi_detail_cache_key(&conn_id, &item);
+        let mut pending = PendingItemAction::new(conn_id.clone(), item.clone(), key.clone());
+        match &call {
+            WiCall::Edit(edit) => {
+                pending.wi = self.shown_wi(&conn_id, &item).cloned();
+                let edit = edit.clone();
+                self.patch_wi(&conn_id, &item, |wi| edit.apply(wi));
+                self.hold(&key).edits.push((token, edit));
+            }
+            WiCall::Comment(body) => {
+                let id = format!("{}0", local_prefix(token));
+                let author = me_user(self.me_on(&conn_id).as_deref());
+                let held = HeldComment::Thread(CommentThread {
+                    id: id.clone(),
+                    comments: vec![Comment { id, author, body: body.clone(), created_at: Some(Utc::now()) }],
+                    file_path: None,
+                    line: None,
+                    is_resolved: false,
+                });
+                for v in self.item_views_mut() {
+                    if let Screen::WiView(v) = v {
+                        if v.connection_id == conn_id && v.wi.item_ref() == item {
+                            held.show_on(&mut v.threads);
+                        }
+                    }
+                }
+                let seen = self.shown_threads(&key);
+                let held = held.counted(&seen);
+                self.hold(&key).comments.push(held);
+            }
+        }
+        self.toast = Some(done.clone());
+        pending.done = done;
+        self.item_actions.insert(token, pending);
+
+        let Some(tx) = self.job_tx.clone() else {
+            // No event loop to answer on (a bare harness): ask inline.
+            let (result, fresh) = wi_action_call(deps, &conn_id, &item, &call).await;
+            self.finish_wi_action(token, result, fresh, deps);
+            return;
+        };
+        let deps = deps.clone();
+        tokio::spawn(async move {
+            let (result, fresh) = wi_action_call(&deps, &conn_id, &item, &call).await;
+            let _ = tx.send(AppEvent::WiActionDone { token, result, fresh: fresh.map(Box::new) });
+        });
+    }
+
+    /// Folds in the provider's answer to a work-item write.
+    fn finish_wi_action(&mut self, token: u64, result: std::result::Result<(), String>, fresh: Option<WorkItem>, deps: &AppDeps) {
+        let Some(pending) = self.item_actions.remove(&token) else { return };
+        let PendingItemAction { conn_id, item, key, done: _, failed, wi, .. } = pending;
         match result {
-            Ok(msg) => {
-                self.toast = Some(msg);
-                match &action {
-                    Action::WiSetState(state) => self.apply_wi_state(&conn_id, &item, state),
-                    Action::WiAssign { id, label } => {
-                        let assignee = id.as_ref().map(|id| User {
-                            id: id.clone(),
-                            display_name: label.clone(),
-                            handle: None,
-                            avatar_url: None,
-                        });
-                        self.patch_wi(&conn_id, &item, |wi| wi.assignee = assignee.clone());
-                    }
-                    Action::WiSetTitle(title) => {
-                        let title = title.trim().to_string();
-                        self.patch_wi(&conn_id, &item, |wi| wi.title = title.clone());
-                    }
-                    Action::WiSetDescription(text) => self.patch_wi(&conn_id, &item, |wi| wi.description = Some(text.clone())),
-                    _ => {}
+            Err(e) => {
+                let undo = self.held_items.get_mut(&key).and_then(|hold| hold.forget(token));
+                self.prune_holds();
+                // Only the field this edit changed goes back: anything else on the item may
+                // have moved on since.
+                if let (Some(edit), Some(before)) = (undo, wi) {
+                    let back = edit.undo(&before);
+                    self.patch_wi(&conn_id, &item, |wi| back.apply(wi));
                 }
-                if matches!(action, Action::WiComment(_)) {
-                    let threads = detail_or_default(source.threads(&item).await, DIAG_WI_THREADS);
-                    if let Screen::WiView(v) = &mut self.screen {
-                        v.threads = threads;
+                let prefix = local_prefix(token);
+                for v in self.item_views_mut() {
+                    if let Screen::WiView(v) = v {
+                        if v.connection_id == conn_id && v.wi.item_ref() == item {
+                            drop_local(&mut v.threads, &prefix);
+                        }
                     }
                 }
-                // Every write lands in the item's history, so the Activity section is re-read too.
-                // A failed read keeps what is on screen rather than blanking it.
-                if let Some(timeline) = detail_or_none(source.timeline(&item).await, DIAG_WI_TIMELINE) {
-                    if let Screen::WiView(v) = &mut self.screen {
-                        v.timeline = timeline;
+                self.toast_error(format!("{failed}: {e}"));
+            }
+            Ok(()) => {
+                // The provider's own copy settles what can't be guessed here — which bucket a
+                // state name falls in is each provider mapper's call.
+                if let Some(mut fresh) = fresh {
+                    self.settle_edits(&key, &mut fresh);
+                    for v in self.item_views_mut() {
+                        if let Screen::WiView(v) = v {
+                            if v.connection_id == conn_id && v.wi.item_ref() == item {
+                                v.wi = fresh.clone();
+                            }
+                        }
                     }
+                    for row in self.wis.iter_mut().filter(|r| r.connection_id == conn_id && r.wi.item_ref() == item) {
+                        row.wi = fresh.clone();
+                    }
+                    self.rebuild_launchpad();
                 }
-                let mut errors = Vec::new();
-                self.reload_work_items(deps, &mut errors).await;
-                self.fix_selection();
-                if let Some(e) = errors.first() {
-                    self.toast = Some(e.clone());
+                // Every write lands in the item's history, so the Activity section is re-read.
+                self.refresh_item_views(&key, deps);
+                self.reload_after_write(deps);
+            }
+        }
+    }
+
+    // ---- optimistic PR / work-item writes: shared plumbing ----
+
+    /// The open item view and the preview's, either of which can show the item a write is for.
+    fn item_views_mut(&mut self) -> impl Iterator<Item = &mut Screen> {
+        std::iter::once(&mut self.screen).chain(self.preview.as_mut().map(|p| &mut p.view))
+    }
+
+    /// The signed-in user's handle on `conn_id`, when the last PR fetch established one.
+    fn me_on(&self, conn_id: &str) -> Option<String> {
+        self.pr_pool.me.get(conn_id).cloned().flatten()
+    }
+
+    /// The hold for the item whose detail key is `key`, started now if there was none.
+    fn hold(&mut self, key: &str) -> &mut ItemHold {
+        let until = Utc::now() + chrono::Duration::seconds(ITEM_HOLD_SECS);
+        let hold = self.held_items.entry(key.to_string()).or_insert_with(|| ItemHold::new(until));
+        hold.until = until;
+        hold
+    }
+
+    /// The hold for `key`, unless it has run out (then it is dropped).
+    fn live_hold(&mut self, key: &str) -> Option<&mut ItemHold> {
+        if self.held_items.get(key).is_some_and(|h| Utc::now() > h.until) {
+            self.held_items.remove(key);
+        }
+        self.held_items.get_mut(key)
+    }
+
+    /// The PR as shown: the open view's copy, else its list row's.
+    fn shown_pr(&self, conn_id: &str, item: &ItemRef) -> Option<&PullRequest> {
+        let views = std::iter::once(&self.screen).chain(self.preview.as_ref().map(|p| &p.view));
+        views
+            .filter_map(|s| match s {
+                Screen::PrView(v) if v.connection_id == conn_id && &v.pr.item_ref() == item => Some(&v.pr),
+                _ => None,
+            })
+            .next()
+            .or_else(|| self.pr_pool.open.iter().chain(&self.pr_pool.completed).chain(&self.prs).find(|r| r.connection_id == conn_id && &r.pr.item_ref() == item).map(|r| &r.pr))
+    }
+
+    /// The work item as shown: the open view's copy, else its list row's.
+    fn shown_wi(&self, conn_id: &str, item: &ItemRef) -> Option<&WorkItem> {
+        let views = std::iter::once(&self.screen).chain(self.preview.as_ref().map(|p| &p.view));
+        views
+            .filter_map(|s| match s {
+                Screen::WiView(v) if v.connection_id == conn_id && &v.wi.item_ref() == item => Some(&v.wi),
+                _ => None,
+            })
+            .next()
+            .or_else(|| self.wis.iter().find(|r| r.connection_id == conn_id && &r.wi.item_ref() == item).map(|r| &r.wi))
+    }
+
+    /// The threads on screen for the item whose detail key is `key` (empty when it isn't open).
+    fn shown_threads(&self, key: &str) -> Vec<CommentThread> {
+        let views = std::iter::once(&self.screen).chain(self.preview.as_ref().map(|p| &p.view));
+        views
+            .filter_map(|s| match s {
+                Screen::PrView(v) if pr_detail_cache_key(&v.connection_id, &v.pr.item_ref()) == key => Some(v.diff.threads.clone()),
+                Screen::WiView(v) if wi_detail_cache_key(&v.connection_id, &v.wi.item_ref()) == key => Some(v.threads.clone()),
+                _ => None,
+            })
+            .next()
+            .unwrap_or_default()
+    }
+
+    /// Applies `edit` to the PR wherever it is shown — the open view, the preview, the pool and
+    /// every list derived from it — so the screen the user goes back to agrees with this one.
+    fn patch_pr(&mut self, conn_id: &str, item: &ItemRef, edit: impl Fn(&mut PullRequest)) {
+        for v in self.item_views_mut() {
+            if let Screen::PrView(v) = v {
+                if v.connection_id == conn_id && &v.pr.item_ref() == item {
+                    edit(&mut v.pr);
                 }
             }
-            Err(e) => self.toast_error(format!("Failed: {e}")),
         }
+        let rows = self
+            .pr_pool
+            .open
+            .iter_mut()
+            .chain(self.pr_pool.completed.iter_mut())
+            .chain(self.prs.iter_mut())
+            .chain(self.lp_prs_mine.iter_mut())
+            .chain(self.lp_prs_review.iter_mut());
+        for row in rows.filter(|r| r.connection_id == conn_id && &r.pr.item_ref() == item) {
+            edit(&mut row.pr);
+        }
+        self.rebuild_launchpad();
+    }
+
+    /// Shows a held vote on a refreshed copy of its PR, until the provider's copy shows it too.
+    fn settle_vote(&mut self, key: &str, pr: &mut PullRequest) {
+        let Some(hold) = self.live_hold(key) else { return };
+        if let Some((_, me, vote)) = hold.vote.clone() {
+            if has_vote(pr, &me, vote) {
+                hold.vote = None;
+            } else {
+                set_vote(pr, &me, vote);
+            }
+        }
+        self.prune_holds();
+    }
+
+    /// Re-applies held votes to a freshly landed PR pool.
+    fn settle_held_votes(&mut self) {
+        if self.held_items.is_empty() {
+            return;
+        }
+        let mut pool = std::mem::take(&mut self.pr_pool);
+        // Settled per PR, not per row: the open and completed lists can both hold one, and the
+        // second must not be read as caught up because the first cleared the hold.
+        let mut caught_up = HashSet::new();
+        for row in pool.open.iter_mut().chain(pool.completed.iter_mut()) {
+            let key = pr_detail_cache_key(&row.connection_id, &row.pr.item_ref());
+            let Some(hold) = self.live_hold(&key) else { continue };
+            let Some((_, me, vote)) = hold.vote.clone() else { continue };
+            if has_vote(&row.pr, &me, vote) {
+                caught_up.insert(key);
+            } else {
+                set_vote(&mut row.pr, &me, vote);
+            }
+        }
+        for key in caught_up {
+            if let Some(hold) = self.held_items.get_mut(&key) {
+                hold.vote = None;
+            }
+        }
+        self.pr_pool = pool;
+        self.prune_holds();
+    }
+
+    /// Re-applies held edits to a work item's refreshed copy, until it shows them itself.
+    fn settle_edits(&mut self, key: &str, wi: &mut WorkItem) {
+        let Some(hold) = self.live_hold(key) else { return };
+        hold.edits.retain(|(_, e)| !e.shown_by(wi));
+        for (_, e) in &hold.edits {
+            e.apply(wi);
+        }
+        self.prune_holds();
+    }
+
+    /// Re-applies held edits to freshly landed work-item rows.
+    fn settle_held_edits(&mut self) {
+        if self.held_items.is_empty() {
+            return;
+        }
+        let mut wis = std::mem::take(&mut self.wis);
+        for row in &mut wis {
+            let key = wi_detail_cache_key(&row.connection_id, &row.wi.item_ref());
+            self.settle_edits(&key, &mut row.wi);
+        }
+        self.wis = wis;
+    }
+
+    /// Puts held comments the provider hasn't listed yet onto `threads`; forgets those it has.
+    fn settle_held_comments(&mut self, key: &str, threads: &mut Vec<CommentThread>) {
+        let Some(hold) = self.live_hold(key) else { return };
+        hold.comments.retain(|h| !h.listed_in(threads));
+        for h in &hold.comments {
+            h.show_on(threads);
+        }
+        self.prune_holds();
+    }
+
+    /// Drops holds with nothing left to hold.
+    fn prune_holds(&mut self) {
+        self.held_items.retain(|_, h| h.vote.is_some() || !h.edits.is_empty() || !h.comments.is_empty());
+    }
+
+    /// Re-asks for the detail of every view showing the item whose detail key is `key`.
+    fn refresh_item_views(&self, key: &str, deps: &AppDeps) {
+        let views = std::iter::once(&self.screen).chain(self.preview.as_ref().map(|p| &p.view));
+        for request in views.filter_map(DetailRequest::for_view).filter(|r| r.key() == key) {
+            self.send_detail_request(deps, request);
+        }
+    }
+
+    /// A refresh after a write. One already out was asked for before the write, so it can't
+    /// show it: another follows it.
+    fn reload_after_write(&mut self, deps: &AppDeps) {
+        if self.reloading {
+            self.reload_again = true;
+        }
+        self.request_reload(deps);
     }
 }
 
@@ -9685,6 +10006,313 @@ struct RunHold {
 /// How long an optimistic rerun or cancel is held against a provider still reporting the old
 /// state.
 const RUN_HOLD_SECS: i64 = 60;
+
+/// A PR write, as sent to the provider.
+enum PrCall {
+    Vote(ReviewVote),
+    Merge(MergeStrategy),
+    Revert,
+    Comment(String),
+    Reply { thread_id: String, body: String },
+    Review { event: ReviewVote, comments: Vec<LineComment> },
+}
+
+/// A work-item write, as sent to the provider.
+enum WiCall {
+    Edit(WiEdit),
+    Comment(String),
+}
+
+/// A work-item field change, applied on screen before the provider has it.
+#[derive(Clone)]
+enum WiEdit {
+    State(String),
+    Assignee(Option<User>),
+    Title(String),
+    Description(String),
+}
+
+impl WiEdit {
+    fn apply(&self, wi: &mut WorkItem) {
+        match self {
+            WiEdit::State(state) => wi.state = state.clone(),
+            WiEdit::Assignee(user) => wi.assignee = user.clone(),
+            WiEdit::Title(title) => wi.title = title.clone(),
+            WiEdit::Description(text) => wi.description = Some(text.clone()),
+        }
+    }
+
+    /// Whether a copy of the item from the provider already shows this edit. An assignee is
+    /// matched by id or name, since a provider's item mapper and its assignable-users mapper
+    /// needn't use the same id (see [`assignee_picker`]).
+    fn shown_by(&self, wi: &WorkItem) -> bool {
+        match self {
+            WiEdit::State(state) => &wi.state == state,
+            WiEdit::Assignee(None) => wi.assignee.is_none(),
+            WiEdit::Assignee(Some(u)) => wi.assignee.as_ref().is_some_and(|a| a.id == u.id || a.display_name == u.display_name),
+            WiEdit::Title(title) => &wi.title == title,
+            WiEdit::Description(text) => wi.description.as_deref() == Some(text.as_str()),
+        }
+    }
+
+    /// The edit that puts back what this one replaced on `before`.
+    fn undo(&self, before: &WorkItem) -> WiEdit {
+        match self {
+            WiEdit::State(_) => WiEdit::State(before.state.clone()),
+            WiEdit::Assignee(_) => WiEdit::Assignee(before.assignee.clone()),
+            WiEdit::Title(_) => WiEdit::Title(before.title.clone()),
+            WiEdit::Description(_) => WiEdit::Description(before.description.clone().unwrap_or_default()),
+        }
+    }
+}
+
+/// A comment posted from here, shown before the provider lists it.
+#[derive(Clone)]
+enum HeldComment {
+    /// A new thread: a top-level comment, or a review's line comment.
+    Thread(CommentThread),
+    /// A reply on an existing thread.
+    Reply { thread_id: String, comment: Comment },
+    /// Either of the above, with how many comments with the same text were already listed when
+    /// it was posted — so it is caught up once one more is, and posting "LGTM" twice holds the
+    /// second until the provider has two.
+    Counted { held: Box<HeldComment>, seen: usize },
+}
+
+impl HeldComment {
+    fn comment(&self) -> Option<&Comment> {
+        match self {
+            HeldComment::Thread(t) => t.comments.first(),
+            HeldComment::Reply { comment, .. } => Some(comment),
+            HeldComment::Counted { held, .. } => held.comment(),
+        }
+    }
+
+    /// How many comments in `threads` the provider listed with this one's text — and, when
+    /// who you are is known, by you: a teammate's identical "LGTM" isn't yours.
+    fn listed(&self, threads: &[CommentThread]) -> usize {
+        let Some(held) = self.comment() else { return 0 };
+        let body = held.body.trim();
+        let me = held.author.handle.as_deref();
+        let thread = match self {
+            HeldComment::Reply { thread_id, .. } => Some(thread_id.as_str()),
+            HeldComment::Counted { held, .. } => match held.as_ref() {
+                HeldComment::Reply { thread_id, .. } => Some(thread_id.as_str()),
+                _ => None,
+            },
+            HeldComment::Thread(_) => None,
+        };
+        threads
+            .iter()
+            .filter(|t| thread.is_none_or(|id| t.id == id))
+            .flat_map(|t| &t.comments)
+            .filter(|c| !is_local(&c.id) && c.body.trim() == body)
+            .filter(|c| me.is_none_or(|me| forgetop_core::filter::is_user(&c.author, me)))
+            .count()
+    }
+
+    /// This comment, counting what `threads` already lists like it.
+    fn counted(self, threads: &[CommentThread]) -> HeldComment {
+        let seen = self.listed(threads);
+        HeldComment::Counted { held: Box::new(self), seen }
+    }
+
+    /// Whether the provider has listed this comment in `threads`.
+    fn listed_in(&self, threads: &[CommentThread]) -> bool {
+        match self {
+            HeldComment::Counted { seen, .. } => self.listed(threads) > *seen,
+            _ => self.listed(threads) > 0,
+        }
+    }
+
+    /// Puts the comment on `threads`, unless it is already there.
+    fn show_on(&self, threads: &mut Vec<CommentThread>) {
+        match self {
+            HeldComment::Thread(t) => {
+                if !threads.iter().any(|x| x.id == t.id) {
+                    threads.push(t.clone());
+                }
+            }
+            HeldComment::Reply { thread_id, comment } => {
+                if let Some(t) = threads.iter_mut().find(|t| &t.id == thread_id) {
+                    if !t.comments.iter().any(|c| c.id == comment.id) {
+                        t.comments.push(comment.clone());
+                    }
+                }
+            }
+            HeldComment::Counted { held, .. } => held.show_on(threads),
+        }
+    }
+
+    /// The id of the placeholder this shows.
+    fn local_id(&self) -> &str {
+        match self {
+            HeldComment::Thread(t) => &t.id,
+            HeldComment::Reply { comment, .. } => &comment.id,
+            HeldComment::Counted { held, .. } => held.local_id(),
+        }
+    }
+}
+
+/// Placeholder ids start with this, then the action's token — so a refusal takes back exactly
+/// the comments its own action added.
+const LOCAL_ID: &str = "local-";
+
+fn local_prefix(token: u64) -> String {
+    format!("{LOCAL_ID}{token}-")
+}
+
+fn is_local(id: &str) -> bool {
+    id.starts_with(LOCAL_ID)
+}
+
+/// Takes the placeholders whose ids start with `prefix` off `threads`.
+fn drop_local(threads: &mut Vec<CommentThread>, prefix: &str) {
+    threads.retain(|t| !t.id.starts_with(prefix));
+    for t in threads.iter_mut() {
+        t.comments.retain(|c| !c.id.starts_with(prefix));
+    }
+}
+
+/// You, as a placeholder comment or reviewer entry shows you before the provider has.
+fn me_user(me: Option<&str>) -> User {
+    let name = me.unwrap_or("you");
+    User { id: name.to_string(), display_name: name.to_string(), handle: me.map(str::to_string), avatar_url: None }
+}
+
+/// Records `vote` as your verdict on `pr`, adding you as a reviewer if you weren't one.
+fn set_vote(pr: &mut PullRequest, me: &str, vote: ReviewVote) {
+    match pr.reviewers.iter_mut().find(|r| forgetop_core::filter::is_user(&r.user, me)) {
+        Some(r) => r.vote = vote,
+        None => pr.reviewers.push(Reviewer { user: me_user(Some(me)), vote, is_required: false }),
+    }
+}
+
+fn has_vote(pr: &PullRequest, me: &str, vote: ReviewVote) -> bool {
+    pr.reviewers.iter().any(|r| r.vote == vote && forgetop_core::filter::is_user(&r.user, me))
+}
+
+/// Optimistic changes to one PR or work item, held against refreshes that haven't caught up.
+/// Each part is let go as soon as a copy from the provider shows it, and all of it when the
+/// hold runs out — then the provider has the last word.
+struct ItemHold {
+    /// Your verdict on a PR: `(token, your handle, verdict)`.
+    vote: Option<(u64, String, ReviewVote)>,
+    /// Comments posted from here that the provider hasn't listed yet.
+    comments: Vec<HeldComment>,
+    /// Work-item edits the provider hasn't reflected yet, by token.
+    edits: Vec<(u64, WiEdit)>,
+    until: DateTime<Utc>,
+}
+
+impl ItemHold {
+    fn new(until: DateTime<Utc>) -> Self {
+        ItemHold { vote: None, comments: Vec::new(), edits: Vec::new(), until }
+    }
+
+    /// Lets go of what the refused action `token` held, returning its work-item edit.
+    fn forget(&mut self, token: u64) -> Option<WiEdit> {
+        if self.vote.as_ref().is_some_and(|(t, ..)| *t == token) {
+            self.vote = None;
+        }
+        let prefix = local_prefix(token);
+        self.comments.retain(|c| !c.local_id().starts_with(&prefix));
+        let i = self.edits.iter().position(|(t, _)| *t == token)?;
+        Some(self.edits.remove(i).1)
+    }
+}
+
+/// How long an optimistic PR or work-item change is held against a provider still reporting
+/// the old state.
+const ITEM_HOLD_SECS: i64 = 60;
+
+/// A PR or work-item write in flight: what to undo, and what to say when the provider answers.
+struct PendingItemAction {
+    conn_id: String,
+    item: ItemRef,
+    /// The item's detail cache key, which is also its hold's.
+    key: String,
+    /// What to say once the provider accepts it.
+    done: String,
+    /// How a refusal is introduced.
+    failed: &'static str,
+    /// A merge, which takes the PR off the Launchpad once the provider has done it.
+    merge: bool,
+    /// The PR's reviewers before an optimistic vote.
+    reviewers: Option<Vec<Reviewer>>,
+    /// The work item before an optimistic edit.
+    wi: Option<WorkItem>,
+    /// A review's comments, taken out of the buffer when it was sent.
+    pending: Vec<LineComment>,
+    /// This action took the PR off the Launchpad.
+    dismissed: bool,
+}
+
+impl PendingItemAction {
+    fn new(conn_id: String, item: ItemRef, key: String) -> Self {
+        PendingItemAction {
+            conn_id,
+            item,
+            key,
+            done: String::new(),
+            failed: "Failed",
+            merge: false,
+            reviewers: None,
+            wi: None,
+            pending: Vec::new(),
+            dismissed: false,
+        }
+    }
+}
+
+/// The provider call behind a PR write, and the PR re-read once it is accepted.
+async fn pr_action_call(
+    deps: &AppDeps,
+    conn_id: &str,
+    item: &ItemRef,
+    call: &PrCall,
+) -> (std::result::Result<(), String>, Option<PullRequest>) {
+    let feeds = detail_or_default(deps.sections.pull_request_feeds().await, DIAG_PR_FEEDS);
+    let Some(source) = feeds.into_iter().find(|f| f.connection.connection_id() == conn_id).map(|f| f.source) else {
+        return (Err("No pull-request provider is bound".into()), None);
+    };
+    let result = match call {
+        PrCall::Vote(vote) => source.vote(item, *vote).await,
+        PrCall::Merge(strategy) => source.merge(item, &MergeOptions { strategy: *strategy, delete_source_ref: false }).await,
+        PrCall::Revert => source.revert(item).await,
+        PrCall::Comment(body) => source.add_comment(item, body).await,
+        PrCall::Reply { thread_id, body } => source.reply_to_thread(item, thread_id, body).await,
+        PrCall::Review { event, comments } => source.submit_review(item, *event, comments).await,
+    };
+    match result {
+        Ok(()) => (Ok(()), detail_or_none(source.get(item).await, DIAG_PR_DETAIL)),
+        Err(e) => (Err(e.to_string()), None),
+    }
+}
+
+/// The provider call behind a work-item write, and the item re-read once it is accepted.
+async fn wi_action_call(
+    deps: &AppDeps,
+    conn_id: &str,
+    item: &ItemRef,
+    call: &WiCall,
+) -> (std::result::Result<(), String>, Option<WorkItem>) {
+    let feeds = detail_or_default(deps.sections.work_item_feeds().await, DIAG_WI_FEEDS);
+    let Some(source) = feeds.into_iter().find(|f| f.connection.connection_id() == conn_id).map(|f| f.source) else {
+        return (Err("No work-item provider is bound".into()), None);
+    };
+    let result = match call {
+        WiCall::Edit(WiEdit::State(state)) => source.set_state(item, state).await,
+        WiCall::Edit(WiEdit::Assignee(user)) => source.set_assignee(item, user.as_ref().map(|u| u.id.as_str())).await,
+        WiCall::Edit(WiEdit::Title(title)) => source.update_fields(item, Some(title), None).await,
+        WiCall::Edit(WiEdit::Description(text)) => source.update_fields(item, None, Some(text)).await,
+        WiCall::Comment(body) => source.add_comment(item, body).await,
+    };
+    match result {
+        Ok(()) => (Ok(()), detail_or_none(source.get(item).await, DIAG_WI_DETAIL)),
+        Err(e) => (Err(e.to_string()), None),
+    }
+}
 
 /// The provider call behind a rerun (`Some(failed_only)`) or a cancel (`None`).
 async fn run_action_call(
@@ -10371,7 +10999,16 @@ fn threads_match(a: &[CommentThread], b: &[CommentThread]) -> bool {
     let counts = |ts: &[CommentThread]| -> (usize, usize) {
         (ts.iter().map(|t| t.comments.len()).sum(), ts.iter().filter(|t| t.is_resolved).count())
     };
-    a.len() == b.len() && counts(a) == counts(b)
+    // A placeholder swapped for the provider's copy of the same comment leaves every count as it
+    // was, but the swap still has to land: the placeholder's id means nothing to the provider.
+    let placeholders = |ts: &[CommentThread]| -> Vec<String> {
+        ts.iter()
+            .flat_map(|t| std::iter::once(&t.id).chain(t.comments.iter().map(|c| &c.id)))
+            .filter(|id| is_local(id))
+            .cloned()
+            .collect()
+    };
+    a.len() == b.len() && counts(a) == counts(b) && placeholders(a) == placeholders(b)
 }
 
 fn files_match(a: &[FileChange], b: &[FileChange]) -> bool {
@@ -11170,7 +11807,7 @@ mod tests {
             scroll: 0,
         }));
 
-        app.apply_wi_state("c", &item.item_ref(), "In Progress");
+        app.patch_wi("c", &item.item_ref(), |wi| WiEdit::State("In Progress".into()).apply(wi));
 
         let Screen::WiView(v) = &app.screen else { panic!("expected WiView") };
         assert_eq!(v.wi.state, "In Progress");
@@ -17251,5 +17888,481 @@ mod tests {
         let sub = deps.config.snapshot().pipelines.unwrap().subscriptions[0].clone();
         assert!(!sub.auto_discover_all && sub.definition_ids.is_empty());
         assert_eq!(app.pipe_scope.as_ref().map(PipeScope::label).as_deref(), Some("Pipelines · 0 of 3"));
+    }
+
+
+    // ---- optimistic PR and work-item writes ----
+
+    /// What the recording PR / work-item provider was asked to do, and how it answers.
+    #[derive(Clone)]
+    struct ItemCalls {
+        log: Arc<std::sync::Mutex<Vec<String>>>,
+        refuse: bool,
+        /// When set, every write waits for this before answering — to see the screen mid-flight.
+        gate: Option<Arc<tokio::sync::Notify>>,
+        /// What `get` answers with after a write.
+        pr: PullRequest,
+        wi: WorkItem,
+    }
+
+    impl ItemCalls {
+        fn new() -> Self {
+            ItemCalls { log: Arc::default(), refuse: false, gate: None, pr: pr(None), wi: wi(None) }
+        }
+
+        fn gated() -> (Self, Arc<tokio::sync::Notify>) {
+            let gate = Arc::new(tokio::sync::Notify::new());
+            (ItemCalls { gate: Some(gate.clone()), ..ItemCalls::new() }, gate)
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.log.lock().unwrap().clone()
+        }
+
+        async fn record(&self, call: String) -> forgetop_core::Result<()> {
+            if let Some(gate) = &self.gate {
+                gate.notified().await;
+            }
+            self.log.lock().unwrap().push(call);
+            if self.refuse {
+                Err(forgetop_core::Error::Provider("the provider said no".into()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    struct MockItemSource(ItemCalls);
+
+    #[async_trait::async_trait]
+    impl PullRequestSource for MockItemSource {
+        async fn list(&self, _query: &PullRequestQuery) -> forgetop_core::Result<Vec<PullRequest>> {
+            Ok(Vec::new())
+        }
+        async fn get(&self, _item: &ItemRef) -> forgetop_core::Result<PullRequest> {
+            Ok(self.0.pr.clone())
+        }
+        async fn threads(&self, _item: &ItemRef) -> forgetop_core::Result<Vec<CommentThread>> {
+            Ok(Vec::new())
+        }
+        async fn changes(&self, _item: &ItemRef) -> forgetop_core::Result<Vec<FileChange>> {
+            Ok(Vec::new())
+        }
+        async fn add_comment(&self, item: &ItemRef, body: &str) -> forgetop_core::Result<()> {
+            self.0.record(format!("comment {} {body}", item.id)).await
+        }
+        async fn reply_to_thread(&self, item: &ItemRef, thread_id: &str, body: &str) -> forgetop_core::Result<()> {
+            self.0.record(format!("reply {} {thread_id} {body}", item.id)).await
+        }
+        async fn vote(&self, item: &ItemRef, vote: ReviewVote) -> forgetop_core::Result<()> {
+            self.0.record(format!("vote {} {vote:?}", item.id)).await
+        }
+        async fn merge(&self, item: &ItemRef, _options: &MergeOptions) -> forgetop_core::Result<()> {
+            self.0.record(format!("merge {}", item.id)).await
+        }
+        async fn submit_review(&self, item: &ItemRef, event: ReviewVote, comments: &[LineComment]) -> forgetop_core::Result<()> {
+            self.0.record(format!("review {} {event:?} {}", item.id, comments.len())).await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl WorkItemSource for MockItemSource {
+        async fn list(&self, _query: &WorkItemQuery) -> forgetop_core::Result<Vec<WorkItem>> {
+            Ok(Vec::new())
+        }
+        async fn get(&self, _item: &ItemRef) -> forgetop_core::Result<WorkItem> {
+            Ok(self.0.wi.clone())
+        }
+        async fn threads(&self, _item: &ItemRef) -> forgetop_core::Result<Vec<CommentThread>> {
+            Ok(Vec::new())
+        }
+        async fn set_state(&self, item: &ItemRef, state: &str) -> forgetop_core::Result<()> {
+            self.0.record(format!("state {} {state}", item.id)).await
+        }
+        async fn add_comment(&self, item: &ItemRef, body: &str) -> forgetop_core::Result<()> {
+            self.0.record(format!("wi-comment {} {body}", item.id)).await
+        }
+    }
+
+    struct MockItemConn(ItemCalls, Capabilities);
+
+    #[async_trait::async_trait]
+    impl ProviderConnection for MockItemConn {
+        fn connection_id(&self) -> &str {
+            "c"
+        }
+        fn provider_type(&self) -> ProviderType {
+            ProviderType::GitHub
+        }
+        fn display_name(&self) -> &str {
+            "GH"
+        }
+        fn capabilities(&self) -> &Capabilities {
+            &self.1
+        }
+        fn pull_requests(&self) -> Option<Arc<dyn PullRequestSource>> {
+            Some(Arc::new(MockItemSource(self.0.clone())))
+        }
+        fn work_items(&self) -> Option<Arc<dyn WorkItemSource>> {
+            Some(Arc::new(MockItemSource(self.0.clone())))
+        }
+        fn pipelines(&self) -> Option<Arc<dyn PipelineSource>> {
+            None
+        }
+        async fn check(&self) -> bool {
+            true
+        }
+    }
+
+    struct MockItemFactory(ItemCalls);
+
+    impl ProviderFactory for MockItemFactory {
+        fn provider_type(&self) -> ProviderType {
+            ProviderType::GitHub
+        }
+        fn describe_capabilities(&self) -> Capabilities {
+            Capabilities { supports_pull_requests: true, supports_work_items: true, ..Capabilities::default() }
+        }
+        fn create(&self, _connection: &Connection, _secret: Option<String>) -> forgetop_core::Result<Arc<dyn ProviderConnection>> {
+            Ok(Arc::new(MockItemConn(self.0.clone(), self.describe_capabilities())))
+        }
+    }
+
+    /// Deps whose one PR and work-item connection, `c`, is the recording provider.
+    async fn deps_with_items(calls: ItemCalls) -> AppDeps {
+        use forgetop_core::config::InMemoryConfigStore;
+        use forgetop_core::secret::InMemorySecretStore;
+        use forgetop_core::service::ConnectionResolver;
+
+        let registry = Arc::new(ProviderRegistry::new(vec![Arc::new(MockItemFactory(calls))]));
+        let secrets = Arc::new(InMemorySecretStore::default());
+        let config = Arc::new(ConfigService::new(Arc::new(InMemoryConfigStore::default()), secrets.clone(), registry.clone()));
+        let connection = Connection {
+            id: "c".into(),
+            provider_type: ProviderType::GitHub,
+            display_name: "GH".into(),
+            base_url: None,
+            organization: None,
+            project: None,
+            repository: None,
+            username: None,
+            credential_ref: None,
+            repo_scope: None,
+        };
+        config.add_or_update_connection(connection, None).await.unwrap();
+        config.bind_pull_requests("c").await.unwrap();
+        config.bind_work_items("c").await.unwrap();
+        let resolver = Arc::new(ConnectionResolver::new(config.clone(), registry, secrets));
+        AppDeps {
+            sections: Arc::new(SectionService::new(config.clone(), resolver.clone())),
+            health: Arc::new(ConnectionHealthService::new(config.clone(), resolver)),
+            config,
+            cache: Arc::new(CacheStore::disabled()),
+        }
+    }
+
+    /// PR `1` open full-screen, listed, waiting on your review on the Launchpad; you are `me`.
+    fn pr_action_app() -> App {
+        let mut app = App::new("slate");
+        app.pr_pool = pool_of(vec![pr_row(pr(None))], Some("me"));
+        app.prs = vec![pr_row(pr(None))];
+        app.lp_prs_review = vec![pr_row(pr(None))];
+        app.rebuild_launchpad();
+        app.screen = pr_view_with_pending(Vec::new());
+        app
+    }
+
+    fn pr_pane(app: &App) -> &PrView {
+        let Screen::PrView(v) = &app.screen else { panic!("expected the PR view") };
+        v
+    }
+
+    fn my_vote(pr: &PullRequest) -> Option<ReviewVote> {
+        pr.reviewers.iter().find(|r| forgetop_core::filter::is_user(&r.user, "me")).map(|r| r.vote)
+    }
+
+    fn on_launchpad(app: &App) -> bool {
+        !app.lp_dismissed.contains(&launchpad::Entry::key("c", "1"))
+    }
+
+    /// Waits for the provider's answer to a write, skipping the background fetches it starts.
+    async fn answer(rx: &mut mpsc::UnboundedReceiver<AppEvent>) -> AppEvent {
+        loop {
+            let event = rx.recv().await.expect("the provider's answer");
+            if matches!(event, AppEvent::PrActionDone { .. } | AppEvent::WiActionDone { .. }) {
+                return event;
+            }
+        }
+    }
+
+    fn pr_detail_with(threads: Vec<CommentThread>) -> AppEvent {
+        AppEvent::PrDetailLoaded {
+            key: pr_detail_cache_key("c", &pr(None).item_ref()),
+            detail: Box::new(PrDetailFetch { threads: Some(threads), ..Default::default() }),
+            fetched_at: Utc::now(),
+        }
+    }
+
+    fn comment_by(id: &str, who: &str, body: &str) -> CommentThread {
+        CommentThread {
+            id: id.into(),
+            comments: vec![Comment { id: format!("{id}-c"), author: me_user(Some(who)), body: body.into(), created_at: None }],
+            file_path: None,
+            line: None,
+            is_resolved: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_approval_shows_before_the_provider_answers_and_a_stale_refresh_keeps_it() {
+        let (calls, gate) = ItemCalls::gated();
+        let deps = deps_with_items(calls.clone()).await;
+        let mut app = pr_action_app();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.job_tx = Some(tx);
+
+        app.execute_action(Action::PrVote(ReviewVote::Approved), &deps).await;
+        assert!(calls.calls().is_empty(), "the provider hasn't answered yet");
+        assert_eq!(my_vote(&pr_pane(&app).pr), Some(ReviewVote::Approved), "the view shows your approval");
+        assert_eq!(my_vote(&app.prs[0].pr), Some(ReviewVote::Approved), "and so does the list row");
+        assert!(!on_launchpad(&app), "reviewed, so it has left the Launchpad");
+        assert_eq!(app.toast.as_deref(), Some("Approved"));
+
+        gate.notify_one();
+        let event = answer(&mut rx).await;
+        app.on_event(event, &deps);
+        assert_eq!(calls.calls(), vec!["vote 1 Approved".to_string()]);
+        assert_eq!(my_vote(&pr_pane(&app).pr), Some(ReviewVote::Approved), "a re-read that hasn't caught up doesn't undo it");
+
+        // A refresh that still lists the PR without your vote doesn't flip it back…
+        let stale = pool_of(vec![pr_row(pr(None))], Some("me"));
+        app.on_event(AppEvent::PrPoolLoaded { pool: Box::new(stale), ok: true }, &deps);
+        assert_eq!(my_vote(&app.prs[0].pr), Some(ReviewVote::Approved), "held until the provider catches up");
+
+        // …and once one shows it, the provider's copy is taken as it is.
+        let mut caught_up = pr(None);
+        set_vote(&mut caught_up, "me", ReviewVote::Approved);
+        let pool = pool_of(vec![pr_row(caught_up)], Some("me"));
+        app.on_event(AppEvent::PrPoolLoaded { pool: Box::new(pool), ok: true }, &deps);
+        assert!(app.held_items.is_empty(), "nothing left to hold");
+    }
+
+    #[tokio::test]
+    async fn a_refused_approval_takes_your_vote_back_and_returns_the_pr_to_the_launchpad() {
+        let calls = ItemCalls { refuse: true, ..ItemCalls::new() };
+        let deps = deps_with_items(calls.clone()).await;
+        let mut app = pr_action_app();
+
+        app.execute_action(Action::PrVote(ReviewVote::Approved), &deps).await;
+        assert_eq!(calls.calls(), vec!["vote 1 Approved".to_string()]);
+        assert_eq!(my_vote(&pr_pane(&app).pr), None, "rolled back on the view");
+        assert_eq!(my_vote(&app.prs[0].pr), None, "and on the list row");
+        assert!(on_launchpad(&app), "back on the Launchpad");
+        assert!(app.held_items.is_empty());
+        assert!(app.toast.as_deref().is_some_and(|t| t.contains("Failed") && t.contains("the provider said no")), "{:?}", app.toast);
+    }
+
+    #[tokio::test]
+    async fn a_comment_shows_before_the_provider_answers_and_survives_a_detail_that_hasnt_caught_up() {
+        let (calls, gate) = ItemCalls::gated();
+        let deps = deps_with_items(calls.clone()).await;
+        let mut app = pr_action_app();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.job_tx = Some(tx);
+
+        app.execute_action(Action::PrComment("LGTM".into()), &deps).await;
+        assert!(calls.calls().is_empty(), "the provider hasn't answered yet");
+        let threads = &pr_pane(&app).diff.threads;
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0].comments[0].body, "LGTM");
+        assert!(forgetop_core::filter::is_user(&threads[0].comments[0].author, "me"), "posted as you");
+
+        gate.notify_one();
+        let event = answer(&mut rx).await;
+        app.on_event(event, &deps);
+        assert_eq!(calls.calls(), vec!["comment 1 LGTM".to_string()]);
+        assert_eq!(app.toast.as_deref(), Some("Comment added"));
+
+        // A detail fetch that doesn't list it yet keeps it on screen…
+        app.on_event(pr_detail_with(vec![comment_by("t1", "sam", "LGTM")]), &deps);
+        let bodies: Vec<_> = pr_pane(&app).diff.threads.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(bodies.len(), 2, "someone else's LGTM was already there; yours is still held: {bodies:?}");
+
+        // …and once the provider lists it, its copy replaces the placeholder.
+        app.on_event(pr_detail_with(vec![comment_by("t1", "sam", "LGTM"), comment_by("t2", "me", "LGTM")]), &deps);
+        let ids: Vec<_> = pr_pane(&app).diff.threads.iter().map(|t| t.id.clone()).collect();
+        assert_eq!(ids, vec!["t1".to_string(), "t2".to_string()]);
+        assert!(app.held_items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_refused_comment_is_taken_back() {
+        let calls = ItemCalls { refuse: true, ..ItemCalls::new() };
+        let deps = deps_with_items(calls.clone()).await;
+        let mut app = pr_action_app();
+
+        app.execute_action(Action::PrComment("LGTM".into()), &deps).await;
+        assert!(pr_pane(&app).diff.threads.is_empty());
+        assert!(app.held_items.is_empty());
+        assert!(app.toast.as_deref().is_some_and(|t| t.contains("the provider said no")), "{:?}", app.toast);
+    }
+
+    #[tokio::test]
+    async fn a_reply_lands_on_its_thread_at_once() {
+        let (calls, gate) = ItemCalls::gated();
+        let deps = deps_with_items(calls.clone()).await;
+        let mut app = pr_action_app();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.job_tx = Some(tx);
+        if let Screen::PrView(v) = &mut app.screen {
+            v.diff.threads = vec![comment_by("t1", "sam", "why?")];
+            v.reply_target = Some("t1".into());
+        }
+
+        app.execute_action(Action::PrReply("because".into()), &deps).await;
+        let thread = &pr_pane(&app).diff.threads[0];
+        assert_eq!(thread.comments.iter().map(|c| c.body.as_str()).collect::<Vec<_>>(), vec!["why?", "because"]);
+        assert!(pr_pane(&app).reply_target.is_none());
+
+        gate.notify_one();
+        let event = answer(&mut rx).await;
+        app.on_event(event, &deps);
+        assert_eq!(calls.calls(), vec!["reply 1 t1 because".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_review_empties_the_buffer_at_once_and_a_refusal_puts_its_comments_back() {
+        let note = LineComment { path: "src/a.rs".into(), line: 3, side: DiffSide::New, body: "nit".into() };
+
+        let (calls, gate) = ItemCalls::gated();
+        let deps = deps_with_items(calls.clone()).await;
+        let mut app = pr_action_app();
+        app.screen = pr_view_with_pending(vec![note.clone()]);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.job_tx = Some(tx);
+        app.execute_action(Action::SubmitReview(ReviewVote::Approved), &deps).await;
+        assert!(pr_pane(&app).pending.is_empty(), "the buffer is sent");
+        let threads = &pr_pane(&app).diff.threads;
+        assert_eq!((threads.len(), threads[0].file_path.as_deref(), threads[0].line), (1, Some("src/a.rs"), Some(3)));
+        assert_eq!(my_vote(&pr_pane(&app).pr), Some(ReviewVote::Approved));
+        gate.notify_one();
+        let event = answer(&mut rx).await;
+        app.on_event(event, &deps);
+        assert_eq!(calls.calls(), vec!["review 1 Approved 1".to_string()]);
+
+        let calls = ItemCalls { refuse: true, ..ItemCalls::new() };
+        let deps = deps_with_items(calls).await;
+        let mut app = pr_action_app();
+        app.screen = pr_view_with_pending(vec![note]);
+        app.execute_action(Action::SubmitReview(ReviewVote::Approved), &deps).await;
+        assert_eq!(pr_pane(&app).pending.len(), 1, "the comments are back in the buffer");
+        assert!(pr_pane(&app).diff.threads.is_empty());
+        assert_eq!(my_vote(&pr_pane(&app).pr), None);
+        assert!(on_launchpad(&app));
+        assert!(app.toast.as_deref().is_some_and(|t| t.starts_with("Submit failed")), "{:?}", app.toast);
+    }
+
+    #[tokio::test]
+    async fn a_merge_is_reported_once_the_provider_has_done_it_without_holding_the_screen() {
+        let (calls, gate) = ItemCalls::gated();
+        let deps = deps_with_items(calls.clone()).await;
+        let mut app = pr_action_app();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.job_tx = Some(tx);
+
+        app.execute_action(Action::PrMerge(MergeStrategy::Squash), &deps).await;
+        assert_eq!(app.toast.as_deref(), Some("Merging…"));
+        assert_eq!(pr_pane(&app).pr.status, PullRequestStatus::Open, "whether it merges is the provider's call");
+        assert!(on_launchpad(&app));
+
+        gate.notify_one();
+        let event = answer(&mut rx).await;
+        app.on_event(event, &deps);
+        assert_eq!(calls.calls(), vec!["merge 1".to_string()]);
+        assert_eq!(app.toast.as_deref(), Some("Merged (Squash)"));
+        assert!(!on_launchpad(&app));
+    }
+
+    fn wi_action_app() -> App {
+        let mut app = App::new("slate");
+        app.active = 1;
+        app.wis = vec![wi_row(wi(None))];
+        app.screen = Screen::WiView(Box::new(WiView {
+            timeline: Vec::new(),
+            connection_id: "c".into(),
+            wi: wi(None),
+            threads: Vec::new(),
+            scroll: 0,
+        }));
+        app
+    }
+
+    fn wi_pane(app: &App) -> &WiView {
+        let Screen::WiView(v) = &app.screen else { panic!("expected the work-item view") };
+        v
+    }
+
+    #[tokio::test]
+    async fn a_state_change_shows_before_the_provider_answers_and_a_stale_refresh_keeps_it() {
+        let (mut calls, gate) = ItemCalls::gated();
+        calls.wi = WorkItem { state: "Done".into(), state_category: WorkItemStateCategory::Completed, ..wi(None) };
+        let deps = deps_with_items(calls.clone()).await;
+        let mut app = wi_action_app();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.job_tx = Some(tx);
+
+        app.execute_action(Action::WiSetState("Done".into()), &deps).await;
+        assert!(calls.calls().is_empty(), "the provider hasn't answered yet");
+        assert_eq!(wi_pane(&app).wi.state, "Done");
+        assert_eq!(app.wis[0].wi.state, "Done", "and on the row behind it");
+
+        // A refresh asked for before the write still says Todo: it doesn't flip the row back.
+        let mut r = reloaded_with_health(Vec::new());
+        r.wis = vec![wi_row(wi(None))];
+        app.on_event(AppEvent::Reloaded(Box::new(r)), &deps);
+        assert_eq!(app.wis[0].wi.state, "Done", "held until the provider catches up");
+
+        gate.notify_one();
+        let event = answer(&mut rx).await;
+        app.on_event(event, &deps);
+        assert_eq!(calls.calls(), vec!["state w Done".to_string()]);
+        assert_eq!(wi_pane(&app).wi.state_category, WorkItemStateCategory::Completed, "the provider's bucket for it");
+        assert_eq!(app.wis[0].wi.state_category, WorkItemStateCategory::Completed);
+        assert!(app.held_items.is_empty(), "its copy showed the change");
+    }
+
+    #[tokio::test]
+    async fn a_refused_state_change_or_comment_puts_the_item_back() {
+        let calls = ItemCalls { refuse: true, ..ItemCalls::new() };
+        let deps = deps_with_items(calls.clone()).await;
+        let mut app = wi_action_app();
+
+        app.execute_action(Action::WiSetState("Done".into()), &deps).await;
+        assert_eq!(wi_pane(&app).wi.state, "Todo");
+        assert_eq!(app.wis[0].wi.state, "Todo");
+        assert!(app.toast.as_deref().is_some_and(|t| t.contains("the provider said no")), "{:?}", app.toast);
+
+        app.execute_action(Action::WiComment("on it".into()), &deps).await;
+        assert!(wi_pane(&app).threads.is_empty());
+        assert!(app.held_items.is_empty());
+        assert_eq!(calls.calls(), vec!["state w Done".to_string(), "wi-comment w on it".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_work_item_comment_shows_before_the_provider_answers() {
+        let (calls, gate) = ItemCalls::gated();
+        let deps = deps_with_items(calls.clone()).await;
+        let mut app = wi_action_app();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.job_tx = Some(tx);
+
+        app.execute_action(Action::WiComment("on it".into()), &deps).await;
+        assert_eq!(wi_pane(&app).threads.len(), 1);
+        assert_eq!(wi_pane(&app).threads[0].comments[0].body, "on it");
+        gate.notify_one();
+        let event = answer(&mut rx).await;
+        app.on_event(event, &deps);
+        assert_eq!(calls.calls(), vec!["wi-comment w on it".to_string()]);
+        assert_eq!(wi_pane(&app).threads.len(), 1, "still shown while the provider catches up");
     }
 }

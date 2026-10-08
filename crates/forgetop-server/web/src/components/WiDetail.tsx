@@ -4,7 +4,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { apiGet, apiPost, useWiDetail, wiDetailKey } from "../api";
 import { relativeTime, wiStateColor } from "../format";
 import type { CommentThread, User, WiRef, WorkItem } from "../types";
-import { patchWorkItem } from "../optimistic";
+import { addWiThread, localThread, meAsUser, patchWorkItem } from "../optimistic";
 import { Avatar, Chip, Pill, SlideOver, Timeline } from "./ui";
 
 // ---- opener context ----
@@ -43,9 +43,11 @@ function WiDetailPanel({ wiRef, onClose }: { wiRef: WiRef; onClose: () => void }
     qc.invalidateQueries({ queryKey: ["launchpad"] });
   };
 
+  // Every write here is optimistic: the caller patches the caches before calling this, so the
+  // note says it's done at once rather than when the provider answers.
   const act = async (label: string, fn: () => Promise<void>) => {
     setBusy(true);
-    setNote(null);
+    setNote(`${label} ✓`);
     try {
       await fn();
       setNote(`${label} ✓`);
@@ -155,7 +157,12 @@ function WiDetailPanel({ wiRef, onClose }: { wiRef: WiRef; onClose: () => void }
           <Comments
             threads={data.threads}
             busy={busy}
-            onComment={(body) => act("Comment posted", () => apiPost("/api/wi/comment", { conn: wiRef.conn, repo: wiRef.repo, id: wiRef.id, body }))}
+            onComment={(body) => {
+              // Who you are isn't known here, so the placeholder reads "You" until the refetch
+              // brings the provider's copy with your name on it.
+              addWiThread(qc, wiRef, localThread(meAsUser(), body));
+              act("Comment posted", () => apiPost("/api/wi/comment", { conn: wiRef.conn, repo: wiRef.repo, id: wiRef.id, body }));
+            }}
           />
 
           {note && (

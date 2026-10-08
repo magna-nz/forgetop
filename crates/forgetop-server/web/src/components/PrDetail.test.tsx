@@ -260,4 +260,69 @@ describe("PrDetail action bar", () => {
       expect(reply!.body).toMatchObject({ thread_id: "t-42", body: "Good point" });
     });
   });
+
+  // ---- optimistic writes: what you did shows before the provider answers ----
+
+  /** A POST that doesn't answer until `release` is called. */
+  const held = () => {
+    let release: () => void = () => {};
+    const answer = new Promise<unknown>((resolve) => (release = () => resolve({ ok: true })));
+    return { answer, release: () => release() };
+  };
+
+  it("an approval shows your tick on the reviewers before the provider answers", async () => {
+    const d = detail("Open");
+    d.me = "sam";
+    const post = held();
+    mockFetch({ get: { "/api/pr/detail": d }, onPost: () => post.answer });
+    renderWithClient(
+      <PrDetailProvider>
+        <Opener conn="c" id="1" />
+      </PrDetailProvider>,
+    );
+
+    await userEvent.click(await screen.findByRole("button", { name: "Approve" }));
+    expect(await screen.findByText("Approved ✓")).toBeInTheDocument();
+    expect(screen.getByText("sam")).toBeInTheDocument();
+    // Still open: the pane closes once the provider has said yes, so a refusal can be read.
+    expect(screen.getByText("Cache the customer risk score")).toBeInTheDocument();
+    post.release();
+    await waitForElementToBeRemoved(() => screen.queryByText("Cache the customer risk score"), { timeout: 2000 });
+  });
+
+  it("a comment shows on the conversation before the provider answers, and can't be replied to yet", async () => {
+    const d = detail("Open");
+    d.me = "sam";
+    const post = held();
+    const { posts } = mockFetch({ get: { "/api/pr/detail": d }, onPost: () => post.answer });
+    renderWithClient(
+      <PrDetailProvider>
+        <Opener conn="c" id="1" />
+      </PrDetailProvider>,
+    );
+
+    await userEvent.type(await screen.findByPlaceholderText("Add a comment…"), "Ship it");
+    await userEvent.click(screen.getByRole("button", { name: "Comment" }));
+    expect(await screen.findByText("Ship it")).toBeInTheDocument();
+    expect(screen.getByText("Posting…")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "↳ Reply" })).not.toBeInTheDocument();
+    expect(posts.find((p) => p.url.includes("/api/pr/comment"))?.body).toMatchObject({ body: "Ship it" });
+    post.release();
+  });
+
+  it("a merge says it's under way, and only says merged once the provider has", async () => {
+    const post = held();
+    mockFetch({ get: { "/api/pr/detail": detail("Open") }, onPost: () => post.answer });
+    renderWithClient(
+      <PrDetailProvider>
+        <Opener conn="c" id="1" />
+      </PrDetailProvider>,
+    );
+
+    await userEvent.click(await screen.findByRole("button", { name: "Merge" }));
+    expect(await screen.findByText("Merging…")).toBeInTheDocument();
+    expect(screen.queryByText("Merged ✓")).not.toBeInTheDocument();
+    post.release();
+    expect(await screen.findByText("Merged ✓")).toBeInTheDocument();
+  });
 });

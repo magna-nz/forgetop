@@ -114,4 +114,21 @@ describe("WiDetail", () => {
       expect(body.description).toBeUndefined();
     });
   });
+
+  it("a comment shows before the provider answers", async () => {
+    let release: () => void = () => {};
+    const answer = new Promise<unknown>((resolve) => (release = () => resolve({ ok: true })));
+    mockFetch({ get: { "/api/wi/detail": detail() }, onPost: () => answer });
+    renderWithClient(
+      <WiDetailProvider>
+        <Opener conn="c" id="w1" />
+      </WiDetailProvider>,
+    );
+
+    await userEvent.type(await screen.findByPlaceholderText("Add a comment…"), "On it");
+    await userEvent.click(screen.getByRole("button", { name: "Comment" }));
+    expect(await screen.findByText("On it")).toBeInTheDocument();
+    expect(screen.getByText("Comment posted ✓")).toBeInTheDocument();
+    release();
+  });
 });

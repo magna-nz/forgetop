@@ -11,14 +11,22 @@
  * real answer rather than show a guess that can be wrong.
  */
 import type { QueryClient } from "@tanstack/react-query";
-import { wiDetailKey } from "./api";
+import { prDetailKey, wiDetailKey } from "./api";
 import type {
+  Comment,
+  CommentThread,
   ConnectionRow,
   HealthRow,
   LaunchpadResponse,
   NotifRow,
   PipelineSelection,
   PipeRow,
+  PrDetail as PrDetailData,
+  PrRef,
+  PrRow,
+  PullRequest,
+  ReviewVote,
+  User,
   WiDetail as WiDetailData,
   WiRef,
   WiRow,
@@ -122,4 +130,81 @@ export function setPipelineSelectionInCache(qc: QueryClient, id: string, all: bo
   qc.setQueriesData<PipeRow[]>({ queryKey: ["pipelines"] }, (rows) =>
     rows?.filter((r) => r.connection_id !== id || selected.includes(r.run.definition_id)),
   );
+}
+
+/**
+ * Applies an edit to a pull request in every cache it lives in: its detail pane, every PR list,
+ * and the Command Center's `pr` rows — the PR twin of {@link patchWorkItem}, matched the same way.
+ */
+export function patchPullRequest(qc: QueryClient, ref: Pick<PrRef, "conn" | "repo" | "id">, edit: (pr: PullRequest) => PullRequest): void {
+  const isTarget = (connectionId: string, pr: PullRequest) =>
+    connectionId === ref.conn && pr.id === ref.id && (!ref.repo || !pr.repository || pr.repository === ref.repo);
+
+  qc.setQueryData<PrDetailData>(prDetailKey(ref), (d) => d && { ...d, pull_request: edit(d.pull_request) });
+  qc.setQueriesData<PrRow[]>({ queryKey: ["prs"] }, (rows) =>
+    rows?.map((r) => (isTarget(r.connection_id, r.pull_request) ? { ...r, pull_request: edit(r.pull_request) } : r)),
+  );
+  qc.setQueriesData<LaunchpadResponse>({ queryKey: ["launchpad"] }, (lp) =>
+    lp && {
+      ...lp,
+      rows: lp.rows.map((r) =>
+        r.kind === "pr" && isTarget(r.connection_id, r.pull_request) ? { ...r, pull_request: edit(r.pull_request) } : r,
+      ),
+    },
+  );
+}
+
+/** You, as a placeholder comment or reviewer entry shows you before the provider has. */
+export function meAsUser(me?: string | null): User {
+  return { id: me ?? "you", display_name: me ?? "You", handle: me ?? null, avatar_url: null };
+}
+
+const sameUser = (u: User, me: string) =>
+  [u.handle, u.display_name, u.id].some((n) => n != null && n.toLowerCase() === me.toLowerCase());
+
+/** `pr` with your verdict recorded on it — added as a reviewer if you weren't one. Your verdict is
+ *  yours to decide, so it is knowable client-side; who *you* are comes from the detail's `me`. */
+export function withVote(pr: PullRequest, me: string, vote: ReviewVote): PullRequest {
+  const mine = pr.reviewers.some((r) => sameUser(r.user, me));
+  return {
+    ...pr,
+    reviewers: mine
+      ? pr.reviewers.map((r) => (sameUser(r.user, me) ? { ...r, vote } : r))
+      : [...pr.reviewers, { user: meAsUser(me), vote, is_required: false }],
+  };
+}
+
+/** Placeholder ids start with this. They mean nothing to the provider, so nothing may be sent
+ *  against one (a reply to a placeholder thread) until the refetch swaps in the real copy. */
+const LOCAL_ID = "local-";
+let localSeq = 0;
+
+export const isLocalId = (id: string) => id.startsWith(LOCAL_ID);
+
+/** A comment as shown before the provider lists it. */
+export function localComment(author: User, body: string): Comment {
+  return { id: `${LOCAL_ID}${Date.now()}-${localSeq++}`, author, body, created_at: new Date().toISOString() };
+}
+
+/** A new thread holding one placeholder comment: a top-level comment, or a review's line comment. */
+export function localThread(author: User, body: string, at?: { path: string; line: number }): CommentThread {
+  const comment = localComment(author, body);
+  return { id: comment.id, comments: [comment], file_path: at?.path ?? null, line: at?.line ?? null, is_resolved: false };
+}
+
+/** Adds placeholder threads to a PR's detail pane. */
+export function addPrThreads(qc: QueryClient, ref: Pick<PrRef, "conn" | "repo" | "id">, threads: CommentThread[]): void {
+  qc.setQueryData<PrDetailData>(prDetailKey(ref), (d) => d && { ...d, threads: [...d.threads, ...threads] });
+}
+
+/** Adds a placeholder reply to one of a PR's threads. */
+export function addPrReply(qc: QueryClient, ref: Pick<PrRef, "conn" | "repo" | "id">, threadId: string, comment: Comment): void {
+  qc.setQueryData<PrDetailData>(prDetailKey(ref), (d) =>
+    d && { ...d, threads: d.threads.map((t) => (t.id === threadId ? { ...t, comments: [...t.comments, comment] } : t)) },
+  );
+}
+
+/** Adds a placeholder thread to a work item's detail pane. */
+export function addWiThread(qc: QueryClient, ref: Pick<WiRef, "conn" | "repo" | "id">, thread: CommentThread): void {
+  qc.setQueryData<WiDetailData>(wiDetailKey(ref), (d) => d && { ...d, threads: [...d.threads, thread] });
 }

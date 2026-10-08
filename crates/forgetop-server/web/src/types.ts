@@ -260,6 +260,8 @@ export interface PrDetail {
   changes: FileChange[];
   checks: CheckRun[];
   commits: Commit[];
+  /** The signed-in user's handle on this connection, when it could be established. */
+  me?: string | null;
 }
 
 /** A pending line comment (matches the Rust LineComment shape). */
