@@ -1,5 +1,6 @@
 //! Runtime config service + resolver/section/health services.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::watch;
@@ -402,15 +403,45 @@ pub struct ConnectionResolver {
     config: Arc<ConfigService>,
     registry: Arc<ProviderRegistry>,
     secrets: Arc<dyn SecretStore>,
+    /// connection id → the live connection last created for it. Reused while the connection's
+    /// configuration and credential are unchanged: a provider client keeps caches (GitHub's
+    /// signed-in login and the full fetch behind each search hit) that only pay off if the client
+    /// outlives one call. Created afresh per call, every reload paid for every search hit again —
+    /// enough to exhaust GitHub's hourly rate limit on a busy repository.
+    live: Mutex<HashMap<String, LiveConnection>>,
+}
+
+/// A created connection with what it was created from, so a change to either recreates it.
+struct LiveConnection {
+    connection: Connection,
+    /// A fingerprint of the credential, not the credential: the client holds that already.
+    secret: u64,
+    live: Arc<dyn ProviderConnection>,
+}
+
+/// A change-detection fingerprint of a credential (not a secure hash — the client holds the
+/// credential itself; this only says whether it is the one the client was built with).
+fn secret_fingerprint(secret: Option<&str>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    secret.hash(&mut hasher);
+    hasher.finish()
 }
 
 impl ConnectionResolver {
     pub fn new(config: Arc<ConfigService>, registry: Arc<ProviderRegistry>, secrets: Arc<dyn SecretStore>) -> Self {
-        Self { config, registry, secrets }
+        Self { config, registry, secrets, live: Mutex::new(HashMap::new()) }
     }
 
     pub async fn resolve(&self, connection_id: &str) -> Result<Option<Arc<dyn ProviderConnection>>> {
+        // The lock is taken before the snapshot and held across no `.await`: two resolves racing
+        // a configuration change then build from the same view of it, and the later one cannot
+        // put a client built from the older configuration over a newer one.
+        let mut live = self.live.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let cfg = self.config.snapshot();
+        // A connection that is gone takes its client with it — the credential it was built with
+        // has no business staying in memory — whichever connection this call is about.
+        live.retain(|id, _| cfg.find_connection(id).is_some());
         let conn = match cfg.find_connection(connection_id) {
             Some(c) => c.clone(),
             None => return Ok(None),
@@ -422,7 +453,15 @@ impl ConnectionResolver {
             Some(r) => self.secrets.get(r)?,
             None => None,
         };
-        Ok(Some(self.registry.create(&conn, secret)?))
+        let fingerprint = secret_fingerprint(secret.as_deref());
+        if let Some(entry) = live.get(connection_id) {
+            if entry.connection == conn && entry.secret == fingerprint {
+                return Ok(Some(entry.live.clone()));
+            }
+        }
+        let created = self.registry.create(&conn, secret)?;
+        live.insert(connection_id.to_string(), LiveConnection { connection: conn, secret: fingerprint, live: created.clone() });
+        Ok(Some(created))
     }
 }
 
@@ -691,26 +730,98 @@ mod tests {
     struct FakeFactory {
         provider: ProviderType,
         caps: Capabilities,
+        /// How many connections this factory has built.
+        created: Arc<std::sync::atomic::AtomicUsize>,
     }
     impl ProviderFactory for FakeFactory {
         fn provider_type(&self) -> ProviderType { self.provider }
         fn describe_capabilities(&self) -> Capabilities { self.caps.clone() }
         fn create(&self, _c: &Connection, _s: Option<String>) -> Result<Arc<dyn ProviderConnection>> {
+            self.created.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(Arc::new(FakeConn { caps: self.caps.clone() }))
         }
     }
 
     fn registry() -> Arc<ProviderRegistry> {
-        Arc::new(ProviderRegistry::new(vec![
+        counting_registry().0
+    }
+
+    /// The registry, and how many GitHub connections it has built so far.
+    fn counting_registry() -> (Arc<ProviderRegistry>, Arc<std::sync::atomic::AtomicUsize>) {
+        let created = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let registry = Arc::new(ProviderRegistry::new(vec![
             Arc::new(FakeFactory {
                 provider: ProviderType::GitHub,
                 caps: Capabilities { supports_pull_requests: true, supports_pipelines: true, ..Default::default() },
+                created: created.clone(),
             }),
             Arc::new(FakeFactory {
                 provider: ProviderType::Linear,
                 caps: Capabilities { supports_work_items: true, ..Default::default() },
+                created: Arc::default(),
             }),
-        ]))
+        ]));
+        (registry, created)
+    }
+
+    /// A resolver over a fresh config, with the count of GitHub connections built.
+    fn resolver() -> (ConnectionResolver, Arc<ConfigService>, Arc<std::sync::atomic::AtomicUsize>) {
+        let (registry, created) = counting_registry();
+        let secrets = Arc::new(InMemorySecretStore::default());
+        let svc = Arc::new(ConfigService::new(Arc::new(InMemoryConfigStore::default()), secrets.clone(), registry.clone()));
+        (ConnectionResolver::new(svc.clone(), registry, secrets), svc, created)
+    }
+
+    #[tokio::test]
+    async fn resolving_a_connection_again_reuses_the_live_one() {
+        let (resolver, svc, created) = resolver();
+        svc.add_or_update_connection(conn("gh-1", ProviderType::GitHub), Some("pat".into())).await.unwrap();
+        let first = resolver.resolve("gh-1").await.unwrap().expect("resolved");
+        let again = resolver.resolve("gh-1").await.unwrap().expect("resolved");
+        assert!(Arc::ptr_eq(&first, &again), "the same live connection, caches and all");
+        assert_eq!(created.load(std::sync::atomic::Ordering::SeqCst), 1, "built once");
+    }
+
+    #[tokio::test]
+    async fn a_changed_credential_or_configuration_recreates_the_connection() {
+        let (resolver, svc, created) = resolver();
+        svc.add_or_update_connection(conn("gh-1", ProviderType::GitHub), Some("pat".into())).await.unwrap();
+        let first = resolver.resolve("gh-1").await.unwrap().unwrap();
+
+        // A new token: the old client would keep sending the old one.
+        svc.add_or_update_connection(conn("gh-1", ProviderType::GitHub), Some("pat-2".into())).await.unwrap();
+        let rekeyed = resolver.resolve("gh-1").await.unwrap().unwrap();
+        assert!(!Arc::ptr_eq(&first, &rekeyed), "rebuilt with the new credential");
+        assert_eq!(created.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        // A new scope: the client fetches from the repositories it was built with.
+        let mut rescoped = conn("gh-1", ProviderType::GitHub);
+        rescoped.repo_scope = Some(vec!["acme/pay".into()]);
+        svc.add_or_update_connection(rescoped, None).await.unwrap();
+        let widened = resolver.resolve("gh-1").await.unwrap().unwrap();
+        assert!(!Arc::ptr_eq(&rekeyed, &widened), "rebuilt with the new scope");
+        assert_eq!(created.load(std::sync::atomic::Ordering::SeqCst), 3);
+
+        // Unchanged since: reused.
+        let same = resolver.resolve("gh-1").await.unwrap().unwrap();
+        assert!(Arc::ptr_eq(&widened, &same));
+        assert_eq!(created.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn a_removed_connection_is_let_go_on_the_next_resolve_of_any_connection() {
+        let (resolver, svc, _) = resolver();
+        svc.add_or_update_connection(conn("gh-1", ProviderType::GitHub), Some("pat".into())).await.unwrap();
+        svc.add_or_update_connection(conn("gh-2", ProviderType::GitHub), Some("pat".into())).await.unwrap();
+        resolver.resolve("gh-1").await.unwrap().expect("resolved");
+        resolver.resolve("gh-2").await.unwrap().expect("resolved");
+        svc.remove_connection("gh-1").await.unwrap();
+        // Nothing resolves a removed id again (feeds iterate the connections that exist), so the
+        // pruning has to ride on whichever resolve comes next.
+        resolver.resolve("gh-2").await.unwrap().expect("still there");
+        let live: Vec<String> = resolver.live.lock().unwrap().keys().cloned().collect();
+        assert_eq!(live, vec!["gh-2".to_string()], "the removed connection's client is gone");
+        assert!(resolver.resolve("gh-1").await.unwrap().is_none());
     }
 
     fn conn(id: &str, provider: ProviderType) -> Connection {

@@ -9,6 +9,25 @@ Adding a release: one `## <version> — <date>` section, a line per user-visible
 and the pull request each one came from. `git log v<previous>..HEAD --merges` lists the
 candidates.
 
+## 1.7.0 — 2026-10-09
+
+Fixed
+
+- **GitHub stopped answering after about half an hour, and "Mine" showed everyone's pull
+  requests.** Since 1.6.4, "Mine" and "Review" are searched for, and each hit is fetched in full.
+  A cache was meant to make a reload that found nothing changed cost nothing, but every reload
+  built a new client, so the cache was always empty: a busy repository paid a full fetch per hit
+  every thirty seconds — about 12,000 GitHub calls an hour against the 5,000 allowed. Once the
+  limit was hit, `/user` was refused too, the connection went red in the footer, and with no
+  identity to filter by "Mine" listed every pull request. Connections now live for the whole run
+  (rebuilt only when their configuration or credential changes), so a quiet reload costs the
+  searches and nothing per row — roughly a tenth of the calls.
+- **A reload that cannot say who you are keeps the last identity it established**, in the
+  terminal UI, so "Mine" stays yours through a refused `/user` call instead of showing everyone's
+  pull requests.
+- **GitHub's rate limit is named in the log** (`github.rate_limit`, once per window, with when it
+  resets) and in the error of any call it refuses, so a red GitHub dot has its reason in the log.
+
 ## 1.6.5 — 2026-10-09
 
 Fixed

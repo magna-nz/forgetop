@@ -665,9 +665,79 @@ pub struct GitHubClient {
     /// fetched for it. A hit whose `updated_at` matches is served from here, so a reload that
     /// finds your pull requests unchanged costs the searches and nothing per row.
     hydrated: tokio::sync::Mutex<HashMap<(String, i64), (String, PullRequest)>>,
+    /// The rate limit (kind and window) whose `github.rate_limit` line is already in the log, so
+    /// that line is written once per window rather than by every call the limit refuses. (Each
+    /// refused list, search or full fetch still logs its own failure under its own context.)
+    rate_limit_logged: std::sync::Mutex<Option<(RateLimitKind, i64)>>,
+}
+
+/// Which of GitHub's rate limits refused a request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateLimitKind {
+    /// The hourly allowance, run out: `x-ratelimit-remaining: 0`.
+    Primary,
+    /// The abuse limit on bursts, with calls still remaining: `retry-after`, or a bare `429`.
+    Secondary,
+}
+
+/// What a refused request says about GitHub's rate limit, when that is what refused it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RateLimitNotice {
+    pub kind: RateLimitKind,
+    /// The window this notice is about — the reset time (seconds since the epoch), or `0` when
+    /// GitHub gave none — so one notice per kind and window reaches the log.
+    pub window: i64,
+    pub message: String,
+}
+
+/// Reads GitHub's rate-limit response: a `403` or `429` whose `x-ratelimit-remaining` is `0`
+/// (the primary, hourly limit — `x-ratelimit-reset` says when it resets), one carrying
+/// `retry-after` (a secondary limit), or any other `429`, which GitHub sends for nothing but a
+/// limit. A `403` with calls remaining is a permission, not a limit, and gives `None`.
+pub fn rate_limit_notice(status: u16, remaining: Option<&str>, reset: Option<&str>, retry_after: Option<&str>) -> Option<RateLimitNotice> {
+    if status != 403 && status != 429 {
+        return None;
+    }
+    let reset_at = reset.and_then(|r| r.trim().parse::<i64>().ok());
+    let window = reset_at.unwrap_or(0);
+    if remaining.map(str::trim) == Some("0") {
+        let when = reset_at
+            .and_then(|epoch| chrono::DateTime::<chrono::Utc>::from_timestamp(epoch, 0))
+            .map(|t| {
+                let left = (t - chrono::Utc::now()).num_minutes().max(0);
+                format!("resets at {} UTC, in about {left} min", t.format("%H:%M"))
+            })
+            .unwrap_or_else(|| "reset time not given".into());
+        return Some(RateLimitNotice { kind: RateLimitKind::Primary, window, message: format!("API rate limit exhausted — {when}") });
+    }
+    if let Some(after) = retry_after.map(str::trim).filter(|a| !a.is_empty()) {
+        return Some(RateLimitNotice { kind: RateLimitKind::Secondary, window, message: format!("secondary rate limit — retry after {after}s") });
+    }
+    if status == 429 {
+        return Some(RateLimitNotice { kind: RateLimitKind::Secondary, window, message: "secondary rate limit — no retry time given".into() });
+    }
+    None
 }
 
 impl GitHubClient {
+    /// A refused response that is the rate limit: logged once per window, and returned so the
+    /// error can say so rather than a bare `403` — the footer's red dot then has its reason.
+    fn note_rate_limit(&self, resp: &reqwest::Response) -> Option<RateLimitNotice> {
+        let header = |name: &str| resp.headers().get(name).and_then(|v| v.to_str().ok()).map(str::to_string);
+        let notice = rate_limit_notice(
+            resp.status().as_u16(),
+            header("x-ratelimit-remaining").as_deref(),
+            header("x-ratelimit-reset").as_deref(),
+            header("retry-after").as_deref(),
+        )?;
+        let mut logged = self.rate_limit_logged.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *logged != Some((notice.kind, notice.window)) {
+            *logged = Some((notice.kind, notice.window));
+            forgetop_core::diag::log("github.rate_limit", &notice.message);
+        }
+        Some(notice)
+    }
+
     /// `repo` is connection-relative (`owner/repo`) — exactly what GitHub's `/repos/` path wants.
     fn repo_path(&self, repo: &str, suffix: &str) -> String {
         format!("{}/repos/{repo}{suffix}", self.base)
@@ -680,7 +750,10 @@ impl GitHubClient {
     async fn get_json(&self, url: &str) -> Result<Value> {
         let resp = self.http.get(url).send().await.map_err(prov)?;
         if !resp.status().is_success() {
-            return Err(Error::Provider(format!("GET {url} -> {}", resp.status())));
+            return Err(Error::Provider(match self.note_rate_limit(&resp) {
+                Some(limit) => format!("GET {url} -> {} ({})", resp.status(), limit.message),
+                None => format!("GET {url} -> {}", resp.status()),
+            }));
         }
         resp.json().await.map_err(prov)
     }
@@ -1434,6 +1507,7 @@ impl ProviderFactory for GitHubFactory {
             scope,
             self_login: tokio::sync::Mutex::new(None),
             hydrated: tokio::sync::Mutex::new(HashMap::new()),
+            rate_limit_logged: std::sync::Mutex::new(None),
         });
         Ok(Arc::new(GitHubConnection {
             id: connection.id.clone(),
@@ -1494,6 +1568,7 @@ mod tests {
             scope: scope.iter().map(|s| s.to_string()).collect(),
             self_login: tokio::sync::Mutex::new(None),
             hydrated: tokio::sync::Mutex::new(HashMap::new()),
+            rate_limit_logged: std::sync::Mutex::new(None),
         })
     }
 
@@ -1926,6 +2001,7 @@ mod tests {
             scope: scope.iter().map(|s| s.to_string()).collect(),
             self_login: tokio::sync::Mutex::new(None),
             hydrated: tokio::sync::Mutex::new(HashMap::new()),
+            rate_limit_logged: std::sync::Mutex::new(None),
         });
         (forge, GitHubPr(client))
     }
@@ -1959,6 +2035,71 @@ mod tests {
         assert_eq!(again[0].title, "from pulls");
         assert_eq!(forge.requests_to("/search/issues").len(), 2);
         assert_eq!(forge.requests_to("/repos/acme/pay/pulls/7").len(), 1, "cached at the same updated_at");
+    }
+
+    /// The saving end to end: two reloads through the real resolver share one client, so the
+    /// second pays the search and `/user` only — the full fetch behind the hit is served from
+    /// the client's cache. Built afresh per reload, as before, it paid the fetch every time.
+    #[tokio::test]
+    async fn two_reloads_through_the_resolver_fetch_each_search_hit_once() {
+        use forgetop_core::config::InMemoryConfigStore;
+        use forgetop_core::secret::InMemorySecretStore;
+        use forgetop_core::service::{ConfigService, ConnectionResolver};
+
+        let (forge, _) = forge_and_client(&["acme/pay"]);
+        forge.route("/user", serde_json::json!({ "login": "dan" }));
+        let registry = Arc::new(ProviderRegistry::new(vec![Arc::new(GitHubFactory)]));
+        let secrets = Arc::new(InMemorySecretStore::default());
+        let config = Arc::new(ConfigService::new(Arc::new(InMemoryConfigStore::default()), secrets.clone(), registry.clone()));
+        let connection = Connection {
+            id: "gh".into(),
+            provider_type: ProviderType::GitHub,
+            display_name: "GitHub".into(),
+            base_url: Some(forge.base().to_string()),
+            organization: None,
+            project: None,
+            repository: None,
+            username: None,
+            credential_ref: None,
+            repo_scope: Some(vec!["acme/pay".into()]),
+        };
+        config.add_or_update_connection(connection, Some("pat".into())).await.unwrap();
+        let resolver = ConnectionResolver::new(config, registry, secrets);
+
+        for reload in 1..=2 {
+            let conn = resolver.resolve("gh").await.unwrap().expect("resolved");
+            let prs = conn.pull_requests().expect("a PR source");
+            assert_eq!(prs.current_user().await.unwrap().as_deref(), Some("dan"));
+            let mine = prs.list(&pr_query(PullRequestFilter::Mine, false)).await.unwrap();
+            assert_eq!(mine[0].title, "from pulls", "reload {reload} shows the full pull request");
+        }
+        assert_eq!(forge.requests_to("/search/issues").len(), 2, "each reload searches");
+        assert_eq!(forge.requests_to("/repos/acme/pay/pulls/7").len(), 1, "the hit is fetched in full once, then cached");
+        assert_eq!(forge.requests_to("/user").len(), 1, "and the signed-in user is asked once");
+    }
+
+    #[test]
+    fn a_refusal_is_read_as_the_rate_limit_only_when_github_says_so() {
+        // The primary limit: a 403 with nothing remaining, and when it resets.
+        let reset = (chrono::Utc::now() + chrono::Duration::minutes(42)).timestamp();
+        let primary = rate_limit_notice(403, Some("0"), Some(&reset.to_string()), None).expect("the primary limit");
+        assert_eq!((primary.kind, primary.window), (RateLimitKind::Primary, reset), "one notice per kind and reset window");
+        assert!(primary.message.contains("rate limit exhausted") && primary.message.contains("in about 4"), "{}", primary.message);
+        // A 429 is the same limit by another status; without a reset time it still says so.
+        let no_reset = rate_limit_notice(429, Some("0"), None, None).expect("still the limit");
+        assert_eq!(no_reset.window, 0);
+        assert!(no_reset.message.contains("reset time not given"));
+        // The secondary (abuse) limit: `retry-after`, with calls still remaining.
+        let secondary = rate_limit_notice(403, Some("4821"), Some(&reset.to_string()), Some("60")).expect("the secondary limit");
+        assert!(secondary.message.contains("secondary rate limit") && secondary.message.contains("60s"), "{}", secondary.message);
+        assert_eq!(secondary.kind, RateLimitKind::Secondary, "told apart from the primary limit in the same window");
+        // A bare 429 is a limit too: GitHub sends 429 for nothing else.
+        let bare = rate_limit_notice(429, Some("4821"), None, None).expect("a 429 is always a limit");
+        assert_eq!(bare.kind, RateLimitKind::Secondary);
+        // A refusal that is not a limit, and a success, say nothing.
+        assert_eq!(rate_limit_notice(403, Some("4821"), Some("1"), None), None, "a plain 403 (a permission) is not a limit");
+        assert_eq!(rate_limit_notice(404, Some("0"), Some("1"), None), None);
+        assert_eq!(rate_limit_notice(200, Some("0"), None, None), None);
     }
 
     #[test]
