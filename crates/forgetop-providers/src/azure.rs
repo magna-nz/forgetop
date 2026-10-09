@@ -629,8 +629,10 @@ impl AzureClient {
     }
 
     async fn item_content(&self, repo: &str, path: &str, commit: &str) -> Option<String> {
+        // `$format=json`: without it Azure answers a single file with its raw bytes (the client
+        // sends no JSON `Accept`), which doesn't parse as the item and reads as no content.
         let url = format!(
-            "{}/items?path={}&versionDescriptor.versionType=commit&versionDescriptor.version={}&includeContent=true&{API}",
+            "{}/items?path={}&versionDescriptor.versionType=commit&versionDescriptor.version={}&includeContent=true&$format=json&{API}",
             self.git_base(repo),
             urlencoding(path),
             commit
@@ -2081,6 +2083,7 @@ mod tests {
         assert_eq!(got.as_deref(), Some("fn a() {}\n"));
         let items = forge.requests_to("/Payments/_apis/git/repositories/pay/items");
         assert!(items[0].contains("path=/src/a.rs") && items[0].contains("versionDescriptor.version=headsha1"), "{}", items[0]);
+        assert!(items[0].contains("$format=json"), "asks for the item as JSON, not the raw file: {}", items[0]);
 
         // A given commit needs no PR lookup; binary content is no text.
         forge.route("/Payments/_apis/git/repositories/pay/items", serde_json::json!({ "content": "PK\u{0}\u{3}" }));
