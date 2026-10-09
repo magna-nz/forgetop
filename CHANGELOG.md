@@ -22,6 +22,7 @@ Fixed
   it, and is left to the provider once a refetch confirms it. GitLab, Azure DevOps and Bitbucket
   keep you as a reviewer after you vote, so their rows stay listed as before. The demo mirrors
   GitHub so the behaviour can be seen without credentials.
+  ([#225](https://github.com/magna-nz/forgetop/pull/225))
 
 ## 1.6.4 — 2026-10-09
 
