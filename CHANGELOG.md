@@ -20,17 +20,17 @@ Added
   and `v` marks every file in it viewed; in the dashboard, click a folder. With the cursor on a
   folder, the terminal shows a summary of its files and threads. When the list is narrow, as
   in the pane beside the list, it shows one level of folders instead.
-  ([#PRNUM](https://github.com/magna-nz/forgetop/pull/PRNUM))
+  ([#231](https://github.com/magna-nz/forgetop/pull/231))
 - **Search a diff's file names and patch text.** In the terminal UI press `/` on the Diff
   tab; in the dashboard type in the box above the files. The list narrows to the files that
   match, each with its number of hits, and the patch highlights every hit. Esc clears it.
-  ([#PRNUM](https://github.com/magna-nz/forgetop/pull/PRNUM))
+  ([#231](https://github.com/magna-nz/forgetop/pull/231))
 - **Show the unchanged lines between hunks.** A `⋯ N unchanged lines` row sits above each hunk
   that has a gap before it. In the terminal UI, Enter on the hunk's `@@` line shows 10 more
   lines from each side, `+` shows them all and `-` folds them back; in the dashboard, click the
   row, or "Show all". The file is fetched once, when you first expand, from GitHub, GitLab or
   Azure DevOps; reloads make no extra calls. Bitbucket doesn't offer it.
-  ([#PRNUM](https://github.com/magna-nz/forgetop/pull/PRNUM))
+  ([#231](https://github.com/magna-nz/forgetop/pull/231))
 
 Docs
 
