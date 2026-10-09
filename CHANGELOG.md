@@ -9,6 +9,36 @@ Adding a release: one `## <version> — <date>` section, a line per user-visible
 and the pull request each one came from. `git log v<previous>..HEAD --merges` lists the
 candidates.
 
+## 1.8.0 — 2026-10-10
+
+Added
+
+- **The Diff tab's file list is a folder tree.** Changed files are grouped under their
+  folders, folders first, and a folder holding only one folder shares its row
+  (`forgetop-core/src/`). Every folder starts open and shows how many of its files you've
+  reviewed. In the terminal UI, Enter on a folder folds or unfolds it, as on a pipeline group,
+  and `v` marks every file in it viewed; in the dashboard, click a folder. With the cursor on a
+  folder, the terminal shows a summary of its files and threads. When the list is narrow, as
+  in the pane beside the list, it shows one level of folders instead.
+  ([#231](https://github.com/magna-nz/forgetop/pull/231))
+- **Search a diff's file names and patch text.** In the terminal UI press `/` on the Diff
+  tab; in the dashboard type in the box above the files. The list narrows to the files that
+  match, each with its number of hits, and the patch highlights every hit. Esc clears it.
+  ([#231](https://github.com/magna-nz/forgetop/pull/231))
+- **Show the unchanged lines between hunks.** A `⋯ N unchanged lines` row sits above each hunk
+  that has a gap before it. In the terminal UI, Enter on the hunk's `@@` line shows 10 more
+  lines from each side, `+` shows them all and `-` folds them back; in the dashboard, click the
+  row, or "Show all". The file is fetched once, when you first expand, from GitHub, GitLab or
+  Azure DevOps; reloads make no extra calls. Bitbucket doesn't offer it.
+  ([#231](https://github.com/magna-nz/forgetop/pull/231))
+
+Fixed
+
+- **Azure DevOps diffs show their changes.** Azure answers a request for one file with the raw
+  file unless it is asked for JSON, and forgetop didn't ask, so every file read as empty: an
+  Azure pull request's Diff tab listed its files at `+0 -0` with no patch to show.
+  ([#231](https://github.com/magna-nz/forgetop/pull/231))
+
 ## 1.7.1 — 2026-10-10
 
 Added

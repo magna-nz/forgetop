@@ -74,6 +74,15 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     HITS.with(|h| h.borrow_mut().clear());
     render_frame(frame, app);
     app.hits = HITS.with(|h| std::mem::take(&mut *h.borrow_mut()));
+    // The frame decided whether a diff's file list is a tree or flat; a cursor left on a folder
+    // the other layout has no row for moves to the nearest one that is listed. (Moving the
+    // cursor changes no row, so the hits just recorded still stand.)
+    let preview = app.preview.as_mut().map(|p| &mut p.view);
+    for screen in std::iter::once(&mut app.screen).chain(preview) {
+        if let Screen::PrView(v) = screen {
+            v.diff.fix_cursor();
+        }
+    }
 }
 
 fn render_frame(frame: &mut Frame, app: &mut App) {
@@ -2622,7 +2631,8 @@ fn footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
     // Prepend (not append) so they survive the footer being clipped on narrow terminals: the
     // palette is where everything the footer leaves out (feedback, views, find, …) is found,
     // and the dashboard shortcut shows whenever its server is running.
-    if app.wizard.is_none() && app.overlay.is_none() && !app.filtering {
+    let diff_searching = matches!(&app.screen, Screen::PrView(v) if v.tab == 3 && v.diff.search_input.is_some());
+    if app.wizard.is_none() && app.overlay.is_none() && !app.filtering && !diff_searching {
         if app.dashboard_url.is_some() {
             keys.insert(0, ("B", "dashboard"));
         }
@@ -2664,20 +2674,43 @@ fn base_footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
             }
             None => Vec::new(),
         };
-        return if v.tab == 3 {
+        let searchable = v.diff.files.len() > 1;
+        return if v.tab == 3 && v.diff.search_input.is_some() {
+            // The `/` prompt takes every key, so the rest of the glossary would be a lie.
+            vec![("type", "search"), ("↵", "done"), ("Esc", "cancel")]
+        } else if v.tab == 3 {
             if v.diff.focus == DiffFocus::Patch {
-                let mut keys = vec![("↑↓", "line"), ("v", "mark viewed"), ("]/[", "threads"), ("c", "comment")];
+                let mut keys = vec![("↑↓", "line")];
+                // On a hunk header with unchanged lines above it: how to reveal them.
+                if let (Some(gap), Some(file)) = (v.diff.gap_at_cursor(), v.diff.current()) {
+                    keys.extend([("↵", "10 more lines"), ("+", "whole gap")]);
+                    if v.diff.revealed(&file.path, gap.hunk) != (0, 0) {
+                        keys.push(("-", "fold"));
+                    }
+                }
+                keys.extend([("v", "mark viewed"), ("]/[", "threads"), ("c", "comment")]);
                 keys.extend(thread_keys);
                 if !v.pending.is_empty() {
                     keys.push(("s", "submit review"));
+                }
+                if searchable {
+                    keys.push(("/", "search"));
                 }
                 keys.extend([("PgUp/Dn", "jump"), ("Esc", "files"), ("o", "open")]);
                 keys
             } else {
                 // `v` ticks the file's `[ ]` to `[x]`; without the hint the box reads as decoration.
-                let mut keys = vec![("←→", "tabs"), ("↑↓", "file"), ("↵", "open file"), ("v", "mark viewed"), ("PgUp/Dn", "scroll")];
+                let mut keys = vec![("←→", "tabs"), ("↑↓", "move"), ("↵", "open / fold"), ("v", "mark viewed")];
+                if searchable {
+                    keys.push(("/", "search"));
+                }
+                keys.push(("PgUp/Dn", "scroll"));
                 keys.extend(acts);
-                keys.extend([("o", "open"), ("Esc", "back")]);
+                keys.push(("o", "open"));
+                if v.diff.query.is_some() {
+                    keys.push(("Esc", "clear search"));
+                }
+                keys.push(("Esc", "back"));
                 keys
             }
         } else if v.tab == 1 {
@@ -3031,38 +3064,79 @@ fn render_diff(frame: &mut Frame, area: Rect, theme: &Theme, diff: &DiffView, pe
     }
     // File list on the left; the patch on the right renders comment threads inline,
     // beneath the lines they anchor to (unanchored threads live on the Conversation tab).
+    let (width, narrow) = diff_files_layout(diff, area.width);
+    diff.narrow.set(narrow);
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(diff_files_width(diff, area.width)), Constraint::Min(20)])
+        .constraints([Constraint::Length(width), Constraint::Min(20)])
         .split(area);
 
     render_diff_files(frame, cols[0], theme, diff);
-    render_diff_patch(frame, cols[1], theme, diff, pending, resolve);
+    // With the cursor on a folder, the right-hand side sums the folder up instead.
+    match diff.cursor_dir() {
+        Some(dir) => render_diff_folder(frame, cols[1], theme, diff, &dir),
+        None => render_diff_patch(frame, cols[1], theme, diff, pending, resolve),
+    }
 }
 
 /// Narrowest and widest the diff's file list is drawn.
 const DIFF_FILES_MIN_W: u16 = 24;
-const DIFF_FILES_MAX_W: u16 = 40;
+const DIFF_FILES_MAX_W: u16 = 48;
+/// A list narrower than this that can't fit the tree draws it flat: the indentation would
+/// cost the names too much.
+const DIFF_FILES_FLAT_BELOW: u16 = 36;
 
-/// The file list is as wide as its longest filename needs, within
-/// [`DIFF_FILES_MIN_W`]..=[`DIFF_FILES_MAX_W`] and never more than a quarter of the pane: the
-/// patch is what's being read. A longer name is cut, as a directory heading may be.
-fn diff_files_width(diff: &DiffView, pane_w: u16) -> u16 {
-    let name = diff.files.iter().map(|f| base_of(&f.path).chars().count()).max().unwrap_or(0);
-    let stats = diff.files.iter().map(|f| diff_stat(f).chars().count()).max().unwrap_or(0);
-    // Borders 2, highlight symbol 2, "[ ]" 3, badge 1, the name's two-space lead, and a
-    // column gap between each of the four cells.
-    let natural = (2 + 2 + 3 + 1 + 2 + name + stats + 3) as u16;
-    natural.clamp(DIFF_FILES_MIN_W, DIFF_FILES_MAX_W.min((pane_w / 4).max(DIFF_FILES_MIN_W)))
+/// The file list's width, and whether it is drawn flat. It is as wide as its tree needs — the
+/// deepest row's indentation included — within [`DIFF_FILES_MIN_W`]..=[`DIFF_FILES_MAX_W`] and
+/// never more than a quarter of the pane: the patch is what's being read. A longer row is cut;
+/// a list that can't fit the tree and is under [`DIFF_FILES_FLAT_BELOW`] goes flat.
+fn diff_files_layout(diff: &DiffView, pane_w: u16) -> (u16, bool) {
+    use crate::diff_tree::{tree_rows, TreeRow};
+    let paths: Vec<&str> = diff.files.iter().map(|f| f.path.as_str()).collect();
+    // The whole tree, unsearched, each folder sized as it reads folded too (`▸ src/  2 files`,
+    // `+a -d  done/total`), so neither a fold nor a search resizes the list or cuts a name.
+    let rows = tree_rows(&paths, &std::collections::HashSet::new(), &|_| true);
+    let left = rows
+        .iter()
+        .map(|r| match r {
+            TreeRow::Dir { files, .. } => diff_row_left_w(diff, r) + 2 + plural(files.len(), "file", "files").chars().count(),
+            TreeRow::File { .. } => diff_row_left_w(diff, r),
+        })
+        .max()
+        .unwrap_or(0);
+    let right = rows
+        .iter()
+        .map(|r| match r {
+            TreeRow::Dir { files, .. } => {
+                let (a, d) = diff_sums(diff, files);
+                format!("+{a} -{d}  {0}/{0} ✓", files.len()).chars().count()
+            }
+            TreeRow::File { idx, .. } => diff_stat(&diff.files[*idx]).chars().count(),
+        })
+        .max()
+        .unwrap_or(0);
+    // Borders 2, highlight symbol 2, and the gap between the row and its right-hand cell.
+    let natural = (2 + 2 + left + 1 + right) as u16;
+    let width = natural.clamp(DIFF_FILES_MIN_W, DIFF_FILES_MAX_W.min((pane_w / 4).max(DIFF_FILES_MIN_W)));
+    (width, width < DIFF_FILES_FLAT_BELOW && width < natural)
+}
+
+/// Columns a row's left-hand cell takes: indentation, then `▾ label/` or `[ ] M  name`.
+fn diff_row_left_w(diff: &DiffView, row: &crate::diff_tree::TreeRow) -> usize {
+    use crate::diff_tree::TreeRow;
+    match row {
+        TreeRow::Dir { label, depth, .. } => depth * 2 + 2 + label.chars().count(),
+        TreeRow::File { idx, depth } => depth * 2 + 3 + 1 + 1 + 2 + base_of(&diff.files[*idx].path).chars().count(),
+    }
 }
 
 fn diff_stat(f: &FileChange) -> String {
     format!("+{} -{}", f.additions, f.deletions)
 }
 
-/// The directory portion of a path (`""` for a root-level file).
-fn dir_of(path: &str) -> &str {
-    path.rfind('/').map(|i| &path[..i]).unwrap_or("")
+/// Total additions and deletions over `files` (indices into the diff's files).
+fn diff_sums(diff: &DiffView, files: &[usize]) -> (usize, usize) {
+    files.iter().filter_map(|&i| diff.files.get(i)).fold((0, 0), |(a, d), f| (a + f.additions as usize, d + f.deletions as usize))
 }
 
 /// The filename portion of a path.
@@ -3070,69 +3144,240 @@ fn base_of(path: &str) -> &str {
     path.rfind('/').map(|i| &path[i + 1..]).unwrap_or(path)
 }
 
+fn plural(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
+/// The log pane's search-hit style, shared by the diff's search.
+fn search_hit(theme: &Theme) -> Style {
+    Style::default().fg(theme.bg).bg(theme.yellow).add_modifier(Modifier::BOLD)
+}
+
+/// `text` as spans in `base`, every occurrence of `query` in the search-hit style.
+fn search_spans(theme: &Theme, text: &str, query: Option<&str>, base: Style) -> Vec<Span<'static>> {
+    let line = Line::from(Span::styled(text.to_owned(), base));
+    match query {
+        Some(q) => overlay_hits(line, q, search_hit(theme)).spans,
+        None => line.spans,
+    }
+}
+
+/// Restyles every occurrence of `query` in `line` as `hit`, keeping each span's own style
+/// (its syntax colour) everywhere else. Matching is the log search's: ASCII case-insensitive.
+fn overlay_hits(line: Line<'static>, query: &str, hit: Style) -> Line<'static> {
+    let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+    let ranges = match_ranges(&text, query);
+    if ranges.is_empty() {
+        return line;
+    }
+    let Line { style, alignment, spans } = line;
+    let mut out = Vec::new();
+    let mut at = 0;
+    for span in spans {
+        let (start, end) = (at, at + span.content.len());
+        at = end;
+        let mut cur = start;
+        for &(a, b) in &ranges {
+            if b <= cur || a >= end {
+                continue;
+            }
+            let (a, b) = (a.max(cur), b.min(end));
+            if a > cur {
+                out.push(Span::styled(text[cur..a].to_owned(), span.style));
+            }
+            out.push(Span::styled(text[a..b].to_owned(), hit));
+            cur = b;
+        }
+        if cur < end {
+            out.push(Span::styled(text[cur..end].to_owned(), span.style));
+        }
+    }
+    Line { style, alignment, spans: out }
+}
+
+/// The file list's bottom line: the open `/` prompt, or the committed search and its hits
+/// (the log pane's [`log_status_line`], for the diff). `None` without a search.
+fn diff_search_line(theme: &Theme, diff: &DiffView, hits: usize) -> Option<Line<'static>> {
+    if let Some(input) = &diff.search_input {
+        return Some(Line::from(vec![
+            Span::styled(format!("/{input}"), Style::default().fg(theme.fg)),
+            Span::styled("█", Style::default().fg(theme.accent)),
+        ]));
+    }
+    let q = diff.query.as_ref()?;
+    let count = if hits == 0 { "no matches".to_string() } else { plural(hits, "match", "matches") };
+    Some(Line::from(vec![
+        Span::styled(format!("/{q}"), Style::default().fg(theme.yellow)),
+        Span::styled(format!("   {count}"), Style::default().fg(theme.dim)),
+    ]))
+}
+
 fn render_diff_files(frame: &mut Frame, area: Rect, theme: &Theme, diff: &DiffView) {
+    use crate::diff_tree::{left_truncate, TreeRow};
+    let query = diff.active_query();
+    let total = diff.files.len();
+    let hits: Vec<usize> = (0..total).map(|i| diff.file_hits(i)).collect();
+    let matching = hits.iter().filter(|&&h| h > 0).count();
     // The PR is named in the header above; a commit's diff says which commit.
     let scope = match &diff.commit_label {
         Some(l) => format!("commit {l}"),
         None => "Files".into(),
     };
-    let title = format!("{scope} · {}/{} reviewed", diff.viewed_count(), diff.files.len());
+    let title = match query {
+        Some(_) => format!("{scope} · {matching} of {total} match"),
+        None => format!("{scope} · {}/{total} reviewed", diff.viewed_count()),
+    };
     let block = section_block(theme, &title);
     if diff.files.is_empty() {
         empty(frame, area, theme, "No changed files.", block);
         return;
     }
-
-    // Files are pre-sorted by path, so same-directory files are contiguous. Emit a dim
-    // directory header whenever the directory changes; track the selected file's row so
-    // the (file-indexed) selection lands on the right display row past the headers.
-    let mut rows: Vec<Row> = Vec::new();
-    // The file each table row shows, for clicks; `None` for directory headings.
-    let mut row_file: Vec<Option<usize>> = Vec::new();
-    let mut sel_row = 0usize;
-    let mut last_dir: Option<&str> = None;
-    for (i, f) in diff.files.iter().enumerate() {
-        let dir = dir_of(&f.path);
-        if last_dir != Some(dir) {
-            row_file.push(None);
-            let label = if dir.is_empty() { "(root)".into() } else { format!("{dir}/") };
-            rows.push(Row::new(vec![
-                Cell::from(""),
-                Cell::from(""),
-                Cell::from(Span::styled(label, Style::default().fg(theme.dim).add_modifier(Modifier::BOLD))),
-                Cell::from(""),
-            ]));
-            last_dir = Some(dir);
-        }
-        if i == diff.selected {
-            sel_row = rows.len();
-        }
-        let viewed = diff.is_viewed(&f.path);
-        let name_style = if viewed { Style::default().fg(theme.dim) } else { Style::default().fg(theme.fg) };
-        row_file.push(Some(i));
-        rows.push(Row::new(vec![
-            Cell::from(Span::styled(if viewed { "[x]" } else { "[ ]" }, Style::default().fg(theme.dim))),
-            Cell::from(kind_badge(theme, f.kind)),
-            Cell::from(Span::styled(format!("  {}", base_of(&f.path)), name_style)),
-            Cell::from(Span::styled(diff_stat(f), Style::default().fg(theme.dim))),
-        ]));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let status = diff_search_line(theme, diff, hits.iter().sum());
+    let body_h = inner.height.saturating_sub(u16::from(status.is_some() && inner.height > 1));
+    let body = Rect { height: body_h, ..inner };
+    if let Some(line) = status {
+        frame.render_widget(Paragraph::new(line), Rect { y: inner.y + body_h, height: inner.height - body_h, ..inner });
+    }
+    let dim = Style::default().fg(theme.dim);
+    if let (Some(q), 0) = (query, matching) {
+        frame.render_widget(Paragraph::new(Span::styled(format!("No files match /{q} · Esc clears"), dim)).wrap(Wrap { trim: true }), body);
+        return;
     }
 
-    let stat_w = diff.files.iter().map(|f| diff_stat(f).chars().count()).max().unwrap_or(0) as u16;
-    let widths = [Constraint::Length(3), Constraint::Length(1), Constraint::Min(4), Constraint::Length(stat_w)];
-    let table = Table::new(rows, widths)
-        .block(block)
+    let narrow = diff.narrow.get();
+    let rows = diff.rows();
+    // Each row's right-hand cell first, so the column can be sized to the widest.
+    let right: Vec<Vec<Span>> = rows
+        .iter()
+        .map(|row| match row {
+            TreeRow::Dir { open, files, .. } => {
+                let done = files.iter().filter(|&&i| diff.is_viewed(&diff.files[i].path)).count();
+                let (count, style) =
+                    if done == files.len() { (format!("{done}/{} ✓", files.len()), Style::default().fg(theme.green)) } else { (format!("{done}/{}", files.len()), dim) };
+                let mut spans = Vec::new();
+                if !open {
+                    let (a, d) = diff_sums(diff, files);
+                    spans.push(Span::styled(format!("+{a} -{d}  "), dim));
+                }
+                spans.push(Span::styled(count, style));
+                spans
+            }
+            // Under a search a file's hit count stands in for its line counts; the flat list
+            // drops the counts (the patch's title has them).
+            TreeRow::File { idx, .. } if query.is_some() => vec![Span::styled(hits[*idx].to_string(), Style::default().fg(theme.yellow))],
+            TreeRow::File { .. } if narrow => Vec::new(),
+            TreeRow::File { idx, .. } => vec![Span::styled(diff_stat(&diff.files[*idx]), dim)],
+        })
+        .collect();
+    let right_w = right.iter().map(|s| s.iter().map(|sp| sp.content.chars().count()).sum::<usize>()).max().unwrap_or(0);
+    // What a flat folder's label may take: the body less the symbol, the glyph and the right cell.
+    let label_room = (body.width as usize).saturating_sub(2 + 2 + 1 + right_w);
+
+    let mut table_rows: Vec<Row> = Vec::new();
+    // What each table row is, for clicks; `None` for the "hidden" note.
+    let mut row_hit: Vec<Option<Hit>> = Vec::new();
+    for (r, (row, right)) in rows.iter().zip(right).enumerate() {
+        let indent = Span::raw("  ".repeat(row.depth()));
+        let left: Vec<Span> = match row {
+            TreeRow::Dir { label, open, files, .. } => {
+                let label = if narrow { left_truncate(label, label_room) } else { label.clone() };
+                let mut spans = vec![
+                    indent,
+                    Span::styled(if *open { "▾ " } else { "▸ " }, dim),
+                    Span::styled(label, dim.add_modifier(Modifier::BOLD)),
+                ];
+                if !open {
+                    spans.push(Span::styled(format!("  {}", plural(files.len(), "file", "files")), dim));
+                }
+                row_hit.push(Some(Hit::DiffDir(r)));
+                spans
+            }
+            TreeRow::File { idx, .. } => {
+                let f = &diff.files[*idx];
+                let viewed = diff.is_viewed(&f.path);
+                let name_style = if viewed { dim } else { Style::default().fg(theme.fg) };
+                let mut spans = vec![indent, Span::styled(if viewed { "[x]" } else { "[ ]" }, dim), Span::raw(" "), kind_badge(theme, f.kind), Span::raw("  ")];
+                spans.extend(search_spans(theme, base_of(&f.path), query, name_style));
+                row_hit.push(Some(Hit::DiffFile(*idx)));
+                spans
+            }
+        };
+        table_rows.push(Row::new(vec![Cell::from(Line::from(left)), Cell::from(Line::from(right).right_aligned())]));
+    }
+    if query.is_some() && matching < total {
+        let hidden = total - matching;
+        let note = format!("{} hidden: no match", plural(hidden, "file", "files"));
+        // Wrapped rather than cut: a list at its floor width is narrower than the note.
+        let lines: Vec<Line> = wrap_words(&note, label_room + 2).into_iter().map(|l| Line::from(Span::styled(l, dim))).collect();
+        let height = lines.len() as u16;
+        table_rows.push(Row::new(vec![Cell::from(ratatui::text::Text::from(lines)), Cell::from("")]).height(height));
+        row_hit.push(None);
+    }
+
+    let widths = [Constraint::Min(4), Constraint::Length(right_w as u16)];
+    let table = Table::new(table_rows, widths)
         .column_spacing(1)
         .row_highlight_style(highlight(theme))
+        .highlight_spacing(ratatui::widgets::HighlightSpacing::Always)
         .highlight_symbol("▐ ");
     let mut state = TableState::default();
-    state.select(Some(sel_row));
-    frame.render_stateful_widget(table, area, &mut state);
-    let body = area.inner(ratatui::layout::Margin::new(1, 1));
-    hit_rows(body, state.offset(), row_file.into_iter().map(|f| f.map(Hit::DiffFile)));
+    state.select(diff.cursor_row(&rows));
+    frame.render_stateful_widget(table, body, &mut state);
+    hit_rows(body, state.offset(), row_hit);
+}
+
+/// With the cursor on a folder: what is in it, how much of it is reviewed, and where its
+/// comment threads are — the patch pane's stand-in until a file is picked.
+fn render_diff_folder(frame: &mut Frame, area: Rect, theme: &Theme, diff: &DiffView, dir: &crate::diff_tree::TreeRow) {
+    let crate::diff_tree::TreeRow::Dir { key, files, .. } = dir else { return };
+    let dim = Style::default().fg(theme.dim);
+    let (adds, dels) = diff_sums(diff, files);
+    let name = if key.is_empty() { "(root)".to_string() } else { format!("{key}/") };
+    let title = format!("{name}  ({} · +{adds} -{dels})", plural(files.len(), "file", "files"));
+    let prefix = if key.is_empty() { String::new() } else { format!("{key}/") };
+    // Azure spells paths with a leading `/`, which the tree's keys leave out.
+    let rel = |path: &str| {
+        let path = path.trim_start_matches('/');
+        path.strip_prefix(prefix.as_str()).unwrap_or(path).to_string()
+    };
+    let rel_w = files.iter().filter_map(|&i| diff.files.get(i)).map(|f| rel(&f.path).chars().count()).max().unwrap_or(0);
+    // Stats padded to the widest, so the thread markers after them line up.
+    let stat_w = files.iter().filter_map(|&i| diff.files.get(i)).map(|f| diff_stat(f).chars().count()).max().unwrap_or(0);
+    let mut lines: Vec<Line> = Vec::new();
+    let mut done = 0;
+    for f in files.iter().filter_map(|&i| diff.files.get(i)) {
+        let viewed = diff.is_viewed(&f.path);
+        done += usize::from(viewed);
+        let name_style = if viewed { dim } else { Style::default().fg(theme.fg) };
+        let mut spans = vec![
+            Span::raw(" "),
+            Span::styled(if viewed { "[x]" } else { "[ ]" }, dim),
+            Span::raw(" "),
+            kind_badge(theme, f.kind),
+            Span::raw("  "),
+            Span::styled(format!("{:<rel_w$}", rel(&f.path)), name_style),
+            Span::styled(format!("  {:<stat_w$}", diff_stat(f)), dim),
+        ];
+        let threads = diff.threads.iter().filter(|t| t.file_path.as_deref() == Some(f.path.as_str()));
+        let (open, resolved) = threads.fold((0, 0), |(o, r), t| if t.is_resolved { (o, r + 1) } else { (o + 1, r) });
+        if open > 0 {
+            spans.push(Span::styled(format!(" ● {}", plural(open, "open thread", "open threads")), Style::default().fg(theme.accent)));
+        }
+        if resolved > 0 {
+            spans.push(Span::styled(format!(" ○ {resolved} resolved"), dim));
+        }
+        lines.push(Line::from(spans));
+    }
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled(format!(" {done} of {} reviewed · +{adds} -{dels}", files.len()), dim)));
+    frame.render_widget(Paragraph::new(lines).block(section_block(theme, &title)).scroll((diff.scroll, 0)), area);
+    hit(area, Hit::DiffPatch);
 }
 
 fn render_diff_patch(frame: &mut Frame, area: Rect, theme: &Theme, diff: &DiffView, pending: &[LineComment], resolve: bool) {
+    use crate::app::ContextText;
     let Some(file) = diff.current() else {
         frame.render_widget(section_block(theme, "Patch"), area);
         return;
@@ -3151,6 +3396,11 @@ fn render_diff_patch(frame: &mut Frame, area: Rect, theme: &Theme, diff: &DiffVi
         Some(loc) => format!("{}  (+{} -{}) · {loc}", file.path, file.additions, file.deletions),
         None => format!("{}  (+{} -{})", file.path, file.additions, file.deletions),
     };
+    let query = diff.active_query();
+    let file_hits = diff.file_hits(diff.selected);
+    if file_hits > 0 {
+        title.push_str(&format!(" · {}", plural(file_hits, "match", "matches")));
+    }
     // Without a file list beside it, the title says what the list would have.
     if diff.files.len() == 1 {
         let mark = if diff.is_viewed(&file.path) { "[x]" } else { "[ ]" };
@@ -3189,48 +3439,107 @@ fn render_diff_patch(frame: &mut Frame, area: Rect, theme: &Theme, diff: &DiffVi
 
     // One highlighter per file (regexes compile once); None for unhighlighted languages.
     let mut hl = lang_for(&file.path).and_then(LineHighlighter::new);
+    // The unchanged lines the patch leaves out above each hunk, and the file text that can
+    // fill them in once it has been fetched.
+    let gaps = crate::diff::hunk_gaps(patch);
+    let context = diff.context_text(file);
     // The file line beside every row — the number the cursor label and comments use: new-side
     // for added and context lines, old-side for removed ones (the +/- already says which).
     let numbers = crate::diff::gutter_numbers(patch);
-    let num_w = numbers.iter().flatten().map(|(n, _)| n.to_string().len()).max().unwrap_or(1);
-    let num_span = |i: usize| -> Span<'static> {
-        match numbers.get(i).copied().flatten() {
-            Some((n, _)) => Span::styled(format!("{n:>num_w$} "), Style::default().fg(theme.dim)),
+    let num_w = numbers
+        .iter()
+        .flatten()
+        .map(|(n, _)| n.to_string().len())
+        .chain(gaps.iter().map(|g| g.end.to_string().len()))
+        .max()
+        .unwrap_or(1);
+    let num_span = |n: Option<i64>| -> Span<'static> {
+        match n {
+            Some(n) => Span::styled(format!("{n:>num_w$} "), Style::default().fg(theme.dim)),
             None => Span::raw(" ".repeat(num_w + 1)),
         }
     };
+    let dim = Style::default().fg(theme.dim);
+    let hit_style = search_hit(theme);
 
     // Build the display lines, splicing each thread in beneath the line it anchors to.
     // `cursor_row` tracks where the cursor's patch line landed (comment lines shift it).
     let mut lines: Vec<Line> = Vec::new();
-    // The patch line each display row shows, for clicks; `None` for inline comment boxes.
-    let mut row_line: Vec<Option<usize>> = Vec::new();
+    // What each display row is, for clicks: a patch line, a gap, or `None` (a comment box, a
+    // revealed line).
+    let mut row_hit: Vec<Option<Hit>> = Vec::new();
     let mut cursor_row = 0usize;
     for (i, l) in patch.lines().enumerate() {
         // Every row pushed before the patch line's own is a comment box from the previous line.
-        row_line.resize(lines.len(), None);
-        row_line.push(Some(i));
+        row_hit.resize(lines.len(), None);
+        if let Some(gap) = gaps.iter().find(|g| g.hunk == i) {
+            let n = gap.len();
+            let gap_row = |count: usize, note: &str| Line::from(Span::styled(format!("    ⋯ {}{note}", plural(count, "unchanged line", "unchanged lines")), dim));
+            // A revealed line reads as context, marked in the pending-mark column as not part of the patch.
+            let revealed = |ln: i64, text: &[String], hl: Option<&mut LineHighlighter>| {
+                let src = text.get(ln as usize - 1).map(String::as_str).unwrap_or("");
+                let mut line = patch_line_hl(theme, &format!(" {src}"), hl);
+                line.spans.insert(0, num_span(Some(ln)));
+                line.spans.insert(0, Span::styled("┊", dim));
+                line
+            };
+            let (top, bottom) = diff.revealed(&file.path, i);
+            match context {
+                ContextText::Lines(text) if top + bottom > 0 => {
+                    let top = top.min(n);
+                    let bottom = bottom.min(n - top);
+                    for k in 0..top {
+                        lines.push(revealed(gap.start + k as i64, text, hl.as_mut()));
+                        row_hit.push(None);
+                    }
+                    if n - top - bottom > 0 {
+                        lines.push(gap_row(n - top - bottom, ""));
+                        row_hit.push(Some(Hit::DiffGap(i)));
+                    }
+                    for k in n - bottom..n {
+                        lines.push(revealed(gap.start + k as i64, text, hl.as_mut()));
+                        row_hit.push(None);
+                    }
+                }
+                _ => {
+                    let note = match context {
+                        ContextText::Loading => " · loading",
+                        ContextText::Unavailable => " · not available",
+                        _ => "",
+                    };
+                    lines.push(gap_row(n, note));
+                    row_hit.push(Some(Hit::DiffGap(i)));
+                }
+            }
+        }
+        row_hit.push(Some(Hit::DiffLine(i)));
         let gutter = if marks.contains(&i) {
             Span::styled("▎", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD))
         } else {
             Span::raw(" ")
         };
+        let number = num_span(numbers.get(i).copied().flatten().map(|(n, _)| n));
         if patch_focus && i == diff.cursor {
             cursor_row = lines.len();
             // Pad to full width (minus the gutter) so the highlight spans the row.
-            let mut text = l.to_string();
-            let w = text.chars().count() + num_w + 1;
-            if w + 1 < inner_w {
-                text.push_str(&" ".repeat(inner_w - 1 - w));
+            let style = Style::default().fg(patch_fg(theme, l)).bg(theme.sel_bg).add_modifier(Modifier::BOLD);
+            let mut line = Line::from(Span::styled(l.to_string(), style));
+            if let Some(q) = query {
+                line = overlay_hits(line, q, hit_style);
             }
-            lines.push(Line::from(vec![
-                gutter,
-                num_span(i),
-                Span::styled(text, Style::default().fg(patch_fg(theme, l)).bg(theme.sel_bg).add_modifier(Modifier::BOLD)),
-            ]));
+            let w = l.chars().count() + num_w + 1;
+            if w + 1 < inner_w {
+                line.spans.push(Span::styled(" ".repeat(inner_w - 1 - w), style));
+            }
+            line.spans.insert(0, number);
+            line.spans.insert(0, gutter);
+            lines.push(line);
         } else {
             let mut line = patch_line_hl(theme, l, hl.as_mut());
-            line.spans.insert(0, num_span(i));
+            if let Some(q) = query {
+                line = overlay_hits(line, q, hit_style);
+            }
+            line.spans.insert(0, number);
             line.spans.insert(0, gutter);
             lines.push(line);
         }
@@ -3256,11 +3565,11 @@ fn render_diff_patch(frame: &mut Frame, area: Rect, theme: &Theme, diff: &DiffVi
         diff.scroll
     };
 
-    row_line.resize(lines.len(), None);
+    row_hit.resize(lines.len(), None);
     frame.render_widget(Paragraph::new(lines).block(block).scroll((scroll, 0)), area);
     hit(area, Hit::DiffPatch);
     let body = area.inner(ratatui::layout::Margin::new(1, 1));
-    hit_rows(body, scroll as usize, row_line.into_iter().map(|l| l.map(Hit::DiffLine)));
+    hit_rows(body, scroll as usize, row_hit);
 }
 
 /// Wrap `s` to `width` display columns on word boundaries.
@@ -5301,8 +5610,11 @@ pub(crate) fn help_sections() -> Vec<(&'static str, Vec<(&'static str, &'static 
                 ("↑/↓ (Conversation)", "Move between comment threads"),
                 ("Enter (Commits)", "Drill into that commit's diff"),
                 ("Enter (Diff file)", "Line cursor in the patch"),
+                ("Enter (Diff folder)", "Fold / unfold the folder"),
+                ("/ (Diff)", "Search file names and patches (Esc clears)"),
+                ("Enter  +  - (on @@)", "Reveal 10 more / all / fold the unchanged lines above a hunk"),
                 ("↑/↓ (line cursor)", "Move line-by-line"),
-                ("v (Diff)", "Mark file viewed (updates N/M reviewed)"),
+                ("v (Diff)", "Mark file viewed (on a folder: every file in it)"),
                 ("[  ] (Diff)", "Jump to previous / next comment thread"),
                 ("s", "Submit buffered line comments as a review"),
                 ("o", "Open in browser"),
@@ -5713,6 +6025,7 @@ mod tests {
                 cursor: 0,
                 commit_label: None,
                 viewed: std::collections::HashSet::new(),
+                ..Default::default()
             },
             pending: vec![],
             review_draft: None,
@@ -5979,22 +6292,167 @@ mod tests {
         assert!(out.contains("╭"), "the draft is boxed like a real comment");
     }
 
-    #[test]
-    fn diff_file_list_groups_by_dir_and_shows_viewed_progress() {
+    fn changed_file(path: &str, adds: i64, patch: Option<&str>) -> FileChange {
+        FileChange { path: path.into(), kind: FileChangeKind::Modified, additions: adds, deletions: 0, patch: patch.map(Into::into) }
+    }
+
+    /// The rows of a PR view on its Diff tab over `files`, after `setup` has had the view.
+    fn diff_rows(files: Vec<FileChange>, w: u16, h: u16, setup: impl FnOnce(&mut DiffView)) -> Vec<String> {
         use crate::app::Screen;
-        let file = |p: &str| FileChange { path: p.into(), kind: FileChangeKind::Modified, additions: 1, deletions: 0, patch: None };
-        // Pre-sorted (as the app does at open); two under src/, one at root.
-        let files = vec![file("README.md"), file("src/a.rs"), file("src/b.rs")];
         let mut view = pr_view(3, vec![], files);
-        view.diff.viewed.insert("src/a.rs".into());
+        view.diff.reset_cursor();
+        setup(&mut view.diff);
         let mut app = App::new("slate");
         app.screen = Screen::PrView(Box::new(view));
+        render_to_rows(&mut app, w, h)
+    }
 
-        let out = render_to_string(&mut app, 150, 24);
+    fn row_with<'a>(rows: &'a [String], needle: &str) -> &'a str {
+        rows.iter().find(|r| r.contains(needle)).unwrap_or_else(|| panic!("no row has {needle:?}:\n{}", rows.join("\n")))
+    }
+
+    #[test]
+    fn diff_file_list_groups_by_dir_and_shows_viewed_progress() {
+        // Pre-sorted (as the app does at open); two under src/, one at root.
+        let files = vec![changed_file("README.md", 1, None), changed_file("src/a.rs", 1, None), changed_file("src/b.rs", 1, None)];
+        let rows = diff_rows(files.clone(), 150, 24, |d| {
+            d.viewed.insert("src/a.rs".into());
+        });
+        let out = rows.join("\n");
         assert!(out.contains("1/3 reviewed"), "progress in the title");
-        assert!(out.contains("src/"), "directory header");
+        assert!(row_with(&rows, "▾ src/").contains("1/2"), "a folder row with its own progress");
         assert!(out.contains("[x]"), "a viewed file's checkbox is ticked");
         assert!(out.contains("[ ]"), "an unviewed file's checkbox is empty");
+        let line = |needle: &str| rows.iter().position(|r| r.contains(needle)).unwrap();
+        assert!(line("▾ src/") < line("M  a.rs") && line("M  b.rs") < line("M  README.md"), "folders first, root files after");
+        let col = |needle: &str| row_with(&rows, needle).chars().position(|c| c == '[').unwrap();
+        assert_eq!(col("M  a.rs"), col("M  README.md") + 2, "a file is indented two under its folder");
+
+        // A folder whose files are all viewed says so; a folded one sums up what it hides.
+        let rows = diff_rows(files.clone(), 150, 24, |d| {
+            d.viewed.extend(["src/a.rs".to_string(), "src/b.rs".to_string()]);
+        });
+        assert!(row_with(&rows, "▾ src/").contains("2/2 ✓"));
+        // (Names long enough that the list has room for the folded row's sums.)
+        let files = vec![changed_file("README.md", 1, None), changed_file("src/http_client.rs", 1, None), changed_file("src/retry_policy.rs", 1, None)];
+        let rows = diff_rows(files, 150, 24, |d| {
+            d.folded.insert("src".into());
+            d.folder = Some("src".into());
+        });
+        let folded = row_with(&rows, "▸ src/");
+        assert!(folded.contains("▸ src/  2 files") && folded.contains("+2 -0  0/2"), "{folded}");
+        assert!(!rows.iter().any(|r| r.split("││").next().unwrap().contains("http_client")), "its files are hidden from the list");
+    }
+
+    #[test]
+    fn a_narrow_file_list_goes_flat_with_left_cut_folder_names() {
+        let files = vec![
+            changed_file("README.md", 3, None),
+            changed_file("crates/forgetop-providers/src/http/client.rs", 3, None),
+            changed_file("crates/forgetop-providers/src/http/retry.rs", 3, None),
+        ];
+        // 120 columns: a quarter is 30, too narrow for the tree's one long folder row.
+        let rows = diff_rows(files, 120, 24, |_| {});
+        let list: Vec<String> = rows.iter().map(|r| r.chars().take(30).collect()).collect();
+        let out = list.join("\n");
+        assert!(out.contains("▾ …") && out.contains("src/http/"), "the folder's full path, cut from the left:\n{out}");
+        assert!(out.contains("▾ (root)"), "root files get a folder of their own:\n{out}");
+        assert!(row_with(&list, "client.rs").contains("  [ ]"), "files sit under their folder");
+        assert!(!out.contains("+3 -0"), "the line counts are dropped (the patch title has them):\n{out}");
+        assert!(row_with(&list, "(root)").contains("0/1"), "the progress stays");
+    }
+
+    #[test]
+    fn a_search_narrows_the_list_counts_hits_and_highlights_the_patch() {
+        use crate::app::Screen;
+        let files = vec![
+            changed_file("README.md", 1, Some("@@ -1 +1 @@\n-# old\n+# retry docs")),
+            changed_file("src/a.rs", 1, Some("@@ -1 +1 @@\n-x\n+y")),
+            changed_file("src/b.rs", 1, Some("@@ -1,1 +1,1 @@\n-fn retry() {}\n+fn retry_twice() {}")),
+        ];
+        let mut view = pr_view(3, vec![], files.clone());
+        view.diff.query = Some("retry".into());
+        view.diff.reset_cursor();
+        let mut app = App::new("slate");
+        app.screen = Screen::PrView(Box::new(view));
+        let mut terminal = Terminal::new(TestBackend::new(150, 24)).unwrap();
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let rows: Vec<String> = (0..24).map(|y| (0..150).map(|x| buf[(x, y)].symbol()).collect()).collect();
+        let out = rows.join("\n");
+        assert!(out.contains("Files · 2 of 3 match"), "{out}");
+        assert!(out.contains("1 file hidden: no match"), "{out}");
+        assert!(!out.contains("a.rs"), "the file without a hit is gone");
+        assert!(out.contains("/retry   3 matches"), "the bottom line, like the log pane's");
+        let list = |needle: &str| row_with(&rows, needle).split("││").next().unwrap().to_string();
+        assert!(list("M  b.rs").trim_end_matches(['│', ' ']).ends_with('2'), "its hit count stands in for the line counts");
+        assert!(list("M  README.md").trim_end_matches(['│', ' ']).ends_with('1'));
+        assert!(out.contains("src/b.rs  (+1 -0) · 2 matches"), "the patch title counts this file's");
+        let theme = Theme::by_name("slate");
+        let lit: String = (0..24)
+            .flat_map(|y| (0..150).map(move |x| (x, y)))
+            .filter(|&(x, y)| buf[(x, y)].bg == theme.yellow && x > 25 && y < 21) // the patch pane, not the footer
+            .map(|(x, y)| buf[(x, y)].symbol().to_string())
+            .collect();
+        assert_eq!(lit, "retryretry", "every hit in the patch on the log pane's hit style");
+
+        // Nothing matches at all.
+        let rows = diff_rows(files.clone(), 150, 24, |d| d.query = Some("zzz".into()));
+        let out = rows.join("\n");
+        assert!(out.contains("No files match /zzz · Esc") && out.contains("│clears"), "wrapped to the list: {out}");
+        // While typing, the bottom line is the prompt.
+        let rows = diff_rows(files, 150, 24, |d| d.search_input = Some("ret".into()));
+        assert!(rows.join("\n").contains("/ret█"));
+    }
+
+    #[test]
+    fn a_folder_under_the_cursor_is_summed_up_beside_the_list() {
+        let files = vec![changed_file("README.md", 1, None), changed_file("src/a.rs", 2, None), changed_file("src/b.rs", 3, None)];
+        let rows = diff_rows(files, 150, 24, |d| {
+            d.folder = Some("src".into());
+            d.viewed.insert("src/b.rs".into());
+            d.threads = vec![
+                CommentThread { id: "t1".into(), comments: vec![], file_path: Some("src/a.rs".into()), line: Some(1), is_resolved: false, is_resolvable: true },
+                CommentThread { id: "t2".into(), comments: vec![], file_path: Some("src/b.rs".into()), line: Some(1), is_resolved: true, is_resolvable: true },
+            ];
+        });
+        let out = rows.join("\n");
+        assert!(out.contains("src/  (2 files · +5 -0)"), "{out}");
+        assert!(row_with(&rows, "+2 -0 ● 1 open thread").contains("[ ] M  a.rs"), "{out}");
+        assert!(row_with(&rows, "○ 1 resolved").contains("[x] M  b.rs"), "{out}");
+        assert!(out.contains("1 of 2 reviewed · +5 -0"), "{out}");
+    }
+
+    #[test]
+    fn the_patch_shows_gaps_and_the_lines_revealed_in_them() {
+        use crate::app::FileText;
+        let patch = "@@ -10,2 +10,2 @@\n line 10\n-old\n+line 11\n@@ -40,1 +40,1 @@\n line 40";
+        let files = vec![changed_file("README.md", 1, None), changed_file("src/a.rs", 1, Some(patch))];
+        let text: Vec<String> = (1..=50).map(|n| format!("line {n}")).collect();
+        let out = diff_rows(files.clone(), 150, 40, |_| {}).join("\n");
+        assert!(out.contains("    ⋯ 9 unchanged lines") && out.contains("    ⋯ 28 unchanged lines"), "{out}");
+
+        let rows = diff_rows(files.clone(), 150, 40, |d| {
+            d.file_texts.insert(("src/a.rs".into(), None), FileText::Lines(text.clone()));
+            d.expanded.insert(("src/a.rs".into(), None, 4), (10, 10));
+        });
+        let out = rows.join("\n");
+        assert!(out.contains("⋯ 8 unchanged lines"), "what's left between the revealed edges: {out}");
+        assert!(row_with(&rows, "line 12").contains("┊12  line 12"), "a revealed line, marked and numbered: {out}");
+        assert!(out.contains("┊39  line 39") && !out.contains("line 22"), "{out}");
+        assert!(out.contains("⋯ 9 unchanged lines"), "the other gap is untouched");
+
+        let out = diff_rows(files.clone(), 150, 40, |d| {
+            d.file_texts.insert(("src/a.rs".into(), None), FileText::Loading);
+            d.expanded.insert(("src/a.rs".into(), None, 4), (10, 10));
+        })
+        .join("\n");
+        assert!(out.contains("⋯ 28 unchanged lines · loading"), "{out}");
+        let out = diff_rows(files, 150, 40, |d| {
+            d.file_texts.insert(("src/a.rs".into(), None), FileText::Missing);
+        })
+        .join("\n");
+        assert!(out.contains("⋯ 28 unchanged lines · not available"), "{out}");
     }
 
     #[test]
@@ -6018,12 +6476,17 @@ mod tests {
     fn the_diff_file_list_is_sized_to_its_names_within_a_quarter_of_the_pane() {
         let file = |p: &str| FileChange { path: p.into(), kind: FileChangeKind::Modified, additions: 49, deletions: 0, patch: None };
         let mut diff = pr_view(3, vec![], vec![file("a/main.tf"), file("a/io.tf")]).diff;
-        // Borders, symbol, checkbox, badge, lead, "main.tf" and "+49 -0" with their gaps.
-        assert_eq!(diff_files_width(&diff, 200), 26, "as wide as the longest name needs");
-        assert_eq!(diff_files_width(&diff, 60), DIFF_FILES_MIN_W, "a quarter of a narrow pane, but never under the floor");
+        // Borders, symbol, the file row's indent under `a/`, checkbox, badge, lead, "main.tf",
+        // and after its gap the widest right-hand cell: `a/` folded, "+98 -0  2/2 ✓".
+        assert_eq!(diff_files_layout(&diff, 200), (34, false), "as wide as the deepest row needs");
+        assert_eq!(diff_files_layout(&diff, 60).0, DIFF_FILES_MIN_W, "a quarter of a narrow pane, but never under the floor");
+        assert!(diff_files_layout(&diff, 60).1, "too narrow for the tree: drawn flat");
         diff.files.push(file("a/an_uncommonly_long_module_file_name.tf"));
-        assert_eq!(diff_files_width(&diff, 200), DIFF_FILES_MAX_W, "a long name is cut at the ceiling");
-        assert_eq!(diff_files_width(&diff, 120), 30, "and at a quarter of the pane");
+        assert_eq!(diff_files_layout(&diff, 200), (DIFF_FILES_MAX_W, false), "a long name is cut at the ceiling");
+        assert_eq!(diff_files_layout(&diff, 120), (30, true), "and at a quarter of the pane, where it goes flat");
+        // A short list that fits stays a tree, however narrow it is.
+        let short = pr_view(3, vec![], vec![file("a/x.tf"), file("y.tf")]).diff;
+        assert_eq!(diff_files_layout(&short, 200), (31, false));
     }
 
     #[test]
@@ -8970,9 +9433,49 @@ mod tests {
         }
         assert!(base_footer_keys(&app).contains(&("v", "mark viewed")), "patch line cursor");
         if let Screen::PrView(v) = &mut app.screen {
+            v.diff.focus = DiffFocus::FileList;
             v.tab = 0;
         }
         assert!(!base_footer_keys(&app).contains(&("v", "mark viewed")), "only on the Diff tab");
+    }
+
+    /// The file list's footer names the tree and search keys; the open `/` prompt replaces the
+    /// glossary (and the global shortcuts it captures); a hunk header with a gap says how to open it.
+    #[test]
+    fn the_diff_footer_follows_the_tree_the_search_and_the_gaps() {
+        use crate::app::Screen;
+        let file = |p: &str, patch: &str| FileChange { path: p.into(), kind: FileChangeKind::Modified, additions: 1, deletions: 0, patch: Some(patch.into()) };
+        let files = vec![file("a.rs", "@@ -1 +1 @@\n-x\n+y"), file("b.rs", "@@ -10,1 +10,1 @@\n ctx")];
+        let mut app = App::new("slate");
+        app.dashboard_url = Some("http://127.0.0.1:8177/?t=x".into());
+        app.screen = Screen::PrView(Box::new(pr_view(3, vec![], files)));
+        let keys = |app: &App| base_footer_keys(app);
+        assert!(keys(&app).starts_with(&[("←→", "tabs"), ("↑↓", "move"), ("↵", "open / fold"), ("v", "mark viewed"), ("/", "search")]));
+        assert!(!keys(&app).contains(&("Esc", "clear search")));
+        let Screen::PrView(v) = &mut app.screen else { unreachable!() };
+        v.diff.query = Some("x".into());
+        let k = keys(&app);
+        let clear = k.iter().position(|k| *k == ("Esc", "clear search")).expect("Esc clears a committed search");
+        assert_eq!(k[clear + 1], ("Esc", "back"));
+
+        let Screen::PrView(v) = &mut app.screen else { unreachable!() };
+        v.diff.search_input = Some("x".into());
+        assert_eq!(keys(&app), vec![("type", "search"), ("↵", "done"), ("Esc", "cancel")]);
+        assert!(!footer_keys(&app).iter().any(|(_, what)| *what == "dashboard" || *what == "search anywhere"), "the prompt has those keys");
+
+        let Screen::PrView(v) = &mut app.screen else { unreachable!() };
+        v.diff.search_input = None;
+        v.diff.query = None;
+        v.diff.focus = DiffFocus::Patch;
+        assert!(keys(&app).contains(&("/", "search")));
+        assert!(!keys(&app).contains(&("↵", "10 more lines")), "not on a line without a gap above it");
+        let Screen::PrView(v) = &mut app.screen else { unreachable!() };
+        v.diff.selected = 1; // b.rs: lines 1–9 unchanged above its hunk
+        assert!(keys(&app).contains(&("↵", "10 more lines")) && keys(&app).contains(&("+", "whole gap")));
+        assert!(!keys(&app).contains(&("-", "fold")));
+        let Screen::PrView(v) = &mut app.screen else { unreachable!() };
+        v.diff.expanded.insert(("b.rs".into(), None, 0), (9, 0));
+        assert!(keys(&app).contains(&("-", "fold")), "once it's open");
     }
 
     // ---- PR writes: resolve, draft / close, reviewers ----

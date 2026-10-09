@@ -1,10 +1,11 @@
-import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
+import { createContext, Fragment, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import { useQueryClient } from "@tanstack/react-query";
-import { apiPost, prDetailKey, useConnections, usePrCommitChanges, usePrDetail, usePrReviewers } from "../api";
+import { apiPost, prDetailKey, useConnections, usePrCommitChanges, usePrDetail, usePrFileText, usePrReviewers } from "../api";
 import { checkMeta, checkSummaryOf, prStateLine, prStatusMeta, relativeTime, voteMeta } from "../format";
 import { providerSupports, unsupportedMessage } from "../capabilities";
-import { parsePatch } from "../diff";
+import { parsePatch, type DiffLine } from "../diff";
+import { buildDiffTree, collectFiles, filterTree, findMatches, flattenTree, searchFiles, type DiffTreeFile, type DiffTreeFolder, type FileMatch } from "../diffTree";
 import { addPrReply, addPrThreads, isLocalId, localComment, localThread, meAsUser, patchPullRequest, setPrThreadResolved, withVote } from "../optimistic";
 import type { CheckRun, CommentThread, Commit, FileChange, FileChangeKind, LineComment, PrRef, PrWriteSupport, ProviderType, PullRequest, ReviewVote, Reviewer, TimelineEvent, User } from "../types";
 import { Avatar, Chip, Pill, StatusBadge, Timeline } from "./ui";
@@ -339,6 +340,8 @@ function PrDetailPanel({ prRef, onClose }: { prRef: PrRef; onClose: () => void }
               {tab === "files" && (
                 <FilesTab
                   key={commitScope?.sha ?? "all"}
+                  prRef={prRef}
+                  sha={commitScope?.sha ?? null}
                   changes={commitScope ? (commitChanges.data ?? []) : data.changes}
                   threads={data.threads}
                   pending={pending}
@@ -710,6 +713,8 @@ function ChecksBadge({ checks, provider, onUnsupported }: { checks: CheckRun[]; 
 // ---- files / diff ----
 
 function FilesTab({
+  prRef,
+  sha,
   changes,
   threads,
   pending,
@@ -720,6 +725,8 @@ function FilesTab({
   onRemovePending,
   scope,
 }: {
+  prRef: PrRef;
+  sha: string | null;
   changes: FileChange[];
   threads: CommentThread[];
   pending: LineComment[];
@@ -730,9 +737,59 @@ function FilesTab({
   onRemovePending: (index: number) => void;
   scope?: { label: string; loading: boolean; onClear: () => void };
 }) {
-  // Which file the left-hand list has selected (clamped in case the file set shrank).
-  const [selected, setSelected] = useState(0);
-  const sel = Math.min(selected, Math.max(0, changes.length - 1));
+  // Which file the tree has selected, by path (an index would drift as folders fold/filter).
+  const [selectedPath, setSelectedPath] = useState<string | null>(null);
+  // Folders the user has folded shut — every folder starts open, so this tracks the exception.
+  const [closed, setClosed] = useState<Set<string>>(() => new Set());
+  // Folds made while a search is in effect, kept apart from `closed` so a fold toggled during
+  // a search can't leak into "what was folded before the search" — clearing the search just
+  // stops consulting this set, giving the real folds back untouched. Mirrors the TUI's
+  // `folded`/`search_folded` split (crates/forgetop-tui/src/app.rs).
+  const [searchClosed, setSearchClosed] = useState<Set<string>>(() => new Set());
+  const [query, setQuery] = useState("");
+
+  const tree = useMemo(() => buildDiffTree(changes), [changes]);
+  // `null` means "not searching" (show everything, respect `closed`); otherwise only files in
+  // the map are kept, and folders default open (ancestors of a match are never hidden) unless
+  // the user folded them during *this* search.
+  const matches = useMemo(() => (query.trim() ? searchFiles(changes, query) : null), [changes, query]);
+  const displayTree = useMemo(() => (matches ? filterTree(tree, matches) : tree), [tree, matches]);
+  const activeClosed = matches ? searchClosed : closed;
+  const rows = useMemo(() => {
+    const isOpen = (p: string) => !activeClosed.has(p);
+    return flattenTree(displayTree, isOpen);
+  }, [displayTree, activeClosed]);
+
+  const totalFiles = changes.length;
+  const visibleFiles = matches ? matches.size : totalFiles;
+  const hiddenCount = Math.max(0, totalFiles - visibleFiles);
+
+  // Every edit to the query starts its search-time folds fresh (mirrors the TUI's
+  // `search_changed`), so a fold made under one query never carries into the next, and the
+  // real `closed` set is never touched while searching.
+  useEffect(() => {
+    setSearchClosed(new Set());
+  }, [query]);
+
+  // A search that drops the current selection jumps to the first match, in tree order.
+  useEffect(() => {
+    if (!matches) return;
+    if (selectedPath && matches.has(selectedPath)) return;
+    const first = collectFiles(tree).find((f) => matches.has(f.path));
+    setSelectedPath(first ? first.path : null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [matches, tree]);
+
+  const toggleFolder = (path: string) => {
+    const setter = matches ? setSearchClosed : setClosed;
+    setter((s) => {
+      const next = new Set(s);
+      if (next.has(path)) next.delete(path);
+      else next.add(path);
+      return next;
+    });
+  };
+
   // Scoped to one commit: show a banner with a way back to the whole-PR diff.
   const banner = scope && (
     <div className="flex items-center gap-3 rounded-lg px-3 py-2 text-xs" style={{ background: "var(--panel2)", border: "1px solid var(--border)" }}>
@@ -753,45 +810,177 @@ function FilesTab({
     );
   }
 
-  const file = changes[sel];
+  // The default selection is the first file in tree order (folders-then-files, alphabetical) —
+  // not `changes[0]`, which is just whatever order the provider happened to list them in.
+  const file = changes.find((f) => f.path === selectedPath) ?? collectFiles(tree)[0]?.file ?? changes[0];
+
   return (
     <div className="flex flex-col h-full">
       {banner && <div className="px-4 pt-4 shrink-0">{banner}</div>}
       <div className="flex flex-1 min-h-0">
-        {/* file list */}
-        <nav className="w-56 shrink-0 overflow-auto p-2 flex flex-col gap-0.5" style={{ borderRight: "1px solid var(--border)" }}>
-          {changes.map((f, i) => {
-            const active = i === sel;
-            const k = kindTag(f.kind);
-            const parts = f.path.split("/");
-            const name = parts.pop() ?? f.path;
-            const dir = parts.join("/");
-            return (
-              <button
-                key={f.path}
-                onClick={() => setSelected(i)}
-                title={f.path}
-                className="flex items-center gap-2 rounded-md px-2 py-1.5 text-left w-full transition-colors"
-                style={{ background: active ? "var(--sel)" : "transparent" }}
-                onMouseEnter={(e) => !active && (e.currentTarget.style.background = "var(--card)")}
-                onMouseLeave={(e) => !active && (e.currentTarget.style.background = "transparent")}
-              >
-                <span className="mono text-xs shrink-0 w-3 text-center" style={{ color: k.color }} title={f.kind}>{k.letter}</span>
-                <span className="flex flex-col min-w-0 flex-1">
-                  <span className="truncate text-xs" style={{ color: "var(--fg)" }}>{name}</span>
-                  {dir && <span className="truncate text-[10px]" style={{ color: "var(--dim)" }}>{dir}</span>}
-                </span>
-              </button>
-            );
-          })}
+        {/* file tree */}
+        <nav className="w-60 shrink-0 overflow-auto p-2 flex flex-col gap-0.5" style={{ borderRight: "1px solid var(--border)" }}>
+          <input
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Escape" && query) {
+                e.stopPropagation();
+                setQuery("");
+              }
+            }}
+            placeholder="Search files…"
+            aria-label="Search files"
+            className="rounded-md px-2 py-1.5 text-xs outline-none mb-1"
+            style={{ background: "var(--card)", color: "var(--fg)", border: "1px solid var(--border)" }}
+          />
+          {rows.map(({ depth, node }) =>
+            node.type === "folder" ? (
+              <FolderRow
+                key={node.path}
+                node={node}
+                depth={depth}
+                open={!activeClosed.has(node.path)}
+                onToggle={() => toggleFolder(node.path)}
+              />
+            ) : (
+              <FileRow
+                key={node.path}
+                node={node}
+                depth={depth}
+                active={node.path === file.path}
+                match={matches?.get(node.path) ?? null}
+                query={query}
+                onSelect={() => setSelectedPath(node.path)}
+              />
+            ),
+          )}
+          {hiddenCount > 0 && (
+            <div className="px-2 py-1 text-[10px]" style={{ color: "var(--dim)" }}>
+              {hiddenCount} file{hiddenCount === 1 ? "" : "s"} hidden
+            </div>
+          )}
         </nav>
         {/* selected file's diff */}
         <div className="flex-1 overflow-auto p-4 min-w-0">
-          <FileDiff key={file.path} file={file} threads={threads} pending={pending} busy={busy} onReply={onReply} onResolve={onResolve} onAddPending={onAddPending} onRemovePending={onRemovePending} />
+          <FileDiff
+            key={file.path}
+            prRef={prRef}
+            sha={sha}
+            file={file}
+            threads={threads}
+            pending={pending}
+            busy={busy}
+            onReply={onReply}
+            onResolve={onResolve}
+            onAddPending={onAddPending}
+            onRemovePending={onRemovePending}
+            searchQuery={query}
+          />
         </div>
       </div>
     </div>
   );
+}
+
+/** A folder row in the Files-tab tree. Starts open; clicking toggles it. Folded, it shows the
+ *  aggregate file count and +/- it's hiding, mirroring the folder-count convention used
+ *  elsewhere in the dashboard. */
+function FolderRow({
+  node,
+  depth,
+  open,
+  onToggle,
+}: {
+  node: DiffTreeFolder;
+  depth: number;
+  open: boolean;
+  onToggle: () => void;
+}) {
+  return (
+    <button
+      onClick={onToggle}
+      aria-expanded={open}
+      title={node.path}
+      className="flex items-center gap-1.5 rounded-md py-1.5 text-left w-full transition-colors"
+      style={{ paddingLeft: 8 + depth * 14, paddingRight: 8 }}
+      onMouseEnter={(e) => (e.currentTarget.style.background = "var(--card)")}
+      onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+    >
+      <span className="shrink-0 text-xs w-3 text-center" style={{ color: "var(--dim)" }}>{open ? "▾" : "▸"}</span>
+      <span className="truncate text-xs flex-1" style={{ color: "var(--fg)" }}>{node.name}</span>
+      {!open && (
+        <span className="mono text-[10px] shrink-0 flex items-center gap-1" style={{ color: "var(--dim)" }}>
+          {node.fileCount}
+          <span style={{ color: "var(--green)" }}>+{node.additions}</span>
+          <span style={{ color: "var(--red)" }}>−{node.deletions}</span>
+        </span>
+      )}
+    </button>
+  );
+}
+
+/** A file row in the Files-tab tree. Normally shows its +/-; while searching, shows its hit
+ *  count (path hits + patch hits) instead, with matches in its name highlighted. */
+function FileRow({
+  node,
+  depth,
+  active,
+  match,
+  query,
+  onSelect,
+}: {
+  node: DiffTreeFile;
+  depth: number;
+  active: boolean;
+  match: FileMatch | null;
+  query: string;
+  onSelect: () => void;
+}) {
+  const f = node.file;
+  const k = kindTag(f.kind);
+  const hits = match ? match.pathHits + match.patchHits : 0;
+  return (
+    <button
+      onClick={onSelect}
+      title={f.path}
+      className="flex items-center gap-2 rounded-md py-1.5 text-left w-full transition-colors"
+      style={{ background: active ? "var(--sel)" : "transparent", paddingLeft: 8 + depth * 14, paddingRight: 8 }}
+      onMouseEnter={(e) => !active && (e.currentTarget.style.background = "var(--card)")}
+      onMouseLeave={(e) => !active && (e.currentTarget.style.background = "transparent")}
+    >
+      <span className="mono text-xs shrink-0 w-3 text-center" style={{ color: k.color }} title={f.kind}>{k.letter}</span>
+      <span className="flex flex-col min-w-0 flex-1">
+        <span className="truncate text-xs" style={{ color: "var(--fg)" }}>
+          {match ? <Highlighted text={node.name} query={query} /> : node.name}
+        </span>
+        <span className="truncate text-[10px] mono">
+          {match ? (
+            <span style={{ color: "var(--dim)" }}>{hits} hit{hits === 1 ? "" : "s"}</span>
+          ) : (
+            <>
+              <span style={{ color: "var(--green)" }}>+{f.additions}</span> <span style={{ color: "var(--red)" }}>−{f.deletions}</span>
+            </>
+          )}
+        </span>
+      </span>
+    </button>
+  );
+}
+
+/** Wraps every ASCII case-insensitive occurrence of `query` in `text` with `<mark>`. */
+function Highlighted({ text, query }: { text: string; query: string }) {
+  const ranges = query ? findMatches(text, query) : [];
+  if (ranges.length === 0) return <>{text}</>;
+  const parts: ReactNode[] = [];
+  let last = 0;
+  ranges.forEach(([s, e], i) => {
+    if (s > last) parts.push(text.slice(last, s));
+    parts.push(<mark key={i}>{text.slice(s, e)}</mark>);
+    last = e;
+  });
+  if (last < text.length) parts.push(text.slice(last));
+  return <>{parts}</>;
 }
 
 /** Single-letter change-kind tag for the file list, coloured like a diff. */
@@ -808,7 +997,12 @@ function kindTag(kind: FileChangeKind): { letter: string; color: string } {
   }
 }
 
+/** A hunk header's range, lifted out of its `DiffLine` for the gap arithmetic below. */
+type HunkMeta = { oldStart: number; oldCount: number; newStart: number; newCount: number };
+
 function FileDiff({
+  prRef,
+  sha,
   file,
   threads,
   pending,
@@ -817,7 +1011,10 @@ function FileDiff({
   onResolve,
   onAddPending,
   onRemovePending,
+  searchQuery,
 }: {
+  prRef: PrRef;
+  sha: string | null;
   file: FileChange;
   threads: CommentThread[];
   pending: LineComment[];
@@ -826,16 +1023,143 @@ function FileDiff({
   onResolve?: OnResolve;
   onAddPending: (c: LineComment) => void;
   onRemovePending: (index: number) => void;
+  searchQuery: string;
 }) {
   const [composeLine, setComposeLine] = useState<number | null>(null);
   const [draft, setDraft] = useState("");
+  // Fetched once, lazily, the first time any gap in this file is clicked — shared by every gap.
+  const [textRequested, setTextRequested] = useState(false);
+  const fileText = usePrFileText(prRef, file.path, sha, file.patch ?? null, textRequested);
   const lines = useMemo(() => (file.patch ? parsePatch(file.patch) : []), [file.patch]);
   const fileThreads = threads.filter((t) => t.file_path === file.path && t.line != null);
+
+  // Group the flat line list back into per-hunk chunks (header line included) so the gaps
+  // between them — the unchanged lines a hunk header doesn't carry — can be worked out. A
+  // provider without hunk headers at all (Azure's patches have none) puts everything in
+  // `preamble` instead — it renders plainly, with no gap rows (there's nothing to anchor one to).
+  const { preamble, hunks } = useMemo(() => {
+    const pre: DiffLine[] = [];
+    const list: { meta: HunkMeta; lines: DiffLine[] }[] = [];
+    let cur: { meta: HunkMeta; lines: DiffLine[] } | null = null;
+    for (const ln of lines) {
+      if (ln.kind === "hunk") {
+        cur = {
+          meta: { oldStart: ln.oldStart ?? 1, oldCount: ln.oldCount ?? 0, newStart: ln.newStart ?? 1, newCount: ln.newCount ?? 0 },
+          lines: [ln],
+        };
+        list.push(cur);
+      } else if (cur) {
+        cur.lines.push(ln);
+      } else {
+        pre.push(ln);
+      }
+    }
+    return { preamble: pre, hunks: list };
+  }, [lines]);
+
+  // Only the new-side range matters here: the fetched text is the file's content at this
+  // commit, which is exactly the diff's new side. Ported from the TUI's `hunk_gaps`
+  // (crates/forgetop-tui/src/diff.rs) line for line, including the `+N,0` (deletion-only hunk)
+  // case: such a hunk sits *after* new line N (not before it), so the gap before it runs
+  // through N inclusive, and the next gap starts at N+1.
+  const gaps = useMemo(() => {
+    const list: { beforeIndex: number; newStart: number; newCount: number }[] = [];
+    let next = 1;
+    hunks.forEach((h, i) => {
+      const { newStart: start, newCount: count } = h.meta;
+      const end = count === 0 ? start : start - 1;
+      if (end >= next) list.push({ beforeIndex: i, newStart: next, newCount: end - next + 1 });
+      next = count === 0 ? start + 1 : start + count;
+    });
+    return list;
+  }, [hunks]);
+
+  const fileLines = useMemo(() => (fileText.data != null ? fileText.data.split("\n") : null), [fileText.data]);
+
+  // The fetched text might no longer be this diff's base (the PR moved on since) — if a hunk's
+  // own first line disagrees with what the fetch says is there, or any gap/hunk range runs
+  // past the text's last line, don't trust any of it.
+  const textUnavailable = useMemo(() => {
+    if (fileText.isError) return true;
+    if (!fileLines) return false;
+    for (const h of hunks) {
+      const firstContent = h.lines.find((l) => l.newLine === h.meta.newStart);
+      if (firstContent && fileLines[h.meta.newStart - 1] !== firstContent.text) return true;
+      if (h.meta.newCount > 0 && h.meta.newStart + h.meta.newCount - 1 > fileLines.length) return true;
+    }
+    for (const g of gaps) {
+      if (g.newStart + g.newCount - 1 > fileLines.length) return true;
+    }
+    return false;
+  }, [fileText.isError, fileLines, hunks, gaps]);
 
   const commit = (line: number) => {
     if (draft.trim()) onAddPending({ path: file.path, line, side: "New", body: draft.trim() });
     setDraft("");
     setComposeLine(null);
+  };
+
+  const renderDiffLine = (ln: DiffLine, key: string) => {
+    const bg = ln.kind === "add" ? "rgba(135,215,135,0.10)" : ln.kind === "del" ? "rgba(255,135,135,0.10)" : "transparent";
+    const marker = ln.kind === "add" ? "+" : ln.kind === "del" ? "−" : ln.kind === "hunk" ? "" : " ";
+    const color = ln.kind === "hunk" ? "var(--cyan)" : ln.kind === "meta" ? "var(--dim)" : "var(--fg)";
+    const canComment = (ln.kind === "add" || ln.kind === "context") && ln.newLine != null;
+    const lineThreads = ln.newLine != null ? fileThreads.filter((t) => t.line === ln.newLine) : [];
+    const linePending = ln.newLine != null ? pending.map((p, idx) => ({ p, idx })).filter((x) => x.p.path === file.path && x.p.line === ln.newLine) : [];
+    return (
+      <div key={key}>
+        <div
+          className="group flex items-stretch"
+          style={{ background: bg, borderLeft: `2px solid ${ln.kind === "add" ? "var(--green)" : ln.kind === "del" ? "var(--red)" : "transparent"}` }}
+        >
+          <span className="w-10 text-right pr-2 select-none shrink-0" style={{ color: "var(--dim)" }}>
+            {ln.newLine ?? ln.oldLine ?? ""}
+          </span>
+          {canComment ? (
+            <span className="w-6 shrink-0 flex items-center justify-center">
+              <button
+                className="flex items-center justify-center rounded opacity-0 group-hover:opacity-100 transition-opacity hover:brightness-110"
+                style={{ width: 16, height: 16, background: "var(--accent)", color: "var(--bg)", fontWeight: 600, lineHeight: 1 }}
+                title="Comment on this line"
+                aria-label="Comment on this line"
+                onClick={() => setComposeLine(ln.newLine!)}
+              >
+                +
+              </button>
+            </span>
+          ) : (
+            <span className="w-6 shrink-0" />
+          )}
+          <span className="pr-3 whitespace-pre" style={{ color }}>
+            {marker}
+            {searchQuery ? <Highlighted text={ln.text} query={searchQuery} /> : ln.text}
+          </span>
+        </div>
+        {lineThreads.map((t) => (
+          <ThreadBox key={t.id} thread={t} busy={busy} onReply={onReply} onResolve={onResolve} />
+        ))}
+        {linePending.map(({ p, idx }) => (
+          <PendingBox key={idx} body={p.body} onRemove={() => onRemovePending(idx)} />
+        ))}
+        {composeLine === ln.newLine && canComment && (
+          <div className="p-2" style={{ background: "var(--panel)" }}>
+            <textarea
+              autoFocus
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              placeholder="Leave a comment on this line…"
+              className="w-full rounded p-2 text-xs outline-none"
+              style={{ background: "var(--bg)", color: "var(--fg)", border: "1px solid var(--border)" }}
+              rows={2}
+            />
+            <div className="flex gap-2 mt-1.5">
+              <ActionButton label="Add comment" onClick={() => commit(ln.newLine!)} primary color="var(--accent)" />
+              <ActionButton label="Cancel" onClick={() => { setDraft(""); setComposeLine(null); }} />
+            </div>
+          </div>
+        )}
+      </div>
+    );
   };
 
   return (
@@ -852,73 +1176,152 @@ function FileDiff({
         </div>
       ) : (
         <div className="mono text-xs overflow-x-auto">
-          {lines.map((ln, i) => {
-            const bg =
-              ln.kind === "add" ? "rgba(135,215,135,0.10)" : ln.kind === "del" ? "rgba(255,135,135,0.10)" : "transparent";
-            const marker = ln.kind === "add" ? "+" : ln.kind === "del" ? "−" : ln.kind === "hunk" ? "" : " ";
-            const color = ln.kind === "hunk" ? "var(--cyan)" : ln.kind === "meta" ? "var(--dim)" : "var(--fg)";
-            const canComment = (ln.kind === "add" || ln.kind === "context") && ln.newLine != null;
-            const lineThreads = ln.newLine != null ? fileThreads.filter((t) => t.line === ln.newLine) : [];
-            const linePending = ln.newLine != null ? pending.map((p, idx) => ({ p, idx })).filter((x) => x.p.path === file.path && x.p.line === ln.newLine) : [];
-            return (
-              <div key={i}>
-                <div
-                  className="group flex items-stretch"
-                  style={{ background: bg, borderLeft: `2px solid ${ln.kind === "add" ? "var(--green)" : ln.kind === "del" ? "var(--red)" : "transparent"}` }}
-                >
-                  <span className="w-10 text-right pr-2 select-none shrink-0" style={{ color: "var(--dim)" }}>
-                    {ln.newLine ?? ln.oldLine ?? ""}
-                  </span>
-                  {canComment ? (
-                    <span className="w-6 shrink-0 flex items-center justify-center">
-                      <button
-                        className="flex items-center justify-center rounded opacity-0 group-hover:opacity-100 transition-opacity hover:brightness-110"
-                        style={{ width: 16, height: 16, background: "var(--accent)", color: "var(--bg)", fontWeight: 600, lineHeight: 1 }}
-                        title="Comment on this line"
-                        aria-label="Comment on this line"
-                        onClick={() => setComposeLine(ln.newLine!)}
-                      >
-                        +
-                      </button>
-                    </span>
-                  ) : (
-                    <span className="w-6 shrink-0" />
-                  )}
-                  <span className="pr-3 whitespace-pre" style={{ color }}>
-                    {marker}
-                    {ln.text}
-                  </span>
-                </div>
-                {lineThreads.map((t) => (
-                  <ThreadBox key={t.id} thread={t} busy={busy} onReply={onReply} onResolve={onResolve} />
+          {preamble.map((ln, i) => renderDiffLine(ln, `pre-${i}`))}
+          {hunks.map((h, i) => (
+            <Fragment key={i}>
+              {gaps
+                .filter((g) => g.beforeIndex === i)
+                .map((g) => (
+                  <GapRow
+                    key={`gap-${i}`}
+                    newStart={g.newStart}
+                    newCount={g.newCount}
+                    fileLines={fileLines}
+                    requested={textRequested}
+                    loading={textRequested && fileText.isLoading}
+                    unavailable={textUnavailable}
+                    onRequestText={() => setTextRequested(true)}
+                    highlightQuery={searchQuery}
+                  />
                 ))}
-                {linePending.map(({ p, idx }) => (
-                  <PendingBox key={idx} body={p.body} onRemove={() => onRemovePending(idx)} />
-                ))}
-                {composeLine === ln.newLine && canComment && (
-                  <div className="p-2" style={{ background: "var(--panel)" }}>
-                    <textarea
-                      autoFocus
-                      value={draft}
-                      onChange={(e) => setDraft(e.target.value)}
-                      placeholder="Leave a comment on this line…"
-                      className="w-full rounded p-2 text-xs outline-none"
-                      style={{ background: "var(--bg)", color: "var(--fg)", border: "1px solid var(--border)" }}
-                      rows={2}
-                    />
-                    <div className="flex gap-2 mt-1.5">
-                      <ActionButton label="Add comment" onClick={() => commit(ln.newLine!)} primary color="var(--accent)" />
-                      <ActionButton label="Cancel" onClick={() => { setDraft(""); setComposeLine(null); }} />
-                    </div>
-                  </div>
-                )}
-              </div>
-            );
-          })}
+              {h.lines.map((ln, li) => renderDiffLine(ln, `${i}-${li}`))}
+            </Fragment>
+          ))}
         </div>
       )}
     </div>
   );
+}
+
+/** A collapsed run of unchanged lines before/between hunks. Click reveals up to 10 lines from
+ *  each edge (fully, when the gap is 20 lines or fewer); "Show all" reveals the whole thing in
+ *  one go. The file's text is fetched lazily (shared across every gap in the file) on first
+ *  click, and the row reports "loading…" or unavailability while that's in flight or fails. */
+function GapRow({
+  newStart,
+  newCount,
+  fileLines,
+  requested,
+  loading,
+  unavailable,
+  onRequestText,
+  highlightQuery,
+}: {
+  newStart: number;
+  newCount: number;
+  fileLines: string[] | null;
+  requested: boolean;
+  loading: boolean;
+  unavailable: boolean;
+  onRequestText: () => void;
+  highlightQuery: string;
+}) {
+  const [revealed, setRevealed] = useState(false);
+  const [all, setAll] = useState(false);
+
+  if (requested && !loading && unavailable) {
+    return (
+      <div className="px-2 py-1 text-[11px] italic" style={{ color: "var(--dim)" }}>
+        context isn't available for this file
+      </div>
+    );
+  }
+
+  if (!revealed) {
+    return (
+      <div className="flex items-center gap-2 w-full px-2 py-1 text-[11px]" style={{ color: "var(--dim)", background: "var(--panel2)" }}>
+        <button
+          className="flex-1 text-left"
+          aria-label={newCount > 20 ? "Show 10 more unchanged lines" : `Show all ${newCount} unchanged lines`}
+          onClick={() => {
+            onRequestText();
+            setRevealed(true);
+          }}
+        >
+          ⋯ {newCount} unchanged line{newCount === 1 ? "" : "s"}
+        </button>
+        {newCount > 20 && (
+          <button
+            className="shrink-0 underline"
+            style={{ color: "var(--accent)" }}
+            aria-label={`Show all ${newCount} unchanged lines`}
+            onClick={() => {
+              onRequestText();
+              setRevealed(true);
+              setAll(true);
+            }}
+          >
+            Show all
+          </button>
+        )}
+      </div>
+    );
+  }
+
+  if (loading) {
+    return (
+      <div className="px-2 py-1 text-[11px]" style={{ color: "var(--dim)" }}>
+        loading…
+      </div>
+    );
+  }
+
+  if (!fileLines) return null;
+
+  if (all || newCount <= 20) {
+    return <>{sliceContextLines(fileLines, newStart, newCount, highlightQuery)}</>;
+  }
+
+  // More than 20 lines and not "show all": reveal 10 from each edge, and leave the untouched
+  // middle collapsed behind its own (smaller) gap row.
+  const middleCount = newCount - 20;
+  return (
+    <>
+      {sliceContextLines(fileLines, newStart, 10, highlightQuery)}
+      <GapRow
+        newStart={newStart + 10}
+        newCount={middleCount}
+        fileLines={fileLines}
+        requested={true}
+        loading={false}
+        unavailable={false}
+        onRequestText={() => {}}
+        highlightQuery={highlightQuery}
+      />
+      {sliceContextLines(fileLines, newStart + newCount - 10, 10, highlightQuery)}
+    </>
+  );
+}
+
+/** Renders `count` lines of `fileLines` starting at new-side line `start` as plain context
+ *  rows — no gutter comment button, since revealed lines don't need a composer. */
+function sliceContextLines(fileLines: string[], start: number, count: number, highlightQuery: string) {
+  const out: ReactNode[] = [];
+  for (let i = 0; i < count; i++) {
+    const newLine = start + i;
+    const text = fileLines[newLine - 1] ?? "";
+    out.push(
+      <div key={`ctx-${newLine}`} className="flex items-stretch">
+        <span className="w-10 text-right pr-2 select-none shrink-0" style={{ color: "var(--dim)" }}>{newLine}</span>
+        <span className="w-6 shrink-0" />
+        <span className="pr-3 whitespace-pre" style={{ color: "var(--fg)" }}>
+          {" "}
+          {highlightQuery ? <Highlighted text={text} query={highlightQuery} /> : text}
+        </span>
+      </div>,
+    );
+  }
+  return out;
 }
 
 function ThreadBox({

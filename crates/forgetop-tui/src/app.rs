@@ -44,6 +44,7 @@ const DIAG_PR_CHECKS: &str = "tui.pr.checks";
 const DIAG_PR_COMMITS: &str = "tui.pr.commits";
 const DIAG_PR_COMMIT_CHANGES: &str = "tui.pr.commit_changes";
 const DIAG_PR_TIMELINE: &str = "tui.pr.timeline";
+const DIAG_PR_FILE_TEXT: &str = "tui.pr.file_text";
 const DIAG_WI_FEEDS: &str = "tui.work_item.feeds";
 const DIAG_WI_DETAIL: &str = "tui.work_item.detail";
 const DIAG_WI_THREADS: &str = "tui.work_item.threads";
@@ -338,6 +339,11 @@ pub enum AppEvent {
     WiActionDone { token: u64, result: std::result::Result<(), String>, fresh: Option<Box<WorkItem>> },
     /// A finished run's problems, fetched apart from its detail. `None` means the call failed.
     PipelineAnnotationsLoaded { key: String, annotations: Option<Vec<PipelineAnnotation>> },
+    /// A changed file's full text, fetched to reveal the unchanged lines between its hunks. `key`
+    /// is the PR's detail key and `sha` the commit it was read at (`None` = the PR's head);
+    /// `None` text means the forge couldn't say. Applied only if the view still shows that PR
+    /// at that commit.
+    FileTextLoaded { key: String, path: String, sha: Option<String>, text: Option<String> },
 }
 
 /// A snapshot of everything the background fetch needs from `self` at spawn time, so it
@@ -1275,11 +1281,14 @@ impl PrView {
     /// Restores the whole-PR diff if the view was showing a single commit's changes.
     fn reset_diff_scope(&mut self) {
         self.diff.focus = DiffFocus::FileList;
+        // Leaving the Diff tab closes a `/` prompt left open (a mouse click can do that while it
+        // has the keys); a committed search stays.
+        self.diff.search_input = None;
         if self.diff.commit_label.is_some() {
             self.diff.files = self.pr_files.clone();
-            self.diff.selected = 0;
-            self.diff.cursor = 0;
             self.diff.commit_label = None;
+            self.diff.commit_sha = None;
+            self.diff.reset_cursor();
         }
     }
 }
@@ -2907,12 +2916,51 @@ pub enum DiffFocus {
     Patch,
 }
 
+/// A file's full text, fetched for revealing the unchanged lines between a patch's hunks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileText {
+    /// Asked for, not yet answered.
+    Loading,
+    /// The forge couldn't say (or the call failed): the gaps stay shut.
+    Missing,
+    /// The file, one entry per line.
+    Lines(Vec<String>),
+}
+
+/// What the gaps of the file on screen can show, once [`DiffView::context_text`] has checked
+/// the fetched text against the patch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextText<'a> {
+    /// Never asked for: no gap has been opened yet.
+    Unfetched,
+    Loading,
+    /// Not available, or it disagrees with the patch; expanding does nothing.
+    Unavailable,
+    Lines(&'a [String]),
+}
+
+/// How a gap changes: ten more lines from each edge, all of it, or shut again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GapExpand {
+    More,
+    All,
+    Fold,
+}
+
+/// Lines a gap reveals from each edge per step.
+pub const GAP_STEP: usize = 10;
+
+/// A fetched file text, addressed by path and the commit it is read at (`None` = the PR's head).
+pub type TextKey = (String, Option<String>);
+
 /// State for the full-screen PR diff + threads view.
+#[derive(Default)]
 pub struct DiffView {
     pub pr_label: String,
     pub url: Option<String>,
     pub files: Vec<FileChange>,
     pub threads: Vec<CommentThread>,
+    /// The file the cursor is on (an index into `files`), unless `folder` puts it on a folder.
     pub selected: usize,
     pub scroll: u16,
     /// Whether keys drive the file list or a line cursor in the patch.
@@ -2922,14 +2970,160 @@ pub struct DiffView {
     /// When set, the diff shows a single commit's changes (label shown in the
     /// file-list title); `None` means the whole-PR diff.
     pub commit_label: Option<String>,
+    /// The sha of that commit, which the unchanged lines between its hunks are read at.
+    pub commit_sha: Option<String>,
     /// Paths the reviewer has marked "viewed". The view's copy; [`App::pr_viewed`] keeps them
     /// across closing and reopening the PR.
     pub viewed: HashSet<String>,
+    /// The folder row the cursor is on, by its directory path; `None` while it is on a file.
+    pub folder: Option<String>,
+    /// Folders the reviewer shut (every folder starts open), by directory path.
+    pub folded: HashSet<String>,
+    /// Folds made while a search is in effect. Each new query starts with every folder that
+    /// holds a match open, and clearing the search gives back the folds from before it.
+    pub search_folded: HashSet<String>,
+    /// The `/` prompt's text while it is open; the list narrows to it as it is typed.
+    pub search_input: Option<String>,
+    /// The committed search.
+    pub query: Option<String>,
+    /// Whether the last frame drew the file list flattened to one level (too narrow for the
+    /// tree). Written by the renderer, so the cursor walks the rows that were drawn.
+    pub narrow: Cell<bool>,
+    /// Texts fetched to reveal unchanged lines, by (path, commit). Fetched once, on the first
+    /// expand; a reload never asks again.
+    pub file_texts: HashMap<TextKey, FileText>,
+    /// Lines revealed per gap — (path, commit, the `@@` line below the gap) → (from the top
+    /// edge, from the bottom edge).
+    pub expanded: HashMap<(String, Option<String>, usize), (usize, usize)>,
+    /// Texts an expand asked for that haven't been sent yet ([`App::request_file_texts`]).
+    pub text_wanted: Vec<TextKey>,
 }
 
 impl DiffView {
+    /// The file the cursor is on; `None` on a folder row.
     pub fn current(&self) -> Option<&FileChange> {
+        if self.folder.is_some() {
+            return None;
+        }
         self.files.get(self.selected)
+    }
+
+    /// The search in effect: the prompt's text while it is open, else the committed query.
+    pub fn active_query(&self) -> Option<&str> {
+        match &self.search_input {
+            Some(input) => Some(input.as_str()),
+            None => self.query.as_deref(),
+        }
+        .filter(|q| !q.is_empty())
+    }
+
+    /// How often the search occurs in file `idx` (path and patch); 0 without a search.
+    pub fn file_hits(&self, idx: usize) -> usize {
+        match (self.active_query(), self.files.get(idx)) {
+            (Some(q), Some(f)) => crate::diff_tree::file_hits(&f.path, f.patch.as_deref(), q),
+            _ => 0,
+        }
+    }
+
+    fn active_folds(&self) -> &HashSet<String> {
+        if self.active_query().is_some() { &self.search_folded } else { &self.folded }
+    }
+
+    /// The file list's rows as the last frame drew them (tree or flat).
+    pub fn rows(&self) -> Vec<crate::diff_tree::TreeRow> {
+        self.rows_for(self.narrow.get())
+    }
+
+    /// The file list's rows in the tree (`narrow` false) or flat layout: folds applied, and
+    /// narrowed to the files that match a search. A lone file is just itself — it has no list.
+    pub fn rows_for(&self, narrow: bool) -> Vec<crate::diff_tree::TreeRow> {
+        use crate::diff_tree::{flat_rows, tree_rows, TreeRow};
+        if self.files.len() <= 1 {
+            return (0..self.files.len()).map(|idx| TreeRow::File { idx, depth: 0 }).collect();
+        }
+        let paths: Vec<&str> = self.files.iter().map(|f| f.path.as_str()).collect();
+        let hits: Option<Vec<bool>> = self.active_query().map(|_| (0..self.files.len()).map(|i| self.file_hits(i) > 0).collect());
+        let include = |i: usize| hits.as_ref().is_none_or(|h| h[i]);
+        if narrow { flat_rows(&paths, self.active_folds(), &include) } else { tree_rows(&paths, self.active_folds(), &include) }
+    }
+
+    /// Where the cursor sits in `rows`, if that row is listed.
+    pub fn cursor_row(&self, rows: &[crate::diff_tree::TreeRow]) -> Option<usize> {
+        use crate::diff_tree::TreeRow;
+        rows.iter().position(|r| match (r, &self.folder) {
+            (TreeRow::Dir { key, .. }, Some(f)) => key == f,
+            (TreeRow::File { idx, .. }, None) => *idx == self.selected,
+            _ => false,
+        })
+    }
+
+    /// The folder row the cursor is on, if it is listed.
+    pub fn cursor_dir(&self) -> Option<crate::diff_tree::TreeRow> {
+        self.folder.as_ref()?;
+        let rows = self.rows();
+        let at = self.cursor_row(&rows)?;
+        Some(rows[at].clone())
+    }
+
+    /// Puts the cursor on `row`; a different file starts at the top of its patch.
+    fn set_row(&mut self, row: &crate::diff_tree::TreeRow) {
+        use crate::diff_tree::TreeRow;
+        match row {
+            TreeRow::Dir { key, .. } => self.folder = Some(key.clone()),
+            TreeRow::File { idx, .. } => {
+                let moved = self.folder.is_some() || self.selected != *idx;
+                self.folder = None;
+                if moved {
+                    self.selected = *idx;
+                    self.scroll = 0;
+                    self.cursor = 0;
+                }
+            }
+        }
+    }
+
+    /// Puts the cursor on the first file as listed (not the first by path: folders come first).
+    pub fn reset_cursor(&mut self) {
+        self.folder = None;
+        let rows = self.rows();
+        self.selected = rows
+            .iter()
+            .find_map(|r| match r {
+                crate::diff_tree::TreeRow::File { idx, .. } => Some(*idx),
+                _ => None,
+            })
+            .unwrap_or(0);
+        self.scroll = 0;
+        self.cursor = 0;
+    }
+
+    /// Moves the cursor onto a listed row when what it was on has gone — a search narrowed it
+    /// away, or the list changed layout. The tree and the flat list key their folders apart: the
+    /// tree has folders that hold no files of their own (`crates/`), the flat list a `(root)`. A
+    /// folder that isn't listed gives way to the nearest one that is (its first listed subfolder,
+    /// else the closest listed parent; `(root)` to the first root-level file); failing that the
+    /// cursor goes to the first listed file, else the first row. Run after every frame
+    /// ([`crate::ui::render`]), so it never sits on a row that isn't drawn.
+    pub(crate) fn fix_cursor(&mut self) {
+        use crate::diff_tree::TreeRow;
+        let rows = self.rows();
+        if rows.is_empty() || self.cursor_row(&rows).is_some() {
+            return;
+        }
+        let near = self.folder.as_deref().and_then(|k| {
+            if k.is_empty() {
+                let root_file = |idx: &usize| !self.files[*idx].path.trim_start_matches('/').contains('/');
+                return rows.iter().find(|r| matches!(r, TreeRow::File { idx, .. } if root_file(idx)));
+            }
+            let under = rows.iter().find(|r| matches!(r, TreeRow::Dir { key, .. } if key.starts_with(&format!("{k}/"))));
+            let over = rows
+                .iter()
+                .filter(|r| matches!(r, TreeRow::Dir { key, .. } if !key.is_empty() && k.starts_with(&format!("{key}/"))))
+                .max_by_key(|r| r.depth());
+            under.or(over)
+        });
+        let row = near.or_else(|| rows.iter().find(|r| matches!(r, TreeRow::File { .. }))).unwrap_or(&rows[0]).clone();
+        self.set_row(&row);
     }
 
     /// The comment thread anchored at the current patch cursor line, if any — the target for `r`.
@@ -2948,14 +3142,70 @@ impl DiffView {
         self.current().and_then(|f| f.patch.as_deref()).map(|p| p.lines().count()).unwrap_or(0)
     }
 
+    /// Moves the cursor `delta` rows through the listed folders and files, wrapping.
     fn select_file(&mut self, delta: isize) {
-        if self.files.is_empty() {
+        let rows = self.rows();
+        if rows.is_empty() {
             return;
         }
-        let n = self.files.len() as isize;
-        self.selected = (((self.selected as isize + delta) % n + n) % n) as usize;
-        self.scroll = 0;
-        self.cursor = 0;
+        let n = rows.len() as isize;
+        let next = match self.cursor_row(&rows) {
+            Some(at) => ((at as isize + delta) % n + n) % n,
+            None => 0,
+        };
+        let row = rows[next as usize].clone();
+        self.set_row(&row);
+        if delta == 0 {
+            self.scroll = 0;
+            self.cursor = 0;
+        }
+    }
+
+    /// Opens or shuts the folder under the cursor. False when the cursor isn't on a folder.
+    fn toggle_fold(&mut self) -> bool {
+        let Some(key) = self.folder.clone() else { return false };
+        let folds = if self.active_query().is_some() { &mut self.search_folded } else { &mut self.folded };
+        if !folds.remove(&key) {
+            folds.insert(key);
+        }
+        true
+    }
+
+    /// Opens the `/` prompt, starting from the committed query.
+    fn open_search(&mut self) {
+        self.search_input = Some(self.query.clone().unwrap_or_default());
+    }
+
+    /// A key while the `/` prompt is open: it takes every key.
+    fn on_search_key(&mut self, key: Key) {
+        let Some(input) = &mut self.search_input else { return };
+        match key {
+            // Back to the query from before the prompt opened.
+            Key::Escape => self.search_input = None,
+            Key::Enter => {
+                let input = self.search_input.take().unwrap_or_default();
+                self.query = (!input.is_empty()).then_some(input);
+            }
+            Key::Backspace => {
+                input.pop();
+            }
+            Key::Char(c) => input.push(c),
+            _ => return,
+        }
+        self.search_changed();
+    }
+
+    /// Drops the committed search.
+    fn clear_search(&mut self) {
+        self.query = None;
+        self.search_input = None;
+        self.search_changed();
+    }
+
+    /// A new query opens every folder holding a match, and the cursor stays on a listed row.
+    fn search_changed(&mut self) {
+        self.search_folded.clear();
+        self.fix_cursor();
     }
 
     /// Enters the patch line cursor for the current file (no-op without a patch).
@@ -2984,8 +3234,20 @@ impl DiffView {
         self.scroll = (self.scroll as i32 + delta).max(0) as u16;
     }
 
-    /// Toggle the "viewed" mark on the current file.
+    /// Toggle the "viewed" mark on the current file — or, on a folder, mark every file in it
+    /// (un-marking them all if every one already is).
     fn toggle_viewed(&mut self) {
+        if let Some(crate::diff_tree::TreeRow::Dir { files, .. }) = self.cursor_dir() {
+            let paths: Vec<String> = files.iter().filter_map(|&i| self.files.get(i)).map(|f| f.path.clone()).collect();
+            if paths.iter().all(|p| self.viewed.contains(p)) {
+                for p in &paths {
+                    self.viewed.remove(p);
+                }
+            } else {
+                self.viewed.extend(paths);
+            }
+            return;
+        }
         if let Some(path) = self.current().map(|f| f.path.clone()) {
             if !self.viewed.remove(&path) {
                 self.viewed.insert(path);
@@ -3000,6 +3262,64 @@ impl DiffView {
     /// How many of the currently-listed files are marked viewed (for "N/M reviewed").
     pub fn viewed_count(&self) -> usize {
         self.files.iter().filter(|f| self.viewed.contains(&f.path)).count()
+    }
+
+    /// What the gaps of `file` can show: the fetched text only once it agrees with the patch.
+    pub fn context_text(&self, file: &FileChange) -> ContextText<'_> {
+        match self.file_texts.get(&(file.path.clone(), self.commit_sha.clone())) {
+            None => ContextText::Unfetched,
+            Some(FileText::Loading) => ContextText::Loading,
+            Some(FileText::Missing) => ContextText::Unavailable,
+            Some(FileText::Lines(text)) => match file.patch.as_deref() {
+                Some(patch) if crate::diff::text_agrees(patch, text) => ContextText::Lines(text),
+                _ => ContextText::Unavailable,
+            },
+        }
+    }
+
+    /// Lines revealed above the hunk at patch line `hunk` of `path`: (from the top, from the bottom).
+    pub fn revealed(&self, path: &str, hunk: usize) -> (usize, usize) {
+        self.expanded.get(&(path.to_string(), self.commit_sha.clone(), hunk)).copied().unwrap_or((0, 0))
+    }
+
+    /// The gap above the patch cursor's line, when the cursor is on a hunk header that has one.
+    pub fn gap_at_cursor(&self) -> Option<crate::diff::Gap> {
+        let patch = self.current()?.patch.as_deref()?;
+        crate::diff::hunk_gaps(patch).into_iter().find(|g| g.hunk == self.cursor)
+    }
+
+    /// Reveals (or shuts) the gap above the hunk header at patch line `hunk` of the current
+    /// file. The first expand of a file asks for its text; while that is out, or once it is
+    /// known to be unavailable, expanding is recorded but shows nothing.
+    fn expand_gap(&mut self, hunk: usize, how: GapExpand) {
+        let Some(file) = self.current() else { return };
+        let Some(gap) = file.patch.as_deref().and_then(|p| crate::diff::hunk_gaps(p).into_iter().find(|g| g.hunk == hunk)) else {
+            return;
+        };
+        let (unfetched, unavailable) = match self.context_text(file) {
+            ContextText::Unfetched => (true, false),
+            ContextText::Unavailable => (false, true),
+            ContextText::Loading | ContextText::Lines(_) => (false, false),
+        };
+        let key = (file.path.clone(), self.commit_sha.clone(), hunk);
+        if how == GapExpand::Fold {
+            self.expanded.remove(&key);
+            return;
+        }
+        if unavailable {
+            return;
+        }
+        let now = self.expanded.get(&key).copied().unwrap_or((0, 0));
+        let next = match how {
+            GapExpand::All => (gap.len(), 0),
+            _ => crate::diff::reveal_step(gap.len(), now, GAP_STEP),
+        };
+        self.expanded.insert(key.clone(), next);
+        if unfetched {
+            let text_key = (key.0, key.1);
+            self.file_texts.insert(text_key.clone(), FileText::Loading);
+            self.text_wanted.push(text_key);
+        }
     }
 
     /// Move the patch cursor to the next (`dir > 0`) or previous thread in the current
@@ -3940,6 +4260,9 @@ impl App {
             AppEvent::PrActionDone { token, result, fresh } => self.finish_pr_action(token, result, fresh.map(|p| *p), deps),
             AppEvent::WiActionDone { token, result, fresh } => self.finish_wi_action(token, result, fresh.map(|w| *w), deps),
             AppEvent::PipelineAnnotationsLoaded { key, annotations } => self.apply_pipeline_annotations(deps, key, annotations),
+            AppEvent::FileTextLoaded { key, path, sha, text } => {
+                self.with_preview_screen(&key.clone(), |app| app.apply_file_text(&key, path, sha, text));
+            }
         }
         self.drive_logs(deps);
         self.refresh_pipeline_context();
@@ -4601,13 +4924,17 @@ impl App {
                 }
                 if v.tab == 3 {
                     if v.diff.focus == DiffFocus::FileList {
-                        out.push(("Line cursor in the patch", Key::Enter));
+                        let on_folder = v.diff.folder.is_some();
+                        out.push((if on_folder { "Fold / unfold the folder" } else { "Line cursor in the patch" }, Key::Enter));
                     }
                     out.extend([
                         ("Mark file viewed", c('v')),
                         ("Next comment thread", c(']')),
                         ("Previous comment thread", c('[')),
                     ]);
+                    if v.diff.files.len() > 1 {
+                        out.push(("Search the diff", c('/')));
+                    }
                 }
                 if v.url.is_some() {
                     out.push(("Open in browser", c('o')));
@@ -5535,6 +5862,19 @@ impl App {
         if v.commit_sel >= v.commits.len() {
             v.commit_sel = v.commits.len().saturating_sub(1);
         }
+        // A file whose whole-PR patch changed (a push) can't use the head text fetched for the
+        // old one, nor the reveals keyed by the old patch's lines: drop both, so the next expand
+        // asks again. Per-commit texts are pinned to their sha and stay.
+        let changed: HashSet<String> = v
+            .pr_files
+            .iter()
+            .filter(|old| files.iter().find(|f| f.path == old.path).is_none_or(|f| f.patch != old.patch))
+            .map(|old| old.path.clone())
+            .collect();
+        if !changed.is_empty() {
+            v.diff.file_texts.retain(|(path, sha), _| sha.is_some() || !changed.contains(path));
+            v.diff.expanded.retain(|(path, sha, _), _| sha.is_some() || !changed.contains(path));
+        }
         v.pr_files = files.clone();
         // A mark stands only while the file's diff is the one that was marked: fresh files can
         // clear some, and they restore the marks a view built before any files were known lacks.
@@ -5547,9 +5887,17 @@ impl App {
         // diff out from under them mid-read. It picks up these fresh whole-PR files the next time
         // they back out, via `reset_diff_scope`, which reads from `pr_files`.
         if v.diff.commit_label.is_none() {
+            let first = v.diff.files.is_empty();
             v.diff.files = files;
             if v.diff.selected >= v.diff.files.len() {
                 v.diff.selected = v.diff.files.len().saturating_sub(1);
+            }
+            // The first files to arrive put the cursor on the top of the list as drawn; later
+            // ones keep it on a row that is still listed (its folder or file may have gone).
+            if first {
+                v.diff.reset_cursor();
+            } else {
+                v.diff.fix_cursor();
             }
         }
         v.diff.threads = threads;
@@ -5631,6 +5979,49 @@ impl App {
             let detail = fetch_pr_detail(&deps, &conn_id, &item).await;
             let _ = tx.send(AppEvent::PrDetailLoaded { key, detail: Box::new(detail), fetched_at });
         });
+    }
+
+    /// Sends the file-text fetches the open diff's expands asked for, one per (path, commit),
+    /// off the render loop. Each answer comes back as [`AppEvent::FileTextLoaded`].
+    fn request_file_texts(&mut self, deps: &AppDeps) {
+        let Screen::PrView(v) = &mut self.screen else { return };
+        if v.diff.text_wanted.is_empty() {
+            return;
+        }
+        let wanted = std::mem::take(&mut v.diff.text_wanted);
+        // Without a job channel nothing would ever answer: say so rather than load forever.
+        let Some(tx) = self.job_tx.clone() else {
+            for text_key in wanted {
+                v.diff.file_texts.insert(text_key, FileText::Missing);
+            }
+            return;
+        };
+        let item = v.pr.item_ref();
+        let key = pr_detail_cache_key(&v.connection_id, &item);
+        for (path, sha) in wanted {
+            let (tx, deps, conn_id, item, key) = (tx.clone(), deps.clone(), v.connection_id.clone(), item.clone(), key.clone());
+            tokio::spawn(async move {
+                let text = fetch_file_text(&deps, &conn_id, &item, &path, sha.as_deref()).await;
+                let _ = tx.send(AppEvent::FileTextLoaded { key, path, sha, text });
+            });
+        }
+    }
+
+    /// Stores a fetched file text in the diff — only if the view still shows the PR it was
+    /// asked for. The key is recomputed from the view, as in [`App::apply_pr_detail`]: the user
+    /// may have opened another PR while the fetch was out. The commit needn't still be on screen:
+    /// the text is filed under its own (path, commit), which a drill-in back into that commit
+    /// reads — dropping it would leave that entry loading for good.
+    fn apply_file_text(&mut self, key: &str, path: String, sha: Option<String>, text: Option<String>) {
+        let Screen::PrView(v) = &mut self.screen else { return };
+        if pr_detail_cache_key(&v.connection_id, &v.pr.item_ref()) != key {
+            return;
+        }
+        let text = match text {
+            Some(t) => FileText::Lines(t.lines().map(str::to_owned).collect()),
+            None => FileText::Missing,
+        };
+        v.diff.file_texts.insert((path, sha), text);
     }
 
     /// Mirrors [`App::apply_pr_detail`]: merges the fetch against the *cached* entry (not the
@@ -6066,6 +6457,7 @@ impl App {
         }
         self.settle_preview(deps);
         self.drive_logs(deps);
+        self.request_file_texts(deps);
         self.refresh_pipeline_context();
         self.request_estimates(deps);
     }
@@ -6152,15 +6544,23 @@ impl App {
             }
             Hit::DiffFile(i) => {
                 let Screen::PrView(v) = &mut self.screen else { return None };
-                if v.diff.focus == DiffFocus::FileList && v.diff.selected == i {
+                if v.diff.focus == DiffFocus::FileList && v.diff.folder.is_none() && v.diff.selected == i {
                     return enter;
                 }
                 v.diff.focus = DiffFocus::FileList;
-                if v.diff.selected != i {
-                    v.diff.selected = i;
-                    v.diff.scroll = 0;
-                    v.diff.cursor = 0;
-                }
+                v.diff.set_row(&crate::diff_tree::TreeRow::File { idx: i, depth: 0 });
+            }
+            Hit::DiffDir(row) => {
+                // One click both selects a folder and opens or shuts it.
+                let Screen::PrView(v) = &mut self.screen else { return None };
+                let dir = v.diff.rows().get(row).cloned()?;
+                v.diff.focus = DiffFocus::FileList;
+                v.diff.set_row(&dir);
+                v.diff.toggle_fold();
+            }
+            Hit::DiffGap(hunk) => {
+                let Screen::PrView(v) = &mut self.screen else { return None };
+                v.diff.expand_gap(hunk, GapExpand::More);
             }
             Hit::DiffLine(i) => {
                 let Screen::PrView(v) = &mut self.screen else { return None };
@@ -6249,12 +6649,12 @@ impl App {
             Screen::PrView(v) => {
                 // Over the patch while the file list has the keys, the wheel scrolls the patch
                 // rather than changing file.
-                if v.tab == 3 && v.diff.focus == DiffFocus::FileList && matches!(hit, Some(Hit::DiffPatch | Hit::DiffLine(_))) {
+                if v.tab == 3 && v.diff.focus == DiffFocus::FileList && matches!(hit, Some(Hit::DiffPatch | Hit::DiffLine(_) | Hit::DiffGap(_))) {
                     v.diff.scroll_by(3 * dir as i32);
                     return None;
                 }
                 // Over the file list while the patch has the keys, the wheel changes file.
-                if v.tab == 3 && v.diff.focus == DiffFocus::Patch && matches!(hit, Some(Hit::DiffFile(_))) {
+                if v.tab == 3 && v.diff.focus == DiffFocus::Patch && matches!(hit, Some(Hit::DiffFile(_) | Hit::DiffDir(_))) {
                     v.diff.exit_patch();
                 }
                 Some((key, if matches!(v.tab, 0 | 2) { 3 } else { 1 }))
@@ -6297,6 +6697,13 @@ impl App {
             let searching = v.logs.as_ref().is_some_and(|l| l.search_input.is_some());
             if searching || (v.logs_have_keys() && matches!(key, Key::Char('n' | 'N'))) {
                 self.on_pipeline_logs_key(key);
+                return;
+            }
+        }
+        // The diff's `/` prompt takes every key the same way, so `n`, `B`, `F`, … are typed.
+        if let Screen::PrView(v) = &mut self.screen {
+            if v.tab == 3 && v.diff.search_input.is_some() {
+                v.diff.on_search_key(key);
                 return;
             }
         }
@@ -6544,18 +6951,15 @@ impl App {
         // in: an entry from before this sort existed (or a future change that stops sorting
         // before caching) must not silently show the file list out of order.
         files.sort_by(|a, b| a.path.cmp(&b.path));
-        let diff = DiffView {
+        let mut diff = DiffView {
             pr_label: label.clone(),
             url: url.clone(),
             files: files.clone(),
             threads,
-            selected: 0,
-            scroll: 0,
-            focus: DiffFocus::FileList,
-            cursor: 0,
-            commit_label: None,
             viewed: still_viewed(pr_viewed.get(&key), &files),
+            ..DiffView::default()
         };
+        diff.reset_cursor();
         let view = Screen::PrView(Box::new(PrView {
             label,
             url,
@@ -6734,10 +7138,10 @@ impl App {
         let title: String = msg.chars().take(50).collect();
         let Screen::PrView(v) = &mut self.screen else { return };
         v.diff.files = files;
-        v.diff.selected = 0;
-        v.diff.cursor = 0;
         v.diff.focus = DiffFocus::FileList;
         v.diff.commit_label = Some(format!("{short} {title}"));
+        v.diff.commit_sha = Some(sha);
+        v.diff.reset_cursor();
         v.tab = 3;
     }
 
@@ -6999,10 +7403,15 @@ impl App {
         // Actions and close are handled before borrowing the view (they need &mut self).
         match key {
             Key::Escape | Key::Char('q') => {
-                // In the patch line cursor, Esc steps back to the file list, not out.
+                // In the patch line cursor, Esc steps back to the file list, not out; in the file
+                // list it clears a search before it leaves.
                 if let Screen::PrView(v) = &mut self.screen {
                     if v.tab == 3 && v.diff.focus == DiffFocus::Patch {
                         v.diff.exit_patch();
+                        return;
+                    }
+                    if v.tab == 3 && key == Key::Escape && v.diff.query.is_some() {
+                        v.diff.clear_search();
                         return;
                     }
                 }
@@ -7066,8 +7475,19 @@ impl App {
         match key {
             Key::Left | Key::Char('h') => v.step_tab(-1),
             Key::Right | Key::Char('l') => v.step_tab(1),
-            // Enter on a file drops into a line cursor within its patch.
-            Key::Enter if v.tab == 3 => v.diff.enter_patch(),
+            // Enter on a file drops into a line cursor within its patch; on a folder it opens or
+            // shuts it; on a hunk header with unchanged lines above it, it reveals ten more.
+            Key::Enter if v.tab == 3 => {
+                if v.diff.focus == DiffFocus::Patch && v.diff.gap_at_cursor().is_some() {
+                    v.diff.expand_gap(v.diff.cursor, GapExpand::More);
+                } else if !(v.diff.focus == DiffFocus::FileList && v.diff.toggle_fold()) {
+                    v.diff.enter_patch();
+                }
+            }
+            Key::Char('+') if v.tab == 3 && v.diff.focus == DiffFocus::Patch => v.diff.expand_gap(v.diff.cursor, GapExpand::All),
+            Key::Char('-') if v.tab == 3 && v.diff.focus == DiffFocus::Patch => v.diff.expand_gap(v.diff.cursor, GapExpand::Fold),
+            // A lone file has no list to narrow, so `/` needs one.
+            Key::Char('/') if v.tab == 3 && v.diff.files.len() > 1 => v.diff.open_search(),
             // Diff-tab review ergonomics: mark viewed, jump between threads.
             Key::Char('v') if v.tab == 3 => {
                 v.diff.toggle_viewed();
@@ -11427,9 +11847,13 @@ pub enum Hit {
     CommitRow(usize),
     /// A file in the Diff tab's file list.
     DiffFile(usize),
+    /// A folder in the Diff tab's file list, by its row in [`DiffView::rows`].
+    DiffDir(usize),
     /// The Diff tab's patch pane, and a patch line in it.
     DiffPatch,
     DiffLine(usize),
+    /// A folded run of unchanged lines, by the patch line of the hunk header below it.
+    DiffGap(usize),
     /// A node of the pipeline tree, and the log pane beside it.
     PipeNode(usize),
     LogPane,
@@ -11635,6 +12059,14 @@ async fn fetch_pr_detail(deps: &AppDeps, conn_id: &str, item: &ItemRef) -> PrDet
     let commits = detail_or_none(source.commits(item).await, DIAG_PR_COMMITS);
     let timeline = detail_or_none(source.timeline(item).await, DIAG_PR_TIMELINE);
     PrDetailFetch { threads, files, checks, commits, timeline, writes: Some(source.pr_writes()) }
+}
+
+/// Fetches one changed file's full text at `sha` (the PR's head when `None`), off the render
+/// loop. `None` when the forge can't say or the call failed — either way the gap stays shut.
+async fn fetch_file_text(deps: &AppDeps, conn_id: &str, item: &ItemRef, path: &str, sha: Option<&str>) -> Option<String> {
+    let feeds = detail_or_default(deps.sections.pull_request_feeds().await, DIAG_PR_FEEDS);
+    let feed = feeds.iter().find(|f| f.connection.connection_id() == conn_id)?;
+    detail_or_none(feed.source.file_text(item, path, sha).await, DIAG_PR_FILE_TEXT).flatten()
 }
 
 /// Fetches the detail behind a work-item view, off the render loop. Mirrors [`fetch_pr_detail`].
@@ -14503,6 +14935,7 @@ mod tests {
             cursor: 0,
             commit_label: None,
             viewed: HashSet::new(),
+            ..Default::default()
         }
     }
 
@@ -15947,6 +16380,7 @@ mod tests {
                 cursor: 0,
                 commit_label: None,
                 viewed: HashSet::new(),
+                ..Default::default()
             },
             pending: vec![],
             review_draft: None,
@@ -18869,6 +19303,12 @@ mod tests {
         async fn submit_review(&self, item: &ItemRef, event: ReviewVote, comments: &[LineComment]) -> forgetop_core::Result<()> {
             self.0.record(format!("review {} {event:?} {}", item.id, comments.len())).await
         }
+        /// Fifty lines, `line 1` … `line 50`, whatever is asked for.
+        async fn file_text(&self, _item: &ItemRef, path: &str, sha: Option<&str>) -> forgetop_core::Result<Option<String>> {
+            self.0.log.lock().unwrap().push(format!("file_text {path} {}", sha.unwrap_or("head")));
+            Ok(Some(fifty_lines().join("\n")))
+        }
+
         fn pr_writes(&self) -> PrWriteSupport {
             PrWriteSupport::ALL
         }
@@ -19764,6 +20204,394 @@ mod tests {
         app.on_event(event, &deps);
         assert_eq!(calls.calls(), vec!["wi-comment w on it".to_string()]);
         assert_eq!(wi_pane(&app).threads.len(), 1, "still shown while the provider catches up");
+    }
+
+    // ---- the Diff tab's file tree, search and unchanged-context expansion ----
+
+    fn fifty_lines() -> Vec<String> {
+        (1..=50).map(|n| format!("line {n}")).collect()
+    }
+
+    /// Two hunks over `line 1` … `line 50`: lines 1–9 unchanged above the first, 12–39 between.
+    const GAPPY_PATCH: &str = "@@ -10,2 +10,2 @@\n line 10\n-old\n+line 11\n@@ -40,1 +40,1 @@\n line 40";
+
+    /// A PR on its Diff tab over `README.md`, `src/a.rs` (with [`GAPPY_PATCH`]) and `src/b.rs`.
+    fn tree_app() -> App {
+        let mut app = App::new("slate");
+        let files = vec![
+            changed("README.md", Some("@@ -1 +1 @@\n-# old\n+# retry docs")),
+            changed("src/a.rs", Some(GAPPY_PATCH)),
+            changed("src/b.rs", Some("@@ -1 +1 @@\n-x\n+y")),
+        ];
+        app.screen = pr_view_showing(pr(None), &files_detail(files));
+        let Screen::PrView(v) = &mut app.screen else { unreachable!() };
+        v.tab = 3;
+        v.diff.reset_cursor();
+        app
+    }
+
+    fn dv(app: &App) -> &DiffView {
+        let Screen::PrView(v) = &app.screen else { panic!("expected PrView") };
+        &v.diff
+    }
+
+    fn dv_mut(app: &mut App) -> &mut DiffView {
+        let Screen::PrView(v) = &mut app.screen else { panic!("expected PrView") };
+        &mut v.diff
+    }
+
+    /// What the cursor is on: `dir:<key>` or the file's path.
+    fn at(app: &App) -> String {
+        let d = dv(app);
+        match &d.folder {
+            Some(k) => format!("dir:{k}"),
+            None => d.files[d.selected].path.clone(),
+        }
+    }
+
+    async fn keys(app: &mut App, deps: &AppDeps, keys: &[Key]) {
+        for &k in keys {
+            app.on_key(k, deps).await;
+        }
+    }
+
+    async fn type_text(app: &mut App, deps: &AppDeps, text: &str) {
+        for c in text.chars() {
+            app.on_key(Key::Char(c), deps).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn the_cursor_walks_folders_and_files_and_enter_folds_a_folder() {
+        let deps = test_deps();
+        let mut app = tree_app();
+        assert_eq!(at(&app), "src/a.rs", "it starts on the first file as listed, not the first by path");
+        keys(&mut app, &deps, &[Key::Up]).await;
+        assert_eq!(at(&app), "dir:src", "the folder row is a stop");
+        keys(&mut app, &deps, &[Key::Enter]).await;
+        assert_eq!(dv(&app).focus, DiffFocus::FileList, "Enter on a folder folds it rather than opening a patch");
+        assert!(dv(&app).folded.contains("src"));
+        keys(&mut app, &deps, &[Key::Down]).await;
+        assert_eq!(at(&app), "README.md", "the folded files are skipped");
+        keys(&mut app, &deps, &[Key::Down]).await;
+        assert_eq!(at(&app), "dir:src", "and it wraps");
+        keys(&mut app, &deps, &[Key::Enter, Key::Down, Key::Down]).await;
+        assert_eq!(at(&app), "src/b.rs", "unfolded again");
+        keys(&mut app, &deps, &[Key::Enter]).await;
+        assert_eq!(dv(&app).focus, DiffFocus::Patch, "Enter on a file still opens its patch");
+    }
+
+    #[tokio::test]
+    async fn clicking_a_folder_selects_and_folds_it() {
+        let deps = test_deps();
+        let mut app = tree_app();
+        draw(&mut app, 150, 30);
+        click(&mut app, &deps, Hit::DiffDir(0)).await;
+        assert_eq!(at(&app), "dir:src");
+        assert!(dv(&app).folded.contains("src"));
+        draw(&mut app, 150, 30);
+        click(&mut app, &deps, Hit::DiffDir(0)).await;
+        assert!(dv(&app).folded.is_empty(), "a second click opens it again");
+        draw(&mut app, 150, 30);
+        click(&mut app, &deps, Hit::DiffFile(2)).await;
+        assert_eq!(at(&app), "src/b.rs", "a file row still selects its file");
+    }
+
+    #[tokio::test]
+    async fn v_on_a_folder_marks_every_file_in_it_and_persists() {
+        let deps = test_deps();
+        let mut app = tree_app();
+        dv_mut(&mut app).viewed.insert("src/a.rs".into());
+        keys(&mut app, &deps, &[Key::Up, Key::Char('v')]).await;
+        assert!(dv(&app).is_viewed("src/a.rs") && dv(&app).is_viewed("src/b.rs"), "the rest of the folder is marked");
+        assert!(!dv(&app).is_viewed("README.md"), "nothing outside it");
+        let key = pr_detail_cache_key("c", &pr(None).item_ref());
+        assert_eq!(app.pr_viewed.get(&key).map(|m| m.len()), Some(2), "recorded like a single file's mark");
+        keys(&mut app, &deps, &[Key::Char('v')]).await;
+        assert_eq!(dv(&app).viewed_count(), 0, "all marked already: un-marks them all");
+        assert!(!app.pr_viewed.contains_key(&key));
+    }
+
+    #[tokio::test]
+    async fn the_search_prompt_takes_every_key_and_narrows_the_list() {
+        let deps = test_deps();
+        let mut app = tree_app();
+        keys(&mut app, &deps, &[Key::Char('/')]).await;
+        assert_eq!(dv(&app).search_input.as_deref(), Some(""));
+        // `n` adds a connection and `B` opens the dashboard anywhere else; here they are typed.
+        type_text(&mut app, &deps, "nB").await;
+        assert_eq!(dv(&app).search_input.as_deref(), Some("nB"));
+        assert!(app.overlay.is_none() && app.wizard.is_none(), "no setup picker opened");
+        keys(&mut app, &deps, &[Key::Backspace, Key::Backspace]).await;
+        type_text(&mut app, &deps, "retry").await;
+        assert_eq!(dv(&app).query, None, "nothing is committed while typing");
+        let listed = |app: &App| {
+            let d = dv(app);
+            d.rows().iter().map(|r| match r {
+                crate::diff_tree::TreeRow::Dir { key, .. } => format!("dir:{key}"),
+                crate::diff_tree::TreeRow::File { idx, .. } => d.files[*idx].path.clone(),
+            }).collect::<Vec<_>>()
+        };
+        assert_eq!(listed(&app), vec!["README.md"], "narrowed live to the file whose patch matches");
+        assert_eq!(at(&app), "README.md", "the cursor follows onto a listed row");
+        assert_eq!(dv(&app).file_hits(0), 1);
+        keys(&mut app, &deps, &[Key::Enter]).await;
+        assert_eq!((dv(&app).search_input.as_deref(), dv(&app).query.as_deref()), (None, Some("retry")), "Enter commits");
+        assert_eq!(listed(&app), vec!["README.md"]);
+
+        // Esc while typing goes back to the committed query.
+        keys(&mut app, &deps, &[Key::Char('/'), Key::Backspace, Key::Backspace, Key::Escape]).await;
+        assert_eq!((dv(&app).search_input.as_deref(), dv(&app).query.as_deref()), (None, Some("retry")));
+
+        // A query in a path matches too.
+        keys(&mut app, &deps, &[Key::Char('/')]).await;
+        for _ in 0..5 {
+            app.on_key(Key::Backspace, &deps).await;
+        }
+        type_text(&mut app, &deps, "B.RS").await;
+        keys(&mut app, &deps, &[Key::Enter]).await;
+        assert_eq!(listed(&app), vec!["dir:src", "src/b.rs"], "ASCII case-insensitive, its folder forced open");
+    }
+
+    #[tokio::test]
+    async fn esc_leaves_the_patch_then_clears_the_search_then_the_view() {
+        let deps = test_deps();
+        let mut app = tree_app();
+        keys(&mut app, &deps, &[Key::Char('/')]).await;
+        type_text(&mut app, &deps, "line").await;
+        keys(&mut app, &deps, &[Key::Enter, Key::Enter]).await;
+        assert_eq!(dv(&app).focus, DiffFocus::Patch);
+        keys(&mut app, &deps, &[Key::Escape]).await;
+        assert_eq!((dv(&app).focus, dv(&app).query.as_deref()), (DiffFocus::FileList, Some("line")), "first back to the files");
+        keys(&mut app, &deps, &[Key::Escape]).await;
+        assert!(matches!(app.screen, Screen::PrView(_)), "the view stays open");
+        assert_eq!(dv(&app).query, None, "the search is cleared");
+        keys(&mut app, &deps, &[Key::Escape]).await;
+        assert!(!matches!(app.screen, Screen::PrView(_)), "and then Esc leaves");
+    }
+
+    #[tokio::test]
+    async fn a_folded_folder_holding_a_match_opens_for_the_search_and_folds_back_after() {
+        let deps = test_deps();
+        let mut app = tree_app();
+        keys(&mut app, &deps, &[Key::Up, Key::Enter]).await; // fold src/
+        keys(&mut app, &deps, &[Key::Char('/')]).await;
+        type_text(&mut app, &deps, "b.rs").await;
+        keys(&mut app, &deps, &[Key::Enter]).await;
+        assert_eq!(dv(&app).rows().len(), 2, "src/ open with its match under it");
+        keys(&mut app, &deps, &[Key::Escape]).await;
+        assert!(dv(&app).folded.contains("src"), "the fold from before the search is back");
+    }
+
+    #[tokio::test]
+    async fn enter_plus_and_minus_on_a_hunk_header_reveal_and_fold_its_gap() {
+        let deps = test_deps();
+        let mut app = tree_app();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        app.job_tx = Some(tx);
+        keys(&mut app, &deps, &[Key::Enter]).await; // src/a.rs's patch
+        dv_mut(&mut app).cursor = 4; // the second `@@`, lines 12–39 above it
+        assert_eq!(dv(&app).gap_at_cursor().map(|g| (g.start, g.end)), Some((12, 39)));
+        keys(&mut app, &deps, &[Key::Enter]).await;
+        assert_eq!(dv(&app).revealed("src/a.rs", 4), (10, 10), "ten from each edge");
+        assert_eq!(dv(&app).file_texts.get(&("src/a.rs".to_string(), None)), Some(&FileText::Loading), "the first expand asks for the text");
+        assert_eq!(dv(&app).cursor, 4, "and the cursor stays on the header");
+
+        let key = pr_detail_cache_key("c", &pr(None).item_ref());
+        app.on_event(AppEvent::FileTextLoaded { key, path: "src/a.rs".into(), sha: None, text: Some(fifty_lines().join("\n")) }, &deps);
+        let Some(file) = dv(&app).current() else { panic!() };
+        assert_eq!(dv(&app).context_text(file), ContextText::Lines(&fifty_lines()));
+
+        keys(&mut app, &deps, &[Key::Enter]).await;
+        assert_eq!(dv(&app).revealed("src/a.rs", 4), (28, 0), "the last eight open whole");
+        keys(&mut app, &deps, &[Key::Char('-')]).await;
+        assert_eq!(dv(&app).revealed("src/a.rs", 4), (0, 0), "folded back");
+        keys(&mut app, &deps, &[Key::Char('+')]).await;
+        assert_eq!(dv(&app).revealed("src/a.rs", 4), (28, 0), "the whole gap at once");
+        assert!(dv(&app).text_wanted.is_empty(), "never asked for twice");
+    }
+
+    #[tokio::test]
+    async fn the_first_expand_fetches_the_text_once_at_the_diffs_commit() {
+        let calls = ItemCalls::new();
+        let deps = deps_with_items(calls.clone()).await;
+        let mut app = tree_app();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.job_tx = Some(tx);
+        keys(&mut app, &deps, &[Key::Enter]).await;
+        dv_mut(&mut app).cursor = 4;
+        dv_mut(&mut app).commit_sha = Some("abc1234".into());
+        keys(&mut app, &deps, &[Key::Enter]).await;
+        let event = rx.recv().await.expect("the text");
+        assert!(matches!(&event, AppEvent::FileTextLoaded { path, sha, .. } if path == "src/a.rs" && sha.as_deref() == Some("abc1234")));
+        app.on_event(event, &deps);
+        assert_eq!(calls.calls(), vec!["file_text src/a.rs abc1234".to_string()]);
+        let Some(file) = dv(&app).current() else { panic!() };
+        assert!(matches!(dv(&app).context_text(file), ContextText::Lines(_)));
+        keys(&mut app, &deps, &[Key::Enter, Key::Char('-'), Key::Enter]).await;
+        tokio::task::yield_now().await;
+        assert!(rx.try_recv().is_err(), "no second fetch");
+        assert_eq!(calls.calls().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_text_for_another_pr_or_commit_is_dropped() {
+        let deps = test_deps();
+        let mut app = tree_app();
+        let key = pr_detail_cache_key("c", &pr(None).item_ref());
+        let other = pr_detail_cache_key("c", &pr_id("2").item_ref());
+        let text = Some(fifty_lines().join("\n"));
+        app.on_event(AppEvent::FileTextLoaded { key: other, path: "src/a.rs".into(), sha: None, text: text.clone() }, &deps);
+        assert!(dv(&app).file_texts.is_empty(), "another PR's answer");
+        // An answer for a commit the view has since left is filed under that commit, not shown here.
+        app.on_event(AppEvent::FileTextLoaded { key: key.clone(), path: "src/a.rs".into(), sha: Some("abc1234".into()), text: text.clone() }, &deps);
+        assert!(matches!(dv(&app).file_texts.get(&("src/a.rs".to_string(), Some("abc1234".to_string()))), Some(FileText::Lines(_))));
+        let Some(file) = dv(&app).files.get(1) else { panic!() };
+        assert_eq!(dv(&app).context_text(file), ContextText::Unfetched, "the whole-PR diff still has no text of its own");
+        app.on_event(AppEvent::FileTextLoaded { key, path: "src/a.rs".into(), sha: None, text }, &deps);
+        assert_eq!(dv(&app).file_texts.len(), 2, "the live view's own answer lands");
+    }
+
+    /// Drilling into a commit, expanding, and backing out before the text arrives must not leave
+    /// that commit's gap loading for good the next time it is drilled into.
+    #[tokio::test]
+    async fn a_text_that_lands_after_leaving_its_commit_is_there_on_the_way_back() {
+        let deps = test_deps();
+        let mut app = tree_app();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        app.job_tx = Some(tx);
+        let drill_in = |app: &mut App| {
+            let Screen::PrView(v) = &mut app.screen else { unreachable!() };
+            v.diff.commit_label = Some("abc1234 m".into());
+            v.diff.commit_sha = Some("abc1234".into());
+            v.diff.reset_cursor();
+        };
+        drill_in(&mut app);
+        keys(&mut app, &deps, &[Key::Enter]).await;
+        dv_mut(&mut app).cursor = 4;
+        keys(&mut app, &deps, &[Key::Enter]).await;
+        let at_commit = ("src/a.rs".to_string(), Some("abc1234".to_string()));
+        assert_eq!(dv(&app).file_texts.get(&at_commit), Some(&FileText::Loading));
+        let Screen::PrView(v) = &mut app.screen else { unreachable!() };
+        v.step_tab(1); // backs out of the commit
+        v.step_tab(-1);
+        assert_eq!(dv(&app).commit_sha, None);
+
+        let key = pr_detail_cache_key("c", &pr(None).item_ref());
+        app.on_event(AppEvent::FileTextLoaded { key, path: "src/a.rs".into(), sha: Some("abc1234".into()), text: Some(fifty_lines().join("\n")) }, &deps);
+        drill_in(&mut app);
+        let Some(file) = dv(&app).files.get(1) else { panic!() };
+        assert!(matches!(dv(&app).context_text(file), ContextText::Lines(_)), "the commit's text was kept");
+    }
+
+    #[tokio::test]
+    async fn with_no_job_channel_an_expand_reads_not_available_rather_than_loading() {
+        let deps = test_deps();
+        let mut app = tree_app();
+        keys(&mut app, &deps, &[Key::Enter]).await;
+        dv_mut(&mut app).cursor = 4;
+        keys(&mut app, &deps, &[Key::Enter]).await;
+        assert_eq!(dv(&app).file_texts.get(&("src/a.rs".to_string(), None)), Some(&FileText::Missing));
+        let buf = draw(&mut app, 150, 60);
+        let screen: String = (0..buf.area.height).map(|y| row_text(&buf, y)).collect::<Vec<_>>().join("\n");
+        assert!(screen.contains("⋯ 28 unchanged lines · not available"), "{screen}");
+    }
+
+    /// A push that changes a file's patch makes its head text and reveals stale: they go, so
+    /// the next expand asks again. Other files, and texts pinned to a commit, stay.
+    #[test]
+    fn a_reload_that_changes_a_patch_drops_its_head_text_and_reveals() {
+        let deps = test_deps();
+        let mut app = tree_app();
+        let lines = FileText::Lines(fifty_lines());
+        {
+            let d = dv_mut(&mut app);
+            d.file_texts.insert(("src/a.rs".into(), None), lines.clone());
+            d.file_texts.insert(("src/a.rs".into(), Some("abc1234".into())), lines.clone());
+            d.file_texts.insert(("src/b.rs".into(), None), lines.clone());
+            d.expanded.insert(("src/a.rs".into(), None, 4), (10, 10));
+            d.expanded.insert(("src/b.rs".into(), None, 0), (1, 0));
+        }
+        let files = vec![
+            changed("README.md", Some("@@ -1 +1 @@\n-# old\n+# retry docs")),
+            changed("src/a.rs", Some("@@ -10,2 +10,2 @@\n line 10\n-old\n+line 11 again")),
+            changed("src/b.rs", Some("@@ -1 +1 @@\n-x\n+y")),
+        ];
+        let key = pr_detail_cache_key("c", &pr(None).item_ref());
+        app.on_event(AppEvent::PrDetailLoaded { key, detail: all_answered(files_detail(files)), fetched_at: Utc::now() }, &deps);
+        let d = dv(&app);
+        assert!(!d.file_texts.contains_key(&("src/a.rs".to_string(), None)), "the changed file's head text is gone");
+        assert!(!d.expanded.contains_key(&("src/a.rs".to_string(), None, 4)), "and its reveals");
+        assert!(d.file_texts.contains_key(&("src/a.rs".to_string(), Some("abc1234".to_string()))), "a commit's text is pinned to its sha");
+        assert!(d.file_texts.contains_key(&("src/b.rs".to_string(), None)) && d.expanded.contains_key(&("src/b.rs".to_string(), None, 0)), "an unchanged file keeps both");
+    }
+
+    /// The tree and the flat list key their folders apart; crossing between them must not leave
+    /// the cursor on a folder the new layout doesn't list.
+    #[test]
+    fn a_folder_cursor_follows_the_list_between_tree_and_flat() {
+        let mut app = App::new("slate");
+        let files = vec![changed("README.md", None), changed("crates/core/src/a.rs", None), changed("crates/tui/b.rs", None)];
+        app.screen = pr_view_showing(pr(None), &files_detail(files));
+        let Screen::PrView(v) = &mut app.screen else { unreachable!() };
+        v.tab = 3;
+        v.diff.reset_cursor();
+        v.diff.folder = Some("crates".into()); // a tree folder with no files of its own
+        draw(&mut app, 200, 30);
+        assert!(!dv(&app).narrow.get());
+        assert_eq!(dv(&app).folder.as_deref(), Some("crates"), "listed in the tree, so it stays");
+        draw(&mut app, 120, 30);
+        assert!(dv(&app).narrow.get(), "too narrow for the tree");
+        assert_eq!(dv(&app).folder.as_deref(), Some("crates/core/src"), "its first listed subfolder");
+        assert!(dv(&app).cursor_row(&dv(&app).rows()).is_some());
+
+        dv_mut(&mut app).folder = Some(String::new()); // the flat list's `(root)`
+        draw(&mut app, 120, 30);
+        assert_eq!(dv(&app).folder.as_deref(), Some(""), "listed flat");
+        draw(&mut app, 200, 30);
+        assert_eq!((dv(&app).folder.as_deref(), dv(&app).selected), (None, 0), "the tree has no (root): its first root file");
+    }
+
+    #[tokio::test]
+    async fn switching_pr_tab_by_mouse_closes_the_search_prompt_and_keeps_the_query() {
+        let deps = test_deps();
+        let mut app = tree_app();
+        dv_mut(&mut app).query = Some("retry".into());
+        keys(&mut app, &deps, &[Key::Char('/')]).await;
+        type_text(&mut app, &deps, "x").await;
+        draw(&mut app, 150, 30);
+        click(&mut app, &deps, Hit::PrTab(0)).await;
+        assert_eq!((dv(&app).search_input.as_deref(), dv(&app).query.as_deref()), (None, Some("retry")));
+        app.on_key(Key::Char('n'), &deps).await;
+        assert!(app.overlay.is_some() || app.wizard.is_some(), "keys reach the app again (`n` adds a connection)");
+    }
+
+    #[tokio::test]
+    async fn an_unavailable_or_mismatched_text_leaves_the_gaps_shut() {
+        let deps = test_deps();
+        let mut app = tree_app();
+        keys(&mut app, &deps, &[Key::Enter]).await;
+        dv_mut(&mut app).cursor = 4;
+        let key = pr_detail_cache_key("c", &pr(None).item_ref());
+        app.on_event(AppEvent::FileTextLoaded { key: key.clone(), path: "src/a.rs".into(), sha: None, text: None }, &deps);
+        keys(&mut app, &deps, &[Key::Enter, Key::Char('+')]).await;
+        assert_eq!(dv(&app).revealed("src/a.rs", 4), (0, 0), "expanding is a no-op");
+        assert_eq!(dv(&app).cursor, 4);
+
+        // A text that doesn't read like the patch's hunks is no better than none.
+        let shifted: Vec<String> = (2..=51).map(|n| format!("line {n}")).collect();
+        app.on_event(AppEvent::FileTextLoaded { key, path: "src/a.rs".into(), sha: None, text: Some(shifted.join("\n")) }, &deps);
+        let Some(file) = dv(&app).current() else { panic!() };
+        assert_eq!(dv(&app).context_text(file), ContextText::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn clicking_a_gap_reveals_ten_from_each_edge() {
+        let deps = test_deps();
+        let mut app = tree_app();
+        draw(&mut app, 150, 60);
+        click(&mut app, &deps, Hit::DiffGap(4)).await;
+        assert_eq!(dv(&app).revealed("src/a.rs", 4), (10, 10));
     }
 
     // ---- PR writes: thread cursor, resolve, draft / close, reviewers ----

@@ -587,6 +587,45 @@ async fn pr_commit_changes_endpoint_returns_a_commits_diff() {
 }
 
 #[tokio::test]
+async fn pr_file_text_endpoint_returns_a_files_full_text() {
+    let server = spawn(demo_deps(true).await, 0).await.expect("server binds");
+    let base = format!("http://127.0.0.1:{}", server.port);
+    let client = reqwest::Client::new();
+    let tok = server.token.clone();
+
+    // Pick a PR and one of the files its diff names.
+    let prs: serde_json::Value =
+        client.get(format!("{base}/api/pull-requests")).header("x-forgetop-token", &tok).send().await.unwrap().json().await.unwrap();
+    let pr = &prs[0];
+    let conn = pr["connection_id"].as_str().unwrap();
+    let id = pr["pull_request"]["id"].as_str().unwrap();
+    let detail: serde_json::Value =
+        client.get(format!("{base}/api/pr/detail?conn={conn}&id={id}")).header("x-forgetop-token", &tok).send().await.unwrap().json().await.unwrap();
+    let path = detail["changes"]
+        .as_array()
+        .expect("the PR's changed files")
+        .iter()
+        .filter_map(|f| f["path"].as_str())
+        .find(|p| p.contains('/'))
+        .expect("a file in a directory")
+        .to_string();
+    let get = |query: String| client.get(format!("{base}/api/pr/file-text?{query}")).header("x-forgetop-token", &tok).send();
+
+    // The head's text, as plain text — the path's slashes encoded, as a browser's URLSearchParams would.
+    let resp = get(format!("conn={conn}&id={id}&path={}", path.replace('/', "%2F"))).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers()["content-type"], "text/plain; charset=utf-8");
+    let text = resp.text().await.unwrap();
+    assert!(text.lines().count() > 1, "the whole file: {text:?}");
+
+    // A path the forge has no text for, and an unknown connection, are 404s — not 500s.
+    assert_eq!(get(format!("conn={conn}&id={id}&path=no%2Fsuch%2Ffile.rs")).await.unwrap().status(), 404);
+    assert_eq!(get(format!("conn=nope&id={id}&path={path}")).await.unwrap().status(), 404);
+    // As is a commit whose patch doesn't agree with the text the demo keeps.
+    assert_eq!(get(format!("conn={conn}&id={id}&path=src%2Fhttp%2Fretry.rs&sha=a1b2c3d")).await.unwrap().status(), 404);
+}
+
+#[tokio::test]
 async fn notifications_carry_drill_in_targets_and_mark_read() {
     let server = spawn(demo_deps(true).await, 0).await.expect("server binds");
     let base = format!("http://127.0.0.1:{}", server.port);

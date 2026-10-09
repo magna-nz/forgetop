@@ -33,7 +33,13 @@ export function mockFetch(routes: {
     }
     const key = Object.keys(routes.get ?? {}).find((k) => url.includes(k));
     if (key) {
-      return new Response(JSON.stringify(routes.get![key]), {
+      const value = routes.get![key];
+      // A plain string fixture answers as `text/plain` (e.g. the file-text endpoint); anything
+      // else is JSON, matching the server's actual content types.
+      if (typeof value === "string") {
+        return new Response(value, { status: 200, headers: { "content-type": "text/plain" } });
+      }
+      return new Response(JSON.stringify(value), {
         status: 200,
         headers: { "content-type": "application/json" },
       });

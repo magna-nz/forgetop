@@ -10,6 +10,7 @@ use forgetop_core::{Error, Result};
 use reqwest::header::{ACCEPT, AUTHORIZATION, USER_AGENT};
 use serde_json::{json, Value};
 
+use crate::content;
 use crate::json::*;
 use crate::scope::{self, fan_out, sort_and_cap};
 
@@ -863,6 +864,22 @@ impl GitHubClient {
         resp.json().await.map_err(prov)
     }
 
+    /// Like `get_json`, but returns `Ok(None)` on a 404 instead of erroring — used for
+    /// `/contents/{path}`, which 404s for a path missing at that commit.
+    async fn get_json_opt(&self, url: &str) -> Result<Option<Value>> {
+        let resp = self.http.get(url).send().await.map_err(prov)?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            return Err(Error::Provider(match self.note_rate_limit(&resp) {
+                Some(limit) => format!("GET {url} -> {} ({})", resp.status(), limit.message),
+                None => format!("GET {url} -> {}", resp.status()),
+            }));
+        }
+        Ok(Some(resp.json().await.map_err(prov)?))
+    }
+
     /// Fetches plain text, returning `Ok(None)` on a 404 — used for `/actions/jobs/{id}/logs`,
     /// which 404s until GitHub has published the job's log (redirects to a signed blob URL once
     /// it has; reqwest follows that redirect and drops `Authorization` cross-host on its own).
@@ -1274,6 +1291,21 @@ impl PullRequestSource for GitHubPr {
         let repo = self.0.resolve(item)?;
         let v = self.0.get_json(&self.0.repo_path(&repo, &format!("/commits/{sha}"))).await?;
         Ok(get_arr(&v, "files").iter().map(map_file_change).collect())
+    }
+    async fn file_text(&self, item: &ItemRef, path: &str, sha: Option<&str>) -> Result<Option<String>> {
+        let repo = self.0.resolve(item)?;
+        let sha = match sha {
+            Some(sha) => sha.to_string(),
+            None => {
+                let detail = self.0.get_json(&self.0.repo_path(&repo, &format!("/pulls/{}", item.id))).await?;
+                let Some(sha) = get_obj(&detail, "head").and_then(|h| get_str(h, "sha")) else { return Ok(None) };
+                sha
+            }
+        };
+        // The default media type answers `{ "encoding": "base64", "content": … }` — or `"none"`
+        // and no content for a file over 1 MB, which `base64_text` reads as no text.
+        let url = self.0.repo_path(&repo, &format!("/contents/{}?ref={}", content::encode_path(path, true), content::encode_path(&sha, false)));
+        Ok(self.0.get_json_opt(&url).await?.as_ref().and_then(content::base64_text))
     }
     async fn add_comment(&self, item: &ItemRef, body: &str) -> Result<()> {
         let repo = self.0.resolve(item)?;
@@ -2433,6 +2465,52 @@ mod tests {
         let rows = pr.list(&pr_query(PullRequestFilter::Mine, true)).await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!((rows[0].title.as_str(), rows[0].repository.as_deref(), rows[0].status), ("only in search", Some("acme/pay"), PullRequestStatus::Merged));
+    }
+
+    /// A file's contents as GitHub's default media type answers them: base64, wrapped at 60
+    /// columns the way GitHub wraps it.
+    fn contents(text: &str) -> Value {
+        use base64::Engine;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(text);
+        let wrapped: Vec<String> = encoded.as_bytes().chunks(60).map(|c| String::from_utf8_lossy(c).into_owned()).collect();
+        json!({ "type": "file", "encoding": "base64", "size": text.len(), "content": wrapped.join("\n") + "\n" })
+    }
+
+    #[tokio::test]
+    async fn file_text_reads_the_file_at_the_pull_requests_head() {
+        let (forge, pr) = forge_and_client(&["acme/pay"]);
+        forge.route("/repos/acme/pay/pulls/7", json!({ "number": 7, "head": { "sha": "headsha1" } }));
+        let text = "fn main() {\n    println!(\"a line long enough that GitHub wraps its base64 across more than one row\");\n}\n";
+        forge.route("/repos/acme/pay/contents/src/my%20main.rs", contents(text));
+
+        let got = pr.file_text(&ItemRef::new("7"), "src/my main.rs", None).await.unwrap();
+        assert_eq!(got.as_deref(), Some(text));
+        assert_eq!(forge.requests_to("/repos/acme/pay/pulls/7").len(), 1, "the head is looked up");
+        let fetched = forge.requests_to("/repos/acme/pay/contents/");
+        assert_eq!(fetched, vec!["GET /repos/acme/pay/contents/src/my%20main.rs?ref=headsha1".to_string()], "segments encoded, slashes kept");
+    }
+
+    #[tokio::test]
+    async fn file_text_at_a_given_commit_skips_the_head_lookup() {
+        let (forge, pr) = forge_and_client(&["acme/pay"]);
+        forge.route("/repos/acme/pay/contents/src/a.rs", contents("a\n"));
+        let got = pr.file_text(&ItemRef::new("7"), "src/a.rs", Some("abc123")).await.unwrap();
+        assert_eq!(got.as_deref(), Some("a\n"));
+        assert!(forge.requests_to("/repos/acme/pay/pulls/").is_empty(), "{:?}", forge.requests());
+        assert!(forge.requests_to("/repos/acme/pay/contents/src/a.rs?ref=abc123").len() == 1, "{:?}", forge.requests());
+    }
+
+    #[tokio::test]
+    async fn file_text_is_none_for_a_missing_oversized_or_binary_file() {
+        let (forge, pr) = forge_and_client(&["acme/pay"]);
+        let item = ItemRef::new("7");
+        // Not routed: a 404, as a path missing at that commit is.
+        assert_eq!(pr.file_text(&item, "src/gone.rs", Some("abc")).await.unwrap(), None);
+        // Over 1 MB GitHub sends `"encoding": "none"` and no content.
+        forge.route("/repos/acme/pay/contents/big.json", json!({ "type": "file", "encoding": "none", "size": 2_000_000, "content": "" }));
+        assert_eq!(pr.file_text(&item, "big.json", Some("abc")).await.unwrap(), None);
+        forge.route("/repos/acme/pay/contents/logo.png", contents("\u{89}PNG\r\n\u{1a}\n\0\0"));
+        assert_eq!(pr.file_text(&item, "logo.png", Some("abc")).await.unwrap(), None, "a NUL byte is binary");
     }
 
     /// A client against a bare fake GitHub (nothing routed), for the pull-request writes.
