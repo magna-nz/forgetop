@@ -32,6 +32,13 @@ Added
   Azure DevOps; reloads make no extra calls. Bitbucket doesn't offer it.
   ([#231](https://github.com/magna-nz/forgetop/pull/231))
 
+Fixed
+
+- **Azure DevOps diffs show their changes.** Azure answers a request for one file with the raw
+  file unless it is asked for JSON, and forgetop didn't ask, so every file read as empty: an
+  Azure pull request's Diff tab listed its files at `+0 -0` with no patch to show.
+  ([#231](https://github.com/magna-nz/forgetop/pull/231))
+
 ## 1.7.1 — 2026-10-10
 
 Added
