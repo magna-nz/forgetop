@@ -1198,6 +1198,16 @@ fn apply_session_state(pr: PullRequest) -> PullRequest {
     apply_session_review(apply_session_merge(pr))
 }
 
+/// A listing names you as a reviewer only until you have reviewed, the way GitHub's
+/// `requested_reviewers` does: once you have voted this run, the list row no longer lists you
+/// (so the review-requested view drops it), while `get` still shows your verdict.
+fn clear_reviewed_request(mut pr: PullRequest) -> PullRequest {
+    if session_votes().lock().unwrap().contains_key(&pr.id) {
+        pr.reviewers.retain(|r| r.user.id != me().id);
+    }
+    pr
+}
+
 struct DemoPr {
     conn: String,
 }
@@ -1208,12 +1218,17 @@ impl PullRequestSource for DemoPr {
         let prs: Vec<_> = prs_for(&self.conn)
             .into_iter()
             .map(apply_session_state)
+            .map(clear_reviewed_request)
             .filter(|p| query.include_completed || matches!(p.status, PullRequestStatus::Open | PullRequestStatus::Draft))
             .collect();
         Ok(apply_pull_request_filter(prs, query.filter, Some(DEMO_ME)))
     }
     async fn current_user(&self) -> Result<Option<String>> {
         Ok(Some(DEMO_ME.to_string()))
+    }
+    fn review_clears_request(&self) -> bool {
+        // Listings drop you once you have reviewed (`clear_reviewed_request`), as GitHub's do.
+        true
     }
     async fn get(&self, item: &ItemRef) -> Result<PullRequest> {
         let id: &str = &item.id;
@@ -1488,8 +1503,13 @@ impl PullRequestSource for DemoPr {
         // Demo revert is a no-op success so the button is present and clickable without a live forge.
         Ok(())
     }
-    async fn submit_review(&self, item: &ItemRef, _event: ReviewVote, comments: &[LineComment]) -> Result<()> {
+    async fn submit_review(&self, item: &ItemRef, event: ReviewVote, comments: &[LineComment]) -> Result<()> {
         let id: &str = &item.id;
+        // A review with a verdict is your vote, exactly as `vote` records it; a comment-only
+        // review leaves your reviewer entry as it was.
+        if event != ReviewVote::NoVote {
+            session_votes().lock().unwrap().insert(id.to_string(), event);
+        }
         // Persist each line comment as an open thread by "you", so it comes back from
         // threads() and the diff shows it exactly as a real provider would.
         let mut store = submitted_threads().lock().unwrap();
@@ -2349,6 +2369,53 @@ mod tests {
         src.mark_read(&review.id).await.unwrap();
         let after = src.list().await.unwrap();
         assert!(!after.iter().find(|n| n.id == review.id).unwrap().unread);
+    }
+
+    /// Listings mirror GitHub's `requested_reviewers`: once you have reviewed a PR its list row
+    /// stops naming you (so the review-requested view drops it), while `get` shows your verdict.
+    #[tokio::test]
+    async fn reviewing_takes_you_off_the_listing_but_your_verdict_stays_on_the_detail() {
+        let src = conn().pull_requests().unwrap();
+        assert!(src.review_clears_request(), "the demo behaves like GitHub here");
+        // #1495 waits on your review in the seed data.
+        let id = "1495";
+        let names_me = |p: &PullRequest| p.reviewers.iter().any(|r| r.user.id == me().id);
+        let review = |prs: Vec<PullRequest>| prs.into_iter().any(|p| p.id == id);
+        let listed = src.list(&PullRequestQuery { filter: PullRequestFilter::ReviewRequested, ..Default::default() }).await.unwrap();
+        assert!(review(listed), "waiting on your review before you give it");
+
+        src.vote(&ItemRef::new(id), ReviewVote::Approved).await.unwrap();
+
+        let all = src.list(&PullRequestQuery::default()).await.unwrap();
+        let row = all.iter().find(|p| p.id == id).expect("still an open PR");
+        assert!(!names_me(row), "the list row no longer names you as a reviewer");
+        let listed = src.list(&PullRequestQuery { filter: PullRequestFilter::ReviewRequested, ..Default::default() }).await.unwrap();
+        assert!(!review(listed), "so the review-requested view drops it");
+        let detail = src.get(&ItemRef::new(id)).await.unwrap();
+        assert!(
+            detail.reviewers.iter().any(|r| r.user.id == me().id && r.vote == ReviewVote::Approved),
+            "the detail shows your approval"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_review_submitted_with_a_verdict_counts_as_your_vote_but_a_comment_only_one_does_not() {
+        let src = conn().pull_requests().unwrap();
+        // #1501 waits on your review in the seed data; a fabricated id can't be listed anyway.
+        let id = "1501";
+        let names_me = |p: &PullRequest| p.reviewers.iter().any(|r| r.user.id == me().id);
+        let listed = |prs: &[PullRequest]| prs.iter().find(|p| p.id == id).cloned();
+        let comment = LineComment { path: "a.rs".into(), line: 1, side: DiffSide::New, body: "nit".into() };
+
+        src.submit_review(&ItemRef::new(id), ReviewVote::NoVote, std::slice::from_ref(&comment)).await.unwrap();
+        let row = listed(&src.list(&PullRequestQuery::default()).await.unwrap()).expect("open");
+        assert!(names_me(&row), "a comment-only review leaves you listed as a reviewer");
+
+        src.submit_review(&ItemRef::new(id), ReviewVote::Rejected, std::slice::from_ref(&comment)).await.unwrap();
+        let row = listed(&src.list(&PullRequestQuery::default()).await.unwrap()).expect("open");
+        assert!(!names_me(&row), "a review with a verdict takes you off the listing");
+        let detail = src.get(&ItemRef::new(id)).await.unwrap();
+        assert!(detail.reviewers.iter().any(|r| r.user.id == me().id && r.vote == ReviewVote::Rejected), "and the detail shows the verdict");
     }
 
     #[tokio::test]

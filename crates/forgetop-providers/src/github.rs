@@ -937,6 +937,11 @@ impl PullRequestSource for GitHubPr {
         // per repository filtered afterwards — see `list`.
         true
     }
+    fn review_clears_request(&self) -> bool {
+        // `requested_reviewers` drops you the moment you review, and `review-requested:@me`
+        // searches it — a reviewed pull request is gone from the view on the next fetch.
+        true
+    }
     async fn decorate(&self, item: &ItemRef) -> Result<PrDecoration> {
         let repo = self.0.resolve(item)?;
         let id = &item.id;
@@ -1954,6 +1959,15 @@ mod tests {
         assert_eq!(again[0].title, "from pulls");
         assert_eq!(forge.requests_to("/search/issues").len(), 2);
         assert_eq!(forge.requests_to("/repos/acme/pay/pulls/7").len(), 1, "cached at the same updated_at");
+    }
+
+    #[test]
+    fn a_reviewed_pull_request_leaves_the_review_requested_view() {
+        let (_forge, pr) = forge_and_client(&["acme/pay"]);
+        assert!(pr.review_clears_request(), "`requested_reviewers` drops you once you have reviewed");
+        // And the list row is built on that field alone: a reviewer who has voted is not on it.
+        let row = map_pull_request(&json!({ "number": 7, "title": "t", "user": { "login": "sam" }, "requested_reviewers": [] }), Some("acme/pay"));
+        assert!(!forgetop_core::filter::pull_request_matches(&row, PullRequestFilter::ReviewRequested, Some("me")));
     }
 
     #[tokio::test]

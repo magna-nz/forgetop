@@ -175,6 +175,7 @@ fn purge_cached_rows(cache: &CacheStore, conn_id: &str) {
         retain_pool_rows(&mut pool, |r| r.connection_id != conn_id);
         pool.me.remove(conn_id);
         pool.needs_decoration.remove(conn_id);
+        pool.review_clears_request.remove(conn_id);
         pool
     });
     purge_cached_section::<WiRow>(cache, CACHE_KEY_WORK_ITEMS, conn_id, |r| &r.connection_id);
@@ -626,6 +627,11 @@ pub struct PrPool {
     /// connection_id → whether its list endpoint omits the decorated fields (GitHub only), so
     /// only those rows are worth spending a per-row decoration call on.
     needs_decoration: HashMap<String, bool>,
+    /// connection_id → whether giving your review takes a pull request out of its
+    /// review-requested listing ([`PullRequestSource::review_clears_request`]), so a vote can
+    /// take the row off the list before the refetch that would.
+    #[serde(default)]
+    review_clears_request: HashMap<String, bool>,
 }
 
 impl PrPool {
@@ -5087,8 +5093,8 @@ impl App {
         let (pipes, pipes_ok) = fetch_pipelines(&deps, &mut errors, &mut pipe_catalog).await;
         let (inbox, inbox_ok) = fetch_notifications(&deps, &mut errors).await;
         let health = deps.health.check_all().await;
-        let review = derive_pool_rows(&pr_pool, PullRequestFilter::ReviewRequested, false);
-        let mine = derive_pool_rows(&pr_pool, PullRequestFilter::Mine, false);
+        let review = derive_pool_rows(&pr_pool, PullRequestFilter::ReviewRequested, false, &HashSet::new());
+        let mine = derive_pool_rows(&pr_pool, PullRequestFilter::Mine, false, &HashSet::new());
         let scan = scan_pr_notifications(&deps, &p, &review, &mine).await;
         let open_pipeline = match &p.open_pipeline {
             Some((conn_id, run_ref)) => fetch_open_pipeline(&deps, conn_id, run_ref).await,
@@ -5682,7 +5688,7 @@ impl App {
 
     /// The rows one PR view shows, derived from the pool and decorated from what we hold.
     fn derive_pr_rows(&self, filter: PullRequestFilter, completed: bool) -> Vec<PrRow> {
-        let mut rows = derive_pool_rows(&self.pr_pool, filter, completed);
+        let mut rows = derive_pool_rows(&self.pr_pool, filter, completed, &self.review_cleared_keys());
         for row in &mut rows {
             if let Some(d) = self.pr_decorations.get(&(row.connection_id.clone(), row.pr.id.clone())) {
                 d.apply_to(&mut row.pr);
@@ -9245,6 +9251,14 @@ impl App {
             pending.dismissed = self.lp_dismissed.insert(launchpad::Entry::key(&conn_id, &item.id));
             self.rebuild_launchpad();
         }
+        // On a forge that stops asking for your review once you have given it, the PR leaves
+        // the review-requested list now, not when the refetch finds it gone.
+        if vote.is_some() && me.is_some() && self.review_clears_request_on(&conn_id) {
+            self.hold(&key).review_cleared = Some(token);
+            self.refresh_derived_prs(deps);
+            self.fix_selection();
+            self.refresh_preview_row();
+        }
 
         let author = me_user(me.as_deref());
         let local = |n: usize| format!("{}{n}", local_prefix(token));
@@ -9324,12 +9338,19 @@ impl App {
         match result {
             Err(e) => {
                 let prefix = local_prefix(token);
+                let listed_again = self.held_items.get(&key).is_some_and(|h| h.review_cleared == Some(token));
                 if let Some(hold) = self.held_items.get_mut(&key) {
                     hold.forget(token);
                 }
                 self.prune_holds();
                 if let Some(reviewers) = reviewers {
                     self.patch_pr(&conn_id, &item, |pr| pr.reviewers = reviewers.clone());
+                }
+                if listed_again {
+                    // The review was refused, so the forge still wants it: back on the list.
+                    self.refresh_derived_prs(deps);
+                    self.fix_selection();
+                    self.refresh_preview_row();
                 }
                 for v in self.item_views_mut() {
                     if let Screen::PrView(v) = v {
@@ -9681,10 +9702,31 @@ impl App {
         self.pr_pool.me.get(conn_id).cloned().flatten()
     }
 
+    /// Whether `conn_id`'s forge stops listing a PR as review-requested once you have reviewed it.
+    fn review_clears_request_on(&self, conn_id: &str) -> bool {
+        self.pr_pool.review_clears_request.get(conn_id).copied().unwrap_or(false)
+    }
+
+    /// The detail keys of PRs a live hold keeps off the review-requested list.
+    fn review_cleared_keys(&self) -> HashSet<String> {
+        let now = Utc::now();
+        self.held_items
+            .iter()
+            .filter(|(_, h)| h.review_cleared.is_some() && now <= h.until)
+            .map(|(k, _)| k.clone())
+            .collect()
+    }
+
     /// The hold for the item whose detail key is `key`, started now if there was none.
     fn hold(&mut self, key: &str) -> &mut ItemHold {
-        let until = Utc::now() + chrono::Duration::seconds(ITEM_HOLD_SECS);
+        let now = Utc::now();
+        let until = now + chrono::Duration::seconds(ITEM_HOLD_SECS);
         let hold = self.held_items.entry(key.to_string()).or_insert_with(|| ItemHold::new(until));
+        // One that ran out is over — the provider had the last word — so it starts afresh
+        // rather than reviving what it used to hold.
+        if now > hold.until {
+            *hold = ItemHold::new(until);
+        }
         hold.until = until;
         hold
     }
@@ -9780,9 +9822,21 @@ impl App {
         // Settled per PR, not per row: the open and completed lists can both hold one, and the
         // second must not be read as caught up because the first cleared the hold.
         let mut caught_up = HashSet::new();
+        let mut cleared = HashSet::new();
         for row in pool.open.iter_mut().chain(pool.completed.iter_mut()) {
             let key = pr_detail_cache_key(&row.connection_id, &row.pr.item_ref());
             let Some(hold) = self.live_hold(&key) else { continue };
+            // A row that no longer names you as a reviewer is the forge having caught up with
+            // your review — the vote too, so nothing puts it back on this row later: that would
+            // list you again, and the review-requested view with you. The row is left as it came.
+            if hold.review_cleared.is_some() {
+                let me = pool.me.get(&row.connection_id).and_then(|m| m.as_deref());
+                if !pull_request_matches(&row.pr, PullRequestFilter::ReviewRequested, me) {
+                    caught_up.insert(key.clone());
+                    cleared.insert(key);
+                    continue;
+                }
+            }
             let Some((_, me, vote)) = hold.vote.clone() else { continue };
             if has_vote(&row.pr, &me, vote) {
                 caught_up.insert(key);
@@ -9793,6 +9847,11 @@ impl App {
         for key in caught_up {
             if let Some(hold) = self.held_items.get_mut(&key) {
                 hold.vote = None;
+            }
+        }
+        for key in cleared {
+            if let Some(hold) = self.held_items.get_mut(&key) {
+                hold.review_cleared = None;
             }
         }
         self.pr_pool = pool;
@@ -9834,7 +9893,8 @@ impl App {
 
     /// Drops holds with nothing left to hold.
     fn prune_holds(&mut self) {
-        self.held_items.retain(|_, h| h.vote.is_some() || !h.edits.is_empty() || !h.comments.is_empty());
+        self.held_items
+            .retain(|_, h| h.vote.is_some() || h.review_cleared.is_some() || !h.edits.is_empty() || !h.comments.is_empty());
     }
 
     /// Re-asks for the detail of every view showing the item whose detail key is `key`.
@@ -10247,6 +10307,10 @@ fn has_vote(pr: &PullRequest, me: &str, vote: ReviewVote) -> bool {
 struct ItemHold {
     /// Your verdict on a PR: `(token, your handle, verdict)`.
     vote: Option<(u64, String, ReviewVote)>,
+    /// The vote (by token) that took the PR off the review-requested list, on a forge that
+    /// stops asking for your review once you have given it. Held until a refetched row no
+    /// longer names you as a reviewer.
+    review_cleared: Option<u64>,
     /// Comments posted from here that the provider hasn't listed yet.
     comments: Vec<HeldComment>,
     /// Work-item edits the provider hasn't reflected yet, by token.
@@ -10256,13 +10320,16 @@ struct ItemHold {
 
 impl ItemHold {
     fn new(until: DateTime<Utc>) -> Self {
-        ItemHold { vote: None, comments: Vec::new(), edits: Vec::new(), until }
+        ItemHold { vote: None, review_cleared: None, comments: Vec::new(), edits: Vec::new(), until }
     }
 
     /// Lets go of what the refused action `token` held, returning its work-item edit.
     fn forget(&mut self, token: u64) -> Option<WiEdit> {
         if self.vote.as_ref().is_some_and(|(t, ..)| *t == token) {
             self.vote = None;
+        }
+        if self.review_cleared == Some(token) {
+            self.review_cleared = None;
         }
         let prefix = local_prefix(token);
         self.comments.retain(|c| !c.local_id().starts_with(&prefix));
@@ -11148,12 +11215,22 @@ fn pipeline_detail_unchanged(
 /// without reordering, and then caps. Order is preserved rather than re-sorted because
 /// `pr_sort` defaults to `None`, which means "provider order" — imposing one here would
 /// silently change the list for everyone who never chose a sort.
-fn derive_pool_rows(pool: &PrPool, filter: PullRequestFilter, completed: bool) -> Vec<PrRow> {
+///
+/// `review_cleared` holds the detail keys of PRs the user has just reviewed on a forge that
+/// then stops listing them as review-requested ([`ItemHold::review_cleared`]); the
+/// `ReviewRequested` view leaves those out ahead of the refetch that would.
+fn derive_pool_rows(pool: &PrPool, filter: PullRequestFilter, completed: bool, review_cleared: &HashSet<String>) -> Vec<PrRow> {
     let mut per_connection: HashMap<&str, usize> = HashMap::new();
     let mut out = Vec::new();
     for row in pool.rows(completed) {
         let me = pool.me.get(&row.connection_id).and_then(|m| m.as_deref());
         if !pull_request_matches(&row.pr, filter, me) {
+            continue;
+        }
+        if filter == PullRequestFilter::ReviewRequested
+            && !review_cleared.is_empty()
+            && review_cleared.contains(&pr_detail_cache_key(&row.connection_id, &row.pr.item_ref()))
+        {
             continue;
         }
         // Capped per connection, not across all of them: each feed used to run its own capped
@@ -11243,6 +11320,7 @@ async fn fetch_pr_pool(deps: &AppDeps, errors: &mut Vec<String>) -> (PrPool, boo
             }
         }
         pool.needs_decoration.insert(conn_id.clone(), feed.source.list_omits_decoration());
+        pool.review_clears_request.insert(conn_id.clone(), feed.source.review_clears_request());
         let targeted: &[(PullRequestFilter, bool)] =
             if feed.source.list_targets_filter() { &POOL_TARGETED_VIEWS } else { &[] };
         let queries = [(PullRequestFilter::All, false), (PullRequestFilter::All, true)].iter().chain(targeted.iter());
@@ -12128,7 +12206,7 @@ mod tests {
     fn test_pool(rows: Vec<PrRow>) -> PrPool {
         let me = rows.iter().map(|r| (r.connection_id.clone(), Some("me".to_string()))).collect();
         let needs_decoration = rows.iter().map(|r| (r.connection_id.clone(), false)).collect();
-        PrPool { open: rows.clone(), completed: rows, me, needs_decoration }
+        PrPool { open: rows.clone(), completed: rows, me, needs_decoration, review_clears_request: HashMap::new() }
     }
 
     /// An otherwise-empty reload carrying just the connection health, which is the
@@ -12412,7 +12490,8 @@ mod tests {
             open: rows.clone(),
             completed: rows,
             me: ids.iter().map(|c| (c.clone(), me.map(str::to_string))).collect(),
-            needs_decoration: ids.into_iter().map(|c| (c, false)).collect(),
+            needs_decoration: ids.iter().map(|c| (c.clone(), false)).collect(),
+            review_clears_request: ids.into_iter().map(|c| (c, false)).collect(),
         }
     }
 
@@ -12621,7 +12700,7 @@ mod tests {
         rows.extend((0..60).map(|i| pool_pr("c", &format!("m{i}"), "me", &[])));
         let pool = pool_of(rows, Some("me"));
 
-        let mine = derive_pool_rows(&pool, PullRequestFilter::Mine, false);
+        let mine = derive_pool_rows(&pool, PullRequestFilter::Mine, false, &HashSet::new());
         assert_eq!(mine.len(), PR_VIEW_CAP, "the cap counts filtered rows");
         assert!(mine.iter().all(|r| r.pr.id.starts_with('m')));
     }
@@ -12632,7 +12711,7 @@ mod tests {
     fn the_view_cap_is_per_connection() {
         let mut rows: Vec<PrRow> = (0..60).map(|i| pool_pr("a", &format!("a{i}"), "me", &[])).collect();
         rows.extend((0..10).map(|i| pool_pr("b", &format!("b{i}"), "me", &[])));
-        let derived = derive_pool_rows(&pool_of(rows, Some("me")), PullRequestFilter::Mine, false);
+        let derived = derive_pool_rows(&pool_of(rows, Some("me")), PullRequestFilter::Mine, false, &HashSet::new());
         assert_eq!(derived.iter().filter(|r| r.connection_id == "a").count(), PR_VIEW_CAP);
         assert_eq!(derived.iter().filter(|r| r.connection_id == "b").count(), 10, "b keeps all of its own");
     }
@@ -12643,7 +12722,7 @@ mod tests {
     #[test]
     fn a_connection_with_no_identity_shows_its_rows_rather_than_hiding_them() {
         let pool = pool_of(vec![pool_pr("c", "1", "them", &[]), pool_pr("c", "2", "other", &[])], None);
-        assert_eq!(derive_pool_rows(&pool, PullRequestFilter::Mine, false).len(), 2);
+        assert_eq!(derive_pool_rows(&pool, PullRequestFilter::Mine, false, &HashSet::new()).len(), 2);
     }
 
     /// Bitbucket's completed state is `MERGED`, which excludes open PRs — so the two variants
@@ -12652,8 +12731,8 @@ mod tests {
     fn the_two_completed_variants_are_kept_apart() {
         let mut pool = pool_of(vec![pool_pr("c", "open", "me", &[])], Some("me"));
         pool.completed = vec![pool_pr("c", "merged", "me", &[])];
-        assert_eq!(derive_pool_rows(&pool, PullRequestFilter::All, false)[0].pr.id, "open");
-        assert_eq!(derive_pool_rows(&pool, PullRequestFilter::All, true)[0].pr.id, "merged");
+        assert_eq!(derive_pool_rows(&pool, PullRequestFilter::All, false, &HashSet::new())[0].pr.id, "open");
+        assert_eq!(derive_pool_rows(&pool, PullRequestFilter::All, true, &HashSet::new())[0].pr.id, "merged");
     }
 
     /// Decoration fetched per row is merged into whatever view is derived next, and a failed
@@ -18229,6 +18308,8 @@ mod tests {
     #[derive(Clone)]
     struct TargetedPrs {
         targets: bool,
+        /// What `review_clears_request` answers.
+        clears: bool,
         log: Arc<std::sync::Mutex<Vec<(PullRequestFilter, bool)>>>,
     }
 
@@ -18260,6 +18341,9 @@ mod tests {
         }
         fn list_targets_filter(&self) -> bool {
             self.0.targets
+        }
+        fn review_clears_request(&self) -> bool {
+            self.0.clears
         }
         async fn get(&self, _item: &ItemRef) -> forgetop_core::Result<PullRequest> {
             Ok(pr(None))
@@ -18372,7 +18456,7 @@ mod tests {
     /// for those views, and what it finds beyond the page joins the pool — once, and in order.
     #[tokio::test]
     async fn the_pool_fetches_targeted_views_and_merges_what_the_page_lacks() {
-        let prs = TargetedPrs { targets: true, log: Arc::default() };
+        let prs = TargetedPrs { targets: true, clears: true, log: Arc::default() };
         let deps = deps_with_targeted_prs(prs.clone()).await;
         let mut errors = Vec::new();
         let (pool, ok) = fetch_pr_pool(&deps, &mut errors).await;
@@ -18386,20 +18470,22 @@ mod tests {
         assert_eq!(ids(&pool.open), vec!["7", "99", "100", "5"]);
         assert_eq!(ids(&pool.completed), vec!["7", "99", "100"], "the review view is not fetched on completed rows");
         // And the derived views are what the user sees: "Mine" has the pull request the page lost.
-        assert_eq!(ids(&derive_pool_rows(&pool, PullRequestFilter::Mine, false)), vec!["7", "99"]);
-        assert_eq!(ids(&derive_pool_rows(&pool, PullRequestFilter::ReviewRequested, false)), vec!["5"]);
-        assert_eq!(ids(&derive_pool_rows(&pool, PullRequestFilter::All, false)), vec!["7", "99", "100", "5"]);
+        assert_eq!(ids(&derive_pool_rows(&pool, PullRequestFilter::Mine, false, &HashSet::new())), vec!["7", "99"]);
+        assert_eq!(ids(&derive_pool_rows(&pool, PullRequestFilter::ReviewRequested, false, &HashSet::new())), vec!["5"]);
+        assert_eq!(ids(&derive_pool_rows(&pool, PullRequestFilter::All, false, &HashSet::new())), vec!["7", "99", "100", "5"]);
+        assert_eq!(pool.review_clears_request.get("c"), Some(&true), "the pool remembers that this forge drops a reviewed PR");
     }
 
     /// A provider that only filters its page is not asked again: the answer would be a subset
     /// of rows the pool already holds, at the price of the same calls over.
     #[tokio::test]
     async fn the_pool_leaves_a_page_filtering_provider_at_two_calls() {
-        let prs = TargetedPrs { targets: false, log: Arc::default() };
+        let prs = TargetedPrs { targets: false, clears: false, log: Arc::default() };
         let deps = deps_with_targeted_prs(prs.clone()).await;
         let (pool, _) = fetch_pr_pool(&deps, &mut Vec::new()).await;
         assert_eq!(prs.log.lock().unwrap().clone(), vec![(PullRequestFilter::All, false), (PullRequestFilter::All, true)]);
         assert_eq!(ids(&pool.open), vec!["99", "100"], "page order, untouched");
+        assert_eq!(pool.review_clears_request.get("c"), Some(&false), "and that this one keeps a reviewed PR listed");
     }
 
     #[test]
@@ -18538,6 +18624,254 @@ mod tests {
         let pool = pool_of(vec![pr_row(caught_up)], Some("me"));
         app.on_event(AppEvent::PrPoolLoaded { pool: Box::new(pool), ok: true }, &deps);
         assert!(app.held_items.is_empty(), "nothing left to hold");
+    }
+
+    /// `pr(None)` with you named as a reviewer who hasn't voted — what the review-requested
+    /// list shows.
+    fn pr_awaiting_me() -> PullRequest {
+        let mut pr = pr(None);
+        pr.reviewers.push(Reviewer { user: me_user(Some("me")), vote: ReviewVote::NoVote, is_required: false });
+        pr
+    }
+
+    /// A pool of `rows` whose connection `c` drops you from a PR's reviewers once you've
+    /// reviewed it, the way GitHub does — or keeps you listed, like GitLab, when `clears` is false.
+    fn pool_where_review_clears(rows: Vec<PrRow>, clears: bool) -> PrPool {
+        let mut pool = pool_of(rows, Some("me"));
+        pool.review_clears_request.insert("c".into(), clears);
+        pool
+    }
+
+    /// `pr_action_app` on the review-requested list, with PR `1` waiting on you.
+    fn review_list_app(clears: bool) -> App {
+        let mut app = pr_action_app();
+        app.pr_filter = PullRequestFilter::ReviewRequested;
+        app.pr_pool = pool_where_review_clears(vec![pr_row(pr_awaiting_me())], clears);
+        if let Screen::PrView(v) = &mut app.screen {
+            v.pr = pr_awaiting_me();
+        }
+        app.pr_pool_loaded = true;
+        app.prs = app.derive_pr_rows(PullRequestFilter::ReviewRequested, false);
+        app.lp_prs_review = app.prs.clone();
+        app.pr_state.select(Some(0));
+        assert_eq!(app.prs.len(), 1, "listed as waiting on your review");
+        app
+    }
+
+    #[tokio::test]
+    async fn on_a_forge_that_stops_asking_once_you_review_an_approval_leaves_the_review_list_at_once() {
+        let (mut calls, gate) = ItemCalls::gated();
+        // The provider's re-read after the write shows your approval, as GitHub's `get` does.
+        set_vote(&mut calls.pr, "me", ReviewVote::Approved);
+        let deps = deps_with_items(calls.clone()).await;
+        let mut app = review_list_app(true);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.job_tx = Some(tx);
+
+        app.execute_action(Action::PrVote(ReviewVote::Approved), &deps).await;
+        assert!(calls.calls().is_empty(), "the provider hasn't answered yet");
+        assert!(app.prs.is_empty(), "off the review-requested list before the provider answers");
+        assert!(app.lp_prs_review.is_empty(), "and out of the Launchpad's review bucket");
+        assert_eq!(app.pr_state.selected(), None, "nothing left to select");
+        assert_eq!(my_vote(&pr_pane(&app).pr), Some(ReviewVote::Approved), "the open view still shows your approval");
+
+        // A refetch that still names you as a reviewer hasn't caught up: the row stays off…
+        let stale = pool_where_review_clears(vec![pr_row(pr_awaiting_me())], true);
+        app.on_event(AppEvent::PrPoolLoaded { pool: Box::new(stale), ok: true }, &deps);
+        assert!(app.prs.is_empty(), "held off the list until the forge catches up");
+
+        gate.notify_one();
+        let event = answer(&mut rx).await;
+        app.on_event(event, &deps);
+        assert_eq!(calls.calls(), vec!["vote 1 Approved".to_string()]);
+        assert!(app.prs.is_empty(), "the provider's acceptance changes nothing on the list");
+
+        // …and one that no longer names you is the forge caught up: the row is left as it
+        // came, your vote isn't pushed back onto it, and nothing is held any more.
+        let gone = pool_where_review_clears(vec![pr_row(pr(None))], true);
+        app.on_event(AppEvent::PrPoolLoaded { pool: Box::new(gone), ok: true }, &deps);
+        assert!(app.prs.is_empty(), "still off the list");
+        assert!(app.pr_pool.open[0].pr.reviewers.is_empty(), "the forge's row is taken as it is");
+        assert!(app.held_items.is_empty(), "nothing left to hold");
+    }
+
+    #[tokio::test]
+    async fn on_a_forge_that_keeps_you_as_a_reviewer_an_approval_leaves_the_review_list_alone() {
+        let (calls, _gate) = ItemCalls::gated();
+        let deps = deps_with_items(calls.clone()).await;
+        let mut app = review_list_app(false);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        app.job_tx = Some(tx);
+
+        app.execute_action(Action::PrVote(ReviewVote::Approved), &deps).await;
+        assert_eq!(app.prs.len(), 1, "still a reviewer, so still listed");
+        assert_eq!(my_vote(&app.prs[0].pr), Some(ReviewVote::Approved), "with your tick on the row");
+        assert!(app.held_items.values().all(|h| h.review_cleared.is_none()), "nothing to take off the list");
+    }
+
+    #[test]
+    fn a_cleared_review_hides_the_pr_from_the_review_view_only() {
+        let pool = pool_where_review_clears(vec![pr_row(pr_awaiting_me())], true);
+        let cleared: HashSet<String> = [pr_detail_cache_key("c", &pr(None).item_ref())].into_iter().collect();
+        assert!(derive_pool_rows(&pool, PullRequestFilter::ReviewRequested, false, &cleared).is_empty(), "off the review view");
+        assert_eq!(derive_pool_rows(&pool, PullRequestFilter::All, false, &cleared).len(), 1, "still in All");
+        assert_eq!(derive_pool_rows(&pool, PullRequestFilter::ReviewRequested, false, &HashSet::new()).len(), 1, "listed with nothing cleared");
+        let other: HashSet<String> = [pr_detail_cache_key("c", &ItemRef::new("2"))].into_iter().collect();
+        assert_eq!(derive_pool_rows(&pool, PullRequestFilter::ReviewRequested, false, &other).len(), 1, "another PR's clearing is not this one's");
+    }
+
+    #[tokio::test]
+    async fn a_review_hold_that_has_run_out_no_longer_hides_the_row() {
+        let (calls, _gate) = ItemCalls::gated();
+        let deps = deps_with_items(calls.clone()).await;
+        let mut app = review_list_app(true);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        app.job_tx = Some(tx);
+        app.execute_action(Action::PrVote(ReviewVote::Approved), &deps).await;
+        assert!(app.prs.is_empty());
+
+        // Sixty seconds on, the provider has the last word: the row derives again.
+        let key = pr_detail_cache_key("c", &pr(None).item_ref());
+        app.held_items.get_mut(&key).unwrap().until = Utc::now() - chrono::Duration::seconds(1);
+        assert_eq!(app.derive_pr_rows(PullRequestFilter::ReviewRequested, false).len(), 1, "no longer held off");
+        let stale = pool_where_review_clears(vec![pr_row(pr_awaiting_me())], true);
+        app.on_event(AppEvent::PrPoolLoaded { pool: Box::new(stale), ok: true }, &deps);
+        assert_eq!(app.prs.len(), 1, "a refetch after the hold ran out lists it as the forge does");
+        assert!(app.held_items.is_empty(), "the run-out hold is dropped");
+    }
+
+    #[tokio::test]
+    async fn requesting_changes_leaves_the_review_list_at_once_too() {
+        let (calls, _gate) = ItemCalls::gated();
+        let deps = deps_with_items(calls.clone()).await;
+        let mut app = review_list_app(true);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        app.job_tx = Some(tx);
+        app.execute_action(Action::PrVote(ReviewVote::Rejected), &deps).await;
+        assert!(app.prs.is_empty(), "a verdict either way is a review given");
+        assert_eq!(my_vote(&pr_pane(&app).pr), Some(ReviewVote::Rejected));
+    }
+
+    #[tokio::test]
+    async fn a_review_submitted_with_a_verdict_leaves_the_review_list_but_a_comment_only_one_stays() {
+        let line = || LineComment { path: "a.rs".into(), line: 3, side: DiffSide::New, body: "nit".into() };
+        for (event, listed_after) in [(ReviewVote::NoVote, 1), (ReviewVote::Approved, 0)] {
+            let (calls, _gate) = ItemCalls::gated();
+            let deps = deps_with_items(calls.clone()).await;
+            let mut app = review_list_app(true);
+            if let Screen::PrView(v) = &mut app.screen {
+                v.pending = vec![line()];
+            }
+            let (tx, _rx) = mpsc::unbounded_channel();
+            app.job_tx = Some(tx);
+            app.submit_review(event, &deps).await;
+            assert_eq!(app.prs.len(), listed_after, "submitted with {event:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_plain_comment_leaves_the_review_list_alone() {
+        let (calls, _gate) = ItemCalls::gated();
+        let deps = deps_with_items(calls.clone()).await;
+        let mut app = review_list_app(true);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        app.job_tx = Some(tx);
+        app.execute_action(Action::PrComment("looks fine so far".into()), &deps).await;
+        assert_eq!(app.prs.len(), 1, "a comment is not a review");
+        assert!(app.held_items.values().all(|h| h.review_cleared.is_none()));
+    }
+
+    #[tokio::test]
+    async fn without_a_known_identity_an_approval_leaves_the_review_list_alone() {
+        let (calls, _gate) = ItemCalls::gated();
+        let deps = deps_with_items(calls.clone()).await;
+        let mut app = review_list_app(true);
+        // The connection could not say who you are: every row passes the filter, and there is
+        // no reviewer entry of yours to clear.
+        app.pr_pool.me.insert("c".into(), None);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        app.job_tx = Some(tx);
+        app.execute_action(Action::PrVote(ReviewVote::Approved), &deps).await;
+        assert_eq!(app.prs.len(), 1, "nothing to take off the list without knowing who voted");
+        assert!(app.held_items.values().all(|h| h.review_cleared.is_none()));
+    }
+
+    #[tokio::test]
+    async fn a_full_reload_that_still_names_you_keeps_the_row_off_the_review_list() {
+        let (calls, _gate) = ItemCalls::gated();
+        let deps = deps_with_items(calls.clone()).await;
+        let mut app = review_list_app(true);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        app.job_tx = Some(tx);
+        app.execute_action(Action::PrVote(ReviewVote::Approved), &deps).await;
+        assert!(app.prs.is_empty());
+
+        // The reload that was already out when you voted still names you as a reviewer.
+        let mut r = reloaded(vec![pr_row(pr_awaiting_me())]);
+        r.pr_pool.review_clears_request.insert("c".into(), true);
+        app.on_event(AppEvent::Reloaded(Box::new(r)), &deps);
+        assert!(app.prs.is_empty(), "the full reload cannot put it back either");
+        assert!(app.lp_prs_review.is_empty(), "nor the Launchpad's review bucket");
+        assert_eq!(app.derive_pr_rows(PullRequestFilter::All, false).len(), 1, "it is still a PR in All");
+    }
+
+    /// `fetch_all` hands the pool over early and then again inside the full reload, so a
+    /// caught-up pool that lands before the provider's answer lands twice while your vote is
+    /// still held — and must not put you back on the row the forge has dropped you from.
+    #[tokio::test]
+    async fn a_caught_up_pool_landing_before_the_answer_and_again_after_never_relists_the_pr() {
+        let (calls, gate) = ItemCalls::gated();
+        let deps = deps_with_items(calls.clone()).await;
+        let mut app = review_list_app(true);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.job_tx = Some(tx);
+        app.execute_action(Action::PrVote(ReviewVote::Approved), &deps).await;
+
+        let gone = || pool_where_review_clears(vec![pr_row(pr(None))], true);
+        app.on_event(AppEvent::PrPoolLoaded { pool: Box::new(gone()), ok: true }, &deps);
+        assert!(app.prs.is_empty(), "the forge has dropped you: still off the list");
+        assert!(app.held_items.is_empty(), "nothing is held once the forge's row shows the review was taken");
+
+        let mut r = reloaded(vec![pr_row(pr(None))]);
+        r.pr_pool.review_clears_request.insert("c".into(), true);
+        app.on_event(AppEvent::Reloaded(Box::new(r)), &deps);
+        assert!(app.prs.is_empty(), "the same pool again does not put your vote — and you — back on the row");
+        assert!(app.pr_pool.open[0].pr.reviewers.is_empty());
+
+        // The provider's answer (a re-read without the vote, say the reviews call failed)
+        // changes nothing on the list either.
+        gate.notify_one();
+        let event = answer(&mut rx).await;
+        app.on_event(event, &deps);
+        app.on_event(AppEvent::PrPoolLoaded { pool: Box::new(gone()), ok: true }, &deps);
+        assert!(app.prs.is_empty());
+        assert!(app.held_items.is_empty());
+    }
+
+    #[test]
+    fn a_hold_that_ran_out_starts_afresh_instead_of_reviving_what_it_held() {
+        let mut app = App::new("slate");
+        let key = pr_detail_cache_key("c", &pr(None).item_ref());
+        app.hold(&key).review_cleared = Some(1);
+        app.held_items.get_mut(&key).unwrap().until = Utc::now() - chrono::Duration::seconds(1);
+        // Sixty seconds later a comment on the same PR takes a hold again…
+        let hold = app.hold(&key);
+        assert_eq!(hold.review_cleared, None, "…without bringing back the clearing the provider has had the last word on");
+        assert!(hold.until > Utc::now());
+    }
+
+    #[tokio::test]
+    async fn a_refused_approval_puts_the_pr_back_on_the_review_list() {
+        let calls = ItemCalls { refuse: true, ..ItemCalls::new() };
+        let deps = deps_with_items(calls.clone()).await;
+        let mut app = review_list_app(true);
+
+        app.execute_action(Action::PrVote(ReviewVote::Approved), &deps).await;
+        assert_eq!(calls.calls(), vec!["vote 1 Approved".to_string()]);
+        assert_eq!(app.prs.len(), 1, "the forge still wants the review, so it is listed again");
+        assert_eq!(my_vote(&app.prs[0].pr), Some(ReviewVote::NoVote), "without a vote");
+        assert_eq!(app.pr_state.selected(), Some(0), "and selected");
+        assert!(app.held_items.is_empty());
     }
 
     #[tokio::test]

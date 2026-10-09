@@ -9,6 +9,21 @@ Adding a release: one `## <version> — <date>` section, a line per user-visible
 and the pull request each one came from. `git log v<previous>..HEAD --merges` lists the
 candidates.
 
+## 1.6.5 — 2026-10-09
+
+Fixed
+
+- **An approved pull request leaves the terminal UI's Review list as you approve it.** Approving
+  (or requesting changes) put your tick on the row straight away, but the row itself stayed in
+  the review-requested list until the provider had accepted the vote and a full refetch had
+  landed — a few seconds of a pull request that no longer wanted your review still sitting there
+  after you pressed Escape. On GitHub, which stops listing you as a requested reviewer the moment
+  you review, the row now goes as soon as the review is sent, comes back if the provider refuses
+  it, and is left to the provider once a refetch confirms it. GitLab, Azure DevOps and Bitbucket
+  keep you as a reviewer after you vote, so their rows stay listed as before. The demo mirrors
+  GitHub so the behaviour can be seen without credentials.
+  ([#225](https://github.com/magna-nz/forgetop/pull/225))
+
 ## 1.6.4 — 2026-10-09
 
 Fixed

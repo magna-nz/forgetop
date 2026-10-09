@@ -337,6 +337,17 @@ pub trait PullRequestSource: Send + Sync {
     fn list_targets_filter(&self) -> bool {
         false
     }
+    /// Whether giving your review takes a pull request out of the `ReviewRequested` view.
+    ///
+    /// `false` by default: on GitLab, Azure DevOps and Bitbucket you stay a reviewer after you
+    /// have voted, so the merge request keeps naming you and keeps its place in the view. GitHub
+    /// is the exception — `requested_reviewers` only names those who have *not* reviewed yet, and
+    /// the view is built on it — so a pull request leaves the view the moment you review it. A
+    /// caller that knows this can take the row off its list as soon as the review is sent,
+    /// rather than on the refetch that would.
+    fn review_clears_request(&self) -> bool {
+        false
+    }
     /// The fields the list endpoint omits, for one pull request. Defaults to projecting them out
     /// of a full [`get`](Self::get) — providers with a cheaper route override it.
     async fn decorate(&self, item: &ItemRef) -> Result<PrDecoration> {
