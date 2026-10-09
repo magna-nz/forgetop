@@ -162,6 +162,17 @@ pub struct CommentThread {
     pub file_path: Option<String>,
     pub line: Option<i64>,
     pub is_resolved: bool,
+    /// Whether the forge can mark this thread resolved at all. `false` for threads a forge only
+    /// bundles (GitHub's flat conversation comments, GitLab's individual notes, work-item
+    /// comments), so a frontend offers "resolve" only where it would work.
+    #[serde(default = "resolvable_by_default")]
+    pub is_resolvable: bool,
+}
+
+/// Serde default for [`CommentThread::is_resolvable`]: a thread cached before the field
+/// existed is assumed resolvable, which is the common case.
+fn resolvable_by_default() -> bool {
+    true
 }
 
 /// What happened in a timeline event — drives its icon/colour in the UI.

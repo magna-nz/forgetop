@@ -1195,7 +1195,7 @@ fn apply_session_review(mut pr: PullRequest) -> PullRequest {
 
 /// All session mutations a real provider would surface on a re-fetch (merge + your review).
 fn apply_session_state(pr: PullRequest) -> PullRequest {
-    apply_session_review(apply_session_merge(pr))
+    apply_session_edits(apply_session_review(apply_session_merge(pr)))
 }
 
 /// A listing names you as a reviewer only until you have reviewed, the way GitHub's
@@ -1206,6 +1206,70 @@ fn clear_reviewed_request(mut pr: PullRequest) -> PullRequest {
         pr.reviewers.retain(|r| r.user.id != me().id);
     }
     pr
+}
+
+/// Thread resolutions made this run, keyed by `"{pr_id}:{thread_id}"`: `true` resolved,
+/// `false` reopened. Overrides the thread's canned state on the next `threads()`.
+fn thread_resolutions() -> &'static Mutex<HashMap<String, bool>> {
+    static STORE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Draft flips made this run, by PR id: `false` marked ready for review, `true` converted back
+/// to a draft. `list()` / `get()` report the new state like a real provider would.
+fn draft_overrides() -> &'static Mutex<HashMap<String, bool>> {
+    static STORE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Close / reopen made this run, by PR id: `true` closed without merging, `false` reopened.
+fn closed_overrides() -> &'static Mutex<HashMap<String, bool>> {
+    static STORE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Reviewers requested this run, by PR id, appended to the PR's reviewers with no vote yet.
+fn requested_reviewers() -> &'static Mutex<HashMap<String, Vec<User>>> {
+    static STORE: OnceLock<Mutex<HashMap<String, Vec<User>>>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Reflect this run's draft, close / reopen and reviewer-request writes on a PR, the way a
+/// re-fetch from a real provider would. A merged PR stays merged whatever was asked of it.
+fn apply_session_edits(mut pr: PullRequest) -> PullRequest {
+    if pr.status == PullRequestStatus::Merged {
+        return pr;
+    }
+    if let Some(&draft) = draft_overrides().lock().unwrap().get(&pr.id) {
+        pr.is_draft = draft;
+        pr.status = if draft { PullRequestStatus::Draft } else { PullRequestStatus::Open };
+        pr.updated_at = Some(base());
+    }
+    if let Some(&closed) = closed_overrides().lock().unwrap().get(&pr.id) {
+        pr.status = if closed {
+            PullRequestStatus::Closed
+        } else if pr.is_draft {
+            PullRequestStatus::Draft
+        } else {
+            PullRequestStatus::Open
+        };
+        pr.updated_at = Some(base());
+    }
+    if let Some(users) = requested_reviewers().lock().unwrap().get(&pr.id) {
+        for u in users {
+            if !pr.reviewers.iter().any(|r| r.user.id == u.id) {
+                pr.reviewers.push(Reviewer { user: u.clone(), vote: ReviewVote::NoVote, is_required: false });
+            }
+        }
+        pr.updated_at = Some(base());
+    }
+    pr
+}
+
+/// Who can be asked to review in the demo: everyone but you (no forge lets you request
+/// yourself), so the picker has somewhere to go on every PR.
+fn demo_reviewable() -> Vec<User> {
+    vec![alice(), bob(), carol(), dev()]
 }
 
 struct DemoPr {
@@ -1253,6 +1317,7 @@ impl PullRequestSource for DemoPr {
                 file_path: Some("src/http/retry.rs".into()),
                 line: Some(15),
                 is_resolved: false,
+                is_resolvable: true,
             },
             // A resolved thread on the other file.
             CommentThread {
@@ -1266,6 +1331,7 @@ impl PullRequestSource for DemoPr {
                 file_path: Some("src/http/client.rs".into()),
                 line: Some(13),
                 is_resolved: true,
+                is_resolvable: true,
             },
             // A general (conversation) comment — no file — so it also shows in the timeline.
             CommentThread {
@@ -1279,6 +1345,7 @@ impl PullRequestSource for DemoPr {
                 file_path: None,
                 line: None,
                 is_resolved: false,
+                is_resolvable: true,
             },
         ];
         // Include anything submitted this session so it persists like a real provider.
@@ -1290,6 +1357,13 @@ impl PullRequestSource for DemoPr {
         for t in &mut threads {
             if let Some(rs) = replies.get(&format!("{id}:{}", t.id)) {
                 t.comments.extend(rs.iter().cloned());
+            }
+        }
+        // And any thread you resolved or reopened this session.
+        let resolutions = thread_resolutions().lock().unwrap();
+        for t in &mut threads {
+            if let Some(&resolved) = resolutions.get(&format!("{id}:{}", t.id)) {
+                t.is_resolved = resolved;
             }
         }
         Ok(threads)
@@ -1475,6 +1549,7 @@ impl PullRequestSource for DemoPr {
             file_path: None,
             line: None,
             is_resolved: false,
+            is_resolvable: true,
         });
         Ok(())
     }
@@ -1503,6 +1578,45 @@ impl PullRequestSource for DemoPr {
         // Demo revert is a no-op success so the button is present and clickable without a live forge.
         Ok(())
     }
+    fn pr_writes(&self) -> PrWriteSupport {
+        PrWriteSupport::ALL
+    }
+    async fn resolve_thread(&self, item: &ItemRef, thread_id: &str, resolved: bool) -> Result<()> {
+        demo_latency().await;
+        let id: &str = &item.id;
+        thread_resolutions().lock().unwrap().insert(format!("{id}:{thread_id}"), resolved);
+        Ok(())
+    }
+    async fn set_draft(&self, item: &ItemRef, draft: bool) -> Result<()> {
+        demo_latency().await;
+        let id: &str = &item.id;
+        draft_overrides().lock().unwrap().insert(id.to_string(), draft);
+        Ok(())
+    }
+    async fn set_closed(&self, item: &ItemRef, closed: bool) -> Result<()> {
+        demo_latency().await;
+        let id: &str = &item.id;
+        closed_overrides().lock().unwrap().insert(id.to_string(), closed);
+        Ok(())
+    }
+    async fn reviewable_users(&self, _item: &ItemRef) -> Result<Vec<User>> {
+        demo_latency().await;
+        Ok(demo_reviewable())
+    }
+    async fn request_reviewer(&self, item: &ItemRef, user_id: &str) -> Result<()> {
+        demo_latency().await;
+        let id: &str = &item.id;
+        let user = demo_reviewable()
+            .into_iter()
+            .find(|u| u.id == user_id)
+            .ok_or_else(|| forgetop_core::Error::NotFound(format!("no reviewable user {user_id}")))?;
+        let mut store = requested_reviewers().lock().unwrap();
+        let entry = store.entry(id.to_string()).or_default();
+        if !entry.iter().any(|u| u.id == user.id) {
+            entry.push(user);
+        }
+        Ok(())
+    }
     async fn submit_review(&self, item: &ItemRef, event: ReviewVote, comments: &[LineComment]) -> Result<()> {
         let id: &str = &item.id;
         // A review with a verdict is your vote, exactly as `vote` records it; a comment-only
@@ -1522,6 +1636,7 @@ impl PullRequestSource for DemoPr {
                 file_path: Some(c.path.clone()),
                 line: Some(c.line),
                 is_resolved: false,
+                is_resolvable: true,
             });
         }
         Ok(())
@@ -1584,6 +1699,7 @@ impl WorkItemSource for DemoWi {
             file_path: None,
             line: None,
             is_resolved: false,
+            is_resolvable: false,
         });
         Ok(())
     }
@@ -2332,6 +2448,91 @@ mod tests {
             threads.iter().any(|t| t.file_path.is_none() && t.comments.iter().any(|c| c.body == "ship it")),
             "a PR comment comes back as a general (non-line) thread"
         );
+    }
+
+    #[tokio::test]
+    async fn resolving_a_thread_persists_and_reopening_undoes_it() {
+        let src = DemoPr { conn: "github".into() };
+        let pr = ItemRef::new("persist-resolve-a"); // unique id → no cross-test pollution
+        let open = src.threads(&pr).await.unwrap().into_iter().find(|t| !t.is_resolved).expect("a demo thread starts open");
+
+        src.resolve_thread(&pr, &open.id, true).await.unwrap();
+        let after = src.threads(&pr).await.unwrap();
+        assert!(after.iter().find(|t| t.id == open.id).unwrap().is_resolved, "resolved on the next threads()");
+
+        src.resolve_thread(&pr, &open.id, false).await.unwrap();
+        let again = src.threads(&pr).await.unwrap();
+        assert!(!again.iter().find(|t| t.id == open.id).unwrap().is_resolved, "reopened on the next threads()");
+
+        // Another PR's copy of the same canned thread is untouched.
+        let other = src.threads(&ItemRef::new("persist-resolve-b")).await.unwrap();
+        assert!(!other.iter().find(|t| t.id == open.id).unwrap().is_resolved);
+    }
+
+    #[tokio::test]
+    async fn marking_a_draft_ready_shows_in_list_and_get() {
+        let src = DemoPr { conn: "github".into() };
+        let draft = src
+            .list(&PullRequestQuery { include_completed: true, ..Default::default() })
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|p| p.status == PullRequestStatus::Draft)
+            .expect("the demo has a draft PR");
+        let item = ItemRef::new(draft.id.clone());
+
+        src.set_draft(&item, false).await.unwrap();
+        let got = src.get(&item).await.unwrap();
+        assert!(!got.is_draft, "no longer a draft");
+        assert_eq!(got.status, PullRequestStatus::Open);
+        let listed = src.list(&PullRequestQuery::default()).await.unwrap();
+        assert_eq!(listed.iter().find(|p| p.id == draft.id).map(|p| p.status), Some(PullRequestStatus::Open), "the row flips too");
+
+        src.set_draft(&item, true).await.unwrap();
+        let back = src.get(&item).await.unwrap();
+        assert!(back.is_draft && back.status == PullRequestStatus::Draft, "and back to a draft");
+    }
+
+    #[tokio::test]
+    async fn closing_a_pull_request_drops_it_from_open_and_reopening_restores_it() {
+        let src = DemoPr { conn: "gitlab".into() };
+        let open = src
+            .list(&PullRequestQuery::default())
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|p| p.status == PullRequestStatus::Open)
+            .expect("an open demo MR");
+        let item = ItemRef::new(open.id.clone());
+
+        src.set_closed(&item, true).await.unwrap();
+        assert_eq!(src.get(&item).await.unwrap().status, PullRequestStatus::Closed);
+        assert!(
+            !src.list(&PullRequestQuery::default()).await.unwrap().iter().any(|p| p.id == open.id),
+            "a closed MR leaves the open list"
+        );
+
+        src.set_closed(&item, false).await.unwrap();
+        assert_eq!(src.get(&item).await.unwrap().status, PullRequestStatus::Open, "reopened");
+    }
+
+    #[tokio::test]
+    async fn requesting_a_reviewer_adds_them_with_no_vote_once() {
+        let src = DemoPr { conn: "bitbucket".into() };
+        let pr = src.list(&PullRequestQuery::default()).await.unwrap().into_iter().next().expect("a demo PR");
+        let item = ItemRef::new(pr.id.clone());
+        let users = src.reviewable_users(&item).await.unwrap();
+        assert!(!users.iter().any(|u| u.id == me().id), "you cannot be asked to review your own PR");
+        let pick = users.iter().find(|u| !pr.reviewers.iter().any(|r| r.user.id == u.id)).expect("someone not yet reviewing");
+
+        src.request_reviewer(&item, &pick.id).await.unwrap();
+        src.request_reviewer(&item, &pick.id).await.unwrap(); // asking twice is one reviewer
+        let got = src.get(&item).await.unwrap();
+        let added: Vec<_> = got.reviewers.iter().filter(|r| r.user.id == pick.id).collect();
+        assert_eq!(added.len(), 1);
+        assert_eq!(added[0].vote, ReviewVote::NoVote);
+        assert!(src.request_reviewer(&item, "nobody").await.is_err(), "an unknown id is refused");
+        assert_eq!(src.pr_writes(), PrWriteSupport::ALL);
     }
 
     #[tokio::test]

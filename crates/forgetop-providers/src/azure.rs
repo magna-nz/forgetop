@@ -430,6 +430,10 @@ pub struct AzureClient {
     /// An Azure PAT reaches every repository in the organization, so this is a user-chosen scope.
     scope: Vec<String>,
     self_id: tokio::sync::Mutex<Option<String>>,
+    /// Each Team Project's people, keyed by project name, fetched on first use and kept for the
+    /// run. Work items and pull requests share a project's identities, so the assignee and
+    /// reviewer pickers both read this — one fetch per project, never one per reload or per row.
+    people: tokio::sync::Mutex<std::collections::HashMap<String, Vec<User>>>,
 }
 
 /// Splits a connection-relative Azure scope entry into its two address components. Azure project
@@ -462,6 +466,17 @@ impl AzureClient {
             return Err(Error::Provider(format!("POST {url} -> {}", resp.status())));
         }
         resp.json().await.map_err(prov)
+    }
+
+    /// PATCHes a JSON body and discards the response. The pull-request writes that change one
+    /// field of a resource (draft, status, a thread's status) all have this shape, and none of
+    /// them needs what Azure echoes back.
+    async fn patch_json(&self, url: &str, body: Value) -> Result<()> {
+        let resp = self.http.patch(url).json(&body).send().await.map_err(prov)?;
+        if !resp.status().is_success() {
+            return Err(Error::Provider(format!("PATCH {url} -> {}", resp.status())));
+        }
+        Ok(())
     }
 
     /// Fetches a build log as plain text (`Accept: text/plain` — the client's default headers
@@ -577,6 +592,39 @@ impl AzureClient {
             *guard = get_obj(&v, "authenticatedUser").and_then(|u| get_str(u, "id"));
         }
         Ok(guard.clone())
+    }
+
+    /// The people of `project` — the members of its first (default) team — cached per project
+    /// for the run.
+    ///
+    /// Each [`User`] carries the identity **id** (a GUID) as `id`, because that is what
+    /// `…/pullRequests/{id}/reviewers/{reviewerId}` addresses, and the `uniqueName` as `handle`,
+    /// because that is what a work item's `System.AssignedTo` accepts. Callers pick the one their
+    /// write needs. A failed fetch is not cached, so the next keypress retries it.
+    async fn project_people(&self, project: &str) -> Result<Vec<User>> {
+        let mut cache = self.people.lock().await;
+        if let Some(people) = cache.get(project) {
+            return Ok(people.clone());
+        }
+        let teams = self.get_json(&format!("{}/_apis/projects/{project}/teams?{API}", self.base)).await?;
+        let people = match get_arr(&teams, "value").first().and_then(|t| get_str(t, "id")) {
+            None => Vec::new(),
+            Some(team_id) => {
+                let members = self.get_json(&format!("{}/_apis/projects/{project}/teams/{team_id}/members?{API}", self.base)).await?;
+                get_arr(&members, "value")
+                    .iter()
+                    .filter_map(|m| {
+                        let identity = get_obj(m, "identity")?;
+                        let unique_name = get_str(identity, "uniqueName");
+                        let id = get_str(identity, "id").unwrap_or_default();
+                        let display_name = get_str(identity, "displayName").or_else(|| unique_name.clone()).unwrap_or_else(|| id.clone());
+                        Some(User { id, display_name, handle: unique_name, avatar_url: get_str(identity, "imageUrl") })
+                    })
+                    .collect()
+            }
+        };
+        cache.insert(project.to_string(), people.clone());
+        Ok(people)
     }
 
     async fn item_content(&self, repo: &str, path: &str, commit: &str) -> Option<String> {
@@ -919,6 +967,7 @@ impl PullRequestSource for AzurePr {
                 file_path: get_obj(t, "threadContext").and_then(|c| get_str(c, "filePath")),
                 line: get_obj(t, "threadContext").and_then(|c| get_obj(c, "rightFileStart")).and_then(|s| get_i64(s, "line")),
                 is_resolved: matches!(get_str(t, "status").as_deref(), Some("closed") | Some("fixed")),
+                is_resolvable: true,
                 comments: get_arr(t, "comments")
                     .iter()
                     .map(|c| Comment {
@@ -1088,6 +1137,51 @@ impl PullRequestSource for AzurePr {
         }
         Ok(())
     }
+    /// Azure supports every pull-request write below: threads have a status, drafts and
+    /// abandonment are both reversible, and reviewers are added by identity.
+    fn pr_writes(&self) -> PrWriteSupport {
+        PrWriteSupport::ALL
+    }
+    /// A thread's resolution is its `status`: `fixed` is what the web UI's "Resolve" sets (it
+    /// shows as "Resolved"; `closed` would show teammates "Closed"), and `active` reopens it.
+    /// [`threads`](PullRequestSource::threads) reads both `closed` and `fixed` as resolved.
+    async fn resolve_thread(&self, item: &ItemRef, thread_id: &str, resolved: bool) -> Result<()> {
+        let repo = self.0.resolve(item)?;
+        let status = if resolved { "fixed" } else { "active" };
+        self.0
+            .patch_json(&format!("{}/threads/{thread_id}?{API}", self.0.pr_base(&repo, &item.id)), json!({ "status": status }))
+            .await
+    }
+    /// Draft is a plain flag on the pull request, settable either way.
+    async fn set_draft(&self, item: &ItemRef, draft: bool) -> Result<()> {
+        let repo = self.0.resolve(item)?;
+        self.0.patch_json(&format!("{}?{API}", self.0.pr_base(&repo, &item.id)), json!({ "isDraft": draft })).await
+    }
+    /// Azure's "close without merging" is abandoning the pull request; reactivating it reopens.
+    async fn set_closed(&self, item: &ItemRef, closed: bool) -> Result<()> {
+        let repo = self.0.resolve(item)?;
+        let status = if closed { "abandoned" } else { "active" };
+        self.0.patch_json(&format!("{}?{API}", self.0.pr_base(&repo, &item.id)), json!({ "status": status })).await
+    }
+    /// The pull request's project's people, from the same per-project cache the work-item
+    /// assignee picker reads. `id` is the identity GUID `request_reviewer` addresses; members
+    /// Azure gives no id for can't be added, so they're left out.
+    async fn reviewable_users(&self, item: &ItemRef) -> Result<Vec<User>> {
+        let project = self.0.resolve_project(item)?;
+        Ok(self.0.project_people(&project).await?.into_iter().filter(|u| !u.id.is_empty()).collect())
+    }
+    /// Adds a reviewer by identity id with no vote — the same `PUT …/reviewers/{id}` that
+    /// [`vote`](PullRequestSource::vote) uses for the signed-in user. Other reviewers are
+    /// untouched, since the call names only this one.
+    async fn request_reviewer(&self, item: &ItemRef, user_id: &str) -> Result<()> {
+        let repo = self.0.resolve(item)?;
+        let url = format!("{}/reviewers/{user_id}?{API}", self.0.pr_base(&repo, &item.id));
+        let resp = self.0.http.put(&url).json(&json!({ "vote": 0 })).send().await.map_err(prov)?;
+        if !resp.status().is_success() {
+            return Err(Error::Provider(format!("PUT {url} -> {}", resp.status())));
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -1169,27 +1263,18 @@ impl WorkItemSource for AzureWi {
         let v = self.0.get_json(&url).await?;
         Ok(get_arr(&v, "value").iter().filter_map(|s| get_str(s, "name")).collect())
     }
+    /// The project's people, addressed by `uniqueName` — `System.AssignedTo` takes that, not
+    /// the identity GUID the shared cache keys a person by.
     async fn assignable_users(&self, item: &ItemRef) -> Result<Vec<User>> {
         let project = self.0.resolve_project(item)?;
-        let teams = self.0.get_json(&format!("{}/_apis/projects/{project}/teams?{API}", self.0.base)).await?;
-        let Some(team_id) = get_arr(&teams, "value").first().and_then(|t| get_str(t, "id")) else {
-            return Ok(Vec::new());
-        };
-        let members = self
+        Ok(self
             .0
-            .get_json(&format!("{}/_apis/projects/{project}/teams/{team_id}/members?{API}", self.0.base))
-            .await?;
-        Ok(get_arr(&members, "value")
-            .iter()
-            .filter_map(|m| {
-                let identity = get_obj(m, "identity")?;
-                let unique_name = get_str(identity, "uniqueName")?;
-                Some(User {
-                    id: unique_name.clone(),
-                    display_name: get_str(identity, "displayName").unwrap_or_else(|| unique_name.clone()),
-                    handle: Some(unique_name),
-                    avatar_url: None,
-                })
+            .project_people(&project)
+            .await?
+            .into_iter()
+            .filter_map(|u| {
+                let unique_name = u.handle?;
+                Some(User { id: unique_name.clone(), display_name: u.display_name, handle: Some(unique_name), avatar_url: None })
             })
             .collect())
     }
@@ -1459,7 +1544,7 @@ impl ProviderFactory for AzureDevOpsFactory {
         }
         let http = crate::http_client(headers).map_err(prov)?;
 
-        let client = Arc::new(AzureClient { http, base, scope, self_id: tokio::sync::Mutex::new(None) });
+        let client = Arc::new(AzureClient { http, base, scope, self_id: tokio::sync::Mutex::new(None), people: Default::default() });
         Ok(Arc::new(AzureConnection { id: connection.id.clone(), display_name: connection.display_name.clone(), client, caps: azure_capabilities() }))
     }
 }
@@ -1523,6 +1608,7 @@ mod tests {
             base: "https://dev.azure.com/contoso".into(),
             scope: scope.iter().map(|s| s.to_string()).collect(),
             self_id: tokio::sync::Mutex::new(None),
+            people: Default::default(),
         }
     }
 
@@ -1911,6 +1997,7 @@ mod tests {
             base: forge.base().to_string(),
             scope: vec!["Payments/pay".into()],
             self_id: tokio::sync::Mutex::new(None),
+            people: Default::default(),
         });
         (forge, AzurePr(client))
     }
@@ -1959,5 +2046,89 @@ mod tests {
         let list = forge.requests_to("/Payments/");
         assert!(!list[0].contains("creatorId"), "no id to filter by: {}", list[0]);
         assert_eq!(rows.len(), 1, "an unknown identity passes every row through, as before");
+    }
+
+    const PR7: &str = "/Payments/_apis/git/repositories/pay/pullRequests/7";
+
+    /// The write requests (anything but GET) sent so far, as `METHOD /path?query`.
+    fn writes(forge: &crate::test_http::FakeForge) -> Vec<String> {
+        forge.requests().into_iter().filter(|r| !r.starts_with("GET ")).collect()
+    }
+
+    #[tokio::test]
+    async fn resolving_and_reopening_a_thread_patch_its_status() {
+        let (forge, pr) = forge_and_client();
+        forge.route(&format!("{PR7}/threads/42"), serde_json::json!({}));
+        let item = ItemRef::in_repo("Payments/pay", "7");
+
+        pr.resolve_thread(&item, "42", true).await.unwrap();
+        let sent = writes(&forge);
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert!(sent[0].starts_with("PATCH ") && sent[0].contains(&format!("{PR7}/threads/42?")) && sent[0].contains(API), "{}", sent[0]);
+
+        pr.resolve_thread(&item, "42", false).await.unwrap();
+        let sent = writes(&forge);
+        assert_eq!(sent.len(), 2, "{sent:?}");
+        assert!(sent[1].starts_with("PATCH ") && sent[1].contains("/threads/42"), "reopen hits the same thread: {}", sent[1]);
+    }
+
+    #[tokio::test]
+    async fn draft_and_close_each_patch_the_pull_request_once() {
+        let (forge, pr) = forge_and_client();
+        forge.route(PR7, serde_json::json!({}));
+        let item = ItemRef::in_repo("Payments/pay", "7");
+
+        pr.set_draft(&item, true).await.unwrap();
+        let sent = writes(&forge);
+        assert_eq!(sent, vec![format!("PATCH {PR7}?{API}")]);
+
+        pr.set_closed(&item, true).await.unwrap();
+        pr.set_closed(&item, false).await.unwrap();
+        let sent = writes(&forge);
+        assert_eq!(sent.len(), 3, "{sent:?}");
+        assert!(sent[1..].iter().all(|r| r == &format!("PATCH {PR7}?{API}")), "{sent:?}");
+    }
+
+    #[tokio::test]
+    async fn requesting_a_reviewer_puts_them_by_identity_id() {
+        let (forge, pr) = forge_and_client();
+        forge.route(&format!("{PR7}/reviewers/guid-ana"), serde_json::json!({}));
+        pr.request_reviewer(&ItemRef::in_repo("Payments/pay", "7"), "guid-ana").await.unwrap();
+        assert_eq!(writes(&forge), vec![format!("PUT {PR7}/reviewers/guid-ana?{API}")]);
+    }
+
+    #[tokio::test]
+    async fn reviewable_users_are_fetched_once_per_project_and_carry_the_identity_id() {
+        let (forge, pr) = forge_and_client();
+        forge.route("/_apis/projects/Payments/teams", serde_json::json!({ "value": [ { "id": "team-1" } ] }));
+        forge.route(
+            "/_apis/projects/Payments/teams/team-1/members",
+            serde_json::json!({ "value": [
+                { "identity": { "id": "guid-ana", "displayName": "Ana", "uniqueName": "ana@contoso.com" } },
+                { "identity": { "id": "guid-bo", "uniqueName": "bo@contoso.com" } } ] }),
+        );
+        let item = ItemRef::in_repo("Payments/pay", "7");
+
+        let first = pr.reviewable_users(&item).await.unwrap();
+        let second = pr.reviewable_users(&item).await.unwrap();
+        let ids = |us: &[User]| us.iter().map(|u| u.id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(&first), ids(&second));
+        assert_eq!(first.iter().map(|u| u.id.as_str()).collect::<Vec<_>>(), vec!["guid-ana", "guid-bo"], "the id reviewers/{{id}} accepts");
+        assert_eq!(first[0].handle.as_deref(), Some("ana@contoso.com"));
+        assert_eq!(first[1].display_name, "bo@contoso.com", "no display name falls back to the unique name");
+        assert_eq!(forge.requests_to("/_apis/projects/Payments/teams/team-1/members").len(), 1, "people cached for the run");
+        assert_eq!(forge.requests_to("/_apis/projects/Payments/teams").len(), 2, "one teams + one members call, once");
+
+        // The work-item assignee picker shares the cache but still addresses people by uniqueName.
+        let wi = AzureWi(pr.0.clone());
+        let assignable = wi.assignable_users(&item).await.unwrap();
+        assert_eq!(assignable.iter().map(|u| u.id.as_str()).collect::<Vec<_>>(), vec!["ana@contoso.com", "bo@contoso.com"]);
+        assert_eq!(forge.requests_to("/_apis/projects/").len(), 2, "no refetch for the assignee picker");
+    }
+
+    #[test]
+    fn azure_advertises_every_pull_request_write() {
+        let (_forge, pr) = forge_and_client();
+        assert_eq!(pr.pr_writes(), PrWriteSupport::ALL);
     }
 }
