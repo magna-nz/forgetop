@@ -208,3 +208,11 @@ export function addPrReply(qc: QueryClient, ref: Pick<PrRef, "conn" | "repo" | "
 export function addWiThread(qc: QueryClient, ref: Pick<WiRef, "conn" | "repo" | "id">, thread: CommentThread): void {
   qc.setQueryData<WiDetailData>(wiDetailKey(ref), (d) => d && { ...d, threads: [...d.threads, thread] });
 }
+
+/** Marks one of a PR's threads resolved (or open again) in its detail pane. Resolution is yours
+ *  to decide, so it is knowable client-side; the caller flips it back if the provider refuses. */
+export function setPrThreadResolved(qc: QueryClient, ref: Pick<PrRef, "conn" | "repo" | "id">, threadId: string, resolved: boolean): void {
+  qc.setQueryData<PrDetailData>(prDetailKey(ref), (d) =>
+    d && { ...d, threads: d.threads.map((t) => (t.id === threadId ? { ...t, is_resolved: resolved } : t)) },
+  );
+}

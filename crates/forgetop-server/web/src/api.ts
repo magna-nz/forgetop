@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import type { ConnectionRow, FileChange, HealthRow, LaunchpadResponse, NotifRow, PipeRef, PipelineDetail, PipelineSelection, PipeRow, PrDecoration, PrDetail, PrRef, ProviderInfo, PrRow, RepositoryPage, WiDetail, WiRef, WiRow } from "./types";
+import type { ConnectionRow, FileChange, HealthRow, LaunchpadResponse, NotifRow, PipeRef, PipelineDetail, PipelineSelection, PipeRow, PrDecoration, PrDetail, PrRef, ProviderInfo, PrRow, RepositoryPage, User, WiDetail, WiRef, WiRow } from "./types";
 
 // The session token arrives once in the URL (`/?t=…`). We stash it in sessionStorage (so a
 // refresh keeps working) and strip it from the visible URL, then replay it on every API call.
@@ -105,6 +105,18 @@ export const usePrDetail = (ref: PrRef | null) =>
     queryFn: () =>
       api<PrDetail>(`/api/pr/detail?conn=${encodeURIComponent(ref!.conn)}&id=${encodeURIComponent(ref!.id)}${repoParam(ref!.repo)}`),
     enabled: !!ref,
+  });
+
+/** The people who can be asked to review a PR — fetched lazily (only once `enabled`, i.e. the
+ *  request-reviewer menu has opened) and then kept for the session: the list is a repository's
+ *  collaborators, which doesn't change while the pane is open. */
+export const usePrReviewers = (ref: PrRef, enabled: boolean) =>
+  useQuery({
+    queryKey: ["pr-reviewers", ref.conn, ref.repo ?? "", ref.id],
+    queryFn: () =>
+      api<User[]>(`/api/pr/reviewers?conn=${encodeURIComponent(ref.conn)}&id=${encodeURIComponent(ref.id)}${repoParam(ref.repo)}`),
+    enabled,
+    staleTime: Infinity,
   });
 
 /** The files changed by a single commit on the PR (for the Commits → Files drill-in). */

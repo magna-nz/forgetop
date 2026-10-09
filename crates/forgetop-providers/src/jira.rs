@@ -168,7 +168,7 @@ impl WorkItemSource for JiraWi {
         Ok(if comments.is_empty() {
             vec![]
         } else {
-            vec![CommentThread { id: format!("issue-{id}"), comments, file_path: None, line: None, is_resolved: false }]
+            vec![CommentThread { id: format!("issue-{id}"), comments, file_path: None, line: None, is_resolved: false, is_resolvable: false }]
         })
     }
     async fn timeline(&self, item: &ItemRef) -> Result<Vec<TimelineEvent>> {

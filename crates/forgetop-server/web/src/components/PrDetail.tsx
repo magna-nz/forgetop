@@ -1,13 +1,13 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import { useQueryClient } from "@tanstack/react-query";
-import { apiPost, prDetailKey, useConnections, usePrCommitChanges, usePrDetail } from "../api";
+import { apiPost, prDetailKey, useConnections, usePrCommitChanges, usePrDetail, usePrReviewers } from "../api";
 import { checkMeta, checkSummaryOf, prStateLine, prStatusMeta, relativeTime, voteMeta } from "../format";
 import { providerSupports, unsupportedMessage } from "../capabilities";
 import { parsePatch } from "../diff";
-import { addPrReply, addPrThreads, isLocalId, localComment, localThread, meAsUser, patchPullRequest, withVote } from "../optimistic";
-import type { CheckRun, CommentThread, Commit, FileChange, FileChangeKind, LineComment, PrRef, ProviderType, PullRequest, ReviewVote, Reviewer, TimelineEvent } from "../types";
-import { Avatar, Chip, Pill, Timeline } from "./ui";
+import { addPrReply, addPrThreads, isLocalId, localComment, localThread, meAsUser, patchPullRequest, setPrThreadResolved, withVote } from "../optimistic";
+import type { CheckRun, CommentThread, Commit, FileChange, FileChangeKind, LineComment, PrRef, PrWriteSupport, ProviderType, PullRequest, ReviewVote, Reviewer, TimelineEvent, User } from "../types";
+import { Avatar, Chip, Pill, StatusBadge, Timeline } from "./ui";
 
 // ---- opener context ----
 
@@ -29,6 +29,12 @@ export function PrDetailProvider({ children }: { children: ReactNode }) {
 
 type Tab = "conversation" | "commits" | "files";
 
+/** What a detail without a `writes` field (an older server) supports: nothing optional. */
+const NO_WRITES: PrWriteSupport = { resolve_threads: false, draft: false, close: false, reopen: false, request_reviewer: false };
+
+/** Signature of a thread resolve/reopen handler; absent where the provider can't do it. */
+type OnResolve = (threadId: string, resolved: boolean) => void;
+
 function PrDetailPanel({ prRef, onClose }: { prRef: PrRef; onClose: () => void }) {
   const { data, isLoading, error } = usePrDetail(prRef);
   const connections = useConnections();
@@ -41,6 +47,13 @@ function PrDetailPanel({ prRef, onClose }: { prRef: PrRef; onClose: () => void }
   // When set, the Files tab shows a single commit's diff instead of the whole-PR changes.
   const [commitScope, setCommitScope] = useState<{ sha: string; label: string } | null>(null);
   const commitChanges = usePrCommitChanges(prRef, commitScope?.sha ?? null);
+  // Close is the one state change you can't take back on every forge, so it takes two clicks.
+  const [confirmClose, setConfirmClose] = useState(false);
+  useEffect(() => {
+    if (!confirmClose) return;
+    const t = setTimeout(() => setConfirmClose(false), 4000);
+    return () => clearTimeout(t);
+  }, [confirmClose]);
 
   const requestClose = () => {
     if (pending.length > 0 && !window.confirm(`Discard ${pending.length} unsubmitted comment(s)?`)) return;
@@ -52,6 +65,7 @@ function PrDetailPanel({ prRef, onClose }: { prRef: PrRef; onClose: () => void }
     setPending([]);
     setNote(null);
     setCommitScope(null);
+    setConfirmClose(false);
   }, [prRef.conn, prRef.id]);
 
   // Esc closes (guarding unsubmitted comments via requestClose).
@@ -167,7 +181,62 @@ function PrDetailPanel({ prRef, onClose }: { prRef: PrRef; onClose: () => void }
     });
   };
 
+  // ---- optional writes (gated on what the connection says it supports) ----
+
+  const writes: PrWriteSupport = data?.writes ?? NO_WRITES;
+  // Unsupported controls stay visible but disabled, titled with the standard message.
+  const unsupported = provider ? unsupportedMessage(provider) : "This provider currently does not support this feature";
+  const gate = (supported: boolean) => (supported ? undefined : unsupported);
+
+  const resolveThread: OnResolve = (threadId, resolved) =>
+    act(
+      resolved ? "Thread resolved" : "Thread reopened",
+      () => apiPost("/api/pr/resolve-thread", { conn: prRef.conn, repo: prRef.repo, id: prRef.id, thread_id: threadId, resolved }),
+      {
+        optimistic: () => setPrThreadResolved(qc, prRef, threadId, resolved),
+        onError: () => setPrThreadResolved(qc, prRef, threadId, !resolved),
+      },
+    );
+
+  /** A draft / close / reopen: the new state is yours to decide, so it shows at once in every
+   *  cache the PR lives in, and is put back if the provider refuses. */
+  const changeState = (label: string, path: string, body: Record<string, boolean>, edit: (p: PullRequest) => PullRequest) => {
+    const current = data?.pull_request;
+    const before = current ? { status: current.status, is_draft: current.is_draft } : null;
+    return act(label, () => apiPost(path, { conn: prRef.conn, repo: prRef.repo, id: prRef.id, ...body }), {
+      optimistic: () => patchPullRequest(qc, prRef, edit),
+      onError: () => before && patchPullRequest(qc, prRef, (p) => ({ ...p, ...before })),
+    });
+  };
+  const markReady = () =>
+    changeState("Marked ready for review", "/api/pr/draft", { draft: false }, (p) => ({ ...p, is_draft: false, status: "Open" }));
+  const convertToDraft = () =>
+    changeState("Converted to draft", "/api/pr/draft", { draft: true }, (p) => ({ ...p, is_draft: true, status: "Draft" }));
+  const closePr = () => {
+    setConfirmClose(false);
+    return changeState("Closed", "/api/pr/closed", { closed: true }, (p) => ({ ...p, status: "Closed" }));
+  };
+  const reopenPr = () =>
+    changeState("Reopened", "/api/pr/closed", { closed: false }, (p) => ({ ...p, status: p.is_draft ? "Draft" : "Open" }));
+
+  const requestReviewer = (user: User) =>
+    act(
+      `Review requested from ${user.display_name}`,
+      () => apiPost("/api/pr/request-reviewer", { conn: prRef.conn, repo: prRef.repo, id: prRef.id, user_id: user.id }),
+      {
+        optimistic: () =>
+          patchPullRequest(qc, prRef, (p) =>
+            p.reviewers.some((r) => r.user.id === user.id) ? p : { ...p, reviewers: [...p.reviewers, { user, vote: "NoVote", is_required: false }] },
+          ),
+        // The menu only offers people not already reviewing, so the entry to take back is ours.
+        onError: () =>
+          patchPullRequest(qc, prRef, (p) => ({ ...p, reviewers: p.reviewers.filter((r) => !(r.user.id === user.id && r.vote === "NoVote")) })),
+      },
+    );
+
   const pr = data?.pull_request;
+  const isDraft = !!pr && (pr.status === "Draft" || pr.is_draft);
+  const onResolve = writes.resolve_threads ? resolveThread : undefined;
 
   return (
     <motion.div
@@ -223,7 +292,21 @@ function PrDetailPanel({ prRef, onClose }: { prRef: PrRef; onClose: () => void }
           <>
             <StateLine pr={pr} checks={data.checks} />
 
-            <MetaBar author={pr.author.display_name} reviewers={pr.reviewers} />
+            <MetaBar
+              author={pr.author.display_name}
+              reviewers={pr.reviewers}
+              request={
+                <RequestReviewer
+                  prRef={prRef}
+                  author={pr.author}
+                  reviewers={pr.reviewers}
+                  supported={writes.request_reviewer}
+                  unsupportedTitle={unsupported}
+                  busy={busy}
+                  onPick={requestReviewer}
+                />
+              }
+            />
 
             {/* tabs */}
             <div className="flex items-center gap-1 px-4 shrink-0" style={{ borderBottom: "1px solid var(--border)" }}>
@@ -261,6 +344,7 @@ function PrDetailPanel({ prRef, onClose }: { prRef: PrRef; onClose: () => void }
                   pending={pending}
                   busy={busy}
                   onReply={reply}
+                  onResolve={onResolve}
                   onAddPending={(c) => setPending((p) => [...p, c])}
                   onRemovePending={(i) => setPending((p) => p.filter((_, k) => k !== i))}
                   scope={
@@ -277,6 +361,7 @@ function PrDetailPanel({ prRef, onClose }: { prRef: PrRef; onClose: () => void }
                   timeline={data.timeline}
                   busy={busy}
                   onReply={reply}
+                  onResolve={onResolve}
                   onComment={comment}
                 />
               )}
@@ -302,6 +387,10 @@ function PrDetailPanel({ prRef, onClose }: { prRef: PrRef; onClose: () => void }
                 <div className="ml-auto flex gap-2">
                   <ActionButton disabled={busy} onClick={revert} label="Revert" color="var(--red)" primary />
                 </div>
+              ) : pr.status === "Closed" ? (
+                <div className="ml-auto flex gap-2">
+                  <ActionButton disabled={busy || !writes.reopen} title={gate(writes.reopen)} onClick={reopenPr} label="Reopen" color="var(--green)" primary />
+                </div>
               ) : pending.length > 0 ? (
                 <>
                   <span className="text-sm" style={{ color: "var(--accent)" }}>
@@ -313,8 +402,28 @@ function PrDetailPanel({ prRef, onClose }: { prRef: PrRef; onClose: () => void }
                     <ActionButton disabled={busy} onClick={() => submitReview("Approved")} label="Approve" color="var(--green)" primary />
                   </div>
                 </>
-              ) : (
+              ) : isDraft ? (
                 <div className="ml-auto flex gap-2">
+                  <ActionButton
+                    disabled={busy || !writes.draft}
+                    title={gate(writes.draft)}
+                    onClick={markReady}
+                    label="Ready for review"
+                    color="var(--green)"
+                    primary
+                  />
+                </div>
+              ) : (
+                <div className="ml-auto flex gap-2 flex-wrap justify-end">
+                  <ActionButton disabled={busy || !writes.draft} title={gate(writes.draft)} onClick={convertToDraft} label="Convert to draft" />
+                  <ActionButton
+                    disabled={busy || !writes.close}
+                    title={gate(writes.close) ?? (confirmClose ? "Click again to close without merging" : "Close without merging")}
+                    onClick={confirmClose ? closePr : () => setConfirmClose(true)}
+                    label={confirmClose ? "Confirm close" : "Close"}
+                    color="var(--red)"
+                    primary={confirmClose}
+                  />
                   <ActionButton disabled={busy} onClick={() => vote("Rejected")} label="Request changes" color="var(--red)" />
                   <ActionButton disabled={busy} onClick={() => vote("Approved")} label="Approve" color="var(--green)" />
                   <ActionButton
@@ -404,13 +513,13 @@ function StateLine({ pr, checks }: { pr: PullRequest; checks: CheckRun[] }) {
   );
 }
 
-function MetaBar({ author, reviewers }: { author: string; reviewers: Reviewer[] }) {
+function MetaBar({ author, reviewers, request }: { author: string; reviewers: Reviewer[]; request?: ReactNode }) {
   return (
     <div className="flex items-center gap-x-5 gap-y-1 px-5 py-2.5 flex-wrap text-xs shrink-0" style={{ borderBottom: "1px solid var(--border)", color: "var(--dim)" }}>
       <span className="flex items-center gap-1.5">
         <Avatar name={author} size={18} /> opened by <span style={{ color: "var(--fg)" }}>{author}</span>
       </span>
-      {reviewers.length > 0 && (
+      {(reviewers.length > 0 || request) && (
         <span className="flex items-center gap-x-3 gap-y-1 flex-wrap">
           <span className="uppercase tracking-wider text-[10px]">Reviewers</span>
           {reviewers.map((r, i) => {
@@ -422,9 +531,121 @@ function MetaBar({ author, reviewers }: { author: string; reviewers: Reviewer[] 
               </span>
             );
           })}
+          {request}
         </span>
       )}
     </div>
+  );
+}
+
+/** "Request reviewer ▾": a searchable menu of the people who can review this PR, fetched the
+ *  first time it opens and kept for the session. The author is left out (no forge lets you
+ *  review your own PR); anyone already reviewing is listed but can't be picked again. */
+function RequestReviewer({
+  prRef,
+  author,
+  reviewers,
+  supported,
+  unsupportedTitle,
+  busy,
+  onPick,
+}: {
+  prRef: PrRef;
+  author: User;
+  reviewers: Reviewer[];
+  supported: boolean;
+  unsupportedTitle: string;
+  busy: boolean;
+  onPick: (user: User) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  // Enabled from the first open on, so reopening the menu reuses the list (staleTime: Infinity).
+  const [wanted, setWanted] = useState(false);
+  const users = usePrReviewers(prRef, supported && wanted);
+
+  const isAuthor = (u: User) => u.id === author.id || (!!u.handle && !!author.handle && u.handle.toLowerCase() === author.handle.toLowerCase());
+  const already = new Set(reviewers.map((r) => r.user.id));
+  const q = query.trim().toLowerCase();
+  const list = (users.data ?? [])
+    .filter((u) => !isAuthor(u))
+    .filter((u) => !q || u.display_name.toLowerCase().includes(q) || (u.handle ?? "").toLowerCase().includes(q));
+  const disabled = !supported || busy;
+
+  const close = () => {
+    setOpen(false);
+    setQuery("");
+  };
+
+  return (
+    <span className="relative">
+      <button
+        onClick={() => {
+          setWanted(true);
+          setOpen((o) => !o);
+        }}
+        disabled={disabled}
+        title={supported ? "Ask someone to review this pull request" : unsupportedTitle}
+        className="rounded px-1.5 py-0.5"
+        style={{
+          color: "var(--dim)",
+          border: "1px solid var(--border)",
+          background: "var(--panel2)",
+          opacity: supported ? 1 : 0.55,
+          cursor: disabled ? "not-allowed" : "pointer",
+        }}
+      >
+        Request reviewer ▾
+      </button>
+      {open && (
+        <>
+          <div className="fixed inset-0" style={{ zIndex: 20 }} onClick={close} />
+          <div
+            className="absolute left-0 top-full mt-1 w-60 rounded-md py-1 shadow-lg normal-case tracking-normal"
+            style={{ zIndex: 21, background: "var(--panel)", border: "1px solid var(--border)" }}
+          >
+            <div className="px-2 pb-1">
+              <input
+                autoFocus
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder="Search people…"
+                className="w-full rounded px-2 py-1 text-xs outline-none"
+                style={{ background: "var(--bg)", color: "var(--fg)", border: "1px solid var(--border)" }}
+              />
+            </div>
+            <div className="max-h-56 overflow-auto">
+              {users.isLoading && <div className="px-3 py-1.5" style={{ color: "var(--dim)" }}>Loading…</div>}
+              {users.isError && <div className="px-3 py-1.5" style={{ color: "var(--red)" }}>Couldn't load reviewers</div>}
+              {!users.isLoading && !users.isError && list.length === 0 && (
+                <div className="px-3 py-1.5" style={{ color: "var(--dim)" }}>No one to request</div>
+              )}
+              {list.map((u) => {
+                const requested = already.has(u.id);
+                return (
+                  <button
+                    key={u.id}
+                    disabled={requested || busy}
+                    onClick={() => {
+                      onPick(u);
+                      close();
+                    }}
+                    className="flex items-center gap-2 w-full text-left px-3 py-1.5"
+                    style={{ color: requested ? "var(--dim)" : "var(--fg)", cursor: requested ? "default" : "pointer" }}
+                    onMouseEnter={(e) => !requested && (e.currentTarget.style.background = "var(--sel)")}
+                    onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+                  >
+                    <Avatar name={u.display_name} size={18} />
+                    <span className="flex-1 truncate">{u.display_name}</span>
+                    {requested && <span className="text-[10px] shrink-0">reviewing</span>}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        </>
+      )}
+    </span>
   );
 }
 
@@ -494,6 +715,7 @@ function FilesTab({
   pending,
   busy,
   onReply,
+  onResolve,
   onAddPending,
   onRemovePending,
   scope,
@@ -503,6 +725,7 @@ function FilesTab({
   pending: LineComment[];
   busy: boolean;
   onReply: (threadId: string, body: string) => void;
+  onResolve?: OnResolve;
   onAddPending: (c: LineComment) => void;
   onRemovePending: (index: number) => void;
   scope?: { label: string; loading: boolean; onClear: () => void };
@@ -564,7 +787,7 @@ function FilesTab({
         </nav>
         {/* selected file's diff */}
         <div className="flex-1 overflow-auto p-4 min-w-0">
-          <FileDiff key={file.path} file={file} threads={threads} pending={pending} busy={busy} onReply={onReply} onAddPending={onAddPending} onRemovePending={onRemovePending} />
+          <FileDiff key={file.path} file={file} threads={threads} pending={pending} busy={busy} onReply={onReply} onResolve={onResolve} onAddPending={onAddPending} onRemovePending={onRemovePending} />
         </div>
       </div>
     </div>
@@ -591,6 +814,7 @@ function FileDiff({
   pending,
   busy,
   onReply,
+  onResolve,
   onAddPending,
   onRemovePending,
 }: {
@@ -599,6 +823,7 @@ function FileDiff({
   pending: LineComment[];
   busy: boolean;
   onReply: (threadId: string, body: string) => void;
+  onResolve?: OnResolve;
   onAddPending: (c: LineComment) => void;
   onRemovePending: (index: number) => void;
 }) {
@@ -665,7 +890,7 @@ function FileDiff({
                   </span>
                 </div>
                 {lineThreads.map((t) => (
-                  <ThreadBox key={t.id} thread={t} busy={busy} onReply={onReply} />
+                  <ThreadBox key={t.id} thread={t} busy={busy} onReply={onReply} onResolve={onResolve} />
                 ))}
                 {linePending.map(({ p, idx }) => (
                   <PendingBox key={idx} body={p.body} onRemove={() => onRemovePending(idx)} />
@@ -696,7 +921,18 @@ function FileDiff({
   );
 }
 
-function ThreadBox({ thread, busy, onReply }: { thread: CommentThread; busy: boolean; onReply: (threadId: string, body: string) => void }) {
+function ThreadBox({
+  thread,
+  busy,
+  onReply,
+  onResolve,
+}: {
+  thread: CommentThread;
+  busy: boolean;
+  onReply: (threadId: string, body: string) => void;
+  /** Absent when the provider can't resolve threads — the state still shows, the button doesn't. */
+  onResolve?: OnResolve;
+}) {
   const [replying, setReplying] = useState(false);
   const [draft, setDraft] = useState("");
   const submit = () => {
@@ -708,6 +944,19 @@ function ThreadBox({ thread, busy, onReply }: { thread: CommentThread; busy: boo
   };
   return (
     <div className="px-3 py-2 text-xs" style={{ background: "var(--panel)", borderTop: "1px solid var(--border)" }}>
+      <div className="flex items-center gap-2 pb-1">
+        <StatusBadge label={thread.is_resolved ? "Resolved" : "Open"} color={thread.is_resolved ? "var(--green)" : "var(--yellow)"} />
+        {onResolve && thread.is_resolvable !== false && !isLocalId(thread.id) && (
+          <button
+            className="ml-auto text-xs rounded px-1.5 py-0.5"
+            disabled={busy}
+            style={{ color: "var(--accent)", border: "1px solid var(--border)", background: "var(--panel2)", opacity: busy ? 0.45 : 1 }}
+            onClick={() => onResolve(thread.id, !thread.is_resolved)}
+          >
+            {thread.is_resolved ? "Reopen" : "Resolve"}
+          </button>
+        )}
+      </div>
       {thread.comments.map((c) => (
         <div key={c.id} className="flex gap-2 py-0.5">
           <Avatar name={c.author.display_name} size={16} />
@@ -766,6 +1015,7 @@ function ConversationTab({
   timeline,
   busy,
   onReply,
+  onResolve,
   onComment,
 }: {
   threads: CommentThread[];
@@ -773,10 +1023,14 @@ function ConversationTab({
   timeline: TimelineEvent[];
   busy: boolean;
   onReply: (threadId: string, body: string) => void;
+  onResolve?: OnResolve;
   onComment: (body: string) => void;
 }) {
   const [draft, setDraft] = useState("");
   const general = threads.filter((t) => !t.file_path);
+  // Counts every open thread on the PR — inline diff threads included — since those are the
+  // ones a review leaves waiting on you.
+  const openCount = threads.filter((t) => !t.is_resolved).length;
   return (
     <div className="p-4 flex flex-col gap-3 max-w-3xl">
       {description && (
@@ -785,9 +1039,12 @@ function ConversationTab({
         </div>
       )}
       {timeline.length > 0 && <Timeline events={timeline} />}
+      <div className="text-[11px] font-semibold uppercase tracking-wider px-1" style={{ color: "var(--dim)" }}>
+        {openCount > 0 ? `Comments · ${openCount} open` : "Comments"}
+      </div>
       {general.length === 0 && <div className="text-xs px-1" style={{ color: "var(--dim)" }}>No comments yet.</div>}
       {general.map((t) => (
-        <ThreadBox key={t.id} thread={t} busy={busy} onReply={onReply} />
+        <ThreadBox key={t.id} thread={t} busy={busy} onReply={onReply} onResolve={onResolve} />
       ))}
       <div className="mt-2">
         <textarea

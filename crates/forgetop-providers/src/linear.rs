@@ -150,7 +150,7 @@ impl WorkItemSource for LinearWi {
         let data = self.0.query(gql, json!({ "id": id })).await?;
         let Some(issue) = get_obj(&data, "issue") else { return Ok(vec![]) };
         let comments: Vec<Comment> = get_obj(issue, "comments").map(|c| get_arr(c, "nodes").iter().map(map_comment).collect()).unwrap_or_default();
-        Ok(if comments.is_empty() { vec![] } else { vec![CommentThread { id: format!("issue-{id}"), comments, file_path: None, line: None, is_resolved: false }] })
+        Ok(if comments.is_empty() { vec![] } else { vec![CommentThread { id: format!("issue-{id}"), comments, file_path: None, line: None, is_resolved: false, is_resolvable: false }] })
     }
     async fn timeline(&self, item: &ItemRef) -> Result<Vec<TimelineEvent>> {
         let id: &str = &item.id;

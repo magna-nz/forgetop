@@ -450,6 +450,11 @@ fn map_gh_comment(c: &Value) -> Comment {
 /// Group GitHub review (diff-line) comments (`GET /pulls/{id}/comments`) into real threads, keyed
 /// by the root comment id (replies carry `in_reply_to_id`). The root id is what a reply posts to
 /// via `/pulls/{id}/comments/{id}/replies`. Each thread keeps the root's file/line.
+///
+/// This is now the **fallback**: review threads come from GraphQL ([`map_gql_review_threads`]),
+/// which alone knows whether a thread is resolved. REST has no resolved state, so a thread built
+/// here is always `is_resolved: false` — used only when GraphQL refuses (an old GHES, or a token
+/// without GraphQL access), so the conversation still shows rather than vanishing.
 fn group_gh_review_threads(raw: &[Value]) -> Vec<CommentThread> {
     use std::collections::HashMap;
     let parent: HashMap<String, String> = raw
@@ -486,10 +491,97 @@ fn group_gh_review_threads(raw: &[Value]) -> Vec<CommentThread> {
                 file_path: head.and_then(|c| get_str(c, "path")),
                 line: head.and_then(|c| get_i64(c, "line").or_else(|| get_i64(c, "original_line"))),
                 is_resolved: false,
+                is_resolvable: true,
                 comments: items.iter().map(|c| map_gh_comment(c)).collect(),
             })
         })
         .collect()
+}
+
+/// The review threads of one pull request, with what REST cannot say: whether each is resolved,
+/// and the thread's node id that `resolveReviewThread` wants. Compact on purpose — the request
+/// body stays small.
+///
+/// `pullRequest` is an alias for `issueOrPullRequest` narrowed to a pull request: the work-item
+/// detail asks for the threads of an *issue* through the same path, and `pullRequest(number:)`
+/// errors on an issue number (which would cost the REST fallback, a third call per reload),
+/// where this answers `{}` and the issue simply has no review threads.
+const REVIEW_THREADS_QUERY: &str = "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest:issueOrPullRequest(number:$number){...on PullRequest{reviewThreads(first:100){nodes{id isResolved path line originalLine comments(first:100){nodes{databaseId body createdAt author{login avatarUrl}}}}}}}}}";
+
+/// A GraphQL `author` (`login`, `avatarUrl`) as our [`User`]. GraphQL's author has no numeric id
+/// unless asked for one, so the login is the id — as it is for an assignable user.
+fn map_gql_user(v: &Value) -> User {
+    let login = get_str(v, "login");
+    User {
+        id: login.clone().unwrap_or_else(|| "unknown".into()),
+        display_name: login.clone().unwrap_or_else(|| "unknown".into()),
+        handle: login,
+        avatar_url: get_str(v, "avatarUrl"),
+    }
+}
+
+/// Map the `data` of [`REVIEW_THREADS_QUERY`] to threads, each paired with its GraphQL node id.
+///
+/// A thread's `id` stays the **root comment's REST id** (`databaseId`), exactly what the REST
+/// grouping gave it: [`reply_to_thread`](PullRequestSource::reply_to_thread) posts to
+/// `/pulls/{n}/comments/{root}/replies` with it. The node id travels alongside so the client can
+/// remember it for `resolveReviewThread` without asking again. A thread whose root has no
+/// `databaseId` (not seen in practice) is addressed by its node id instead. `line` falls back to
+/// `originalLine` when the diff has moved on and the line is gone (`line: null`), as the REST
+/// mapper falls back to `original_line`. Threads keep GitHub's order.
+pub fn map_gql_review_threads(data: &Value) -> Vec<(CommentThread, String)> {
+    let threads = get_obj(data, "repository").and_then(|r| get_obj(r, "pullRequest")).and_then(|p| get_obj(p, "reviewThreads"));
+    let Some(threads) = threads else { return Vec::new() };
+    get_arr(threads, "nodes")
+        .iter()
+        .filter_map(|t| {
+            let node_id = get_str(t, "id")?;
+            let raw = get_obj(t, "comments").map(|c| get_arr(c, "nodes")).unwrap_or(&[]);
+            let comments: Vec<Comment> = raw
+                .iter()
+                .map(|c| Comment {
+                    id: get_i64(c, "databaseId").map(|n| n.to_string()).unwrap_or_else(|| "0".into()),
+                    author: get_obj(c, "author").map(map_gql_user).unwrap_or_else(unknown_user),
+                    body: get_str(c, "body").unwrap_or_default(),
+                    created_at: get_date(c, "createdAt"),
+                })
+                .collect();
+            let id = raw.first().and_then(|c| get_i64(c, "databaseId")).map(|n| n.to_string()).unwrap_or_else(|| node_id.clone());
+            let thread = CommentThread {
+                id,
+                file_path: get_str(t, "path"),
+                line: get_i64(t, "line").or_else(|| get_i64(t, "originalLine")),
+                is_resolved: get_bool(t, "isResolved"),
+                is_resolvable: true,
+                comments,
+            };
+            Some((thread, node_id))
+        })
+        .collect()
+}
+
+/// GitHub's GraphQL endpoint for a REST `base`: `{base}/graphql` on github.com
+/// (`https://api.github.com/graphql`), but `/api/graphql` beside GHES's `/api/v3`.
+pub fn graphql_url(base: &str) -> String {
+    let base = base.trim_end_matches('/');
+    match base.strip_suffix("/api/v3") {
+        Some(host) => format!("{host}/api/graphql"),
+        None => format!("{base}/graphql"),
+    }
+}
+
+/// A connection-relative `owner/repo` as GraphQL's separate `owner` and `name`. Only ever fed the
+/// output of `resolve`, which is connection-relative already — this splits it, it doesn't convert.
+fn owner_and_name(repo: &str) -> Result<(&str, &str)> {
+    match repo.split_once('/') {
+        Some((owner, name)) if !owner.is_empty() && !name.is_empty() && !name.contains('/') => Ok((owner, name)),
+        _ => Err(Error::Provider(format!("'{repo}' is not an owner/repository path"))),
+    }
+}
+
+/// A pull request's number, for GraphQL's `Int!` (REST takes it as a path segment unparsed).
+fn pr_number(id: &str) -> Result<i64> {
+    id.parse().map_err(|_| Error::Provider(format!("'{id}' is not a pull request number")))
 }
 
 // ---- client ----
@@ -669,6 +761,19 @@ pub struct GitHubClient {
     /// that line is written once per window rather than by every call the limit refuses. (Each
     /// refused list, search or full fetch still logs its own failure under its own context.)
     rate_limit_logged: std::sync::Mutex<Option<(RateLimitKind, i64)>>,
+    /// `"{repo}#{number}:{root comment id}"` → the review thread's GraphQL node id, filled by
+    /// every [`threads`](PullRequestSource::threads) fetch. Resolving a thread the user is looking
+    /// at then costs the mutation alone, not a second read to find the id.
+    review_thread_ids: tokio::sync::Mutex<HashMap<String, String>>,
+    /// Set once a GraphQL call was refused (an old GHES, a token without GraphQL access, a
+    /// GraphQL-side rate limit). While set, `threads()` goes straight to REST so a host where
+    /// GraphQL fails stays at two calls per reload instead of paying the refusal every 30 s, and
+    /// the log says so once. Any later GraphQL call that succeeds clears it.
+    graphql_down: std::sync::atomic::AtomicBool,
+    /// Repository → its collaborators (who can be asked to review). Fetched on the first review
+    /// request for a repository and kept for the run: the list rarely changes, and the picker
+    /// must not cost a call each time it opens.
+    collaborators: tokio::sync::Mutex<HashMap<String, Vec<User>>>,
 }
 
 /// Which of GitHub's rate limits refused a request.
@@ -809,6 +914,75 @@ impl GitHubClient {
             return Err(Error::Provider(format!("PUT {url} -> {}", resp.status())));
         }
         Ok(())
+    }
+
+    async fn patch_json(&self, url: &str, body: Value) -> Result<()> {
+        let resp = self.http.patch(url).json(&body).send().await.map_err(prov)?;
+        if !resp.status().is_success() {
+            return Err(Error::Provider(format!("PATCH {url} -> {}", resp.status())));
+        }
+        Ok(())
+    }
+
+    /// One GraphQL request, returning its `data`. Used where REST has no equivalent — a review
+    /// thread's resolved state, resolving it, and the draft flag. GraphQL answers a failed query
+    /// with `200` and an `errors` array, so that is an error here too (with GitHub's first
+    /// message), as is a refused status — read for the rate limit like any REST call.
+    async fn graphql(&self, query: &str, variables: Value) -> Result<Value> {
+        let url = graphql_url(&self.base);
+        let resp = self.http.post(&url).json(&json!({ "query": query, "variables": variables })).send().await.map_err(prov)?;
+        if !resp.status().is_success() {
+            return Err(Error::Provider(match self.note_rate_limit(&resp) {
+                Some(limit) => format!("POST {url} -> {} ({})", resp.status(), limit.message),
+                None => format!("POST {url} -> {}", resp.status()),
+            }));
+        }
+        let body: Value = resp.json().await.map_err(prov)?;
+        if let Some(first) = get_arr(&body, "errors").first() {
+            let message = get_str(first, "message").unwrap_or_else(|| first.to_string());
+            return Err(Error::Provider(format!("GitHub GraphQL: {message}")));
+        }
+        self.graphql_down.store(false, std::sync::atomic::Ordering::Relaxed);
+        Ok(body.get("data").cloned().unwrap_or(Value::Null))
+    }
+
+    /// The review threads of `repo#number` from GraphQL — one call, with resolved state — and
+    /// each thread's node id remembered for [`resolve_thread`](PullRequestSource::resolve_thread).
+    async fn review_threads(&self, repo: &str, number: &str) -> Result<Vec<CommentThread>> {
+        let (owner, name) = owner_and_name(repo)?;
+        let n = pr_number(number)?;
+        let data = self.graphql(REVIEW_THREADS_QUERY, json!({ "owner": owner, "name": name, "number": n })).await?;
+        let mapped = map_gql_review_threads(&data);
+        let mut ids = self.review_thread_ids.lock().await;
+        // Bounded like the hydration cache: it serves the threads being looked at, not history.
+        if ids.len() >= HYDRATION_CACHE_MAX {
+            ids.clear();
+        }
+        for (thread, node_id) in &mapped {
+            ids.insert(format!("{repo}#{number}:{}", thread.id), node_id.clone());
+        }
+        Ok(mapped.into_iter().map(|(thread, _)| thread).collect())
+    }
+
+    /// The GraphQL node id of the review thread whose root comment is `thread_id`. Served from
+    /// what the last [`threads`](PullRequestSource::threads) fetch remembered — the detail being
+    /// acted on was just fetched, so this is normally free — else one fetch of the threads. An id
+    /// that isn't a number is already a node id (a thread whose root had no REST id).
+    async fn review_thread_node_id(&self, repo: &str, number: &str, thread_id: &str) -> Result<String> {
+        if thread_id.parse::<i64>().is_err() {
+            return Ok(thread_id.to_string());
+        }
+        let key = format!("{repo}#{number}:{thread_id}");
+        if let Some(id) = self.review_thread_ids.lock().await.get(&key) {
+            return Ok(id.clone());
+        }
+        self.review_threads(repo, number).await?;
+        self.review_thread_ids
+            .lock()
+            .await
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| Error::Provider(format!("no review thread {thread_id} on {repo}#{number}")))
     }
 
     async fn self_login(&self) -> Result<Option<String>> {
@@ -1029,19 +1203,43 @@ impl PullRequestSource for GitHubPr {
         }
         Ok(d)
     }
+    /// The pull request's conversation: its flat issue comments as one bundled thread (`pr-{n}` —
+    /// GitHub has no reply or resolve API for these), then its review (diff-line) threads, which
+    /// support both. The review threads come from one GraphQL query — REST can't say whether a
+    /// thread is resolved — in place of the REST list, so this stays two calls on every reload.
+    /// Where GraphQL refuses (an old GHES, a token without GraphQL access) it falls back to the
+    /// REST list, and resolved state is unknown (`false`) as it always was there.
     async fn threads(&self, item: &ItemRef) -> Result<Vec<CommentThread>> {
         let repo = self.0.resolve(item)?;
         let id = &item.id;
-        // The PR conversation is flat issue comments (one bundled thread; GitHub has no reply API
-        // for these), plus the real review (diff-line) threads which *do* support replies.
         let issues = self.0.get_json(&self.0.repo_path(&repo, &format!("/issues/{id}/comments?per_page=100"))).await?;
         let comments: Vec<Comment> = issues.as_array().unwrap_or(&vec![]).iter().map(map_gh_comment).collect();
         let mut threads = Vec::new();
         if !comments.is_empty() {
-            threads.push(CommentThread { id: format!("pr-{id}"), comments, file_path: None, line: None, is_resolved: false });
+            threads.push(CommentThread { id: format!("pr-{id}"), comments, file_path: None, line: None, is_resolved: false, is_resolvable: false });
         }
-        let reviews = self.0.get_json(&self.0.repo_path(&repo, &format!("/pulls/{id}/comments?per_page=100"))).await?;
-        threads.extend(group_gh_review_threads(reviews.as_array().unwrap_or(&vec![])));
+        use std::sync::atomic::Ordering;
+        let review = if self.0.graphql_down.load(Ordering::Relaxed) { None } else { Some(self.0.review_threads(&repo, id).await) };
+        match review {
+            Some(Ok(review)) => threads.extend(review),
+            refused => {
+                if let Some(Err(e)) = refused {
+                    // Only a refusal of the endpoint itself (a non-2xx: no GraphQL on this host,
+                    // a token it won't take, its own rate limit) parks GraphQL for the run. An
+                    // error inside a 200 is about this one query and must not take every other
+                    // pull request's resolved state with it.
+                    if matches!(&e, Error::Provider(msg) if msg.starts_with("POST ")) {
+                        self.0.graphql_down.store(true, Ordering::Relaxed);
+                    }
+                    forgetop_core::diag::log(
+                        "github.review_threads",
+                        &format!("GraphQL refused ({e}) — review threads come from REST for the rest of the run, resolved state unknown"),
+                    );
+                }
+                let reviews = self.0.get_json(&self.0.repo_path(&repo, &format!("/pulls/{id}/comments?per_page=100"))).await?;
+                threads.extend(group_gh_review_threads(reviews.as_array().unwrap_or(&vec![])));
+            }
+        }
         Ok(threads)
     }
     async fn timeline(&self, item: &ItemRef) -> Result<Vec<TimelineEvent>> {
@@ -1136,6 +1334,87 @@ impl PullRequestSource for GitHubPr {
             return Err(Error::Provider(format!("PUT {url} -> {}", resp.status())));
         }
         Ok(())
+    }
+    fn pr_writes(&self) -> PrWriteSupport {
+        // Every one: threads and draft through GraphQL, close/reopen and reviewers through REST.
+        PrWriteSupport::ALL
+    }
+    /// Resolves (or reopens) a review thread with GraphQL's `resolveReviewThread` /
+    /// `unresolveReviewThread` — REST has no such write. One call when the thread's node id is
+    /// remembered from the fetch that showed it. The bundled conversation (`pr-{n}`) is plain
+    /// issue comments, which GitHub cannot resolve at all.
+    async fn resolve_thread(&self, item: &ItemRef, thread_id: &str, resolved: bool) -> Result<()> {
+        if thread_id.starts_with("pr-") {
+            return Err(Error::Provider("GitHub can only resolve review threads on the diff".into()));
+        }
+        let repo = self.0.resolve(item)?;
+        let node_id = self.0.review_thread_node_id(&repo, &item.id, thread_id).await?;
+        let mutation = if resolved {
+            "mutation($id:ID!){resolveReviewThread(input:{threadId:$id}){thread{id isResolved}}}"
+        } else {
+            "mutation($id:ID!){unresolveReviewThread(input:{threadId:$id}){thread{id isResolved}}}"
+        };
+        self.0.graphql(mutation, json!({ "id": node_id })).await?;
+        Ok(())
+    }
+    /// Converts to a draft or marks ready for review. REST can only *read* `draft`, so this is
+    /// GraphQL: the pull request's node id, then the mutation — two calls, on the key only.
+    async fn set_draft(&self, item: &ItemRef, draft: bool) -> Result<()> {
+        let repo = self.0.resolve(item)?;
+        let (owner, name) = owner_and_name(&repo)?;
+        let number = pr_number(&item.id)?;
+        let data = self
+            .0
+            .graphql(
+                "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){id}}}",
+                json!({ "owner": owner, "name": name, "number": number }),
+            )
+            .await?;
+        let pr_id = get_obj(&data, "repository")
+            .and_then(|r| get_obj(r, "pullRequest"))
+            .and_then(|p| get_str(p, "id"))
+            .ok_or_else(|| Error::Provider(format!("no pull request {repo}#{number}")))?;
+        let mutation = if draft {
+            "mutation($id:ID!){convertPullRequestToDraft(input:{pullRequestId:$id}){pullRequest{isDraft}}}"
+        } else {
+            "mutation($id:ID!){markPullRequestReadyForReview(input:{pullRequestId:$id}){pullRequest{isDraft}}}"
+        };
+        self.0.graphql(mutation, json!({ "id": pr_id })).await?;
+        Ok(())
+    }
+    /// Closes without merging, or reopens: a pull request's `state` is writable on REST.
+    async fn set_closed(&self, item: &ItemRef, closed: bool) -> Result<()> {
+        let repo = self.0.resolve(item)?;
+        let state = if closed { "closed" } else { "open" };
+        self.0.patch_json(&self.0.repo_path(&repo, &format!("/pulls/{}", item.id)), json!({ "state": state })).await
+    }
+    /// The repository's collaborators, by login — what `requested_reviewers` takes. Fetched once
+    /// per repository and kept on the client, so reopening the picker costs nothing.
+    async fn reviewable_users(&self, item: &ItemRef) -> Result<Vec<User>> {
+        let repo = self.0.resolve(item)?;
+        if let Some(users) = self.0.collaborators.lock().await.get(&repo) {
+            return Ok(users.clone());
+        }
+        // Not held across the request: a slow fetch for one repository mustn't block another's.
+        let v = self.0.get_json(&self.0.repo_path(&repo, "/collaborators?per_page=100")).await?;
+        let users: Vec<User> = v
+            .as_array()
+            .unwrap_or(&vec![])
+            .iter()
+            .map(|u| {
+                let login = get_str(u, "login").unwrap_or_else(|| "unknown".into());
+                User { id: login.clone(), display_name: login.clone(), handle: Some(login), avatar_url: get_str(u, "avatar_url") }
+            })
+            .collect();
+        self.0.collaborators.lock().await.insert(repo, users.clone());
+        Ok(users)
+    }
+    /// Adds `user_id` (a login) to the requested reviewers; GitHub keeps those already there.
+    async fn request_reviewer(&self, item: &ItemRef, user_id: &str) -> Result<()> {
+        let repo = self.0.resolve(item)?;
+        self.0
+            .post_json(&self.0.repo_path(&repo, &format!("/pulls/{}/requested_reviewers", item.id)), json!({ "reviewers": [user_id] }))
+            .await
     }
 }
 
@@ -1508,6 +1787,9 @@ impl ProviderFactory for GitHubFactory {
             self_login: tokio::sync::Mutex::new(None),
             hydrated: tokio::sync::Mutex::new(HashMap::new()),
             rate_limit_logged: std::sync::Mutex::new(None),
+            review_thread_ids: tokio::sync::Mutex::new(HashMap::new()),
+            collaborators: tokio::sync::Mutex::new(HashMap::new()),
+            graphql_down: std::sync::atomic::AtomicBool::new(false),
         });
         Ok(Arc::new(GitHubConnection {
             id: connection.id.clone(),
@@ -1569,6 +1851,9 @@ mod tests {
             self_login: tokio::sync::Mutex::new(None),
             hydrated: tokio::sync::Mutex::new(HashMap::new()),
             rate_limit_logged: std::sync::Mutex::new(None),
+            review_thread_ids: tokio::sync::Mutex::new(HashMap::new()),
+            collaborators: tokio::sync::Mutex::new(HashMap::new()),
+            graphql_down: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -2002,6 +2287,9 @@ mod tests {
             self_login: tokio::sync::Mutex::new(None),
             hydrated: tokio::sync::Mutex::new(HashMap::new()),
             rate_limit_logged: std::sync::Mutex::new(None),
+            review_thread_ids: tokio::sync::Mutex::new(HashMap::new()),
+            collaborators: tokio::sync::Mutex::new(HashMap::new()),
+            graphql_down: std::sync::atomic::AtomicBool::new(false),
         });
         (forge, GitHubPr(client))
     }
@@ -2145,5 +2433,208 @@ mod tests {
         let rows = pr.list(&pr_query(PullRequestFilter::Mine, true)).await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!((rows[0].title.as_str(), rows[0].repository.as_deref(), rows[0].status), ("only in search", Some("acme/pay"), PullRequestStatus::Merged));
+    }
+
+    /// A client against a bare fake GitHub (nothing routed), for the pull-request writes.
+    fn forge_client(scope: &[&str]) -> (crate::test_http::FakeForge, GitHubPr) {
+        let forge = crate::test_http::FakeForge::start();
+        let client = Arc::new(GitHubClient {
+            http: reqwest::Client::new(),
+            base: forge.base().to_string(),
+            scope: scope.iter().map(|s| s.to_string()).collect(),
+            self_login: tokio::sync::Mutex::new(None),
+            hydrated: tokio::sync::Mutex::new(HashMap::new()),
+            rate_limit_logged: std::sync::Mutex::new(None),
+            review_thread_ids: tokio::sync::Mutex::new(HashMap::new()),
+            collaborators: tokio::sync::Mutex::new(HashMap::new()),
+            graphql_down: std::sync::atomic::AtomicBool::new(false),
+        });
+        (forge, GitHubPr(client))
+    }
+
+    /// `acme/pay#7`'s review threads as GraphQL answers them: an open one (root 501, reply 502)
+    /// and a resolved one (root 601).
+    fn review_threads_body() -> Value {
+        json!({ "data": { "repository": { "pullRequest": { "reviewThreads": { "nodes": [
+            { "id": "PRRT_open", "isResolved": false, "path": "src/pay.rs", "line": 12, "originalLine": 10,
+              "comments": { "nodes": [
+                { "databaseId": 501, "body": "why this?", "createdAt": "2026-09-01T00:00:00Z", "author": { "login": "sam", "avatarUrl": "https://a/sam" } },
+                { "databaseId": 502, "body": "because", "createdAt": "2026-09-01T01:00:00Z", "author": { "login": "dan", "avatarUrl": null } } ] } },
+            { "id": "PRRT_done", "isResolved": true, "path": "src/ledger.rs", "line": 3, "originalLine": 3,
+              "comments": { "nodes": [
+                { "databaseId": 601, "body": "nit", "createdAt": "2026-09-02T00:00:00Z", "author": { "login": "sam", "avatarUrl": null } } ] } }
+        ] } } } } })
+    }
+
+    fn count(forge: &crate::test_http::FakeForge, line: &str) -> usize {
+        forge.requests().iter().filter(|r| r.as_str() == line).count()
+    }
+
+    #[tokio::test]
+    async fn review_threads_come_from_graphql_with_resolved_state_and_root_ids() {
+        let (forge, pr) = forge_client(&["acme/pay"]);
+        forge.route("/graphql", review_threads_body());
+        forge.route("/repos/acme/pay/issues/7/comments", json!([]));
+
+        let threads = pr.threads(&ItemRef::in_repo("acme/pay", "7")).await.unwrap();
+        assert_eq!(threads.len(), 2, "no bundled conversation without issue comments");
+        let (open, done) = (&threads[0], &threads[1]);
+        assert_eq!(open.id, "501", "the root comment's REST id, which a reply posts to");
+        assert_eq!(done.id, "601");
+        assert!(!open.is_resolved && done.is_resolved);
+        assert_eq!((open.file_path.as_deref(), open.line), (Some("src/pay.rs"), Some(12)));
+        assert_eq!((done.file_path.as_deref(), done.line), (Some("src/ledger.rs"), Some(3)));
+        let bodies: Vec<&str> = open.comments.iter().map(|c| c.body.as_str()).collect();
+        assert_eq!(bodies, vec!["why this?", "because"]);
+        assert_eq!((open.comments[0].id.as_str(), open.comments[1].id.as_str()), ("501", "502"));
+        assert_eq!(open.comments[0].author.handle.as_deref(), Some("sam"));
+        assert_eq!(open.comments[0].author.avatar_url.as_deref(), Some("https://a/sam"));
+
+        assert_eq!(count(&forge, "POST /graphql"), 1, "{:?}", forge.requests());
+        assert!(forge.requests_to("/repos/acme/pay/pulls/7/comments").is_empty(), "GraphQL replaces the REST list");
+        assert_eq!(forge.requests().len(), 2, "still two calls per reload: {:?}", forge.requests());
+    }
+
+    #[tokio::test]
+    async fn a_refused_graphql_is_not_retried_on_the_next_reload() {
+        let (forge, pr) = forge_client(&["acme/pay"]);
+        // No /graphql route: the first fetch is refused with a 404, and the second must not ask again.
+        forge.route("/repos/acme/pay/issues/7/comments", json!([]));
+        forge.route("/repos/acme/pay/pulls/7/comments", json!([]));
+        let item = ItemRef::in_repo("acme/pay", "7");
+        pr.threads(&item).await.unwrap();
+        pr.threads(&item).await.unwrap();
+        assert_eq!(count(&forge, "POST /graphql"), 1, "{:?}", forge.requests());
+        assert_eq!(forge.requests_to("/repos/acme/pay/pulls/7/comments").len(), 2, "REST both times");
+        // A GraphQL call that later succeeds (here: a routed /graphql) puts threads back on GraphQL.
+        forge.route("/graphql", review_threads_body());
+        pr.resolve_thread(&item, "PRRT_open", true).await.unwrap();
+        pr.threads(&item).await.unwrap();
+        assert_eq!(count(&forge, "POST /graphql"), 3, "the mutation and the fetch that followed it: {:?}", forge.requests());
+    }
+
+    #[tokio::test]
+    async fn threads_fall_back_to_rest_when_graphql_fails() {
+        let (forge, pr) = forge_client(&["acme/pay"]);
+        // No `/graphql` route: a 404, as an old GHES without the endpoint would answer.
+        forge.route("/repos/acme/pay/issues/7/comments", json!([]));
+        forge.route(
+            "/repos/acme/pay/pulls/7/comments",
+            json!([
+                { "id": 501, "body": "why this?", "path": "src/pay.rs", "line": 12, "created_at": "2026-09-01T00:00:00Z", "user": { "login": "sam" } },
+                { "id": 502, "in_reply_to_id": 501, "body": "because", "path": "src/pay.rs", "line": 12, "created_at": "2026-09-01T01:00:00Z", "user": { "login": "dan" } }
+            ]),
+        );
+        let threads = pr.threads(&ItemRef::in_repo("acme/pay", "7")).await.unwrap();
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0].id, "501");
+        assert_eq!(threads[0].comments.len(), 2);
+        assert!(!threads[0].is_resolved, "REST cannot say, so unknown reads as open");
+        assert_eq!(forge.requests_to("/repos/acme/pay/pulls/7/comments").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn graphql_errors_in_a_200_are_still_errors() {
+        let (forge, pr) = forge_client(&["acme/pay"]);
+        forge.route("/graphql", json!({ "data": null, "errors": [ { "message": "Resource not accessible by integration" } ] }));
+        let err = pr.set_draft(&ItemRef::in_repo("acme/pay", "7"), true).await.unwrap_err();
+        assert!(err.to_string().contains("Resource not accessible"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn an_error_inside_a_200_does_not_park_graphql_for_other_pull_requests() {
+        let (forge, pr) = forge_client(&["acme/pay"]);
+        forge.route("/graphql", json!({ "data": null, "errors": [ { "message": "Could not resolve to a PullRequest with the number of 7." } ] }));
+        forge.route("/repos/acme/pay/issues/7/comments", json!([]));
+        forge.route("/repos/acme/pay/pulls/7/comments", json!([]));
+        let item = ItemRef::in_repo("acme/pay", "7");
+        pr.threads(&item).await.unwrap();
+        pr.threads(&item).await.unwrap();
+        assert_eq!(count(&forge, "POST /graphql"), 2, "a per-query error is retried next reload: {:?}", forge.requests());
+    }
+
+    #[tokio::test]
+    async fn resolve_thread_reuses_the_node_id_the_fetch_cached() {
+        let (forge, pr) = forge_client(&["acme/pay"]);
+        forge.route("/graphql", review_threads_body());
+        forge.route("/repos/acme/pay/issues/7/comments", json!([]));
+        let item = ItemRef::in_repo("acme/pay", "7");
+        pr.threads(&item).await.unwrap();
+        assert_eq!(count(&forge, "POST /graphql"), 1);
+
+        // The fake answers every `/graphql` with the threads body: no `errors`, so it succeeds.
+        pr.resolve_thread(&item, "501", true).await.unwrap();
+        assert_eq!(count(&forge, "POST /graphql"), 2, "the mutation alone: {:?}", forge.requests());
+
+        let before = forge.requests().len();
+        assert!(pr.resolve_thread(&item, "pr-7", true).await.is_err(), "the bundled conversation can't be resolved");
+        assert_eq!(forge.requests().len(), before, "and refusing it costs no request");
+    }
+
+    #[tokio::test]
+    async fn resolve_thread_looks_the_node_id_up_when_nothing_was_cached() {
+        let (forge, pr) = forge_client(&["acme/pay"]);
+        forge.route("/graphql", review_threads_body());
+        pr.resolve_thread(&ItemRef::in_repo("acme/pay", "7"), "601", false).await.unwrap();
+        assert_eq!(count(&forge, "POST /graphql"), 2, "one lookup, then the mutation");
+        let err = pr.resolve_thread(&ItemRef::in_repo("acme/pay", "7"), "999", true).await.unwrap_err();
+        assert!(err.to_string().contains("no review thread 999"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn set_closed_patches_the_pull_request_state() {
+        let (forge, pr) = forge_client(&["acme/pay"]);
+        forge.route("/repos/acme/pay/pulls/7", json!({}));
+        pr.set_closed(&ItemRef::in_repo("acme/pay", "7"), true).await.unwrap();
+        pr.set_closed(&ItemRef::in_repo("acme/pay", "7"), false).await.unwrap();
+        assert_eq!(count(&forge, "PATCH /repos/acme/pay/pulls/7"), 2, "{:?}", forge.requests());
+    }
+
+    #[tokio::test]
+    async fn request_reviewer_posts_the_login() {
+        let (forge, pr) = forge_client(&["acme/pay"]);
+        forge.route("/repos/acme/pay/pulls/7/requested_reviewers", json!({}));
+        pr.request_reviewer(&ItemRef::in_repo("acme/pay", "7"), "sam").await.unwrap();
+        assert_eq!(count(&forge, "POST /repos/acme/pay/pulls/7/requested_reviewers"), 1, "{:?}", forge.requests());
+    }
+
+    #[tokio::test]
+    async fn reviewable_users_are_fetched_once_per_repository() {
+        let (forge, pr) = forge_client(&["acme/pay"]);
+        forge.route("/repos/acme/pay/collaborators", json!([ { "login": "sam", "avatar_url": "https://a/sam" }, { "login": "dan" } ]));
+        let item = ItemRef::in_repo("acme/pay", "7");
+        let first = pr.reviewable_users(&item).await.unwrap();
+        let second = pr.reviewable_users(&item).await.unwrap();
+        assert_eq!(first.len(), 2);
+        assert_eq!(second.len(), 2);
+        assert!(first.iter().all(|u| u.handle.as_deref() == Some(u.id.as_str())), "the login is the id and the handle");
+        assert_eq!(first[0].avatar_url.as_deref(), Some("https://a/sam"));
+        assert_eq!(forge.requests_to("/repos/acme/pay/collaborators").len(), 1, "the second is served from the client");
+    }
+
+    #[test]
+    fn pr_writes_advertise_everything() {
+        assert_eq!(GitHubPr(client(&["acme/pay"])).pr_writes(), PrWriteSupport::ALL);
+    }
+
+    #[test]
+    fn a_review_thread_whose_line_is_gone_keeps_its_original_line() {
+        let data = json!({ "repository": { "pullRequest": { "reviewThreads": { "nodes": [
+            { "id": "PRRT_x", "isResolved": false, "path": "src/a.rs", "line": null, "originalLine": 40,
+              "comments": { "nodes": [ { "databaseId": 9, "body": "outdated", "createdAt": "2026-09-01T00:00:00Z", "author": null } ] } } ] } } } });
+        let threads = map_gql_review_threads(&data);
+        assert_eq!(threads.len(), 1);
+        let (thread, node_id) = &threads[0];
+        assert_eq!((thread.id.as_str(), node_id.as_str(), thread.line), ("9", "PRRT_x", Some(40)));
+        assert_eq!(thread.comments[0].author.display_name, "unknown", "a deleted account is not a crash");
+        // An issue number answers `pullRequest: {}` through the alias — no threads, not an error.
+        assert!(map_gql_review_threads(&json!({ "repository": { "pullRequest": {} } })).is_empty());
+    }
+
+    #[test]
+    fn graphql_lives_beside_rest_on_both_github_com_and_ghes() {
+        assert_eq!(graphql_url("https://api.github.com"), "https://api.github.com/graphql");
+        assert_eq!(graphql_url("https://ghe.acme.io/api/v3"), "https://ghe.acme.io/api/graphql");
+        assert_eq!(graphql_url("https://ghe.acme.io/api/v3/"), "https://ghe.acme.io/api/graphql");
     }
 }

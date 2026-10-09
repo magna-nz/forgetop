@@ -208,6 +208,9 @@ export interface CommentThread {
   file_path?: string | null;
   line?: number | null;
   is_resolved: boolean;
+  /** Whether the forge can mark this thread resolved at all (false for GitHub's bundled
+   *  conversation comments, GitLab's individual notes, work-item comments). */
+  is_resolvable?: boolean;
 }
 
 export interface FileChange {
@@ -262,6 +265,22 @@ export interface PrDetail {
   commits: Commit[];
   /** The signed-in user's handle on this connection, when it could be established. */
   me?: string | null;
+  /** Which optional writes this connection supports — the pane disables the ones it can't do. */
+  writes: PrWriteSupport;
+}
+
+/** Which of the optional pull-request writes a connection can perform (`PrWriteSupport` in
+ *  `forgetop-core`). All false by default. */
+export interface PrWriteSupport {
+  resolve_threads: boolean;
+  /** Mark ready for review / convert to draft. */
+  draft: boolean;
+  /** Close an open pull request without merging. */
+  close: boolean;
+  /** Reopen a closed one. */
+  reopen: boolean;
+  /** List reviewable users and request a review from one. */
+  request_reviewer: boolean;
 }
 
 /** A pending line comment (matches the Rust LineComment shape). */
