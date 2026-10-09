@@ -22,11 +22,14 @@ Fixed
   identity to filter by "Mine" listed every pull request. Connections now live for the whole run
   (rebuilt only when their configuration or credential changes), so a quiet reload costs the
   searches and nothing per row — roughly a tenth of the calls.
+  ([#226](https://github.com/magna-nz/forgetop/pull/226))
 - **A reload that cannot say who you are keeps the last identity it established**, in the
   terminal UI, so "Mine" stays yours through a refused `/user` call instead of showing everyone's
   pull requests.
+  ([#226](https://github.com/magna-nz/forgetop/pull/226))
 - **GitHub's rate limit is named in the log** (`github.rate_limit`, once per window, with when it
   resets) and in the error of any call it refuses, so a red GitHub dot has its reason in the log.
+  ([#226](https://github.com/magna-nz/forgetop/pull/226))
 
 ## 1.6.5 — 2026-10-09
 
