@@ -9,6 +9,43 @@ Adding a release: one `## <version> — <date>` section, a line per user-visible
 and the pull request each one came from. `git log v<previous>..HEAD --merges` lists the
 candidates.
 
+## 1.7.1 — 2026-10-10
+
+Added
+
+- **Resolve and reopen a comment thread** without leaving the terminal. On a pull request's Diff
+  tab, `R` resolves the thread under the cursor (or reopens a resolved one); the Conversation tab
+  gains a cursor that walks its threads (`↑`/`↓`) so the same key works there, and its heading
+  counts how many are still open. The thread box and the footer offer `R` and `r reply` only while
+  the cursor is on a thread. GitHub's review threads now come from one GraphQL query instead of
+  the REST list — the same number of calls — which is what gives them a real resolved state (they
+  always read as open before) and the id a resolve needs. Where GraphQL is refused, threads fall
+  back to REST for the rest of the run and the log says so once. Bitbucket now reads a thread's
+  resolution back, and Azure DevOps resolves with the status its own Resolve button sets. Threads
+  a forge cannot resolve (GitHub's flat conversation comments, GitLab's individual notes) say so,
+  and neither frontend offers the key there. The dashboard's pull-request pane gets a Resolve /
+  Reopen button on each thread.
+  ([#230](https://github.com/magna-nz/forgetop/pull/230))
+- **Mark a draft ready for review, convert back to draft, close and reopen.** `D` flips a draft
+  to ready (the banner says so: `D marks it ready for review`) or an open pull request back to a
+  draft; `X` closes an open one after a one-line confirm and reopens a closed one. The row in the
+  list flips on the same keypress and is taken back if the forge refuses. The footer shows only
+  the key that applies to the pull request's state, and approve / reject / merge are not offered
+  on a draft or a closed one. GitLab has no draft flag, so there it is the `Draft:` title prefix;
+  Bitbucket can decline but not reopen, so reopen is not offered there. The dashboard shows the
+  same actions in the pane's action bar.
+  ([#230](https://github.com/magna-nz/forgetop/pull/230))
+- **Request a reviewer.** `@` on a pull request opens the same searchable picker work items use
+  for assignees, listing who can review on that repository (GitHub collaborators, GitLab members,
+  the Azure DevOps team, Bitbucket workspace members), fetched once per repository for the run.
+  The author is left out and people already reviewing are shown with their verdict and cannot be
+  picked twice; the chosen reviewer appears on the Reviewers row as `(Requested)` straight away.
+  The dashboard has a Request reviewer control beside the Reviewers row.
+  ([#230](https://github.com/magna-nz/forgetop/pull/230))
+
+None of this adds a call to the 30-second reload: every write is one call on the key, and the
+reviewer list is cached for the run.
+
 ## 1.7.0 — 2026-10-09
 
 Fixed
