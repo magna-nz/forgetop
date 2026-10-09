@@ -1034,8 +1034,16 @@ impl PullRequestSource for AzurePr {
         let sha = match sha {
             Some(sha) => sha.to_string(),
             None => {
-                let pr = self.0.get_json(&format!("{}?{API}", self.0.pr_base(&repo, &item.id))).await?;
-                let Some(sha) = get_obj(&pr, "lastMergeSourceCommit").and_then(|c| get_str(c, "commitId")) else { return Ok(None) };
+                // The head is the last iteration's source commit, as `changes` reads it: a new pull
+                // request's `lastMergeSourceCommit` stays empty until Azure has computed its merge.
+                let pr_base = self.0.pr_base(&repo, &item.id);
+                let iters = self.0.get_json(&format!("{pr_base}/iterations?{API}")).await?;
+                let head = get_arr(&iters, "value").last().and_then(|i| get_obj(i, "sourceRefCommit")).and_then(|c| get_str(c, "commitId"));
+                let head = match head {
+                    Some(sha) => Some(sha),
+                    None => get_obj(&self.0.get_json(&format!("{pr_base}?{API}")).await?, "lastMergeSourceCommit").and_then(|c| get_str(c, "commitId")),
+                };
+                let Some(sha) = head else { return Ok(None) };
                 sha
             }
         };
@@ -2064,7 +2072,9 @@ mod tests {
     #[tokio::test]
     async fn file_text_reads_the_item_at_the_pull_requests_source_commit() {
         let (forge, pr) = forge_and_client();
-        forge.route("/Payments/_apis/git/repositories/pay/pullRequests/7", serde_json::json!({ "pullRequestId": 7, "lastMergeSourceCommit": { "commitId": "headsha1" } }));
+        forge.route("/Payments/_apis/git/repositories/pay/pullRequests/7/iterations", serde_json::json!({ "value": [
+            { "id": 1, "sourceRefCommit": { "commitId": "oldsha" } },
+            { "id": 2, "sourceRefCommit": { "commitId": "headsha1" } } ] }));
         forge.route("/Payments/_apis/git/repositories/pay/items", serde_json::json!({ "path": "/src/a.rs", "content": "fn a() {}\n" }));
 
         let got = pr.file_text(&ItemRef::new("7"), "/src/a.rs", None).await.unwrap();
@@ -2076,6 +2086,17 @@ mod tests {
         forge.route("/Payments/_apis/git/repositories/pay/items", serde_json::json!({ "content": "PK\u{0}\u{3}" }));
         assert_eq!(pr.file_text(&ItemRef::new("7"), "/a.zip", Some("abc")).await.unwrap(), None);
         assert_eq!(forge.requests_to("/Payments/_apis/git/repositories/pay/pullRequests/7").len(), 1, "only the first call looked the head up");
+    }
+
+    #[tokio::test]
+    async fn file_text_falls_back_to_the_merge_source_commit_without_iterations() {
+        let (forge, pr) = forge_and_client();
+        forge.route("/Payments/_apis/git/repositories/pay/pullRequests/7/iterations", serde_json::json!({ "value": [] }));
+        forge.route("/Payments/_apis/git/repositories/pay/pullRequests/7", serde_json::json!({ "pullRequestId": 7, "lastMergeSourceCommit": { "commitId": "mergesrc" } }));
+        forge.route("/Payments/_apis/git/repositories/pay/items", serde_json::json!({ "content": "x\n" }));
+        assert_eq!(pr.file_text(&ItemRef::new("7"), "/x.rs", None).await.unwrap().as_deref(), Some("x\n"));
+        let items = forge.requests_to("/Payments/_apis/git/repositories/pay/items");
+        assert!(items[0].contains("versionDescriptor.version=mergesrc"), "{}", items[0]);
     }
 
     const PR7: &str = "/Payments/_apis/git/repositories/pay/pullRequests/7";
