@@ -247,7 +247,9 @@ fn group_bb_threads(raw: &[Value]) -> Vec<CommentThread> {
                 comments: items.iter().map(|c| map_pr_comment(c)).collect(),
                 file_path,
                 line,
-                is_resolved: false,
+                // Bitbucket puts a `resolution` object on the root comment once it is resolved.
+                is_resolved: items.first().is_some_and(|c| get_obj(c, "resolution").is_some()),
+                is_resolvable: true,
             })
         })
         .collect()
@@ -403,6 +405,10 @@ pub struct BitbucketClient {
     scope: Vec<String>,
     /// The signed-in account's (display name or nickname, uuid), fetched once from `/user`.
     self_user: tokio::sync::Mutex<Option<(Option<String>, Option<String>)>>,
+    /// The workspace's members, keyed by workspace — the reviewer picker's list. Fetched on first
+    /// use and kept for the run: membership changes rarely, and the TUI reloads every 30 s, so
+    /// re-asking would be a call per reload for nothing.
+    reviewable: tokio::sync::Mutex<std::collections::HashMap<String, Vec<User>>>,
 }
 
 impl BitbucketClient {
@@ -455,6 +461,31 @@ impl BitbucketClient {
         let resp = self.http.post(url).json(&body).send().await.map_err(prov)?;
         if !resp.status().is_success() {
             return Err(Error::Provider(format!("POST {url} -> {}", resp.status())));
+        }
+        Ok(())
+    }
+
+    /// Like `post_ok`, with no body — for action endpoints (`…/resolve`) that take none.
+    async fn post_empty(&self, url: &str) -> Result<()> {
+        let resp = self.http.post(url).send().await.map_err(prov)?;
+        if !resp.status().is_success() {
+            return Err(Error::Provider(format!("POST {url} -> {}", resp.status())));
+        }
+        Ok(())
+    }
+
+    async fn put_ok(&self, url: &str, body: Value) -> Result<()> {
+        let resp = self.http.put(url).json(&body).send().await.map_err(prov)?;
+        if !resp.status().is_success() {
+            return Err(Error::Provider(format!("PUT {url} -> {}", resp.status())));
+        }
+        Ok(())
+    }
+
+    async fn delete_ok(&self, url: &str) -> Result<()> {
+        let resp = self.http.delete(url).send().await.map_err(prov)?;
+        if !resp.status().is_success() {
+            return Err(Error::Provider(format!("DELETE {url} -> {}", resp.status())));
         }
         Ok(())
     }
@@ -633,6 +664,58 @@ impl PullRequestSource for BitbucketPr {
         self.0
             .post_ok(&self.0.repo_path(&repo, &format!("/pullrequests/{}/merge", item.id)), json!({ "merge_strategy": strategy }))
             .await
+    }
+    fn pr_writes(&self) -> PrWriteSupport {
+        // A declined pull request is final on Bitbucket — there is no reopen endpoint.
+        PrWriteSupport { reopen: false, ..PrWriteSupport::ALL }
+    }
+    async fn resolve_thread(&self, item: &ItemRef, thread_id: &str, resolved: bool) -> Result<()> {
+        let repo = self.0.resolve(item)?;
+        // A thread is its root comment, and resolution lives on the root: POST resolves, DELETE
+        // of the same resource reopens.
+        let url = self.0.repo_path(&repo, &format!("/pullrequests/{}/comments/{thread_id}/resolve", item.id));
+        if resolved {
+            self.0.post_empty(&url).await
+        } else {
+            self.0.delete_ok(&url).await
+        }
+    }
+    async fn set_draft(&self, item: &ItemRef, draft: bool) -> Result<()> {
+        let repo = self.0.resolve(item)?;
+        self.0.put_ok(&self.0.repo_path(&repo, &format!("/pullrequests/{}", item.id)), json!({ "draft": draft })).await
+    }
+    async fn set_closed(&self, item: &ItemRef, closed: bool) -> Result<()> {
+        if !closed {
+            return Err(Error::Provider("Bitbucket cannot reopen a declined pull request — open a new one from the branch".into()));
+        }
+        let repo = self.0.resolve(item)?;
+        self.0.post_empty(&self.0.repo_path(&repo, &format!("/pullrequests/{}/decline", item.id))).await
+    }
+    async fn reviewable_users(&self, _item: &ItemRef) -> Result<Vec<User>> {
+        // Workspace members, not the repository's: every repository in scope is in this one
+        // workspace, so one list (and one call) serves them all.
+        let workspace = &self.0.workspace;
+        // Held across the fetch so two pickers opened at once still cost one call.
+        let mut cache = self.0.reviewable.lock().await;
+        if let Some(users) = cache.get(workspace) {
+            return Ok(users.clone());
+        }
+        let v = self.0.get_json(&format!("{}/workspaces/{workspace}/members?pagelen=100", self.0.base)).await?;
+        let users: Vec<User> = get_arr(&v, "values").iter().filter_map(|m| get_obj(m, "user")).map(map_user).collect();
+        cache.insert(workspace.clone(), users.clone());
+        Ok(users)
+    }
+    async fn request_reviewer(&self, item: &ItemRef, user_id: &str) -> Result<()> {
+        let repo = self.0.resolve(item)?;
+        // A PUT replaces the whole reviewer list, so re-send the ones already on it.
+        let url = self.0.repo_path(&repo, &format!("/pullrequests/{}", item.id));
+        let pr = self.0.get_json(&url).await?;
+        let mut uuids: Vec<String> = get_arr(&pr, "reviewers").iter().filter_map(|r| get_str(r, "uuid")).collect();
+        if !uuids.iter().any(|u| u == user_id) {
+            uuids.push(user_id.to_string());
+        }
+        let reviewers: Vec<Value> = uuids.iter().map(|uuid| json!({ "uuid": uuid })).collect();
+        self.0.put_ok(&url, json!({ "reviewers": reviewers })).await
     }
 }
 
@@ -851,6 +934,7 @@ impl ProviderFactory for BitbucketFactory {
             workspace,
             scope,
             self_user: tokio::sync::Mutex::new(None),
+            reviewable: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         });
         Ok(Arc::new(BitbucketConnection {
             id: connection.id.clone(),
@@ -986,7 +1070,8 @@ mod tests {
                 { "id": 10, "content": { "raw": "root" }, "created_on": "2026-06-01T10:00:00Z", "inline": { "path": "src/x.rs", "to": 12 } },
                 { "id": 11, "content": { "raw": "reply" }, "created_on": "2026-06-01T10:05:00Z", "parent": { "id": 10 } },
                 { "id": 12, "content": { "raw": "gone" }, "deleted": true },
-                { "id": 20, "content": { "raw": "general" }, "created_on": "2026-06-01T11:00:00Z" }
+                { "id": 20, "content": { "raw": "general" }, "created_on": "2026-06-01T11:00:00Z",
+                  "resolution": { "type": "comment_resolution", "user": { "uuid": "{u-1}" } } }
             ]"#,
         )
         .unwrap();
@@ -999,6 +1084,9 @@ mod tests {
         assert_eq!(inline.line, Some(12));
         assert_eq!(threads[1].id, "20");
         assert!(threads[1].file_path.is_none());
+        assert!(!inline.is_resolved, "no resolution object: open");
+        assert!(threads[1].is_resolved, "a `resolution` on the root reads as resolved, so a resolve round-trips");
+        assert!(inline.is_resolvable && threads[1].is_resolvable);
     }
 
     #[test]
@@ -1119,6 +1207,7 @@ mod tests {
             workspace: "acme".into(),
             scope: vec!["acme/pay".into()],
             self_user: tokio::sync::Mutex::new(None),
+            reviewable: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         });
         (forge, BitbucketPr(client))
     }
@@ -1177,5 +1266,76 @@ mod tests {
         assert!(!list[0].contains("q="), "no uuid to filter by: {}", list[0]);
         // The page is filtered in memory by the name that *was* established — exactly as before.
         assert_eq!(rows.iter().map(|r| r.title.as_str()).collect::<Vec<_>>(), vec!["dan's"]);
+    }
+
+    const PR_PATH: &str = "/repositories/acme/pay/pullrequests/7";
+
+    #[tokio::test]
+    async fn resolve_posts_the_root_comment_and_reopen_deletes_it() {
+        let (forge, pr) = forge_and_client();
+        forge.route(&format!("{PR_PATH}/comments/9/resolve"), serde_json::json!({}));
+        let item = ItemRef::in_repo("acme/pay", "7");
+        pr.resolve_thread(&item, "9", true).await.unwrap();
+        pr.resolve_thread(&item, "9", false).await.unwrap();
+        assert_eq!(
+            forge.requests(),
+            vec![format!("POST {PR_PATH}/comments/9/resolve"), format!("DELETE {PR_PATH}/comments/9/resolve")]
+        );
+    }
+
+    #[tokio::test]
+    async fn set_draft_puts_the_pull_request() {
+        let (forge, pr) = forge_and_client();
+        forge.route(PR_PATH, serde_json::json!({ "id": 7 }));
+        pr.set_draft(&ItemRef::in_repo("acme/pay", "7"), true).await.unwrap();
+        assert_eq!(forge.requests(), vec![format!("PUT {PR_PATH}")]);
+    }
+
+    #[tokio::test]
+    async fn close_declines_and_reopen_is_refused_without_a_call() {
+        let (forge, pr) = forge_and_client();
+        forge.route(&format!("{PR_PATH}/decline"), serde_json::json!({}));
+        let item = ItemRef::in_repo("acme/pay", "7");
+        pr.set_closed(&item, true).await.unwrap();
+        assert_eq!(forge.requests(), vec![format!("POST {PR_PATH}/decline")]);
+
+        let err = pr.set_closed(&item, false).await.unwrap_err();
+        assert!(err.to_string().contains("cannot reopen"), "{err}");
+        assert_eq!(forge.requests().len(), 1, "reopen makes no request");
+    }
+
+    #[tokio::test]
+    async fn request_reviewer_reads_the_reviewers_then_puts_the_list() {
+        let (forge, pr) = forge_and_client();
+        forge.route(PR_PATH, serde_json::json!({ "id": 7, "reviewers": [{ "uuid": "{u-3}" }] }));
+        pr.request_reviewer(&ItemRef::in_repo("acme/pay", "7"), "{u-5}").await.unwrap();
+        assert_eq!(forge.requests(), vec![format!("GET {PR_PATH}"), format!("PUT {PR_PATH}")]);
+    }
+
+    #[tokio::test]
+    async fn reviewable_users_are_fetched_once_per_workspace() {
+        let (forge, pr) = forge_and_client();
+        forge.route(
+            "/workspaces/acme/members",
+            serde_json::json!({ "values": [ { "user": { "uuid": "{u-5}", "display_name": "Ana", "nickname": "ana",
+                                                         "links": { "avatar": { "href": "https://a/x.png" } } } } ] }),
+        );
+        let item = ItemRef::in_repo("acme/pay", "7");
+        let users = pr.reviewable_users(&item).await.unwrap();
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0].id, "{u-5}");
+        assert_eq!(users[0].display_name, "Ana");
+        assert_eq!(users[0].handle.as_deref(), Some("ana"));
+        assert_eq!(users[0].avatar_url.as_deref(), Some("https://a/x.png"));
+        assert_eq!(pr.reviewable_users(&item).await.unwrap().len(), 1);
+        assert_eq!(forge.requests_to("/workspaces/acme/members").len(), 1, "cached for the run");
+    }
+
+    #[test]
+    fn every_write_but_reopen_is_advertised() {
+        let (_forge, pr) = forge_and_client();
+        let w = pr.pr_writes();
+        assert!(!w.reopen);
+        assert!(w.resolve_threads && w.draft && w.close && w.request_reviewer);
     }
 }

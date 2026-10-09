@@ -3,6 +3,7 @@
 use chrono::{DateTime, Utc};
 use forgetop_core::domain::*;
 use forgetop_core::launchpad::{pr_approved_by, pr_changes_requested_by, pr_state, PrBlocker, PrState};
+use forgetop_core::provider::PrWriteSupport;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -18,9 +19,9 @@ use forgetop_core::runlog;
 
 use crate::app::{
     dashboard_target, first_failed_node, gate_stage, is_error_line, last_activity, match_ranges, pipe_definition_name,
-    provider_label, run_secs, waiting_secs, App, ArtifactsPanel, ConfigView, DiffFocus, DiffView, FlatNode, Hit, LogRow,
-    LogView, LpSlot, PipeGroup, PipeHead, PipeLine, PipeRow, PipelineView, PrView, RunHistory, Screen, WiView,
-    LOG_SPLIT_MIN_WIDTH, LOG_TREE_WIDTH, PR_TABS, TABS,
+    pr_life, provider_label, run_secs, waiting_secs, App, ArtifactsPanel, ConfigView, DiffFocus, DiffView, FlatNode, Hit,
+    LogRow, LogView, LpSlot, PipeGroup, PipeHead, PipeLine, PipeRow, PipelineView, PrLife, PrView, RunHistory, Screen,
+    WiView, LOG_SPLIT_MIN_WIDTH, LOG_TREE_WIDTH, PR_TABS, TABS,
 };
 use crate::diff::{cursor_line_label, pending_marks};
 use crate::highlight::{lang_for, HlKind, LineHighlighter};
@@ -1332,7 +1333,9 @@ fn checks_clause(pr: &PullRequest) -> Option<String> {
 
 /// The one-line verdict shown under the PR header: where this pull request stands, and why.
 /// Rendered from [`pr_state`], so it agrees with the list's State column and the Command Center.
-fn pr_state_line(theme: &Theme, pr: &PullRequest) -> Line<'static> {
+/// A draft or closed PR also names the key that moves it on, where the connection has one
+/// (`writes`) — the verdict is where the user looks for what to do next.
+fn pr_state_line(theme: &Theme, pr: &PullRequest, writes: PrWriteSupport) -> Line<'static> {
     let target = || pr.target_ref.clone().unwrap_or_else(|| "the target branch".into());
     let who = |u: Option<&forgetop_core::domain::User>| u.map(|u| format!(" by {}", u.display_name)).unwrap_or_default();
     let (glyph, text, color) = match pr_state(pr) {
@@ -1341,7 +1344,9 @@ fn pr_state_line(theme: &Theme, pr: &PullRequest) -> Line<'static> {
             let when = if age == "—" { String::new() } else { format!(" {age} ago") };
             ("✦", format!("Merged into {}{when}", target()), theme.magenta)
         }
+        PrState::Closed if writes.reopen => ("✗", "Closed without merging · X reopens it".into(), theme.red),
         PrState::Closed => ("✗", "Closed without merging".into(), theme.red),
+        PrState::Draft if writes.draft => ("◌", "Draft — not open for review yet · D marks it ready for review".into(), theme.dim),
         PrState::Draft => ("◌", "Draft — not open for review yet".into(), theme.dim),
         PrState::Blocked(PrBlocker::Conflicting) => ("⚠", format!("Blocked — conflicts with {}", target()), theme.yellow),
         PrState::Blocked(PrBlocker::ChangesRequested) => (
@@ -2260,17 +2265,29 @@ fn pr_tabs_line(theme: &Theme, view: &PrView) -> Line<'static> {
 }
 
 /// A reviewer's vote as a coloured glyph: green ✓ approved, red ✗ changes requested,
-/// yellow … waiting, dim · not yet voted.
+/// yellow … waiting, dim ◌ asked but not yet voted.
 fn review_glyph(theme: &Theme, vote: ReviewVote) -> (&'static str, ratatui::style::Color) {
     match vote {
         ReviewVote::Approved | ReviewVote::ApprovedWithSuggestions => ("✓", theme.green),
         ReviewVote::Rejected => ("✗", theme.red),
         ReviewVote::WaitingForAuthor => ("…", theme.yellow),
-        ReviewVote::NoVote => ("·", theme.dim),
+        ReviewVote::NoVote => ("◌", theme.dim),
     }
 }
 
-fn pr_conversation_lines(theme: &Theme, pr: &PullRequest, threads: &[CommentThread], timeline: &[TimelineEvent]) -> Vec<Line<'static>> {
+/// The Conversation tab: the PR's fields, description, comment threads and activity. `sel` is
+/// the thread cursor (an index into the general threads) and `hint` the keys to show on the
+/// selected thread's first line, right-aligned within `width`. Also returns the line each general
+/// thread starts on, in cursor order, so the caller can work out where it lands once wrapped.
+fn pr_conversation_lines(
+    theme: &Theme,
+    pr: &PullRequest,
+    threads: &[CommentThread],
+    timeline: &[TimelineEvent],
+    sel: Option<usize>,
+    hint: &str,
+    width: usize,
+) -> (Vec<Line<'static>>, Vec<usize>) {
     let mut lines = vec![
         field(theme, "Author", pr.author.display_name.clone()),
         field(theme, "Branch", format!("{} → {}", pr.source_ref.clone().unwrap_or_default(), pr.target_ref.clone().unwrap_or_default())),
@@ -2291,7 +2308,12 @@ fn pr_conversation_lines(theme: &Theme, pr: &PullRequest, threads: &[CommentThre
                 spans.push(Span::styled(", ", Style::default().fg(theme.dim)));
             }
             let (glyph, color) = review_glyph(theme, r.vote);
-            spans.push(Span::styled(format!("{} ({:?}) ", r.user.display_name, r.vote), Style::default().fg(theme.fg)));
+            // No vote yet means asked and waiting — "Requested" says that; "NoVote" doesn't.
+            let vote = match r.vote {
+                ReviewVote::NoVote => "Requested".to_string(),
+                v => format!("{v:?}"),
+            };
+            spans.push(Span::styled(format!("{} ({vote}) ", r.user.display_name), Style::default().fg(theme.fg)));
             spans.push(Span::styled(glyph, Style::default().fg(color)));
         }
         lines.push(Line::from(spans));
@@ -2307,9 +2329,88 @@ fn pr_conversation_lines(theme: &Theme, pr: &PullRequest, threads: &[CommentThre
         lines.push(Line::from(Span::styled("Description", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD))));
         lines.extend(crate::markdown::render(desc, theme, theme.fg));
     }
-    lines.extend(comment_lines(theme, threads));
+    let base = lines.len();
+    let (comments, starts) = pr_comment_lines(theme, threads, sel, hint, width);
+    lines.extend(comments);
     lines.extend(activity_lines(theme, timeline));
-    lines
+    (lines, starts.into_iter().map(|i| base + i).collect())
+}
+
+/// The Conversation tab's Comments section. Each thread opens on its state and who started it
+/// (`● open  Elena Sokolova · 2h`, or a dim `○ resolved …`), its comments beneath, dimmed once
+/// resolved. The general thread at `sel` gets a `▌` bar down its left and `hint` right-aligned
+/// on its first line, when that fits in `width`. Returns the lines and the index of each general
+/// thread's first line, in cursor order.
+fn pr_comment_lines(theme: &Theme, threads: &[CommentThread], sel: Option<usize>, hint: &str, width: usize) -> (Vec<Line<'static>>, Vec<usize>) {
+    let total: usize = threads.iter().map(|t| t.comments.len()).sum();
+    let open = threads.iter().filter(|t| !t.is_resolved).count();
+    let mut heading = vec![Span::styled(format!("Comments ({total})"), Style::default().fg(theme.accent).add_modifier(Modifier::BOLD))];
+    if open > 0 {
+        heading.push(Span::styled(format!(" · {open} open"), Style::default().fg(theme.yellow).add_modifier(Modifier::BOLD)));
+    }
+    if total == 0 {
+        heading.push(Span::styled("   No comments.", Style::default().fg(theme.dim)));
+    }
+    let mut lines = vec![Line::from(""), Line::from(heading)];
+    let mut starts = Vec::new();
+    for thread in threads {
+        let general = thread.file_path.is_none();
+        let selected = general && sel == Some(starts.len());
+        if general {
+            starts.push(lines.len());
+        }
+        let bar = || if selected { Span::styled("▌ ", Style::default().fg(theme.accent)) } else { Span::raw("  ") };
+        let body_fg = if thread.is_resolved { theme.dim } else { theme.fg };
+        let first = thread.comments.first();
+        let author = first.map(|c| c.author.display_name.clone()).unwrap_or_else(|| "—".into());
+        let (glyph, word, glyph_fg, word_fg) =
+            if thread.is_resolved { ("○", "resolved", theme.dim, theme.dim) } else { ("●", "open", theme.yellow, theme.fg) };
+        let mut head = vec![
+            bar(),
+            Span::styled(glyph, Style::default().fg(glyph_fg)),
+            Span::styled(format!(" {word}  "), Style::default().fg(word_fg).add_modifier(Modifier::BOLD)),
+            Span::styled(author, Style::default().fg(theme.blue)),
+        ];
+        let age = rel_age(first.and_then(|c| c.created_at));
+        if age != "—" {
+            head.push(Span::styled(format!(" · {age}"), Style::default().fg(theme.dim)));
+        }
+        // A line comment listed here too says where it lives; the Diff tab is where it's acted on.
+        if let Some(path) = &thread.file_path {
+            let at = thread.line.map(|l| format!(":{l}")).unwrap_or_default();
+            head.push(Span::styled(format!(" · {path}{at}"), Style::default().fg(theme.dim)));
+        }
+        if selected && !hint.is_empty() {
+            let used: usize = head.iter().map(|s| s.content.chars().count()).sum();
+            let hint_w = hint.chars().count();
+            // Never wrap the first line for the hint: the cursor's scroll-follow counts rows.
+            if used + 3 + hint_w <= width {
+                head.push(Span::raw(" ".repeat(width - used - hint_w)));
+                head.push(Span::styled(hint.to_string(), Style::default().fg(theme.accent)));
+            }
+        }
+        lines.push(Line::from(head));
+        for (i, c) in thread.comments.iter().enumerate() {
+            // The first comment's author is on the thread's first line already.
+            if i > 0 {
+                lines.push(Line::from(vec![bar(), Span::styled(format!("{}:", c.author.display_name), Style::default().fg(theme.blue))]));
+            }
+            for l in c.body.lines() {
+                lines.push(Line::from(vec![bar(), Span::styled(format!("  {l}"), Style::default().fg(body_fg))]));
+            }
+        }
+    }
+    (lines, starts)
+}
+
+/// The keys that act on the thread under a cursor, as its first line shows them: resolve or
+/// reopen where the connection can, and reply.
+fn thread_hint(resolve: bool, resolved: bool) -> &'static str {
+    match (resolve, resolved) {
+        (true, false) => "R resolve   r reply",
+        (true, true) => "R reopen   r reply",
+        (false, _) => "r reply",
+    }
 }
 
 /// The Commits tab: one line per commit (short sha · message · author · age).
@@ -2381,7 +2482,7 @@ fn render_pr_view(frame: &mut Frame, area: Rect, theme: &Theme, view: &PrView) -
     frame.render_widget(Paragraph::new(header).block(section_block(theme, &view.label)), rows[0]);
 
     // Where this pull request stands — visible from every tab, not just the Checks one.
-    frame.render_widget(Paragraph::new(pr_state_line(theme, &view.pr)), rows[1]);
+    frame.render_widget(Paragraph::new(pr_state_line(theme, &view.pr, view.writes)), rows[1]);
 
     // Sub-tab bar.
     let tabs = pr_tabs_line(theme, view);
@@ -2396,7 +2497,7 @@ fn render_pr_view(frame: &mut Frame, area: Rect, theme: &Theme, view: &PrView) -
 
     // Content.
     if view.tab == 3 {
-        render_diff(frame, rows[3], theme, &view.diff, &view.pending);
+        render_diff(frame, rows[3], theme, &view.diff, &view.pending, view.can_resolve());
         return 0; // the Diff tab manages its own scrolling
     }
     // Commits: a row cursor (Enter drills into that commit's diff), scroll follows it.
@@ -2411,13 +2512,43 @@ fn render_pr_view(frame: &mut Frame, area: Rect, theme: &Theme, view: &PrView) -
         return 0;
     }
     let (title, lines) = match view.tab {
-        0 => ("Conversation", pr_conversation_lines(theme, &view.pr, &view.diff.threads, &view.timeline)),
+        0 => {
+            let inner_w = rows[3].width.saturating_sub(2);
+            let hint = view.conv_thread().map_or("", |t| thread_hint(view.can_resolve_thread(t), t.is_resolved));
+            let (lines, starts) =
+                pr_conversation_lines(theme, &view.pr, &view.diff.threads, &view.timeline, view.conv_sel, hint, inner_w as usize);
+            record_conv_layout(view, &lines, &starts, inner_w, rows[3].height.saturating_sub(2));
+            ("Conversation", lines)
+        }
         _ => ("Checks", pr_checks_lines(theme, &view.checks)),
     };
     let para = Paragraph::new(lines).block(section_block(theme, title)).wrap(Wrap { trim: false });
     let max = wrapped_scroll_max(&para, rows[3]);
     frame.render_widget(para.scroll((view.scroll.min(max), 0)), rows[3]);
     max
+}
+
+/// Records where each general thread landed once the Conversation's lines wrap to `width`, and
+/// how many rows the pane shows, for the thread cursor's scroll-follow (see
+/// [`PrView::conv_layout`]). Lines wrap independently, so each one's row count adds up.
+fn record_conv_layout(view: &PrView, lines: &[Line<'static>], starts: &[usize], width: u16, height: u16) {
+    let mut rows = Vec::with_capacity(starts.len());
+    let mut row: u16 = 0;
+    let mut next = starts.iter().peekable();
+    for (i, line) in lines.iter().enumerate() {
+        if next.peek().is_none() {
+            break;
+        }
+        while next.peek() == Some(&&i) {
+            rows.push(row);
+            next.next();
+        }
+        let n = Paragraph::new(line.clone()).wrap(Wrap { trim: false }).line_count(width);
+        row = row.saturating_add(u16::try_from(n).unwrap_or(u16::MAX));
+    }
+    let mut layout = view.conv_layout.borrow_mut();
+    layout.rows = rows;
+    layout.height = height;
 }
 
 /// How far a wrapped, bordered pane can scroll: the rows its lines take once wrapped to the
@@ -2529,11 +2660,20 @@ fn base_footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
         return vec![("←→", "columns"), ("↵", "open"), ("D", "dismiss"), ("r", "refresh"), ("?", "help"), ("Ctrl-C", "quit")];
     }
     if let Screen::PrView(v) = &app.screen {
-        // A merged PR only offers Revert; an open one offers approve / (reject) / merge.
-        let merged = v.pr.status == PullRequestStatus::Merged;
-        let acts: Vec<(&'static str, &'static str)> = if merged { vec![("R", "revert")] } else { vec![("a", "approve"), ("m", "merge")] };
-        let acts_full: Vec<(&'static str, &'static str)> =
-            if merged { vec![("R", "revert")] } else { vec![("a", "approve"), ("x", "reject"), ("m", "merge")] };
+        // What the PR's state allows (approve / merge, ready for review, reopen, revert…), the
+        // same on every tab; then, where a cursor sits on a thread, what acts on that thread.
+        let acts = pr_state_keys(v);
+        let thread_keys: Vec<(&'static str, &'static str)> = match v.focused_thread() {
+            Some(t) => {
+                let mut keys = Vec::new();
+                if v.can_resolve_thread(t) {
+                    keys.push(("R", if t.is_resolved { "reopen" } else { "resolve" }));
+                }
+                keys.push(("r", "reply"));
+                keys
+            }
+            None => Vec::new(),
+        };
         let searchable = v.diff.files.len() > 1;
         return if v.tab == 3 && v.diff.search_input.is_some() {
             // The `/` prompt takes every key, so the rest of the glossary would be a lie.
@@ -2548,7 +2688,8 @@ fn base_footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
                         keys.push(("-", "fold"));
                     }
                 }
-                keys.extend([("v", "mark viewed"), ("]/[", "threads"), ("c", "comment"), ("r", "reply")]);
+                keys.extend([("v", "mark viewed"), ("]/[", "threads"), ("c", "comment")]);
+                keys.extend(thread_keys);
                 if !v.pending.is_empty() {
                     keys.push(("s", "submit review"));
                 }
@@ -2577,10 +2718,22 @@ fn base_footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
             keys.extend(acts);
             keys.extend([("o", "open"), ("Esc", "back")]);
             keys
+        } else if v.tab == 0 {
+            // The selected thread's keys lead, beside the arrows that chose it, so a footer
+            // clipped on a narrow terminal still says what R and r will do.
+            let mut keys = vec![("←→", "tabs")];
+            if v.general_threads().next().is_some() {
+                keys.push(("↑↓", "thread"));
+            }
+            keys.extend(thread_keys);
+            keys.push(("PgUp/Dn", "scroll"));
+            keys.extend(acts);
+            keys.extend([("c", "comment"), ("o", "open"), ("Esc", "back")]);
+            keys
         } else {
             let mut keys = vec![("←→", "tabs"), ("PgUp/Dn", "scroll")];
-            keys.extend(acts_full);
-            keys.extend([("c", "comment"), ("r", "reply"), ("o", "open"), ("Esc", "back")]);
+            keys.extend(acts);
+            keys.extend([("c", "comment"), ("o", "open"), ("Esc", "back")]);
             keys
         };
     }
@@ -2802,7 +2955,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         && app.wizard.is_none();
     for (key, label) in footer_keys(app) {
         let search = key == SEARCH_KEY;
-        let chip = if search || (item_open && is_write_action(label)) { theme.yellow } else { theme.accent };
+        let chip = if search || (item_open && is_write_action(key, label)) { theme.yellow } else { theme.accent };
         spans.push(Span::styled(format!(" {key} "), bar.fg(theme.bg).bg(chip).add_modifier(Modifier::BOLD)));
         spans.push(Span::styled(format!(" {label}  "), bar.fg(if search { theme.yellow } else { theme.fg })));
     }
@@ -2844,13 +2997,49 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-/// Footer labels for the keys that write to the provider, as the item views name them.
-fn is_write_action(label: &str) -> bool {
+/// The PR view's state keys: approve / reject / merge, to draft and close on an open PR; ready
+/// for review on a draft; reopen on a closed one; revert on a merged one. `D`, `X` and `@` only
+/// where the connection can do them (see [`PrView::writes`]).
+fn pr_state_keys(v: &PrView) -> Vec<(&'static str, &'static str)> {
+    let w = v.writes;
+    let life = pr_life(&v.pr);
+    let mut keys = Vec::new();
+    match life {
+        PrLife::Merged => keys.push(("R", "revert")),
+        PrLife::Closed => {
+            if w.reopen {
+                keys.push(("X", "reopen"));
+            }
+        }
+        PrLife::Draft => {
+            if w.draft {
+                keys.push(("D", "ready for review"));
+            }
+        }
+        PrLife::Open => {
+            keys.extend([("a", "approve"), ("x", "reject"), ("m", "merge")]);
+            if w.draft {
+                keys.push(("D", "to draft"));
+            }
+            if w.close {
+                keys.push(("X", "close"));
+            }
+        }
+    }
+    if w.request_reviewer && matches!(life, PrLife::Open | PrLife::Draft) {
+        keys.push(("@", "request review"));
+    }
+    keys
+}
+
+/// Footer keys that write to the provider, as the item views name them. Keyed on the key as
+/// well as the label where a label alone is ambiguous (`Esc close` only closes a panel).
+fn is_write_action(key: &str, label: &str) -> bool {
     matches!(
         label,
         "approve" | "reject" | "merge" | "revert" | "comment" | "reply" | "submit review" | "update state" | "assign" | "edit"
-            | "trigger" | "cancel" | "rerun" | "rerun failed"
-    )
+            | "trigger" | "cancel" | "rerun" | "rerun failed" | "resolve" | "ready for review" | "to draft" | "request review"
+    ) || matches!((key, label), ("X", "close") | ("X" | "R", "reopen"))
 }
 
 // ---- diff view ----
@@ -2865,11 +3054,12 @@ fn kind_badge(theme: &Theme, kind: FileChangeKind) -> Span<'static> {
     Span::styled(letter, Style::default().fg(color).add_modifier(Modifier::BOLD))
 }
 
-fn render_diff(frame: &mut Frame, area: Rect, theme: &Theme, diff: &DiffView, pending: &[LineComment]) {
+/// `resolve` is whether `R` resolves a thread here, for the hint on the one under the cursor.
+fn render_diff(frame: &mut Frame, area: Rect, theme: &Theme, diff: &DiffView, pending: &[LineComment], resolve: bool) {
     // A single file leaves nothing to pick: the patch takes the whole width, and its title
     // carries what the file list would have (the path, the counts, whether it's reviewed).
     if diff.files.len() == 1 {
-        render_diff_patch(frame, area, theme, diff, pending);
+        render_diff_patch(frame, area, theme, diff, pending, resolve);
         return;
     }
     // File list on the left; the patch on the right renders comment threads inline,
@@ -2885,7 +3075,7 @@ fn render_diff(frame: &mut Frame, area: Rect, theme: &Theme, diff: &DiffView, pe
     // With the cursor on a folder, the right-hand side sums the folder up instead.
     match diff.cursor_dir() {
         Some(dir) => render_diff_folder(frame, cols[1], theme, diff, &dir),
-        None => render_diff_patch(frame, cols[1], theme, diff, pending),
+        None => render_diff_patch(frame, cols[1], theme, diff, pending, resolve),
     }
 }
 
@@ -3186,7 +3376,7 @@ fn render_diff_folder(frame: &mut Frame, area: Rect, theme: &Theme, diff: &DiffV
     hit(area, Hit::DiffPatch);
 }
 
-fn render_diff_patch(frame: &mut Frame, area: Rect, theme: &Theme, diff: &DiffView, pending: &[LineComment]) {
+fn render_diff_patch(frame: &mut Frame, area: Rect, theme: &Theme, diff: &DiffView, pending: &[LineComment], resolve: bool) {
     use crate::app::ContextText;
     let Some(file) = diff.current() else {
         frame.render_widget(section_block(theme, "Patch"), area);
@@ -3354,11 +3544,10 @@ fn render_diff_patch(frame: &mut Frame, area: Rect, theme: &Theme, diff: &DiffVi
             lines.push(line);
         }
         if let Some(ts) = threads_at.get(&i) {
+            // The thread `R` / `r` would act on: the first one on the cursor's line.
+            let target = if patch_focus && i == diff.cursor { diff.thread_at_cursor().map(|t| t.id.as_str()) } else { None };
             for &t in ts {
-                let (glyph, state) = if t.is_resolved { ("○", "resolved") } else { ("●", "open") };
-                let border = if t.is_resolved { theme.dim } else { theme.accent };
-                let bodies: Vec<String> = t.comments.iter().map(|c| format!("{}: {}", c.author.display_name, c.body)).collect();
-                lines.extend(inline_box(theme, border, &format!("{glyph} {state}"), &bodies, inner_w));
+                lines.extend(thread_box(theme, t, target == Some(t.id.as_str()), resolve, inner_w));
             }
         }
         if let Some(ps) = pending_at.get(&i) {
@@ -3414,38 +3603,78 @@ fn wrap_words(s: &str, width: usize) -> Vec<String> {
 /// background-filled box shown inline beneath its diff line, so it's clearly distinct from
 /// the code. `header` is the state line; `bodies` are the comment texts (`author: body`).
 fn inline_box(theme: &Theme, border: ratatui::style::Color, header: &str, bodies: &[String], width: usize) -> Vec<Line<'static>> {
+    let head = vec![Span::styled(header.to_string(), Style::default().fg(border).bg(theme.panel).add_modifier(Modifier::BOLD))];
+    boxed(theme, border, head, None, bodies, theme.fg, width, false)
+}
+
+/// An existing thread beneath its diff line: `● open · N comments` (amber dot) or a dim
+/// `○ resolved` over its comments, which dim too once it's resolved. The thread under the
+/// cursor gets a `▌` bar down its left and the keys that act on it right-aligned on its first
+/// line, so what `R` and `r` will touch is never a guess.
+fn thread_box(theme: &Theme, t: &CommentThread, selected: bool, resolve: bool, width: usize) -> Vec<Line<'static>> {
     let bg = theme.panel;
-    let indent = "  ";
+    let (border, body_fg) = if t.is_resolved { (theme.dim, theme.dim) } else { (theme.accent, theme.fg) };
+    let head = if t.is_resolved {
+        vec![Span::styled("○ resolved", Style::default().fg(theme.dim).bg(bg).add_modifier(Modifier::BOLD))]
+    } else {
+        let n = t.comments.len();
+        let noun = if n == 1 { "comment" } else { "comments" };
+        vec![
+            Span::styled("●", Style::default().fg(theme.yellow).bg(bg).add_modifier(Modifier::BOLD)),
+            Span::styled(format!(" open · {n} {noun}"), Style::default().fg(border).bg(bg).add_modifier(Modifier::BOLD)),
+        ]
+    };
+    let bodies: Vec<String> = t.comments.iter().map(|c| format!("{}: {}", c.author.display_name, c.body)).collect();
+    let hint = selected.then(|| thread_hint(resolve && t.is_resolvable, t.is_resolved));
+    boxed(theme, border, head, hint, &bodies, body_fg, width, selected)
+}
+
+/// The box [`inline_box`] and [`thread_box`] draw: `head` on the first row with `hint`
+/// right-aligned beside it (dropped when it doesn't fit), then the wrapped `bodies` in
+/// `body_fg`. `bar` draws a `▌` down the left in place of the indent, keeping the width.
+#[allow(clippy::too_many_arguments)]
+fn boxed(
+    theme: &Theme,
+    border: ratatui::style::Color,
+    mut head: Vec<Span<'static>>,
+    hint: Option<&str>,
+    bodies: &[String],
+    body_fg: ratatui::style::Color,
+    width: usize,
+    bar: bool,
+) -> Vec<Line<'static>> {
+    let bg = theme.panel;
+    let indent = || if bar { Span::styled("▌ ", Style::default().fg(theme.accent)) } else { Span::raw("  ") };
     let box_w = width.saturating_sub(3).max(20); // leaves a small right margin
     let content_w = box_w.saturating_sub(4); // inside "│ " … " │"
     let frame = |style: Style| style.fg(border).bg(bg);
+    let span_w = |spans: &[Span<'static>]| spans.iter().map(|s| s.content.chars().count()).sum::<usize>();
 
-    // Inner content rows (each a single styled string): a header, then wrapped comments.
-    let mut rows: Vec<Span<'static>> = vec![Span::styled(header.to_string(), frame(Style::default()).add_modifier(Modifier::BOLD))];
+    if let Some(hint) = hint {
+        let (used, hint_w) = (span_w(&head), hint.chars().count());
+        if used + 3 + hint_w <= content_w {
+            head.push(Span::styled(" ".repeat(content_w - used - hint_w), Style::default().bg(bg)));
+            head.push(Span::styled(hint.to_string(), Style::default().fg(theme.accent).bg(bg)));
+        }
+    }
+    // Inner content rows: the header, then wrapped comments.
+    let mut rows: Vec<Vec<Span<'static>>> = vec![head];
     for b in bodies {
         for chunk in wrap_words(b, content_w) {
-            rows.push(Span::styled(chunk, Style::default().fg(theme.fg).bg(bg)));
+            rows.push(vec![Span::styled(chunk, Style::default().fg(body_fg).bg(bg))]);
         }
     }
 
     let dashes = "─".repeat(box_w.saturating_sub(2));
-    let mut out = vec![Line::from(vec![
-        Span::raw(indent),
-        Span::styled(format!("╭{dashes}╮"), frame(Style::default())),
-    ])];
+    let mut out = vec![Line::from(vec![indent(), Span::styled(format!("╭{dashes}╮"), frame(Style::default()))])];
     for inner in rows {
-        let fill = content_w.saturating_sub(inner.content.chars().count());
-        out.push(Line::from(vec![
-            Span::raw(indent),
-            Span::styled("│ ", frame(Style::default())),
-            inner,
-            Span::styled(format!("{} │", " ".repeat(fill)), frame(Style::default())),
-        ]));
+        let fill = content_w.saturating_sub(span_w(&inner));
+        let mut line = vec![indent(), Span::styled("│ ", frame(Style::default()))];
+        line.extend(inner);
+        line.push(Span::styled(format!("{} │", " ".repeat(fill)), frame(Style::default())));
+        out.push(Line::from(line));
     }
-    out.push(Line::from(vec![
-        Span::raw(indent),
-        Span::styled(format!("╰{dashes}╯"), frame(Style::default())),
-    ]));
+    out.push(Line::from(vec![indent(), Span::styled(format!("╰{dashes}╯"), frame(Style::default()))]));
     out
 }
 
@@ -5372,7 +5601,13 @@ pub(crate) fn help_sections() -> Vec<(&'static str, Vec<(&'static str, &'static 
                 ("←/→", "Switch sub-tab"),
                 ("a  x", "Approve / request changes"),
                 ("m", "Merge (choose strategy)"),
+                ("D", "Mark a draft ready for review / convert to draft"),
+                ("X", "Close without merging (asks first) / reopen"),
+                ("@", "Request a reviewer (type to search)"),
                 ("c", "Comment (inline on a diff line, else the PR)"),
+                ("r", "Reply to the thread under the cursor"),
+                ("R", "Resolve / reopen that thread (revert, on a merged PR)"),
+                ("↑/↓ (Conversation)", "Move between comment threads"),
                 ("Enter (Commits)", "Drill into that commit's diff"),
                 ("Enter (Diff file)", "Line cursor in the patch"),
                 ("Enter (Diff folder)", "Fold / unfold the folder"),
@@ -5795,6 +6030,9 @@ mod tests {
             pending: vec![],
             review_draft: None,
             reply_target: None,
+            writes: PrWriteSupport::default(),
+            conv_sel: None,
+            conv_layout: Default::default(),
         }
     }
 
@@ -5909,7 +6147,7 @@ mod tests {
 
             // Compare wording, not spacing: the terminal pads the glyph with two columns while
             // the dashboard uses a CSS gap. Both are right for their medium.
-            let line = pr_state_line(&theme, &pr);
+            let line = pr_state_line(&theme, &pr, PrWriteSupport::default());
             let raw: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
             let rendered = raw.split_whitespace().collect::<Vec<_>>().join(" ");
             assert_eq!(rendered, g("expect"), "case: {}", g("name"));
@@ -6018,6 +6256,7 @@ mod tests {
             file_path: Some("a.rs".into()),
             line: Some(1),
             is_resolved: false,
+            is_resolvable: true,
         }];
         let mut app = App::new("slate");
         app.screen = Screen::PrView(Box::new(view));
@@ -6173,8 +6412,8 @@ mod tests {
             d.folder = Some("src".into());
             d.viewed.insert("src/b.rs".into());
             d.threads = vec![
-                CommentThread { id: "t1".into(), comments: vec![], file_path: Some("src/a.rs".into()), line: Some(1), is_resolved: false },
-                CommentThread { id: "t2".into(), comments: vec![], file_path: Some("src/b.rs".into()), line: Some(1), is_resolved: true },
+                CommentThread { id: "t1".into(), comments: vec![], file_path: Some("src/a.rs".into()), line: Some(1), is_resolved: false, is_resolvable: true },
+                CommentThread { id: "t2".into(), comments: vec![], file_path: Some("src/b.rs".into()), line: Some(1), is_resolved: true, is_resolvable: true },
             ];
         });
         let out = rows.join("\n");
@@ -6302,7 +6541,7 @@ mod tests {
             Reviewer { user: who("Priya Nair"), vote: ReviewVote::Approved, is_required: true },
             Reviewer { user: who("Marcus Lee"), vote: ReviewVote::Rejected, is_required: false },
         ];
-        let lines = pr_conversation_lines(&theme, &pr, &[], &[]);
+        let (lines, _) = pr_conversation_lines(&theme, &pr, &[], &[], None, "", 100);
 
         let green_tick = lines.iter().any(|l| l.spans.iter().any(|s| s.content.as_ref() == "✓" && s.style.fg == Some(theme.green)));
         let red_cross = lines.iter().any(|l| l.spans.iter().any(|s| s.content.as_ref() == "✗" && s.style.fg == Some(theme.red)));
@@ -9237,5 +9476,209 @@ mod tests {
         let Screen::PrView(v) = &mut app.screen else { unreachable!() };
         v.diff.expanded.insert(("b.rs".into(), None, 0), (9, 0));
         assert!(keys(&app).contains(&("-", "fold")), "once it's open");
+    }
+
+    // ---- PR writes: resolve, draft / close, reviewers ----
+
+    fn pr_thread(id: &str, path: Option<&str>, resolved: bool) -> CommentThread {
+        CommentThread {
+            id: id.into(),
+            comments: vec![Comment {
+                id: format!("{id}-c"),
+                author: User { id: "u".into(), display_name: "Elena Sokolova".into(), handle: None, avatar_url: None },
+                body: "cap the backoff here".into(),
+                created_at: None,
+            }],
+            file_path: path.map(str::to_string),
+            line: path.map(|_| 1),
+            is_resolved: resolved,
+            is_resolvable: true,
+        }
+    }
+
+    /// The Diff tab's patch with one thread on `a.rs` line 1 — patch row 1; row 2 has none.
+    fn patch_view_with_thread(resolved: bool, cursor: usize) -> PrView {
+        let file = FileChange {
+            path: "a.rs".into(),
+            kind: FileChangeKind::Added,
+            additions: 2,
+            deletions: 0,
+            patch: Some("@@ -0,0 +1,2 @@\n+let n = 5;\n+// done".into()),
+        };
+        let mut view = pr_view(3, vec![], vec![file]);
+        view.diff.focus = DiffFocus::Patch;
+        view.diff.cursor = cursor;
+        view.diff.threads = vec![pr_thread("t1", Some("a.rs"), resolved)];
+        view.writes = PrWriteSupport::ALL;
+        view
+    }
+
+    fn footer_of(view: PrView) -> Vec<(&'static str, &'static str)> {
+        let mut app = App::new("slate");
+        app.screen = Screen::PrView(Box::new(view));
+        base_footer_keys(&app)
+    }
+
+    fn has_key(keys: &[(&'static str, &'static str)], key: &str) -> bool {
+        keys.iter().any(|(k, _)| *k == key)
+    }
+
+    #[test]
+    fn resolve_and_reply_show_on_the_patch_footer_only_with_the_cursor_on_a_thread() {
+        let off = footer_of(patch_view_with_thread(false, 2));
+        assert!(!has_key(&off, "R") && !has_key(&off, "r"), "no thread under the cursor, nothing to resolve or reply to: {off:?}");
+
+        let on = footer_of(patch_view_with_thread(false, 1));
+        assert!(on.contains(&("R", "resolve")) && on.contains(&("r", "reply")), "{on:?}");
+
+        let resolved = footer_of(patch_view_with_thread(true, 1));
+        assert!(resolved.contains(&("R", "reopen")), "a resolved thread reopens: {resolved:?}");
+
+        let mut unsupported = patch_view_with_thread(false, 1);
+        unsupported.writes = PrWriteSupport::default();
+        let keys = footer_of(unsupported);
+        assert!(!has_key(&keys, "R") && keys.contains(&("r", "reply")), "no resolve where the forge can't: {keys:?}");
+
+        let mut merged = patch_view_with_thread(false, 1);
+        merged.pr.status = PullRequestStatus::Merged;
+        assert!(!footer_of(merged).contains(&("R", "resolve")), "on a merged PR R stays revert");
+    }
+
+    #[test]
+    fn the_footer_offers_the_keys_for_the_state_the_pr_is_in() {
+        let view = |status: PullRequestStatus, writes: PrWriteSupport| {
+            let mut v = pr_view(0, vec![], vec![]);
+            v.pr.status = status;
+            v.pr.is_draft = status == PullRequestStatus::Draft;
+            v.writes = writes;
+            v
+        };
+        let all = PrWriteSupport::ALL;
+
+        let draft = footer_of(view(PullRequestStatus::Draft, all));
+        assert!(draft.contains(&("D", "ready for review")), "{draft:?}");
+        for gone in ["a", "x", "m", "X"] {
+            assert!(!has_key(&draft, gone), "a draft isn't up for {gone}: {draft:?}");
+        }
+
+        let open = footer_of(view(PullRequestStatus::Open, all));
+        for want in [("a", "approve"), ("x", "reject"), ("m", "merge"), ("D", "to draft"), ("X", "close"), ("@", "request review")] {
+            assert!(open.contains(&want), "an open PR offers {want:?}: {open:?}");
+        }
+
+        let closed = footer_of(view(PullRequestStatus::Closed, all));
+        assert!(closed.contains(&("X", "reopen")), "{closed:?}");
+        for gone in ["a", "m", "D", "@"] {
+            assert!(!has_key(&closed, gone), "a closed PR has no {gone}: {closed:?}");
+        }
+
+        let merged = footer_of(view(PullRequestStatus::Merged, all));
+        assert!(merged.contains(&("R", "revert")) && !has_key(&merged, "D") && !has_key(&merged, "X"), "{merged:?}");
+
+        // Nothing the connection can't do — and no resolve, even on a selected thread.
+        for status in [PullRequestStatus::Open, PullRequestStatus::Draft, PullRequestStatus::Closed] {
+            let mut v = view(status, PrWriteSupport::default());
+            v.diff.threads = vec![pr_thread("g1", None, false)];
+            v.conv_sel = Some(0);
+            let keys = footer_of(v);
+            for gone in ["D", "X", "R", "@"] {
+                assert!(!has_key(&keys, gone), "{status:?} offers {gone} without support: {keys:?}");
+            }
+            assert!(keys.contains(&("r", "reply")), "replying needs no support flag");
+        }
+    }
+
+    #[test]
+    fn the_conversation_footer_offers_thread_keys_only_with_a_thread_selected() {
+        let mut v = pr_view(0, vec![], vec![]);
+        v.writes = PrWriteSupport::ALL;
+        v.diff.threads = vec![pr_thread("g1", None, false)];
+        let keys = footer_of(v);
+        assert!(keys.contains(&("↑↓", "thread")), "{keys:?}");
+        assert!(!has_key(&keys, "R") && !has_key(&keys, "r"), "nothing selected yet: {keys:?}");
+
+        let mut v = pr_view(0, vec![], vec![]);
+        v.writes = PrWriteSupport::ALL;
+        v.diff.threads = vec![pr_thread("g1", None, true)];
+        v.conv_sel = Some(0);
+        let keys = footer_of(v);
+        assert!(keys.contains(&("R", "reopen")) && keys.contains(&("r", "reply")), "{keys:?}");
+    }
+
+    #[test]
+    fn a_thread_the_forge_cannot_resolve_offers_reply_but_not_resolve() {
+        let mut v = pr_view(0, vec![], vec![]);
+        v.writes = PrWriteSupport::ALL;
+        let mut bundled = pr_thread("pr-7", None, false);
+        bundled.is_resolvable = false;
+        v.diff.threads = vec![bundled];
+        v.conv_sel = Some(0);
+        let keys = footer_of(v);
+        assert!(keys.contains(&("r", "reply")), "{keys:?}");
+        assert!(!has_key(&keys, "R"), "GitHub's bundled conversation has no resolved state: {keys:?}");
+    }
+
+    #[test]
+    fn the_banner_names_the_key_that_moves_a_draft_or_closed_pr_on_only_when_supported() {
+        let theme = Theme::by_name("slate");
+        let text = |pr: &PullRequest, w: PrWriteSupport| pr_state_line(&theme, pr, w).spans.iter().map(|s| s.content.to_string()).collect::<String>();
+        let mut pr = sample_pr();
+        pr.status = PullRequestStatus::Draft;
+        pr.is_draft = true;
+        assert!(text(&pr, PrWriteSupport::ALL).contains("Draft — not open for review yet · D marks it ready for review"));
+        assert!(!text(&pr, PrWriteSupport::default()).contains("D marks"), "no key the forge can't honour");
+        pr.status = PullRequestStatus::Closed;
+        pr.is_draft = false;
+        assert!(text(&pr, PrWriteSupport::ALL).contains("X reopens it"));
+        assert!(!text(&pr, PrWriteSupport { reopen: false, ..PrWriteSupport::ALL }).contains("X reopens"));
+    }
+
+    #[test]
+    fn the_diff_thread_box_shows_its_state_and_the_keys_under_the_cursor() {
+        let mut app = App::new("slate");
+        app.screen = Screen::PrView(Box::new(patch_view_with_thread(false, 1)));
+        let out = render_to_string(&mut app, 150, 24);
+        assert!(out.contains("● open · 1 comment"), "the state line counts the comments");
+        assert!(out.contains("R resolve   r reply"), "the keys sit on the selected thread's first line");
+        assert!(out.contains("▌"), "a bar marks the selected thread");
+
+        app.screen = Screen::PrView(Box::new(patch_view_with_thread(false, 2)));
+        let out = render_to_string(&mut app, 150, 24);
+        assert!(!out.contains("R resolve") && !out.contains("▌"), "nothing selected, no keys and no bar");
+
+        app.screen = Screen::PrView(Box::new(patch_view_with_thread(true, 1)));
+        let out = render_to_string(&mut app, 150, 24);
+        assert!(out.contains("○ resolved") && out.contains("R reopen   r reply"));
+    }
+
+    #[test]
+    fn the_conversation_marks_the_selected_thread_and_counts_the_open_ones() {
+        let mut v = pr_view(0, vec![], vec![]);
+        v.writes = PrWriteSupport::ALL;
+        v.diff.threads = vec![pr_thread("g1", None, false), pr_thread("f1", Some("a.rs"), false), pr_thread("g2", None, true)];
+        v.conv_sel = Some(1);
+        let mut app = App::new("slate");
+        app.screen = Screen::PrView(Box::new(v));
+        let out = render_to_string(&mut app, 140, 60);
+        assert!(out.contains("Comments (3) · 2 open"), "the heading counts open threads");
+        assert!(out.contains("○ resolved  Elena Sokolova"), "a thread opens on its state and author");
+        assert!(out.contains("R reopen   r reply"), "the selected (resolved) thread carries its keys");
+        assert!(out.contains("▌"), "and a bar");
+        let Screen::PrView(v) = &app.screen else { unreachable!() };
+        assert_eq!(v.conv_layout.borrow().rows.len(), 2, "where both general threads landed, for the scroll-follow");
+    }
+
+    #[test]
+    fn help_lists_the_pr_write_keys() {
+        let pr_view = help_sections().into_iter().find(|(s, _)| *s == "PR view (after Enter)").expect("PR view help").1;
+        for key in ["R", "D", "X", "@", "r"] {
+            assert!(pr_view.iter().any(|(k, _)| *k == key), "help documents {key}");
+        }
+        let mut app = App::new("slate");
+        app.overlay = Some(Overlay::Help { scroll: 0 });
+        let out = render_to_string(&mut app, 120, 200);
+        for text in ["Resolve / reopen that thread", "ready for review", "Close without merging", "Request a reviewer"] {
+            assert!(out.contains(text), "help shows '{text}'");
+        }
     }
 }

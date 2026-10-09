@@ -17,6 +17,15 @@ pub enum Action {
     PrComment(String),
     /// Reply (body) to the thread stashed on the PR view's `reply_target`.
     PrReply(String),
+    /// Resolve (`resolved`) or reopen a comment thread on the open PR.
+    PrResolveThread { thread_id: String, resolved: bool },
+    /// Convert the open PR to a draft (`true`) or mark it ready for review (`false`).
+    PrSetDraft(bool),
+    /// Close the open PR without merging (`true`) or reopen it (`false`).
+    PrSetClosed(bool),
+    /// Ask the user with this id to review the open PR. `None` is someone already reviewing —
+    /// the app says so and keeps the picker. `label` is the row as shown.
+    PrRequestReviewer { id: Option<String>, label: String },
     WiSetState(String),
     WiComment(String),
     /// Assign the open work item to the user with this id (`None` = unassign). `label` is the
@@ -98,6 +107,8 @@ pub enum SearchKind {
     /// The open work item's assignee. `me` indexes the signed-in user's row, when this
     /// connection can say who that is, so `@` assigns you without typing.
     Assignee { me: Option<usize> },
+    /// Someone to ask to review the open PR. Rows already reviewing carry no id.
+    Reviewer,
 }
 
 /// What a [`Overlay::Toggle`] checklist is choosing.
@@ -212,6 +223,8 @@ impl Overlay {
     /// Footer hint shown while this overlay is open.
     pub fn hint(&self) -> Vec<(&'static str, &'static str)> {
         match self {
+            // Closing says what Esc keeps, since "cancel" next to "close" reads both ways.
+            Overlay::Confirm { action: Action::PrSetClosed(true), .. } => vec![("↵", "close"), ("Esc", "keep open")],
             Overlay::Confirm { .. } => vec![("y", "confirm"), ("Esc", "cancel")],
             Overlay::Picker { .. } => vec![("↑↓", "choose"), ("↵", "select"), ("Esc", "cancel")],
             Overlay::Input { .. } => vec![("Esc", "cancel"), ("↵", "submit")],
@@ -227,6 +240,10 @@ impl Overlay {
                 }
                 keys.push(("Esc", "cancel"));
                 keys
+            }
+            // No "@ me": asking yourself to review isn't a thing.
+            Overlay::Search { kind: SearchKind::Reviewer, .. } => {
+                vec![("type", "search"), ("↑↓", "choose"), ("↵", "request"), ("Esc", "cancel")]
             }
             Overlay::Help { .. } => vec![("↑↓", "scroll"), ("Esc", "close")],
             Overlay::Palette { .. } => {
@@ -357,7 +374,7 @@ impl Overlay {
                             Some(item) => Outcome::Submit(resolve_search(kind, item)),
                             None => Outcome::Keep,
                         },
-                        SearchKind::Assignee { me: None } => Outcome::Keep,
+                        SearchKind::Assignee { me: None } | SearchKind::Reviewer => Outcome::Keep,
                     },
                     Key::Char(c) => {
                         query.push(c);
@@ -513,6 +530,7 @@ fn resolve_input(kind: InputKind, text: String) -> Action {
 fn resolve_search(kind: &SearchKind, item: &SearchItem) -> Action {
     match kind {
         SearchKind::Assignee { .. } => Action::WiAssign { id: item.id.clone(), label: item.label.clone() },
+        SearchKind::Reviewer => Action::PrRequestReviewer { id: item.id.clone(), label: item.label.clone() },
     }
 }
 

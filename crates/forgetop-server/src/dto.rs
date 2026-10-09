@@ -10,8 +10,8 @@ use forgetop_core::domain::{
 use forgetop_core::filter::run_triggered_by;
 use forgetop_core::launchpad::{self, EntryItem, PipeInput, PrInput, WiInput};
 use forgetop_core::provider::{
-    ItemRef, PipelineSource, PrDecoration, PullRequestFilter, PullRequestQuery, PullRequestSource,
-    WorkItemQuery, WorkItemSource,
+    ItemRef, PipelineSource, PrDecoration, PrWriteSupport, PullRequestFilter, PullRequestQuery,
+    PullRequestSource, WorkItemQuery, WorkItemSource,
 };
 use forgetop_core::service::{ConnectionHealthService, SectionService};
 use serde::Serialize;
@@ -422,6 +422,9 @@ pub struct PrDetail {
     /// pane shows your vote and comments as before the provider lists them.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub me: Option<String>,
+    /// Which pull-request writes this connection supports (resolve threads, draft, close/reopen,
+    /// request reviewer) — the pane disables the controls a provider can't perform.
+    pub writes: PrWriteSupport,
 }
 
 /// Resolves the PR source for a connection id (the one the action/detail is scoped to).
@@ -496,6 +499,7 @@ pub async fn pr_detail(sections: &SectionService, conn: &str, item: &ItemRef) ->
             .inspect_err(|_| log_fetch_failure("dashboard.pr_detail.current_user"))
             .ok()
             .flatten(),
+        writes: source.pr_writes(),
     })
 }
 

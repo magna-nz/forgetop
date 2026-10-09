@@ -106,6 +106,55 @@ pub struct PrReviewReq {
 }
 
 #[derive(Deserialize)]
+pub struct PrResolveThreadReq {
+    pub conn: String,
+    pub id: String,
+    /// The item's **connection-relative** repository. Optional: a single-repository connection
+    /// still resolves without it, which is what keeps links written before this change working.
+    #[serde(default)]
+    pub repo: Option<String>,
+    pub thread_id: String,
+    /// `true` resolves the thread, `false` reopens it.
+    pub resolved: bool,
+}
+
+#[derive(Deserialize)]
+pub struct PrDraftReq {
+    pub conn: String,
+    pub id: String,
+    /// The item's **connection-relative** repository. Optional: a single-repository connection
+    /// still resolves without it, which is what keeps links written before this change working.
+    #[serde(default)]
+    pub repo: Option<String>,
+    /// `true` converts to a draft, `false` marks it ready for review.
+    pub draft: bool,
+}
+
+#[derive(Deserialize)]
+pub struct PrClosedReq {
+    pub conn: String,
+    pub id: String,
+    /// The item's **connection-relative** repository. Optional: a single-repository connection
+    /// still resolves without it, which is what keeps links written before this change working.
+    #[serde(default)]
+    pub repo: Option<String>,
+    /// `true` closes without merging, `false` reopens.
+    pub closed: bool,
+}
+
+#[derive(Deserialize)]
+pub struct PrRequestReviewerReq {
+    pub conn: String,
+    pub id: String,
+    /// The item's **connection-relative** repository. Optional: a single-repository connection
+    /// still resolves without it, which is what keeps links written before this change working.
+    #[serde(default)]
+    pub repo: Option<String>,
+    /// The reviewer's id (from the reviewable-users list).
+    pub user_id: String,
+}
+
+#[derive(Deserialize)]
 pub struct WiStateReq {
     pub conn: String,
     pub id: String,
@@ -224,6 +273,32 @@ pub async fn pr_reply(sections: &SectionService, req: PrReplyReq) -> Result<(), 
 pub async fn pr_review(sections: &SectionService, req: PrReviewReq) -> Result<(), ActionError> {
     let source = dto::pr_source(sections, &req.conn).await.ok_or(ActionError::NotFound)?;
     source.submit_review(&ItemRef::maybe(req.repo, req.id), req.event, &req.comments).await.map_err(failed)
+}
+
+pub async fn pr_resolve_thread(sections: &SectionService, req: PrResolveThreadReq) -> Result<(), ActionError> {
+    let source = dto::pr_source(sections, &req.conn).await.ok_or(ActionError::NotFound)?;
+    source.resolve_thread(&ItemRef::maybe(req.repo, req.id), &req.thread_id, req.resolved).await.map_err(failed)
+}
+
+pub async fn pr_set_draft(sections: &SectionService, req: PrDraftReq) -> Result<(), ActionError> {
+    let source = dto::pr_source(sections, &req.conn).await.ok_or(ActionError::NotFound)?;
+    source.set_draft(&ItemRef::maybe(req.repo, req.id), req.draft).await.map_err(failed)
+}
+
+pub async fn pr_set_closed(sections: &SectionService, req: PrClosedReq) -> Result<(), ActionError> {
+    let source = dto::pr_source(sections, &req.conn).await.ok_or(ActionError::NotFound)?;
+    source.set_closed(&ItemRef::maybe(req.repo, req.id), req.closed).await.map_err(failed)
+}
+
+/// The people who can be asked to review a pull request (for the request-reviewer menu).
+pub async fn pr_reviewers(sections: &SectionService, conn: &str, item: &ItemRef) -> Option<Vec<forgetop_core::domain::User>> {
+    let source = dto::pr_source(sections, conn).await?;
+    Some(source.reviewable_users(item).await.unwrap_or_default())
+}
+
+pub async fn pr_request_reviewer(sections: &SectionService, req: PrRequestReviewerReq) -> Result<(), ActionError> {
+    let source = dto::pr_source(sections, &req.conn).await.ok_or(ActionError::NotFound)?;
+    source.request_reviewer(&ItemRef::maybe(req.repo, req.id), &req.user_id).await.map_err(failed)
 }
 
 /// The states a work item can move to (for the transition menu).

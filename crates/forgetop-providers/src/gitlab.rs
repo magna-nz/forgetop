@@ -4,6 +4,7 @@
 //! requests), Issues (work items), and CI pipelines. The project is addressed by
 //! its URL-encoded `group/project` path.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -420,12 +421,19 @@ fn map_note(v: &Value) -> Comment {
     }
 }
 
+/// Whether `thread_id` is the one bundled thread [`notes_to_thread`] makes (`"{prefix}-{iid}"`)
+/// rather than a discussion id. Discussion ids are hex SHAs with no `-`, so the shape is enough:
+/// a bundled thread is every flat note at once and has nothing GitLab can resolve.
+fn is_bundled_thread(thread_id: &str, iid: &str) -> bool {
+    thread_id.rsplit_once('-').is_some_and(|(prefix, id)| !prefix.is_empty() && id == iid)
+}
+
 fn notes_to_thread(prefix: &str, id: &str, notes: &[Value]) -> Vec<CommentThread> {
     let comments: Vec<Comment> = notes.iter().filter(|n| !get_bool(n, "system")).map(map_note).collect();
     if comments.is_empty() {
         vec![]
     } else {
-        vec![CommentThread { id: format!("{prefix}-{id}"), comments, file_path: None, line: None, is_resolved: false }]
+        vec![CommentThread { id: format!("{prefix}-{id}"), comments, file_path: None, line: None, is_resolved: false, is_resolvable: false }]
     }
 }
 
@@ -449,12 +457,42 @@ fn discussions_to_thread(discussions: &[Value]) -> Vec<CommentThread> {
                 file_path,
                 line,
                 is_resolved: visible.iter().any(|n| get_bool(n, "resolved")),
+                is_resolvable: visible.iter().any(|n| get_bool(n, "resolvable")),
             })
         })
         .collect()
 }
 
 // ---- client ----
+
+/// The title prefixes GitLab reads as "this merge request is a draft", lower-cased. GitLab's
+/// update API has no draft flag — the prefix *is* the flag — so changing the draft state means
+/// rewriting the title.
+/// The prefixes GitLab treats as a draft marker. `WIP:` stopped counting in GitLab 15, so it is
+/// neither stripped nor taken as "already a draft".
+const DRAFT_MARKERS: [&str; 3] = ["draft:", "[draft]", "(draft)"];
+
+/// `title` with its draft marker removed, or `None` when it carries none.
+fn strip_draft_marker(title: &str) -> Option<&str> {
+    DRAFT_MARKERS
+        .iter()
+        .find(|m| title.get(..m.len()).is_some_and(|head| head.eq_ignore_ascii_case(m)))
+        .map(|m| title[m.len()..].trim_start())
+}
+
+/// The title that marks a merge request a draft (`draft = true`: `Draft: ` prepended unless any
+/// marker is already there) or ready (`draft = false`: every leading marker stripped, so
+/// `Draft: WIP: x` doesn't stay a draft under the second one).
+pub fn draft_title(title: &str, draft: bool) -> String {
+    if draft {
+        return if strip_draft_marker(title).is_some() { title.to_string() } else { format!("Draft: {title}") };
+    }
+    let mut rest = title;
+    while let Some(stripped) = strip_draft_marker(rest) {
+        rest = stripped;
+    }
+    rest.to_string()
+}
 
 /// GitLab todo `action_name` → our unified kind.
 fn gitlab_action_kind(action: &str) -> NotificationKind {
@@ -510,6 +548,10 @@ pub struct GitLabClient {
     /// a user-chosen scope, not a permission boundary.
     scope: Vec<String>,
     self_username: tokio::sync::Mutex<Option<String>>,
+    /// Each project's members, keyed by connection-relative project path — the reviewer picker's
+    /// list. Fetched on first use and kept for the run: membership changes rarely, and the TUI
+    /// reloads every 30 s, so re-asking would be a call per reload for nothing.
+    reviewable: tokio::sync::Mutex<HashMap<String, Vec<User>>>,
 }
 
 impl GitLabClient {
@@ -584,6 +626,17 @@ impl GitLabClient {
 
     async fn post_json(&self, url: &str, body: Value) -> Result<()> {
         self.send(self.http.post(url).json(&body), &format!("POST {url}")).await
+    }
+
+    async fn put_json(&self, url: &str, body: Value) -> Result<()> {
+        self.send(self.http.put(url).json(&body), &format!("PUT {url}")).await
+    }
+
+    /// Everyone who is a member of `project`, inherited group members included — who an issue
+    /// can be assigned to and who a merge request can be sent to for review.
+    async fn project_members(&self, project: &str) -> Result<Vec<User>> {
+        let v = self.get_json(&self.project_path(project, "/members/all?per_page=100")).await?;
+        Ok(v.as_array().unwrap_or(&vec![]).iter().map(map_user).collect())
     }
 
     /// Like `post_json`, but returns the created resource (a new pipeline).
@@ -858,6 +911,59 @@ impl PullRequestSource for GitLabPr {
         }
         Ok(())
     }
+    fn pr_writes(&self) -> PrWriteSupport {
+        PrWriteSupport::ALL
+    }
+    async fn resolve_thread(&self, item: &ItemRef, thread_id: &str, resolved: bool) -> Result<()> {
+        // Only a discussion resolves; the bundled flat-notes thread is many notes, not one.
+        if is_bundled_thread(thread_id, &item.id) {
+            return Err(Error::Provider("GitLab can only resolve discussions on the diff".into()));
+        }
+        let project = self.0.resolve(item)?;
+        let url = self.0.project_path(&project, &format!("/merge_requests/{}/discussions/{thread_id}", item.id));
+        self.0.put_json(&url, json!({ "resolved": resolved })).await
+    }
+    async fn set_draft(&self, item: &ItemRef, draft: bool) -> Result<()> {
+        let project = self.0.resolve(item)?;
+        // No draft flag on update — the title prefix is the flag, so rewrite the current title.
+        let url = self.0.project_path(&project, &format!("/merge_requests/{}", item.id));
+        let mr = self.0.get_json(&url).await?;
+        let title = get_str(&mr, "title").unwrap_or_default();
+        let new_title = draft_title(&title, draft);
+        if new_title.trim().is_empty() {
+            return Err(Error::Provider("the merge request's title is only its draft marker — give it a title first".into()));
+        }
+        self.0.put_json(&url, json!({ "title": new_title })).await
+    }
+    async fn set_closed(&self, item: &ItemRef, closed: bool) -> Result<()> {
+        let project = self.0.resolve(item)?;
+        let event = if closed { "close" } else { "reopen" };
+        let url = self.0.project_path(&project, &format!("/merge_requests/{}", item.id));
+        self.0.put_json(&url, json!({ "state_event": event })).await
+    }
+    async fn reviewable_users(&self, item: &ItemRef) -> Result<Vec<User>> {
+        let project = self.0.resolve(item)?;
+        // Held across the fetch so two pickers opened at once still cost one call.
+        let mut cache = self.0.reviewable.lock().await;
+        if let Some(users) = cache.get(&project) {
+            return Ok(users.clone());
+        }
+        let users = self.0.project_members(&project).await?;
+        cache.insert(project, users.clone());
+        Ok(users)
+    }
+    async fn request_reviewer(&self, item: &ItemRef, user_id: &str) -> Result<()> {
+        let project = self.0.resolve(item)?;
+        let new_id: i64 = user_id.parse().map_err(|_| Error::Provider(format!("invalid GitLab user id '{user_id}'")))?;
+        // A PUT replaces the whole reviewer list, so re-send the ones already on it.
+        let url = self.0.project_path(&project, &format!("/merge_requests/{}", item.id));
+        let mr = self.0.get_json(&url).await?;
+        let mut ids: Vec<i64> = get_arr(&mr, "reviewers").iter().filter_map(|r| get_i64(r, "id")).collect();
+        if !ids.contains(&new_id) {
+            ids.push(new_id);
+        }
+        self.0.put_json(&url, json!({ "reviewer_ids": ids })).await
+    }
 }
 
 #[async_trait]
@@ -909,8 +1015,7 @@ impl WorkItemSource for GitLabWi {
     }
     async fn assignable_users(&self, item: &ItemRef) -> Result<Vec<User>> {
         let project = self.0.resolve(item)?;
-        let v = self.0.get_json(&self.0.project_path(&project, "/members/all?per_page=100")).await?;
-        Ok(v.as_array().unwrap_or(&vec![]).iter().map(map_user).collect())
+        self.0.project_members(&project).await
     }
     async fn set_assignee(&self, item: &ItemRef, assignee_id: Option<&str>) -> Result<()> {
         let project = self.0.resolve(item)?;
@@ -1207,6 +1312,7 @@ impl ProviderFactory for GitLabFactory {
             base: connection.base_url.clone().unwrap_or_else(|| "https://gitlab.com/api/v4".into()),
             scope,
             self_username: tokio::sync::Mutex::new(None),
+            reviewable: tokio::sync::Mutex::new(HashMap::new()),
         });
         Ok(Arc::new(GitLabConnection {
             id: connection.id.clone(),
@@ -1537,6 +1643,7 @@ mod tests {
             base: forge.base().to_string(),
             scope: vec!["acme/pay".into()],
             self_username: tokio::sync::Mutex::new(None),
+            reviewable: tokio::sync::Mutex::new(HashMap::new()),
         });
         (forge, GitLabPr(client))
     }
@@ -1617,5 +1724,93 @@ mod tests {
         let file = format!("/projects/{}/repository/files/big.bin", encode_project("acme/pay"));
         forge.route(&file, json!({ "encoding": "base64", "content": "AAEC" }));
         assert_eq!(pr.file_text(&ItemRef::new("7"), "big.bin", Some("abc")).await.unwrap(), None, "binary");
+    }
+
+    #[test]
+    fn draft_title_adds_and_strips_the_prefix() {
+        assert_eq!(draft_title("Draft: x", false), "x");
+        assert_eq!(draft_title("WIP: x", false), "WIP: x", "WIP is no longer a marker, so it is left alone");
+        assert_eq!(draft_title("[Draft] x", false), "x");
+        assert_eq!(draft_title("(draft)   x", false), "x");
+        assert_eq!(draft_title("draft: [Draft] x", false), "x", "every leading marker goes, or it stays a draft");
+        assert_eq!(draft_title("x", false), "x");
+        assert_eq!(draft_title("Drafting the plan", false), "Drafting the plan", "a word that merely starts with draft is no marker");
+        assert_eq!(draft_title("x", true), "Draft: x");
+        assert_eq!(draft_title("Draft: x", true), "Draft: x", "already a draft stays single-prefixed");
+        assert_eq!(draft_title("WIP: x", true), "Draft: WIP: x", "WIP alone does not make it a draft");
+    }
+
+    #[tokio::test]
+    async fn marking_a_title_only_draft_ready_is_refused_before_the_put() {
+        let (forge, pr) = forge_and_client();
+        forge.route(MR_PATH, serde_json::json!({ "title": "Draft:" }));
+        let err = pr.set_draft(&ItemRef::in_repo("acme/pay", "7"), false).await.unwrap_err();
+        assert!(err.to_string().contains("only its draft marker"), "{err}");
+        assert!(!forge.requests().iter().any(|r| r.starts_with("PUT ")), "{:?}", forge.requests());
+    }
+
+    const MR_PATH: &str = "/projects/acme%2Fpay/merge_requests/7";
+
+    #[tokio::test]
+    async fn resolve_puts_the_discussion_and_refuses_the_bundled_thread() {
+        let (forge, pr) = forge_and_client();
+        forge.route(&format!("{MR_PATH}/discussions/abc123"), serde_json::json!({}));
+        let item = ItemRef::in_repo("acme/pay", "7");
+
+        let err = pr.resolve_thread(&item, "mr-7", true).await.unwrap_err();
+        assert!(err.to_string().contains("only resolve discussions"), "{err}");
+        assert!(forge.requests().is_empty(), "the bundled thread is refused before any call");
+
+        pr.resolve_thread(&item, "abc123", true).await.unwrap();
+        pr.resolve_thread(&item, "abc123", false).await.unwrap();
+        assert_eq!(forge.requests(), vec![format!("PUT {MR_PATH}/discussions/abc123"); 2]);
+    }
+
+    #[tokio::test]
+    async fn set_closed_puts_the_merge_request_once() {
+        let (forge, pr) = forge_and_client();
+        forge.route(MR_PATH, serde_json::json!({ "iid": 7 }));
+        pr.set_closed(&ItemRef::in_repo("acme/pay", "7"), true).await.unwrap();
+        assert_eq!(forge.requests(), vec![format!("PUT {MR_PATH}")]);
+    }
+
+    #[tokio::test]
+    async fn set_draft_reads_the_title_then_puts_it() {
+        let (forge, pr) = forge_and_client();
+        forge.route(MR_PATH, serde_json::json!({ "iid": 7, "title": "Draft: x" }));
+        pr.set_draft(&ItemRef::in_repo("acme/pay", "7"), false).await.unwrap();
+        assert_eq!(forge.requests(), vec![format!("GET {MR_PATH}"), format!("PUT {MR_PATH}")]);
+    }
+
+    #[tokio::test]
+    async fn request_reviewer_reads_the_reviewers_then_puts_the_list() {
+        let (forge, pr) = forge_and_client();
+        forge.route(MR_PATH, serde_json::json!({ "iid": 7, "reviewers": [{ "id": 3, "username": "sam" }] }));
+        pr.request_reviewer(&ItemRef::in_repo("acme/pay", "7"), "5").await.unwrap();
+        assert_eq!(forge.requests(), vec![format!("GET {MR_PATH}"), format!("PUT {MR_PATH}")]);
+        assert!(pr.request_reviewer(&ItemRef::in_repo("acme/pay", "7"), "sam").await.is_err(), "a non-numeric id is refused");
+    }
+
+    #[tokio::test]
+    async fn reviewable_users_are_fetched_once_per_project() {
+        let (forge, pr) = forge_and_client();
+        forge.route(
+            "/projects/acme%2Fpay/members/all",
+            serde_json::json!([{ "id": 5, "username": "ana", "name": "Ana", "avatar_url": "https://a/x.png" }]),
+        );
+        let item = ItemRef::in_repo("acme/pay", "7");
+        let users = pr.reviewable_users(&item).await.unwrap();
+        assert_eq!(users[0].id, "5");
+        assert_eq!(users[0].display_name, "Ana");
+        assert_eq!(users[0].handle.as_deref(), Some("ana"));
+        assert_eq!(users[0].avatar_url.as_deref(), Some("https://a/x.png"));
+        assert_eq!(pr.reviewable_users(&item).await.unwrap().len(), users.len());
+        assert_eq!(forge.requests_to("/projects/acme%2Fpay/members/all").len(), 1, "cached for the run");
+    }
+
+    #[test]
+    fn every_pull_request_write_is_advertised() {
+        let (_forge, pr) = forge_and_client();
+        assert_eq!(pr.pr_writes(), PrWriteSupport::ALL);
     }
 }

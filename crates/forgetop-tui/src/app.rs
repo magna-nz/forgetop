@@ -51,6 +51,7 @@ const DIAG_WI_THREADS: &str = "tui.work_item.threads";
 const DIAG_WI_STATES: &str = "tui.work_item.states";
 const DIAG_WI_TIMELINE: &str = "tui.work_item.timeline";
 const DIAG_WI_ASSIGNABLE: &str = "tui.work_item.assignable_users";
+const DIAG_PR_REVIEWABLE: &str = "tui.pr.reviewable_users";
 const DIAG_PIPELINE_FEEDS: &str = "tui.pipeline.feeds";
 const DIAG_PIPELINE_DISCOVERY: &str = "tui.pipeline.discovery";
 const DIAG_PIPELINE_RUN: &str = "tui.pipeline.run";
@@ -706,6 +707,9 @@ pub struct PrDetailFetch {
     pub checks: Option<Vec<CheckRun>>,
     pub commits: Option<Vec<Commit>>,
     pub timeline: Option<Vec<TimelineEvent>>,
+    /// The connection's optional PR writes; `None` when no source answered for it. Not cached:
+    /// it is a property of the connection, asked of the source each time the view opens.
+    pub writes: Option<PrWriteSupport>,
 }
 
 /// The detail fetched behind a work-item view (its comment thread and activity timeline),
@@ -1033,6 +1037,12 @@ pub struct App {
     /// Problems fetched this session, by detail key — what a detail landing after them carries,
     /// whichever of the two events arrives first.
     annotations_by_key: HashMap<String, Vec<PipelineAnnotation>>,
+    /// Who can be asked to review, per `(connection, repository)`, kept for the run: the list
+    /// is the same for every pull request in a repository, so `@` twice costs one fetch.
+    reviewable_cache: HashMap<(String, String), Vec<User>>,
+    /// Which optional PR writes each connection reported, so a PR view opened again starts
+    /// with the right keys instead of none until its detail fetch answers.
+    pr_writes: HashMap<String, PrWriteSupport>,
 }
 
 /// Full-screen views layered above the list. The large views are boxed so the
@@ -1157,6 +1167,26 @@ pub struct PrView {
     pub reply_target: Option<String>,
     /// Reviews, merges, state changes, … shown as Activity under the Conversation tab.
     pub timeline: Vec<TimelineEvent>,
+    /// Which optional writes (resolve a thread, draft ↔ ready, close ↔ reopen, request a
+    /// reviewer) this PR's connection can perform. A key is offered only where it would work,
+    /// so a forge without the API never shows one that could only fail.
+    pub writes: PrWriteSupport,
+    /// The Conversation tab's thread cursor: an index into the PR's general threads
+    /// ([`PrView::general_threads`]), the ones that tab can act on with `R` / `r`.
+    pub conv_sel: Option<usize>,
+    /// Where the Conversation tab drew each general thread in the last frame. Written by the
+    /// renderer, read by the key handler so moving the cursor can scroll its thread into view —
+    /// only the renderer knows how the text wrapped.
+    pub conv_layout: std::cell::RefCell<ConvLayout>,
+}
+
+/// The Conversation tab's geometry from the last frame (see [`PrView::conv_layout`]).
+#[derive(Debug, Clone, Default)]
+pub struct ConvLayout {
+    /// The wrapped row each general thread's first line sits on, in cursor order.
+    pub rows: Vec<u16>,
+    /// The text rows the pane shows at once.
+    pub height: u16,
 }
 
 /// The file line a pending comment is being written against.
@@ -1173,7 +1203,79 @@ impl PrView {
         let n = PR_TABS.len() as isize;
         self.tab = (self.tab as isize + delta).rem_euclid(n) as usize;
         self.scroll = 0;
+        // The scroll went back to the top, so a thread cursor left below it would act on a
+        // thread the user can no longer see.
+        self.conv_sel = None;
         self.reset_diff_scope();
+    }
+
+    /// The threads not anchored to a file line — the ones the Conversation tab's cursor walks.
+    /// In `diff.threads` order, which is the order the Comments section lists them in.
+    pub fn general_threads(&self) -> impl Iterator<Item = &CommentThread> {
+        self.diff.threads.iter().filter(|t| t.file_path.is_none())
+    }
+
+    /// The general thread under the Conversation cursor, if any.
+    pub fn conv_thread(&self) -> Option<&CommentThread> {
+        self.conv_sel.and_then(|i| self.general_threads().nth(i))
+    }
+
+    /// The thread `R` and `r` act on right now: the one under the patch cursor on the Diff
+    /// tab, the one under the Conversation cursor on that tab, none elsewhere. One answer for
+    /// the keys, the footer and the palette, so they can't disagree about what is selected.
+    pub fn focused_thread(&self) -> Option<&CommentThread> {
+        match self.tab {
+            0 => self.conv_thread(),
+            3 if self.diff.focus == DiffFocus::Patch => self.diff.thread_at_cursor(),
+            _ => None,
+        }
+    }
+
+    /// Whether `R` resolves / reopens a thread here: the provider can, and the PR isn't merged
+    /// (on a merged PR `R` is revert).
+    pub fn can_resolve(&self) -> bool {
+        self.writes.resolve_threads && self.pr.status != PullRequestStatus::Merged
+    }
+
+    /// Whether `R` would resolve / reopen `thread` in particular: the connection can
+    /// ([`can_resolve`](Self::can_resolve)) and the forge can act on this thread — GitHub's
+    /// bundled conversation comments and GitLab's individual notes have no resolved state.
+    pub fn can_resolve_thread(&self, thread: &CommentThread) -> bool {
+        self.can_resolve() && thread.is_resolvable
+    }
+
+    /// Moves the Conversation cursor `delta` threads, clamped at both ends like the commit and
+    /// patch cursors, and scrolls its thread into view (up to `max`). From no selection either
+    /// direction lands on the first thread. Returns false when there is no thread to move to,
+    /// so the caller can scroll the text instead.
+    fn move_conv(&mut self, delta: isize, max: u16) -> bool {
+        let n = self.general_threads().count();
+        if n == 0 {
+            return false;
+        }
+        let next = match self.conv_sel {
+            None => 0,
+            // Past either end the arrow is for the text (the Activity below, the description
+            // above), not the cursor.
+            Some(i) if (i == 0 && delta < 0) || (i + 1 >= n && delta > 0) => return false,
+            Some(i) => (i as isize + delta).clamp(0, n as isize - 1) as usize,
+        };
+        self.conv_sel = Some(next);
+        let layout = self.conv_layout.borrow();
+        if let Some(&row) = layout.rows.get(next) {
+            let h = layout.height.max(1);
+            if row < self.scroll || row >= self.scroll.saturating_add(h) {
+                // One row of what comes before it, so the thread doesn't sit flush on the border.
+                self.scroll = row.saturating_sub(1).min(max);
+            }
+        }
+        true
+    }
+
+    /// Keeps the Conversation cursor on a thread that still exists after the threads changed.
+    fn clamp_conv(&mut self) {
+        let n = self.general_threads().count();
+        self.conv_sel = self.conv_sel.filter(|_| n > 0).map(|i| i.min(n - 1));
     }
 
     /// Restores the whole-PR diff if the view was showing a single commit's changes.
@@ -3348,6 +3450,8 @@ impl App {
             follow_new_run: None,
             annotations_asked: std::cell::RefCell::new(HashMap::new()),
             annotations_by_key: HashMap::new(),
+            reviewable_cache: HashMap::new(),
+            pr_writes: HashMap::new(),
         }
     }
 
@@ -4330,7 +4434,17 @@ impl App {
         match self.active {
             0 => {
                 let row = self.selected_pr_row()?;
-                Some(Self::build_pr_view(deps, &self.pr_viewed, 0, pr_label(&row.pr), row.pr.url.clone(), row.connection_id.clone(), row.pr.clone()))
+                let writes = self.pr_writes.get(&row.connection_id).copied().unwrap_or_default();
+                Some(Self::build_pr_view(
+                    deps,
+                    &self.pr_viewed,
+                    writes,
+                    0,
+                    pr_label(&row.pr),
+                    row.pr.url.clone(),
+                    row.connection_id.clone(),
+                    row.pr.clone(),
+                ))
             }
             1 => {
                 let row = self.selected_wi_row()?;
@@ -4686,7 +4800,7 @@ impl App {
             views: &self.views,
             visible: &self.visible,
             // Exactly when `m` / `u` would open their pickers.
-            can_merge: matches!(&self.screen, Screen::PrView(v) if v.pr.status != PullRequestStatus::Merged),
+            can_merge: matches!(&self.screen, Screen::PrView(v) if pr_life(&v.pr) == PrLife::Open),
             can_set_state: matches!(self.screen, Screen::WiView(_)),
         }));
         c
@@ -4765,12 +4879,36 @@ impl App {
                     ("Connections", c('C')),
                 ]);
             }
-            // The PR arm of `on_key_inner` and `on_pr_view_key`.
+            // The PR arm of `on_key_inner`, `on_pr_write_key` and `on_pr_view_key`.
             Screen::PrView(v) => {
-                if v.pr.status == PullRequestStatus::Merged {
-                    out.push(("Revert", c('R')));
-                } else {
-                    out.extend([("Approve", c('a')), ("Request changes", c('x')), ("Merge…", c('m'))]);
+                let w = v.writes;
+                match pr_life(&v.pr) {
+                    PrLife::Merged => out.push(("Revert", c('R'))),
+                    PrLife::Closed => {
+                        if w.reopen {
+                            out.push(("Reopen the pull request", c('X')));
+                        }
+                    }
+                    PrLife::Draft => {
+                        if w.draft {
+                            out.push(("Mark ready for review", c('D')));
+                        }
+                    }
+                    PrLife::Open => {
+                        out.extend([("Approve", c('a')), ("Request changes", c('x')), ("Merge…", c('m'))]);
+                        if w.draft {
+                            out.push(("Convert to draft", c('D')));
+                        }
+                        if w.close {
+                            out.push(("Close without merging…", c('X')));
+                        }
+                    }
+                }
+                if w.request_reviewer && matches!(pr_life(&v.pr), PrLife::Open | PrLife::Draft) {
+                    out.push(("Request a reviewer…", c('@')));
+                }
+                if let Some(t) = v.focused_thread().filter(|t| v.can_resolve_thread(t)) {
+                    out.push((if t.is_resolved { "Reopen thread" } else { "Resolve thread" }, c('R')));
                 }
                 let on_line = v.tab == 3 && v.diff.focus == DiffFocus::Patch;
                 out.push((if on_line { "Comment on this line" } else { "Comment" }, c('c')));
@@ -4996,7 +5134,7 @@ impl App {
             }
             // `:merge <strategy>` — the `m` picker, with the strategy preselected.
             PaletteTarget::MergePicker { selected } => {
-                if matches!(self.screen, Screen::PrView(_)) && !self.active_pr_is_merged() {
+                if matches!(self.screen, Screen::PrView(_)) && self.active_pr_is_open() {
                     self.open_pr_merge();
                     if let Some(Overlay::Picker { selected: sel, .. }) = &mut self.overlay {
                         *sel = selected;
@@ -5672,7 +5810,17 @@ impl App {
     /// open a different PR while this fetch was in flight, and a late answer landing on whatever
     /// happens to be on screen would show one PR's data under another's chrome.
     fn apply_pr_detail(&mut self, deps: &AppDeps, key: String, fetch: PrDetailFetch, fetched_at: DateTime<Utc>) {
-        let PrDetailFetch { threads, files, checks, commits, timeline } = fetch;
+        let PrDetailFetch { threads, files, checks, commits, timeline, writes } = fetch;
+        // What the connection can write is known as soon as its source answered, whatever the
+        // four detail calls did — and it is the view's keys, not data, so it skips the cache.
+        if let Some(writes) = writes {
+            if let Screen::PrView(v) = &mut self.screen {
+                if pr_detail_cache_key(&v.connection_id, &v.pr.item_ref()) == key {
+                    v.writes = writes;
+                    self.pr_writes.insert(v.connection_id.clone(), writes);
+                }
+            }
+        }
         if threads.is_none() && files.is_none() && checks.is_none() && commits.is_none() && timeline.is_none() {
             // Nothing was learned, so there is nothing to write and nothing to repaint. Caching
             // four empty lists here is precisely how a total outage used to erase a good entry.
@@ -5753,6 +5901,7 @@ impl App {
             }
         }
         v.diff.threads = threads;
+        v.clamp_conv();
     }
 
     /// Paints the last known lists before the first fetch has answered, so launching the app
@@ -6648,6 +6797,10 @@ impl App {
                         }
                     }
                 }
+                // R / D / X / @ write to the provider, or fetch who can review — async too.
+                if self.on_pr_write_key(key, deps).await {
+                    return;
+                }
                 self.on_pr_view_key(key);
                 return;
             }
@@ -6742,7 +6895,8 @@ impl App {
     /// for as long as the network took (see commit 8fc2117 for the same fix on the refresh path).
     #[allow(clippy::too_many_arguments)]
     fn open_pr_view_for(&mut self, deps: &AppDeps, tab: usize, label: String, url: Option<String>, conn_id: String, pr: PullRequest) {
-        let (view, fetch) = Self::build_pr_view(deps, &self.pr_viewed, tab, label, url, conn_id, pr);
+        let writes = self.pr_writes.get(&conn_id).copied().unwrap_or_default();
+        let (view, fetch) = Self::build_pr_view(deps, &self.pr_viewed, writes, tab, label, url, conn_id, pr);
         self.screen = view;
         // The view is on screen now; the fetch that keeps it fresh runs in the background and
         // patches it in place via `AppEvent::PrDetailLoaded` (see `apply_pr_detail`).
@@ -6778,6 +6932,7 @@ impl App {
     fn build_pr_view(
         deps: &AppDeps,
         pr_viewed: &HashMap<String, HashMap<String, u64>>,
+        writes: PrWriteSupport,
         tab: usize,
         label: String,
         url: Option<String>,
@@ -6821,6 +6976,9 @@ impl App {
             review_draft: None,
             reply_target: None,
             timeline,
+            writes,
+            conv_sel: None,
+            conv_layout: Default::default(),
         }));
         (view, DetailRequest::Pr { conn_id, item, key })
     }
@@ -6850,8 +7008,8 @@ impl App {
         }
     }
 
-    /// Opens a reply to an existing thread: the one under the diff cursor (Diff tab), or the sole
-    /// conversation thread (Conversation tab). Stashes its id on `reply_target` for the submit.
+    /// Opens a reply to an existing thread: the one under the diff cursor (Diff tab), or the one
+    /// under the Conversation cursor. Stashes its id on `reply_target` for the submit.
     fn open_thread_reply(&mut self) {
         // Resolve the target id (or an error message) under an immutable borrow, then mutate.
         let target: Result<String, &'static str> = {
@@ -6862,14 +7020,18 @@ impl App {
                     .thread_at_cursor()
                     .map(|t| t.id.clone())
                     .ok_or("Move onto a comment thread first (] / [ to jump), then r to reply"),
-                0 => {
-                    let general: Vec<&CommentThread> = v.diff.threads.iter().filter(|t| t.file_path.is_none()).collect();
-                    match general.as_slice() {
-                        [t] => Ok(t.id.clone()),
-                        [] => Err("No comment thread to reply to — press c to add a comment"),
-                        _ => Err("Multiple threads — reply from the Diff tab (] / [ to a thread, then r)"),
+                0 => match v.conv_thread() {
+                    Some(t) => Ok(t.id.clone()),
+                    None => {
+                        let general: Vec<&CommentThread> = v.general_threads().collect();
+                        match general.as_slice() {
+                            // One thread needs no cursor, as before the cursor existed.
+                            [t] => Ok(t.id.clone()),
+                            [] => Err("No comment thread to reply to — press c to add a comment"),
+                            _ => Err("Move onto a comment thread first (↑/↓), then r to reply"),
+                        }
                     }
-                }
+                },
                 _ => Err("Switch to the Conversation or Diff tab to reply to a comment"),
             }
         };
@@ -7266,20 +7428,21 @@ impl App {
                 return;
             }
             // A merged PR offers Revert; an open one offers approve / request-changes / merge.
+            // A draft or a closed PR offers neither — it isn't asking for a review or a merge.
             Key::Char('a') => {
-                if !self.active_pr_is_merged() {
+                if self.active_pr_is_open() {
                     self.open_pr_vote(ReviewVote::Approved);
                 }
                 return;
             }
             Key::Char('x') => {
-                if !self.active_pr_is_merged() {
+                if self.active_pr_is_open() {
                     self.open_pr_vote(ReviewVote::Rejected);
                 }
                 return;
             }
             Key::Char('m') => {
-                if !self.active_pr_is_merged() {
+                if self.active_pr_is_open() {
                     self.open_pr_merge();
                 }
                 return;
@@ -7297,7 +7460,7 @@ impl App {
                 return;
             }
             Key::Char('r') => {
-                // Reply to an existing thread (under the diff cursor, or the sole conversation thread).
+                // Reply to an existing thread (under the diff cursor, or the Conversation cursor).
                 self.open_thread_reply();
                 return;
             }
@@ -7341,7 +7504,9 @@ impl App {
                     }
                 } else if v.tab == 1 {
                     v.commit_sel = v.commit_sel.saturating_sub(1);
-                } else {
+                } else if v.tab != 0 || !v.move_conv(-1, max) {
+                    // On the Conversation the arrows walk its threads while it has any;
+                    // PgUp/PgDn still scroll.
                     v.scroll = v.scroll.saturating_sub(1);
                 }
             }
@@ -7356,7 +7521,8 @@ impl App {
                     if !v.commits.is_empty() {
                         v.commit_sel = (v.commit_sel + 1).min(v.commits.len() - 1);
                     }
-                } else {
+                } else if v.tab != 0 || !v.move_conv(1, max) {
+                    // As above: a thread to walk to takes the arrow before the scroll does.
                     v.scroll = (v.scroll + 1).min(max);
                 }
             }
@@ -8810,6 +8976,11 @@ impl App {
                     self.toast = Some("Cancelled".into());
                 }
             }
+            // Someone already reviewing: say so and keep the picker open for another choice.
+            Outcome::Submit(Action::PrRequestReviewer { id: None, label }) => {
+                self.toast = Some(format!("{} is already reviewing", reviewer_name(&label)));
+                self.overlay = Some(overlay);
+            }
             Outcome::Submit(action) => self.execute_action(action, deps).await,
         }
     }
@@ -9537,6 +9708,117 @@ impl App {
         self.active_pr().map(|pr| pr.status == PullRequestStatus::Merged).unwrap_or(false)
     }
 
+    /// True when the PR in focus is open for review — not a draft, closed or merged — so
+    /// approve, request changes and merge apply to it.
+    fn active_pr_is_open(&self) -> bool {
+        self.active_pr().is_some_and(|pr| pr_life(pr) == PrLife::Open)
+    }
+
+    /// The PR view's keys that change the PR without a confirm, or that fetch before they can
+    /// ask: `R` resolves or reopens the focused thread, `D` flips draft ↔ ready, `X` closes
+    /// (after a confirm) or reopens, `@` requests a reviewer. Each acts only where the
+    /// connection supports it and the PR's state allows it; otherwise the key is swallowed, so
+    /// it never falls through to something else. `R` on a merged PR is left to revert.
+    /// Returns whether the key was taken.
+    async fn on_pr_write_key(&mut self, key: Key, deps: &AppDeps) -> bool {
+        let Screen::PrView(v) = &self.screen else { return false };
+        let life = pr_life(&v.pr);
+        let writes = v.writes;
+        let live = matches!(life, PrLife::Open | PrLife::Draft);
+        match key {
+            Key::Char('R') if life != PrLife::Merged => {
+                if !v.can_resolve() {
+                    return true;
+                }
+                if v.focused_thread().is_some_and(|t| !t.is_resolvable) {
+                    self.toast = Some("This thread has no resolved state on the forge — reply to it instead".into());
+                    return true;
+                }
+                let target = v.focused_thread().map(|t| (t.id.clone(), t.is_resolved));
+                let on_threads = matches!(v.tab, 0 | 3);
+                match target {
+                    // A comment still on its way has no thread at the provider to resolve yet.
+                    Some((id, _)) if is_local(&id) => {
+                        self.toast = Some("That comment is still being posted — resolve it in a moment".into())
+                    }
+                    Some((thread_id, resolved)) => {
+                        self.execute_action(Action::PrResolveThread { thread_id, resolved: !resolved }, deps).await
+                    }
+                    None if on_threads => self.toast = Some("Move onto a comment thread first, then R to resolve it".into()),
+                    None => {}
+                }
+                true
+            }
+            Key::Char('D') => {
+                if writes.draft && live {
+                    self.execute_action(Action::PrSetDraft(life == PrLife::Open), deps).await;
+                }
+                true
+            }
+            Key::Char('X') => {
+                match life {
+                    PrLife::Closed if writes.reopen => self.execute_action(Action::PrSetClosed(false), deps).await,
+                    PrLife::Open | PrLife::Draft if writes.close => self.open_pr_close(),
+                    _ => {}
+                }
+                true
+            }
+            Key::Char('@') => {
+                if writes.request_reviewer && live {
+                    self.open_pr_reviewer(deps).await;
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// `X` on an open or draft PR: closing is the one write here that takes the PR out of
+    /// everyone's way, so it asks first — and says how to undo it.
+    fn open_pr_close(&mut self) {
+        let Some(pr) = self.active_pr() else { return };
+        let num = pr.number.map(|n| format!("#{n} — ")).unwrap_or_default();
+        let title: String = pr.title.chars().take(40).collect();
+        self.overlay = Some(Overlay::Confirm {
+            title: format!("Close {num}{title}?"),
+            message: "The branch stays. You can reopen it from here with X.".into(),
+            action: Action::PrSetClosed(true),
+        });
+    }
+
+    /// `@` in the PR view: a searchable picker over who can be asked to review. Fetched once per
+    /// repository for the run (see [`App::reviewable_cache`]); a failed fetch isn't kept, so the
+    /// next `@` asks again.
+    async fn open_pr_reviewer(&mut self, deps: &AppDeps) {
+        let (item, conn_id, pr) = match &self.screen {
+            Screen::PrView(v) => (v.pr.item_ref(), v.connection_id.clone(), v.pr.clone()),
+            _ => return,
+        };
+        let cache_key = (conn_id.clone(), item.repo.clone().unwrap_or_default());
+        let users = match self.reviewable_cache.get(&cache_key) {
+            Some(users) => users.clone(),
+            None => {
+                let fetched = match self.pr_source_for(&conn_id, deps).await {
+                    Some(src) => detail_or_none(src.reviewable_users(&item).await, DIAG_PR_REVIEWABLE),
+                    None => None,
+                };
+                let Some(users) = fetched else {
+                    // `detail_or_none` has logged it; the user just needs to know to retry.
+                    self.toast = Some("Couldn't load who can review — try again, or request one in the browser (o)".into());
+                    return;
+                };
+                self.reviewable_cache.insert(cache_key, users.clone());
+                users
+            }
+        };
+        let num = pr.number.map(|n| format!("#{n} — ")).unwrap_or_default();
+        let title: String = pr.title.chars().take(40).collect();
+        match reviewer_picker(format!("Request a reviewer on {num}{title}"), &users, &pr) {
+            Some(picker) => self.overlay = Some(picker),
+            None => self.toast = Some("No one else can be asked to review — request one in the browser (o)".into()),
+        }
+    }
+
     fn open_pr_comment(&mut self) {
         let Some(pr) = self.active_pr() else { return };
         let title = format!("Comment on {}", pr_label(pr));
@@ -9545,9 +9827,15 @@ impl App {
 
     async fn execute_action(&mut self, action: Action, deps: &AppDeps) {
         match action {
-            Action::PrVote(_) | Action::PrMerge(_) | Action::PrRevert | Action::PrComment(_) | Action::PrReply(_) => {
-                self.execute_pr_action(action, deps).await
-            }
+            Action::PrVote(_)
+            | Action::PrMerge(_)
+            | Action::PrRevert
+            | Action::PrComment(_)
+            | Action::PrReply(_)
+            | Action::PrResolveThread { .. }
+            | Action::PrSetDraft(_)
+            | Action::PrSetClosed(_)
+            | Action::PrRequestReviewer { .. } => self.execute_pr_action(action, deps).await,
             Action::WiSetState(_)
             | Action::WiComment(_)
             | Action::WiAssign { .. }
@@ -9638,6 +9926,23 @@ impl App {
                 };
                 PrCall::Reply { thread_id, body: text }
             }
+            Action::PrResolveThread { thread_id, resolved } => PrCall::Resolve { thread_id, resolved },
+            Action::PrSetDraft(draft) => PrCall::SetDraft(draft),
+            Action::PrSetClosed(closed) => PrCall::SetClosed(closed),
+            Action::PrRequestReviewer { id: Some(id), label } => {
+                // The picker's own copy of the user carries the handle a refetch is matched by.
+                let known = self
+                    .reviewable_cache
+                    .iter()
+                    .filter(|((c, _), _)| *c == conn_id)
+                    .flat_map(|(_, users)| users)
+                    .find(|u| u.id == id)
+                    .cloned();
+                let user = known.unwrap_or(User { id, display_name: label, handle: None, avatar_url: None });
+                PrCall::RequestReviewer { user }
+            }
+            // Someone already reviewing — answered in `on_overlay_key`, never sent.
+            Action::PrRequestReviewer { id: None, .. } => return,
             _ => return,
         };
         self.send_pr_call(conn_id, item, call, deps).await;
@@ -9660,6 +9965,22 @@ impl App {
                 let msg = format!("Review submitted ({} comment(s))", comments.len());
                 (Some(msg.clone()), msg)
             }
+            PrCall::Resolve { resolved, .. } => {
+                let msg = if *resolved { "Thread resolved" } else { "Thread reopened" };
+                (Some(msg.to_string()), msg.to_string())
+            }
+            PrCall::SetDraft(draft) => {
+                let msg = if *draft { "Converted to draft" } else { "Ready for review" };
+                (Some(msg.to_string()), msg.to_string())
+            }
+            PrCall::SetClosed(closed) => {
+                let msg = if *closed { "Closed" } else { "Reopened" };
+                (Some(msg.to_string()), msg.to_string())
+            }
+            PrCall::RequestReviewer { user } => {
+                let msg = format!("Review requested from {}", user.display_name);
+                (Some(msg.clone()), msg)
+            }
         };
         pending.done = done;
         pending.merge = matches!(call, PrCall::Merge(_));
@@ -9677,6 +9998,31 @@ impl App {
             pending.reviewers = self.shown_pr(&conn_id, &item).map(|pr| pr.reviewers.clone());
             self.patch_pr(&conn_id, &item, |pr| set_vote(pr, me, vote));
             self.hold(&key).vote = Some((token, me.to_string(), vote));
+        }
+        // Draft, close / reopen and a requested reviewer are the user's to decide, so they show
+        // on the PR and its rows now — the list row flips on the same frame as the view.
+        if let Some(edit) = call.edit() {
+            self.patch_pr(&conn_id, &item, |pr| edit.apply(pr));
+            // A newer edit of the same field replaces the held one: close then reopen must not
+            // leave "closed" held over a refetch that shows it open.
+            let hold = self.hold(&key);
+            hold.pr_edits.retain(|(_, held)| !held.same_field(&edit));
+            hold.pr_edits.push((token, edit.clone()));
+            pending.pr_edit = Some(edit);
+        }
+        // So is a thread's resolution: flipped on screen now, held against stale refetches.
+        if let PrCall::Resolve { thread_id, resolved } = &call {
+            for v in self.item_views_mut() {
+                if let Screen::PrView(v) = v {
+                    if v.connection_id == conn_id && v.pr.item_ref() == item {
+                        set_resolved(&mut v.diff.threads, thread_id, *resolved);
+                    }
+                }
+            }
+            let hold = self.hold(&key);
+            hold.thread_states.retain(|(_, id, _)| id != thread_id);
+            hold.thread_states.push((token, thread_id.clone(), *resolved));
+            pending.thread_state = Some((thread_id.clone(), *resolved));
         }
         // Reviewing a PR clears it from the Launchpad now; a merge waits for the provider.
         if matches!(call, PrCall::Vote(_) | PrCall::Review { .. }) {
@@ -9701,6 +10047,7 @@ impl App {
                 file_path: None,
                 line: None,
                 is_resolved: false,
+                is_resolvable: true,
             })],
             PrCall::Reply { thread_id, body } => vec![HeldComment::Reply {
                 thread_id: thread_id.clone(),
@@ -9716,6 +10063,7 @@ impl App {
                         file_path: Some(c.path.clone()),
                         line: Some(c.line),
                         is_resolved: false,
+                        is_resolvable: true,
                     })
                 })
                 .collect(),
@@ -9766,7 +10114,9 @@ impl App {
     /// Folds in the provider's answer to a PR write.
     fn finish_pr_action(&mut self, token: u64, result: std::result::Result<(), String>, fresh: Option<PullRequest>, deps: &AppDeps) {
         let Some(pending) = self.item_actions.remove(&token) else { return };
-        let PendingItemAction { conn_id, item, key, done, failed, reviewers, pending: comments, dismissed, merge, .. } = pending;
+        let PendingItemAction {
+            conn_id, item, key, done, failed, reviewers, pending: comments, dismissed, merge, pr_edit, thread_state, ..
+        } = pending;
         match result {
             Err(e) => {
                 let prefix = local_prefix(token);
@@ -9777,6 +10127,19 @@ impl App {
                 self.prune_holds();
                 if let Some(reviewers) = reviewers {
                     self.patch_pr(&conn_id, &item, |pr| pr.reviewers = reviewers.clone());
+                }
+                // Only what this write changed goes back: the rest of the PR may have moved on.
+                if let Some(edit) = pr_edit {
+                    self.patch_pr(&conn_id, &item, |pr| edit.revert(pr));
+                }
+                if let Some((thread_id, resolved)) = &thread_state {
+                    for v in self.item_views_mut() {
+                        if let Screen::PrView(v) = v {
+                            if v.connection_id == conn_id && v.pr.item_ref() == item {
+                                set_resolved(&mut v.diff.threads, thread_id, !*resolved);
+                            }
+                        }
+                    }
                 }
                 if listed_again {
                     // The review was refused, so the forge still wants it: back on the list.
@@ -9811,6 +10174,7 @@ impl App {
                 // vote it hasn't caught up with yet still showing.
                 if let Some(mut fresh) = fresh {
                     self.settle_vote(&key, &mut fresh);
+                    self.settle_pr_edits(&key, &mut fresh);
                     for v in self.item_views_mut() {
                         if let Screen::PrView(v) = v {
                             if v.connection_id == conn_id && v.pr.item_ref() == item {
@@ -10044,6 +10408,7 @@ impl App {
                     file_path: None,
                     line: None,
                     is_resolved: false,
+                    is_resolvable: true,
                 });
                 for v in self.item_views_mut() {
                     if let Screen::WiView(v) = v {
@@ -10245,7 +10610,18 @@ impl App {
         self.prune_holds();
     }
 
-    /// Re-applies held votes to a freshly landed PR pool.
+    /// Re-applies held draft / close / reviewer edits to a refreshed copy of their PR, letting
+    /// go of each once the provider's copy shows it.
+    fn settle_pr_edits(&mut self, key: &str, pr: &mut PullRequest) {
+        let Some(hold) = self.live_hold(key) else { return };
+        hold.pr_edits.retain(|(_, e)| !e.reflected(pr));
+        for (_, e) in &hold.pr_edits {
+            e.apply(pr);
+        }
+        self.prune_holds();
+    }
+
+    /// Re-applies held votes (and held draft / close / reviewer edits) to a freshly landed PR pool.
     fn settle_held_votes(&mut self) {
         if self.held_items.is_empty() {
             return;
@@ -10255,9 +10631,18 @@ impl App {
         // second must not be read as caught up because the first cleared the hold.
         let mut caught_up = HashSet::new();
         let mut cleared = HashSet::new();
+        let mut edits_shown: Vec<(String, u64)> = Vec::new();
         for row in pool.open.iter_mut().chain(pool.completed.iter_mut()) {
             let key = pr_detail_cache_key(&row.connection_id, &row.pr.item_ref());
             let Some(hold) = self.live_hold(&key) else { continue };
+            // Held draft / close / reviewer edits, before the vote's early exits below.
+            for (token, edit) in &hold.pr_edits {
+                if edit.reflected(&row.pr) {
+                    edits_shown.push((key.clone(), *token));
+                } else {
+                    edit.apply(&mut row.pr);
+                }
+            }
             // A row that no longer names you as a reviewer is the forge having caught up with
             // your review — the vote too, so nothing puts it back on this row later: that would
             // list you again, and the review-requested view with you. The row is left as it came.
@@ -10284,6 +10669,11 @@ impl App {
         for key in cleared {
             if let Some(hold) = self.held_items.get_mut(&key) {
                 hold.review_cleared = None;
+            }
+        }
+        for (key, token) in edits_shown {
+            if let Some(hold) = self.held_items.get_mut(&key) {
+                hold.pr_edits.retain(|(t, _)| *t != token);
             }
         }
         self.pr_pool = pool;
@@ -10314,19 +10704,30 @@ impl App {
     }
 
     /// Puts held comments the provider hasn't listed yet onto `threads`; forgets those it has.
+    /// Likewise a thread resolved or reopened here: shown so until the provider's copy agrees.
     fn settle_held_comments(&mut self, key: &str, threads: &mut Vec<CommentThread>) {
         let Some(hold) = self.live_hold(key) else { return };
         hold.comments.retain(|h| !h.listed_in(threads));
         for h in &hold.comments {
             h.show_on(threads);
         }
+        hold.thread_states.retain(|(_, id, resolved)| !threads.iter().any(|t| &t.id == id && t.is_resolved == *resolved));
+        for (_, id, resolved) in &hold.thread_states {
+            set_resolved(threads, id, *resolved);
+        }
         self.prune_holds();
     }
 
     /// Drops holds with nothing left to hold.
     fn prune_holds(&mut self) {
-        self.held_items
-            .retain(|_, h| h.vote.is_some() || h.review_cleared.is_some() || !h.edits.is_empty() || !h.comments.is_empty());
+        self.held_items.retain(|_, h| {
+            h.vote.is_some()
+                || h.review_cleared.is_some()
+                || !h.edits.is_empty()
+                || !h.comments.is_empty()
+                || !h.pr_edits.is_empty()
+                || !h.thread_states.is_empty()
+        });
     }
 
     /// Re-asks for the detail of every view showing the item whose detail key is `key`.
@@ -10359,6 +10760,42 @@ fn assignee_picker(title: String, users: &[User], current: Option<&User>, me: Op
     let selected = current.and_then(|c| users.iter().position(|u| same(u, c))).map_or(0, |i| i + 1);
     let me = me.and_then(|me| users.iter().position(|u| forgetop_core::filter::is_user(u, me))).map(|i| i + 1);
     Overlay::Search { title, query: String::new(), items, selected, kind: SearchKind::Assignee { me } }
+}
+
+/// The reviewer picker: who can be asked, less the PR's author (no forge lets you ask the author
+/// to review their own PR). Someone already on the PR is listed with their verdict and no id, so
+/// choosing them says so rather than asking again. `None` when that leaves nobody to list.
+fn reviewer_picker(title: String, users: &[User], pr: &PullRequest) -> Option<Overlay> {
+    let items: Vec<SearchItem> = users
+        .iter()
+        .filter(|u| !same_user(u, &pr.author))
+        .map(|u| match pr.reviewers.iter().find(|r| same_user(u, &r.user)) {
+            Some(r) => SearchItem { id: None, label: format!("{} · {}", u.display_name, reviewer_vote_label(r.vote)) },
+            None => SearchItem { id: Some(u.id.clone()), label: u.display_name.clone() },
+        })
+        .collect();
+    if items.is_empty() {
+        return None;
+    }
+    // Start on the first person who can actually be asked.
+    let selected = items.iter().position(|i| i.id.is_some()).unwrap_or(0);
+    Some(Overlay::Search { title, query: String::new(), items, selected, kind: SearchKind::Reviewer })
+}
+
+/// A reviewer's verdict as the reviewer picker words it beside their name.
+fn reviewer_vote_label(vote: ReviewVote) -> &'static str {
+    match vote {
+        ReviewVote::Approved => "approved ✓",
+        ReviewVote::ApprovedWithSuggestions => "approved with suggestions ✓",
+        ReviewVote::Rejected => "changes requested ✗",
+        ReviewVote::WaitingForAuthor => "waiting for author",
+        ReviewVote::NoVote => "requested",
+    }
+}
+
+/// The name in a reviewer-picker row, without the ` · <verdict>` an existing reviewer carries.
+fn reviewer_name(label: &str) -> &str {
+    label.split(" · ").next().unwrap_or(label)
 }
 
 fn wi_label(wi: &WorkItem) -> String {
@@ -10556,6 +10993,127 @@ enum PrCall {
     Comment(String),
     Reply { thread_id: String, body: String },
     Review { event: ReviewVote, comments: Vec<LineComment> },
+    /// Resolve (`resolved`) or reopen a comment thread.
+    Resolve { thread_id: String, resolved: bool },
+    /// To a draft (`true`) or ready for review (`false`).
+    SetDraft(bool),
+    /// Close without merging (`true`) or reopen (`false`).
+    SetClosed(bool),
+    RequestReviewer { user: User },
+}
+
+impl PrCall {
+    /// The change this call makes to the PR itself, shown before the provider answers.
+    fn edit(&self) -> Option<PrEdit> {
+        match self {
+            PrCall::SetDraft(draft) => Some(PrEdit::Draft(*draft)),
+            PrCall::SetClosed(closed) => Some(PrEdit::Closed(*closed)),
+            PrCall::RequestReviewer { user } => Some(PrEdit::Reviewer(user.clone())),
+            _ => None,
+        }
+    }
+}
+
+/// A pull-request field change, applied on screen before the provider has it — the PR
+/// counterpart of [`WiEdit`].
+#[derive(Clone, Debug)]
+enum PrEdit {
+    /// `is_draft` and the status that goes with it.
+    Draft(bool),
+    /// Closed without merging, or open again.
+    Closed(bool),
+    /// Asked to review, with no verdict yet.
+    Reviewer(User),
+}
+
+impl PrEdit {
+    fn apply(&self, pr: &mut PullRequest) {
+        match self {
+            PrEdit::Draft(draft) => {
+                pr.is_draft = *draft;
+                // A closed PR's draft flag can move without reopening it.
+                if pr.status != PullRequestStatus::Closed {
+                    pr.status = if *draft { PullRequestStatus::Draft } else { PullRequestStatus::Open };
+                }
+            }
+            PrEdit::Closed(true) => pr.status = PullRequestStatus::Closed,
+            PrEdit::Closed(false) => {
+                pr.status = if pr.is_draft { PullRequestStatus::Draft } else { PullRequestStatus::Open };
+            }
+            PrEdit::Reviewer(user) => {
+                if !pr.reviewers.iter().any(|r| same_user(&r.user, user)) {
+                    pr.reviewers.push(Reviewer { user: user.clone(), vote: ReviewVote::NoVote, is_required: false });
+                }
+            }
+        }
+    }
+
+    /// Whether a copy of the PR from the provider already shows this edit. A draft is read the
+    /// way the banner reads it (either the flag or the status), and a reviewer is matched by id,
+    /// handle or name, since the reviewable-users mapper needn't use the PR mapper's id.
+    fn reflected(&self, pr: &PullRequest) -> bool {
+        match self {
+            PrEdit::Draft(draft) => (pr.is_draft || pr.status == PullRequestStatus::Draft) == *draft,
+            PrEdit::Closed(closed) => (pr.status == PullRequestStatus::Closed) == *closed,
+            PrEdit::Reviewer(user) => pr.reviewers.iter().any(|r| same_user(&r.user, user)),
+        }
+    }
+
+    /// Whether `other` sets the same thing as this edit, so the later of the two is what holds.
+    fn same_field(&self, other: &PrEdit) -> bool {
+        match (self, other) {
+            (PrEdit::Draft(_), PrEdit::Draft(_)) | (PrEdit::Closed(_), PrEdit::Closed(_)) => true,
+            (PrEdit::Reviewer(a), PrEdit::Reviewer(b)) => same_user(a, b),
+            _ => false,
+        }
+    }
+
+    /// Takes this edit back off `pr` after the provider refused it. Exact, because each edit is
+    /// only ever sent from the state it flips (`D` on a draft marks it ready, and so on).
+    fn revert(&self, pr: &mut PullRequest) {
+        match self {
+            PrEdit::Draft(draft) => PrEdit::Draft(!*draft).apply(pr),
+            PrEdit::Closed(closed) => PrEdit::Closed(!*closed).apply(pr),
+            PrEdit::Reviewer(user) => {
+                pr.reviewers.retain(|r| !(same_user(&r.user, user) && r.vote == ReviewVote::NoVote));
+            }
+        }
+    }
+}
+
+/// The same person, by id, handle or name — a provider's PR mapper and its user-list mapper
+/// needn't agree on which id they use (GitHub: numeric id vs login).
+fn same_user(a: &User, b: &User) -> bool {
+    let is = forgetop_core::filter::is_user;
+    a.id == b.id || b.handle.as_deref().is_some_and(|h| is(a, h)) || is(a, &b.display_name)
+}
+
+/// Marks the thread `thread_id` in `threads` resolved or open, if it is there.
+fn set_resolved(threads: &mut [CommentThread], thread_id: &str, resolved: bool) {
+    if let Some(t) = threads.iter_mut().find(|t| t.id == thread_id) {
+        t.is_resolved = resolved;
+    }
+}
+
+/// A pull request's lifecycle, as far as the PR view's keys care: which of `a x m`, `D`, `X` and
+/// `R` (revert) apply. Read through core's `pr_state`, so a draft here is a draft on the banner
+/// and in the list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrLife {
+    Open,
+    Draft,
+    Closed,
+    Merged,
+}
+
+pub fn pr_life(pr: &PullRequest) -> PrLife {
+    use forgetop_core::launchpad::{pr_state, PrState};
+    match pr_state(pr) {
+        PrState::Merged => PrLife::Merged,
+        PrState::Closed => PrLife::Closed,
+        PrState::Draft => PrLife::Draft,
+        _ => PrLife::Open,
+    }
 }
 
 /// A work-item write, as sent to the provider.
@@ -10747,12 +11305,25 @@ struct ItemHold {
     comments: Vec<HeldComment>,
     /// Work-item edits the provider hasn't reflected yet, by token.
     edits: Vec<(u64, WiEdit)>,
+    /// PR draft / close / reviewer edits the provider hasn't reflected yet, by token.
+    pr_edits: Vec<(u64, PrEdit)>,
+    /// Threads resolved (`true`) or reopened here, `(token, thread id, resolved)`, until a
+    /// refetch of the threads shows them so.
+    thread_states: Vec<(u64, String, bool)>,
     until: DateTime<Utc>,
 }
 
 impl ItemHold {
     fn new(until: DateTime<Utc>) -> Self {
-        ItemHold { vote: None, review_cleared: None, comments: Vec::new(), edits: Vec::new(), until }
+        ItemHold {
+            vote: None,
+            review_cleared: None,
+            comments: Vec::new(),
+            edits: Vec::new(),
+            pr_edits: Vec::new(),
+            thread_states: Vec::new(),
+            until,
+        }
     }
 
     /// Lets go of what the refused action `token` held, returning its work-item edit.
@@ -10763,6 +11334,8 @@ impl ItemHold {
         if self.review_cleared == Some(token) {
             self.review_cleared = None;
         }
+        self.pr_edits.retain(|(t, _)| *t != token);
+        self.thread_states.retain(|(t, ..)| *t != token);
         let prefix = local_prefix(token);
         self.comments.retain(|c| !c.local_id().starts_with(&prefix));
         let i = self.edits.iter().position(|(t, _)| *t == token)?;
@@ -10794,6 +11367,10 @@ struct PendingItemAction {
     pending: Vec<LineComment>,
     /// This action took the PR off the Launchpad.
     dismissed: bool,
+    /// The draft / close / reviewer edit this action showed, to take back on a refusal.
+    pr_edit: Option<PrEdit>,
+    /// The thread this action resolved (`true`) or reopened, to flip back on a refusal.
+    thread_state: Option<(String, bool)>,
 }
 
 impl PendingItemAction {
@@ -10809,6 +11386,8 @@ impl PendingItemAction {
             wi: None,
             pending: Vec::new(),
             dismissed: false,
+            pr_edit: None,
+            thread_state: None,
         }
     }
 }
@@ -10831,6 +11410,10 @@ async fn pr_action_call(
         PrCall::Comment(body) => source.add_comment(item, body).await,
         PrCall::Reply { thread_id, body } => source.reply_to_thread(item, thread_id, body).await,
         PrCall::Review { event, comments } => source.submit_review(item, *event, comments).await,
+        PrCall::Resolve { thread_id, resolved } => source.resolve_thread(item, thread_id, *resolved).await,
+        PrCall::SetDraft(draft) => source.set_draft(item, *draft).await,
+        PrCall::SetClosed(closed) => source.set_closed(item, *closed).await,
+        PrCall::RequestReviewer { user } => source.request_reviewer(item, &user.id).await,
     };
     match result {
         Ok(()) => (Ok(()), detail_or_none(source.get(item).await, DIAG_PR_DETAIL)),
@@ -11475,7 +12058,7 @@ async fn fetch_pr_detail(deps: &AppDeps, conn_id: &str, item: &ItemRef) -> PrDet
     let checks = detail_or_none(source.checks(item).await, DIAG_PR_CHECKS);
     let commits = detail_or_none(source.commits(item).await, DIAG_PR_COMMITS);
     let timeline = detail_or_none(source.timeline(item).await, DIAG_PR_TIMELINE);
-    PrDetailFetch { threads, files, checks, commits, timeline }
+    PrDetailFetch { threads, files, checks, commits, timeline, writes: Some(source.pr_writes()) }
 }
 
 /// Fetches one changed file's full text at `sha` (the PR's head when `None`), off the render
@@ -11570,8 +12153,10 @@ fn pr_detail_unchanged(v: &PrView, d: &PrDetail) -> bool {
 }
 
 fn threads_match(a: &[CommentThread], b: &[CommentThread]) -> bool {
-    let counts = |ts: &[CommentThread]| -> (usize, usize) {
-        (ts.iter().map(|t| t.comments.len()).sum(), ts.iter().filter(|t| t.is_resolved).count())
+    // Resolved state is compared per thread: one resolved and another reopened leaves the count
+    // alone but both have to repaint.
+    let counts = |ts: &[CommentThread]| -> (usize, Vec<(String, bool)>) {
+        (ts.iter().map(|t| t.comments.len()).sum(), ts.iter().map(|t| (t.id.clone(), t.is_resolved)).collect())
     };
     // A placeholder swapped for the provider's copy of the same comment leaves every count as it
     // was, but the swap still has to land: the placeholder's id means nothing to the provider.
@@ -14416,7 +15001,7 @@ mod tests {
         // new-side lines: 20 (ctx, idx 1), 21 (added, idx 2).
         let mut d = diff(vec![changed("a.rs", Some("@@ -10,3 +20,4 @@\n ctx\n+added\n-removed"))]);
         d.threads = vec![
-            CommentThread { id: "t1".into(), comments: vec![], file_path: Some("a.rs".into()), line: Some(21), is_resolved: false },
+            CommentThread { id: "t1".into(), comments: vec![], file_path: Some("a.rs".into()), line: Some(21), is_resolved: false, is_resolvable: true },
         ];
         d.jump_thread(1); // next thread from cursor 0 → the one at patch line 2
         assert_eq!(d.focus, DiffFocus::Patch);
@@ -14437,7 +15022,7 @@ mod tests {
     fn diff_thread_at_cursor_matches_only_on_the_anchored_line() {
         // new-side line 21 (added) sits at patch index 2.
         let mut d = diff(vec![changed("a.rs", Some("@@ -10,3 +20,4 @@\n ctx\n+added\n-removed"))]);
-        d.threads = vec![CommentThread { id: "t7".into(), comments: vec![], file_path: Some("a.rs".into()), line: Some(21), is_resolved: false }];
+        d.threads = vec![CommentThread { id: "t7".into(), comments: vec![], file_path: Some("a.rs".into()), line: Some(21), is_resolved: false, is_resolvable: true }];
         d.cursor = 0;
         assert!(d.thread_at_cursor().is_none(), "cursor not on the thread's line");
         d.cursor = 2;
@@ -14468,6 +15053,9 @@ mod tests {
             pending: vec![],
             review_draft: None,
             reply_target: None,
+            writes: PrWriteSupport::default(),
+            conv_sel: None,
+            conv_layout: Default::default(),
         };
 
         v.reset_diff_scope();
@@ -14495,6 +15083,7 @@ mod tests {
     fn all_answered(d: PrDetail) -> Box<PrDetailFetch> {
         Box::new(PrDetailFetch {
             timeline: None,
+            writes: None,
             threads: Some(d.threads),
             files: Some(d.files),
             checks: Some(d.checks),
@@ -14522,6 +15111,9 @@ mod tests {
             pending: vec![],
             review_draft: None,
             reply_target: None,
+            writes: PrWriteSupport::default(),
+            conv_sel: None,
+            conv_layout: Default::default(),
         }));
 
         // A detail landing for a different PR (id "2") on the same connection.
@@ -14571,6 +15163,9 @@ mod tests {
             pending: vec![LineComment { path: "a.rs".into(), line: 3, side: DiffSide::New, body: "wip".into() }],
             review_draft: Some(DraftComment { path: "a.rs".into(), line: 3, side: DiffSide::New }),
             reply_target: Some("t1".into()),
+            writes: PrWriteSupport::default(),
+            conv_sel: None,
+            conv_layout: Default::default(),
         }));
 
         let fresh = PrDetail {
@@ -14620,6 +15215,9 @@ mod tests {
             pending: vec![],
             review_draft: None,
             reply_target: None,
+            writes: PrWriteSupport::default(),
+            conv_sel: None,
+            conv_layout: Default::default(),
         }));
 
         let fresh = PrDetail {
@@ -14637,7 +15235,7 @@ mod tests {
     }
 
     fn thread(id: &str) -> CommentThread {
-        CommentThread { id: id.into(), comments: vec![], file_path: Some("a.rs".into()), line: Some(21), is_resolved: false }
+        CommentThread { id: id.into(), comments: vec![], file_path: Some("a.rs".into()), line: Some(21), is_resolved: false, is_resolvable: true }
     }
 
     fn check(name: &str, status: CheckStatus) -> CheckRun {
@@ -14664,6 +15262,9 @@ mod tests {
             pending: vec![],
             review_draft: None,
             reply_target: None,
+            writes: PrWriteSupport::default(),
+            conv_sel: None,
+            conv_layout: Default::default(),
         }))
     }
 
@@ -14796,6 +15397,7 @@ mod tests {
                 key: key.clone(),
                 detail: Box::new(PrDetailFetch {
                     timeline: None,
+     writes: None,
                     threads: None,
                     files: None,
                     checks: Some(vec![check("ci", CheckStatus::Failed)]),
@@ -15549,6 +16151,9 @@ mod tests {
                 pending: vec![],
                 review_draft: None,
                 reply_target: None,
+                writes: PrWriteSupport::default(),
+                conv_sel: None,
+                conv_layout: Default::default(),
             }))
         };
 
@@ -15605,6 +16210,9 @@ mod tests {
             pending: vec![],
             review_draft: Some(DraftComment { path: "a.rs".into(), line: 5, side: DiffSide::New }),
             reply_target: None,
+            writes: PrWriteSupport::default(),
+            conv_sel: None,
+            conv_layout: Default::default(),
         }));
 
         app.add_line_comment("looks off".into());
@@ -15645,6 +16253,9 @@ mod tests {
             pending: vec![],
             review_draft: None,
             reply_target: None,
+            writes: PrWriteSupport::default(),
+            conv_sel: None,
+            conv_layout: Default::default(),
         }));
 
         app.open_pr_vote(ReviewVote::Approved);
@@ -15674,6 +16285,9 @@ mod tests {
             pending,
             review_draft: None,
             reply_target: None,
+            writes: PrWriteSupport::default(),
+            conv_sel: None,
+            conv_layout: Default::default(),
         }))
     }
 
@@ -15771,6 +16385,9 @@ mod tests {
             pending: vec![],
             review_draft: None,
             reply_target: None,
+            writes: PrWriteSupport::default(),
+            conv_sel: None,
+            conv_layout: Default::default(),
         }));
         assert_eq!(app.selected_url().as_deref(), Some("http://prview"));
     }
@@ -18624,11 +19241,13 @@ mod tests {
         /// What `get` answers with after a write.
         pr: PullRequest,
         wi: WorkItem,
+        /// Who `reviewable_users` answers with.
+        users: Vec<User>,
     }
 
     impl ItemCalls {
         fn new() -> Self {
-            ItemCalls { log: Arc::default(), refuse: false, gate: None, pr: pr(None), wi: wi(None) }
+            ItemCalls { log: Arc::default(), refuse: false, gate: None, pr: pr(None), wi: wi(None), users: Vec::new() }
         }
 
         fn gated() -> (Self, Arc<tokio::sync::Notify>) {
@@ -18688,6 +19307,27 @@ mod tests {
         async fn file_text(&self, _item: &ItemRef, path: &str, sha: Option<&str>) -> forgetop_core::Result<Option<String>> {
             self.0.log.lock().unwrap().push(format!("file_text {path} {}", sha.unwrap_or("head")));
             Ok(Some(fifty_lines().join("\n")))
+        }
+
+        fn pr_writes(&self) -> PrWriteSupport {
+            PrWriteSupport::ALL
+        }
+        async fn resolve_thread(&self, item: &ItemRef, thread_id: &str, resolved: bool) -> forgetop_core::Result<()> {
+            self.0.record(format!("resolve {} {thread_id} {resolved}", item.id)).await
+        }
+        async fn set_draft(&self, item: &ItemRef, draft: bool) -> forgetop_core::Result<()> {
+            self.0.record(format!("draft {} {draft}", item.id)).await
+        }
+        async fn set_closed(&self, item: &ItemRef, closed: bool) -> forgetop_core::Result<()> {
+            self.0.record(format!("closed {} {closed}", item.id)).await
+        }
+        async fn reviewable_users(&self, _item: &ItemRef) -> forgetop_core::Result<Vec<User>> {
+            // A read, not a write: logged without waiting on the gate.
+            self.0.log.lock().unwrap().push("reviewable".into());
+            Ok(self.0.users.clone())
+        }
+        async fn request_reviewer(&self, item: &ItemRef, user_id: &str) -> forgetop_core::Result<()> {
+            self.0.record(format!("request {} {user_id}", item.id)).await
         }
     }
 
@@ -19040,6 +19680,7 @@ mod tests {
             file_path: None,
             line: None,
             is_resolved: false,
+            is_resolvable: true,
         }
     }
 
@@ -19951,5 +20592,327 @@ mod tests {
         draw(&mut app, 150, 60);
         click(&mut app, &deps, Hit::DiffGap(4)).await;
         assert_eq!(dv(&app).revealed("src/a.rs", 4), (10, 10));
+    }
+
+    // ---- PR writes: thread cursor, resolve, draft / close, reviewers ----
+
+    fn general(id: &str, resolved: bool) -> CommentThread {
+        CommentThread { is_resolved: resolved, ..comment_by(id, "sam", "nit") }
+    }
+
+    fn on_file(id: &str) -> CommentThread {
+        CommentThread { file_path: Some("a.rs".into()), line: Some(1), ..comment_by(id, "sam", "nit") }
+    }
+
+    /// `pr_action_app` with every optional write supported and `threads` on the open PR.
+    fn pr_writes_app(threads: Vec<CommentThread>) -> App {
+        let mut app = pr_action_app();
+        if let Screen::PrView(v) = &mut app.screen {
+            v.writes = PrWriteSupport::ALL;
+            v.diff.threads = threads;
+        }
+        app
+    }
+
+    fn pr_writes_app_with(status: PullRequestStatus) -> App {
+        let mut p = pr(None);
+        p.status = status;
+        p.is_draft = status == PullRequestStatus::Draft;
+        let mut app = pr_writes_app(Vec::new());
+        app.pr_pool = pool_of(vec![pr_row(p.clone())], Some("me"));
+        app.prs = vec![pr_row(p.clone())];
+        if let Screen::PrView(v) = &mut app.screen {
+            v.pr = p;
+        }
+        app
+    }
+
+    fn conv_id(app: &App) -> Option<String> {
+        pr_pane(app).conv_thread().map(|t| t.id.clone())
+    }
+
+    #[test]
+    fn the_conversation_cursor_walks_only_the_general_threads_and_stops_at_the_ends() {
+        let mut app = pr_writes_app(vec![general("g1", false), on_file("f1"), general("g2", false)]);
+        assert_eq!(conv_id(&app), None, "nothing selected until an arrow is pressed");
+        app.on_pr_view_key(Key::Down);
+        assert_eq!(conv_id(&app).as_deref(), Some("g1"));
+        app.on_pr_view_key(Key::Char('j'));
+        assert_eq!(conv_id(&app).as_deref(), Some("g2"), "the line comment is skipped");
+        app.on_pr_view_key(Key::Down);
+        assert_eq!(conv_id(&app).as_deref(), Some("g2"), "clamped at the last, like the commit cursor");
+        app.on_pr_view_key(Key::Up);
+        app.on_pr_view_key(Key::Char('k'));
+        assert_eq!(conv_id(&app).as_deref(), Some("g1"), "and at the first");
+
+        // r replies to the selected thread, not to "the only one".
+        app.on_pr_view_key(Key::Down);
+        app.on_pr_view_key(Key::Char('r'));
+        assert_eq!(pr_pane(&app).reply_target.as_deref(), Some("g2"));
+        assert!(matches!(app.overlay, Some(Overlay::Input { kind: InputKind::PrThreadReply, .. })));
+    }
+
+    #[test]
+    fn reply_on_the_conversation_asks_for_a_thread_until_one_is_selected() {
+        let mut app = pr_writes_app(vec![general("g1", false), general("g2", false)]);
+        app.on_pr_view_key(Key::Char('r'));
+        assert!(app.overlay.is_none());
+        assert_eq!(app.toast.as_deref(), Some("Move onto a comment thread first (↑/↓), then r to reply"));
+        // With no general thread at all the arrows still scroll the text.
+        let mut app = pr_writes_app(vec![on_file("f1")]);
+        app.detail_scroll_max = 5;
+        app.on_pr_view_key(Key::Down);
+        assert_eq!(pr_pane(&app).scroll, 1);
+        assert_eq!(conv_id(&app), None);
+    }
+
+    #[test]
+    fn moving_the_conversation_cursor_scrolls_its_thread_into_view() {
+        let mut app = pr_writes_app(vec![general("g1", false), general("g2", false)]);
+        app.detail_scroll_max = 100;
+        if let Screen::PrView(v) = &mut app.screen {
+            *v.conv_layout.borrow_mut() = ConvLayout { rows: vec![12, 40], height: 10 };
+        }
+        app.on_pr_view_key(Key::Down);
+        assert_eq!(pr_pane(&app).scroll, 11, "the first thread was below the pane");
+        app.on_pr_view_key(Key::Down);
+        assert_eq!(pr_pane(&app).scroll, 39, "and so was the second");
+        app.on_pr_view_key(Key::Up);
+        assert_eq!(pr_pane(&app).scroll, 11, "back up to the first");
+    }
+
+    #[tokio::test]
+    async fn resolving_a_thread_flips_it_at_once_and_a_stale_refetch_keeps_it() {
+        let (calls, gate) = ItemCalls::gated();
+        let deps = deps_with_items(calls.clone()).await;
+        let mut app = pr_writes_app(vec![general("g1", false)]);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.job_tx = Some(tx);
+
+        app.on_key(Key::Down, &deps).await;
+        app.on_key(Key::Char('R'), &deps).await;
+        assert!(calls.calls().is_empty(), "the provider hasn't answered yet");
+        assert!(pr_pane(&app).diff.threads[0].is_resolved, "resolved on screen before the provider answers");
+        assert_eq!(app.toast.as_deref(), Some("Thread resolved"));
+
+        gate.notify_one();
+        let event = answer(&mut rx).await;
+        app.on_event(event, &deps);
+        assert_eq!(calls.calls(), vec!["resolve 1 g1 true".to_string()]);
+
+        // A detail fetch that still has it open doesn't flip it back…
+        app.on_event(pr_detail_with(vec![general("g1", false)]), &deps);
+        assert!(pr_pane(&app).diff.threads[0].is_resolved, "held until the provider shows it");
+        // …and once one shows it resolved, the hold lets go.
+        app.on_event(pr_detail_with(vec![general("g1", true)]), &deps);
+        assert!(pr_pane(&app).diff.threads[0].is_resolved);
+        assert!(app.held_items.is_empty(), "nothing left to hold");
+
+        // R again reopens it.
+        app.on_key(Key::Char('R'), &deps).await;
+        assert!(!pr_pane(&app).diff.threads[0].is_resolved);
+        assert_eq!(app.toast.as_deref(), Some("Thread reopened"));
+    }
+
+    #[tokio::test]
+    async fn a_refused_resolve_flips_the_thread_back() {
+        let calls = ItemCalls { refuse: true, ..ItemCalls::new() };
+        let deps = deps_with_items(calls.clone()).await;
+        let mut app = pr_writes_app(vec![general("g1", false)]);
+        app.on_key(Key::Down, &deps).await;
+        app.on_key(Key::Char('R'), &deps).await;
+        assert_eq!(calls.calls(), vec!["resolve 1 g1 true".to_string()]);
+        assert!(!pr_pane(&app).diff.threads[0].is_resolved, "back to open");
+        assert!(app.held_items.is_empty());
+        assert!(app.toast.as_deref().is_some_and(|t| t.contains("the provider said no")), "{:?}", app.toast);
+    }
+
+    #[tokio::test]
+    async fn r_does_nothing_where_the_connection_cannot_resolve() {
+        let deps = deps_with_items(ItemCalls::new()).await;
+        let mut app = pr_writes_app(vec![general("g1", false)]);
+        if let Screen::PrView(v) = &mut app.screen {
+            v.writes = PrWriteSupport::default();
+        }
+        app.on_key(Key::Down, &deps).await;
+        app.on_key(Key::Char('R'), &deps).await;
+        assert!(!pr_pane(&app).diff.threads[0].is_resolved);
+        assert!(app.overlay.is_none() && app.held_items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn d_on_a_draft_marks_it_ready_on_the_view_and_the_row_before_any_refetch() {
+        let (calls, gate) = ItemCalls::gated();
+        let deps = deps_with_items(calls.clone()).await;
+        let mut app = pr_writes_app_with(PullRequestStatus::Draft);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.job_tx = Some(tx);
+
+        app.on_key(Key::Char('D'), &deps).await;
+        assert!(calls.calls().is_empty(), "the provider hasn't answered yet");
+        assert_eq!(pr_pane(&app).pr.status, PullRequestStatus::Open, "the view flips now");
+        assert!(!pr_pane(&app).pr.is_draft);
+        assert_eq!(app.prs[0].pr.status, PullRequestStatus::Open, "and the list row on the same frame");
+        assert_eq!(app.toast.as_deref(), Some("Ready for review"));
+
+        // A refresh that still lists it as a draft doesn't flip the row back.
+        let mut stale = pr(None);
+        stale.status = PullRequestStatus::Draft;
+        stale.is_draft = true;
+        app.on_event(AppEvent::PrPoolLoaded { pool: Box::new(pool_of(vec![pr_row(stale)], Some("me"))), ok: true }, &deps);
+        assert_eq!(app.prs[0].pr.status, PullRequestStatus::Open, "held until the provider catches up");
+
+        gate.notify_one();
+        let event = answer(&mut rx).await;
+        app.on_event(event, &deps);
+        assert_eq!(calls.calls(), vec!["draft 1 false".to_string()]);
+        // `get` answers an open PR, which shows the edit: the hold lets go.
+        assert_eq!(pr_pane(&app).pr.status, PullRequestStatus::Open);
+        assert!(app.held_items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_refused_draft_flip_is_taken_back() {
+        let calls = ItemCalls { refuse: true, ..ItemCalls::new() };
+        let deps = deps_with_items(calls.clone()).await;
+        let mut app = pr_writes_app_with(PullRequestStatus::Open);
+        app.on_key(Key::Char('D'), &deps).await;
+        assert_eq!(calls.calls(), vec!["draft 1 true".to_string()]);
+        assert_eq!(pr_pane(&app).pr.status, PullRequestStatus::Open, "back to open");
+        assert!(!app.prs[0].pr.is_draft, "on the row too");
+        assert!(app.held_items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn x_on_an_open_pr_asks_first_and_enter_closes_it_and_x_again_reopens() {
+        let calls = ItemCalls::new();
+        let deps = deps_with_items(calls.clone()).await;
+        let mut app = pr_writes_app_with(PullRequestStatus::Open);
+
+        app.on_key(Key::Char('X'), &deps).await;
+        match &app.overlay {
+            Some(Overlay::Confirm { title, message, action: Action::PrSetClosed(true) }) => {
+                assert_eq!(title, "Close #1 — t?");
+                assert_eq!(message, "The branch stays. You can reopen it from here with X.");
+            }
+            _ => panic!("X asks before closing"),
+        }
+        assert!(calls.calls().is_empty(), "nothing sent before the confirm");
+        app.on_key(Key::Enter, &deps).await;
+        assert_eq!(calls.calls(), vec!["closed 1 true".to_string()]);
+        assert_eq!(pr_pane(&app).pr.status, PullRequestStatus::Closed, "kept closed though `get` hasn't caught up");
+        assert_eq!(app.prs[0].pr.status, PullRequestStatus::Closed);
+        assert_eq!(app.toast.as_deref(), Some("Closed"));
+
+        // Reopening is reversible enough to need no confirm.
+        app.on_key(Key::Char('X'), &deps).await;
+        assert!(app.overlay.is_none());
+        assert_eq!(calls.calls().last().map(String::as_str), Some("closed 1 false"));
+        assert_eq!(pr_pane(&app).pr.status, PullRequestStatus::Open);
+        assert_eq!(app.toast.as_deref(), Some("Reopened"));
+    }
+
+    #[tokio::test]
+    async fn state_keys_are_inert_where_they_dont_apply() {
+        let calls = ItemCalls::new();
+        let deps = deps_with_items(calls.clone()).await;
+        let mut app = pr_writes_app_with(PullRequestStatus::Merged);
+        for key in ['D', 'X', '@'] {
+            app.on_key(Key::Char(key), &deps).await;
+        }
+        assert!(app.overlay.is_none() && calls.calls().is_empty(), "a merged PR is past all of these");
+
+        let mut app = pr_writes_app_with(PullRequestStatus::Draft);
+        for key in ['a', 'x', 'm'] {
+            app.on_key(Key::Char(key), &deps).await;
+            assert!(app.overlay.is_none(), "a draft isn't up for {key}");
+        }
+    }
+
+    fn reviewer_user(id: &str, name: &str) -> User {
+        User { id: id.into(), display_name: name.into(), handle: Some(id.into()), avatar_url: None }
+    }
+
+    #[tokio::test]
+    async fn the_reviewer_picker_leaves_out_the_author_and_marks_who_is_already_reviewing() {
+        let calls = ItemCalls { users: vec![reviewer_user("a", "A"), reviewer_user("priya", "Priya Nair"), reviewer_user("tom", "Tom Becker")], ..ItemCalls::new() };
+        let deps = deps_with_items(calls.clone()).await;
+        let mut app = pr_writes_app(Vec::new());
+        if let Screen::PrView(v) = &mut app.screen {
+            v.pr.reviewers = vec![Reviewer { user: reviewer_user("priya", "Priya Nair"), vote: ReviewVote::Approved, is_required: false }];
+        }
+
+        app.on_key(Key::Char('@'), &deps).await;
+        match &app.overlay {
+            Some(Overlay::Search { title, items, selected, kind: SearchKind::Reviewer, .. }) => {
+                assert_eq!(title, "Request a reviewer on #1 — t");
+                let rows: Vec<_> = items.iter().map(|i| (i.id.as_deref(), i.label.as_str())).collect();
+                assert_eq!(rows, vec![(None, "Priya Nair · approved ✓"), (Some("tom"), "Tom Becker")], "no author; Priya marked");
+                assert_eq!(*selected, 1, "starts on someone who can be asked");
+            }
+            _ => panic!("@ opens the reviewer picker"),
+        }
+
+        // Choosing someone already reviewing sends nothing and keeps the picker.
+        app.on_key(Key::Up, &deps).await;
+        app.on_key(Key::Enter, &deps).await;
+        assert_eq!(app.toast.as_deref(), Some("Priya Nair is already reviewing"));
+        assert!(matches!(app.overlay, Some(Overlay::Search { kind: SearchKind::Reviewer, .. })), "still open");
+        assert_eq!(calls.calls(), vec!["reviewable".to_string()], "no request sent");
+
+        // Choosing Tom asks for his review, shown at once.
+        app.on_key(Key::Down, &deps).await;
+        app.on_key(Key::Enter, &deps).await;
+        assert!(app.overlay.is_none());
+        assert_eq!(calls.calls(), vec!["reviewable".to_string(), "request 1 tom".to_string()]);
+        assert_eq!(app.toast.as_deref(), Some("Review requested from Tom Becker"));
+        let tom = pr_pane(&app).pr.reviewers.iter().find(|r| r.user.id == "tom").map(|r| r.vote);
+        assert_eq!(tom, Some(ReviewVote::NoVote), "Tom is on the PR, asked and not yet voted");
+
+        // A second @ costs no second fetch, and now lists Tom as requested.
+        app.on_key(Key::Char('@'), &deps).await;
+        assert_eq!(calls.calls().iter().filter(|c| *c == "reviewable").count(), 1, "kept for the run");
+        match &app.overlay {
+            Some(Overlay::Search { items, .. }) => {
+                assert!(items.iter().any(|i| i.id.is_none() && i.label == "Tom Becker · requested"), "{items:?}");
+            }
+            _ => panic!("the picker opens again"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_reviewer_request_is_taken_back() {
+        let calls = ItemCalls { refuse: true, users: vec![reviewer_user("tom", "Tom Becker")], ..ItemCalls::new() };
+        let deps = deps_with_items(calls.clone()).await;
+        let mut app = pr_writes_app(Vec::new());
+        app.on_key(Key::Char('@'), &deps).await;
+        app.on_key(Key::Enter, &deps).await;
+        assert_eq!(calls.calls(), vec!["reviewable".to_string(), "request 1 tom".to_string()]);
+        assert!(pr_pane(&app).pr.reviewers.is_empty(), "Tom is taken back off");
+        assert!(app.held_items.is_empty());
+        assert!(app.toast.as_deref().is_some_and(|t| t.contains("the provider said no")), "{:?}", app.toast);
+    }
+
+    #[test]
+    fn the_palette_lists_the_pr_write_actions_only_where_they_apply() {
+        let actions = |app: &App| app.context_actions().into_iter().map(|(_, k)| k).collect::<Vec<_>>();
+        let mut app = pr_writes_app_with(PullRequestStatus::Open);
+        let keys = actions(&app);
+        for key in ['D', 'X', '@'] {
+            assert!(keys.contains(&Key::Char(key)), "an open PR offers {key}");
+        }
+        assert!(!keys.contains(&Key::Char('R')), "no thread selected, no resolve");
+        if let Screen::PrView(v) = &mut app.screen {
+            v.diff.threads = vec![general("g1", false)];
+            v.conv_sel = Some(0);
+        }
+        assert!(actions(&app).contains(&Key::Char('R')), "resolve, with a thread selected");
+        if let Screen::PrView(v) = &mut app.screen {
+            v.writes = PrWriteSupport::default();
+        }
+        let keys = actions(&app);
+        for key in ['D', 'X', '@', 'R'] {
+            assert!(!keys.contains(&Key::Char(key)), "nothing the connection can't do: {key}");
+        }
     }
 }

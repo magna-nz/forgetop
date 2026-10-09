@@ -137,6 +137,11 @@ fn router(state: AppState) -> Router {
         .route("/api/pr/comment", post(pr_comment))
         .route("/api/pr/reply", post(pr_reply))
         .route("/api/pr/review", post(pr_review))
+        .route("/api/pr/resolve-thread", post(pr_resolve_thread))
+        .route("/api/pr/draft", post(pr_draft))
+        .route("/api/pr/closed", post(pr_closed))
+        .route("/api/pr/reviewers", get(pr_reviewers))
+        .route("/api/pr/request-reviewer", post(pr_request_reviewer))
         .route("/api/wi/detail", get(wi_detail))
         .route("/api/wi/states", get(wi_states))
         .route("/api/wi/state", post(wi_state))
@@ -371,6 +376,25 @@ async fn pr_reply(State(s): State<AppState>, Json(req): Json<actions::PrReplyReq
 async fn pr_review(State(s): State<AppState>, Json(req): Json<actions::PrReviewReq>) -> Response {
     action_response("dashboard.pr_review", actions::pr_review(&s.deps.sections, req).await)
 }
+async fn pr_resolve_thread(State(s): State<AppState>, Json(req): Json<actions::PrResolveThreadReq>) -> Response {
+    action_response("dashboard.pr_resolve_thread", actions::pr_resolve_thread(&s.deps.sections, req).await)
+}
+async fn pr_draft(State(s): State<AppState>, Json(req): Json<actions::PrDraftReq>) -> Response {
+    action_response("dashboard.pr_draft", actions::pr_set_draft(&s.deps.sections, req).await)
+}
+async fn pr_closed(State(s): State<AppState>, Json(req): Json<actions::PrClosedReq>) -> Response {
+    action_response("dashboard.pr_closed", actions::pr_set_closed(&s.deps.sections, req).await)
+}
+async fn pr_reviewers(State(s): State<AppState>, Query(q): Query<ItemQuery>) -> Response {
+    let (conn, item) = q.item();
+    match actions::pr_reviewers(&s.deps.sections, &conn, &item).await {
+        Some(users) => Json(users).into_response(),
+        None => (StatusCode::NOT_FOUND, "pull request connection not found").into_response(),
+    }
+}
+async fn pr_request_reviewer(State(s): State<AppState>, Json(req): Json<actions::PrRequestReviewerReq>) -> Response {
+    action_response("dashboard.pr_request_reviewer", actions::pr_request_reviewer(&s.deps.sections, req).await)
+}
 
 async fn wi_detail(State(s): State<AppState>, Query(q): Query<ItemQuery>) -> Response {
     let (conn, item) = q.item();
@@ -545,5 +569,157 @@ async fn set_pipeline_selection(State(s): State<AppState>, Json(req): Json<Pipel
     match saved {
         Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The optional pull-request writes (resolve a thread, draft, close/reopen, request a
+    //! reviewer) end to end through the HTTP API, against the in-memory demo provider — the same
+    //! harness `tests/api.rs` uses for the other routes.
+
+    use super::*;
+    use forgetop_core::config::{ConfigStore, ForgetopConfig, InMemoryConfigStore};
+    use forgetop_core::domain::ProviderType;
+    use forgetop_core::provider::{Connection, ProviderRegistry};
+    use forgetop_core::secret::InMemorySecretStore;
+    use forgetop_core::service::ConnectionResolver;
+    use forgetop_providers::demo::demo_factories;
+
+    /// One demo GitHub connection bound to the PR section — the shape `forgetop --demo` wires.
+    async fn demo_deps() -> Deps {
+        let registry = Arc::new(ProviderRegistry::new(demo_factories()));
+        let store: Arc<dyn ConfigStore> = Arc::new(InMemoryConfigStore::new(ForgetopConfig::default()));
+        let secrets: Arc<dyn SecretStore> = Arc::new(InMemorySecretStore::default());
+        let config = Arc::new(ConfigService::new(store, secrets.clone(), registry.clone()));
+        config.load().await.unwrap();
+        let conn = Connection {
+            id: "github".into(),
+            provider_type: ProviderType::GitHub,
+            display_name: "github".into(),
+            base_url: None,
+            organization: None,
+            project: None,
+            repository: None,
+            username: None,
+            credential_ref: None,
+            repo_scope: None,
+        };
+        config.add_or_update_connection(conn, None).await.unwrap();
+        config.bind_pull_requests("github").await.unwrap();
+        let resolver = Arc::new(ConnectionResolver::new(config.clone(), registry, secrets.clone()));
+        let sections = Arc::new(SectionService::new(config.clone(), resolver.clone()));
+        let health = Arc::new(ConnectionHealthService::new(config.clone(), resolver));
+        Deps { sections, health, config, secrets }
+    }
+
+    struct Api {
+        base: String,
+        token: String,
+        client: reqwest::Client,
+    }
+
+    impl Api {
+        async fn start() -> Api {
+            let server = spawn(demo_deps().await, 0).await.expect("server binds a free port");
+            Api { base: format!("http://127.0.0.1:{}", server.port), token: server.token, client: reqwest::Client::new() }
+        }
+        async fn get(&self, path: &str) -> serde_json::Value {
+            let r = self.client.get(format!("{}{path}", self.base)).header("x-forgetop-token", &self.token).send().await.unwrap();
+            assert_eq!(r.status(), 200, "GET {path}");
+            r.json().await.unwrap()
+        }
+        async fn post(&self, path: &str, body: serde_json::Value) -> u16 {
+            let r = self.client.post(format!("{}{path}", self.base)).header("x-forgetop-token", &self.token).json(&body).send().await.unwrap();
+            r.status().as_u16()
+        }
+        /// The open PRs the list shows, as `(id, status)`.
+        async fn open_prs(&self) -> Vec<(String, String)> {
+            let rows = self.get("/api/pull-requests").await;
+            rows.as_array()
+                .unwrap()
+                .iter()
+                .map(|r| (r["pull_request"]["id"].as_str().unwrap().to_string(), r["pull_request"]["status"].as_str().unwrap().to_string()))
+                .collect()
+        }
+        async fn detail(&self, id: &str) -> serde_json::Value {
+            self.get(&format!("/api/pr/detail?conn=github&id={id}")).await
+        }
+    }
+
+    /// The demo PRs are global to the process, so each test picks its own open PR to write to.
+    async fn open_pr(api: &Api, nth: usize) -> String {
+        let open: Vec<_> = api.open_prs().await.into_iter().filter(|(_, s)| s == "Open").collect();
+        open.get(nth).unwrap_or_else(|| panic!("demo has at least {} open PRs", nth + 1)).0.clone()
+    }
+
+    #[tokio::test]
+    async fn pr_detail_advertises_the_demo_writes() {
+        let api = Api::start().await;
+        let id = open_pr(&api, 0).await;
+        let writes = &api.detail(&id).await["writes"];
+        for k in ["resolve_threads", "draft", "close", "reopen", "request_reviewer"] {
+            assert_eq!(writes[k], true, "demo supports {k}: {writes}");
+        }
+    }
+
+    #[tokio::test]
+    async fn resolving_a_thread_flips_it_on_the_next_detail() {
+        let api = Api::start().await;
+        let id = open_pr(&api, 1).await;
+        let thread = |d: &serde_json::Value, t: &str| d["threads"].as_array().unwrap().iter().find(|x| x["id"] == t).cloned().unwrap();
+        assert_eq!(thread(&api.detail(&id).await, "t1")["is_resolved"], false, "t1 starts open");
+
+        let body = |resolved: bool| serde_json::json!({ "conn": "github", "id": id, "thread_id": "t1", "resolved": resolved });
+        assert_eq!(api.post("/api/pr/resolve-thread", body(true)).await, 200);
+        assert_eq!(thread(&api.detail(&id).await, "t1")["is_resolved"], true, "resolve persists");
+        assert_eq!(api.post("/api/pr/resolve-thread", body(false)).await, 200);
+        assert_eq!(thread(&api.detail(&id).await, "t1")["is_resolved"], false, "reopen persists");
+    }
+
+    #[tokio::test]
+    async fn draft_and_close_change_the_pr_status() {
+        let api = Api::start().await;
+        let id = open_pr(&api, 2).await;
+        let status = |d: serde_json::Value| d["pull_request"]["status"].as_str().unwrap().to_string();
+
+        assert_eq!(api.post("/api/pr/draft", serde_json::json!({ "conn": "github", "id": id, "draft": true })).await, 200);
+        assert_eq!(status(api.detail(&id).await), "Draft", "converted to a draft");
+        assert_eq!(api.post("/api/pr/draft", serde_json::json!({ "conn": "github", "id": id, "draft": false })).await, 200);
+        assert_eq!(status(api.detail(&id).await), "Open", "ready for review again");
+
+        assert_eq!(api.post("/api/pr/closed", serde_json::json!({ "conn": "github", "id": id, "closed": true })).await, 200);
+        assert_eq!(status(api.detail(&id).await), "Closed");
+        assert!(!api.open_prs().await.iter().any(|(p, _)| *p == id), "a closed PR leaves the open list");
+        assert_eq!(api.post("/api/pr/closed", serde_json::json!({ "conn": "github", "id": id, "closed": false })).await, 200);
+        assert_eq!(status(api.detail(&id).await), "Open", "reopened");
+        assert!(api.open_prs().await.iter().any(|(p, _)| *p == id), "and back on the open list");
+
+        // A missing connection is a 404, as for every other action.
+        assert_eq!(api.post("/api/pr/draft", serde_json::json!({ "conn": "nope", "id": id, "draft": true })).await, 404);
+    }
+
+    #[tokio::test]
+    async fn requesting_a_reviewer_adds_them_to_the_pr() {
+        let api = Api::start().await;
+        let id = open_pr(&api, 3).await;
+        let users = api.get(&format!("/api/pr/reviewers?conn=github&id={id}")).await;
+        let users = users.as_array().expect("reviewers is a JSON array of users");
+        assert!(!users.is_empty(), "the demo has someone to ask");
+
+        let reviewer_ids = |d: &serde_json::Value| -> Vec<String> {
+            d["pull_request"]["reviewers"].as_array().unwrap().iter().map(|r| r["user"]["id"].as_str().unwrap().to_string()).collect()
+        };
+        let before = reviewer_ids(&api.detail(&id).await);
+        let pick = users.iter().map(|u| u["id"].as_str().unwrap().to_string()).find(|u| !before.contains(u)).expect("someone not yet reviewing");
+
+        assert_eq!(api.post("/api/pr/request-reviewer", serde_json::json!({ "conn": "github", "id": id, "user_id": pick })).await, 200);
+        let after = api.detail(&id).await;
+        let added = after["pull_request"]["reviewers"].as_array().unwrap().iter().find(|r| r["user"]["id"] == pick.as_str()).cloned();
+        let added = added.expect("the requested reviewer is on the PR");
+        assert_eq!(added["vote"], "NoVote", "requested, not yet voted");
+
+        let missing = api.client.get(format!("{}/api/pr/reviewers?conn=nope&id={id}", api.base)).header("x-forgetop-token", &api.token).send().await.unwrap();
+        assert_eq!(missing.status(), 404, "a bad connection is a 404");
     }
 }

@@ -271,6 +271,29 @@ pub struct MergeOptions {
     pub delete_source_ref: bool,
 }
 
+/// Which of the optional pull-request writes a connection can perform. All `false` by default:
+/// a frontend shows the key for each only where the provider says it works, so a forge without
+/// an API for one (Bitbucket cannot reopen a declined pull request; GitLab has no draft flag
+/// beyond the title prefix) never offers a key that would only fail.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrWriteSupport {
+    /// [`PullRequestSource::resolve_thread`] works.
+    pub resolve_threads: bool,
+    /// [`PullRequestSource::set_draft`] works in both directions.
+    pub draft: bool,
+    /// [`PullRequestSource::set_closed`] can close an open pull request.
+    pub close: bool,
+    /// [`PullRequestSource::set_closed`] can reopen a closed one.
+    pub reopen: bool,
+    /// [`PullRequestSource::reviewable_users`] and [`PullRequestSource::request_reviewer`] work.
+    pub request_reviewer: bool,
+}
+
+impl PrWriteSupport {
+    /// Every write supported — what a full-featured forge (and the demo) reports.
+    pub const ALL: PrWriteSupport = PrWriteSupport { resolve_threads: true, draft: true, close: true, reopen: true, request_reviewer: true };
+}
+
 // ---- capability-scoped sources ----
 
 /// Pull requests from one connection. Every method that names a single pull request takes an
@@ -385,6 +408,37 @@ pub trait PullRequestSource: Send + Sync {
     /// request-changes / plain comment. Defaults to unsupported.
     async fn submit_review(&self, _item: &ItemRef, _event: ReviewVote, _comments: &[LineComment]) -> Result<()> {
         Err(Error::Provider("this provider doesn't support line-comment reviews".into()))
+    }
+    /// Which of the writes below this connection can perform. Nothing by default; a provider
+    /// reports exactly the ones it implements so a frontend offers only those.
+    fn pr_writes(&self) -> PrWriteSupport {
+        PrWriteSupport::default()
+    }
+    /// Marks a comment thread (by the id [`threads`](Self::threads) gave it) resolved or, with
+    /// `resolved = false`, open again. Defaults to unsupported.
+    async fn resolve_thread(&self, _item: &ItemRef, _thread_id: &str, _resolved: bool) -> Result<()> {
+        Err(Error::Provider("this provider doesn't support resolving comment threads".into()))
+    }
+    /// Converts an open pull request to a draft (`draft = true`) or marks a draft ready for
+    /// review (`draft = false`). Defaults to unsupported.
+    async fn set_draft(&self, _item: &ItemRef, _draft: bool) -> Result<()> {
+        Err(Error::Provider("this provider doesn't support changing a pull request's draft state".into()))
+    }
+    /// Closes an open pull request without merging (`closed = true`) or reopens a closed one
+    /// (`closed = false`). Defaults to unsupported.
+    async fn set_closed(&self, _item: &ItemRef, _closed: bool) -> Result<()> {
+        Err(Error::Provider("this provider doesn't support closing or reopening pull requests".into()))
+    }
+    /// The people who can be asked to review this pull request — the repository's collaborators,
+    /// members or team, depending on the forge. Fetched once per repository and kept for the
+    /// run by a caller; a provider should likewise cache it on its client. Defaults to none.
+    async fn reviewable_users(&self, _item: &ItemRef) -> Result<Vec<User>> {
+        Ok(Vec::new())
+    }
+    /// Asks `user_id` (an id from [`reviewable_users`](Self::reviewable_users)) to review the
+    /// pull request, keeping any reviewers already on it. Defaults to unsupported.
+    async fn request_reviewer(&self, _item: &ItemRef, _user_id: &str) -> Result<()> {
+        Err(Error::Provider("this provider doesn't support requesting reviewers".into()))
     }
 }
 
@@ -720,5 +774,49 @@ mod tests {
     #[test]
     fn new_id_is_prefixed() {
         assert!(Connection::new_id(ProviderType::GitHub).starts_with("github-"));
+    }
+
+    /// A source that implements only the required methods: the optional writes default to
+    /// "unsupported", and `pr_writes` says so, so a frontend offers none of their keys.
+    struct BarePrs;
+
+    #[async_trait]
+    impl PullRequestSource for BarePrs {
+        async fn list(&self, _q: &PullRequestQuery) -> Result<Vec<PullRequest>> {
+            Ok(Vec::new())
+        }
+        async fn get(&self, item: &ItemRef) -> Result<PullRequest> {
+            Err(Error::NotFound(item.id.clone()))
+        }
+        async fn threads(&self, _item: &ItemRef) -> Result<Vec<CommentThread>> {
+            Ok(Vec::new())
+        }
+        async fn changes(&self, _item: &ItemRef) -> Result<Vec<FileChange>> {
+            Ok(Vec::new())
+        }
+        async fn add_comment(&self, _item: &ItemRef, _body: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn vote(&self, _item: &ItemRef, _vote: ReviewVote) -> Result<()> {
+            Ok(())
+        }
+        async fn merge(&self, _item: &ItemRef, _options: &MergeOptions) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn optional_pull_request_writes_default_to_unsupported() {
+        let src = BarePrs;
+        let item = ItemRef::new("1");
+        assert_eq!(src.pr_writes(), PrWriteSupport::default(), "nothing advertised");
+        assert!(!PrWriteSupport::default().resolve_threads && !PrWriteSupport::default().request_reviewer);
+        assert!(src.resolve_thread(&item, "t1", true).await.is_err());
+        assert!(src.set_draft(&item, false).await.is_err());
+        assert!(src.set_closed(&item, true).await.is_err());
+        assert!(src.request_reviewer(&item, "u1").await.is_err());
+        assert!(src.reviewable_users(&item).await.unwrap().is_empty(), "no people rather than an error, so a picker opens empty");
+        let all = PrWriteSupport::ALL;
+        assert!(all.resolve_threads && all.draft && all.close && all.reopen && all.request_reviewer);
     }
 }
