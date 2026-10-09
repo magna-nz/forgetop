@@ -5245,7 +5245,16 @@ impl App {
     ///
     /// Shared by the full reload and the pool the reload hands over early, so the PR list never
     /// waits on work items, pipelines, notifications or discovery to show rows it already has.
-    fn take_pr_pool(&mut self, pool: PrPool, ok: SectionsOk, deps: &AppDeps) {
+    fn take_pr_pool(&mut self, mut pool: PrPool, ok: SectionsOk, deps: &AppDeps) {
+        // A reload that could not say who you are on a connection (a rate limit answering
+        // `/user`, say) keeps the identity the last one established — including the one the
+        // cache seeded at launch. "Mine" filtered by who you were a minute ago beats "Mine"
+        // showing everyone's rows because the answer was missing this time.
+        for (conn_id, me) in &self.pr_pool.me {
+            if me.is_some() && pool.me.get(conn_id).is_some_and(|m| m.is_none()) {
+                pool.me.insert(conn_id.clone(), me.clone());
+            }
+        }
         let pool_incoming = !pool.open.is_empty() || !pool.completed.is_empty();
         if ok.prs || pool_incoming {
             self.pr_pool = pool;
@@ -9008,6 +9017,9 @@ impl App {
     fn purge_connection(&mut self, id: &str, deps: &AppDeps) {
         self.prs.retain(|r| r.connection_id != id);
         retain_pool_rows(&mut self.pr_pool, |r| r.connection_id != id);
+        // Its identity goes too, or a connection re-made under the same id could inherit it.
+        self.pr_pool.me.remove(id);
+        self.pr_pool.review_clears_request.remove(id);
         self.wis.retain(|r| r.connection_id != id);
         self.pipes.retain(|r| r.connection_id != id);
         self.inbox.retain(|r| r.connection_id != id);
@@ -18858,6 +18870,27 @@ mod tests {
         let hold = app.hold(&key);
         assert_eq!(hold.review_cleared, None, "…without bringing back the clearing the provider has had the last word on");
         assert!(hold.until > Utc::now());
+    }
+
+    /// A reload whose `/user` call failed (a rate limit, say) must not turn "Mine" into
+    /// everyone's pull requests: the identity the previous reload established still filters it.
+    #[tokio::test]
+    async fn a_reload_that_cannot_say_who_you_are_keeps_the_last_identity() {
+        let deps = deps_with_items(ItemCalls::new()).await;
+        let mut app = App::new("slate");
+        app.pr_filter = PullRequestFilter::Mine;
+        let mine = || pool_pr("c", "1", "me", &[]);
+        let theirs = || pool_pr("c", "2", "sam", &[]);
+        app.on_event(AppEvent::PrPoolLoaded { pool: Box::new(pool_of(vec![mine(), theirs()], Some("me"))), ok: true }, &deps);
+        assert_eq!(ids(&app.prs), vec!["1"], "Mine is yours");
+
+        app.on_event(AppEvent::PrPoolLoaded { pool: Box::new(pool_of(vec![mine(), theirs()], None)), ok: true }, &deps);
+        assert_eq!(app.pr_pool.me.get("c"), Some(&Some("me".to_string())), "the identity carries over");
+        assert_eq!(ids(&app.prs), vec!["1"], "so Mine is still yours, not everyone's");
+
+        // One that answers is taken as it is, as ever.
+        app.on_event(AppEvent::PrPoolLoaded { pool: Box::new(pool_of(vec![mine(), theirs()], Some("sam"))), ok: true }, &deps);
+        assert_eq!(ids(&app.prs), vec!["2"]);
     }
 
     #[tokio::test]
