@@ -358,6 +358,13 @@ pub trait PullRequestSource: Send + Sync {
     async fn commit_changes(&self, _item: &ItemRef, _sha: &str) -> Result<Vec<FileChange>> {
         Ok(Vec::new())
     }
+    /// The full text of `path` as of commit `sha` — the pull request's head when `sha` is
+    /// `None` — so a diff can show the unchanged lines between its hunks. Fetched on demand,
+    /// never on a reload. `None` when the forge can't say: a binary or oversized file, a path
+    /// missing at that commit, or (the default) a provider without a content API.
+    async fn file_text(&self, _item: &ItemRef, _path: &str, _sha: Option<&str>) -> Result<Option<String>> {
+        Ok(None)
+    }
     async fn add_comment(&self, item: &ItemRef, body: &str) -> Result<()>;
     /// Replies to an existing comment thread (returned by [`threads`](Self::threads)), so you can
     /// answer someone else's comment in-thread rather than starting a new top-level one. Defaults

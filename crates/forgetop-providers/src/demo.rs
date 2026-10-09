@@ -1208,6 +1208,233 @@ fn clear_reviewed_request(mut pr: PullRequest) -> PullRequest {
     pr
 }
 
+// ---- the demo pull request's files, in full ----
+//
+// Each is the file as of the pull request's head, so a diff can expand the unchanged lines
+// between its hunks. Every context and added line in `changes()` sits verbatim at the line its
+// hunk header puts it on — `check_patch` holds the two together, and a test runs it over them all.
+
+const RETRY_RS: &str = r#"use std::time::Duration;
+
+/// Retry policy with jittered exponential backoff.
+pub struct RetryPolicy {
+    pub max_attempts: u32,
+    pub base: Duration,
+}
+
+impl RetryPolicy {
+    pub fn new(max_attempts: u32) -> Self {
+        Self { max_attempts, base: Duration::from_millis(100) }
+    }
+
+    pub fn backoff(&self, attempt: u32) -> Duration {
+        let exp = self.base * 2u32.pow(attempt);
+        exp + jitter(exp)
+    }
+}
+"#;
+
+const CLIENT_RS: &str = r#"use crate::http::retry::RetryPolicy;
+use crate::http::transport::Transport;
+use crate::http::{Request, Response, Result};
+
+/// A thin wrapper over the transport that knows the API's base URL.
+pub struct HttpClient {
+    inner: Transport,
+    base: String,
+}
+
+impl HttpClient {
+    pub async fn send(&self, req: Request) -> Result<Response> {
+        let policy = RetryPolicy::new(3);
+        self.send_with_retry(req, &policy).await
+    }
+
+    fn base_url(&self) -> &str {
+        self.base.trim_end_matches('/')
+    }
+
+    /// Joins `path` onto the base URL, with exactly one slash between them.
+    pub fn url(&self, path: &str) -> String {
+        format!("{}/{}", self.base_url(), path.trim_start_matches('/'))
+    }
+
+    pub async fn get(&self, path: &str) -> Result<Response> {
+        self.send(Request::get(self.url(path))).await
+    }
+
+    pub async fn post(&self, path: &str, body: Vec<u8>) -> Result<Response> {
+        self.send(Request::post(self.url(path)).body(body)).await
+    }
+
+    pub async fn delete(&self, path: &str) -> Result<Response> {
+        self.send(Request::delete(self.url(path))).await
+    }
+
+    /// The base URL exactly as configured, trailing slash and all. Kept for the callers
+    /// that compare it verbatim (the response cache keys on it), where `base_url`'s
+    /// trimmed form would miss.
+    pub fn raw_base(&self) -> &String {
+        &self.base
+    }
+
+    async fn send_with_retry(&self, req: Request, policy: &RetryPolicy) -> Result<Response> {
+        // retry loop with jittered backoff
+        self.inner.execute(req).await
+    }
+}
+"#;
+
+const GITHUB_AUTH_RS: &str = r#"//! GitHub personal-access-token authentication.
+
+use crate::http::{Error, HttpClient, Result};
+
+/// A personal access token, sent as a bearer header on every request.
+pub struct TokenAuth {
+    token: String,
+}
+
+impl TokenAuth {
+    pub fn new(token: impl Into<String>) -> Self {
+        Self { token: token.into() }
+    }
+
+    pub fn header(&self) -> (&'static str, String) {
+        ("Authorization", format!("Bearer {}", self.token))
+    }
+
+    /// Checks the token against `/user`. `send` retries a dropped connection now, so a
+    /// flaky network no longer reads as a bad token.
+    pub async fn verify(&self, client: &HttpClient) -> Result<()> {
+        let resp = client.get("/user").await?;
+        if resp.status() == 401 {
+            return Err(Error::Unauthorized);
+        }
+        Ok(())
+    }
+}
+"#;
+
+const GITLAB_AUTH_RS: &str = r#"//! GitLab personal-access-token authentication.
+
+use crate::http::{Error, HttpClient, Result};
+
+/// A personal access token, sent as GitLab's `PRIVATE-TOKEN` header.
+pub struct TokenAuth {
+    token: String,
+}
+
+impl TokenAuth {
+    pub fn new(token: impl Into<String>) -> Self {
+        Self { token: token.into() }
+    }
+
+    pub fn header(&self) -> (&'static str, String) {
+        ("PRIVATE-TOKEN", self.token.clone())
+    }
+
+    /// Checks the token against `/user`; `send` retries a dropped connection.
+    pub async fn verify(&self, client: &HttpClient) -> Result<()> {
+        let resp = client.get("/api/v4/user").await?;
+        match resp.status() {
+            401 | 403 => Err(Error::Unauthorized),
+            _ => Ok(()),
+        }
+    }
+}
+"#;
+
+const RETRY_MD: &str = r#"# Retries
+
+Every request the HTTP client sends goes through a `RetryPolicy`: up to three attempts,
+with jittered exponential backoff between them (100 ms, then 200 ms, then 400 ms, each
+plus up to the same again at random).
+
+A dropped connection no longer fails sign-in: `TokenAuth::verify` on both GitHub and
+GitLab goes through `send`, so it gets the same retries as every other request.
+"#;
+
+const CARGO_TOML: &str = r#"[package]
+name = "payments-client"
+version = "0.4.0"
+edition = "2021"
+
+[dependencies]
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+thiserror = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+
+[dev-dependencies]
+tokio-test = "0.4"
+"#;
+
+/// The full text of a demo pull request's file at its head, for the paths `changes()` lists.
+fn demo_file_text(path: &str) -> Option<&'static str> {
+    Some(match path {
+        "src/http/retry.rs" => RETRY_RS,
+        "src/http/client.rs" => CLIENT_RS,
+        "src/providers/github/auth.rs" => GITHUB_AUTH_RS,
+        "src/providers/gitlab/auth.rs" => GITLAB_AUTH_RS,
+        "docs/retry.md" => RETRY_MD,
+        "Cargo.toml" => CARGO_TOML,
+        _ => return None,
+    })
+}
+
+/// Whether `patch` agrees with `text`, the file as of the patch's new side: every context and
+/// added line verbatim at the line its `@@ -a,b +c,d @@` header puts it on, and every header's
+/// counts the lines its hunk holds. `Err` names the first disagreement.
+fn check_patch(text: &str, patch: &str) -> std::result::Result<(), String> {
+    let file: Vec<&str> = text.lines().collect();
+    let range = |r: &str| -> Option<(usize, usize)> {
+        match r.split_once(',') {
+            Some((start, count)) => Some((start.parse().ok()?, count.parse().ok()?)),
+            None => Some((r.parse().ok()?, 1)),
+        }
+    };
+    // The open hunk: its header, the next new-side line number, and the old and new lines left.
+    let mut open: Option<(&str, usize, usize, usize)> = None;
+    let close = |open: Option<(&str, usize, usize, usize)>| match open {
+        Some((header, _, old, new)) if (old, new) != (0, 0) => Err(format!("{header}: {old} old / {new} new line(s) short of its counts")),
+        _ => Ok(()),
+    };
+    for line in patch.lines() {
+        if line.starts_with("@@") {
+            close(open)?;
+            let bad = || format!("{line}: not a hunk header");
+            let ranges = line.trim_start_matches("@@ ").split(" @@").next().unwrap_or("");
+            let (old, new) = ranges.split_once(' ').ok_or_else(bad)?;
+            let (_, old_count) = old.strip_prefix('-').and_then(range).ok_or_else(bad)?;
+            let (new_start, new_count) = new.strip_prefix('+').and_then(range).ok_or_else(bad)?;
+            open = Some((line, new_start, old_count, new_count));
+            continue;
+        }
+        let Some((header, next, old, new)) = open.as_mut() else { return Err(format!("{line:?} comes before any hunk header")) };
+        let over = |side: &str| format!("{header}: more {side} lines than its counts");
+        let mut chars = line.chars();
+        let tag = chars.next().unwrap_or(' ');
+        let body = chars.as_str();
+        match tag {
+            '\\' => {} // "\ No newline at end of file"
+            '-' => *old = old.checked_sub(1).ok_or_else(|| over("old"))?,
+            ' ' | '+' => {
+                if tag == ' ' {
+                    *old = old.checked_sub(1).ok_or_else(|| over("old"))?;
+                }
+                *new = new.checked_sub(1).ok_or_else(|| over("new"))?;
+                let at = next.checked_sub(1).and_then(|i| file.get(i)).copied();
+                if at != Some(body) {
+                    return Err(format!("{header}: line {next} is {at:?}, the hunk says {body:?}"));
+                }
+                *next += 1;
+            }
+            _ => return Err(format!("{header}: {line:?} is not a diff line")),
+        }
+    }
+    close(open)
+}
+
 struct DemoPr {
     conn: String,
 }
@@ -1368,10 +1595,10 @@ impl PullRequestSource for DemoPr {
             FileChange {
                 path: "src/http/client.rs".into(),
                 kind: FileChangeKind::Modified,
-                additions: 8,
+                additions: 7,
                 deletions: 1,
                 patch: Some(
-                    "@@ -12,7 +12,9 @@ impl HttpClient {\n\
+                    "@@ -12,5 +12,6 @@ impl HttpClient {\n\
                      \x20    pub async fn send(&self, req: Request) -> Result<Response> {\n\
                      -        self.inner.execute(req).await\n\
                      +        let policy = RetryPolicy::new(3);\n\
@@ -1379,7 +1606,7 @@ impl PullRequestSource for DemoPr {
                      \x20    }\n\
                      \x20\n\
                      \x20    fn base_url(&self) -> &str {\n\
-                     @@ -40,6 +42,12 @@ impl HttpClient {\n\
+                     @@ -41,2 +42,7 @@ impl HttpClient {\n\
                      \x20        &self.base\n\
                      +    }\n\
                      +\n\
@@ -1387,6 +1614,95 @@ impl PullRequestSource for DemoPr {
                      +        // retry loop with jittered backoff\n\
                      +        self.inner.execute(req).await\n\
                      \x20    }\n"
+                        .into(),
+                ),
+            },
+            FileChange {
+                path: "src/providers/github/auth.rs".into(),
+                kind: FileChangeKind::Modified,
+                additions: 7,
+                deletions: 7,
+                patch: Some(
+                    "@@ -16,13 +16,13 @@ impl TokenAuth {\n\
+                     \x20        (\"Authorization\", format!(\"Bearer {}\", self.token))\n\
+                     \x20    }\n\
+                     \x20\n\
+                     -    /// Checks the token against `/user`, retrying by hand: the client didn't retry.\n\
+                     +    /// Checks the token against `/user`. `send` retries a dropped connection now, so a\n\
+                     +    /// flaky network no longer reads as a bad token.\n\
+                     \x20    pub async fn verify(&self, client: &HttpClient) -> Result<()> {\n\
+                     -        for _ in 0..3 {\n\
+                     -            if let Ok(resp) = client.get(\"/user\").await {\n\
+                     -                return if resp.status() == 401 { Err(Error::Unauthorized) } else { Ok(()) };\n\
+                     -            }\n\
+                     -        }\n\
+                     -        Err(Error::Unreachable)\n\
+                     +        let resp = client.get(\"/user\").await?;\n\
+                     +        if resp.status() == 401 {\n\
+                     +            return Err(Error::Unauthorized);\n\
+                     +        }\n\
+                     +        Ok(())\n\
+                     \x20    }\n\
+                     \x20}\n"
+                        .into(),
+                ),
+            },
+            FileChange {
+                path: "src/providers/gitlab/auth.rs".into(),
+                kind: FileChangeKind::Modified,
+                additions: 2,
+                deletions: 2,
+                patch: Some(
+                    "@@ -16,9 +16,9 @@ impl TokenAuth {\n\
+                     \x20        (\"PRIVATE-TOKEN\", self.token.clone())\n\
+                     \x20    }\n\
+                     \x20\n\
+                     -    /// Checks the token against `/user`, once: a dropped connection fails sign-in.\n\
+                     +    /// Checks the token against `/user`; `send` retries a dropped connection.\n\
+                     \x20    pub async fn verify(&self, client: &HttpClient) -> Result<()> {\n\
+                     -        let resp = client.get_once(\"/api/v4/user\").await?;\n\
+                     +        let resp = client.get(\"/api/v4/user\").await?;\n\
+                     \x20        match resp.status() {\n\
+                     \x20            401 | 403 => Err(Error::Unauthorized),\n\
+                     \x20            _ => Ok(()),\n"
+                        .into(),
+                ),
+            },
+            FileChange {
+                path: "docs/retry.md".into(),
+                kind: FileChangeKind::Added,
+                additions: 8,
+                deletions: 0,
+                patch: Some(
+                    "@@ -0,0 +1,8 @@\n\
+                     +# Retries\n\
+                     +\n\
+                     +Every request the HTTP client sends goes through a `RetryPolicy`: up to three attempts,\n\
+                     +with jittered exponential backoff between them (100 ms, then 200 ms, then 400 ms, each\n\
+                     +plus up to the same again at random).\n\
+                     +\n\
+                     +A dropped connection no longer fails sign-in: `TokenAuth::verify` on both GitHub and\n\
+                     +GitLab goes through `send`, so it gets the same retries as every other request.\n"
+                        .into(),
+                ),
+            },
+            FileChange {
+                path: "Cargo.toml".into(),
+                kind: FileChangeKind::Modified,
+                additions: 2,
+                deletions: 1,
+                patch: Some(
+                    "@@ -4,8 +4,9 @@\n\
+                     \x20edition = \"2021\"\n\
+                     \x20\n\
+                     \x20[dependencies]\n\
+                     +rand = \"0.8\"\n\
+                     \x20serde = { version = \"1\", features = [\"derive\"] }\n\
+                     \x20thiserror = \"1\"\n\
+                     -tokio = { version = \"1\", features = [\"rt-multi-thread\", \"macros\"] }\n\
+                     +tokio = { version = \"1\", features = [\"rt-multi-thread\", \"macros\", \"time\"] }\n\
+                     \x20\n\
+                     \x20[dev-dependencies]\n"
                         .into(),
                 ),
             },
@@ -1461,6 +1777,22 @@ impl PullRequestSource for DemoPr {
             },
         };
         Ok(vec![file])
+    }
+    async fn file_text(&self, item: &ItemRef, path: &str, sha: Option<&str>) -> Result<Option<String>> {
+        let Some(text) = demo_file_text(path) else { return Ok(None) };
+        // The demo keeps only the head's text, which is also the text at a commit whose own patch
+        // to the file agrees with it; at any other commit the forge would say something else.
+        let agrees = match sha {
+            None => true,
+            Some(sha) => self
+                .commit_changes(item, sha)
+                .await?
+                .iter()
+                .find(|f| f.path == path)
+                .and_then(|f| f.patch.as_deref())
+                .is_some_and(|patch| check_patch(text, patch).is_ok()),
+        };
+        Ok(agrees.then(|| text.to_string()))
     }
     async fn add_comment(&self, item: &ItemRef, body: &str) -> Result<()> {
         let id: &str = &item.id;
@@ -2710,5 +3042,63 @@ mod tests {
             mine.iter().all(|w| w.assignee.as_ref().map(|u| u.id == "me").unwrap_or(false)),
             "only Alice's items remain"
         );
+    }
+
+    /// The guard against demo drift: the full text `file_text` serves must agree with every hunk
+    /// `changes()` shows, or expanding a gap would show lines the diff contradicts.
+    #[tokio::test]
+    async fn file_text_agrees_with_every_hunk_of_the_demo_diff() {
+        let src = DemoPr { conn: "github".into() };
+        let item = ItemRef::new("101");
+        let files = src.changes(&item).await.unwrap();
+        for file in &files {
+            let text = src.file_text(&item, &file.path, None).await.unwrap().unwrap_or_else(|| panic!("{} has text", file.path));
+            let patch = file.patch.as_deref().unwrap();
+            check_patch(&text, patch).unwrap_or_else(|e| panic!("{}: {e}", file.path));
+            // Spelled out for each hunk's first line on the new side: it sits at the header's new start.
+            let (added, mut seen) = (patch.lines().filter(|l| l.starts_with('+')).count(), 0);
+            assert_eq!(added as i64, file.additions, "{}: additions match the patch", file.path);
+            for (n, line) in patch.lines().enumerate().filter(|(_, l)| l.starts_with("@@")) {
+                let new_start: usize = line.split(" +").nth(1).and_then(|r| r.split([',', ' ']).next()).and_then(|n| n.parse().ok()).unwrap();
+                let first = patch.lines().skip(n + 1).find(|l| !l.starts_with('-')).unwrap();
+                if new_start > 0 {
+                    assert_eq!(text.lines().nth(new_start - 1), Some(&first[1..]), "{}: {line}", file.path);
+                    seen += 1;
+                }
+            }
+            assert!(seen > 0, "{}: has a hunk to check", file.path);
+        }
+
+        // The tree is real: nested directories and a file at the root.
+        let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+        for path in ["src/providers/github/auth.rs", "src/providers/gitlab/auth.rs", "docs/retry.md", "Cargo.toml"] {
+            assert!(paths.contains(&path), "{path} is in the diff");
+        }
+        // And there are gaps to expand: client.rs's lines before its first hunk and between its two.
+        let client = src.file_text(&item, "src/http/client.rs", None).await.unwrap().unwrap();
+        assert_eq!(client.lines().nth(10), Some("impl HttpClient {"), "line 11, above the hunk at +12");
+        assert!(client.lines().count() > 42, "the file runs past the hunk at +42");
+
+        assert_eq!(src.file_text(&item, "src/nope.rs", None).await.unwrap(), None, "a path the diff doesn't name");
+    }
+
+    #[tokio::test]
+    async fn file_text_at_a_commit_is_the_head_only_where_that_commit_agrees() {
+        let src = DemoPr { conn: "github".into() };
+        let item = ItemRef::new("101");
+        // e4f5a6b's patch to client.rs agrees with the head's text…
+        assert!(src.file_text(&item, "src/http/client.rs", Some("e4f5a6b")).await.unwrap().is_some());
+        // …a1b2c3d's to retry.rs doesn't (the file was shorter then), and it never touched client.rs.
+        assert_eq!(src.file_text(&item, "src/http/retry.rs", Some("a1b2c3d")).await.unwrap(), None);
+        assert_eq!(src.file_text(&item, "src/http/client.rs", Some("a1b2c3d")).await.unwrap(), None);
+    }
+
+    #[test]
+    fn check_patch_names_the_first_disagreement() {
+        let text = "a\nb\nc\n";
+        assert_eq!(check_patch(text, "@@ -2,2 +2,2 @@\n b\n-x\n+c\n"), Ok(()));
+        assert!(check_patch(text, "@@ -1,2 +1,2 @@\n b\n-x\n+c\n").unwrap_err().contains("line 1"), "off by one");
+        assert!(check_patch(text, "@@ -2,3 +2,3 @@\n b\n-x\n+c\n").unwrap_err().contains("short"), "counts too high");
+        assert!(check_patch(text, "@@ -2,1 +2,1 @@\n b\n-x\n+c\n").unwrap_err().contains("more"), "counts too low");
     }
 }

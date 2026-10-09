@@ -6,6 +6,7 @@ use forgetop_core::provider::ProviderFactory;
 
 pub mod azure;
 pub mod bitbucket;
+mod content;
 pub mod demo;
 pub mod github;
 pub mod gitlab;

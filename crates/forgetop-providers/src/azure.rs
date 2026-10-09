@@ -12,6 +12,7 @@ use reqwest::header::{ACCEPT, AUTHORIZATION};
 use serde_json::{json, Value};
 use similar::{ChangeTag, TextDiff};
 
+use crate::content;
 use crate::html;
 use crate::json::*;
 use crate::scope::{self, fan_out, sort_and_cap};
@@ -978,6 +979,18 @@ impl PullRequestSource for AzurePr {
         let repo = self.0.resolve(item)?;
         let v = self.0.get_json(&format!("{}/commits?{API}", self.0.pr_base(&repo, &item.id))).await?;
         Ok(get_arr(&v, "value").iter().map(map_az_commit).collect())
+    }
+    async fn file_text(&self, item: &ItemRef, path: &str, sha: Option<&str>) -> Result<Option<String>> {
+        let repo = self.0.resolve(item)?;
+        let sha = match sha {
+            Some(sha) => sha.to_string(),
+            None => {
+                let pr = self.0.get_json(&format!("{}?{API}", self.0.pr_base(&repo, &item.id))).await?;
+                let Some(sha) = get_obj(&pr, "lastMergeSourceCommit").and_then(|c| get_str(c, "commitId")) else { return Ok(None) };
+                sha
+            }
+        };
+        Ok(self.0.item_content(&repo, path, &sha).await.and_then(content::text_only))
     }
     async fn commit_changes(&self, item: &ItemRef, sha: &str) -> Result<Vec<FileChange>> {
         let repo = self.0.resolve(item)?;
@@ -1959,5 +1972,22 @@ mod tests {
         let list = forge.requests_to("/Payments/");
         assert!(!list[0].contains("creatorId"), "no id to filter by: {}", list[0]);
         assert_eq!(rows.len(), 1, "an unknown identity passes every row through, as before");
+    }
+
+    #[tokio::test]
+    async fn file_text_reads_the_item_at_the_pull_requests_source_commit() {
+        let (forge, pr) = forge_and_client();
+        forge.route("/Payments/_apis/git/repositories/pay/pullRequests/7", serde_json::json!({ "pullRequestId": 7, "lastMergeSourceCommit": { "commitId": "headsha1" } }));
+        forge.route("/Payments/_apis/git/repositories/pay/items", serde_json::json!({ "path": "/src/a.rs", "content": "fn a() {}\n" }));
+
+        let got = pr.file_text(&ItemRef::new("7"), "/src/a.rs", None).await.unwrap();
+        assert_eq!(got.as_deref(), Some("fn a() {}\n"));
+        let items = forge.requests_to("/Payments/_apis/git/repositories/pay/items");
+        assert!(items[0].contains("path=/src/a.rs") && items[0].contains("versionDescriptor.version=headsha1"), "{}", items[0]);
+
+        // A given commit needs no PR lookup; binary content is no text.
+        forge.route("/Payments/_apis/git/repositories/pay/items", serde_json::json!({ "content": "PK\u{0}\u{3}" }));
+        assert_eq!(pr.file_text(&ItemRef::new("7"), "/a.zip", Some("abc")).await.unwrap(), None);
+        assert_eq!(forge.requests_to("/Payments/_apis/git/repositories/pay/pullRequests/7").len(), 1, "only the first call looked the head up");
     }
 }

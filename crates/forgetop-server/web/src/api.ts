@@ -118,6 +118,29 @@ export const usePrCommitChanges = (ref: PrRef | null, sha: string | null) =>
     enabled: !!ref && !!sha,
   });
 
+/** A file's full text at a commit (the PR head when `sha` is omitted) — fetched lazily, only
+ *  once a Files-tab gap is clicked, to reveal the unchanged context around a hunk. A 404 means
+ *  it's unavailable (binary, too large, or the provider doesn't support it); `retry: false` so
+ *  that shows up promptly instead of after three retries.
+ *
+ *  `patchKey` (the file's own patch text) is folded into the query key purely so the cache
+ *  can't go stale: the server names no head sha for "no `sha`" (the PR's own diff), so a
+ *  refetched detail with a *different* patch (the PR moved on) is a different key, not a
+ *  cache hit on text that no longer matches. */
+export const usePrFileText = (ref: PrRef | null, path: string | null, sha: string | null, patchKey: string | null, enabled: boolean) =>
+  useQuery({
+    queryKey: ["pr-file-text", ref?.conn, ref?.repo ?? "", ref?.id, path ?? "", sha ?? "", patchKey ?? ""],
+    queryFn: () =>
+      apiGetText(
+        `/api/pr/file-text?conn=${encodeURIComponent(ref!.conn)}&id=${encodeURIComponent(ref!.id)}&path=${encodeURIComponent(path!)}` +
+          (sha ? `&sha=${encodeURIComponent(sha)}` : "") +
+          repoParam(ref!.repo),
+      ),
+    enabled: enabled && !!ref && !!path,
+    staleTime: Infinity,
+    retry: false,
+  });
+
 /** One row's decorated fields, fetched lazily because the list endpoint no longer pays for them.
  *  Keyed (and server-cached) on `updated_at` — the provider's own statement that the PR changed —
  *  so an entry can never outlive the change that invalidates it. */

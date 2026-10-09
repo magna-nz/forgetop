@@ -14,6 +14,7 @@ use forgetop_core::{Error, Result};
 use reqwest::header::AUTHORIZATION;
 use serde_json::{json, Value};
 
+use crate::content;
 use crate::json::*;
 use crate::scope::{self, fan_out, sort_and_cap};
 
@@ -733,6 +734,24 @@ impl PullRequestSource for GitLabPr {
         let project = self.0.resolve(item)?;
         let v = self.0.get_json(&self.0.project_path(&project, &format!("/repository/commits/{sha}/diff?per_page=100"))).await?;
         Ok(v.as_array().unwrap_or(&vec![]).iter().map(map_change).collect())
+    }
+    async fn file_text(&self, item: &ItemRef, path: &str, sha: Option<&str>) -> Result<Option<String>> {
+        let project = self.0.resolve(item)?;
+        let sha = match sha {
+            Some(sha) => sha.to_string(),
+            None => {
+                let mr = self.0.get_json(&self.0.project_path(&project, &format!("/merge_requests/{}", item.id))).await?;
+                let head = get_str(&mr, "sha").or_else(|| get_obj(&mr, "diff_refs").and_then(|d| get_str(d, "head_sha")));
+                let Some(sha) = head else { return Ok(None) };
+                sha
+            }
+        };
+        // The file path is one URL segment here, its slashes encoded along with the rest.
+        let url = self.0.project_path(
+            &project,
+            &format!("/repository/files/{}?ref={}", content::encode_path(path, false), content::encode_path(&sha, false)),
+        );
+        Ok(self.0.get_json_opt(&url).await?.as_ref().and_then(content::base64_text))
     }
     async fn checks(&self, item: &ItemRef) -> Result<Vec<CheckRun>> {
         let project = self.0.resolve(item)?;
@@ -1568,5 +1587,35 @@ mod tests {
         let list = forge.requests_to("/projects/");
         assert!(!list[0].contains("author_username"), "no username to filter by: {}", list[0]);
         assert_eq!(rows.len(), 1, "an unknown identity passes every row through, as before");
+    }
+
+    #[tokio::test]
+    async fn file_text_reads_the_file_at_the_merge_requests_head() {
+        use base64::Engine;
+        let (forge, pr) = forge_and_client();
+        forge.route(&format!("/projects/{}/merge_requests/7", encode_project("acme/pay")), json!({ "iid": 7, "sha": "headsha1" }));
+        let text = "fn main() {}\n";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(text);
+        let file = format!("/projects/{}/repository/files/src%2Fmy%20main.rs", encode_project("acme/pay"));
+        forge.route(&file, json!({ "file_path": "src/my main.rs", "encoding": "base64", "content": encoded }));
+
+        let got = pr.file_text(&ItemRef::new("7"), "src/my main.rs", None).await.unwrap();
+        assert_eq!(got.as_deref(), Some(text));
+        assert_eq!(forge.requests_to(&file), vec![format!("GET {file}?ref=headsha1")], "the whole path is one encoded segment");
+
+        // An MR that names its head only in `diff_refs` still resolves.
+        forge.route(&format!("/projects/{}/merge_requests/8", encode_project("acme/pay")), json!({ "iid": 8, "diff_refs": { "head_sha": "headsha2" } }));
+        assert_eq!(pr.file_text(&ItemRef::new("8"), "src/my main.rs", None).await.unwrap().as_deref(), Some(text));
+        assert!(forge.requests_to(&file).last().unwrap().ends_with("?ref=headsha2"));
+    }
+
+    #[tokio::test]
+    async fn file_text_at_a_given_commit_skips_the_head_lookup_and_a_missing_file_is_none() {
+        let (forge, pr) = forge_and_client();
+        assert_eq!(pr.file_text(&ItemRef::new("7"), "src/gone.rs", Some("abc")).await.unwrap(), None, "a 404");
+        assert!(forge.requests_to(&format!("/projects/{}/merge_requests/", encode_project("acme/pay"))).is_empty(), "{:?}", forge.requests());
+        let file = format!("/projects/{}/repository/files/big.bin", encode_project("acme/pay"));
+        forge.route(&file, json!({ "encoding": "base64", "content": "AAEC" }));
+        assert_eq!(pr.file_text(&ItemRef::new("7"), "big.bin", Some("abc")).await.unwrap(), None, "binary");
     }
 }

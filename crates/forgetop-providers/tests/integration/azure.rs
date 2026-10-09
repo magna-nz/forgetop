@@ -63,6 +63,15 @@ async fn azure_pull_request_lifecycle() {
         "the commit reports the file it added"
     );
 
+    // The full text of that file, at the head (resolved by the provider) and at the commit, is
+    // what the fixture wrote — addressed by the path the diff reported, as a caller expanding it would.
+    let fixture = &commit_files.iter().find(|f| f.path.contains(&format!("{prefix}.txt"))).expect("the fixture file").path;
+    let head_text = prs.file_text(&ItemRef::new(&id), fixture, None).await.expect("file text at the head");
+    assert!(head_text.as_deref().is_some_and(|t| t.contains("forgetop integration fixture")), "the head's text is the fixture's: {head_text:?}");
+    let commit_text = prs.file_text(&ItemRef::new(&id), fixture, Some(&sha)).await.expect("file text at the commit");
+    assert!(commit_text.as_deref().is_some_and(|t| t.contains("forgetop integration fixture")), "the commit's text is the fixture's: {commit_text:?}");
+    assert_eq!(prs.file_text(&ItemRef::new(&id), &format!("{prefix}-missing.txt"), None).await.expect("a missing path is not an error"), None);
+
     prs.add_comment(&ItemRef::new(&id), &format!("{prefix} comment")).await.expect("comment");
     let threads = prs.threads(&ItemRef::new(&id)).await.expect("threads");
     assert!(threads.iter().any(|t| t.comments.iter().any(|c| c.body.contains(prefix))), "comment shows in threads");

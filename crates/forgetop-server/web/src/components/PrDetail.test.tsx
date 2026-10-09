@@ -209,6 +209,25 @@ describe("PrDetail action bar", () => {
     expect(screen.queryByText("src/a.rs")).not.toBeInTheDocument();
   });
 
+  it("Files tab: the default selection is the first file in tree order, not the list's own order", async () => {
+    const d = detail("Open");
+    // The provider lists "zebra.rs" first; tree order (alphabetical) puts "alpha.rs" first.
+    d.changes = [
+      { path: "src/zebra.rs", kind: "Modified", additions: 1, deletions: 0, patch: "@@ -1,1 +1,1 @@\n-old\n+z" },
+      { path: "src/alpha.rs", kind: "Modified", additions: 1, deletions: 0, patch: "@@ -1,1 +1,1 @@\n-old\n+a" },
+    ];
+    mockFetch({ get: { "/api/pr/detail": d } });
+    renderWithClient(
+      <PrDetailProvider>
+        <Opener conn="c" id="1" />
+      </PrDetailProvider>,
+    );
+    await userEvent.click(await screen.findByRole("button", { name: /files/i }));
+    // The diff header carries the full path, so it's distinct from the nav row's bare name.
+    expect(await screen.findByText("src/alpha.rs")).toBeInTheDocument();
+    expect(screen.queryByText("src/zebra.rs")).not.toBeInTheDocument();
+  });
+
   it("Commits tab: selecting a commit shows that commit's diff in Files", async () => {
     const d = detail("Open");
     d.commits = [{ sha: "abc1234def", message: "Add retry policy", author: "alice", date: null, url: null }];
@@ -229,6 +248,245 @@ describe("PrDetail action bar", () => {
     expect(await screen.findByText("Showing commit")).toBeInTheDocument();
     expect(await screen.findByText("src/retry.rs")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /Show all files/i })).toBeInTheDocument();
+  });
+
+  it("Files tab: folders start open and fold their files away on click", async () => {
+    const d = detail("Open");
+    d.changes = [
+      { path: "src/a.rs", kind: "Modified", additions: 1, deletions: 1, patch: "@@ -1 +1 @@\n-old\n+newA" },
+      { path: "src/b.rs", kind: "Added", additions: 2, deletions: 0, patch: "@@ -0,0 +1,2 @@\n+newB\n+two" },
+    ];
+    mockFetch({ get: { "/api/pr/detail": d } });
+    renderWithClient(
+      <PrDetailProvider>
+        <Opener conn="c" id="1" />
+      </PrDetailProvider>,
+    );
+    await userEvent.click(await screen.findByRole("button", { name: /files/i }));
+    const folder = await screen.findByRole("button", { name: /src/ });
+    expect(folder).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByRole("button", { name: /a\.rs/i })).toBeInTheDocument();
+    await userEvent.click(folder);
+    expect(folder).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByRole("button", { name: /a\.rs/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /b\.rs/i })).not.toBeInTheDocument();
+  });
+
+  it("Files tab: folding a folder while searching doesn't change its fold once the search clears", async () => {
+    const d = detail("Open");
+    d.changes = [
+      { path: "src/alpha.rs", kind: "Modified", additions: 1, deletions: 0, patch: "@@ -1,1 +1,1 @@\n-old\n+needle" },
+      { path: "src/beta.rs", kind: "Modified", additions: 1, deletions: 0, patch: "@@ -1,1 +1,1 @@\n-old\n+nothing" },
+    ];
+    mockFetch({ get: { "/api/pr/detail": d } });
+    renderWithClient(
+      <PrDetailProvider>
+        <Opener conn="c" id="1" />
+      </PrDetailProvider>,
+    );
+    await userEvent.click(await screen.findByRole("button", { name: /files/i }));
+    const folderBefore = await screen.findByRole("button", { name: /src/ });
+    expect(folderBefore).toHaveAttribute("aria-expanded", "true");
+
+    // Search down to one match, then fold "src" while that search is active.
+    await userEvent.type(await screen.findByPlaceholderText("Search files…"), "needle");
+    const folderDuring = await screen.findByRole("button", { name: /src/ });
+    await userEvent.click(folderDuring);
+    expect(folderDuring).toHaveAttribute("aria-expanded", "false");
+
+    // Clearing the search restores the fold from before it — "src" is open again, both files back.
+    await userEvent.clear(screen.getByPlaceholderText("Search files…"));
+    const folderAfter = await screen.findByRole("button", { name: /src/ });
+    expect(folderAfter).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByRole("button", { name: /alpha\.rs/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /beta\.rs/i })).toBeInTheDocument();
+  });
+
+  it("Files tab: search filters the tree, shows hit counts, and a hidden-files note", async () => {
+    const d = detail("Open");
+    d.changes = [
+      { path: "src/alpha.rs", kind: "Modified", additions: 1, deletions: 0, patch: "@@ -1,1 +1,1 @@\n-old\n+needle here" },
+      { path: "src/beta.rs", kind: "Modified", additions: 1, deletions: 0, patch: "@@ -1,1 +1,1 @@\n-old\n+nothing" },
+    ];
+    mockFetch({ get: { "/api/pr/detail": d } });
+    renderWithClient(
+      <PrDetailProvider>
+        <Opener conn="c" id="1" />
+      </PrDetailProvider>,
+    );
+    await userEvent.click(await screen.findByRole("button", { name: /files/i }));
+    await userEvent.type(await screen.findByPlaceholderText("Search files…"), "needle");
+    expect(await screen.findByText("1 hit")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /beta\.rs/i })).not.toBeInTheDocument();
+    expect(screen.getByText("1 file hidden")).toBeInTheDocument();
+  });
+
+  it("Files tab: a header-less patch (no @@ lines, like Azure's) still renders its lines", async () => {
+    const d = detail("Open");
+    // Azure's `unified_diff` (crates/forgetop-providers/src/azure.rs) emits +/-/space-prefixed
+    // lines with no `@@` header at all.
+    d.changes = [{ path: "src/azure.cs", kind: "Modified", additions: 1, deletions: 1, patch: "-old\n+new\n context" }];
+    mockFetch({ get: { "/api/pr/detail": d } });
+    renderWithClient(
+      <PrDetailProvider>
+        <Opener conn="c" id="1" />
+      </PrDetailProvider>,
+    );
+    await userEvent.click(await screen.findByRole("button", { name: /files/i }));
+    expect(await screen.findByText(/old/)).toBeInTheDocument();
+    expect(screen.getByText(/new/)).toBeInTheDocument();
+    expect(screen.getByText("context")).toBeInTheDocument();
+    // No hunk header means nothing to anchor a gap to.
+    expect(screen.queryByText(/unchanged lines/)).not.toBeInTheDocument();
+  });
+
+  it("Files tab: a deletion-only hunk (+N,0) doesn't shift the next gap by one line", async () => {
+    const d = detail("Open");
+    // A `+N,0` hunk (pure deletion) sits *after* new line N — the gap before it runs through
+    // N inclusive, and the next gap starts at N+1, not N.
+    d.changes = [
+      {
+        path: "src/delonly.rs",
+        kind: "Modified",
+        additions: 2,
+        deletions: 3,
+        patch: "@@ -1,1 +1,1 @@\n+L1\n@@ -5,3 +5,0 @@\n-D1\n-D2\n-D3\n@@ -9,1 +9,1 @@\n+L9",
+      },
+    ];
+    const fileText = ["L1", "line2", "line3", "line4", "line5", "line6", "line7", "line8", "L9"].join("\n");
+    mockFetch({ get: { "/api/pr/detail": d, "/api/pr/file-text": fileText } });
+    renderWithClient(
+      <PrDetailProvider>
+        <Opener conn="c" id="1" />
+      </PrDetailProvider>,
+    );
+    await userEvent.click(await screen.findByRole("button", { name: /files/i }));
+    // The gap before the deletion-only hunk runs through its own line (2..5, inclusive).
+    await userEvent.click(await screen.findByText("⋯ 4 unchanged lines"));
+    expect(await screen.findByText("line2")).toBeInTheDocument();
+    expect(screen.getByText("line5")).toBeInTheDocument();
+    // The next gap starts right after it (6..8), not one line early.
+    await userEvent.click(await screen.findByText("⋯ 3 unchanged lines"));
+    expect(await screen.findByText("line6")).toBeInTheDocument();
+    expect(screen.getByText("line8")).toBeInTheDocument();
+  });
+
+  it("Files tab: a hunk reaching past the fetched text's last line makes the whole file's context unavailable", async () => {
+    const d = detail("Open");
+    d.changes = [
+      {
+        path: "src/overflow.rs",
+        kind: "Modified",
+        additions: 6,
+        deletions: 0,
+        patch: "@@ -1,1 +1,1 @@\n+L1\n@@ -10,1 +10,5 @@\n+L10\n+L11\n+L12\n+L13\n+L14",
+      },
+    ];
+    // Only 10 lines came back — the second hunk's own range (new lines 10-14) runs past that,
+    // even though its first line ("L10") still agrees with what's there.
+    const fileText = ["L1", "line2", "line3", "line4", "line5", "line6", "line7", "line8", "line9", "L10"].join("\n");
+    mockFetch({ get: { "/api/pr/detail": d, "/api/pr/file-text": fileText } });
+    renderWithClient(
+      <PrDetailProvider>
+        <Opener conn="c" id="1" />
+      </PrDetailProvider>,
+    );
+    await userEvent.click(await screen.findByRole("button", { name: /files/i }));
+    // The gap being clicked (lines 2-9) is itself well within bounds...
+    await userEvent.click(await screen.findByText("⋯ 8 unchanged lines"));
+    // ...but the file's text is still unusable: another hunk in the same file overflows it.
+    expect(await screen.findByText("context isn't available for this file")).toBeInTheDocument();
+  });
+
+  it("Files tab: gap rows appear before the first hunk and between hunks", async () => {
+    const d = detail("Open");
+    d.changes = [{ path: "src/gap.rs", kind: "Modified", additions: 2, deletions: 2, patch: "@@ -5,1 +5,1 @@\n-old5\n+new5\n@@ -20,1 +20,1 @@\n-old20\n+new20" }];
+    mockFetch({ get: { "/api/pr/detail": d } });
+    renderWithClient(
+      <PrDetailProvider>
+        <Opener conn="c" id="1" />
+      </PrDetailProvider>,
+    );
+    await userEvent.click(await screen.findByRole("button", { name: /files/i }));
+    // Before the first hunk (which starts at line 5): lines 1-4.
+    expect(await screen.findByText("⋯ 4 unchanged lines")).toBeInTheDocument();
+    // Between the two hunks: lines 6-19.
+    expect(await screen.findByText("⋯ 14 unchanged lines")).toBeInTheDocument();
+  });
+
+  it("Files tab: a gap row reveals 10 lines from each edge, leaving the middle collapsed", async () => {
+    const d = detail("Open");
+    d.changes = [{ path: "src/gap.rs", kind: "Modified", additions: 2, deletions: 2, patch: "@@ -1,1 +1,1 @@\n-oldL1\n+L1\n@@ -27,1 +27,1 @@\n-oldL27\n+L27" }];
+    const fileText = Array.from({ length: 27 }, (_, i) => (i === 0 ? "L1" : i === 26 ? "L27" : `line${i + 1}`)).join("\n");
+    mockFetch({ get: { "/api/pr/detail": d, "/api/pr/file-text": fileText } });
+    renderWithClient(
+      <PrDetailProvider>
+        <Opener conn="c" id="1" />
+      </PrDetailProvider>,
+    );
+    await userEvent.click(await screen.findByRole("button", { name: /files/i }));
+    const gapRow = await screen.findByText("⋯ 25 unchanged lines");
+    await userEvent.click(gapRow);
+    // 10 lines revealed from the top edge (new lines 2-11) and from the bottom edge (17-26).
+    expect(await screen.findByText("line2")).toBeInTheDocument();
+    expect(screen.getByText("line11")).toBeInTheDocument();
+    expect(screen.getByText("line17")).toBeInTheDocument();
+    expect(screen.getByText("line26")).toBeInTheDocument();
+    // The untouched middle (new lines 12-16) still collapses behind its own, smaller gap row.
+    const middleGap = await screen.findByText("⋯ 5 unchanged lines");
+    await userEvent.click(middleGap);
+    expect(await screen.findByText("line16")).toBeInTheDocument();
+    expect(screen.queryByText(/unchanged lines/)).not.toBeInTheDocument();
+  });
+
+  it("Files tab: a gap row's Show all reveals the whole gap in one go", async () => {
+    const d = detail("Open");
+    d.changes = [{ path: "src/gap.rs", kind: "Modified", additions: 2, deletions: 2, patch: "@@ -1,1 +1,1 @@\n-oldL1\n+L1\n@@ -27,1 +27,1 @@\n-oldL27\n+L27" }];
+    const fileText = Array.from({ length: 27 }, (_, i) => (i === 0 ? "L1" : i === 26 ? "L27" : `line${i + 1}`)).join("\n");
+    mockFetch({ get: { "/api/pr/detail": d, "/api/pr/file-text": fileText } });
+    renderWithClient(
+      <PrDetailProvider>
+        <Opener conn="c" id="1" />
+      </PrDetailProvider>,
+    );
+    await userEvent.click(await screen.findByRole("button", { name: /files/i }));
+    await screen.findByText("⋯ 25 unchanged lines");
+    await userEvent.click(screen.getByRole("button", { name: "Show all 25 unchanged lines" }));
+    expect(await screen.findByText("line16")).toBeInTheDocument();
+    expect(await screen.findByText("line2")).toBeInTheDocument();
+    expect(await screen.findByText("line26")).toBeInTheDocument();
+    expect(screen.queryByText(/unchanged lines/)).not.toBeInTheDocument();
+  });
+
+  it("Files tab: a gap whose file text 404s says context isn't available", async () => {
+    const d = detail("Open");
+    d.changes = [{ path: "src/gap.rs", kind: "Modified", additions: 1, deletions: 1, patch: "@@ -5,1 +5,1 @@\n-old5\n+new5" }];
+    // No "/api/pr/file-text" fixture — mockFetch's catch-all answers 404.
+    mockFetch({ get: { "/api/pr/detail": d } });
+    renderWithClient(
+      <PrDetailProvider>
+        <Opener conn="c" id="1" />
+      </PrDetailProvider>,
+    );
+    await userEvent.click(await screen.findByRole("button", { name: /files/i }));
+    await userEvent.click(await screen.findByText("⋯ 4 unchanged lines"));
+    expect(await screen.findByText("context isn't available for this file")).toBeInTheDocument();
+  });
+
+  it("Files tab: fetched text that disagrees with the hunk is treated as unavailable", async () => {
+    const d = detail("Open");
+    d.changes = [{ path: "src/gap.rs", kind: "Modified", additions: 1, deletions: 1, patch: "@@ -5,1 +5,1 @@\n-old5\n+new5" }];
+    // Line 5 of the fetched text doesn't match "new5" — the hunk's own first line — so it's stale.
+    const fileText = Array.from({ length: 6 }, (_, i) => `mismatch${i + 1}`).join("\n");
+    mockFetch({ get: { "/api/pr/detail": d, "/api/pr/file-text": fileText } });
+    renderWithClient(
+      <PrDetailProvider>
+        <Opener conn="c" id="1" />
+      </PrDetailProvider>,
+    );
+    await userEvent.click(await screen.findByRole("button", { name: /files/i }));
+    await userEvent.click(await screen.findByText("⋯ 4 unchanged lines"));
+    expect(await screen.findByText("context isn't available for this file")).toBeInTheDocument();
   });
 
   it("replying to a conversation thread posts /api/pr/reply with the thread id", async () => {

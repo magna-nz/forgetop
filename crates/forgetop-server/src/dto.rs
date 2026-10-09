@@ -518,6 +518,13 @@ pub async fn pr_commit_changes(sections: &SectionService, conn: &str, item: &Ite
     )
 }
 
+/// One file's full text as of `sha` (the PR's head when `None`), fetched only when a diff is
+/// expanded. `None` for an unknown connection, a failed fetch, or a forge with no text to give.
+pub async fn pr_file_text(sections: &SectionService, conn: &str, item: &ItemRef, path: &str, sha: Option<&str>) -> Option<String> {
+    let source = pr_source(sections, conn).await?;
+    source.file_text(item, path, sha).await.inspect_err(|_| log_fetch_failure("dashboard.pr_file_text")).ok().flatten()
+}
+
 // ---- work-item detail ----
 
 /// Everything the work-item detail view needs.

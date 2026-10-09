@@ -9,6 +9,33 @@ Adding a release: one `## <version> — <date>` section, a line per user-visible
 and the pull request each one came from. `git log v<previous>..HEAD --merges` lists the
 candidates.
 
+## 1.8.0 — 2026-10-10
+
+Added
+
+- **The Diff tab's file list is a folder tree.** Changed files are grouped under their
+  folders, folders first, and a folder holding only one folder shares its row
+  (`forgetop-core/src/`). Every folder starts open and shows how many of its files you've
+  reviewed. In the terminal UI, Enter on a folder folds or unfolds it, as on a pipeline group,
+  and `v` marks every file in it viewed; in the dashboard, click a folder. With the cursor on a
+  folder, the terminal shows a summary of its files and threads. When the list is narrow, as
+  in the pane beside the list, it shows one level of folders instead.
+  ([#PRNUM](https://github.com/magna-nz/forgetop/pull/PRNUM))
+- **Search a diff's file names and patch text.** In the terminal UI press `/` on the Diff
+  tab; in the dashboard type in the box above the files. The list narrows to the files that
+  match, each with its number of hits, and the patch highlights every hit. Esc clears it.
+  ([#PRNUM](https://github.com/magna-nz/forgetop/pull/PRNUM))
+- **Show the unchanged lines between hunks.** A `⋯ N unchanged lines` row sits above each hunk
+  that has a gap before it. In the terminal UI, Enter on the hunk's `@@` line shows 10 more
+  lines from each side, `+` shows them all and `-` folds them back; in the dashboard, click the
+  row, or "Show all". The file is fetched once, when you first expand, from GitHub, GitLab or
+  Azure DevOps; reloads make no extra calls. Bitbucket doesn't offer it.
+  ([#PRNUM](https://github.com/magna-nz/forgetop/pull/PRNUM))
+
+Docs
+
+- A still PNG preview of the terminal UI, `docs/terminal-preview.png`. ([#229](https://github.com/magna-nz/forgetop/pull/229))
+
 ## 1.7.0 — 2026-10-09
 
 Fixed

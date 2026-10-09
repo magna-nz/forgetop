@@ -10,9 +10,15 @@ export interface DiffLine {
   newLine?: number;
   /** Old-file line number (context + removed lines) — shown in the gutter. */
   oldLine?: number;
+  /** Hunk-header range, present only on `kind: "hunk"` lines — lets a caller work out the
+   *  unchanged gaps before/between hunks without re-parsing the header text. */
+  oldStart?: number;
+  oldCount?: number;
+  newStart?: number;
+  newCount?: number;
 }
 
-const HUNK = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/;
+const HUNK = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/;
 
 export function parsePatch(patch: string): DiffLine[] {
   const out: DiffLine[] = [];
@@ -22,8 +28,11 @@ export function parsePatch(patch: string): DiffLine[] {
     const m = raw.match(HUNK);
     if (m) {
       oldLine = parseInt(m[1], 10);
-      newLine = parseInt(m[2], 10);
-      out.push({ kind: "hunk", text: raw });
+      // A hunk header omits the count when it's 1 (`@@ -5 +5 @@` means one line, not zero).
+      const oldCount = m[2] !== undefined ? parseInt(m[2], 10) : 1;
+      newLine = parseInt(m[3], 10);
+      const newCount = m[4] !== undefined ? parseInt(m[4], 10) : 1;
+      out.push({ kind: "hunk", text: raw, oldStart: oldLine, oldCount, newStart: newLine, newCount });
       continue;
     }
     const c = raw[0];

@@ -130,6 +130,7 @@ fn router(state: AppState) -> Router {
         .route("/api/pr/detail", get(pr_detail))
         .route("/api/pr/decoration", get(pr_decoration))
         .route("/api/pr/commit-changes", get(pr_commit_changes))
+        .route("/api/pr/file-text", get(pr_file_text))
         .route("/api/pr/vote", post(pr_vote))
         .route("/api/pr/merge", post(pr_merge))
         .route("/api/pr/revert", post(pr_revert))
@@ -247,6 +248,19 @@ struct CommitQuery {
     repo: Option<String>,
 }
 
+/// Query params naming one file of a PR (`?conn=…&id=…&path=…`), as of a commit (`&sha=…`) or,
+/// without one, the PR's head.
+#[derive(Deserialize)]
+struct FileTextQuery {
+    conn: String,
+    id: String,
+    path: String,
+    #[serde(default)]
+    sha: Option<String>,
+    #[serde(default)]
+    repo: Option<String>,
+}
+
 /// Query params for the PR list: which view to show (`?view=all|merged|review_requested`).
 #[derive(Deserialize)]
 struct PrListQuery {
@@ -291,6 +305,16 @@ async fn pr_commit_changes(State(s): State<AppState>, Query(q): Query<CommitQuer
     match dto::pr_commit_changes(&s.deps.sections, &q.conn, &ItemRef::maybe(q.repo, q.id), &q.sha).await {
         Some(changes) => Json(changes).into_response(),
         None => (StatusCode::NOT_FOUND, "pull request not found").into_response(),
+    }
+}
+
+/// One file's full text, so a diff can expand the unchanged lines between its hunks — plain text,
+/// or a 404 when there's no such connection, or the forge has no text for it (binary, oversized,
+/// missing at that commit, or a provider without a content API).
+async fn pr_file_text(State(s): State<AppState>, Query(q): Query<FileTextQuery>) -> Response {
+    match dto::pr_file_text(&s.deps.sections, &q.conn, &ItemRef::maybe(q.repo, q.id), &q.path, q.sha.as_deref()).await {
+        Some(text) => ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], text).into_response(),
+        None => (StatusCode::NOT_FOUND, "file text not available").into_response(),
     }
 }
 
