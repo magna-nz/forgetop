@@ -602,10 +602,13 @@ pub struct PrRow {
 /// three PR views (All / Mine / Review requested) and both Launchpad PR buckets are derived
 /// locally.
 ///
-/// Providers build their list URL from `include_completed` and `limit` alone — the filter is
-/// applied in memory afterwards — so a `list` per filter re-fetched identical rows. This used to
-/// mean four calls per connection per reload (the list section, the two Launchpad buckets, and
-/// the notification scan), and a fifth, blocking, every time `[`/`]` moved between views.
+/// Providers used to build their list URL from `include_completed` and `limit` alone — the filter
+/// was applied in memory afterwards — so a `list` per filter re-fetched identical rows. This
+/// meant four calls per connection per reload (the list section, the two Launchpad buckets, and
+/// the notification scan), and a fifth, blocking, every time `[`/`]` moved between views. A
+/// provider that targets its filters instead (all four repository forges now do; the demo does
+/// not) contributes the rows its filtered `list` finds beyond the page, merged in by
+/// [`fetch_pr_pool`].
 #[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PrPool {
     /// Rows fetched with `include_completed: false`.
@@ -11165,11 +11168,45 @@ fn derive_pool_rows(pool: &PrPool, filter: PullRequestFilter, completed: bool) -
     out
 }
 
-/// Fetches the unfiltered pool both `include_completed` variants of every PR view derive from.
+/// Adds to `rows` the `incoming` rows it does not already hold — same connection, repository and
+/// id — and returns how many it added. When it added any, `rows` is re-ordered newest-updated
+/// first (stably), so a view derived from it does not show the page's rows and then the searched
+/// ones as two runs.
+fn merge_pool_rows(rows: &mut Vec<PrRow>, incoming: Vec<PrRow>) -> usize {
+    let key = |row: &PrRow| (row.connection_id.clone(), row.pr.repository.clone(), row.pr.id.clone());
+    let mut held: HashSet<(String, Option<String>, String)> = rows.iter().map(key).collect();
+    let mut added = 0;
+    for row in incoming {
+        if held.insert(key(&row)) {
+            rows.push(row);
+            added += 1;
+        }
+    }
+    if added > 0 {
+        rows.sort_by_key(|row| std::cmp::Reverse(row.pr.updated_at));
+    }
+    added
+}
+
+/// The filtered `list` calls a connection that targets its filters gets on top of the
+/// unfiltered pair: the views the pool derives, each on the `include_completed` it derives on
+/// (the list section and the review bucket on open rows, the Launchpad's "yours" bucket on
+/// completed ones, which for every such provider include the open ones).
+const POOL_TARGETED_VIEWS: [(PullRequestFilter, bool); 3] =
+    [(PullRequestFilter::Mine, false), (PullRequestFilter::Mine, true), (PullRequestFilter::ReviewRequested, false)];
+
+/// Fetches the pool both `include_completed` variants of every PR view derive from.
 ///
-/// Two `list` calls per connection, where there used to be four — the list section, both
-/// Launchpad buckets and the notification scan each ran their own. None of them carries a
-/// filter: the rows are identical whichever view asked for them.
+/// Two unfiltered `list` calls per connection, where there used to be four — the list section,
+/// both Launchpad buckets and the notification scan each ran their own. The rows are identical
+/// whichever view asked for them, *as long as the provider filters a page it fetched anyway*.
+///
+/// A provider whose `list` targets the filter itself ([`PullRequestSource::list_targets_filter`])
+/// gets three more, for [`POOL_TARGETED_VIEWS`], merged into the pool without duplicates. Those
+/// are the rows an unfiltered page cannot hold: on a busy repository the page is the newest 50,
+/// and your own pull request leaves it as soon as 50 newer ones exist — "Mine" then went blank
+/// although nothing about it had changed. The derived views still filter the merged pool with
+/// `pull_request_matches`, so a searched row shows under exactly the views it belongs to.
 ///
 /// `limit: None` is deliberate. Providers cap **after** filtering (`sort_and_cap`), so a pool
 /// capped at 50 here would make a derived "Mine" a subset of the newest 50 overall, rather than
@@ -11206,25 +11243,25 @@ async fn fetch_pr_pool(deps: &AppDeps, errors: &mut Vec<String>) -> (PrPool, boo
             }
         }
         pool.needs_decoration.insert(conn_id.clone(), feed.source.list_omits_decoration());
-        for completed in [false, true] {
-            let query = PullRequestQuery {
-                filter: PullRequestFilter::All,
-                include_completed: completed,
-                limit: None,
-                decorate: false,
-            };
+        let targeted: &[(PullRequestFilter, bool)] =
+            if feed.source.list_targets_filter() { &POOL_TARGETED_VIEWS } else { &[] };
+        let queries = [(PullRequestFilter::All, false), (PullRequestFilter::All, true)].iter().chain(targeted.iter());
+        // This connection's rows, merged on their own: a targeted view re-orders only the rows of
+        // the connection it was fetched from, never another connection's.
+        let (mut open, mut completed_rows) = (Vec::new(), Vec::new());
+        for &(filter, completed) in queries {
+            let query = PullRequestQuery { filter, include_completed: completed, limit: None, decorate: false };
             match feed.source.list(&query).await {
                 Ok(list) => {
-                    let rows = list.into_iter().map(|pr| PrRow {
-                        connection_id: conn_id.clone(),
-                        connection: name.clone(),
-                        provider,
-                        pr,
-                    });
-                    if completed {
-                        pool.completed.extend(rows);
+                    let rows = list
+                        .into_iter()
+                        .map(|pr| PrRow { connection_id: conn_id.clone(), connection: name.clone(), provider, pr })
+                        .collect();
+                    let into = if completed { &mut completed_rows } else { &mut open };
+                    if filter == PullRequestFilter::All {
+                        into.extend(rows);
                     } else {
-                        pool.open.extend(rows);
+                        merge_pool_rows(into, rows);
                     }
                 }
                 Err(e) => {
@@ -11233,6 +11270,8 @@ async fn fetch_pr_pool(deps: &AppDeps, errors: &mut Vec<String>) -> (PrPool, boo
                 }
             }
         }
+        pool.open.extend(open);
+        pool.completed.extend(completed_rows);
     }
     (pool, ok)
 }
@@ -18183,6 +18222,203 @@ mod tests {
         fn create(&self, _connection: &Connection, _secret: Option<String>) -> forgetop_core::Result<Arc<dyn ProviderConnection>> {
             Ok(Arc::new(MockItemConn(self.0.clone(), self.describe_capabilities())))
         }
+    }
+
+    /// A PR source whose `list` answers each filter from its own rows, recording the queries it
+    /// was asked — the shape of a provider that targets its filters (GitHub) or does not.
+    #[derive(Clone)]
+    struct TargetedPrs {
+        targets: bool,
+        log: Arc<std::sync::Mutex<Vec<(PullRequestFilter, bool)>>>,
+    }
+
+    struct TargetedPrSource(TargetedPrs);
+
+    #[async_trait::async_trait]
+    impl PullRequestSource for TargetedPrSource {
+        async fn list(&self, query: &PullRequestQuery) -> forgetop_core::Result<Vec<PullRequest>> {
+            use chrono::TimeZone;
+            self.0.log.lock().unwrap().push((query.filter, query.include_completed));
+            let at = |day: u32| Some(chrono::Utc.with_ymd_and_hms(2026, 10, day, 0, 0, 0).unwrap());
+            let mut by_me_in_page = pool_pr("c", "99", "me", &[]).pr;
+            by_me_in_page.updated_at = at(3);
+            let mut by_other = pool_pr("c", "100", "sam", &[]).pr;
+            by_other.updated_at = at(2);
+            // Older than the page holds — only a targeted fetch finds it.
+            let mut by_me_beyond_page = pool_pr("c", "7", "me", &[]).pr;
+            by_me_beyond_page.updated_at = at(4);
+            let mut wants_my_review = pool_pr("c", "5", "sam", &["me"]).pr;
+            wants_my_review.updated_at = at(1);
+            Ok(match query.filter {
+                PullRequestFilter::All => vec![by_me_in_page, by_other],
+                PullRequestFilter::Mine => vec![by_me_in_page, by_me_beyond_page],
+                PullRequestFilter::ReviewRequested => vec![wants_my_review],
+            })
+        }
+        async fn current_user(&self) -> forgetop_core::Result<Option<String>> {
+            Ok(Some("me".into()))
+        }
+        fn list_targets_filter(&self) -> bool {
+            self.0.targets
+        }
+        async fn get(&self, _item: &ItemRef) -> forgetop_core::Result<PullRequest> {
+            Ok(pr(None))
+        }
+        async fn threads(&self, _item: &ItemRef) -> forgetop_core::Result<Vec<CommentThread>> {
+            Ok(Vec::new())
+        }
+        async fn changes(&self, _item: &ItemRef) -> forgetop_core::Result<Vec<FileChange>> {
+            Ok(Vec::new())
+        }
+        async fn add_comment(&self, _item: &ItemRef, _body: &str) -> forgetop_core::Result<()> {
+            Ok(())
+        }
+        async fn reply_to_thread(&self, _item: &ItemRef, _thread_id: &str, _body: &str) -> forgetop_core::Result<()> {
+            Ok(())
+        }
+        async fn vote(&self, _item: &ItemRef, _vote: ReviewVote) -> forgetop_core::Result<()> {
+            Ok(())
+        }
+        async fn merge(&self, _item: &ItemRef, _options: &MergeOptions) -> forgetop_core::Result<()> {
+            Ok(())
+        }
+        async fn submit_review(&self, _item: &ItemRef, _event: ReviewVote, _comments: &[LineComment]) -> forgetop_core::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct TargetedPrConn(TargetedPrs, Capabilities);
+
+    #[async_trait::async_trait]
+    impl ProviderConnection for TargetedPrConn {
+        fn connection_id(&self) -> &str {
+            "c"
+        }
+        fn provider_type(&self) -> ProviderType {
+            ProviderType::GitHub
+        }
+        fn display_name(&self) -> &str {
+            "GH"
+        }
+        fn capabilities(&self) -> &Capabilities {
+            &self.1
+        }
+        fn pull_requests(&self) -> Option<Arc<dyn PullRequestSource>> {
+            Some(Arc::new(TargetedPrSource(self.0.clone())))
+        }
+        fn work_items(&self) -> Option<Arc<dyn WorkItemSource>> {
+            None
+        }
+        fn pipelines(&self) -> Option<Arc<dyn PipelineSource>> {
+            None
+        }
+        async fn check(&self) -> bool {
+            true
+        }
+    }
+
+    struct TargetedPrFactory(TargetedPrs);
+
+    impl ProviderFactory for TargetedPrFactory {
+        fn provider_type(&self) -> ProviderType {
+            ProviderType::GitHub
+        }
+        fn describe_capabilities(&self) -> Capabilities {
+            Capabilities { supports_pull_requests: true, ..Capabilities::default() }
+        }
+        fn create(&self, _connection: &Connection, _secret: Option<String>) -> forgetop_core::Result<Arc<dyn ProviderConnection>> {
+            Ok(Arc::new(TargetedPrConn(self.0.clone(), self.describe_capabilities())))
+        }
+    }
+
+    /// Deps whose one PR connection, `c`, is a [`TargetedPrSource`].
+    async fn deps_with_targeted_prs(prs: TargetedPrs) -> AppDeps {
+        use forgetop_core::config::InMemoryConfigStore;
+        use forgetop_core::secret::InMemorySecretStore;
+        use forgetop_core::service::ConnectionResolver;
+
+        let registry = Arc::new(ProviderRegistry::new(vec![Arc::new(TargetedPrFactory(prs))]));
+        let secrets = Arc::new(InMemorySecretStore::default());
+        let config = Arc::new(ConfigService::new(Arc::new(InMemoryConfigStore::default()), secrets.clone(), registry.clone()));
+        let connection = Connection {
+            id: "c".into(),
+            provider_type: ProviderType::GitHub,
+            display_name: "GH".into(),
+            base_url: None,
+            organization: None,
+            project: None,
+            repository: None,
+            username: None,
+            credential_ref: None,
+            repo_scope: None,
+        };
+        config.add_or_update_connection(connection, None).await.unwrap();
+        config.bind_pull_requests("c").await.unwrap();
+        let resolver = Arc::new(ConnectionResolver::new(config.clone(), registry, secrets));
+        AppDeps {
+            sections: Arc::new(SectionService::new(config.clone(), resolver.clone())),
+            health: Arc::new(ConnectionHealthService::new(config.clone(), resolver)),
+            config,
+            cache: Arc::new(CacheStore::disabled()),
+        }
+    }
+
+    fn ids(rows: &[PrRow]) -> Vec<&str> {
+        rows.iter().map(|r| r.pr.id.as_str()).collect()
+    }
+
+    /// The bug this guards: a page is the newest 50 of a repository, and "Mine" derived from it
+    /// goes blank once 50 newer pull requests exist. A provider that targets the filter is asked
+    /// for those views, and what it finds beyond the page joins the pool — once, and in order.
+    #[tokio::test]
+    async fn the_pool_fetches_targeted_views_and_merges_what_the_page_lacks() {
+        let prs = TargetedPrs { targets: true, log: Arc::default() };
+        let deps = deps_with_targeted_prs(prs.clone()).await;
+        let mut errors = Vec::new();
+        let (pool, ok) = fetch_pr_pool(&deps, &mut errors).await;
+        assert!(ok && errors.is_empty(), "{errors:?}");
+        assert_eq!(
+            prs.log.lock().unwrap().clone(),
+            [(PullRequestFilter::All, false), (PullRequestFilter::All, true)].into_iter().chain(POOL_TARGETED_VIEWS).collect::<Vec<_>>(),
+            "the unfiltered pair, then each targeted view on the variant it is derived on"
+        );
+        // Every row once — `99` came back from the page and the search — newest-updated first.
+        assert_eq!(ids(&pool.open), vec!["7", "99", "100", "5"]);
+        assert_eq!(ids(&pool.completed), vec!["7", "99", "100"], "the review view is not fetched on completed rows");
+        // And the derived views are what the user sees: "Mine" has the pull request the page lost.
+        assert_eq!(ids(&derive_pool_rows(&pool, PullRequestFilter::Mine, false)), vec!["7", "99"]);
+        assert_eq!(ids(&derive_pool_rows(&pool, PullRequestFilter::ReviewRequested, false)), vec!["5"]);
+        assert_eq!(ids(&derive_pool_rows(&pool, PullRequestFilter::All, false)), vec!["7", "99", "100", "5"]);
+    }
+
+    /// A provider that only filters its page is not asked again: the answer would be a subset
+    /// of rows the pool already holds, at the price of the same calls over.
+    #[tokio::test]
+    async fn the_pool_leaves_a_page_filtering_provider_at_two_calls() {
+        let prs = TargetedPrs { targets: false, log: Arc::default() };
+        let deps = deps_with_targeted_prs(prs.clone()).await;
+        let (pool, _) = fetch_pr_pool(&deps, &mut Vec::new()).await;
+        assert_eq!(prs.log.lock().unwrap().clone(), vec![(PullRequestFilter::All, false), (PullRequestFilter::All, true)]);
+        assert_eq!(ids(&pool.open), vec!["99", "100"], "page order, untouched");
+    }
+
+    #[test]
+    fn merging_pool_rows_skips_what_is_held_and_reorders_only_when_it_added() {
+        use chrono::TimeZone;
+        let row = |id: &str, repo: Option<&str>, day: u32| {
+            let mut r = pool_pr("c", id, "me", &[]);
+            r.pr.repository = repo.map(str::to_string);
+            r.pr.updated_at = Some(chrono::Utc.with_ymd_and_hms(2026, 10, day, 0, 0, 0).unwrap());
+            r
+        };
+        let mut rows = vec![row("2", Some("acme/pay"), 2), row("1", Some("acme/pay"), 5)];
+        // Nothing new: the page's own order (not newest-first here) is left alone.
+        assert_eq!(merge_pool_rows(&mut rows, vec![row("2", Some("acme/pay"), 2)]), 0);
+        assert_eq!(ids(&rows), vec!["2", "1"]);
+        // The same number in another repository is another pull request; a held one is skipped.
+        assert_eq!(merge_pool_rows(&mut rows, vec![row("1", Some("acme/pay"), 5), row("2", Some("acme/ledger"), 9)]), 1);
+        assert_eq!(ids(&rows), vec!["2", "1", "2"]);
+        assert_eq!(rows[0].pr.repository.as_deref(), Some("acme/ledger"), "newest-updated first once something was added");
     }
 
     /// Deps whose one PR and work-item connection, `c`, is the recording provider.

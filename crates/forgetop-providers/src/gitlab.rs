@@ -632,6 +632,22 @@ impl NotificationSource for GitLabNotif {
     }
 }
 
+/// The query-string parameters that make GitLab return `filter`'s merge requests for `me`
+/// (a username), or `None` for `All`.
+///
+/// A project's `/merge_requests` page is its newest 50; filtering that page in memory makes
+/// "Mine" a filter over a *window*, and on a busy project your own merge request leaves it as
+/// soon as 50 newer ones exist. Asking GitLab for the author or reviewer instead returns them
+/// however old they are, newest-updated first so the cap keeps the live ones.
+pub fn mr_filter_params(filter: PullRequestFilter, me: &str) -> Option<String> {
+    let who = match filter {
+        PullRequestFilter::All => return None,
+        PullRequestFilter::Mine => "author_username",
+        PullRequestFilter::ReviewRequested => "reviewer_username",
+    };
+    Some(format!("&scope=all&{who}={me}&order_by=updated_at&sort=desc"))
+}
+
 #[async_trait]
 impl PullRequestSource for GitLabPr {
     async fn list(&self, query: &PullRequestQuery) -> Result<Vec<PullRequest>> {
@@ -642,18 +658,27 @@ impl PullRequestSource for GitLabPr {
         }
         let state = if query.include_completed { "all" } else { "opened" };
         let per_page = query.limit.unwrap_or(50);
+        let me = if query.filter == PullRequestFilter::All { None } else { self.0.self_username().await? };
+        // GitLab filters when it knows who you are; an identity it could not establish falls
+        // back to the page, where `apply_pull_request_filter` passes every row through.
+        let params = me.as_deref().and_then(|me| mr_filter_params(query.filter, me));
+        let params_ref = params.as_deref().unwrap_or("");
         let rows = fan_out(scope, "gitlab.pull_requests.list", |project| async move {
-            let url = self.0.project_path(&project, &format!("/merge_requests?state={state}&per_page={per_page}"));
+            let url = self.0.project_path(&project, &format!("/merge_requests?state={state}&per_page={per_page}{params_ref}"));
             let v = self.0.get_json(&url).await?;
             Ok(v.as_array().unwrap_or(&vec![]).iter().map(|mr| map_merge_request(mr, Some(&project))).collect())
         })
         .await;
-        let me = if query.filter == PullRequestFilter::All { None } else { self.0.self_username().await? };
-        let filtered = apply_pull_request_filter(rows, query.filter, me.as_deref());
+        let filtered = if params.is_some() { rows } else { apply_pull_request_filter(rows, query.filter, me.as_deref()) };
         Ok(sort_and_cap(filtered, scope.len(), query.limit, |pr| pr.updated_at))
     }
     async fn current_user(&self) -> Result<Option<String>> {
         self.0.self_username().await
+    }
+    fn list_targets_filter(&self) -> bool {
+        // `Mine` and `ReviewRequested` are `author_username` / `reviewer_username` queries per
+        // project, not a page filtered afterwards — see `mr_filter_params`.
+        true
     }
     async fn get(&self, item: &ItemRef) -> Result<PullRequest> {
         let project = self.0.resolve(item)?;
@@ -1175,6 +1200,14 @@ impl ProviderFactory for GitLabFactory {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn filtered_merge_requests_are_asked_for_by_author_or_reviewer() {
+        use super::*;
+        assert_eq!(mr_filter_params(PullRequestFilter::All, "dan"), None);
+        assert_eq!(mr_filter_params(PullRequestFilter::Mine, "dan").as_deref(), Some("&scope=all&author_username=dan&order_by=updated_at&sort=desc"));
+        assert_eq!(mr_filter_params(PullRequestFilter::ReviewRequested, "dan").as_deref(), Some("&scope=all&reviewer_username=dan&order_by=updated_at&sort=desc"));
+    }
+
     use super::*;
 
     #[test]
@@ -1467,5 +1500,73 @@ mod tests {
     fn strip_ci_log_leaves_plain_text_untouched() {
         let raw = "hello world\nsecond line\nthird line";
         assert_eq!(strip_ci_log(raw), raw);
+    }
+
+    /// A client against a fake GitLab whose one project, `acme/pay`, lists a merge request by
+    /// `sam` — whatever was asked. Returned under "Mine", that proves the rows are the forge's
+    /// answer to the filter, not a page filtered again in memory.
+    fn forge_and_client() -> (crate::test_http::FakeForge, GitLabPr) {
+        let forge = crate::test_http::FakeForge::start();
+        forge.route(
+            &format!("/projects/{}/merge_requests", encode_project("acme/pay")),
+            serde_json::json!([{ "iid": 7, "title": "old but mine", "state": "opened",
+                                 "author": { "username": "sam", "name": "Sam" },
+                                 "updated_at": "2026-09-01T00:00:00Z" }]),
+        );
+        let client = Arc::new(GitLabClient {
+            http: reqwest::Client::new(),
+            base: forge.base().to_string(),
+            scope: vec!["acme/pay".into()],
+            self_username: tokio::sync::Mutex::new(None),
+        });
+        (forge, GitLabPr(client))
+    }
+
+    fn query(filter: PullRequestFilter, include_completed: bool) -> PullRequestQuery {
+        PullRequestQuery { filter, include_completed, limit: None, decorate: false }
+    }
+
+    #[tokio::test]
+    async fn mine_and_review_are_asked_of_gitlab_by_username() {
+        let (forge, pr) = forge_and_client();
+        forge.route("/user", serde_json::json!({ "username": "dan" }));
+        assert!(pr.list_targets_filter());
+
+        let rows = pr.list(&query(PullRequestFilter::Mine, false)).await.unwrap();
+        assert_eq!(rows.iter().map(|r| r.title.as_str()).collect::<Vec<_>>(), vec!["old but mine"], "the forge's answer is trusted");
+        let list = forge.requests_to("/projects/");
+        assert_eq!(list.len(), 1, "{list:?}");
+        for needle in ["state=opened", "scope=all", "author_username=dan", "order_by=updated_at", "sort=desc"] {
+            assert!(list[0].contains(needle), "{needle} missing from {}", list[0]);
+        }
+        assert_eq!(forge.requests_to("/user").len(), 1, "identity fetched once");
+
+        // Review asks for the reviewer; the completed variant asks for every state. The username
+        // is cached, so no second `/user`.
+        pr.list(&query(PullRequestFilter::ReviewRequested, true)).await.unwrap();
+        let list = forge.requests_to("/projects/");
+        assert!(list[1].contains("reviewer_username=dan") && list[1].contains("state=all"), "{}", list[1]);
+        assert!(!list[1].contains("author_username"), "{}", list[1]);
+        assert_eq!(forge.requests_to("/user").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn all_is_the_plain_page_and_needs_no_identity() {
+        let (forge, pr) = forge_and_client();
+        pr.list(&query(PullRequestFilter::All, false)).await.unwrap();
+        let list = forge.requests_to("/projects/");
+        assert_eq!(list.len(), 1);
+        assert!(!list[0].contains("username") && !list[0].contains("scope="), "{}", list[0]);
+        assert!(forge.requests_to("/user").is_empty(), "All never asks who you are");
+    }
+
+    #[tokio::test]
+    async fn an_identity_gitlab_cannot_name_falls_back_to_the_page() {
+        let (forge, pr) = forge_and_client();
+        forge.route("/user", serde_json::json!({ "id": 1 })); // no username
+        let rows = pr.list(&query(PullRequestFilter::Mine, false)).await.unwrap();
+        let list = forge.requests_to("/projects/");
+        assert!(!list[0].contains("author_username"), "no username to filter by: {}", list[0]);
+        assert_eq!(rows.len(), 1, "an unknown identity passes every row through, as before");
     }
 }

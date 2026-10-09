@@ -1,10 +1,10 @@
 //! GitHub provider: pure mappers (fixture-tested) + a reqwest client.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use forgetop_core::domain::*;
-use forgetop_core::filter::apply_pull_request_filter;
 use forgetop_core::provider::*;
 use forgetop_core::{Error, Result};
 use reqwest::header::{ACCEPT, AUTHORIZATION, USER_AGENT};
@@ -556,6 +556,103 @@ pub fn repositories_from_page(v: &Value) -> Vec<String> {
     v.as_array().map(|a| a.as_slice()).unwrap_or(&[]).iter().filter_map(|r| get_str(r, "full_name")).collect()
 }
 
+// ---- searching for your own / review-requested pull requests ----
+
+/// GitHub caps a search `q` at this many characters. A scope of a few dozen repositories does not
+/// fit in one, so [`search_queries`] splits it.
+const SEARCH_QUERY_MAX: usize = 256;
+
+/// GitHub allows at most five `AND`/`OR`/`NOT` operators in one query, so one query names at
+/// most six repositories.
+const SEARCH_REPOS_PER_QUERY: usize = 6;
+
+/// The search qualifier that names `filter`'s rows for the signed-in user, or `None` for `All`,
+/// which is a page per repository and no search.
+fn search_qualifier(filter: PullRequestFilter) -> Option<&'static str> {
+    match filter {
+        PullRequestFilter::All => None,
+        PullRequestFilter::Mine => Some("author:@me"),
+        PullRequestFilter::ReviewRequested => Some("review-requested:@me"),
+    }
+}
+
+/// The search queries that together cover `scope`, each within GitHub's limits.
+///
+/// `/pulls` lists a repository's newest 50 pull requests, and a filter applied to that page is a
+/// filter over a *window*: on a busy repository your own pull request drops out of it as soon as
+/// 50 newer ones exist, and "Mine" goes blank although nothing about it changed. Search addresses
+/// the filter itself — `author:@me` in any `repo:` in scope — so the rows come back however old
+/// they are. The repositories are OR-ed explicitly: in GitHub's advanced search syntax (the
+/// default since September 2025, and what `advanced_search=true` asks for) a space is `AND`, and
+/// `repo:a repo:b` would match nothing.
+pub fn search_queries(scope: &[String], qualifier: &str, open_only: bool) -> Vec<String> {
+    let head = if open_only { format!("is:pr is:open {qualifier}") } else { format!("is:pr {qualifier}") };
+    let mut out = Vec::new();
+    let mut current: Vec<&str> = Vec::new();
+    let query = |repos: &[&str]| match repos {
+        [only] => format!("{head} repo:{only}"),
+        many => format!("{head} ({})", many.iter().map(|r| format!("repo:{r}")).collect::<Vec<_>>().join(" OR ")),
+    };
+    for repo in scope {
+        let mut next = current.clone();
+        next.push(repo);
+        if !current.is_empty() && (next.len() > SEARCH_REPOS_PER_QUERY || query(&next).len() > SEARCH_QUERY_MAX) {
+            out.push(query(&current));
+            current.clear();
+        }
+        current.push(repo);
+    }
+    if !current.is_empty() {
+        out.push(query(&current));
+    }
+    out
+}
+
+/// One search result: where the pull request lives and when it last changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchHit {
+    /// Connection-relative (`owner/repo`), from the item's `repository_url`.
+    pub repo: String,
+    pub number: i64,
+    /// The item's `updated_at`, verbatim — the key that decides whether a cached full fetch of
+    /// this pull request is still current.
+    pub updated_at: Option<String>,
+    /// The item itself: issue-shaped, so it lacks `head`, `base` and `requested_reviewers`, but it
+    /// is a usable row if fetching the full pull request fails.
+    pub item: Value,
+}
+
+/// Reads a `/search/issues` item into a [`SearchHit`]; `None` for an item that names no
+/// repository under `base` or no number.
+pub fn search_hit(item: &Value, base: &str) -> Option<SearchHit> {
+    let repos = format!("{}/repos/", base.trim_end_matches('/'));
+    let repo = get_str(item, "repository_url")?.strip_prefix(&repos)?.trim_matches('/').to_string();
+    if repo.is_empty() {
+        return None;
+    }
+    Some(SearchHit { repo, number: get_i64(item, "number")?, updated_at: get_str(item, "updated_at"), item: item.clone() })
+}
+
+/// A search item as a row, for when the full pull request could not be fetched. Search items
+/// keep `merged_at` under `pull_request`, where [`map_pull_request`] does not look.
+fn map_search_item(hit: &SearchHit) -> PullRequest {
+    let mut pr = map_pull_request(&hit.item, Some(&hit.repo));
+    if get_obj(&hit.item, "pull_request").and_then(|p| get_str(p, "merged_at")).is_some() {
+        pr.status = PullRequestStatus::Merged;
+    }
+    pr
+}
+
+/// Whether a full fetch cached at `cached_updated_at` still describes a hit last updated at
+/// `updated_at`. An unknown timestamp on either side means fetch again.
+pub fn hydration_is_current(cached_updated_at: &str, updated_at: Option<&str>) -> bool {
+    updated_at == Some(cached_updated_at)
+}
+
+/// Past this many cached full fetches the cache is dropped wholesale: it exists to make a reload
+/// that finds nothing changed cost nothing, not to remember every pull request ever searched.
+const HYDRATION_CACHE_MAX: usize = 2000;
+
 pub struct GitHubClient {
     http: reqwest::Client,
     base: String,
@@ -564,6 +661,10 @@ pub struct GitHubClient {
     /// not a permission boundary.
     scope: Vec<String>,
     self_login: tokio::sync::Mutex<Option<String>>,
+    /// (repository, number) → the `updated_at` a search last reported and the full pull request
+    /// fetched for it. A hit whose `updated_at` matches is served from here, so a reload that
+    /// finds your pull requests unchanged costs the searches and nothing per row.
+    hydrated: tokio::sync::Mutex<HashMap<(String, i64), (String, PullRequest)>>,
 }
 
 impl GitHubClient {
@@ -646,6 +747,62 @@ impl GitHubClient {
         Ok(guard.clone())
     }
 
+    /// The pull requests matching `qualifier` across the scope, newest-updated first.
+    ///
+    /// One search per [`search_queries`] chunk, then each hit becomes a full pull request — the
+    /// search item is issue-shaped and has no `head`, `base` or `requested_reviewers`, and the
+    /// review-requested view is derived from the last of those. A hit the cache already holds at
+    /// the same `updated_at` is not fetched again. A chunk whose search fails is dropped like a
+    /// repository whose list fails: the rows the other chunks found still show.
+    async fn search_pull_requests(&self, qualifier: &str, open_only: bool, per_page: u32) -> Vec<PullRequest> {
+        let queries = search_queries(&self.scope, qualifier, open_only);
+        let per_page = per_page.min(100);
+        let hits = fan_out(&queries, "github.pull_requests.search", |q| async move {
+            let url =
+                format!("{}/search/issues?q={}&advanced_search=true&sort=updated&order=desc&per_page={per_page}", self.base, q.replace(' ', "+"));
+            let v = self.get_json(&url).await?;
+            Ok(get_arr(&v, "items").iter().filter_map(|item| search_hit(item, &self.base)).collect::<Vec<_>>())
+        })
+        .await;
+        let mut out = Vec::with_capacity(hits.len());
+        for chunk in hits.chunks(scope::MAX_CONCURRENT) {
+            out.extend(futures_util::future::join_all(chunk.iter().map(|hit| self.hydrate(hit))).await);
+        }
+        out
+    }
+
+    /// The full pull request for one search hit, from the cache when its `updated_at` has not
+    /// moved, else from `/pulls/{number}`. Falls back to the search item itself rather than
+    /// losing the row when that fetch fails.
+    async fn hydrate(&self, hit: &SearchHit) -> PullRequest {
+        let key = (hit.repo.clone(), hit.number);
+        if let Some((seen, pr)) = self.hydrated.lock().await.get(&key) {
+            if hydration_is_current(seen, hit.updated_at.as_deref()) {
+                return pr.clone();
+            }
+        }
+        match self.get_json(&self.repo_path(&hit.repo, &format!("/pulls/{}", hit.number))).await {
+            Ok(detail) => {
+                let pr = map_pull_request(&detail, Some(&hit.repo));
+                if let Some(updated) = &hit.updated_at {
+                    let mut cache = self.hydrated.lock().await;
+                    if cache.len() >= HYDRATION_CACHE_MAX {
+                        cache.clear();
+                    }
+                    cache.insert(key, (updated.clone(), pr.clone()));
+                }
+                pr
+            }
+            Err(e) => {
+                forgetop_core::diag::log(
+                    "github.pull_requests.search",
+                    &format!("full fetch of {}#{} failed ({e}) — showing the search result", hit.repo, hit.number),
+                );
+                map_search_item(hit)
+            }
+        }
+    }
+
     /// GitHub's list endpoints omit `mergeable_state`, `changed_files`, `additions` and
     /// `deletions` entirely, so those only exist after a per-PR fetch (plus one for checks).
     async fn enrich(&self, pr: PullRequest) -> PullRequest {
@@ -726,17 +883,23 @@ impl PullRequestSource for GitHubPr {
         if scope.is_empty() {
             return Ok(Vec::new());
         }
-        let state = if query.include_completed { "all" } else { "open" };
         let per_page = query.limit.unwrap_or(50);
-        let rows = fan_out(scope, "github.pull_requests.list", |repo| async move {
-            let url = self.0.repo_path(&repo, &format!("/pulls?state={state}&per_page={per_page}"));
-            let v = self.0.get_json(&url).await?;
-            Ok(v.as_array().unwrap_or(&vec![]).iter().map(|pr| map_pull_request(pr, Some(&repo))).collect())
-        })
-        .await;
-
-        let me = if query.filter == PullRequestFilter::All { None } else { self.0.self_login().await? };
-        let filtered = apply_pull_request_filter(rows, query.filter, me.as_deref());
+        // "Mine" and "Review" are searched for, not filtered out of a page: `/pulls` returns a
+        // repository's newest 50, and your own pull request leaves that window as soon as 50
+        // newer ones exist — on a busy repository, within days of opening it. The search names
+        // the signed-in user itself (`@me`), so it needs no `/user` call.
+        let filtered = match search_qualifier(query.filter) {
+            Some(qualifier) => self.0.search_pull_requests(qualifier, !query.include_completed, per_page).await,
+            None => {
+                let state = if query.include_completed { "all" } else { "open" };
+                fan_out(scope, "github.pull_requests.list", |repo| async move {
+                    let url = self.0.repo_path(&repo, &format!("/pulls?state={state}&per_page={per_page}"));
+                    let v = self.0.get_json(&url).await?;
+                    Ok(v.as_array().unwrap_or(&vec![]).iter().map(|pr| map_pull_request(pr, Some(&repo))).collect())
+                })
+                .await
+            }
+        };
         // Sort and cap once across the whole scope, then decorate only what survived — so the
         // cost of decoration is bounded by what we return, not multiplied by the scope size.
         let kept = sort_and_cap(filtered, scope.len(), query.limit, |pr| pr.updated_at);
@@ -767,6 +930,11 @@ impl PullRequestSource for GitHubPr {
     }
     fn list_omits_decoration(&self) -> bool {
         // `/pulls` omits mergeable_state, changed_files, additions and deletions entirely.
+        true
+    }
+    fn list_targets_filter(&self) -> bool {
+        // `Mine` and `ReviewRequested` are `/search/issues` queries over the scope, not a page
+        // per repository filtered afterwards — see `list`.
         true
     }
     async fn decorate(&self, item: &ItemRef) -> Result<PrDecoration> {
@@ -1260,6 +1428,7 @@ impl ProviderFactory for GitHubFactory {
             base: connection.base_url.clone().unwrap_or_else(|| "https://api.github.com".into()),
             scope,
             self_login: tokio::sync::Mutex::new(None),
+            hydrated: tokio::sync::Mutex::new(HashMap::new()),
         });
         Ok(Arc::new(GitHubConnection {
             id: connection.id.clone(),
@@ -1319,6 +1488,7 @@ mod tests {
             base: "http://127.0.0.1:9/never".into(),
             scope: scope.iter().map(|s| s.to_string()).collect(),
             self_login: tokio::sync::Mutex::new(None),
+            hydrated: tokio::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -1650,5 +1820,175 @@ mod tests {
         assert!(text.starts_with("build: in progress"));
         assert!(text.contains("✓ checkout"));
         assert!(text.contains("… compile"));
+    }
+
+    #[test]
+    fn search_queries_cover_the_scope_within_githubs_limits() {
+        // 40 repositories cannot share one query: at most six per query (five `OR`s), and never
+        // more than 256 characters.
+        let scope: Vec<String> = (0..40).map(|i| format!("tilt-engineering/service-number-{i:02}")).collect();
+        let queries = search_queries(&scope, "author:@me", true);
+        assert!(queries.len() >= 7, "a wide scope is split: {queries:?}");
+        let mut seen = Vec::new();
+        for q in &queries {
+            assert!(q.len() <= SEARCH_QUERY_MAX, "{} chars: {q}", q.len());
+            assert!(q.starts_with("is:pr is:open author:@me (repo:"), "{q}");
+            assert!(q.matches(" OR ").count() < SEARCH_REPOS_PER_QUERY, "{q}");
+            seen.extend(q.trim_end_matches(')').split([' ', '(']).filter_map(|t| t.strip_prefix("repo:")).map(str::to_string));
+        }
+        assert_eq!(seen, scope, "every repository, once, in scope order");
+        // Long names split on length before they reach six per query.
+        let long: Vec<String> = (0..6).map(|i| format!("{}/{i}", "o".repeat(100))).collect();
+        assert!(search_queries(&long, "author:@me", true).iter().all(|q| q.len() <= SEARCH_QUERY_MAX));
+        // One repository needs no grouping; completed views search all states; an empty scope
+        // searches nothing at all.
+        assert_eq!(search_queries(&scope[..1], "review-requested:@me", false), vec!["is:pr review-requested:@me repo:tilt-engineering/service-number-00"]);
+        assert_eq!(search_queries(&scope[..2], "author:@me", true), vec!["is:pr is:open author:@me (repo:tilt-engineering/service-number-00 OR repo:tilt-engineering/service-number-01)"]);
+        assert!(search_queries(&[], "author:@me", true).is_empty());
+    }
+
+    #[test]
+    fn a_search_item_names_its_repository_and_number() {
+        let item: Value = serde_json::from_str(
+            r#"{ "number": 25471, "updated_at": "2026-10-06T01:02:03Z", "state": "open", "draft": false,
+                 "title": "Add UserKey", "user": { "login": "dan" },
+                 "repository_url": "https://api.github.com/repos/tilt/monorepo",
+                 "pull_request": { "url": "https://api.github.com/repos/tilt/monorepo/pulls/25471", "merged_at": null } }"#,
+        )
+        .unwrap();
+        let hit = search_hit(&item, "https://api.github.com").unwrap();
+        assert_eq!((hit.repo.as_str(), hit.number, hit.updated_at.as_deref()), ("tilt/monorepo", 25471, Some("2026-10-06T01:02:03Z")));
+        // A trailing slash on the base does not break the match; another host is not ours.
+        assert_eq!(search_hit(&item, "https://api.github.com/").unwrap().repo, "tilt/monorepo");
+        assert!(search_hit(&item, "https://ghe.example.com/api/v3").is_none());
+        // The item is a usable row on its own — connection-relative repository, number, author.
+        let row = map_search_item(&hit);
+        assert_eq!((row.repository.as_deref(), row.number, row.author.handle.as_deref()), (Some("tilt/monorepo"), Some(25471), Some("dan")));
+        assert_eq!(row.status, PullRequestStatus::Open);
+    }
+
+    #[test]
+    fn a_search_item_is_merged_when_only_its_pull_request_says_so() {
+        // Search items carry `merged_at` under `pull_request`, not at the top level.
+        let item: Value = serde_json::from_str(
+            r#"{ "number": 3, "state": "closed", "repository_url": "https://api.github.com/repos/acme/pay",
+                 "pull_request": { "merged_at": "2026-10-01T00:00:00Z" } }"#,
+        )
+        .unwrap();
+        assert_eq!(map_search_item(&search_hit(&item, "https://api.github.com").unwrap()).status, PullRequestStatus::Merged);
+    }
+
+    #[test]
+    fn a_cached_full_fetch_is_current_only_at_the_same_timestamp() {
+        assert!(hydration_is_current("2026-10-06T01:02:03Z", Some("2026-10-06T01:02:03Z")));
+        assert!(!hydration_is_current("2026-10-06T01:02:03Z", Some("2026-10-07T01:02:03Z")));
+        assert!(!hydration_is_current("2026-10-06T01:02:03Z", None));
+    }
+
+    #[tokio::test]
+    async fn a_filtered_list_is_searched_for_and_a_failed_search_is_empty_not_an_error() {
+        // The views the pool fetches on their own: GitHub says it targets them.
+        let pr = GitHubPr(client(&["acme/pay", "acme/ledger"]));
+        assert!(pr.list_targets_filter());
+        // A search that cannot be made is dropped like a repository whose list fails — the
+        // caller keeps the rows it has rather than an error wiping the section.
+        let query = PullRequestQuery { filter: PullRequestFilter::Mine, ..PullRequestQuery::default() };
+        assert!(pr.list(&query).await.unwrap().is_empty());
+    }
+
+    /// A client against a fake GitHub whose search finds `acme/pay#7`, and whose `/pulls/7` is
+    /// the full pull request (branches, reviewers) the search item lacks.
+    fn forge_and_client(scope: &[&str]) -> (crate::test_http::FakeForge, GitHubPr) {
+        let forge = crate::test_http::FakeForge::start();
+        forge.route(
+            "/search/issues",
+            serde_json::json!({ "total_count": 1, "incomplete_results": false, "items": [ {
+                "number": 7, "title": "from search", "state": "open", "draft": false,
+                "user": { "login": "dan" }, "updated_at": "2026-09-01T00:00:00Z",
+                "repository_url": format!("{}/repos/acme/pay", forge.base()),
+                "pull_request": { "merged_at": null } } ] }),
+        );
+        forge.route(
+            "/repos/acme/pay/pulls/7",
+            serde_json::json!({ "number": 7, "title": "from pulls", "state": "open", "draft": false,
+                "user": { "login": "dan" }, "updated_at": "2026-09-01T00:00:00Z",
+                "head": { "ref": "feat/user-key" }, "base": { "ref": "main", "repo": { "full_name": "acme/pay" } },
+                "requested_reviewers": [ { "login": "sam" } ] }),
+        );
+        let client = Arc::new(GitHubClient {
+            http: reqwest::Client::new(),
+            base: forge.base().to_string(),
+            scope: scope.iter().map(|s| s.to_string()).collect(),
+            self_login: tokio::sync::Mutex::new(None),
+            hydrated: tokio::sync::Mutex::new(HashMap::new()),
+        });
+        (forge, GitHubPr(client))
+    }
+
+    fn pr_query(filter: PullRequestFilter, include_completed: bool) -> PullRequestQuery {
+        PullRequestQuery { filter, include_completed, limit: None, decorate: false }
+    }
+
+    #[tokio::test]
+    async fn mine_is_one_search_over_the_scope_and_a_full_fetch_per_hit_once() {
+        let (forge, pr) = forge_and_client(&["acme/pay", "acme/ledger"]);
+
+        let rows = pr.list(&pr_query(PullRequestFilter::Mine, false)).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!((row.repository.as_deref(), row.number, row.title.as_str()), (Some("acme/pay"), Some(7), "from pulls"));
+        assert_eq!(row.source_ref.as_deref(), Some("feat/user-key"), "the row is the full pull request");
+        assert_eq!(row.reviewers[0].user.handle.as_deref(), Some("sam"), "with the reviewers the review view is derived from");
+
+        let searches = forge.requests_to("/search/issues");
+        assert_eq!(searches.len(), 1, "two repositories, one query: {searches:?}");
+        for needle in ["q=is:pr+is:open+author:@me+(repo:acme/pay+OR+repo:acme/ledger)", "advanced_search=true", "sort=updated", "per_page=50"] {
+            assert!(searches[0].contains(needle), "{needle} missing from {}", searches[0]);
+        }
+        assert_eq!(forge.requests_to("/repos/acme/pay/pulls/7").len(), 1);
+        assert!(forge.requests_to("/user").is_empty(), "`@me` needs no /user call");
+        assert!(forge.requests_to("/repos/acme/pay/pulls?").is_empty(), "and no page is listed");
+
+        // The same hit, unchanged: served from the cache, not fetched again.
+        let again = pr.list(&pr_query(PullRequestFilter::Mine, false)).await.unwrap();
+        assert_eq!(again[0].title, "from pulls");
+        assert_eq!(forge.requests_to("/search/issues").len(), 2);
+        assert_eq!(forge.requests_to("/repos/acme/pay/pulls/7").len(), 1, "cached at the same updated_at");
+    }
+
+    #[tokio::test]
+    async fn review_and_completed_change_only_the_query() {
+        let (forge, pr) = forge_and_client(&["acme/pay"]);
+        pr.list(&pr_query(PullRequestFilter::ReviewRequested, true)).await.unwrap();
+        let searches = forge.requests_to("/search/issues");
+        assert!(searches[0].contains("q=is:pr+review-requested:@me+repo:acme/pay&"), "{}", searches[0]);
+        assert!(!searches[0].contains("is:open"), "completed searches every state: {}", searches[0]);
+    }
+
+    #[tokio::test]
+    async fn all_is_still_the_page_per_repository() {
+        let (forge, pr) = forge_and_client(&["acme/pay"]);
+        forge.route("/repos/acme/pay/pulls", serde_json::json!([ { "number": 100, "title": "newest", "state": "open", "user": { "login": "sam" } } ]));
+        let rows = pr.list(&pr_query(PullRequestFilter::All, false)).await.unwrap();
+        assert_eq!(rows[0].title, "newest");
+        assert!(forge.requests_to("/search/issues").is_empty());
+        assert!(forge.requests_to("/repos/acme/pay/pulls?state=open&per_page=50").len() == 1, "{:?}", forge.requests());
+    }
+
+    #[tokio::test]
+    async fn a_hit_whose_full_fetch_fails_still_shows_from_the_search_item() {
+        let (forge, pr) = forge_and_client(&["acme/pay"]);
+        forge.route(
+            "/search/issues",
+            serde_json::json!({ "items": [ {
+                "number": 9, "title": "only in search", "state": "closed", "user": { "login": "dan" },
+                "updated_at": "2026-09-02T00:00:00Z",
+                "repository_url": format!("{}/repos/acme/pay", forge.base()),
+                "pull_request": { "merged_at": "2026-09-02T00:00:00Z" } } ] }),
+        );
+        // `/repos/acme/pay/pulls/9` is not routed: a 404, as a deleted or forbidden PR would be.
+        let rows = pr.list(&pr_query(PullRequestFilter::Mine, true)).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].title.as_str(), rows[0].repository.as_deref(), rows[0].status), ("only in search", Some("acme/pay"), PullRequestStatus::Merged));
     }
 }
