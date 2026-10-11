@@ -2674,7 +2674,7 @@ fn base_footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
             }
             None => Vec::new(),
         };
-        let searchable = v.diff.files.len() > 1;
+        let searchable = !v.diff.files.is_empty();
         return if v.tab == 3 && v.diff.search_input.is_some() {
             // The `/` prompt takes every key, so the rest of the glossary would be a lie.
             vec![("type", "search"), ("↵", "done"), ("Esc", "cancel")]
@@ -3056,12 +3056,6 @@ fn kind_badge(theme: &Theme, kind: FileChangeKind) -> Span<'static> {
 
 /// `resolve` is whether `R` resolves a thread here, for the hint on the one under the cursor.
 fn render_diff(frame: &mut Frame, area: Rect, theme: &Theme, diff: &DiffView, pending: &[LineComment], resolve: bool) {
-    // A single file leaves nothing to pick: the patch takes the whole width, and its title
-    // carries what the file list would have (the path, the counts, whether it's reviewed).
-    if diff.files.len() == 1 {
-        render_diff_patch(frame, area, theme, diff, pending, resolve);
-        return;
-    }
     // File list on the left; the patch on the right renders comment threads inline,
     // beneath the lines they anchor to (unanchored threads live on the Conversation tab).
     let (width, narrow) = diff_files_layout(diff, area.width);
@@ -3400,14 +3394,6 @@ fn render_diff_patch(frame: &mut Frame, area: Rect, theme: &Theme, diff: &DiffVi
     let file_hits = diff.file_hits(diff.selected);
     if file_hits > 0 {
         title.push_str(&format!(" · {}", plural(file_hits, "match", "matches")));
-    }
-    // Without a file list beside it, the title says what the list would have.
-    if diff.files.len() == 1 {
-        let mark = if diff.is_viewed(&file.path) { "[x]" } else { "[ ]" };
-        title = format!("{mark} {title}");
-        if let Some(l) = &diff.commit_label {
-            title.push_str(&format!(" · commit {l}"));
-        }
     }
     let block = section_block(theme, &title);
 
@@ -6456,7 +6442,7 @@ mod tests {
     }
 
     #[test]
-    fn a_single_file_diff_gives_the_patch_the_whole_width() {
+    fn a_single_file_diff_still_lists_its_file() {
         use crate::app::Screen;
         let file = FileChange {
             path: "terraform/main.tf".into(),
@@ -6468,8 +6454,10 @@ mod tests {
         let mut app = App::new("slate");
         app.screen = Screen::PrView(Box::new(pr_view(3, vec![], vec![file])));
         let out = render_to_string(&mut app, 120, 24);
-        assert!(!out.contains("reviewed"), "no file list to pick from");
-        assert!(out.contains("[ ] terraform/main.tf  (+49 -0)"), "the patch title says what the list would have");
+        assert!(out.contains("Files · 0/1 reviewed"), "the file list is drawn for one file too");
+        assert!(out.contains("terraform/"), "with the file's folder");
+        assert!(out.contains("terraform/main.tf  (+49 -0)"), "beside its patch");
+        assert!(!out.contains("[ ] terraform/main.tf"), "the list carries the viewed mark, not the patch title");
     }
 
     #[test]

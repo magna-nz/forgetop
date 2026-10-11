@@ -9,6 +9,16 @@ Adding a release: one `## <version> — <date>` section, a line per user-visible
 and the pull request each one came from. `git log v<previous>..HEAD --merges` lists the
 candidates.
 
+## 1.8.1 — 2026-10-12
+
+Fixed
+
+- **A one-file diff keeps its file list.** In the terminal UI, the Diff tab hid the file
+  column when a pull request or commit changed a single file and gave the patch the whole
+  width. It now shows the file's folder and its viewed checkbox like any other diff, and `/`
+  searches it too.
+  ([#PR](https://github.com/magna-nz/forgetop/pull/PR))
+
 ## 1.8.0 — 2026-10-10
 
 Added
