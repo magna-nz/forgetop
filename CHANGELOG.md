@@ -17,7 +17,7 @@ Fixed
   column when a pull request or commit changed a single file and gave the patch the whole
   width. It now shows the file's folder and its viewed checkbox like any other diff, and `/`
   searches it too.
-  ([#PR](https://github.com/magna-nz/forgetop/pull/PR))
+  ([#232](https://github.com/magna-nz/forgetop/pull/232))
 
 ## 1.8.0 — 2026-10-10
 
