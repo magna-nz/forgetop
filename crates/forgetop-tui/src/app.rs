@@ -3035,12 +3035,9 @@ impl DiffView {
     }
 
     /// The file list's rows in the tree (`narrow` false) or flat layout: folds applied, and
-    /// narrowed to the files that match a search. A lone file is just itself — it has no list.
+    /// narrowed to the files that match a search.
     pub fn rows_for(&self, narrow: bool) -> Vec<crate::diff_tree::TreeRow> {
-        use crate::diff_tree::{flat_rows, tree_rows, TreeRow};
-        if self.files.len() <= 1 {
-            return (0..self.files.len()).map(|idx| TreeRow::File { idx, depth: 0 }).collect();
-        }
+        use crate::diff_tree::{flat_rows, tree_rows};
         let paths: Vec<&str> = self.files.iter().map(|f| f.path.as_str()).collect();
         let hits: Option<Vec<bool>> = self.active_query().map(|_| (0..self.files.len()).map(|i| self.file_hits(i) > 0).collect());
         let include = |i: usize| hits.as_ref().is_none_or(|h| h[i]);
@@ -4932,7 +4929,7 @@ impl App {
                         ("Next comment thread", c(']')),
                         ("Previous comment thread", c('[')),
                     ]);
-                    if v.diff.files.len() > 1 {
+                    if !v.diff.files.is_empty() {
                         out.push(("Search the diff", c('/')));
                     }
                 }
@@ -7486,8 +7483,7 @@ impl App {
             }
             Key::Char('+') if v.tab == 3 && v.diff.focus == DiffFocus::Patch => v.diff.expand_gap(v.diff.cursor, GapExpand::All),
             Key::Char('-') if v.tab == 3 && v.diff.focus == DiffFocus::Patch => v.diff.expand_gap(v.diff.cursor, GapExpand::Fold),
-            // A lone file has no list to narrow, so `/` needs one.
-            Key::Char('/') if v.tab == 3 && v.diff.files.len() > 1 => v.diff.open_search(),
+            Key::Char('/') if v.tab == 3 && !v.diff.files.is_empty() => v.diff.open_search(),
             // Diff-tab review ergonomics: mark viewed, jump between threads.
             Key::Char('v') if v.tab == 3 => {
                 v.diff.toggle_viewed();
