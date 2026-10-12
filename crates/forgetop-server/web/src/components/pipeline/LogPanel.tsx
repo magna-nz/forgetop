@@ -1,5 +1,6 @@
 // The run pane's log panel: one job's log, folded into its steps' sections the way the TUI's
-// LogView does (../../pipeline/runlog), with first-error jump, search, follow and wrap.
+// LogView does (../../pipeline/runlog), with first-error jump, search, follow, wrap and raw (the
+// log as fetched: no step sections, timestamps kept).
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { usePipelineLogs } from "../../api";
 import {
@@ -15,7 +16,9 @@ import {
   type LogSection,
 } from "../../pipeline/runlog";
 import type { PipeRef, PipelineJob } from "../../types";
-import { PaneButton, PaneLink, MONO_DIM } from "./parts";
+import { Icon } from "../icons";
+import { Button, IconButton } from "../ui";
+import { PaneLink, MONO_DIM } from "./parts";
 
 const ROW_PX = 20;
 const fmtN = (n: number) => n.toLocaleString("en-US");
@@ -84,6 +87,7 @@ export const LogPanel = memo(function LogPanel({ pipeRef, jobId, job, step, live
 
   const [follow, setFollow] = useState(live);
   const [wrap, setWrap] = useState(false);
+  const [raw, setRaw] = useState(false);
   const [query, setQuery] = useState("");
   const [matchAt, setMatchAt] = useState(0);
   const [scrollTo, setScrollTo] = useState<number | "bottom" | null>(null);
@@ -118,11 +122,17 @@ export const LogPanel = memo(function LogPanel({ pipeRef, jobId, job, step, live
   }, [parsed, openAbs]);
 
   const rows = useMemo(
-    () => (parsed ? layoutLog({ lines: parsed.lines, sections: parsed.sections, open, stepPassed }) : []),
-    [parsed, open, stepPassed],
+    () =>
+      !parsed
+        ? []
+        : raw
+          ? parsed.lines.map((_, line) => ({ kind: "line" as const, line }))
+          : layoutLog({ lines: parsed.lines, sections: parsed.sections, open, stepPassed }),
+    [parsed, open, stepPassed, raw],
   );
 
-  const sectioned = (parsed?.sections.length ?? 0) > 0;
+  // Raw shows every line as fetched; otherwise a sectioned log drops its timestamps.
+  const sectioned = !raw && (parsed?.sections.length ?? 0) > 0;
   const matches = useMemo(() => {
     if (!parsed || !query) return [];
     const ql = query.toLowerCase();
@@ -200,31 +210,58 @@ export const LogPanel = memo(function LogPanel({ pipeRef, jobId, job, step, live
   const sectionName = (s: LogSection) => (s.step !== null && steps[s.step] ? steps[s.step] : s.name);
 
   return (
-    <section className="rounded-lg flex flex-col overflow-hidden" style={{ background: "var(--panel)", border: "1px solid var(--border)" }} aria-label={`Logs · ${title}`}>
-      <div className="flex items-center gap-2.5 px-3 py-2 flex-wrap" style={{ borderBottom: "1px solid var(--border)" }}>
-        <span className="text-[11px] font-semibold uppercase tracking-wider" style={{ color: "var(--dim)" }}>
-          Logs · {title}
+    <section
+      className="flex flex-col overflow-hidden"
+      style={{ borderRadius: 6, background: "var(--panel)", border: "1px solid var(--border)" }}
+      aria-label={`Logs · ${title}`}
+    >
+      <div className="flex items-center gap-2 px-2.5 flex-wrap text-[12px]" style={{ minHeight: 30, borderBottom: "1px solid var(--border)", color: "var(--fg3)" }}>
+        <span className="mono truncate" style={{ color: "var(--fg)" }}>
+          {title}
         </span>
+        <span>·</span>
+        <span>{live ? "live" : "finished"}</span>
         {parsed && (
-          <span className="text-xs" style={{ color: "var(--dim)" }}>
-            {fmtN(total)} lines
-            {parsed.dropped > 0 && ` (showing last ${fmtN(parsed.lines.length)} lines)`}
+          <span className="num">
+            · {fmtN(total)} lines
+            {parsed.dropped > 0 && ` (showing last ${fmtN(parsed.lines.length)})`}
           </span>
-        )}
-        {parsed?.firstError != null && (
-          <button type="button" className="text-xs" style={{ color: "var(--red)" }} onClick={() => reveal(parsed.firstError!)} title="Scroll to the first error">
-            first error · line {fmtN(lineNo(parsed.firstError))}
-          </button>
         )}
         <span className="flex-1" />
-        <label className="inline-flex items-center gap-1.5 rounded-md px-2 py-0.5 text-xs" style={{ background: "var(--bg)", border: "1px solid var(--border)" }}>
-          <span style={{ color: "var(--dim)" }} aria-hidden="true">
-            /
-          </span>
+        {parsed?.firstError != null && (
+          <Button quiet sm style={{ color: "var(--red)" }} onClick={() => reveal(parsed.firstError!)} title="Scroll to the first error">
+            Jump to error · line {fmtN(lineNo(parsed.firstError))}
+          </Button>
+        )}
+        <Button quiet sm aria-pressed={wrap} style={wrap ? { color: "var(--fg)", background: "var(--active)" } : undefined} onClick={() => setWrap((w) => !w)}>
+          Wrap
+        </Button>
+        <Button
+          quiet
+          sm
+          aria-pressed={raw}
+          title="The log as fetched: no step sections, timestamps kept"
+          style={raw ? { color: "var(--fg)", background: "var(--active)" } : undefined}
+          onClick={() => setRaw((r) => !r)}
+        >
+          Raw
+        </Button>
+        <Button
+          quiet
+          sm
+          aria-pressed={follow}
+          disabled={!live}
+          title={live ? "Keep the newest lines in view" : "The job has finished"}
+          style={follow ? { color: "var(--fg)", background: "var(--active)" } : undefined}
+          onClick={() => setFollow((f) => !f)}
+        >
+          Follow
+        </Button>
+        <span className="inline-flex items-center gap-1">
           <input
             type="search"
             value={query}
-            placeholder="search"
+            placeholder="Search"
             aria-label="Search log"
             onChange={(e) => {
               setQuery(e.target.value);
@@ -240,39 +277,28 @@ export const LogPanel = memo(function LogPanel({ pipeRef, jobId, job, step, live
                 setQuery("");
               }
             }}
-            className="mono bg-transparent outline-none text-xs"
-            style={{ width: 120, color: "var(--yellow)", border: 0 }}
+            className="ft-input"
+            style={{ width: 130, height: 22, fontSize: 12 }}
           />
-          {query && (
-            <span style={{ color: "var(--dim)" }}>
-              {matches.length ? `${Math.min(matchAt, matches.length - 1) + 1} of ${matches.length}` : "0 of 0"}
-            </span>
-          )}
-        </label>
-        <PaneButton label="↑" ariaLabel="Previous match" neutral disabled={!matches.length} onClick={() => step_(-1)} />
-        <PaneButton label="↓" ariaLabel="Next match" neutral disabled={!matches.length} onClick={() => step_(1)} />
-        <PaneButton
-          label="Follow"
-          neutral
-          pressed={follow}
-          disabled={!live}
-          title={live ? "Keep the newest lines in view" : "The job has finished"}
-          onClick={() => setFollow((f) => !f)}
-        />
-        <PaneButton label="Wrap" neutral pressed={wrap} onClick={() => setWrap((w) => !w)} />
-        {job?.url && <PaneLink href={job.url}>Open job ↗</PaneLink>}
-        <button type="button" aria-label="Close logs" onClick={onClose} className="text-sm px-1 leading-none" style={{ color: "var(--dim)" }}>
-          ✕
-        </button>
+          {query && <span className="num whitespace-nowrap">{matches.length ? `${Math.min(matchAt, matches.length - 1) + 1} of ${matches.length}` : "0 of 0"}</span>}
+          <Button quiet sm aria-label="Previous match" title="Previous match (Shift+Enter)" disabled={!matches.length} onClick={() => step_(-1)} className="px-1">
+            <Icon name="chevron-down" size={12} style={{ transform: "rotate(180deg)" }} />
+          </Button>
+          <Button quiet sm aria-label="Next match" title="Next match (Enter)" disabled={!matches.length} onClick={() => step_(1)} className="px-1">
+            <Icon name="chevron-down" size={12} />
+          </Button>
+        </span>
+        {job?.url && <PaneLink href={job.url}>Open job</PaneLink>}
+        <IconButton icon="x" label="Close logs" size={13} onClick={onClose} style={{ width: 22, height: 22 }} />
       </div>
       <div
         ref={bodyRef}
         onScroll={onScroll}
-        className="mono text-xs py-1.5"
-        style={{ maxHeight: 420, overflow: "auto", lineHeight: `${ROW_PX}px` }}
+        className="mono py-1.5"
+        style={{ maxHeight: 420, overflow: "auto", lineHeight: `${ROW_PX}px`, color: "var(--fg2)" }}
         data-testid="log-body"
       >
-        {q.isLoading && <div className="px-3" style={{ color: "var(--dim)" }}>Loading logs…</div>}
+        {q.isLoading && <div className="px-3" style={{ color: "var(--fg3)" }}>Loading logs…</div>}
         {q.error && <div className="px-3" style={{ color: "var(--red)" }}>Couldn't load logs.</div>}
         {parsed &&
           rows.map((r) => {
@@ -288,10 +314,10 @@ export const LogPanel = memo(function LogPanel({ pipeRef, jobId, job, step, live
                   type="button"
                   aria-expanded={false}
                   onClick={() => toggleSections(idx)}
-                  className="flex w-full items-center gap-2 px-3 text-left"
-                  style={{ color: "var(--dim)" }}
+                  className="flex w-full items-center gap-2 px-3 text-left text-[12px] hover:bg-[var(--hover)]"
+                  style={{ color: "var(--fg3)" }}
                 >
-                  <span aria-hidden="true">▸</span>
+                  <Icon name="chevron-right" size={12} />
                   <span className="truncate">
                     {n} steps · {sectionName(first)} … {sectionName(last)}
                   </span>
@@ -309,15 +335,13 @@ export const LogPanel = memo(function LogPanel({ pipeRef, jobId, job, step, live
                   type="button"
                   aria-expanded={isOpen}
                   onClick={() => toggleSections([r.section])}
-                  className="flex w-full items-center gap-2 px-3 text-left"
-                  style={{ color: isOpen ? "var(--accent)" : "var(--fg)", fontWeight: isOpen ? 700 : undefined }}
+                  className="flex w-full items-center gap-2 px-3 text-left text-[12px] font-medium hover:bg-[var(--hover)]"
+                  style={{ color: "var(--fg)" }}
                 >
-                  <span style={{ color: "var(--dim)", fontWeight: 400 }} aria-hidden="true">
-                    {isOpen ? "▾" : "▸"}
-                  </span>
+                  <Icon name={isOpen ? "chevron-down" : "chevron-right"} size={12} style={{ color: "var(--fg3)" }} />
                   <span className="truncate">{sectionName(s)}</span>
                   <span className="flex-1" />
-                  <span className="shrink-0" style={{ color: "var(--dim)", fontWeight: 400 }}>
+                  <span className="shrink-0 font-normal" style={{ color: "var(--fg3)" }}>
                     {isOpen ? `line ${fmtN(lineNo(s.start))}` : `${fmtN(Math.max(0, s.end - s.start - 1))} lines`}
                   </span>
                 </button>
@@ -337,20 +361,20 @@ export const LogPanel = memo(function LogPanel({ pipeRef, jobId, job, step, live
                 style={{
                   whiteSpace: wrap ? "pre-wrap" : "pre",
                   overflowWrap: wrap ? "anywhere" : undefined,
-                  color: isErr ? "var(--red)" : "var(--fg)",
-                  background: isCur ? "var(--sel)" : undefined,
+                  color: isErr ? "var(--red)" : "var(--fg2)",
+                  background: isCur ? "color-mix(in srgb, var(--yellow) 12%, transparent)" : undefined,
                   minWidth: wrap ? undefined : "max-content",
                 }}
               >
-                <span className="shrink-0 font-bold" style={{ width: 10, color: "var(--red)" }} aria-label={isFirst ? "first error" : undefined}>
-                  {isFirst ? "▶" : ""}
+                <span className="shrink-0 inline-flex items-center" style={{ width: 10, color: "var(--red)" }} aria-label={isFirst ? "first error" : undefined}>
+                  {isFirst && <Icon name="arrow-right" size={10} />}
                 </span>
                 <span className="shrink-0 text-right select-none" style={{ width: 44, color: MONO_DIM }}>
                   {lineNo(r.line)}
                 </span>
                 {g ? (
                   <>
-                    <span className="shrink-0" style={{ color: "var(--dim)" }}>
+                    <span className="shrink-0" style={{ color: "var(--fg3)" }}>
                       {g[1]}
                     </span>
                     <span className="min-w-0">{highlight(g[3], query)}</span>

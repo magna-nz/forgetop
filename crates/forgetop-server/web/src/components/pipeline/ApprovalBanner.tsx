@@ -3,7 +3,8 @@
 import { useState } from "react";
 import { fmtSecs } from "../../format";
 import type { ApprovalDecision, PipelineApproval, PipelineCapabilities } from "../../types";
-import { PaneButton } from "./parts";
+import { Icon } from "../icons";
+import { Button, StatusGlyph } from "../ui";
 
 export function ApprovalBanner({
   approvals,
@@ -32,64 +33,84 @@ export function ApprovalBanner({
 
   return (
     <div
-      className="flex items-center gap-2.5 px-5 py-2 text-[13px] flex-wrap"
-      style={{ background: "color-mix(in srgb, var(--yellow) 8%, transparent)", borderBottom: "1px solid color-mix(in srgb, var(--yellow) 30%, transparent)" }}
+      className="flex items-center gap-2.5 px-3 py-2.5 flex-wrap"
+      style={{
+        borderRadius: 6,
+        border: "1px solid color-mix(in srgb, var(--yellow) 35%, transparent)",
+        background: "color-mix(in srgb, var(--yellow) 6%, transparent)",
+      }}
       role="status"
     >
-      <span className="font-bold" style={{ color: "var(--yellow)" }}>
-        ⏸ {names.join(", ")} {names.length === 1 ? "needs" : "need"} approval
-      </span>
-      {waitSecs !== null && <span style={{ color: "var(--yellow)" }}>· waiting {fmtSecs(waitSecs)}</span>}
-      <span className="flex-1" />
-      {!caps.can_respond_approvals ? (
-        runUrl ? (
-          <a href={runUrl} target="_blank" rel="noreferrer" className="text-xs underline" style={{ color: "var(--dim)" }}>
-            Open in {providerLabel} to approve ↗
-          </a>
-        ) : (
-          <span className="text-xs" style={{ color: "var(--dim)" }}>
-            Open in {providerLabel} to approve
-          </span>
-        )
-      ) : respondable.length === 0 ? (
-        <span className="text-xs" style={{ color: "var(--dim)" }}>
-          Waiting on others
+      <StatusGlyph glyph="clock" color="var(--yellow)" />
+      <span className="text-[12.5px] min-w-0">
+        <span className="font-medium" style={{ color: "var(--fg)" }}>
+          {names.join(", ")}
+        </span>{" "}
+        <span style={{ color: "var(--fg2)" }}>
+          {names.length === 1 ? "is" : "are"} waiting for approval
+          {waitSecs !== null && <span className="num"> · {fmtSecs(waitSecs)}</span>}
         </span>
-      ) : (
-        respondable.map((a) => {
-          const named = respondable.length > 1 ? ` ${a.name}` : "";
-          if (rejecting?.id === a.id)
+      </span>
+      <span className="ml-auto flex items-center gap-1.5 flex-wrap">
+        {!caps.can_respond_approvals ? (
+          runUrl ? (
+            <a href={runUrl} target="_blank" rel="noreferrer" className="ft-btn ft-btn-sm">
+              Open in {providerLabel} to approve
+              <Icon name="external" size={12} />
+            </a>
+          ) : (
+            <span className="text-[12px]" style={{ color: "var(--fg3)" }}>
+              Open in {providerLabel} to approve
+            </span>
+          )
+        ) : respondable.length === 0 ? (
+          <span className="text-[12px]" style={{ color: "var(--fg3)" }}>
+            Waiting on others
+          </span>
+        ) : (
+          respondable.map((a) => {
+            const named = respondable.length > 1 ? ` ${a.name}` : "";
+            if (rejecting?.id === a.id)
+              return (
+                <span key={a.id} className="inline-flex items-center gap-1.5">
+                  <input
+                    autoFocus
+                    value={rejecting.comment}
+                    onChange={(e) => setRejecting({ id: a.id, comment: e.target.value })}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") reject(a, rejecting.comment);
+                      if (e.key === "Escape") {
+                        // Closes the reason box, not the pane.
+                        e.stopPropagation();
+                        setRejecting(null);
+                      }
+                    }}
+                    placeholder="Reason (optional)"
+                    aria-label={`Reason for rejecting ${a.name}`}
+                    className="ft-input"
+                    style={{ width: 220, height: 22 }}
+                  />
+                  <Button sm danger disabled={busy} onClick={() => reject(a, rejecting.comment)}>
+                    Confirm reject{named}
+                  </Button>
+                  <Button sm quiet onClick={() => setRejecting(null)}>
+                    Cancel
+                  </Button>
+                </span>
+              );
             return (
-              <span key={a.id} className="inline-flex items-center gap-2">
-                <input
-                  autoFocus
-                  value={rejecting.comment}
-                  onChange={(e) => setRejecting({ id: a.id, comment: e.target.value })}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") reject(a, rejecting.comment);
-                    if (e.key === "Escape") {
-                      // Closes the reason box, not the pane.
-                      e.stopPropagation();
-                      setRejecting(null);
-                    }
-                  }}
-                  placeholder="Reason (optional)"
-                  aria-label={`Reason for rejecting ${a.name}`}
-                  className="rounded-md px-2 py-1 text-xs outline-none"
-                  style={{ background: "var(--bg)", border: "1px solid var(--border)", color: "var(--fg)", width: 220 }}
-                />
-                <PaneButton label={`✗ Confirm reject${named}`} color="var(--red)" disabled={busy} onClick={() => reject(a, rejecting.comment)} />
-                <PaneButton label="Cancel" neutral onClick={() => setRejecting(null)} />
+              <span key={a.id} className="inline-flex items-center gap-1.5">
+                <Button sm disabled={busy} onClick={() => setRejecting({ id: a.id, comment: "" })}>
+                  Reject{named}
+                </Button>
+                <Button sm primary disabled={busy} onClick={() => onRespond(a, "Approve")}>
+                  Approve{named}
+                </Button>
               </span>
             );
-          return (
-            <span key={a.id} className="inline-flex items-center gap-2">
-              <PaneButton label={`✓ Approve${named}`} color="var(--green)" filled disabled={busy} onClick={() => onRespond(a, "Approve")} />
-              <PaneButton label={`✗ Reject${named}`} color="var(--red)" disabled={busy} onClick={() => setRejecting({ id: a.id, comment: "" })} />
-            </span>
-          );
-        })
-      )}
+          })
+        )}
+      </span>
     </div>
   );
 }

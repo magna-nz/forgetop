@@ -111,9 +111,8 @@ describe("PipelineDetail", () => {
 
     // Header: the run's total elapsed time.
     expect((await screen.findAllByText("1m41s")).length).toBeGreaterThan(0);
-    // History strip from the list rows: one square per run, the open one current.
-    expect(await screen.findByText("History · CI on this branch")).toBeInTheDocument();
-    expect(screen.getByText("5 runs")).toBeInTheDocument();
+    // History line from the list rows: one bar per run, the open one current; its scope in the label's tooltip.
+    expect(await screen.findByText("History:")).toHaveAttribute("title", "CI on this branch · 5 runs (#436 … #443)");
     expect(screen.getByRole("button", { name: /#438 failed/ })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /#443 succeeded/ })).toHaveAttribute("aria-current", "true");
     expect(screen.getByText(/last failure/)).toHaveTextContent("last failure #438");
@@ -141,9 +140,9 @@ describe("PipelineDetail", () => {
     });
     render("r438");
 
-    expect(await screen.findByText("✗ Test failed")).toBeInTheDocument();
-    expect(await screen.findByText("Logs · Test")).toBeInTheDocument();
-    expect(await screen.findByText("first error · line 9")).toBeInTheDocument();
+    expect(await screen.findByText("Test failed")).toBeInTheDocument();
+    expect(await screen.findByRole("region", { name: "Logs · Test" })).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: "Jump to error · line 9" })).toBeInTheDocument();
     // The Test section is unfolded on the failure.
     const body = screen.getByTestId("log-body");
     expect(within(body).getByText("thread 'x' panicked at src/a.rs:12:9:")).toBeInTheDocument();
@@ -154,6 +153,23 @@ describe("PipelineDetail", () => {
     // The failure line names the file only, like the TUI; the problem row keeps the whole path.
     expect(within(screen.getByRole("status")).getByText("a.rs:12")).toBeInTheDocument();
     expect(screen.getByText("src/a.rs:12")).toBeInTheDocument();
+  });
+
+  it("Raw shows the log as fetched, without step sections", async () => {
+    mockFetch({ get: { "/api/pipeline/detail": detail(ci438()), "/api/pipeline/logs": FAILED_LOG, "/api/pipeline/annotations": [] } });
+    render("r438");
+
+    const body = await screen.findByTestId("log-body");
+    await within(body).findByRole("button", { name: /Test/, expanded: true });
+    const raw = screen.getByRole("button", { name: "Raw" });
+    expect(raw).toHaveAttribute("aria-pressed", "false");
+    await userEvent.click(raw);
+    expect(raw).toHaveAttribute("aria-pressed", "true");
+    // No section headers; the group markers show as the lines they are.
+    expect(within(body).queryByRole("button", { name: /Test/ })).not.toBeInTheDocument();
+    expect(within(body).getByText("##[group]Build")).toBeInTheDocument();
+    await userEvent.click(raw);
+    expect(within(body).getByRole("button", { name: /Test/, expanded: true })).toBeInTheDocument();
   });
 
   it("with no test name, the failure line shows the annotation's first message line", async () => {
@@ -219,7 +235,7 @@ describe("PipelineDetail", () => {
     act(() => openRun("r443"));
     await waitFor(() => expect(urls().some((u) => u.includes("detail?conn=c&run_id=r443"))).toBe(true));
     act(() => openRun("r438"));
-    expect(await screen.findByText(/^Logs · /)).toBeInTheDocument();
+    expect(await screen.findByRole("region", { name: /^Logs · / })).toBeInTheDocument();
     act(() => openRun("r443"));
     await screen.findAllByText("1m41s");
     await new Promise((r) => setTimeout(r, 100));
@@ -237,14 +253,14 @@ describe("PipelineDetail", () => {
     });
     render("r438");
 
-    await userEvent.click(await screen.findByRole("button", { name: "↻ Re-run failed jobs" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Re-run failed jobs" }));
     await waitFor(() => {
       const post = posts.find((p) => p.url.includes("/api/pipeline/rerun"));
       expect(post).toBeDefined();
       expect(post!.body).toMatchObject({ conn: "c", run_id: "r438", failed_only: true });
     });
     // Shown queued at once: the run is in flight again, so Cancel replaces the re-run buttons.
-    expect(await screen.findByRole("button", { name: "■ Cancel" })).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: "Cancel" })).toBeInTheDocument();
     expect(screen.getByText(/attempt 2/)).toBeInTheDocument();
     resolve({ ok: true });
   });
@@ -259,10 +275,10 @@ describe("PipelineDetail", () => {
     });
     render("r438");
 
-    const btn = await screen.findByRole("button", { name: "↻ Re-run failed jobs" });
+    const btn = await screen.findByRole("button", { name: "Re-run failed jobs" });
     expect(btn).toBeDisabled();
     await waitFor(() => expect(btn).toHaveAttribute("title", "GitHub currently does not support this feature"));
-    expect(screen.getByRole("button", { name: "↻ Re-run" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Re-run" })).toBeEnabled();
   });
 
   it("approves a gate from the banner", async () => {
@@ -273,27 +289,36 @@ describe("PipelineDetail", () => {
     });
     render("g1");
 
-    expect(await screen.findByText("⏸ Deploy Prod needs approval")).toBeInTheDocument();
-    expect(screen.getByText("⏸ Waiting for approval")).toBeInTheDocument();
-    await userEvent.click(screen.getByRole("button", { name: "✓ Approve" }));
+    expect(await screen.findByText(/is waiting for approval/)).toBeInTheDocument();
+    expect(screen.getByText("Waiting for approval")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Approve" }));
     await waitFor(() => {
       const post = posts.find((p) => p.url.includes("/api/pipeline/approval"));
       expect(post).toBeDefined();
       expect(post!.body).toMatchObject({ run_id: "g1", approval_id: "a1", decision: "Approve" });
     });
     // Answered: the banner goes before the provider confirms.
-    expect(screen.queryByText("⏸ Deploy Prod needs approval")).not.toBeInTheDocument();
-    expect(screen.getByText("Approved Deploy Prod ✓")).toBeInTheDocument();
+    expect(screen.queryByText(/is waiting for approval/)).not.toBeInTheDocument();
+    expect(screen.getByText("Approved Deploy Prod")).toBeInTheDocument();
     resolve({ ok: true });
+  });
+
+  it("a run of several stages shows the stage strip", async () => {
+    mockFetch({ get: { "/api/pipeline/detail": detail(gatedRun(), { approvals: [gate] }), "/api/connections": connections } });
+    render("g1");
+
+    const strip = await screen.findByRole("list", { name: "Stages" });
+    const items = within(strip).getAllByRole("listitem");
+    expect(items.map((i) => i.textContent)).toEqual(["Build5m00s", "Deploy Prod"]);
   });
 
   it("rejects with an inline reason", async () => {
     const { posts } = mockFetch({ get: { "/api/pipeline/detail": detail(gatedRun(), { approvals: [gate] }), "/api/connections": connections } });
     render("g1");
 
-    await userEvent.click(await screen.findByRole("button", { name: "✗ Reject" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Reject" }));
     await userEvent.type(screen.getByPlaceholderText("Reason (optional)"), "not today");
-    await userEvent.click(screen.getByRole("button", { name: "✗ Confirm reject" }));
+    await userEvent.click(screen.getByRole("button", { name: "Confirm reject" }));
     await waitFor(() => {
       const post = posts.find((p) => p.url.includes("/api/pipeline/approval"));
       expect(post?.body).toMatchObject({ approval_id: "a1", decision: "Reject", comment: "not today" });
@@ -310,6 +335,6 @@ describe("PipelineDetail", () => {
     render("g1");
 
     expect(await screen.findByRole("link", { name: /Open in GitHub to approve/ })).toHaveAttribute("href", "https://github.com/acme/pay/actions/runs/1");
-    expect(screen.queryByRole("button", { name: "✓ Approve" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Approve" })).not.toBeInTheDocument();
   });
 });

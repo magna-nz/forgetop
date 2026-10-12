@@ -1,6 +1,6 @@
 import { useEffect } from "react";
 import { describe, it, expect } from "vitest";
-import { screen, waitFor } from "@testing-library/react";
+import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { WiDetailProvider, useWiOpener } from "./WiDetail";
 import { renderWithClient, mockFetch } from "../test/util";
@@ -91,6 +91,27 @@ describe("WiDetail", () => {
     expect(screen.queryByRole("button", { name: "Unassign" })).not.toBeInTheDocument();
   });
 
+  it("moves the state via the footer menu, posting /api/wi/state", async () => {
+    const { posts } = mockFetch({ get: { "/api/wi/detail": detail(), "/api/wi/states": ["Todo", "In Progress", "Done"] } });
+    renderWithClient(
+      <WiDetailProvider>
+        <Opener conn="c" id="w1" />
+      </WiDetailProvider>,
+    );
+
+    const move = await screen.findByRole("button", { name: "Move" });
+    expect(move).toHaveAttribute("aria-expanded", "false");
+    await userEvent.click(move);
+    expect(move).toHaveAttribute("aria-expanded", "true");
+    // The current state is not offered.
+    await screen.findByRole("button", { name: "Done" });
+    expect(screen.queryByRole("button", { name: "In Progress" })).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Done" }));
+
+    await waitFor(() => expect(posts.some((p) => p.url.includes("/api/wi/state") && (p.body as { state?: string }).state === "Done")).toBe(true));
+    expect(within(screen.getByRole("status")).getByText("Moved to Done")).toBeInTheDocument();
+  });
+
   it("edits the title, posting only the changed field to /api/wi/update", async () => {
     const { posts } = mockFetch({ get: { "/api/wi/detail": detail() } });
     renderWithClient(
@@ -128,7 +149,7 @@ describe("WiDetail", () => {
     await userEvent.type(await screen.findByPlaceholderText("Add a comment…"), "On it");
     await userEvent.click(screen.getByRole("button", { name: "Comment" }));
     expect(await screen.findByText("On it")).toBeInTheDocument();
-    expect(screen.getByText("Comment posted ✓")).toBeInTheDocument();
+    expect(within(screen.getByRole("status")).getByText("Comment posted")).toBeInTheDocument();
     release();
   });
 });

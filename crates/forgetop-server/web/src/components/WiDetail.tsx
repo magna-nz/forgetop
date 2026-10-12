@@ -2,10 +2,11 @@ import { createContext, useCallback, useContext, useEffect, useState, type React
 import { AnimatePresence } from "framer-motion";
 import { useQueryClient } from "@tanstack/react-query";
 import { apiGet, apiPost, useWiDetail, wiDetailKey } from "../api";
-import { relativeTime, wiStateColor } from "../format";
+import { relativeTime, wiStateColor, wiStateGlyph } from "../format";
 import type { CommentThread, User, WiRef, WorkItem } from "../types";
 import { addWiThread, localThread, meAsUser, patchWorkItem } from "../optimistic";
-import { Avatar, Chip, Pill, SlideOver, Timeline } from "./ui";
+import { Avatar, Button, GroupHeading, PaneHeader, SlideOver, Timeline } from "./ui";
+import { Icon } from "./icons";
 
 // ---- opener context ----
 
@@ -23,13 +24,47 @@ export function WiDetailProvider({ children }: { children: ReactNode }) {
   );
 }
 
+// ---- local helpers (candidates for ui.tsx) ----
+
+/** An icon-only link styled as `IconButton`: opening the item at its provider is navigation, so
+ *  it stays a real `<a>`. */
+function ExternalIconLink({ href, label }: { href: string; label: string }) {
+  return (
+    <a href={href} target="_blank" rel="noreferrer" aria-label={label} title={label} className="ft-btn ft-btn-icon">
+      <Icon name="external" size={15} />
+    </a>
+  );
+}
+
+/** A small menu that opens above its trigger (the triggers live in the pane's footer). */
+function MenuPanel({ children, wide = false }: { children: ReactNode; wide?: boolean }) {
+  return (
+    <div
+      className={`absolute left-0 bottom-full mb-1 z-10 py-1 max-h-64 overflow-auto ${wide ? "min-w-52" : "min-w-44"}`}
+      style={{ background: "var(--raised)", border: "1px solid var(--border-strong)", borderRadius: 6, boxShadow: "0 8px 24px rgba(0,0,0,0.35)" }}
+    >
+      {children}
+    </div>
+  );
+}
+
+const MENU_ITEM = "flex items-center gap-2 w-full h-7 px-3 text-left text-[12.5px] hover:bg-[var(--hover)] disabled:opacity-45";
+
+const Sep = () => <span style={{ color: "var(--fg3)" }}>·</span>;
+
 // ---- panel ----
+
+/** What the last write said: `ok` once it is done (or optimistically assumed done). */
+interface Note {
+  text: string;
+  ok: boolean;
+}
 
 function WiDetailPanel({ wiRef, onClose }: { wiRef: WiRef; onClose: () => void }) {
   const { data, isLoading, error } = useWiDetail(wiRef);
   const qc = useQueryClient();
   const [busy, setBusy] = useState(false);
-  const [note, setNote] = useState<string | null>(null);
+  const [note, setNote] = useState<Note | null>(null);
   const [editing, setEditing] = useState(false);
 
   useEffect(() => {
@@ -47,12 +82,12 @@ function WiDetailPanel({ wiRef, onClose }: { wiRef: WiRef; onClose: () => void }
   // note says it's done at once rather than when the provider answers.
   const act = async (label: string, fn: () => Promise<void>) => {
     setBusy(true);
-    setNote(`${label} ✓`);
+    setNote({ text: label, ok: true });
     try {
       await fn();
-      setNote(`${label} ✓`);
+      setNote({ text: label, ok: true });
     } catch (e) {
-      setNote(e instanceof Error ? e.message : String(e));
+      setNote({ text: e instanceof Error ? e.message : String(e), ok: false });
     } finally {
       // Refreshed on both paths: after a success it confirms the optimistic patch the caller
       // already applied, after a failure it is the rollback — the server's truth replaces it.
@@ -62,70 +97,120 @@ function WiDetailPanel({ wiRef, onClose }: { wiRef: WiRef; onClose: () => void }
   };
 
   const wi = data?.work_item;
-  const color = wi ? wiStateColor(wi.state, wi.state_category) : "var(--dim)";
+  const color = wi ? wiStateColor(wi.state, wi.state_category) : "var(--fg3)";
 
   const header = (
-    <>
-      {wi && <Pill icon="●" label={wi.state} color={color} />}
-      <div className="flex-1 min-w-0">
-        <div className="font-medium truncate" style={{ color: "var(--fg)" }}>
-          {wi?.title ?? (isLoading ? "Loading…" : "Work item")}
-        </div>
-        {wi && (
-          <div className="flex items-center gap-2 mt-1 text-xs" style={{ color: "var(--dim)" }}>
-            {wi.identifier && <span className="mono">{wi.identifier}</span>}
-            {wi.work_item_type && <Chip>{wi.work_item_type}</Chip>}
-            <span>{relativeTime(wi.updated_at)}</span>
-          </div>
-        )}
-      </div>
-      {wi?.url && (
-        <a href={wi.url} target="_blank" rel="noreferrer" title="Open in provider" className="text-sm px-2 py-1" style={{ color: "var(--dim)" }}>
-          ↗
-        </a>
+    <PaneHeader
+      glyph={wi ? wiStateGlyph(wi.state, wi.state_category) : undefined}
+      color={color}
+      title={wi?.title ?? (isLoading ? "Loading…" : "Work item")}
+      ident={wi?.identifier ?? undefined}
+      actions={wi?.url ? <ExternalIconLink href={wi.url} label="Open in provider" /> : undefined}
+    >
+      {wi && (
+        <>
+          <span className="font-medium" style={{ color }}>
+            {wi.state}
+          </span>
+          {wi.work_item_type && (
+            <>
+              <Sep />
+              <span>{wi.work_item_type}</span>
+            </>
+          )}
+          <Sep />
+          {wi.assignee ? (
+            <span className="inline-flex items-center gap-1.5">
+              <Avatar name={wi.assignee.display_name} size={18} />
+              {wi.assignee.display_name}
+            </span>
+          ) : (
+            <span style={{ color: "var(--fg3)" }}>Unassigned</span>
+          )}
+          {wi.parent && (
+            <>
+              <Sep />
+              <span className="truncate" style={{ color: "var(--fg2)" }}>
+                {wi.parent.kind} · {wi.parent.title}
+              </span>
+            </>
+          )}
+        </>
       )}
-    </>
+    </PaneHeader>
   );
 
+  const footer = wi ? (
+    <>
+      <AssigneePicker
+        wiRef={wiRef}
+        assignee={wi.assignee}
+        busy={busy}
+        onPick={(user) => {
+          // The picker already holds the full `User` it listed, so the new assignee is
+          // knowable locally — name and avatar can change on the click.
+          patchWorkItem(qc, wiRef, { assignee: user });
+          act(user ? "Reassigned" : "Unassigned", () =>
+            apiPost("/api/wi/assignee", { conn: wiRef.conn, repo: wiRef.repo, id: wiRef.id, assignee_id: user?.id ?? null }),
+          );
+        }}
+      />
+      <MoveState
+        wiRef={wiRef}
+        current={wi.state}
+        busy={busy}
+        onMove={(state) => {
+          // Only the state *name* is knowable: /api/wi/states answers with raw names, so
+          // `state_category` — which drives the state colour and the Command Center bucket —
+          // is deliberately left as it was until the refetch supplies the real one.
+          patchWorkItem(qc, wiRef, { state });
+          act(`Moved to ${state}`, () => apiPost("/api/wi/state", { conn: wiRef.conn, repo: wiRef.repo, id: wiRef.id, state }));
+        }}
+      />
+      {!editing && (
+        <Button quiet onClick={() => setEditing(true)}>
+          Edit
+        </Button>
+      )}
+      {note && (
+        <span
+          role="status"
+          className="ml-auto inline-flex items-center gap-1.5 text-[12px] min-w-0 truncate"
+          style={{ color: note.ok ? "var(--green)" : "var(--red)" }}
+        >
+          <Icon name={note.ok ? "check" : "x-circle"} size={13} />
+          {note.text}
+        </span>
+      )}
+    </>
+  ) : undefined;
+
+  const facts: [string, ReactNode][] = [];
+  if (wi?.repository) facts.push(["Repository", <span className="mono">{wi.repository}</span>]);
+  if (wi?.parent)
+    facts.push([
+      wi.parent.kind,
+      wi.parent.url ? (
+        <a href={wi.parent.url} target="_blank" rel="noreferrer" style={{ color: "var(--accent-fg)" }}>
+          {wi.parent.title}
+        </a>
+      ) : (
+        wi.parent.title
+      ),
+    ]);
+  if (wi?.created_at && relativeTime(wi.created_at)) facts.push(["Created", <span className="num">{relativeTime(wi.created_at)}</span>]);
+  if (wi?.updated_at && relativeTime(wi.updated_at)) facts.push(["Updated", <span className="num">{relativeTime(wi.updated_at)}</span>]);
+
   return (
-    <SlideOver onClose={onClose} header={header}>
-      {error && <div className="p-6 text-sm" style={{ color: "var(--red)" }}>Couldn't load this work item.</div>}
+    <SlideOver onClose={onClose} header={header} footer={footer} width="md" label="Work item">
+      {error && (
+        <div className="px-5 py-6 text-[13px]" style={{ color: "var(--red)" }}>
+          Couldn't load this work item.
+        </div>
+      )}
 
       {wi && data && (
-        <div className="p-5 flex flex-col gap-4 max-w-3xl">
-          <div className="flex flex-wrap items-center gap-x-4 gap-y-2 text-xs" style={{ color: "var(--dim)" }}>
-            <AssigneePicker
-              wiRef={wiRef}
-              assignee={wi.assignee}
-              busy={busy}
-              onPick={(user) => {
-                // The picker already holds the full `User` it listed, so the new assignee is
-                // knowable locally — name and avatar can change on the click.
-                patchWorkItem(qc, wiRef, { assignee: user });
-                act(user ? "Reassigned" : "Unassigned", () =>
-                  apiPost("/api/wi/assignee", { conn: wiRef.conn, repo: wiRef.repo, id: wiRef.id, assignee_id: user?.id ?? null }),
-                );
-              }}
-            />
-            <MoveState
-              wiRef={wiRef}
-              current={wi.state}
-              busy={busy}
-              onMove={(state) => {
-                // Only the state *name* is knowable: /api/wi/states answers with raw names, so
-                // `state_category` — which drives the state colour and the Command Center bucket —
-                // is deliberately left as it was until the refetch supplies the real one.
-                patchWorkItem(qc, wiRef, { state });
-                act(`Moved to ${state}`, () => apiPost("/api/wi/state", { conn: wiRef.conn, repo: wiRef.repo, id: wiRef.id, state }));
-              }}
-            />
-            {!editing && (
-              <button onClick={() => setEditing(true)} className="rounded px-2 py-1" style={{ color: "var(--dim)", border: "1px solid var(--border)", background: "var(--panel2)" }}>
-                Edit
-              </button>
-            )}
-          </div>
-
+        <div className="px-5 py-4 flex flex-col gap-5">
           {editing ? (
             <EditFields
               wi={wi}
@@ -146,10 +231,23 @@ function WiDetailPanel({ wiRef, onClose }: { wiRef: WiRef; onClose: () => void }
             />
           ) : (
             wi.description && (
-              <div className="rounded-lg p-3 text-sm whitespace-pre-wrap" style={{ background: "var(--card)", border: "1px solid var(--border)", color: "var(--fg)" }}>
+              <div className="text-[13px] whitespace-pre-wrap" style={{ color: "var(--fg)" }}>
                 {wi.description}
               </div>
             )
+          )}
+
+          {facts.length > 0 && (
+            <dl className="grid m-0 gap-x-4 gap-y-1.5 text-[12.5px]" style={{ gridTemplateColumns: "96px 1fr" }}>
+              {facts.map(([label, value]) => (
+                <div key={label} className="contents">
+                  <dt style={{ color: "var(--fg3)" }}>{label}</dt>
+                  <dd className="m-0 min-w-0 truncate" style={{ color: "var(--fg)" }}>
+                    {value}
+                  </dd>
+                </div>
+              ))}
+            </dl>
           )}
 
           {data.timeline.length > 0 && <Timeline events={data.timeline} />}
@@ -164,12 +262,6 @@ function WiDetailPanel({ wiRef, onClose }: { wiRef: WiRef; onClose: () => void }
               act("Comment posted", () => apiPost("/api/wi/comment", { conn: wiRef.conn, repo: wiRef.repo, id: wiRef.id, body }));
             }}
           />
-
-          {note && (
-            <div className="text-xs" style={{ color: note.endsWith("✓") ? "var(--green)" : "var(--red)" }}>
-              {note}
-            </div>
-          )}
         </div>
       )}
     </SlideOver>
@@ -197,35 +289,40 @@ function MoveState({ wiRef, current, busy, onMove }: { wiRef: WiRef; current: st
 
   return (
     <div className="relative">
-      <button
-        onClick={() => setOpen((o) => !o)}
-        disabled={busy}
-        className="text-xs rounded px-2 py-1"
-        style={{ color: "var(--dim)", border: "1px solid var(--border)", background: "var(--panel2)" }}
-      >
-        Move ▾
-      </button>
+      {/* The state change is the pane's one primary action while its picker is open. */}
+      <Button primary={open} onClick={() => setOpen((o) => !o)} disabled={busy} aria-expanded={open} aria-haspopup="menu">
+        Move
+        <Icon name="chevron-down" size={12} />
+      </Button>
       {open && (
-        <div className="absolute left-0 mt-1 z-10 rounded-md py-1 min-w-40 shadow-lg" style={{ background: "var(--panel)", border: "1px solid var(--border)" }}>
-          {loading && <div className="px-3 py-1.5" style={{ color: "var(--dim)" }}>Loading…</div>}
-          {!loading && options.length === 0 && <div className="px-3 py-1.5" style={{ color: "var(--dim)" }}>No transitions available</div>}
+        <MenuPanel>
+          {loading && (
+            <div className="px-3 h-7 flex items-center text-[12.5px]" style={{ color: "var(--fg3)" }}>
+              Loading…
+            </div>
+          )}
+          {!loading && options.length === 0 && (
+            <div className="px-3 h-7 flex items-center text-[12.5px]" style={{ color: "var(--fg3)" }}>
+              No transitions available
+            </div>
+          )}
           {options.map((s) => (
             <button
               key={s}
+              type="button"
               disabled={busy}
               onClick={() => {
                 onMove(s);
                 setOpen(false);
               }}
-              className="block w-full text-left px-3 py-1.5"
+              className={MENU_ITEM}
               style={{ color: "var(--fg)" }}
-              onMouseEnter={(e) => (e.currentTarget.style.background = "var(--sel)")}
-              onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
             >
-              → {s}
+              <Icon name="arrow-right" size={12} style={{ color: "var(--fg3)" }} />
+              {s}
             </button>
           ))}
-        </div>
+        </MenuPanel>
       )}
     </div>
   );
@@ -259,52 +356,38 @@ function AssigneePicker({ wiRef, assignee, busy, onPick }: { wiRef: WiRef; assig
 
   return (
     <div className="relative">
-      <button
-        onClick={() => setOpen((o) => !o)}
-        disabled={busy}
-        className="flex items-center gap-1.5 rounded px-2 py-1"
-        style={{ color: "var(--dim)", border: "1px solid var(--border)", background: "var(--panel2)" }}
-      >
+      <Button onClick={() => setOpen((o) => !o)} disabled={busy} aria-expanded={open} aria-haspopup="menu" title="Assign">
         {assignee ? (
           <>
             <Avatar name={assignee.display_name} size={18} /> {assignee.display_name}
           </>
         ) : (
-          "Unassigned"
-        )}{" "}
-        ▾
-      </button>
+          <>
+            <Icon name="user" size={13} /> Unassigned
+          </>
+        )}
+        <Icon name="chevron-down" size={12} />
+      </Button>
       {open && (
-        <div className="absolute left-0 mt-1 z-10 rounded-md py-1 min-w-48 max-h-64 overflow-auto shadow-lg" style={{ background: "var(--panel)", border: "1px solid var(--border)" }}>
-          {loading && <div className="px-3 py-1.5" style={{ color: "var(--dim)" }}>Loading…</div>}
+        <MenuPanel wide>
+          {loading && (
+            <div className="px-3 h-7 flex items-center text-[12.5px]" style={{ color: "var(--fg3)" }}>
+              Loading…
+            </div>
+          )}
           {/* Only offer Unassign when there's actually an assignee — avoids a no-op clear
               (and the Azure "remove an unset field" 400), mirroring how Move hides the current state. */}
           {assignee && (
-            <button
-              disabled={busy}
-              onClick={() => pick(null)}
-              className="block w-full text-left px-3 py-1.5"
-              style={{ color: "var(--dim)" }}
-              onMouseEnter={(e) => (e.currentTarget.style.background = "var(--sel)")}
-              onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
-            >
+            <button type="button" disabled={busy} onClick={() => pick(null)} className={MENU_ITEM} style={{ color: "var(--fg2)" }}>
               Unassign
             </button>
           )}
           {(users ?? []).map((u) => (
-            <button
-              key={u.id}
-              disabled={busy}
-              onClick={() => pick(u)}
-              className="flex items-center gap-2 w-full text-left px-3 py-1.5"
-              style={{ color: "var(--fg)" }}
-              onMouseEnter={(e) => (e.currentTarget.style.background = "var(--sel)")}
-              onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
-            >
+            <button key={u.id} type="button" disabled={busy} onClick={() => pick(u)} className={MENU_ITEM} style={{ color: "var(--fg)" }}>
               <Avatar name={u.display_name} size={18} /> {u.display_name}
             </button>
           ))}
-        </div>
+        </MenuPanel>
       )}
     </div>
   );
@@ -320,34 +403,23 @@ function EditFields({ wi, busy, onSave, onCancel }: { wi: WorkItem; busy: boolea
   const dirty = changedTitle || changedDesc;
   const canSave = !busy && dirty && title.trim().length > 0;
   return (
-    <div className="rounded-lg p-3 flex flex-col gap-2" style={{ background: "var(--card)", border: "1px solid var(--border)" }}>
-      <input
-        value={title}
-        onChange={(e) => setTitle(e.target.value)}
-        placeholder="Title"
-        className="rounded-md px-2 py-1.5 text-sm outline-none"
-        style={{ background: "var(--bg)", color: "var(--fg)", border: "1px solid var(--border)" }}
-      />
+    <div className="flex flex-col gap-2">
+      <input value={title} onChange={(e) => setTitle(e.target.value)} placeholder="Title" aria-label="Title" className="ft-input w-full" />
       <textarea
         value={description}
         onChange={(e) => setDescription(e.target.value)}
         placeholder="Description"
+        aria-label="Description"
         rows={6}
-        className="rounded-md px-2 py-1.5 text-sm outline-none"
-        style={{ background: "var(--bg)", color: "var(--fg)", border: "1px solid var(--border)" }}
+        className="ft-input w-full"
       />
       <div className="flex gap-2">
-        <button
-          disabled={!canSave}
-          onClick={() => onSave(changedTitle ? title : undefined, changedDesc ? description : undefined)}
-          className="rounded-md px-3 py-1.5 text-sm font-medium"
-          style={{ color: "#12151b", background: "var(--accent)", opacity: canSave ? 1 : 0.45, cursor: canSave ? "pointer" : "not-allowed" }}
-        >
+        <Button primary sm disabled={!canSave} onClick={() => onSave(changedTitle ? title : undefined, changedDesc ? description : undefined)}>
           Save
-        </button>
-        <button onClick={onCancel} className="rounded-md px-3 py-1.5 text-sm" style={{ color: "var(--dim)", border: "1px solid var(--border)", background: "var(--panel2)" }}>
+        </Button>
+        <Button quiet sm onClick={onCancel}>
           Cancel
-        </button>
+        </Button>
       </div>
     </div>
   );
@@ -357,49 +429,61 @@ function EditFields({ wi, busy, onSave, onCancel }: { wi: WorkItem; busy: boolea
 
 function Comments({ threads, busy, onComment }: { threads: CommentThread[]; busy: boolean; onComment: (body: string) => void }) {
   const [draft, setDraft] = useState("");
+  const count = threads.reduce((n, t) => n + t.comments.length, 0);
   return (
-    <div className="flex flex-col gap-3">
-      {threads.length === 0 && <div className="text-sm" style={{ color: "var(--dim)" }}>No comments yet.</div>}
+    <div className="flex flex-col gap-2">
+      <GroupHeading count={count || undefined}>Comments</GroupHeading>
+      {threads.length === 0 && (
+        <div className="text-[12.5px]" style={{ color: "var(--fg3)" }}>
+          No comments yet.
+        </div>
+      )}
       {threads.map((t) => (
-        <div key={t.id} className="rounded-lg px-3 py-2 text-xs" style={{ background: "var(--card)", border: "1px solid var(--border)" }}>
+        <div
+          key={t.id}
+          className="flex flex-col gap-2 px-3 py-2"
+          style={{ background: "var(--hover)", border: "1px solid var(--border)", borderRadius: 6 }}
+        >
           {t.comments.map((c) => (
-            <div key={c.id} className="flex gap-2 py-0.5">
-              <Avatar name={c.author.display_name} size={16} />
-              <span>
-                <span className="font-medium" style={{ color: "var(--fg)" }}>{c.author.display_name}</span>{" "}
-                <span style={{ color: "var(--dim)" }}>{c.body}</span>
-              </span>
+            <div key={c.id} className="flex flex-col gap-1">
+              <div className="flex items-center gap-2 text-[12.5px]">
+                <Avatar name={c.author.display_name} size={18} />
+                <span className="font-medium" style={{ color: "var(--fg)" }}>
+                  {c.author.display_name}
+                </span>
+                {c.created_at && (
+                  <span className="num ml-auto text-[12px]" style={{ color: "var(--fg3)" }}>
+                    {relativeTime(c.created_at)}
+                  </span>
+                )}
+              </div>
+              <div className="text-[13px] whitespace-pre-wrap" style={{ color: "var(--fg)" }}>
+                {c.body}
+              </div>
             </div>
           ))}
         </div>
       ))}
+      <textarea
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        placeholder="Add a comment…"
+        aria-label="Add a comment"
+        rows={3}
+        className="ft-input w-full mt-1"
+      />
       <div>
-        <textarea
-          value={draft}
-          onChange={(e) => setDraft(e.target.value)}
-          placeholder="Add a comment…"
-          rows={3}
-          className="w-full rounded-lg p-3 text-sm outline-none"
-          style={{ background: "var(--card)", color: "var(--fg)", border: "1px solid var(--border)" }}
-        />
-        <div className="mt-2">
-          <button
-            disabled={busy || !draft.trim()}
-            onClick={() => {
-              onComment(draft.trim());
-              setDraft("");
-            }}
-            className="rounded-md px-3 py-1.5 text-sm font-medium"
-            style={{
-              color: "#12151b",
-              background: "var(--accent)",
-              opacity: busy || !draft.trim() ? 0.45 : 1,
-              cursor: busy || !draft.trim() ? "not-allowed" : "pointer",
-            }}
-          >
-            Comment
-          </button>
-        </div>
+        <Button
+          primary
+          sm
+          disabled={busy || !draft.trim()}
+          onClick={() => {
+            onComment(draft.trim());
+            setDraft("");
+          }}
+        >
+          Comment
+        </Button>
       </div>
     </div>
   );
