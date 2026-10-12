@@ -13,6 +13,7 @@ import { WorkItems } from "./components/WorkItems";
 import { Pipelines } from "./components/Pipelines";
 import { Notifications } from "./components/Notifications";
 import { Settings } from "./components/Settings";
+import { PaneSlotContext } from "./components/ui";
 import { NavContext } from "./nav";
 import type { SectionId } from "./types";
 
@@ -39,6 +40,8 @@ export default function App() {
   // The sidebar always starts open on each load; the toggle collapses it to give a section the
   // full page width, but that choice is intentionally not persisted across sessions.
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  // Where detail panes render: the column to the right of the page content (see `SlideOver`).
+  const [paneSlot, setPaneSlot] = useState<HTMLElement | null>(null);
   const connections = useConnections();
   const View = VIEWS[section];
 
@@ -77,32 +80,36 @@ export default function App() {
   }
 
   return (
-    <PrDetailProvider>
-      <WiDetailProvider>
-        <PipelineDetailProvider>
-          <NavContext.Provider value={setSection}>
-          <div className="flex h-full">
-            <Sidebar section={section} onSelect={setSection} collapsed={!sidebarOpen} />
-            <main className="flex flex-col flex-1 min-w-0 h-full">
-              <TopBar
-                section={section}
-                onOpenPalette={() => setPaletteOpen(true)}
-                sidebarOpen={sidebarOpen}
-                onToggleSidebar={() => setSidebarOpen((o) => !o)}
-              />
-              <div className="flex-1 overflow-auto">
-                {/* key forces a remount per section so the CSS fade replays; row-level entrance
-                    animations live in <Row>. */}
-                <div key={section} className="fade-in">
-                  <View />
-                </div>
+    <PaneSlotContext.Provider value={paneSlot}>
+      <PrDetailProvider>
+        <WiDetailProvider>
+          <PipelineDetailProvider>
+            <NavContext.Provider value={setSection}>
+              <div className="flex h-full">
+                <Sidebar section={section} onSelect={setSection} collapsed={!sidebarOpen} />
+                <main className="flex flex-col flex-1 min-w-0 h-full">
+                  <TopBar
+                    section={section}
+                    onOpenPalette={() => setPaletteOpen(true)}
+                    sidebarOpen={sidebarOpen}
+                    onToggleSidebar={() => setSidebarOpen((o) => !o)}
+                  />
+                  <div className="flex flex-1 min-h-0">
+                    <div className="flex-1 min-w-0 overflow-auto">
+                      {/* key forces a remount per section so the CSS fade replays. */}
+                      <div key={section} className="fade-in">
+                        <View />
+                      </div>
+                    </div>
+                    <div ref={setPaneSlot} className="flex shrink-0 min-h-0 h-full" data-testid="pane-slot" />
+                  </div>
+                </main>
+                <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} onNavigate={setSection} />
               </div>
-            </main>
-            <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} onNavigate={setSection} />
-          </div>
-          </NavContext.Provider>
-        </PipelineDetailProvider>
-      </WiDetailProvider>
-    </PrDetailProvider>
+            </NavContext.Provider>
+          </PipelineDetailProvider>
+        </WiDetailProvider>
+      </PrDetailProvider>
+    </PaneSlotContext.Provider>
   );
 }

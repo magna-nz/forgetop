@@ -1,82 +1,132 @@
 @import "tailwindcss";
 
-/* Palettes mirror the TUI themes (crates/forgetop-tui/src/theme.rs, xterm-256 → hex).
-   `data-theme` on <html> selects one; default (unset) is slate. */
+/* Design tokens. `data-theme` on <html> selects one; default (unset) is slate.
+   See DESIGN.md for what each token is for. Legacy names (--panel2, --card, --dim, --sel, the
+   six ANSI-ish status colours) are kept so untouched components still render; new code should
+   prefer the names in the "semantic" block. */
 :root,
 :root[data-theme="slate"] {
-  --bg: #1c1c1c;
-  --panel: #212121;
-  --panel2: #262626;
-  --card: #242424;
-  --card-hover: #2b2b2b;
-  --fg: #dadada;
-  --dim: #8a8a8a;
-  --border: #333333;
-  --sel: #303030;
-  --green: #87d787;
-  --red: #ff8787;
-  --yellow: #ffd787;
-  --blue: #5fafff;
-  --accent: #5fafff;
-  --magenta: #d787d7;
-  --cyan: #5fd7d7;
+  --bg: #111214;
+  --panel: #0d0e10;
+  --panel2: #1b1c20;
+  --card: #16171a;
+  --card-hover: #1b1c20;
+  --raised: #1d1e22;
+  --fg: #ececf1;
+  --fg2: #a3a6ad;
+  --fg3: #6f737c;
+  --dim: #6f737c;
+  --border: rgba(255, 255, 255, 0.08);
+  --border-strong: rgba(255, 255, 255, 0.14);
+  --hover: rgba(255, 255, 255, 0.04);
+  --active: rgba(255, 255, 255, 0.07);
+  --sel: rgba(232, 118, 58, 0.08);
+  --accent: #e8763a;
+  --accent-hover: #f08a52;
+  --accent-fg: #f29a63;
+  --accent-contrast: #1a0d05;
+  --green: #48b47a;
+  --red: #e5534b;
+  --yellow: #d9a441;
+  --blue: #6ea4e8;
+  --magenta: #a78bfa;
+  --cyan: #5fb3b3;
+  --scrollbar: #2c2e33;
+  --diff-add: rgba(72, 180, 122, 0.1);
+  --diff-del: rgba(229, 83, 75, 0.1);
 }
 
 :root[data-theme="dark"] {
-  --bg: #080808;
-  --panel: #141414;
-  --panel2: #1c1c1c;
-  --card: #161616;
-  --card-hover: #1f1f1f;
-  --fg: #dadada;
-  --dim: #808080;
-  --border: #2a2a2a;
-  --sel: #333333;
-  --green: #5fff87;
-  --red: #ff5f5f;
-  --yellow: #ffd75f;
-  --blue: #00afff;
-  --accent: #00afff;
-  --magenta: #d787ff;
-  --cyan: #5fd7d7;
+  --bg: #000000;
+  --panel: #000000;
+  --panel2: #141416;
+  --card: #0d0d0f;
+  --card-hover: #141416;
+  --raised: #17171a;
+  --fg: #f0f0f3;
+  --fg2: #a6a8ae;
+  --fg3: #74777f;
+  --dim: #74777f;
+  --border: rgba(255, 255, 255, 0.1);
+  --border-strong: rgba(255, 255, 255, 0.16);
+  --hover: rgba(255, 255, 255, 0.05);
+  --active: rgba(255, 255, 255, 0.08);
+  --sel: rgba(232, 118, 58, 0.1);
+  --accent: #e8763a;
+  --accent-hover: #f08a52;
+  --accent-fg: #f29a63;
+  --accent-contrast: #1a0d05;
+  --green: #4fc083;
+  --red: #ec5a52;
+  --yellow: #e0ab45;
+  --blue: #74aaef;
+  --magenta: #ad93fb;
+  --cyan: #63bcbc;
+  --scrollbar: #26272b;
+  --diff-add: rgba(79, 192, 131, 0.1);
+  --diff-del: rgba(236, 90, 82, 0.1);
 }
 
 :root[data-theme="light"] {
-  --bg: #f4f4f4;
-  --panel: #eaeaea;
-  --panel2: #e2e2e2;
+  --bg: #f7f7f8;
+  --panel: #f0f0f2;
+  --panel2: #e9e9ec;
   --card: #ffffff;
-  --card-hover: #f0f0f0;
-  --fg: #2a2a2a;
-  --dim: #6b6b6b;
-  --border: #d4d4d4;
-  --sel: #dcdcdc;
-  --green: #1a8a1a;
-  --red: #cc2222;
-  --yellow: #9a7500;
-  --blue: #005fd7;
-  --accent: #005fd7;
-  --magenta: #870087;
-  --cyan: #007a7a;
+  --card-hover: #f2f2f4;
+  --raised: #ffffff;
+  --fg: #1b1c20;
+  --fg2: #5c6068;
+  --fg3: #7b7f88;
+  --dim: #7b7f88;
+  --border: rgba(0, 0, 0, 0.1);
+  --border-strong: rgba(0, 0, 0, 0.16);
+  --hover: rgba(0, 0, 0, 0.04);
+  --active: rgba(0, 0, 0, 0.07);
+  --sel: rgba(212, 100, 42, 0.1);
+  --accent: #d4642a;
+  --accent-hover: #c2571f;
+  --accent-fg: #b8521c;
+  --accent-contrast: #ffffff;
+  --green: #1f8a4c;
+  --red: #c93c35;
+  --yellow: #9a6b10;
+  --blue: #2a6fd6;
+  --magenta: #7c5ce6;
+  --cyan: #1a8a8a;
+  --scrollbar: #cfd0d4;
+  --diff-add: rgba(31, 138, 76, 0.1);
+  --diff-del: rgba(201, 60, 53, 0.1);
 }
 
 :root[data-theme="matrix"] {
-  --bg: #000000;
-  --panel: #0a0a0a;
-  --panel2: #101010;
-  --card: #0c0c0c;
-  --card-hover: #141414;
-  --fg: #00ff5f;
-  --dim: #009a3a;
-  --border: #005f00;
-  --sel: #003b00;
+  --bg: #020603;
+  --panel: #000000;
+  --panel2: #06140a;
+  --card: #04100a;
+  --card-hover: #06140a;
+  --raised: #081a0e;
+  --fg: #a8ffb8;
+  --fg2: #5ed97a;
+  --fg3: #2f8a48;
+  --dim: #2f8a48;
+  --border: rgba(0, 255, 95, 0.14);
+  --border-strong: rgba(0, 255, 95, 0.24);
+  --hover: rgba(0, 255, 95, 0.05);
+  --active: rgba(0, 255, 95, 0.09);
+  --sel: rgba(0, 255, 135, 0.1);
+  --accent: #00ff87;
+  --accent-hover: #4dffa8;
+  --accent-fg: #4dffa8;
+  --accent-contrast: #00210d;
   --green: #00ff5f;
   --red: #ff5f5f;
   --yellow: #d7ff00;
-  --blue: #00ff87;
-  --accent: #00ff87;
+  --blue: #00e0ff;
   --magenta: #5fffd7;
   --cyan: #00ffff;
+  --scrollbar: #0b2a14;
+  --diff-add: rgba(0, 255, 95, 0.08);
+  --diff-del: rgba(255, 95, 95, 0.1);
 }
 
 html,
@@ -89,14 +139,253 @@ body {
   margin: 0;
   background: var(--bg);
   color: var(--fg);
-  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-  font-size: 14px;
+  font-family: "IBM Plex Sans", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-size: 13px;
+  line-height: 1.45;
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
 }
 
 .mono {
-  font-family: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  font-family: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 12px;
+}
+
+.num {
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---- primitives (see components/ui.tsx) ------------------------------------------------ */
+
+/* A list row: 36px, hairline-separated, hover tint, accent wash when selected. */
+.ft-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 36px;
+  padding: 0 12px;
+  width: 100%;
+  text-align: left;
+  color: var(--fg);
+  background: transparent;
+  border: 0;
+  border-bottom: 1px solid var(--border);
+  font: inherit;
+  cursor: pointer;
+  transition: background-color 80ms ease-out;
+}
+.ft-row:hover {
+  background: var(--hover);
+}
+.ft-row[aria-current="true"],
+.ft-row[data-selected="true"] {
+  background: var(--sel);
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+.ft-row:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+/* Buttons: one filled per screen, outlined for secondary, quiet for rare, danger for destructive. */
+.ft-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 11px;
+  border-radius: 6px;
+  border: 1px solid var(--border-strong);
+  background: transparent;
+  color: var(--fg);
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 500;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background-color 80ms ease-out, opacity 80ms ease-out;
+}
+.ft-btn:hover {
+  background: var(--hover);
+}
+.ft-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.ft-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.ft-btn-primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-contrast);
+}
+.ft-btn-primary:hover {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+}
+.ft-btn-quiet {
+  border-color: transparent;
+  color: var(--fg2);
+}
+.ft-btn-quiet:hover {
+  color: var(--fg);
+}
+.ft-btn-danger {
+  color: var(--red);
+  border-color: color-mix(in srgb, var(--red) 40%, transparent);
+}
+.ft-btn-sm {
+  height: 22px;
+  padding: 0 8px;
+  font-size: 12px;
+}
+.ft-btn-icon {
+  width: 28px;
+  padding: 0;
+  border-color: transparent;
+  color: var(--fg2);
+}
+.ft-btn-icon:hover {
+  color: var(--fg);
+}
+
+/* A native <select> dressed as a quiet menu button: the control stays a real select. */
+.ft-select {
+  appearance: none;
+  -webkit-appearance: none;
+  height: 28px;
+  padding: 0 24px 0 10px;
+  border-radius: 6px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--fg2);
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 500;
+  cursor: pointer;
+}
+.ft-select:hover {
+  background: var(--hover);
+  color: var(--fg);
+}
+.ft-select:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.ft-select option {
+  background: var(--raised);
+  color: var(--fg);
+}
+
+/* Segmented control. */
+.ft-seg {
+  display: inline-flex;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.ft-seg > button {
+  height: 26px;
+  padding: 0 10px;
+  border: 0;
+  background: transparent;
+  color: var(--fg2);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+}
+.ft-seg > button[aria-pressed="true"] {
+  background: var(--active);
+  color: var(--fg);
+}
+
+/* Underline tabs. */
+.ft-tab {
+  height: 32px;
+  padding: 0 2px;
+  margin-right: 18px;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  background: transparent;
+  color: var(--fg2);
+  font: inherit;
+  font-weight: 500;
+  cursor: pointer;
+}
+.ft-tab[aria-selected="true"] {
+  color: var(--fg);
+  border-bottom-color: var(--fg);
+}
+.ft-tab:hover {
+  color: var(--fg);
+}
+
+/* Text inputs. */
+.ft-input {
+  height: 28px;
+  padding: 0 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border-strong);
+  background: transparent;
+  color: var(--fg);
+  font: inherit;
+  font-size: 12.5px;
+}
+.ft-input::placeholder {
+  color: var(--fg3);
+}
+.ft-input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 0;
+  border-color: transparent;
+}
+textarea.ft-input {
+  height: auto;
+  padding: 8px 10px;
+  line-height: 1.45;
+}
+
+kbd.ft-kbd {
+  font-family: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+  font-size: 11px;
+  color: var(--fg2);
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  padding: 1px 5px;
+  background: var(--hover);
+  line-height: 1.2;
+}
+
+/* Right-hand detail pane: a column beside the content, never a modal. Below 900px it covers. */
+.ft-pane {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-width: 0;
+  background: var(--bg);
+  border-left: 1px solid var(--border);
+}
+.ft-pane-md {
+  width: min(100%, 520px);
+}
+.ft-pane-lg {
+  width: min(100%, 640px);
+}
+.ft-pane-xl {
+  width: min(100%, 820px);
+}
+@media (max-width: 900px) {
+  .ft-pane {
+    position: fixed;
+    inset: 0 0 0 auto;
+    width: 100%;
+    z-index: 40;
+  }
 }
 
 ::-webkit-scrollbar {
@@ -104,12 +393,9 @@ body {
   height: 10px;
 }
 ::-webkit-scrollbar-thumb {
-  background: #3a3a3a;
+  background: var(--scrollbar);
   border-radius: 6px;
   border: 2px solid var(--bg);
-}
-::-webkit-scrollbar-thumb:hover {
-  background: #454545;
 }
 ::-webkit-scrollbar-track {
   background: transparent;
@@ -148,18 +434,4 @@ body {
 }
 .pulse {
   animation: pulse-dot 1.4s ease-in-out infinite;
-}
-
-/* Every clickable control gets the hand cursor and a subtle lighten on hover, app-wide —
-   so any button feels interactive even if it doesn't set its own hover style. */
-button:not(:disabled),
-[role="button"]:not([aria-disabled="true"]),
-select:not(:disabled),
-a[href] {
-  cursor: pointer;
-}
-button:not(:disabled):hover,
-[role="button"]:not([aria-disabled="true"]):hover,
-select:not(:disabled):hover {
-  filter: brightness(1.12);
 }
