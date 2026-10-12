@@ -432,6 +432,63 @@ async fn work_item_and_pipeline_detail_reach_the_provider() {
 }
 
 #[tokio::test]
+async fn pipeline_capabilities_annotations_artifacts_and_rerun() {
+    let server = spawn(demo_deps(true).await, 0).await.expect("server binds");
+    let base = format!("http://127.0.0.1:{}", server.port);
+    let client = reqwest::Client::new();
+    let tok = server.token.clone();
+    let hdr = |r: reqwest::RequestBuilder| r.header("x-forgetop-token", &tok);
+    let detail_url = format!("{base}/api/pipeline/detail?conn=github&run_id=r500");
+
+    // Detail carries the provider's capabilities.
+    let detail: serde_json::Value = hdr(client.get(&detail_url)).send().await.unwrap().json().await.unwrap();
+    let caps = &detail["capabilities"];
+    assert_eq!(caps["supports_rerun"], true);
+    assert_eq!(caps["supports_artifacts"], true);
+    assert_eq!(caps["supports_approvals"], true);
+    assert_eq!(caps["can_respond_approvals"], true);
+    for key in ["supports_rerun_failed", "rerun_starts_new_run", "rerun_failed_starts_new_run"] {
+        assert!(caps[key].is_boolean(), "capabilities carries {key}");
+    }
+
+    // Annotations: the failed run has some, a run without any returns an empty array.
+    let annotations: serde_json::Value =
+        hdr(client.get(format!("{base}/api/pipeline/annotations?conn=github&run_id=r500"))).send().await.unwrap().json().await.unwrap();
+    assert!(!annotations.as_array().unwrap().is_empty(), "r500 has annotations");
+    let none: serde_json::Value =
+        hdr(client.get(format!("{base}/api/pipeline/annotations?conn=github&run_id=r493"))).send().await.unwrap().json().await.unwrap();
+    assert_eq!(none, serde_json::json!([]));
+
+    // Artifacts.
+    let artifacts: serde_json::Value =
+        hdr(client.get(format!("{base}/api/pipeline/artifacts?conn=github&run_id=r207"))).send().await.unwrap().json().await.unwrap();
+    assert_eq!(artifacts.as_array().unwrap().len(), 7);
+
+    // Re-run: the demo re-queues the same run (no new run id), and the detail reflects it.
+    let rerun = hdr(client.post(format!("{base}/api/pipeline/rerun")))
+        .json(&serde_json::json!({ "conn": "github", "run_id": "r500", "failed_only": true }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rerun.status(), 200);
+    let rerun: serde_json::Value = rerun.json().await.unwrap();
+    assert_eq!(rerun["ok"], true);
+    assert!(rerun["new_run_id"].is_null());
+    let after: serde_json::Value = hdr(client.get(&detail_url)).send().await.unwrap().json().await.unwrap();
+    assert_eq!(after["run"]["status"], "Queued");
+
+    // Unknown connection → 404.
+    let missing_annotations = hdr(client.get(format!("{base}/api/pipeline/annotations?conn=nope&run_id=r500"))).send().await.unwrap();
+    assert_eq!(missing_annotations.status(), 404);
+    let missing_rerun = hdr(client.post(format!("{base}/api/pipeline/rerun")))
+        .json(&serde_json::json!({ "conn": "nope", "run_id": "r500" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing_rerun.status(), 404);
+}
+
+#[tokio::test]
 async fn launchpad_shape_ordering_and_expand_buckets() {
     // The exact cap→overflow arithmetic is unit-tested in `forgetop_core::launchpad`; here we verify
     // the endpoint wires the flags through, keeps every capped list within its limit, orders

@@ -143,7 +143,42 @@ export interface PipelineRun {
   finished_at?: string | null;
   url?: string | null;
   stages: PipelineStage[];
+  /** What started the run, in the provider's own words (`push`, `pull_request`, `schedule`,
+   *  Azure `individualCI`, GitLab `merge_request_event`, …). Omitted when unknown. */
+  event?: string | null;
+  /** Which attempt of this run this is (GitHub `run_attempt`); omitted where the provider
+   *  doesn't number re-runs. */
+  attempt?: number | null;
+  /** The pull/merge request this run was built for, by number, when the provider says. */
+  pull_request?: number | null;
 }
+
+/** How serious a `PipelineAnnotation` is, most severe first. Mirrors the Rust `AnnotationLevel`. */
+export type AnnotationLevel = "Failure" | "Warning" | "Notice";
+
+/** A problem a run reported, usually anchored to a file and line: a GitHub check-run
+ *  annotation, a GitLab failed test case, an Azure timeline issue. Mirrors the Rust domain type. */
+export interface PipelineAnnotation {
+  level: AnnotationLevel;
+  message: string;
+  title?: string | null;
+  path?: string | null;
+  line?: number | null;
+  /** The job that reported it, matching a `PipelineJob.id`, when known. */
+  job_id?: string | null;
+}
+
+/** A file a run published (build output, report, installer). Mirrors the Rust domain type. */
+export interface PipelineArtifact {
+  id: string;
+  name: string;
+  size_bytes?: number | null;
+  expires_at?: string | null;
+  url?: string | null;
+}
+
+/** A decision on a pending `PipelineApproval`. Mirrors the Rust `ApprovalDecision`. */
+export type ApprovalDecision = "Approve" | "Reject";
 
 export interface Notification {
   id: string;
@@ -342,9 +377,22 @@ export interface WiDetail {
   timeline: TimelineEvent[];
 }
 
+/** What a run's provider can do, for gating the drill-in's actions. */
+export interface PipelineCapabilities {
+  supports_rerun: boolean;
+  supports_rerun_failed: boolean;
+  /** A rerun starts a new run (with its own id) rather than a new attempt of this one. */
+  rerun_starts_new_run: boolean;
+  rerun_failed_starts_new_run: boolean;
+  supports_artifacts: boolean;
+  supports_approvals: boolean;
+  can_respond_approvals: boolean;
+}
+
 export interface PipelineDetail {
   run: PipelineRun;
   approvals: PipelineApproval[];
+  capabilities: PipelineCapabilities;
 }
 
 interface LaunchpadBase {

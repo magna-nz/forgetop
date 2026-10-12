@@ -4,8 +4,8 @@
 use std::sync::Arc;
 
 use forgetop_core::domain::{
-    CheckRun, CommentThread, Commit, FileChange, Notification, PipelineApproval, PipelineRun,
-    ProviderType, PullRequest, PullRequestStatus, TimelineEvent, TimelineEventKind, WorkItem,
+    CheckRun, CommentThread, Commit, FileChange, Notification, PipelineAnnotation, PipelineApproval,
+    PipelineArtifact, PipelineRun, ProviderType, PullRequest, PullRequestStatus, TimelineEvent, TimelineEventKind, WorkItem,
 };
 use forgetop_core::filter::run_triggered_by;
 use forgetop_core::launchpad::{self, EntryItem, PipeInput, PrInput, WiInput};
@@ -579,6 +579,22 @@ pub async fn wi_detail(sections: &SectionService, conn: &str, item: &ItemRef) ->
 pub struct PipelineDetail {
     pub run: PipelineRun,
     pub approvals: Vec<PipelineApproval>,
+    pub capabilities: PipelineCapabilities,
+}
+
+/// What the run's provider can do with it — the frontend gates re-run, artifacts and approval
+/// controls on these, the way `PrDetail.writes` gates the PR actions.
+#[derive(Serialize)]
+pub struct PipelineCapabilities {
+    pub supports_rerun: bool,
+    pub supports_rerun_failed: bool,
+    /// A full re-run starts a separate run (rather than re-queuing this one as its next attempt).
+    pub rerun_starts_new_run: bool,
+    /// Same, for a failed-jobs-only re-run.
+    pub rerun_failed_starts_new_run: bool,
+    pub supports_artifacts: bool,
+    pub supports_approvals: bool,
+    pub can_respond_approvals: bool,
 }
 
 /// Resolves the pipeline source for a connection id.
@@ -607,7 +623,16 @@ pub async fn pipeline_detail(sections: &SectionService, conn: &str, run: &ItemRe
         Vec::new()
     };
     run.status = run.shown_status(approvals.iter().any(|a| a.blocks_run));
-    Some(PipelineDetail { run, approvals })
+    let capabilities = PipelineCapabilities {
+        supports_rerun: source.supports_rerun(),
+        supports_rerun_failed: source.supports_rerun_failed(),
+        rerun_starts_new_run: source.rerun_starts_new_run(false),
+        rerun_failed_starts_new_run: source.rerun_starts_new_run(true),
+        supports_artifacts: source.supports_artifacts(),
+        supports_approvals: source.supports_approvals(),
+        can_respond_approvals: source.can_respond_to_approvals(),
+    };
+    Some(PipelineDetail { run, approvals, capabilities })
 }
 
 /// Logs for a run, optionally scoped to a single job. Best-effort: `None` when the connection
@@ -615,6 +640,20 @@ pub async fn pipeline_detail(sections: &SectionService, conn: &str, run: &ItemRe
 pub async fn pipeline_logs(sections: &SectionService, conn: &str, run: &ItemRef, job_id: Option<&str>) -> Option<String> {
     let source = pipe_source(sections, conn).await?;
     source.logs(run, job_id).await.inspect_err(|_| log_fetch_failure("dashboard.pipeline_logs.get")).ok()
+}
+
+/// Problems a run reported (failed tests, compiler errors, warnings). Best-effort: `None` when
+/// the connection isn't found or the provider errors.
+pub async fn pipeline_annotations(sections: &SectionService, conn: &str, run: &ItemRef) -> Option<Vec<PipelineAnnotation>> {
+    let source = pipe_source(sections, conn).await?;
+    source.annotations(run).await.inspect_err(|_| log_fetch_failure("dashboard.pipeline_annotations.get")).ok()
+}
+
+/// Files a run published. Best-effort: `None` when the connection isn't found or the provider
+/// errors.
+pub async fn pipeline_artifacts(sections: &SectionService, conn: &str, run: &ItemRef) -> Option<Vec<PipelineArtifact>> {
+    let source = pipe_source(sections, conn).await?;
+    source.artifacts(run).await.inspect_err(|_| log_fetch_failure("dashboard.pipeline_artifacts.get")).ok()
 }
 
 pub async fn health(svc: &ConnectionHealthService) -> Vec<HealthRow> {
