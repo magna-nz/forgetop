@@ -14,14 +14,18 @@ use forgetop_core::provider::{
     PullRequestSource, WorkItemQuery, WorkItemSource,
 };
 use forgetop_core::service::{ConnectionHealthService, SectionService};
-use serde::Serialize;
+use chrono::Utc;
+use forgetop_core::cache::CacheStore;
+use serde::{Deserialize, Serialize};
+
+use crate::cached;
 
 fn log_fetch_failure(operation: &'static str) {
     forgetop_core::diag::log(operation, "provider fetch failed");
 }
 
 /// One item tagged with the connection it came from (the "Provider" column in the TUI).
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct PrRow {
     pub connection_id: String,
     pub connection: String,
@@ -32,7 +36,7 @@ pub struct PrRow {
     pub needs_decoration: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct WiRow {
     pub connection_id: String,
     pub connection: String,
@@ -40,7 +44,7 @@ pub struct WiRow {
     pub work_item: WorkItem,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct PipeRow {
     pub connection_id: String,
     pub connection: String,
@@ -54,7 +58,7 @@ pub struct PipeRow {
     pub approvals: Vec<PipelineApproval>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct NotifRow {
     pub connection_id: String,
     pub connection: String,
@@ -72,7 +76,7 @@ pub struct HealthRow {
 
 /// Which slice of pull requests the PR page is showing. The provider `list(query)` does the
 /// filtering (the same path the TUI uses), so each view is correct for real providers, not just demo.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub enum PrView {
     /// Open PRs across the bound connections.
     All,
@@ -95,14 +99,19 @@ impl PrView {
         }
     }
 
-    fn query(self) -> PullRequestQuery {
-        let (filter, include_completed) = match self {
+    /// The provider filter and whether completed PRs are included — also the TUI's cache key.
+    pub fn parts(self) -> (PullRequestFilter, bool) {
+        match self {
             // "Merged by you" needs completed PRs; we keep only the merged ones below.
             PrView::MergedByYou => (PullRequestFilter::Mine, true),
             PrView::Yours => (PullRequestFilter::Mine, false),
             PrView::ReviewRequested => (PullRequestFilter::ReviewRequested, false),
             PrView::All => (PullRequestFilter::All, false),
-        };
+        }
+    }
+
+    fn query(self) -> PullRequestQuery {
+        let (filter, include_completed) = self.parts();
         // The dashboard renders decorated fields (mergeable, +/-) per visible row from
         // `/api/pr/decoration`, so the list itself doesn't pay for them. On a five-repository
         // scope that is the difference between one list call per repo and ~50 extra per repo.
@@ -110,7 +119,7 @@ impl PrView {
     }
 
     /// `Mine + include_completed` also returns your closed-but-not-merged PRs; drop those.
-    fn keep(self, pr: &PullRequest) -> bool {
+    pub fn keep(self, pr: &PullRequest) -> bool {
         match self {
             PrView::MergedByYou => matches!(pr.status, PullRequestStatus::Merged),
             _ => true,
@@ -118,7 +127,7 @@ impl PrView {
     }
 }
 
-pub async fn pull_requests(sections: &SectionService, view: PrView) -> Vec<PrRow> {
+pub async fn pull_requests(sections: &SectionService, cache: &CacheStore, view: PrView) -> Vec<PrRow> {
     let mut out = Vec::new();
     if let Ok(feeds) = sections.pull_request_feeds().await.inspect_err(|_| log_fetch_failure("dashboard.pull_requests.feeds")) {
         let query = view.query();
@@ -136,10 +145,11 @@ pub async fn pull_requests(sections: &SectionService, view: PrView) -> Vec<PrRow
             }
         }
     }
+    cached::store_pull_requests(cache, view, &out, Utc::now());
     out
 }
 
-pub async fn work_items(sections: &SectionService) -> Vec<WiRow> {
+pub async fn work_items(sections: &SectionService, cache: &CacheStore) -> Vec<WiRow> {
     let mut out = Vec::new();
     if let Ok(feeds) = sections.work_item_feeds().await.inspect_err(|_| log_fetch_failure("dashboard.work_items.feeds")) {
         let query = WorkItemQuery { mine_only: true, include_completed: false, limit: Some(50) };
@@ -154,6 +164,7 @@ pub async fn work_items(sections: &SectionService) -> Vec<WiRow> {
             }
         }
     }
+    cached::store_work_items(cache, &out.iter().map(|r| WiInput { connection_id: r.connection_id.clone(), connection: r.connection.clone(), provider: r.provider, wi: r.work_item.clone() }).collect::<Vec<_>>(), Utc::now());
     out
 }
 
@@ -200,7 +211,7 @@ pub async fn pipelines(sections: &SectionService) -> Vec<PipeRow> {
     out
 }
 
-pub async fn notifications(sections: &SectionService) -> Vec<NotifRow> {
+pub async fn notifications(sections: &SectionService, cache: &CacheStore) -> Vec<NotifRow> {
     let mut out = Vec::new();
     if let Ok(feeds) = sections.notification_feeds().await.inspect_err(|_| log_fetch_failure("dashboard.notifications.feeds")) {
         for feed in feeds {
@@ -215,6 +226,7 @@ pub async fn notifications(sections: &SectionService) -> Vec<NotifRow> {
         }
     }
     out.sort_by_key(|r| std::cmp::Reverse(r.notification.updated_at)); // newest first
+    cached::store_notifications(cache, &out, Utc::now());
     out
 }
 
@@ -298,10 +310,10 @@ async fn wi_inputs(sections: &SectionService) -> Vec<WiInput> {
     out
 }
 
-/// Pipeline inputs with the derived flags the classifier needs: the pipeline's display name (from
-/// discovery), whether an in-flight run is waiting on an approval gate you can respond to, and
-/// whether you started it. Mirrors the TUI's pipeline reload.
-async fn pipe_inputs(sections: &SectionService) -> Vec<PipeInput> {
+/// Pipeline rows as the TUI caches them: the run as the provider reported it, the gates holding
+/// it by name, whether one is yours to answer, and whether you started it — the flags the
+/// classifier needs, derived once here for the live path and read back by `cached::launchpad`.
+async fn pipe_rows(sections: &SectionService) -> Vec<cached::TuiPipeRow> {
     let mut out = Vec::new();
     if let Ok(feeds) = sections.pipeline_feeds().await.inspect_err(|_| log_fetch_failure("dashboard.launchpad.pipeline_feeds")) {
         for feed in feeds {
@@ -323,7 +335,7 @@ async fn pipe_inputs(sections: &SectionService) -> Vec<PipeInput> {
                 .unwrap_or_default();
             for result in feed.list_runs(&defs).await {
                 if let Ok(runs) = result.inspect_err(|_| log_fetch_failure("dashboard.launchpad.pipelines")) {
-                    for mut run in runs {
+                    for run in runs {
                         let approvals = if supports && run.status.is_active() {
                             feed.source
                                 .pending_approvals(&run.item_ref())
@@ -334,15 +346,16 @@ async fn pipe_inputs(sections: &SectionService) -> Vec<PipeInput> {
                             Vec::new()
                         };
                         // Any pending gate holds the run; only one you can answer puts it in your queue.
-                        run.status = run.shown_status(approvals.iter().any(|a| a.blocks_run));
+                        let gates = approvals.iter().filter(|a| a.blocks_run).map(|a| a.name.clone()).collect();
                         let awaiting_approval = approvals.iter().any(|x| x.can_respond);
-                        out.push(PipeInput {
+                        out.push(cached::TuiPipeRow {
                             connection_id: feed.connection.connection_id().to_string(),
                             connection: feed.connection.display_name().to_string(),
                             provider: feed.connection.provider_type(),
                             definition_name: def_names.get(&run.definition_id).cloned(),
                             awaiting_approval,
                             triggered_by_me: run_triggered_by(&run, me.as_deref()),
+                            gates,
                             run,
                         });
                     }
@@ -370,13 +383,25 @@ pub struct LaunchpadResponse {
     pub more: LaunchpadMore,
 }
 
-pub async fn launchpad(sections: &SectionService) -> LaunchpadResponse {
+pub async fn launchpad(sections: &SectionService, cache: &CacheStore) -> LaunchpadResponse {
     let review = pr_inputs(sections, PullRequestFilter::ReviewRequested, false).await;
     let mine = pr_inputs(sections, PullRequestFilter::Mine, true).await;
     let wis = wi_inputs(sections).await;
-    let pipes = pipe_inputs(sections).await;
+    let pipe_rows = pipe_rows(sections).await;
+    // Everything the Command Center was built from goes to the shared cache, under the keys and
+    // in the shapes the TUI uses, so either frontend's next start paints it.
+    let now = Utc::now();
+    cached::store_launchpad_prs(cache, cached::KEY_LAUNCHPAD_REVIEW, &review, now);
+    cached::store_launchpad_prs(cache, cached::KEY_LAUNCHPAD_MINE, &mine, now);
+    cached::store_work_items(cache, &wis, now);
+    cached::store_pipelines(cache, &pipe_rows, now);
+    let pipes: Vec<PipeInput> = pipe_rows.into_iter().map(cached::pipe_input).collect();
+    build_launchpad(&review, &mine, &wis, &pipes)
+}
 
-    let built = launchpad::build(&review, &mine, &wis, &pipes);
+/// The Command Center from its inputs — live or cached, the same build.
+pub fn build_launchpad(review: &[PrInput], mine: &[PrInput], wis: &[WiInput], pipes: &[PipeInput]) -> LaunchpadResponse {
+    let built = launchpad::build(review, mine, wis, pipes);
     let rows = built
         .entries
         .into_iter()

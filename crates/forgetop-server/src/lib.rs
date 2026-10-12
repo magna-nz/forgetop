@@ -13,6 +13,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
 use axum::Router;
+use forgetop_core::cache::CacheStore;
 use forgetop_core::provider::{ItemRef, PrDecoration};
 use forgetop_core::secret::SecretStore;
 use forgetop_core::service::{ConfigService, ConnectionHealthService, SectionService};
@@ -20,6 +21,8 @@ use rust_embed::RustEmbed;
 use serde::Deserialize;
 
 use crate::actions::ActionError;
+
+pub mod cached;
 
 mod actions;
 mod connections;
@@ -41,6 +44,10 @@ pub struct Deps {
     pub health: Arc<ConnectionHealthService>,
     pub config: Arc<ConfigService>,
     pub secrets: Arc<dyn SecretStore>,
+    /// The on-disk cache the TUI paints from at launch, shared so the dashboard does too: lists
+    /// answer from it first and the live fetch writes back (see `cached`). Pass a disabled store
+    /// to cache nothing (`--demo`).
+    pub cache: Arc<CacheStore>,
 }
 
 /// A bound, running server: where it lives and the token needed to reach it.
@@ -87,6 +94,10 @@ struct AppState {
     deps: Deps,
     token: Arc<str>,
     decorations: Arc<DecorationCache>,
+    /// Lists with a live fetch out right now, by key: a poll that lands meanwhile answers from
+    /// the cache rather than starting another.
+    inflight: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    flusher: Arc<cached::Flusher>,
 }
 
 async fn bind(deps: Deps, port: u16) -> std::io::Result<(tokio::net::TcpListener, Server, AppState)> {
@@ -94,7 +105,14 @@ async fn bind(deps: Deps, port: u16) -> std::io::Result<(tokio::net::TcpListener
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await?;
     let bound = listener.local_addr()?.port();
     let url = format!("http://127.0.0.1:{bound}/?t={token}");
-    let state = AppState { deps, token: Arc::from(token.as_str()), decorations: Arc::new(DecorationCache::default()) };
+    let flusher = Arc::new(cached::Flusher::new(deps.cache.clone()));
+    let state = AppState {
+        deps,
+        token: Arc::from(token.as_str()),
+        decorations: Arc::new(DecorationCache::default()),
+        inflight: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        flusher,
+    };
     Ok((listener, Server { port: bound, token, url }, state))
 }
 
@@ -211,20 +229,94 @@ fn token_from(req: &Request) -> Option<String> {
 async fn health(State(s): State<AppState>) -> Json<Vec<dto::HealthRow>> {
     Json(dto::health(&s.deps.health).await)
 }
-async fn pull_requests(State(s): State<AppState>, Query(q): Query<PrListQuery>) -> Json<Vec<dto::PrRow>> {
-    Json(dto::pull_requests(&s.deps.sections, dto::PrView::parse(q.view.as_deref())).await)
+/// The response header naming when a cached answer's data was fetched. Absent on a live answer.
+pub const FETCHED_AT_HEADER: &str = "x-forgetop-fetched-at";
+
+/// How long a list request waits for its live fetch before answering from the shared cache
+/// instead (the fetch carries on behind the answer and writes back). Long enough that a quick
+/// forge still answers live on every poll, short enough that a slow one never leaves the page on
+/// skeletons. `FORGETOP_CACHE_WAIT_MS` overrides it; 0 always answers from the cache when it can.
+const STALE_WAIT: std::time::Duration = std::time::Duration::from_millis(1500);
+
+fn stale_wait() -> std::time::Duration {
+    std::env::var("FORGETOP_CACHE_WAIT_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(STALE_WAIT)
 }
-async fn work_items(State(s): State<AppState>) -> Json<Vec<dto::WiRow>> {
-    Json(dto::work_items(&s.deps.sections).await)
+
+/// Answers a list live when the forge is quick, and from the shared cache when it is not: the
+/// live fetch starts at once, the request waits `stale_wait()` for it, and past that the cached
+/// rows go out (dated by the header) while the fetch finishes behind them and writes back. With
+/// nothing cached the request waits for the fetch however long it takes. One live fetch per key
+/// at a time: a poll that lands while one is out answers from the cache.
+async fn serve_cached<T, F, Fut>(s: &AppState, key: &str, cached: Option<cached::Cached<T>>, fetch: F) -> Response
+where
+    T: serde::Serialize + Send + 'static,
+    F: FnOnce(AppState) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = T> + Send + 'static,
+{
+    let claim = |s: &AppState| s.inflight.lock().unwrap_or_else(|p| p.into_inner()).insert(key.to_string());
+    let from_cache = |hit: cached::Cached<T>| {
+        let mut res = Json(hit.value).into_response();
+        if let Ok(v) = hit.fetched_at.to_rfc3339().parse() {
+            res.headers_mut().insert(FETCHED_AT_HEADER, v);
+        }
+        res
+    };
+    if !claim(s) {
+        // A fetch is already out for this list; it lands shortly and the next poll sees it.
+        return match cached {
+            Some(hit) => from_cache(hit),
+            None => Json(fetch(s.clone()).await).into_response(),
+        };
+    }
+    let live = {
+        let s2 = s.clone();
+        let key = key.to_string();
+        tokio::spawn(async move {
+            let value = fetch(s2.clone()).await;
+            s2.inflight.lock().unwrap_or_else(|p| p.into_inner()).remove(&key);
+            s2.flusher.schedule();
+            value
+        })
+    };
+    let Some(hit) = cached else {
+        return match live.await {
+            Ok(value) => Json(value).into_response(),
+            Err(_) => (StatusCode::BAD_GATEWAY, "the fetch behind this list failed").into_response(),
+        };
+    };
+    match tokio::time::timeout(stale_wait(), live).await {
+        Ok(Ok(value)) => Json(value).into_response(),
+        // Slow forge, or a panicked fetch: the last known rows, dated, while the fetch runs on.
+        _ => from_cache(hit),
+    }
 }
-async fn pipelines(State(s): State<AppState>) -> Json<Vec<dto::PipeRow>> {
-    Json(dto::pipelines(&s.deps.sections).await)
+
+async fn pull_requests(State(s): State<AppState>, Query(q): Query<PrListQuery>) -> Response {
+    let view = dto::PrView::parse(q.view.as_deref());
+    let hit = cached::pull_requests(&s.deps.cache, view);
+    serve_cached(&s, &format!("prs.{view:?}"), hit, move |s: AppState| async move { dto::pull_requests(&s.deps.sections, &s.deps.cache, view).await }).await
 }
-async fn notifications(State(s): State<AppState>) -> Json<Vec<dto::NotifRow>> {
-    Json(dto::notifications(&s.deps.sections).await)
+async fn work_items(State(s): State<AppState>) -> Response {
+    let hit = cached::work_items(&s.deps.cache);
+    serve_cached(&s, "work_items", hit, |s: AppState| async move { dto::work_items(&s.deps.sections, &s.deps.cache).await }).await
 }
-async fn launchpad(State(s): State<AppState>) -> Json<dto::LaunchpadResponse> {
-    Json(dto::launchpad(&s.deps.sections).await)
+async fn pipelines(State(s): State<AppState>) -> Response {
+    // Read-only against the cache: the launchpad fetch writes the pipelines entry, with the
+    // "yours" flag the list alone cannot tell.
+    let hit = cached::pipelines(&s.deps.cache);
+    serve_cached(&s, "pipelines", hit, |s: AppState| async move { dto::pipelines(&s.deps.sections).await }).await
+}
+async fn notifications(State(s): State<AppState>) -> Response {
+    let hit = cached::notifications(&s.deps.cache);
+    serve_cached(&s, "notifications", hit, |s: AppState| async move { dto::notifications(&s.deps.sections, &s.deps.cache).await }).await
+}
+async fn launchpad(State(s): State<AppState>) -> Response {
+    let hit = cached::launchpad(&s.deps.cache);
+    serve_cached(&s, "launchpad", hit, |s: AppState| async move { dto::launchpad(&s.deps.sections, &s.deps.cache).await }).await
 }
 
 /// Query params identifying an item within a connection (`?conn=…&id=…&repo=…`).
@@ -613,6 +705,10 @@ mod tests {
 
     /// One demo GitHub connection bound to the PR section — the shape `forgetop --demo` wires.
     async fn demo_deps() -> Deps {
+        deps_with(Arc::new(CacheStore::disabled())).await
+    }
+
+    async fn deps_with(cache: Arc<CacheStore>) -> Deps {
         let registry = Arc::new(ProviderRegistry::new(demo_factories()));
         let store: Arc<dyn ConfigStore> = Arc::new(InMemoryConfigStore::new(ForgetopConfig::default()));
         let secrets: Arc<dyn SecretStore> = Arc::new(InMemorySecretStore::default());
@@ -632,10 +728,12 @@ mod tests {
         };
         config.add_or_update_connection(conn, None).await.unwrap();
         config.bind_pull_requests("github").await.unwrap();
+        config.bind_work_items("github").await.unwrap();
+        config.set_pipeline_auto_discover("github", true).await.unwrap();
         let resolver = Arc::new(ConnectionResolver::new(config.clone(), registry, secrets.clone()));
         let sections = Arc::new(SectionService::new(config.clone(), resolver.clone()));
         let health = Arc::new(ConnectionHealthService::new(config.clone(), resolver));
-        Deps { sections, health, config, secrets }
+        Deps { sections, health, config, secrets, cache }
     }
 
     struct Api {
@@ -648,6 +746,15 @@ mod tests {
         async fn start() -> Api {
             let server = spawn(demo_deps().await, 0).await.expect("server binds a free port");
             Api { base: format!("http://127.0.0.1:{}", server.port), token: server.token, client: reqwest::Client::new() }
+        }
+
+        async fn start_with(deps: Deps) -> Api {
+            let server = spawn(deps, 0).await.expect("server binds a free port");
+            Api { base: format!("http://127.0.0.1:{}", server.port), token: server.token, client: reqwest::Client::new() }
+        }
+
+        async fn get_raw(&self, path: &str) -> reqwest::Response {
+            self.client.get(format!("{}{path}", self.base)).header("x-forgetop-token", &self.token).send().await.expect("request")
         }
         async fn get(&self, path: &str) -> serde_json::Value {
             let r = self.client.get(format!("{}{path}", self.base)).header("x-forgetop-token", &self.token).send().await.unwrap();
@@ -746,5 +853,78 @@ mod tests {
 
         let missing = api.client.get(format!("{}/api/pr/reviewers?conn=nope&id={id}", api.base)).header("x-forgetop-token", &api.token).send().await.unwrap();
         assert_eq!(missing.status(), 404, "a bad connection is a 404");
+    }
+
+    fn scratch_cache() -> (Arc<CacheStore>, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!("forgetop-api-cache-{}.json", uuid::Uuid::new_v4()));
+        (Arc::new(CacheStore::new(&path)), path)
+    }
+
+    /// A list answers from the shared cache at once, says so in a header, and the live fetch
+    /// behind it replaces the entry.
+    #[tokio::test]
+    async fn lists_answer_from_the_shared_cache_then_refresh_behind_it() {
+        // Demo data answers in microseconds, so to see the cached path the wait is turned off.
+        std::env::set_var("FORGETOP_CACHE_WAIT_MS", "0");
+        let (cache, path) = scratch_cache();
+        let api = Api::start_with(deps_with(cache.clone()).await).await;
+
+        // Cold: the live fetch answers and writes the TUI's entry.
+        let cold = api.get_raw("/api/work-items").await;
+        assert!(cold.headers().get(FETCHED_AT_HEADER).is_none(), "a live answer carries no cache date");
+        let live: Vec<serde_json::Value> = cold.json().await.unwrap();
+        assert!(!live.is_empty());
+        assert!(cache.get::<Vec<cached::TuiWiRow>>(cached::KEY_WORK_ITEMS).is_some(), "the live fetch wrote the TUI's key");
+
+        // Make the cached entry recognisably stale, as a TUI that ran earlier would have left it.
+        assert!(cache.rewrite::<Vec<cached::TuiWiRow>>(cached::KEY_WORK_ITEMS, |mut rows| {
+            rows[0].wi.title = "Left here by the terminal".into();
+            rows
+        }));
+        let warm = api.get_raw("/api/work-items").await;
+        let fetched_at = warm.headers().get(FETCHED_AT_HEADER).expect("a cached answer says when it was fetched").clone();
+        assert!(chrono::DateTime::parse_from_rfc3339(fetched_at.to_str().unwrap()).is_ok());
+        let rows: Vec<serde_json::Value> = warm.json().await.unwrap();
+        assert_eq!(rows[0]["work_item"]["title"], "Left here by the terminal");
+
+        // The fetch that ran behind that answer has replaced the entry by now (demo data is instant).
+        let mut fresh = Vec::new();
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            fresh = api.get_raw("/api/work-items").await.json::<Vec<serde_json::Value>>().await.unwrap();
+            if fresh[0]["work_item"]["title"] != "Left here by the terminal" {
+                break;
+            }
+        }
+        assert_ne!(fresh[0]["work_item"]["title"], "Left here by the terminal", "the live fetch wrote back");
+        std::env::remove_var("FORGETOP_CACHE_WAIT_MS");
+        // And the flusher put it on disk for the next process.
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        assert!(path.exists(), "the cache was flushed to {}", path.display());
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Every list the dashboard fetches lands in the cache under the key the TUI reads at launch.
+    #[tokio::test]
+    async fn live_fetches_write_the_terminal_ui_keys() {
+        let (cache, path) = scratch_cache();
+        let api = Api::start_with(deps_with(cache.clone()).await).await;
+        let _ = api.get_raw("/api/pull-requests?view=all").await;
+        let _ = api.get_raw("/api/pull-requests?view=review_requested").await;
+        let _ = api.get_raw("/api/launchpad").await;
+        let _ = api.get_raw("/api/notifications").await;
+        let all = cache.get::<Vec<cached::TuiPrRow>>(&cached::prs_key(forgetop_core::provider::PullRequestFilter::All, false)).expect("All view");
+        assert!(!all.value.is_empty());
+        assert!(cache.get::<Vec<cached::TuiPrRow>>(&cached::prs_key(forgetop_core::provider::PullRequestFilter::ReviewRequested, false)).is_some());
+        assert!(cache.get::<Vec<cached::TuiPrRow>>(cached::KEY_LAUNCHPAD_MINE).is_some());
+        assert!(cache.get::<Vec<cached::TuiPrRow>>(cached::KEY_LAUNCHPAD_REVIEW).is_some());
+        assert!(cache.get::<Vec<cached::TuiWiRow>>(cached::KEY_WORK_ITEMS).is_some());
+        assert!(cache.get::<Vec<cached::TuiPipeRow>>(cached::KEY_PIPELINES).is_some());
+        assert!(cache.get::<Vec<dto::NotifRow>>(cached::KEY_INBOX).is_some());
+        // The Command Center rebuilt from those entries is the one the live build produced.
+        let live: serde_json::Value = api.get_raw("/api/launchpad").await.json().await.unwrap();
+        let from_cache = cached::launchpad(&cache).expect("launchpad from cache");
+        assert_eq!(serde_json::to_value(&from_cache.value).unwrap(), live);
+        let _ = std::fs::remove_file(path);
     }
 }

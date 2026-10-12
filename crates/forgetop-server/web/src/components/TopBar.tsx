@@ -1,6 +1,6 @@
 import { useIsFetching, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState } from "react";
-import { apiPost, useNotifications } from "../api";
+import { apiPost, useCacheStatus, useNotifications } from "../api";
 import { notificationMeta, relativeTime, toTime } from "../format";
 import { useNavigateSection } from "../nav";
 import type { NotifRow, SectionId } from "../types";
@@ -20,6 +20,16 @@ const TITLES: Record<SectionId, string> = {
   settings: "Settings",
 };
 
+/** "4m", "2h", "3d" — how old the cached rows on screen are. */
+export function cacheAgeLabel(ms: number): string {
+  const m = Math.round(ms / 60_000);
+  if (m < 1) return "under a minute";
+  if (m < 60) return `${m}m`;
+  const h = Math.round(m / 60);
+  if (h < 48) return `${h}h`;
+  return `${Math.round(h / 24)}d`;
+}
+
 export function TopBar({
   section,
   onOpenPalette,
@@ -32,6 +42,7 @@ export function TopBar({
   onToggleSidebar: () => void;
 }) {
   const fetching = useIsFetching() > 0;
+  const staleAge = useCacheStatus();
   const qc = useQueryClient();
   const { data: notifications } = useNotifications();
   const navigate = useNavigateSection();
@@ -93,11 +104,18 @@ export function TopBar({
       <h1 className="m-0 text-[15px] font-semibold leading-tight ml-1" style={{ letterSpacing: "-0.01em" }}>
         {TITLES[section]}
       </h1>
-      {fetching && (
-        <span className="flex items-center gap-1.5 text-[12px] ml-2" style={{ color: "var(--fg3)" }}>
+      {staleAge !== null ? (
+        <span className="flex items-center gap-1.5 text-[12px] ml-2" style={{ color: "var(--fg3)" }} title="Shown from the cache shared with the terminal UI; a live refresh is on its way">
           <StatusGlyph glyph="running" spin color="var(--fg3)" />
-          syncing
+          from {cacheAgeLabel(staleAge)} ago · refreshing
         </span>
+      ) : (
+        fetching && (
+          <span className="flex items-center gap-1.5 text-[12px] ml-2" style={{ color: "var(--fg3)" }}>
+            <StatusGlyph glyph="running" spin color="var(--fg3)" />
+            syncing
+          </span>
+        )
       )}
 
       <div className="ml-auto flex items-center gap-1">
