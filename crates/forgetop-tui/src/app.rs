@@ -1002,6 +1002,9 @@ pub struct App {
     pub pr_viewed: HashMap<String, HashMap<String, u64>>,
     /// True while the preview is focused: its view is `screen`, drawn beside the list.
     pub preview_focus: bool,
+    /// True while the open item view is a pane over the Command Center it was opened from,
+    /// rather than full-screen: the Command Center stays drawn beside it and Esc closes it.
+    pub lp_pane: bool,
     /// Width of the content area in the last frame, which decides whether the split fits.
     pub content_w: u16,
     /// The log fetch in flight — `(conn, run, job)` key and anim ticks waited — so at most
@@ -3432,6 +3435,7 @@ impl App {
             preview_hidden: DEFAULT_PREVIEW_HIDDEN,
             pr_viewed: HashMap::new(),
             preview_focus: false,
+            lp_pane: false,
             content_w: 0,
             log_inflight: None,
             run_details: HashMap::new(),
@@ -3888,7 +3892,7 @@ impl App {
 
     /// The top-level tab position: 0 = Launchpad, then each visible section.
     fn top_pos(&self) -> usize {
-        if matches!(self.screen, Screen::Launchpad) {
+        if matches!(self.screen, Screen::Launchpad) || self.lp_pane {
             0
         } else {
             1 + self.visible_indices().iter().position(|&i| i == self.screen_section()).unwrap_or(0)
@@ -4472,6 +4476,10 @@ impl App {
         if self.preview_focus && !matches!(self.screen, Screen::PrView(_) | Screen::WiView(_) | Screen::Pipeline(_)) {
             self.preview_focus = false;
         }
+        // The same for the pane over the Command Center.
+        if self.lp_pane && !self.item_view_open() {
+            self.lp_pane = false;
+        }
         if !matches!(self.screen, Screen::List) || !self.preview_shown() {
             self.preview = None;
             return;
@@ -4635,6 +4643,10 @@ impl App {
                 }
                 true
             }
+            Key::Char('p') if self.lp_pane => {
+                self.close_lp_pane();
+                true
+            }
             Key::Char('p') if focused => {
                 let view = std::mem::replace(&mut self.screen, Screen::List);
                 self.preview_focus = false;
@@ -4724,8 +4736,8 @@ impl App {
         self.refresh_derived_prs(deps);
     }
 
-    /// Opens the selected Launchpad row in its full item view, or follows a "more…" slot to the
-    /// full section.
+    /// Opens the selected Launchpad row in a pane over the Command Center, or follows a "more…"
+    /// slot to the full section. A terminal too narrow for the pane opens the item full-screen.
     async fn open_launchpad_selected(&mut self, deps: &AppDeps) {
         let entry = match self.lp_selected_slot() {
             Some(LpSlot::Entry(i)) => match self.lp.get(i) {
@@ -4769,6 +4781,23 @@ impl App {
                 }
             }
         }
+        self.lp_pane = self.content_w >= PREVIEW_MIN_WIDTH && self.item_view_open();
+    }
+
+    /// Whether the screen is a PR, work-item or pipeline view.
+    fn item_view_open(&self) -> bool {
+        matches!(self.screen, Screen::PrView(_) | Screen::WiView(_) | Screen::Pipeline(_))
+    }
+
+    /// `p` in the pane over the Command Center closes it — on a list, `p` hands focus back to the
+    /// list beside the pane, and here the Command Center is what's beside it. Unsubmitted line
+    /// comments get the same prompt Esc gives them.
+    fn close_lp_pane(&mut self) {
+        if matches!(&self.screen, Screen::PrView(v) if !v.pending.is_empty()) {
+            self.open_pending_exit_prompt();
+            return;
+        }
+        self.screen = self.view_origin();
     }
 
     // ---- command palette ----
@@ -6748,11 +6777,12 @@ impl App {
 
         // Tab walks the tab strip — Command Center, then each visible section — from any
         // screen, an open PR / work item / pipeline run included; Shift-Tab walks it backwards.
-        // Both wrap. A PR open in the pane beside its list is the exception: there Tab walks the
-        // PR's own tabs, and Esc closes the pane to hand Tab back to the strip. The
+        // Both wrap. A PR open in a pane — beside its list, or over the Command Center — is the
+        // exception: there Tab walks the PR's own tabs, and Esc closes the pane to hand Tab back
+        // to the strip. The
         // input-capturing modes (wizard, overlay, quick filter) return above, so Tab still
         // reaches them.
-        if matches!(key, Key::Tab | Key::BackTab) && self.preview_focus {
+        if matches!(key, Key::Tab | Key::BackTab) && (self.preview_focus || self.lp_pane) {
             if let Screen::PrView(v) = &mut self.screen {
                 v.step_tab(if key == Key::Tab { 1 } else { -1 });
                 return;
@@ -17056,6 +17086,184 @@ mod tests {
         }
         app.tick_preview(&deps);
         assert!(app.preview.as_ref().unwrap().sent, "sent after the settle ticks");
+    }
+
+    /// Puts the Command Center cursor on the entry for item `id`.
+    fn lp_select(app: &mut App, id: &str) {
+        for side in 0..2 {
+            let pos = app.lp_slots(side).iter().position(|s| matches!(s, LpSlot::Entry(i) if app.lp[*i].item_id() == id));
+            if let Some(pos) = pos {
+                app.lp_side = side;
+                app.lp_sel[side] = pos;
+                return;
+            }
+        }
+        panic!("{id} isn't on the Command Center");
+    }
+
+    /// The Command Center over a wide terminal, its cursor on `select`, last left on Pipelines —
+    /// so a section changing under it would be the open's doing.
+    fn lp_app(prs: &[&str], wis: &[&str], pipes: Vec<PipeRow>, select: &str) -> App {
+        let mut app = App::new("slate");
+        app.prs = prs
+            .iter()
+            .map(|id| {
+                let mut p = pr(None);
+                p.id = (*id).into();
+                pr_row(p)
+            })
+            .collect();
+        app.lp_prs_mine = app.prs.clone();
+        app.wis = wis
+            .iter()
+            .map(|id| {
+                let mut w = wi(None);
+                w.id = (*id).into();
+                wi_row(w)
+            })
+            .collect();
+        app.pipes = pipes;
+        app.rebuild_launchpad();
+        app.active = index_of(Section::Pipelines);
+        app.screen = Screen::Launchpad;
+        app.content_w = 150;
+        lp_select(&mut app, select);
+        app
+    }
+
+    /// Every line of a drawn frame, top to bottom.
+    fn screen_text(buf: &ratatui::buffer::Buffer) -> Vec<String> {
+        (0..buf.area.height).map(|y| row_text(buf, y)).collect()
+    }
+
+    /// Enter on a Command Center PR opens it in a pane over the Command Center — the tab strip,
+    /// the section lists and `active` untouched — and Esc closes it onto the same row.
+    #[tokio::test]
+    async fn a_command_center_pr_opens_in_a_pane_over_it_and_esc_returns() {
+        let deps = test_deps();
+        let mut app = lp_app(&["1", "2", "3"], &[], Vec::new(), "2");
+        let cursor = (app.lp_side, app.lp_sel);
+
+        app.on_key(Key::Enter, &deps).await;
+        assert!(matches!(&app.screen, Screen::PrView(v) if v.pr.id == "2"), "the PR is open");
+        assert!(app.lp_pane, "in the pane over the Command Center");
+        assert!(!app.preview_focus, "not a list's pane");
+        assert_eq!(app.active, index_of(Section::Pipelines), "no section was switched to");
+        assert_eq!(app.top_pos(), 0, "the tab strip stays on the Command Center");
+
+        app.on_key(Key::Escape, &deps).await;
+        assert!(matches!(app.screen, Screen::Launchpad), "Esc closes the pane");
+        assert_eq!((app.lp_side, app.lp_sel), cursor, "onto the same row");
+        assert!(!app.lp_pane);
+    }
+
+    /// Drawn, the Command Center is still on screen to the pane's left, and the pane holds the
+    /// item. The Command Center under it answers no clicks while the pane has the keys.
+    #[tokio::test]
+    async fn the_command_center_pane_draws_over_the_command_center() {
+        let deps = test_deps();
+        let mut app = lp_app(&["1"], &[], Vec::new(), "1");
+        app.on_key(Key::Enter, &deps).await;
+        let buf = draw(&mut app, 200, 40);
+        let lines = screen_text(&buf);
+
+        let pane_x = 200 - 200 * 70 / 100;
+        let left: Vec<String> = lines.iter().map(|l| l.chars().take(pane_x).collect()).collect();
+        let right: Vec<String> = lines.iter().map(|l| l.chars().skip(pane_x).collect()).collect();
+        assert!(left.iter().any(|l| l.contains("Needs you")), "the Command Center is drawn beside the pane");
+        assert!(right.iter().any(|l| l.contains("Conversation")), "the PR is drawn in the pane");
+        assert!(
+            !app.hits.iter().any(|(_, h)| matches!(h, Hit::LpRow { .. } | Hit::LpColumn(_))),
+            "the Command Center takes no clicks under the pane"
+        );
+
+        app.on_key(Key::Escape, &deps).await;
+        draw(&mut app, 200, 40);
+        assert!(app.hits.iter().any(|(_, h)| matches!(h, Hit::LpRow { .. })), "and takes them again once it closes");
+    }
+
+    #[tokio::test]
+    async fn a_command_center_work_item_opens_in_a_pane_over_it_and_esc_returns() {
+        let deps = test_deps();
+        let mut app = lp_app(&[], &["w1", "w2"], Vec::new(), "w2");
+        let cursor = (app.lp_side, app.lp_sel);
+
+        app.on_key(Key::Enter, &deps).await;
+        assert!(matches!(&app.screen, Screen::WiView(v) if v.wi.id == "w2"));
+        assert!(app.lp_pane);
+        assert_eq!(app.active, index_of(Section::Pipelines));
+        let lines = screen_text(&draw(&mut app, 200, 40));
+        assert!(lines.iter().any(|l| l.contains("Needs you")), "the Command Center is still drawn");
+
+        app.on_key(Key::Escape, &deps).await;
+        assert!(matches!(app.screen, Screen::Launchpad));
+        assert_eq!((app.lp_side, app.lp_sel), cursor);
+        assert!(!app.lp_pane);
+    }
+
+    #[tokio::test]
+    async fn a_command_center_pipeline_run_opens_in_a_pane_over_it_and_esc_returns() {
+        let deps = test_deps();
+        let mut app = lp_app(&[], &[], vec![pipe_row("r1", PipelineRunStatus::Succeeded, false)], "r1");
+        let cursor = (app.lp_side, app.lp_sel);
+
+        app.on_key(Key::Enter, &deps).await;
+        assert!(matches!(&app.screen, Screen::Pipeline(v) if v.run.id == "r1"));
+        assert!(app.lp_pane);
+        assert_eq!(app.top_pos(), 0);
+        let buf = draw(&mut app, 200, 40);
+        assert!(screen_text(&buf).iter().any(|l| l.contains("Needs you")), "the Command Center is still drawn");
+        // As wide as a PR's pane: its left border sits 70% of the way in from the right.
+        let pane_x = 200 - 200 * 70 / 100;
+        assert!((0..40).any(|y| buf[(pane_x, y)].symbol() == "┏"), "the pipeline pane is 70% wide too");
+
+        app.on_key(Key::Escape, &deps).await;
+        assert!(matches!(app.screen, Screen::Launchpad));
+        assert_eq!((app.lp_side, app.lp_sel), cursor);
+    }
+
+    /// `p` hands focus back to what's beside a pane: here that's the Command Center.
+    #[tokio::test]
+    async fn p_closes_the_command_center_pane() {
+        let deps = test_deps();
+        let mut app = lp_app(&["1"], &[], Vec::new(), "1");
+        app.on_key(Key::Enter, &deps).await;
+        app.on_key(Key::Char('p'), &deps).await;
+        assert!(matches!(app.screen, Screen::Launchpad));
+        assert!(!app.lp_pane);
+    }
+
+    /// In a PR's pane Tab walks the PR's own tabs, as in a list's pane; for anything else it
+    /// leaves the Command Center for the next tab, and the pane goes with it.
+    #[tokio::test]
+    async fn tab_in_the_command_center_pane() {
+        let deps = test_deps();
+        let mut app = lp_app(&["1"], &["w1"], Vec::new(), "1");
+        app.on_key(Key::Enter, &deps).await;
+        app.on_key(Key::Tab, &deps).await;
+        assert!(matches!(&app.screen, Screen::PrView(v) if v.tab == 1), "Tab moved to the PR's next tab");
+        assert!(app.lp_pane);
+
+        let mut app = lp_app(&["1"], &["w1"], Vec::new(), "w1");
+        app.on_key(Key::Enter, &deps).await;
+        app.on_key(Key::Tab, &deps).await;
+        assert!(matches!(app.screen, Screen::List), "Tab leaves for the next tab");
+        assert_eq!(app.active, app.visible_indices()[0], "the one after the Command Center");
+        assert!(!app.lp_pane);
+    }
+
+    /// Too narrow for the pane, the item opens full-screen as it always did, and Esc returns.
+    #[tokio::test]
+    async fn a_narrow_terminal_opens_a_command_center_item_full_screen() {
+        let deps = test_deps();
+        let mut app = lp_app(&["1"], &[], Vec::new(), "1");
+        app.content_w = PREVIEW_MIN_WIDTH - 1;
+
+        app.on_key(Key::Enter, &deps).await;
+        assert!(matches!(&app.screen, Screen::PrView(v) if v.pr.id == "1"));
+        assert!(!app.lp_pane, "full-screen");
+        app.on_key(Key::Escape, &deps).await;
+        assert!(matches!(app.screen, Screen::Launchpad));
     }
 
     #[tokio::test]
