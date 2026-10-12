@@ -983,6 +983,18 @@ fn mark_selected_idle(line: &mut Line, theme: &Theme) {
     }
 }
 
+/// A row marked for a bulk action: a tinted background and a bright bar in the lead column.
+/// Under the cursor the bar is what's left to say so, since the cursor's own background wins.
+fn mark_bulk(line: &mut Line, theme: &Theme) {
+    let tint = Style::default().bg(theme.mark_bg);
+    for span in &mut line.spans {
+        span.style = span.style.patch(tint);
+    }
+    if let Some(lead) = line.spans.first_mut() {
+        *lead = Span::styled("▌", tint.fg(theme.magenta));
+    }
+}
+
 /// Renders a section as a fixed column header + a scrollable body of rows, with the
 /// selected row highlighted. Enter opens a full-screen view for the row.
 /// `flex` names the column that flexes and the selected row's full text in it: when a pane
@@ -1009,10 +1021,14 @@ fn render_inline_list(
 
     let selected = app.selected().unwrap_or(0);
     let scroll = app.list_scroll;
+    let marked = app.marked_rows();
     let lines: Vec<Line> = rows
         .into_iter()
         .enumerate()
         .map(|(i, mut row)| {
+            if marked.get(i).copied().unwrap_or(false) {
+                mark_bulk(&mut row, &app.theme);
+            }
             if i == selected {
                 if let (Some(cut), Some((col, text))) = (LIST_CUT.with(|c| c.get()), flex.as_ref()) {
                     scroll_cut_cell(&mut row, *col, text, inner.x, cut, app.anim);
@@ -1284,6 +1300,15 @@ fn with_sort(mut base: String, app: &App, section: usize) -> String {
     base
 }
 
+/// Appends "· 3 selected" while rows are marked for a bulk action.
+fn with_marks(mut base: String, app: &App) -> String {
+    let marked = app.marked_count();
+    if marked > 0 {
+        base.push_str(&format!(" · {marked} selected"));
+    }
+    base
+}
+
 /// The repository column: just the trailing name, since the owner/workspace repeats on every row.
 fn short_repo(repo: Option<&str>) -> String {
     repo.map(|r| r.rsplit('/').next().unwrap_or(r).to_string()).unwrap_or_default()
@@ -1417,7 +1442,7 @@ fn render_prs(frame: &mut Frame, area: Rect, app: &mut App) {
     let theme = &app.theme;
     let idxs = app.filtered_pr_indices();
     let base = with_scope(format!("Pull Requests · {}", crate::app::pr_status_summary(&app.pr_shown_statuses)), app, 0);
-    let base = with_sort(base, app, 0);
+    let base = with_marks(with_sort(base, app, 0), app);
     let title = list_title(base, &app.filters[0]);
     if idxs.is_empty() {
         let msg = if !app.filters[0].is_empty() {
@@ -1498,7 +1523,7 @@ fn render_wis(frame: &mut Frame, area: Rect, app: &mut App) {
     } else {
         format!("Work Items · mine · {hidden_in_view} state(s) hidden")
     };
-    let title = list_title(with_sort(with_scope(base, app, 1), app, 1), &app.filters[1]);
+    let title = list_title(with_marks(with_sort(with_scope(base, app, 1), app, 1), app), &app.filters[1]);
     if idxs.is_empty() {
         let msg = if !app.filters[1].is_empty() {
             "No matches. Esc clears the filter.".to_string()
@@ -2644,6 +2669,10 @@ fn render_health(frame: &mut Frame, area: Rect, app: &App) {
 /// footer leaves out.
 const SEARCH_KEY: &str = "Ctrl-K";
 
+/// The footer hint for acting on the rows marked with Space. It gets its own chip colour,
+/// so that a selection being live is hard to miss.
+const BULK_HINT: (&str, &str) = ("b", "bulk action");
+
 /// Context-aware key glossary for the active tab (azdo-style bar along the bottom). Leads with
 /// the Ctrl-K palette ("search anywhere") and the dashboard shortcut (when its server runs),
 /// except while the wizard, an overlay, or the quick-filter is capturing input.
@@ -2860,6 +2889,16 @@ fn base_footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
     // Moving, tab walking, focusing the preview, saved views, repos and find are left to `?`
     // help and the Ctrl-K palette, so the footer keeps the section's own actions.
     let mut keys = Vec::new();
+    // One marked row is still just a row; from the second it is a selection to act on — where
+    // there is something to do with one. Esc lets go of the marks before it leaves the list,
+    // and says so up here, where a narrow footer still shows it.
+    let marked = app.marked_count();
+    if marked > 1 && app.active == 1 {
+        keys.push(BULK_HINT);
+    }
+    if marked > 0 {
+        keys.push(("Esc/q", "clear selection"));
+    }
     // Enter's hint only where it opens the row: focusing the preview and expanding or drilling
     // into a pipeline are left out like the others.
     let preview = app.preview_shown() && app.preview.is_some();
@@ -2881,8 +2920,10 @@ fn base_footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
         ("r", "refresh"),
         ("t", "theme"),
         ("?", "help"),
-        ("Esc/q", "back"),
     ]);
+    if marked == 0 {
+        keys.push(("Esc/q", "back"));
+    }
     keys
 }
 
@@ -2980,9 +3021,23 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         && app.wizard.is_none();
     for (key, label) in footer_keys(app) {
         let search = key == SEARCH_KEY;
-        let chip = if search || (item_open && is_write_action(key, label)) { theme.yellow } else { theme.accent };
+        let bulk = (key, label) == BULK_HINT;
+        let chip = if bulk {
+            theme.magenta
+        } else if search || (item_open && is_write_action(key, label)) {
+            theme.yellow
+        } else {
+            theme.accent
+        };
+        let text = if bulk {
+            theme.magenta
+        } else if search {
+            theme.yellow
+        } else {
+            theme.fg
+        };
         spans.push(Span::styled(format!(" {key} "), bar.fg(theme.bg).bg(chip).add_modifier(Modifier::BOLD)));
-        spans.push(Span::styled(format!(" {label}  "), bar.fg(if search { theme.yellow } else { theme.fg })));
+        spans.push(Span::styled(format!(" {label}  "), bar.fg(text)));
     }
 
     // Right side: a transient toast, else the standing status line. "Refreshing…" normally
@@ -5637,6 +5692,8 @@ pub(crate) fn help_sections() -> Vec<(&'static str, Vec<(&'static str, &'static 
             vec![
                 ("Enter", "Open the item (actions live there)"),
                 ("f", "Choose which states to show"),
+                ("Space", "Select the row (again to unselect; Esc clears)"),
+                ("b", "Bulk action on the selected rows: set state"),
             ],
         ),
         (
@@ -9693,5 +9750,78 @@ mod tests {
         for text in ["Resolve / reopen that thread", "ready for review", "Close without merging", "Request a reviewer"] {
             assert!(out.contains(text), "help shows '{text}'");
         }
+    }
+
+    fn wi_list(ids: &[&str]) -> App {
+        let mut app = App::new("slate");
+        app.active = 1;
+        app.screen = Screen::List;
+        app.wis = ids
+            .iter()
+            .map(|id| crate::app::WiRow {
+                connection_id: "c".into(),
+                connection: "Linear".into(),
+                provider: ProviderType::Linear,
+                wi: WorkItem {
+                    repository: None,
+                    id: id.to_string(),
+                    identifier: Some(id.to_string()),
+                    title: format!("item {id}"),
+                    description: None,
+                    state: "Todo".into(),
+                    state_category: WorkItemStateCategory::Backlog,
+                    work_item_type: None,
+                    assignee: None,
+                    created_at: None,
+                    updated_at: None,
+                    url: None,
+                },
+            })
+            .collect();
+        app.wi_state.select(Some(0));
+        app
+    }
+
+    #[test]
+    fn the_bulk_hint_appears_from_the_second_marked_row_in_its_own_colour() {
+        let mut app = wi_list(&["A-1", "A-2", "A-3"]);
+        assert!(!base_footer_keys(&app).contains(&BULK_HINT));
+
+        app.toggle_mark();
+        assert!(!base_footer_keys(&app).contains(&BULK_HINT), "one row isn't a selection yet");
+        assert_eq!(base_footer_keys(&app).first(), Some(&("Esc/q", "clear selection")));
+        assert!(!base_footer_keys(&app).contains(&("Esc/q", "back")), "Esc says one thing at a time");
+        assert!(render_to_string(&mut app, 140, 20).contains("1 selected"));
+
+        app.wi_state.select(Some(2));
+        app.toggle_mark();
+        assert_eq!(base_footer_keys(&app).first(), Some(&BULK_HINT), "leads, so a narrow footer keeps it");
+
+        // Pull requests can be marked but have nothing to do in bulk yet: no hint to press.
+        app.active = 0;
+        assert!(!base_footer_keys(&app).contains(&BULK_HINT));
+        app.active = 1;
+
+        let mut terminal = Terminal::new(TestBackend::new(140, 20)).unwrap();
+        terminal.draw(|f| render(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let rows: Vec<String> = (0..20).map(|y| (0..140).map(|x| buf[(x, y)].symbol()).collect()).collect();
+        assert!(rows.iter().any(|r| r.contains("2 selected")), "the title counts them");
+
+        // The chip: magenta, where every other list key is the accent colour.
+        let footer = rows.iter().position(|r| r.contains("bulk action")).expect("the footer hint");
+        let at = rows[footer].find(" b ").expect("the chip");
+        let x = rows[footer][..at].chars().count() as u16 + 1;
+        assert_eq!(buf[(x, footer as u16)].bg, app.theme.magenta);
+
+        // The rows: marked ones carry the bar and the tint; the cursor's own background wins.
+        let row_of = |id: &str| rows.iter().position(|r| r.contains(&format!("item {id}"))).unwrap() as u16;
+        let title_x = |id: &str| rows[row_of(id) as usize].find("item").map(|b| rows[row_of(id) as usize][..b].chars().count() as u16).unwrap();
+        assert_eq!(buf[(1, row_of("A-1"))].symbol(), "▌");
+        assert_eq!(buf[(title_x("A-1"), row_of("A-1"))].bg, app.theme.mark_bg);
+        assert_ne!(buf[(1, row_of("A-2"))].symbol(), "▌");
+        assert_ne!(buf[(title_x("A-2"), row_of("A-2"))].bg, app.theme.mark_bg);
+        assert_eq!(buf[(1, row_of("A-3"))].symbol(), "▌", "marked, and under the cursor");
+        assert_eq!(buf[(title_x("A-3"), row_of("A-3"))].bg, app.theme.sel_bg);
     }
 }

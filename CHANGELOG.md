@@ -9,6 +9,20 @@ Adding a release: one `## <version> — <date>` section, a line per user-visible
 and the pull request each one came from. `git log v<previous>..HEAD --merges` lists the
 candidates.
 
+## 1.8.3 — 2026-10-12
+
+Added
+
+- **Bulk actions on work items.** In the terminal UI, Space selects the row under the cursor
+  in the Work Items list (Space again unselects it; Esc clears the selection). From the second
+  selected row the footer shows a `b bulk action` hint in its own colour: `b` opens a menu,
+  and *Set state…* moves every selected item to the state you pick. The rows change at once
+  and the provider is asked in the background, a few items at a time; an item it refuses goes
+  back on its own. The states offered are the ones the selected items' providers say they
+  can all take, and rows a filter is hiding are left alone. Pull request rows can be selected too, but have no bulk actions
+  yet; Pipelines keep Space for expanding groups.
+  ([#236](https://github.com/magna-nz/forgetop/pull/236))
+
 ## 1.8.2 — 2026-10-12
 
 Changed
