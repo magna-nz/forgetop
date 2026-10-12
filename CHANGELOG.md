@@ -21,6 +21,7 @@ Added
   back on its own. The states offered are the ones the selected items' providers say they
   can all take, and rows a filter is hiding are left alone. Pull request rows can be selected too, but have no bulk actions
   yet; Pipelines keep Space for expanding groups.
+  ([#236](https://github.com/magna-nz/forgetop/pull/236))
 
 ## 1.8.2 — 2026-10-12
 
