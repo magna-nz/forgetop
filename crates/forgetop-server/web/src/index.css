@@ -361,7 +361,9 @@ kbd.ft-kbd {
   line-height: 1.2;
 }
 
-/* Right-hand detail pane: a column beside the content, never a modal. Below 900px it covers. */
+/* Right-hand detail pane: a column beside the content, never a modal. Widths are in vw, never a
+   percentage of the slot: the content column is a size container, so the slot has no width of its
+   own to resolve against. Below 900px it covers. */
 .ft-pane {
   position: relative;
   display: flex;
@@ -372,13 +374,13 @@ kbd.ft-kbd {
   border-left: 1px solid var(--border);
 }
 .ft-pane-md {
-  width: min(100%, 520px);
+  width: min(520px, 40vw);
 }
 .ft-pane-lg {
-  width: min(100%, 640px);
+  width: min(640px, 48vw);
 }
 .ft-pane-xl {
-  width: min(100%, 820px);
+  width: min(820px, 58vw);
 }
 @media (max-width: 900px) {
   .ft-pane {

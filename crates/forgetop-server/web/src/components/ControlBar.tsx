@@ -1,5 +1,4 @@
 import { useMemo, useState, type CSSProperties, type ReactNode } from "react";
-import { relativeTime } from "../format";
 import { Icon } from "./icons";
 import { Select } from "./ui";
 
@@ -181,9 +180,4 @@ export function ToggleRow({
   );
 }
 
-/** `relativeTime` as an age column: `3h`, `2d`, `now` — a number, not a sentence. (A formatter
- *  that belongs in format.ts; here until it moves.) */
-export function shortAge(iso?: string | null): string {
-  const t = relativeTime(iso);
-  return t === "just now" ? "now" : t.replace(/ ago$/, "");
-}
+export { shortAge } from "../format";

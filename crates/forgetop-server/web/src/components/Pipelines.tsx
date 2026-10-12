@@ -1,6 +1,6 @@
 import { useMemo, useState, type MouseEvent } from "react";
 import { usePipelines } from "../api";
-import { fmtSecs, pipeMeta, toTime } from "../format";
+import { fmtSecs, pipeMeta, sameRef, toTime } from "../format";
 import type { PipelineRunStatus, PipeRow } from "../types";
 import { groupPipelines, listStrip, parseGroupMode, pipeDefinitionName, rowGates, rowShownStatus } from "../pipeline/grouping";
 import type { GroupMode, PipeGroup } from "../pipeline/grouping";
@@ -9,7 +9,7 @@ import { Icon } from "./icons";
 import { Avatar, Button, Chip, List, Segmented, Skeleton, StateCard, StatusGlyph } from "./ui";
 import { ErrorState } from "./ErrorState";
 import { shortAge, ToggleRow, useListView, type SortOption } from "./ControlBar";
-import { usePipelineOpener } from "./PipelineDetail";
+import { useCurrentPipeline, usePipelineOpener } from "./PipelineDetail";
 import { useRepoScope } from "./RepoScope";
 import { usePipelineScope } from "./PipelineScope";
 
@@ -255,6 +255,8 @@ function PipeRunRow({ row, now, mode }: { row: PipeRow; now: Date; mode?: GroupM
   const secs = runSecs(run, now);
   const gate = row.approvals.find((a) => a.can_respond);
   const openRun = usePipelineOpener();
+  const current = useCurrentPipeline();
+  const selected = sameRef(current, { conn: row.connection_id, repo: run.repository, runId: run.id });
   const open = () => openRun({ conn: row.connection_id, repo: run.repository, runId: run.id });
   const stop = (fn: () => void) => (e: MouseEvent) => {
     e.stopPropagation();
@@ -264,7 +266,7 @@ function PipeRunRow({ row, now, mode }: { row: PipeRow; now: Date; mode?: GroupM
   return (
     // The whole row is a click target for the mouse; the inner button is the keyboard and
     // screen-reader target. They are siblings of the Approve button, never its parent.
-    <div className="ft-row" style={{ minHeight: child ? 34 : 36, paddingLeft: child ? 44 : 12 }} onClick={open}>
+    <div className="ft-row" data-selected={selected || undefined} style={{ minHeight: child ? 34 : 36, paddingLeft: child ? 44 : 12 }} onClick={open}>
       <button
         type="button"
         onClick={stop(open)}

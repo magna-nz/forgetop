@@ -1,11 +1,11 @@
 import { useState } from "react";
 import { usePrDecoration, usePullRequests, type PrView } from "../api";
-import { prSignalMeta, prState, prStatusMeta, toTime } from "../format";
+import { prSignalMeta, prState, prStatusMeta, repoShort, sameRef, toTime } from "../format";
 import type { PrRow } from "../types";
 import { Icon } from "./icons";
 import { Chip, List, Row, Skeleton, StateCard, StatusGlyph, Tabs } from "./ui";
 import { ErrorState } from "./ErrorState";
-import { usePrOpener } from "./PrDetail";
+import { useCurrentPr, usePrOpener } from "./PrDetail";
 import { shortAge, useListView } from "./ControlBar";
 import { useRepoScope } from "./RepoScope";
 
@@ -106,12 +106,6 @@ export function PullRequests() {
   );
 }
 
-/** The last segment of a connection-relative repository (`acme/pay` → `pay`), for display only. */
-function repoShort(repo?: string | null): string {
-  if (!repo) return "";
-  return repo.slice(repo.lastIndexOf("/") + 1);
-}
-
 /** One pull request: glyph · title · identifier · signal · age, and — unless `dense` — a second
  *  line with the author and the size of the change. */
 function PrListRow({ row, dense = false }: { row: PrRow; dense?: boolean }) {
@@ -137,8 +131,9 @@ function PrListRow({ row, dense = false }: { row: PrRow; dense?: boolean }) {
   const repo = repoShort(pr.repository);
   const ident = [repo, pr.number != null ? `#${pr.number}` : ""].filter(Boolean).join(" ");
   const open = usePrOpener();
+  const current = useCurrentPr();
   return (
-    <Row dense={dense} onClick={() => open({ conn: row.connection_id, repo: pr.repository, id: pr.id })}>
+    <Row dense={dense} selected={sameRef(current, { conn: row.connection_id, repo: pr.repository, id: pr.id })} onClick={() => open({ conn: row.connection_id, repo: pr.repository, id: pr.id })}>
       <StatusGlyph glyph={status.glyph} color={status.color} title={status.label} />
       <span className="flex-1 min-w-0 flex flex-col">
         <span className="flex items-center gap-2 min-w-0">

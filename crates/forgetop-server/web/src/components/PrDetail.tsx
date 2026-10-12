@@ -14,14 +14,19 @@ import { Icon } from "./icons";
 
 const PrOpenerCtx = createContext<(ref: PrRef) => void>(() => {});
 export const usePrOpener = () => useContext(PrOpenerCtx);
+/** The pull request open in the pane, so a list can mark its row as selected. */
+const PrCurrentCtx = createContext<PrRef | null>(null);
+export const useCurrentPr = () => useContext(PrCurrentCtx);
 
 export function PrDetailProvider({ children }: { children: ReactNode }) {
   const [ref, setRef] = useState<PrRef | null>(null);
   const open = useCallback((r: PrRef) => setRef(r), []);
   return (
     <PrOpenerCtx.Provider value={open}>
-      {children}
-      {ref && <PrDetailPanel prRef={ref} onClose={() => setRef(null)} />}
+      <PrCurrentCtx.Provider value={ref}>
+        {children}
+        {ref && <PrDetailPanel prRef={ref} onClose={() => setRef(null)} />}
+      </PrCurrentCtx.Provider>
     </PrOpenerCtx.Provider>
   );
 }

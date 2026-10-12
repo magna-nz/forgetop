@@ -95,7 +95,7 @@ export default function App() {
                     onToggleSidebar={() => setSidebarOpen((o) => !o)}
                   />
                   <div className="flex flex-1 min-h-0">
-                    <div className="flex-1 min-w-0 overflow-auto">
+                    <div className="flex-1 min-w-0 overflow-auto @container">
                       {/* key forces a remount per section so the CSS fade replays. */}
                       <div key={section} className="fade-in">
                         <View />

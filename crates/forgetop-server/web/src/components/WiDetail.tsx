@@ -12,14 +12,19 @@ import { Icon } from "./icons";
 
 const WiOpenerCtx = createContext<(ref: WiRef) => void>(() => {});
 export const useWiOpener = () => useContext(WiOpenerCtx);
+/** The work item open in the pane, so a list can mark its row as selected. */
+const WiCurrentCtx = createContext<WiRef | null>(null);
+export const useCurrentWi = () => useContext(WiCurrentCtx);
 
 export function WiDetailProvider({ children }: { children: ReactNode }) {
   const [ref, setRef] = useState<WiRef | null>(null);
   const open = useCallback((r: WiRef) => setRef(r), []);
   return (
     <WiOpenerCtx.Provider value={open}>
-      {children}
-      <AnimatePresence>{ref && <WiDetailPanel wiRef={ref} onClose={() => setRef(null)} />}</AnimatePresence>
+      <WiCurrentCtx.Provider value={ref}>
+        {children}
+        <AnimatePresence>{ref && <WiDetailPanel wiRef={ref} onClose={() => setRef(null)} />}</AnimatePresence>
+      </WiCurrentCtx.Provider>
     </WiOpenerCtx.Provider>
   );
 }

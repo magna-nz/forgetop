@@ -367,6 +367,27 @@ export function timelineMeta(kind: TimelineEventKind): { icon: string; glyph: Gl
   }
 }
 
+/** The last segment of a connection-relative repository (`acme/pay` → `pay`), for display. */
+export function repoShort(repo?: string | null): string {
+  if (!repo) return "";
+  const i = repo.lastIndexOf("/");
+  return i >= 0 ? repo.slice(i + 1) : repo;
+}
+
+/** `relativeTime` squeezed for a narrow column: "12h ago" → "12h", "just now" → "now". */
+export function shortAge(iso?: string | null): string {
+  const t = relativeTime(iso);
+  if (!t) return "";
+  if (t === "just now") return "now";
+  return t.replace(/ ago$/, "");
+}
+
+/** Whether two item references name the same thing: same connection, repository and id. */
+export function sameRef(a: { conn: string; repo?: string | null; id?: string; runId?: string } | null | undefined, b: { conn: string; repo?: string | null; id?: string; runId?: string }): boolean {
+  if (!a) return false;
+  return a.conn === b.conn && (a.repo ?? "") === (b.repo ?? "") && (a.id ?? a.runId) === (b.id ?? b.runId);
+}
+
 export function initials(name: string): string {
   const parts = name.trim().split(/\s+/).filter(Boolean);
   if (parts.length === 0) return "?";

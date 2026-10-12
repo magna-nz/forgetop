@@ -1,12 +1,12 @@
 import { useMemo, useState } from "react";
 import { useWorkItems } from "../api";
-import { toTime, wiStateColor, wiStateGlyph } from "../format";
+import { sameRef, toTime, wiStateColor, wiStateGlyph } from "../format";
 import type { WiRow, WorkItemParent } from "../types";
 import { Icon } from "./icons";
 import { Avatar, List, Row, Select, Skeleton, StateCard, StatusGlyph } from "./ui";
 import { ErrorState } from "./ErrorState";
 import { shortAge, ToggleRow, useListView } from "./ControlBar";
-import { useWiOpener } from "./WiDetail";
+import { useCurrentWi, useWiOpener } from "./WiDetail";
 
 const GROUP_KEY = "forgetop:work-items:group";
 type GroupMode = "off" | "parent";
@@ -174,9 +174,10 @@ function WiGroupSection({ group, open, onToggle }: { group: WiGroup; open: boole
 function WiListRow({ row, indent = false }: { row: WiRow; indent?: boolean }) {
   const wi = row.work_item;
   const open = useWiOpener();
+  const current = useCurrentWi();
   const blocked = isBlocked(row);
   return (
-    <Row onClick={() => open({ conn: row.connection_id, repo: wi.repository, id: wi.id })} className={indent ? "pl-9!" : undefined}>
+    <Row selected={sameRef(current, { conn: row.connection_id, repo: wi.repository, id: wi.id })} onClick={() => open({ conn: row.connection_id, repo: wi.repository, id: wi.id })} className={indent ? "pl-9!" : undefined}>
       <StatusGlyph glyph={wiStateGlyph(wi.state, wi.state_category)} color={wiStateColor(wi.state, wi.state_category)} title={wi.state} />
       <span className="mono shrink-0 truncate" style={{ width: 76, color: "var(--fg3)" }}>
         {wi.identifier}

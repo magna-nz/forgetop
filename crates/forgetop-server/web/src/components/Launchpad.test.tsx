@@ -10,9 +10,9 @@ const { navigate, openPr, openWi } = vi.hoisted(() => ({
   openWi: vi.fn(),
 }));
 vi.mock("../nav", () => ({ useNavigateSection: () => navigate }));
-vi.mock("./PrDetail", () => ({ usePrOpener: () => openPr }));
-vi.mock("./WiDetail", () => ({ useWiOpener: () => openWi }));
-vi.mock("./PipelineDetail", () => ({ usePipelineOpener: () => vi.fn() }));
+vi.mock("./PrDetail", () => ({ usePrOpener: () => openPr, useCurrentPr: () => null }));
+vi.mock("./WiDetail", () => ({ useWiOpener: () => openWi, useCurrentWi: () => null }));
+vi.mock("./PipelineDetail", () => ({ usePipelineOpener: () => vi.fn(), useCurrentPipeline: () => null }));
 
 // Imported after the mocks so the component picks them up.
 import { Launchpad } from "./Launchpad";

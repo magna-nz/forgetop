@@ -7,7 +7,9 @@ import {
   prSignalMeta,
   prState,
   prStatusMeta,
-  relativeTime,
+  repoShort,
+  sameRef,
+  shortAge,
   wiStateColor,
   wiStateGlyph,
   type GlyphName,
@@ -16,9 +18,9 @@ import type { LaunchpadMore, LaunchpadRow, SectionId } from "../types";
 import { Button, GroupHeading, Row, SectionHeading, Skeleton, StateCard, StatusGlyph } from "./ui";
 import { Icon } from "./icons";
 import { ErrorState } from "./ErrorState";
-import { usePrOpener } from "./PrDetail";
-import { useWiOpener } from "./WiDetail";
-import { usePipelineOpener } from "./PipelineDetail";
+import { useCurrentPr, usePrOpener } from "./PrDetail";
+import { useCurrentWi, useWiOpener } from "./WiDetail";
+import { useCurrentPipeline, usePipelineOpener } from "./PipelineDetail";
 import { useNavigateSection } from "../nav";
 
 export function Launchpad() {
@@ -32,7 +34,7 @@ export function Launchpad() {
   const right = groupByBucket(data.rows.filter((r) => r.column === 1));
 
   return (
-    <div className="grid lg:grid-cols-2 gap-x-11 gap-y-8 max-w-[1280px] mx-auto px-7 py-5">
+    <div className="grid @[900px]:grid-cols-2 gap-x-11 gap-y-8 max-w-[1280px] mx-auto px-7 py-5">
       <Column heading="Needs you" groups={left} emptyHint="Nothing waiting on you." more={data.more} />
       <Column heading="Your work" groups={right} emptyHint="No open work." more={data.more} />
     </div>
@@ -173,6 +175,16 @@ function ItemRow({ row, bucket }: { row: LaunchpadRow; bucket: string }) {
   const openPr = usePrOpener();
   const openWi = useWiOpener();
   const openPipe = usePipelineOpener();
+  const currentPr = useCurrentPr();
+  const currentWi = useCurrentWi();
+  const currentPipe = useCurrentPipeline();
+  // The row whose item is open in the pane carries the selected wash.
+  const selected =
+    row.kind === "pr"
+      ? sameRef(currentPr, { conn: row.connection_id, repo: row.pull_request.repository, id: row.pull_request.id })
+      : row.kind === "wi"
+        ? sameRef(currentWi, { conn: row.connection_id, repo: row.work_item.repository, id: row.work_item.id })
+        : sameRef(currentPipe, { conn: row.connection_id, repo: row.run.repository, runId: row.run.id });
   // Every row kind opens its in-app detail panel, matching the list views.
   const onClick =
     row.kind === "pr"
@@ -190,7 +202,7 @@ function ItemRow({ row, bucket }: { row: LaunchpadRow; bucket: string }) {
   ) : null;
 
   return (
-    <Row onClick={onClick}>
+    <Row onClick={onClick} selected={selected}>
       <StatusGlyph glyph={v.glyph} color={v.color} spin={v.spin} title={v.glyphTitle} />
       {v.keyFirst && ident}
       <span className="flex-1 min-w-0 truncate">
@@ -275,19 +287,6 @@ function view(row: LaunchpadRow, bucket: string): RowView {
 const capitalize = (s: string): string => (s.length ? s[0].toUpperCase() + s.slice(1) : s);
 
 /** The repository's last segment, for display only (`acme/payments` → `payments`). */
-function repoShort(repo?: string | null): string {
-  if (!repo) return "";
-  const i = repo.lastIndexOf("/");
-  return i >= 0 ? repo.slice(i + 1) : repo;
-}
-
-/** `12h ago` → `12h`, sized for the 34px age column. */
-function shortAge(iso?: string | null): string {
-  const t = relativeTime(iso);
-  if (t === "just now") return "now";
-  return t.replace(/ ago$/, "");
-}
-
 /// A row's identity within its connection. The repository is part of it: one connection now
 /// spans an account, so `#7` exists in more than one repository and `connection_id:id` alone
 /// stops being unique.

@@ -63,17 +63,22 @@ const Sep = () => <span style={{ color: "var(--fg3)" }}>·</span>;
 
 const PipeOpenerCtx = createContext<(ref: PipeRef) => void>(() => {});
 export const usePipelineOpener = () => useContext(PipeOpenerCtx);
+/** The run open in the pane, so a list can mark its row as selected. */
+const PipeCurrentCtx = createContext<PipeRef | null>(null);
+export const useCurrentPipeline = () => useContext(PipeCurrentCtx);
 
 export function PipelineDetailProvider({ children }: { children: ReactNode }) {
   const [ref, setRef] = useState<PipeRef | null>(null);
   const open = useCallback((r: PipeRef) => setRef(r), []);
   return (
     <PipeOpenerCtx.Provider value={open}>
+      <PipeCurrentCtx.Provider value={ref}>
       {children}
       {/* Keyed by run: another run gets a fresh panel, so no frame shows the last run's state. */}
       <AnimatePresence>
         {ref && <PipelineDetailPanel key={`${ref.conn}|${ref.repo ?? ""}|${ref.runId}`} pipeRef={ref} onClose={() => setRef(null)} />}
       </AnimatePresence>
+      </PipeCurrentCtx.Provider>
     </PipeOpenerCtx.Provider>
   );
 }
