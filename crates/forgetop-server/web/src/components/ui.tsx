@@ -2,6 +2,8 @@ import {
   createContext,
   useContext,
   useEffect,
+  useRef,
+  useState,
   type ButtonHTMLAttributes,
   type CSSProperties,
   type ReactNode,
@@ -360,6 +362,131 @@ export function claimPane(kind: string): boolean {
   return true;
 }
 
+/** The pane's narrowest useful width, and the least the content column keeps beside it. */
+const PANE_MIN = 360;
+const CONTENT_MIN = 320;
+const PANE_STEP = 24;
+const paneWidthKey = (size: string) => `forgetop:pane:${size}`;
+
+/** The pane's right edge and the widest it may go: the content column beside it (whatever is
+ *  left of the sidebar) keeps `CONTENT_MIN`. Without layout (tests) the viewport stands in. */
+function paneBounds(pane: HTMLElement | null): { right: number; max: number } {
+  const rect = pane?.getBoundingClientRect();
+  const right = rect && rect.right > 0 ? rect.right : window.innerWidth;
+  // pane → slot → the row holding the content column and the slot.
+  const row = pane?.parentElement?.parentElement;
+  const left = row?.getBoundingClientRect().left ?? 0;
+  return { right, max: Math.max(PANE_MIN, right - left - CONTENT_MIN) };
+}
+
+function clampPaneWidth(px: number, max: number): number {
+  return Math.round(Math.min(max, Math.max(PANE_MIN, px)));
+}
+
+function storedPaneWidth(size: string): number | null {
+  try {
+    const v = Number(localStorage.getItem(paneWidthKey(size)));
+    return Number.isFinite(v) && v > 0 ? v : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The pane's width when the user has dragged it (else null for the size's CSS default), and
+ *  the grip on its left edge that sets it: drag, ←/→ by 24px, double-click to reset. The width
+ *  is remembered per pane size, so a wider PR pane does not widen the work-item one. */
+function usePaneWidth(size: "md" | "lg" | "xl") {
+  const [px, setPx] = useState<number | null>(() => storedPaneWidth(size));
+  const [dragging, setDragging] = useState(false);
+  const paneRef = useRef<HTMLElement | null>(null);
+  useEffect(() => setPx(storedPaneWidth(size)), [size]);
+
+  const commit = (next: number | null) => {
+    setPx(next);
+    try {
+      if (next == null) localStorage.removeItem(paneWidthKey(size));
+      else localStorage.setItem(paneWidthKey(size), String(next));
+    } catch {
+      /* per-viewer convenience only */
+    }
+  };
+  const current = () => px ?? paneRef.current?.getBoundingClientRect().width ?? PANE_MIN;
+
+  const onPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (e.button > 0) return; // secondary buttons; a synthetic event without one still drags
+    e.preventDefault();
+    // The pane hugs the right edge, so its width is the distance from the pointer to it.
+    const { right, max } = paneBounds(paneRef.current);
+    const target = e.currentTarget;
+    target.setPointerCapture?.(e.pointerId);
+    setDragging(true);
+    let last = current();
+    const move = (ev: PointerEvent) => {
+      if (!Number.isFinite(ev.clientX)) return;
+      last = clampPaneWidth(right - ev.clientX, max);
+      setPx(last);
+    };
+    const up = () => {
+      target.removeEventListener("pointermove", move);
+      target.removeEventListener("pointerup", up);
+      target.removeEventListener("pointercancel", up);
+      setDragging(false);
+      commit(last);
+    };
+    target.addEventListener("pointermove", move);
+    target.addEventListener("pointerup", up);
+    target.addEventListener("pointercancel", up);
+  };
+  // The pane hugs the right edge, so ← expands it and → shrinks it.
+  const resizeKey = (key: string): boolean => {
+    const { max } = paneBounds(paneRef.current);
+    if (key === "ArrowLeft") commit(clampPaneWidth(current() + PANE_STEP, max));
+    else if (key === "ArrowRight") commit(clampPaneWidth(current() - PANE_STEP, max));
+    else if (key === "Home") commit(max);
+    else if (key === "End") commit(PANE_MIN);
+    else return false;
+    return true;
+  };
+  const onKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    if (resizeKey(e.key)) e.preventDefault();
+  };
+  // ←/→ resize the open pane from anywhere on the page that is not a text field or a control
+  // with its own arrow keys (tabs, menus, lists), so the footer hint is true wherever focus is.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.defaultPrevented || e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return;
+      if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+      const t = e.target as HTMLElement | null;
+      if (t && (t.closest("input, textarea, select, [contenteditable=''], [contenteditable='true'], [role='tablist'], [role='listbox'], [role='menu'], [role='separator']"))) return;
+      if (resizeKey(e.key)) e.preventDefault();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [px, size]);
+
+  const grip = (
+    <div
+      ref={(el) => {
+        paneRef.current = (el?.parentElement as HTMLElement | null) ?? null;
+      }}
+      className="ft-pane-grip"
+      role="separator"
+      aria-orientation="vertical"
+      aria-label="Resize pane"
+      aria-valuemin={PANE_MIN}
+      aria-valuenow={px ?? undefined}
+      tabIndex={0}
+      title="Drag to resize · double-click to reset"
+      data-dragging={dragging || undefined}
+      onPointerDown={onPointerDown}
+      onKeyDown={onKeyDown}
+      onDoubleClick={() => commit(null)}
+    />
+  );
+  return { px, grip };
+}
+
 /** The right-hand detail pane, beside the content (never a modal). Esc and ✕ close it. `header`
  *  is the title block (see `PaneHeader`), `footer` the action bar. */
 export function SlideOver({
@@ -387,19 +514,22 @@ export function SlideOver({
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
+  const { px, grip } = usePaneWidth(size);
 
   const pane = (
-    <aside className={`ft-pane ft-pane-${size} fade-in`} role="region" aria-label={label}>
+    <aside className={`ft-pane ft-pane-${size} fade-in`} role="region" aria-label={label} style={px != null ? { width: px } : undefined}>
+      {grip}
       <div className="flex items-start gap-3 px-5 pt-4 pb-3 shrink-0" style={{ borderBottom: "1px solid var(--border)" }}>
         <div className="flex-1 min-w-0">{header}</div>
         <IconButton icon="x" label="Close" title="Close (Esc)" onClick={onClose} className="-mr-2 -mt-1" />
       </div>
       <div className="flex-1 overflow-auto min-h-0">{children}</div>
-      {footer && (
-        <div className="flex items-center gap-2 px-5 py-2.5 shrink-0" style={{ borderTop: "1px solid var(--border)", background: "var(--panel)" }}>
-          {footer}
-        </div>
-      )}
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1.5 px-5 py-2.5 shrink-0" style={{ borderTop: "1px solid var(--border)", background: "var(--panel)" }}>
+        <span className="inline-flex max-[900px]:hidden items-center gap-1.5 text-[12px] shrink-0 mr-2" style={{ color: "var(--fg3)" }} aria-hidden="true">
+          <Kbd>←</Kbd> expand <Kbd>→</Kbd> shrink
+        </span>
+        {footer}
+      </div>
     </aside>
   );
   return slot ? createPortal(pane, slot) : pane;

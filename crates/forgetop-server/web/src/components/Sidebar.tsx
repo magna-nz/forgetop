@@ -73,9 +73,21 @@ export function Sidebar({
     >
       <div className="flex flex-col w-60 h-full px-2.5 pt-3.5 pb-3" style={{ background: "var(--panel)" }}>
         <div className="flex items-center gap-2 px-2.5 pb-3.5">
-          <svg width="18" height="18" viewBox="0 0 18 18" aria-hidden="true">
-            <path d="M3 15 9 3l6 12H3z" fill="none" stroke="var(--accent)" strokeWidth="1.8" strokeLinejoin="round" />
-            <path d="M6.6 15 9 10l2.4 5" fill="none" stroke="var(--accent)" strokeWidth="1.8" strokeLinejoin="round" />
+          {/* The README mark: four forges linked to one core (docs/forgetop-mark.svg). */}
+          <svg width="20" height="20" viewBox="0 0 256 256" fill="none" aria-hidden="true" data-icon="forgetop-mark">
+            <g stroke="#8A79E0" strokeWidth="14" strokeLinecap="round">
+              <path d="M128 56V88" />
+              <path d="M200 128H168" />
+              <path d="M128 200V168" />
+              <path d="M56 128H88" />
+            </g>
+            <g fill="#8A79E0">
+              <circle cx="128" cy="36" r="20" />
+              <circle cx="220" cy="128" r="20" />
+              <circle cx="128" cy="220" r="20" />
+              <circle cx="36" cy="128" r="20" />
+            </g>
+            <rect x="88" y="88" width="80" height="80" rx="20" fill="#6C5BD4" />
           </svg>
           <span className="font-semibold text-[14px]" style={{ letterSpacing: "-0.01em" }}>
             forgetop
