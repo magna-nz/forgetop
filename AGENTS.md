@@ -118,7 +118,8 @@ whole workspace. So a repository is a **per-call address**, never connection ide
 - **A work item's `parent` is for grouping, never for fetching.** `WorkItem.parent`
   (`WorkItemParent { kind, id, title, url }`) is what the item sits under, in the forge's own
   word for it: a GitHub/GitLab milestone (GitLab falls back to the epic), a Jira `parent`, a
-  Linear milestone (else project), an Azure `System.Parent` named by one extra batch read. Both
+  Linear milestone (else project), an Azure hierarchy link (read with `$expand=relations`;
+  `System.Parent` is only the fallback) named by one extra batch read. Both
   frontends group by `(connection, kind, id)` as a view over the rows already fetched — the TUI
   via `App::wi_lines` (mirroring `pipe_lines`), the dashboard in `WorkItems.tsx`. Grouping is
   the default, and a list in which nothing has a parent stays flat.

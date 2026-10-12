@@ -154,13 +154,29 @@ pub fn map_work_item(v: &Value, project: Option<&str>) -> WorkItem {
         url: get_str(v, "url"),
         // The item carries only its parent's id; `AzureClient::name_parents` fills in the rest.
         // Until then the id stands in for the title, which still groups siblings together.
-        parent: fields.get("System.Parent").and_then(Value::as_i64).map(|id| WorkItemParent {
+        parent: parent_id(v, fields).map(|id| WorkItemParent {
             kind: "Parent".into(),
             id: id.to_string(),
             title: format!("#{id}"),
             url: None,
         }),
     }
+}
+
+/// Asks a work-item read for the item's links as well as its fields: the parent is one of them.
+const WITH_LINKS: &str = "$expand=relations";
+
+/// The id of a work item's parent.
+///
+/// Read from the hierarchy link itself, which is there the moment the link is made. The
+/// `System.Parent` field says the same thing but a live read of a freshly linked item came back
+/// without it, so it is only the fallback for a read that carries no links.
+fn parent_id(v: &Value, fields: &Value) -> Option<i64> {
+    let linked = get_arr(v, "relations")
+        .iter()
+        .filter(|r| get_str(r, "rel").as_deref() == Some("System.LinkTypes.Hierarchy-Reverse"))
+        .find_map(|r| get_str(r, "url")?.rsplit('/').next()?.parse::<i64>().ok());
+    linked.or_else(|| fields.get("System.Parent").and_then(Value::as_i64))
 }
 
 /// Azure pipelines are project-addressed too, so `project` is a bare Team Project name.
@@ -1279,7 +1295,7 @@ impl WorkItemSource for AzureWi {
             if ids.is_empty() {
                 return Ok(vec![]);
             }
-            let v = self.0.get_json(&format!("{}/_apis/wit/workitems?ids={}&{API}", self.0.base, ids.join(","))).await?;
+            let v = self.0.get_json(&format!("{}/_apis/wit/workitems?ids={}&{WITH_LINKS}&{API}", self.0.base, ids.join(","))).await?;
             // The batch read answers in id order, not the query's.
             let mut rows: Vec<WorkItem> = get_arr(&v, "value").iter().map(|w| map_work_item(w, None)).collect();
             rows.sort_by_key(|wi| std::cmp::Reverse(wi.updated_at));
@@ -1307,7 +1323,7 @@ impl WorkItemSource for AzureWi {
                 if ids.is_empty() {
                     return Ok(vec![]);
                 }
-                let v = self.0.get_json(&format!("{}/_apis/wit/workitems?ids={}&{API}", self.0.base, ids.join(","))).await?;
+                let v = self.0.get_json(&format!("{}/_apis/wit/workitems?ids={}&{WITH_LINKS}&{API}", self.0.base, ids.join(","))).await?;
                 Ok(get_arr(&v, "value").iter().map(|w| map_work_item(w, Some(&project))).collect())
             }
         })
@@ -1318,7 +1334,7 @@ impl WorkItemSource for AzureWi {
     }
     async fn get(&self, item: &ItemRef) -> Result<WorkItem> {
         // Work items are addressable organization-wide by id, so no project segment is needed.
-        let v = self.0.get_json(&format!("{}/_apis/wit/workitems/{}?{API}", self.0.base, item.id)).await?;
+        let v = self.0.get_json(&format!("{}/_apis/wit/workitems/{}?{WITH_LINKS}&{API}", self.0.base, item.id)).await?;
         let mut wi = map_work_item(&v, item.repo.as_deref());
         self.0.name_parents(std::slice::from_mut(&mut wi)).await;
         Ok(wi)
@@ -2147,6 +2163,27 @@ mod tests {
     }
 
     #[test]
+    fn the_parent_is_read_from_the_hierarchy_link_and_only_then_from_the_field() {
+        let link = |rel: &str, id: i64| serde_json::json!({ "rel": rel, "url": format!("https://dev.azure.com/contoso/_apis/wit/workItems/{id}") });
+        let item = |relations: Vec<Value>, field: Option<i64>| {
+            let mut fields = serde_json::json!({ "System.Title": "t", "System.State": "Active" });
+            if let Some(p) = field {
+                fields["System.Parent"] = p.into();
+            }
+            map_work_item(&serde_json::json!({ "id": 1, "fields": fields, "relations": relations }), None).parent.map(|p| p.id)
+        };
+        // The link alone is enough — a live read of a freshly linked item had no field.
+        assert_eq!(item(vec![link("System.LinkTypes.Hierarchy-Reverse", 550)], None).as_deref(), Some("550"));
+        // A child link, a related link and an attachment are not a parent.
+        let others = vec![link("System.LinkTypes.Hierarchy-Forward", 7), link("System.LinkTypes.Related", 8), link("AttachedFile", 9)];
+        assert_eq!(item(others.clone(), None), None);
+        // The link wins over the field; the field stands in for a read that carries no links.
+        assert_eq!(item(vec![link("System.LinkTypes.Hierarchy-Reverse", 550)], Some(1)).as_deref(), Some("550"));
+        assert_eq!(item(others, Some(42)).as_deref(), Some("42"));
+        assert_eq!(item(vec![], None), None);
+    }
+
+    #[test]
     fn resolved_and_review_named_states_are_in_review() {
         assert_eq!(map_state("Active"), WorkItemStateCategory::Started);
         assert_eq!(map_state("Resolved"), WorkItemStateCategory::Review);
@@ -2198,7 +2235,7 @@ mod tests {
         let asked = forge.requests();
         assert_eq!(asked.len(), 3, "one query, one batch read, one read naming the parents: {asked:?}");
         assert!(asked[0].starts_with("POST /_apis/wit/wiql?$top=50"), "organization-wide, no project segment: {}", asked[0]);
-        assert!(asked[1].starts_with("GET /_apis/wit/workitems?ids=55,9"), "{}", asked[1]);
+        assert!(asked[1].starts_with("GET /_apis/wit/workitems?ids=55,9&$expand=relations"), "the links come with it: {}", asked[1]);
         // The listing itself goes on to name its parents; an answer that names none (this fake
         // returns the items again) leaves the placeholder rather than failing the list.
         assert!(asked[2].starts_with("GET /_apis/wit/workitems?ids=100&fields=System.Title,System.WorkItemType"), "{}", asked[2]);
