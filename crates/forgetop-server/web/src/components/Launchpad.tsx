@@ -1,13 +1,26 @@
-import { useState } from "react";
-import { motion } from "framer-motion";
+import { useState, type ReactNode } from "react";
 import { useLaunchpad } from "../api";
-import { checkMeta, pipeMeta, pipeTitle, pipeWorkflow, prStatusMeta, relativeTime, wiStateColor } from "../format";
+import {
+  pipeMeta,
+  pipeTitle,
+  pipeWorkflow,
+  prSignalMeta,
+  prState,
+  prStatusMeta,
+  repoShort,
+  sameRef,
+  shortAge,
+  wiStateColor,
+  wiStateGlyph,
+  type GlyphName,
+} from "../format";
 import type { LaunchpadMore, LaunchpadRow, SectionId } from "../types";
-import { Skeleton, StateCard, StatusBadge } from "./ui";
+import { Button, GroupHeading, Row, SectionHeading, Skeleton, StateCard, StatusGlyph } from "./ui";
+import { Icon } from "./icons";
 import { ErrorState } from "./ErrorState";
-import { usePrOpener } from "./PrDetail";
-import { useWiOpener } from "./WiDetail";
-import { usePipelineOpener } from "./PipelineDetail";
+import { useCurrentPr, usePrOpener } from "./PrDetail";
+import { useCurrentWi, useWiOpener } from "./WiDetail";
+import { useCurrentPipeline, usePipelineOpener } from "./PipelineDetail";
 import { useNavigateSection } from "../nav";
 
 export function Launchpad() {
@@ -15,13 +28,13 @@ export function Launchpad() {
   if (isLoading) return <Skeleton />;
   if (error) return <ErrorState error={error} />;
   if (!data || data.rows.length === 0)
-    return <StateCard icon="✦" title="All clear" sub="Nothing needs your attention right now." />;
+    return <StateCard icon={<Icon name="check-circle" size={24} />} title="All clear" sub="Nothing needs your attention right now." />;
 
   const left = groupByBucket(data.rows.filter((r) => r.column === 0));
   const right = groupByBucket(data.rows.filter((r) => r.column === 1));
 
   return (
-    <div className="grid gap-5 p-5 max-w-6xl mx-auto lg:grid-cols-2">
+    <div className="grid @[900px]:grid-cols-2 gap-x-11 gap-y-8 max-w-[1280px] mx-auto px-7 py-5">
       <Column heading="Needs you" groups={left} emptyHint="Nothing waiting on you." more={data.more} />
       <Column heading="Your work" groups={right} emptyHint="No open work." more={data.more} />
     </div>
@@ -88,13 +101,12 @@ function groupByBucket(rows: LaunchpadRow[]): Group[] {
 }
 
 function Column({ heading, groups, emptyHint, more }: { heading: string; groups: Group[]; emptyHint: string; more: LaunchpadMore }) {
+  const total = groups.reduce((n, g) => n + g.rows.length, 0);
   return (
-    <section className="flex flex-col gap-5">
-      <h2 className="text-xs font-semibold uppercase tracking-wider px-1" style={{ color: "var(--dim)" }}>
-        {heading}
-      </h2>
+    <section className="min-w-0">
+      <SectionHeading count={total}>{heading}</SectionHeading>
       {groups.length === 0 ? (
-        <p className="text-sm px-1" style={{ color: "var(--dim)" }}>
+        <p className="mt-3 text-[13px]" style={{ color: "var(--fg3)" }}>
           {emptyHint}
         </p>
       ) : (
@@ -121,127 +133,158 @@ function BucketGroup({ group, more }: { group: Group; more: LaunchpadMore }) {
   const go = navMore ? moreTarget(group.bucket, navigate) : null;
 
   return (
-    <div>
-      <div className="flex items-center gap-2 px-1 mb-2">
-        <span className="text-sm font-medium" style={{ color: group.muted ? "var(--dim)" : "var(--fg)" }}>
-          {group.title}
-        </span>
-        <span className="mono text-xs rounded-full px-1.5" style={{ background: "var(--panel2)", color: "var(--dim)" }}>
-          {group.rows.length}
-        </span>
-      </div>
-      <div className="flex flex-col gap-1.5">
-        {rows.map((row, i) => (
-          <ItemRow key={`${row.connection_id}:${row.kind}:${rowId(row)}`} row={row} index={i} muted={group.muted} />
+    <div className="mt-[18px]">
+      <GroupHeading count={group.rows.length}>
+        <span style={group.muted ? { color: "var(--fg3)" } : undefined}>{group.title}</span>
+      </GroupHeading>
+      {/* Rows carry their own 12px padding; pull them out so their content lines up with the headings. */}
+      <div className="flex flex-col -mx-3">
+        {rows.map((row) => (
+          <ItemRow key={`${row.connection_id}:${row.kind}:${rowId(row)}`} row={row} bucket={group.bucket} />
         ))}
-        {(go || expandMore) && (
-          <button
-            onClick={go ?? (() => setLimit((l) => l + EXPAND_STEP))}
-            className="text-xs font-medium rounded-lg px-3 py-2 text-left transition-colors hover:brightness-110"
-            style={{ color: "var(--accent)", background: "var(--card)", border: "1px solid var(--border)" }}
-          >
-            more…
-          </button>
-        )}
       </div>
+      {(go || expandMore) && (
+        <Button quiet sm className="mt-1 -ml-2" onClick={go ?? (() => setLimit((l) => l + EXPAND_STEP))}>
+          more…
+        </Button>
+      )}
     </div>
   );
 }
 
-function ItemRow({ row, index, muted }: { row: LaunchpadRow; index: number; muted: boolean }) {
-  const { title, meta } = describe(row);
-  const badge = statusBadge(row);
+/** What one Command Center row draws, in reading order: glyph · title (· note) · identifier ·
+ *  signal glyph · age. Work items put their key before the title instead. */
+interface RowView {
+  glyph: GlyphName;
+  color: string;
+  spin?: boolean;
+  /** The state, announced on the glyph (the row no longer prints it as a word). */
+  glyphTitle: string;
+  title: string;
+  note?: string;
+  noteColor?: string;
+  ident: string;
+  /** Work items: the key leads, in a fixed column. */
+  keyFirst?: boolean;
+  signal?: { glyph: GlyphName; color: string; spin: boolean; title: string };
+  age: string;
+}
+
+function ItemRow({ row, bucket }: { row: LaunchpadRow; bucket: string }) {
+  const v = view(row, bucket);
   const openPr = usePrOpener();
   const openWi = useWiOpener();
   const openPipe = usePipelineOpener();
-  // Every card kind opens its in-app detail panel, matching the list views.
+  const currentPr = useCurrentPr();
+  const currentWi = useCurrentWi();
+  const currentPipe = useCurrentPipeline();
+  // The row whose item is open in the pane carries the selected wash.
+  const selected =
+    row.kind === "pr"
+      ? sameRef(currentPr, { conn: row.connection_id, repo: row.pull_request.repository, id: row.pull_request.id })
+      : row.kind === "wi"
+        ? sameRef(currentWi, { conn: row.connection_id, repo: row.work_item.repository, id: row.work_item.id })
+        : sameRef(currentPipe, { conn: row.connection_id, repo: row.run.repository, runId: row.run.id });
+  // Every row kind opens its in-app detail panel, matching the list views.
   const onClick =
     row.kind === "pr"
       ? () => openPr({ conn: row.connection_id, repo: row.pull_request.repository, id: row.pull_request.id })
       : row.kind === "wi"
         ? () => openWi({ conn: row.connection_id, repo: row.work_item.repository, id: row.work_item.id })
         : () => openPipe({ conn: row.connection_id, repo: row.run.repository, runId: row.run.id });
-  const common = {
-    initial: { opacity: 0, y: 4 },
-    animate: { opacity: 1, y: 0 },
-    transition: { duration: 0.2, delay: Math.min(index * 0.015, 0.25) },
-    className: "group flex items-center gap-2.5 rounded-lg px-3 py-1.5 transition-colors w-full text-left",
-    style: { background: "var(--card)", border: "1px solid var(--border)", opacity: muted ? 0.85 : 1, cursor: "pointer" },
-    onMouseEnter: (e: React.MouseEvent<HTMLElement>) => (e.currentTarget.style.background = "var(--card-hover)"),
-    onMouseLeave: (e: React.MouseEvent<HTMLElement>) => (e.currentTarget.style.background = "var(--card)"),
-  };
-  const inner = (
-    <>
-      <StatusBadge label={badge.label} color={badge.color} />
-      <div className="flex-1 min-w-0">
-        <div className="truncate text-sm" style={{ color: "var(--fg)" }}>
-          {title}
-        </div>
-        <div className="flex items-center gap-2 mt-0.5">
-          <span className="mono text-[11px] rounded px-1" style={{ background: "var(--panel2)", color: "var(--dim)" }}>
-            {kindLabel(row.kind)}
-          </span>
-          {meta && (
-            <span className="text-xs truncate" style={{ color: "var(--dim)" }}>
-              {meta}
-            </span>
-          )}
-        </div>
-      </div>
-    </>
-  );
+
+  const ident: ReactNode = v.ident ? (
+    <span className="mono shrink-0 truncate" style={{ color: "var(--fg3)", width: v.keyFirst ? 76 : undefined, maxWidth: v.keyFirst ? undefined : "40%" }}>
+      {v.ident}
+    </span>
+  ) : v.keyFirst ? (
+    <span className="shrink-0" style={{ width: 76 }} />
+  ) : null;
+
   return (
-    <motion.button {...common} onClick={onClick}>
-      {inner}
-    </motion.button>
+    <Row onClick={onClick} selected={selected}>
+      <StatusGlyph glyph={v.glyph} color={v.color} spin={v.spin} title={v.glyphTitle} />
+      {v.keyFirst && ident}
+      <span className="flex-1 min-w-0 truncate">
+        {v.title}
+        {v.note && (
+          <span style={{ color: v.noteColor ?? "var(--fg3)" }}>
+            <span aria-hidden="true">{" · "}</span>
+            {v.note}
+          </span>
+        )}
+      </span>
+      {!v.keyFirst && ident}
+      {v.signal && <StatusGlyph glyph={v.signal.glyph} color={v.signal.color} spin={v.signal.spin} title={v.signal.title} />}
+      <span className="num shrink-0 text-right text-[12px]" style={{ width: 34, color: "var(--fg3)" }}>
+        {v.age}
+      </span>
+    </Row>
   );
 }
 
-function describe(row: LaunchpadRow): { title: string; meta: string } {
+function view(row: LaunchpadRow, bucket: string): RowView {
   if (row.kind === "pr") {
     const pr = row.pull_request;
-    const c = pr.checks !== "None" ? ` · ${checkMeta(pr.checks).label}` : "";
-    return {
+    const status = prStatusMeta(pr);
+    const signal = prSignalMeta(pr);
+    const st = prState(pr);
+    const ident = [repoShort(pr.repository), pr.number != null ? `#${pr.number}` : ""].filter(Boolean).join(" ");
+    const base = {
+      glyph: status.glyph,
+      color: status.color,
+      glyphTitle: capitalize(status.label),
       title: pr.title,
-      meta: `${pr.number != null ? "#" + pr.number : ""}${relativeTime(pr.updated_at) ? " · " + relativeTime(pr.updated_at) : ""}${c}`,
+      ident,
+      age: shortAge(pr.updated_at),
+    };
+    // "Needs fixing" is the blocker's bucket: the row reads red and names what to fix.
+    if (bucket === "needs_fixing") {
+      return { ...base, color: "var(--red)", note: st.kind === "blocked" ? signal.label : undefined };
+    }
+    const open = st.kind !== "merged" && st.kind !== "closed";
+    const hasSignal = open && (st.kind === "blocked" || pr.checks !== "None");
+    return {
+      ...base,
+      note: st.kind === "draft" ? "draft" : undefined,
+      signal: hasSignal ? { glyph: signal.glyph, color: signal.color, spin: signal.spin, title: signal.label } : undefined,
     };
   }
   if (row.kind === "wi") {
     const wi = row.work_item;
+    const blocked = wi.state.toLowerCase() === "blocked";
     return {
+      glyph: wiStateGlyph(wi.state, wi.state_category),
+      color: wiStateColor(wi.state, wi.state_category),
+      glyphTitle: wi.state,
       title: wi.title,
-      meta: `${wi.identifier ?? ""}${relativeTime(wi.updated_at) ? " · " + relativeTime(wi.updated_at) : ""}`,
+      note: blocked ? "blocked" : undefined,
+      noteColor: blocked ? "var(--red)" : undefined,
+      ident: wi.identifier ?? "",
+      keyFirst: true,
+      age: shortAge(wi.updated_at),
     };
   }
   const run = row.run;
-  // The title is what the run was building; the workflow it ran under goes in the meta line —
-  // and is dropped there when it *is* the title, so it never reads as "Integration · Integration".
+  const m = pipeMeta(run.status);
+  // The title is what the run was building; the workflow it ran under goes in the note — and is
+  // dropped there when it *is* the title, so it never reads as "Integration · Integration".
   const title = pipeTitle(run, row.definition_name);
   const workflow = pipeWorkflow(run, row.definition_name);
-  const age = relativeTime(run.finished_at ?? run.started_at);
+  const note = [workflow === title ? "" : workflow, run.branch ?? ""].filter(Boolean).join(" · ");
   return {
+    glyph: m.glyph,
+    color: m.color,
+    spin: m.running,
+    glyphTitle: run.status === "Failed" ? "Error" : capitalize(m.label),
     title,
-    meta: [workflow === title ? "" : workflow, run.branch ?? "", age].filter(Boolean).join(" · "),
+    note: note || undefined,
+    ident: repoShort(run.repository),
+    age: shortAge(run.finished_at ?? run.started_at),
   };
 }
 
 const capitalize = (s: string): string => (s.length ? s[0].toUpperCase() + s.slice(1) : s);
-
-/** The status word + colour shown on each Command Center row, replacing the old status dot.
- *  PRs → Open/Merged/Closed/Draft, work items → their state, pipelines → Running/Queued/…
- *  with a failed run reading as "Error". Colours reuse the shared status model. */
-function statusBadge(row: LaunchpadRow): { label: string; color: string } {
-  if (row.kind === "pr") {
-    const s = prStatusMeta(row.pull_request);
-    return { label: capitalize(s.label), color: s.color };
-  }
-  if (row.kind === "wi") {
-    const wi = row.work_item;
-    return { label: wi.state, color: wiStateColor(wi.state, wi.state_category) };
-  }
-  const m = pipeMeta(row.run.status);
-  return { label: row.run.status === "Failed" ? "Error" : capitalize(m.label), color: m.color };
-}
 
 /// A row's identity within its connection. The repository is part of it: one connection now
 /// spans an account, so `#7` exists in more than one repository and `connection_id:id` alone
@@ -250,8 +293,4 @@ function rowId(row: LaunchpadRow): string {
   if (row.kind === "pr") return `${row.pull_request.repository ?? ""}:${row.pull_request.id}`;
   if (row.kind === "wi") return `${row.work_item.repository ?? ""}:${row.work_item.id}`;
   return `${row.run.repository ?? ""}:${row.run.id}`;
-}
-
-function kindLabel(kind: LaunchpadRow["kind"]): string {
-  return kind === "pr" ? "Pull Request" : kind === "wi" ? "Work Item" : "Pipeline";
 }

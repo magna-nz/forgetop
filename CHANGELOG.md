@@ -9,6 +9,25 @@ Adding a release: one `## <version> — <date>` section, a line per user-visible
 and the pull request each one came from. `git log v<previous>..HEAD --merges` lists the
 candidates.
 
+## 1.10.0 — 2026-10-13
+
+Changed
+
+- **The dashboard has a new look, "Quiet ink".** Lists are rows, not cards: a status glyph, the
+  title, a mono identifier and the age in a 36px hairline row, so nine items fit where five did.
+  Status is a stroke glyph with a distinct shape per state plus a word where the word carries
+  information; the tinted chips are gone. One ember accent marks the primary action on a screen,
+  the selected row and focus, and nothing else. IBM Plex Sans, with Plex Mono for identifiers
+  only, is embedded in the binary. A pull request, work item or pipeline run opens in a column
+  beside the list instead of a modal over it; the Command Center drops to one column when a pane
+  squeezes it. Filters are quiet menus, grouping is a segmented control, views are underline
+  tabs. The pull-request pane gains a Checks tab, a Viewed checkbox per file and a More menu for
+  draft and close; the pipeline-run pane gains a stage strip over the jobs, duration bars and a
+  Raw toggle on the log. All four themes keep their names. The terminal UI is unchanged.
+  ([#240](https://github.com/magna-nz/forgetop/pull/240))
+- **README GIFs re-recorded** for 1.9.x on both surfaces.
+  ([#239](https://github.com/magna-nz/forgetop/pull/239))
+
 ## 1.9.1 — 2026-10-12
 
 Added

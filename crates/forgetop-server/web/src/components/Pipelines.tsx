@@ -1,19 +1,26 @@
-import { useMemo, useState } from "react";
-import { motion } from "framer-motion";
+import { useMemo, useState, type MouseEvent } from "react";
 import { usePipelines } from "../api";
-import { fmtSecs, pipeMeta, relativeTime, toTime } from "../format";
+import { fmtSecs, pipeMeta, sameRef, toTime } from "../format";
 import type { PipelineRunStatus, PipeRow } from "../types";
 import { groupPipelines, listStrip, parseGroupMode, pipeDefinitionName, rowGates, rowShownStatus } from "../pipeline/grouping";
 import type { GroupMode, PipeGroup } from "../pipeline/grouping";
 import { runSecs } from "../pipeline/timeline";
-import { Avatar, Chip, List, Pill, Skeleton, StateCard, StatusBadge } from "./ui";
+import { Icon } from "./icons";
+import { Avatar, Button, Chip, List, Segmented, Skeleton, StateCard, StatusGlyph } from "./ui";
 import { ErrorState } from "./ErrorState";
-import { useListView, type SortOption } from "./ControlBar";
-import { usePipelineOpener } from "./PipelineDetail";
+import { shortAge, ToggleRow, useListView, type SortOption } from "./ControlBar";
+import { useCurrentPipeline, usePipelineOpener } from "./PipelineDetail";
 import { useRepoScope } from "./RepoScope";
 import { usePipelineScope } from "./PipelineScope";
 
 const GROUP_KEY = "forgetop:pipelines:group";
+
+const GROUP_OPTIONS: { value: GroupMode; label: string }[] = [
+  { value: "pipeline", label: "By pipeline" },
+  { value: "trigger", label: "By trigger" },
+  { value: "branch", label: "By branch" },
+  { value: "off", label: "Flat" },
+];
 
 /** Grouped by pipeline unless the viewer chose otherwise. */
 function readGroupMode(): GroupMode {
@@ -37,6 +44,14 @@ export function Pipelines() {
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set());
   const scope = useRepoScope("pipelines");
   const pipes = usePipelineScope();
+  const chooseMode = (m: GroupMode) => {
+    setMode(m);
+    try {
+      localStorage.setItem(GROUP_KEY, m);
+    } catch {
+      /* ignore */
+    }
+  };
   const { rows, bar, sortIndex } = useListView<PipeRow>({
     storageKey: "pipelines",
     rows: data,
@@ -51,6 +66,17 @@ export function Pipelines() {
       { label: "Awaiting approval", match: (r) => r.approvals.some((a) => a.can_respond) },
     ],
     statusLabel: "Show",
+    // The pipeline picker stays reachable in every state the bar shows: with nothing selected there
+    // are no rows, and that is exactly when it is needed.
+    extra: (
+      <>
+        {pipes.control}
+        {scope.control}
+        <span className="px-1">
+          <Segmented label="Group" value={mode} onChange={chooseMode} options={GROUP_OPTIONS} />
+        </span>
+      </>
+    ),
   });
 
   // A view over the rows already sorted and filtered: every mode shows the same runs. The sort
@@ -64,26 +90,18 @@ export function Pipelines() {
     // Distinct from "nothing to show": nothing was fetched because nothing was asked for.
     return (
       <StateCard
-        icon="◍"
+        icon={<Icon name="workflow" size={24} />}
         title="No repositories selected"
         sub="This connection spans your whole account — choose which repositories it fetches from."
         action={scope.control}
       />
     );
-  // The pipeline picker stays reachable in every state below: with nothing selected there are no
-  // rows, and that is exactly when it is needed.
-  const controls = (
-    <div className="flex flex-wrap items-center gap-2 px-5 pt-4 max-w-5xl mx-auto">
-      {pipes.control}
-      {scope.control}
-    </div>
-  );
   if (pipes.noneSelected)
     // Pipelines are opt-in: nothing was fetched because nothing was chosen yet. The picker sits in
     // the card, like the empty repository scope's.
     return (
       <StateCard
-        icon="◇"
+        icon={<Icon name="workflow" size={24} />}
         title="No pipelines selected"
         sub="Choose which pipelines to show. Your choice is saved."
         action={pipes.control}
@@ -92,19 +110,11 @@ export function Pipelines() {
   if (!data || data.length === 0)
     return (
       <>
-        {controls}
-        <StateCard icon="◇" title="No pipeline runs" sub="Recent runs of the pipelines you've chosen appear here." />
+        {bar}
+        <StateCard icon={<Icon name="workflow" size={24} />} title="No pipeline runs" sub="Recent runs of the pipelines you've chosen appear here." />
       </>
     );
 
-  const chooseMode = (m: GroupMode) => {
-    setMode(m);
-    try {
-      localStorage.setItem(GROUP_KEY, m);
-    } catch {
-      /* ignore */
-    }
-  };
   const toggle = (key: string) =>
     setExpanded((prev) => {
       const next = new Set(prev);
@@ -115,30 +125,13 @@ export function Pipelines() {
 
   return (
     <>
-      {controls}
       {bar}
-      <div className="flex flex-wrap items-center gap-2 px-5 pt-2 max-w-5xl mx-auto">
-        <label className="flex items-center gap-1.5 text-xs" style={{ color: "var(--dim)" }}>
-          Group
-          <select
-            value={mode}
-            onChange={(e) => chooseMode(parseGroupMode(e.target.value))}
-            className="rounded-md px-2 py-1 text-xs outline-none"
-            style={{ background: "var(--panel2)", color: "var(--fg)", border: "1px solid var(--border)" }}
-          >
-            <option value="pipeline">Pipeline</option>
-            <option value="trigger">Trigger</option>
-            <option value="branch">Branch</option>
-            <option value="off">Off</option>
-          </select>
-        </label>
-      </div>
       <List>
         {groups.length > 0
           ? groups.map((g) => (
               <PipeGroupSection key={g.key} group={g} mode={mode} now={now} open={expanded.has(g.key)} onToggle={() => toggle(g.key)} />
             ))
-          : rows.map((row, i) => <PipeCard key={rowKey(row)} row={row} index={i} now={now} />)}
+          : rows.map((row) => <PipeRunRow key={rowKey(row)} row={row} now={now} />)}
       </List>
     </>
   );
@@ -161,70 +154,50 @@ function PipeGroupSection({
   const latest = group.latest;
   const branch = latest.run.branch;
   return (
-    <div className="flex flex-col gap-2">
-      <div className="rounded-lg px-3 py-1.5" style={{ background: "var(--panel2)", border: "1px solid var(--border)" }}>
-        <button
-          type="button"
-          onClick={onToggle}
-          aria-expanded={open}
-          className="w-full min-w-0 text-left flex items-center gap-2"
-          style={{ cursor: "pointer" }}
-        >
-          <span className="text-xs shrink-0" style={{ color: "var(--dim)", width: 14 }} aria-hidden="true">
-            {open ? "▾" : "▸"}
+    <>
+      <ToggleRow open={open} onToggle={onToggle} height={40}>
+        <StatusGlyph glyph={meta.glyph} color={meta.color} spin={meta.running} title={meta.label} />
+        <span className="truncate font-semibold min-w-0 shrink">{group.subject}</span>
+        {group.repo && (
+          <span className="mono shrink-0 whitespace-nowrap" style={{ color: "var(--fg3)" }} title="repository">
+            {group.repo}
           </span>
-          {/* The same fixed status column as the run rows, so names line up. */}
-          <span className="shrink-0" style={{ width: 84 }}>
-            <StatusBadge label={cap(meta.label)} color={meta.color} />
+        )}
+        {mode === "trigger" && group.commit && (
+          <span className="mono shrink-0" style={{ color: "var(--fg3)" }}>
+            {group.commit}
           </span>
-          <span className="truncate font-semibold min-w-0" style={{ color: "var(--fg)" }}>
-            {group.subject}
+        )}
+        {(mode === "pipeline" || mode === "trigger") && branch && (
+          <span className="mono truncate min-w-0" style={{ color: "var(--fg3)", maxWidth: 260 }} title="branch">
+            {branch}
           </span>
-          {group.failed > 0 && (
-            <span className="text-xs shrink-0 whitespace-nowrap" style={{ color: "var(--red)" }}>
-              · {group.failed} failed
-            </span>
-          )}
-          {group.repo && (
-            <span className="shrink-0">
-              <Chip title="repository">{group.repo}</Chip>
-            </span>
-          )}
-          {mode === "trigger" && group.commit && (
-            <span className="mono text-xs shrink-0" style={{ color: "var(--dim)" }}>
-              {group.commit}
-            </span>
-          )}
-          {(mode === "pipeline" || mode === "trigger") && branch && (
-            <span className="min-w-0 truncate" style={{ maxWidth: 260 }}>
-              <Chip title="branch">⑂ {branch}</Chip>
-            </span>
-          )}
-          <StageStrip row={latest} />
-          {group.approval && (
-            <span className="shrink-0">
-              <Pill icon="⏳" label="Approval needed" color="var(--red)" />
-            </span>
-          )}
-          <span className="flex-1" />
-          <span className="text-xs shrink-0 whitespace-nowrap" style={{ color: "var(--dim)" }}>
-            {group.runs} {group.runs === 1 ? "run" : "runs"}
+        )}
+        {group.failed > 0 && (
+          <span className="text-[12px] shrink-0 whitespace-nowrap" style={{ color: "var(--red)" }}>
+            {group.failed} failed
           </span>
-          <span className="text-xs shrink-0 whitespace-nowrap" style={{ color: "var(--dim)" }}>
-            {relativeTime(group.started)}
+        )}
+        {group.approval && (
+          <span className="text-[12px] shrink-0 whitespace-nowrap" style={{ color: "var(--yellow)" }}>
+            waiting for approval
           </span>
-          {latest.run.triggered_by && <Avatar name={latest.run.triggered_by.display_name} />}
-        </button>
-      </div>
-      {open &&
-        group.rows.map((row, i) => (
-          <PipeCard key={rowKey(row)} row={row} index={i} now={now} child={{ mode, last: i === group.rows.length - 1 }} />
-        ))}
-    </div>
+        )}
+        <span className="flex-1" />
+        <StageStrip row={latest} />
+        <span className="num text-[12px] shrink-0 whitespace-nowrap text-right" style={{ color: "var(--fg3)", minWidth: 44 }}>
+          {group.runs} {group.runs === 1 ? "run" : "runs"}
+        </span>
+        <span className="num text-[12px] shrink-0 whitespace-nowrap text-right" style={{ color: "var(--fg3)", width: 30 }}>
+          {shortAge(group.started)}
+        </span>
+      </ToggleRow>
+      {open && group.rows.map((row) => <PipeRunRow key={rowKey(row)} row={row} now={now} mode={mode} />)}
+    </>
   );
 }
 
-/** One small square per stage (per job where the run has a single stage). Nothing for a run that
+/** One small bar per stage (per job where the run has a single stage). Nothing for a run that
  *  carries no stages. */
 function StageStrip({ row }: { row: PipeRow }) {
   const { unit, statuses } = listStrip(row.run, rowShownStatus(row), rowGates(row));
@@ -236,116 +209,118 @@ function StageStrip({ row }: { row: PipeRow }) {
   }
   const summary = [...counts].map(([label, n]) => `${n} ${label}`).join(", ");
   return (
-    <span role="img" aria-label={`${unit}: ${summary}`} title={`${unit}: ${summary}`} className="inline-flex items-center shrink-0" style={{ gap: 3 }}>
+    <span role="img" aria-label={`${unit}: ${summary}`} title={`${unit}: ${summary}`} className="inline-flex items-center shrink-0" style={{ gap: 2 }}>
       {statuses.map((s, i) => (
-        <span
-          key={i}
-          className={s === "Running" ? "pulse" : undefined}
-          style={{ width: 7, height: 7, borderRadius: 2, background: squareColor(s) }}
-        />
+        <span key={i} className={s === "Running" ? "pulse" : undefined} style={{ width: 5, height: 10, borderRadius: 1.5, background: barColor(s) }} />
       ))}
     </span>
   );
 }
 
-/** Done and live stages in their status colour; ones that haven't run (or won't) muted. */
-function squareColor(s: PipelineRunStatus): string {
-  return s === "Queued" || s === "Skipped" ? "color-mix(in srgb, var(--dim) 45%, var(--border))" : pipeMeta(s).color;
+/** Done and live stages lit in their status colour; ones that haven't run (or won't) unlit. */
+function barColor(s: PipelineRunStatus): string {
+  switch (s) {
+    case "Succeeded":
+      return "var(--green)";
+    case "Failed":
+      return "var(--red)";
+    case "Running":
+      return "var(--blue)";
+    case "Waiting":
+    case "PartiallySucceeded":
+      return "var(--yellow)";
+    default:
+      return "var(--active)";
+  }
 }
 
-/** The first failed job's problem, as `✗ job · problem`, when the run failed and one says why. */
+/** The first failed job's problem, as `job · problem`, when the run failed and one says why. */
 function failedProblem(row: PipeRow): string | null {
   if (row.run.status !== "Failed") return null;
-  for (const s of row.run.stages)
-    for (const j of s.jobs) if (j.status === "Failed" && j.problem) return `✗ ${j.name} · ${j.problem}`;
+  for (const s of row.run.stages) for (const j of s.jobs) if (j.status === "Failed" && j.problem) return `${j.name} · ${j.problem}`;
   return null;
 }
 
-function PipeCard({
-  row,
-  index,
-  now,
-  child,
-}: {
-  row: PipeRow;
-  index: number;
-  now: Date;
-  /** Set when the row sits under a group header: its grouping and whether it is the last one. */
-  child?: { mode: GroupMode; last: boolean };
-}) {
+/** One run. Flat (no `mode`) it names its pipeline and carries its stage strip; under a header
+ *  (34px, indented past the header's chevron and glyph) it names the pipeline only when that is
+ *  what varies within the group. The row opens the run; the Approve button, shown only for a gate
+ *  this user can answer, opens it too — the decision itself is taken in the pane's gate banner. */
+function PipeRunRow({ row, now, mode }: { row: PipeRow; now: Date; mode?: GroupMode }) {
   const run = row.run;
-  const shown = rowShownStatus(row);
-  const meta = pipeMeta(shown);
-  // Flat: the pipeline (definition) name first, then the run's own name/number. Under a header
-  // the pipeline name is only shown when it is what varies within the group.
-  const pipelineName = child
-    ? child.mode === "pipeline"
-      ? null
-      : pipeDefinitionName(row)
-    : (row.definition_name ?? run.definition_id);
+  const child = mode !== undefined;
+  const meta = pipeMeta(rowShownStatus(row));
+  const pipelineName = child ? (mode === "pipeline" ? null : pipeDefinitionName(row)) : (row.definition_name ?? run.definition_id);
   const runName = child && run.number != null ? `#${run.number}` : (run.name ?? (run.number != null ? `#${run.number}` : ""));
   const problem = failedProblem(row);
   const secs = runSecs(run, now);
-  // A pending gate → a red "Approval needed" badge (like the PR Mergeable badge). Actions
-  // (approve / re-run / cancel) live in the pane, not on the row.
-  const needsApproval = row.approvals.length > 0;
-  const open = usePipelineOpener();
+  const gate = row.approvals.find((a) => a.can_respond);
+  const waitingOnOthers = !gate && row.approvals.length > 0;
+  const openRun = usePipelineOpener();
+  const current = useCurrentPipeline();
+  const selected = sameRef(current, { conn: row.connection_id, repo: run.repository, runId: run.id });
+  const open = () => openRun({ conn: row.connection_id, repo: run.repository, runId: run.id });
+  const stop = (fn: () => void) => (e: MouseEvent) => {
+    e.stopPropagation();
+    fn();
+  };
 
   return (
-    <motion.div
-      initial={{ opacity: 0, y: 6 }}
-      animate={{ opacity: 1, y: 0 }}
-      transition={{ duration: 0.22, delay: Math.min(index * 0.02, 0.3), ease: "easeOut" }}
-      className="flex items-center gap-3 rounded-lg px-3 py-1.5"
-      style={{ background: "var(--card)", border: "1px solid var(--border)", ...(child ? { marginLeft: 16 } : {}) }}
-    >
+    // The whole row is a click target for the mouse; the inner button is the keyboard and
+    // screen-reader target. They are siblings of the Approve button, never its parent.
+    <div className="ft-row" data-selected={selected || undefined} style={{ minHeight: child ? 34 : 36, paddingLeft: child ? 44 : 12 }} onClick={open}>
       <button
-        onClick={() => open({ conn: row.connection_id, repo: run.repository, runId: run.id })}
-        className="flex-1 min-w-0 text-left flex items-center gap-2"
-        style={{ cursor: "pointer" }}
+        type="button"
+        onClick={stop(open)}
+        className="flex items-center gap-2.5 flex-1 min-w-0 text-left rounded outline-none focus-visible:outline-2 focus-visible:outline-[var(--accent)]"
+        style={{ background: "transparent", border: 0, padding: 0, color: "inherit", font: "inherit", cursor: "pointer" }}
       >
-        {child && (
-          <span className="mono text-xs shrink-0" style={{ color: "var(--dim)", opacity: 0.6, width: 14 }} aria-hidden="true">
-            {child.last ? "└" : "├"}
+        <StatusGlyph glyph={meta.glyph} color={meta.color} spin={meta.running} title={meta.label} />
+        {runName && (
+          <span className="mono shrink-0 whitespace-nowrap" style={{ color: "var(--fg3)", minWidth: 30 }}>
+            {runName}
           </span>
         )}
-        {/* Fixed-width status column so the pipeline name lines up across rows. */}
-        <span className="shrink-0" style={{ width: 84 }}>
-          <StatusBadge label={cap(meta.label)} color={meta.color} />
+        {pipelineName && <span className="font-medium shrink-0 whitespace-nowrap">{pipelineName}</span>}
+        <span className="flex-1 min-w-0 truncate">
+          {run.title && <span>{run.title}</span>}
+          {problem && <span style={{ color: "var(--red)" }}>{run.title ? " " : ""}· {problem}</span>}
         </span>
-        {pipelineName && <span className="font-medium shrink-0" style={{ color: "var(--fg)" }}>{pipelineName}</span>}
-        {runName && <span className="mono text-xs shrink-0" style={{ color: "var(--dim)" }}>{runName}</span>}
         {run.branch && (
-          <span className="shrink-0">
-            <Chip title="branch">⑂ {run.branch}</Chip>
-          </span>
+          <Chip title="branch" className="shrink-0 max-w-[200px] truncate">
+            {run.branch}
+          </Chip>
         )}
-        {run.commit_sha && <span className="mono text-xs shrink-0" style={{ color: "var(--dim)" }}>{run.commit_sha.slice(0, 7)}</span>}
-        {problem ? (
-          <span className="truncate text-xs min-w-0" style={{ color: "var(--red)" }}>{problem}</span>
-        ) : (
-          run.title && <span className="truncate text-sm italic min-w-0" style={{ color: "var(--dim)" }}>{run.title}</span>
-        )}
-        {needsApproval && (
-          <span className="shrink-0">
-            <Pill icon="⏳" label="Approval needed" color="var(--red)" />
+        {run.commit_sha && (
+          <span className="mono shrink-0" style={{ color: "var(--fg3)" }}>
+            {run.commit_sha.slice(0, 7)}
           </span>
         )}
       </button>
-      <div className="flex items-center gap-2 shrink-0">
-        <StageStrip row={row} />
-        {secs !== null && (
-          <span className="text-xs whitespace-nowrap" style={{ color: meta.running ? "var(--accent)" : "var(--dim)" }}>
-            {fmtSecs(secs)}
-          </span>
-        )}
-        <span className="text-xs whitespace-nowrap" style={{ color: "var(--dim)" }}>
-          {relativeTime(run.finished_at ?? run.started_at)}
+      {gate && (
+        <Button
+          sm
+          onClick={stop(open)}
+          title={`Open the run to approve ${gate.name}`}
+          style={{ color: "var(--yellow)", borderColor: "color-mix(in srgb, var(--yellow) 40%, transparent)" }}
+        >
+          Open to approve {gate.name}
+        </Button>
+      )}
+      {waitingOnOthers && (
+        <span className="text-[12px] shrink-0 whitespace-nowrap" style={{ color: "var(--yellow)" }}>
+          waiting for approval
         </span>
-        {run.triggered_by && <Avatar name={run.triggered_by.display_name} />}
-      </div>
-    </motion.div>
+      )}
+      {!child && <StageStrip row={row} />}
+      <span className="num text-[12px] shrink-0 whitespace-nowrap text-right" style={{ width: 50, color: meta.running ? "var(--blue)" : "var(--fg3)" }}>
+        {secs !== null ? fmtSecs(secs) : ""}
+      </span>
+      <span className="num text-[12px] shrink-0 whitespace-nowrap text-right" style={{ width: 30, color: "var(--fg3)" }}>
+        {shortAge(run.finished_at ?? run.started_at)}
+      </span>
+      <span className="inline-flex shrink-0 justify-center" style={{ width: 18 }}>
+        {run.triggered_by && <Avatar name={run.triggered_by.display_name} size={18} />}
+      </span>
+    </div>
   );
 }
-
-const cap = (s: string): string => (s.length ? s[0].toUpperCase() + s.slice(1) : s);

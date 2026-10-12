@@ -1,12 +1,12 @@
 import { useMemo, useState } from "react";
-import { motion } from "framer-motion";
 import { useWorkItems } from "../api";
-import { relativeTime, toTime, wiStateColor } from "../format";
+import { sameRef, toTime, wiStateColor, wiStateGlyph } from "../format";
 import type { WiRow, WorkItemParent } from "../types";
-import { Avatar, Chip, List, Skeleton, StateCard, StatusBadge } from "./ui";
+import { Icon } from "./icons";
+import { Avatar, List, Row, Select, Skeleton, StateCard, StatusGlyph } from "./ui";
 import { ErrorState } from "./ErrorState";
-import { useListView } from "./ControlBar";
-import { useWiOpener } from "./WiDetail";
+import { shortAge, ToggleRow, useListView } from "./ControlBar";
+import { useCurrentWi, useWiOpener } from "./WiDetail";
 
 const GROUP_KEY = "forgetop:work-items:group";
 type GroupMode = "off" | "parent";
@@ -53,6 +53,14 @@ export function WorkItems() {
   const { data, isLoading, error } = useWorkItems();
   const [mode, setMode] = useState<GroupMode>(readGroupMode);
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set());
+  const chooseMode = (m: GroupMode) => {
+    setMode(m);
+    try {
+      localStorage.setItem(GROUP_KEY, m);
+    } catch {
+      /* ignore */
+    }
+  };
   const { rows, bar } = useListView<WiRow>({
     storageKey: "work-items",
     rows: data,
@@ -71,6 +79,12 @@ export function WorkItems() {
     ],
     statusLabel: "Show",
     facet: { label: "Type", value: (r) => r.work_item.work_item_type },
+    extra: (
+      <Select label="Group" value={mode} onChange={(e) => chooseMode(e.target.value === "parent" ? "parent" : "off")}>
+        <option value="parent">By parent</option>
+        <option value="off">Flat</option>
+      </Select>
+    ),
   });
 
   const groups = useMemo(() => (mode === "parent" ? groupByParent(rows) : []), [mode, rows]);
@@ -78,16 +92,8 @@ export function WorkItems() {
   if (isLoading) return <Skeleton />;
   if (error) return <ErrorState error={error} />;
   if (!data || data.length === 0)
-    return <StateCard icon="◇" title="No work items assigned" sub="Issues and tickets assigned to you appear here." />;
+    return <StateCard icon={<Icon name="circle-dot" size={24} />} title="No work items assigned" sub="Issues and tickets assigned to you appear here." />;
 
-  const chooseMode = (m: GroupMode) => {
-    setMode(m);
-    try {
-      localStorage.setItem(GROUP_KEY, m);
-    } catch {
-      /* ignore */
-    }
-  };
   const toggle = (key: string) =>
     setExpanded((prev) => {
       const next = new Set(prev);
@@ -98,170 +104,99 @@ export function WorkItems() {
   return (
     <>
       {bar}
-      <div className="flex flex-wrap items-center gap-2 px-5 pt-2 max-w-5xl mx-auto">
-        <label className="flex items-center gap-1.5 text-xs" style={{ color: "var(--dim)" }}>
-          Group
-          <select
-            value={mode}
-            onChange={(e) => chooseMode(e.target.value === "parent" ? "parent" : "off")}
-            className="rounded-md px-2 py-1 text-xs outline-none"
-            style={{ background: "var(--panel2)", color: "var(--fg)", border: "1px solid var(--border)" }}
-          >
-            <option value="parent">Parent</option>
-            <option value="off">Off</option>
-          </select>
-        </label>
-      </div>
       <List>
         {groups.length > 0
-          ? groups.map((g) => (
-              <WiGroupSection key={g.key} group={g} open={expanded.has(g.key)} onToggle={() => toggle(g.key)} />
-            ))
-          : rows.map((row, i) => (
-              <WiCard key={`${row.connection_id}:${row.work_item.repository ?? ""}:${row.work_item.id}`} row={row} index={i} />
-            ))}
+          ? groups.map((g) => <WiGroupSection key={g.key} group={g} open={expanded.has(g.key)} onToggle={() => toggle(g.key)} />)
+          : rows.map((row) => <WiListRow key={wiKey(row)} row={row} />)}
       </List>
     </>
   );
 }
 
+const wiKey = (row: WiRow) => `${row.connection_id}:${row.work_item.repository ?? ""}:${row.work_item.id}`;
+
+const isBlocked = (row: WiRow) => row.work_item.state.toLowerCase() === "blocked";
+
 function WiGroupSection({ group, open, onToggle }: { group: WiGroup; open: boolean; onToggle: () => void }) {
   const { parent, rows } = group;
-  const blocked = rows.filter((r) => r.work_item.state.toLowerCase() === "blocked").length;
-  const unblockedIn = (category: string) =>
-    rows.filter((r) => r.work_item.state_category === category && r.work_item.state.toLowerCase() !== "blocked").length;
+  const blocked = rows.filter(isBlocked).length;
+  const unblockedIn = (category: string) => rows.filter((r) => r.work_item.state_category === category && !isBlocked(r)).length;
   const inProgress = unblockedIn("Started");
   const inReview = unblockedIn("Review");
+  const counts: { text: string; color: string }[] = [{ text: `${rows.length} ${rows.length === 1 ? "item" : "items"}`, color: "var(--fg3)" }];
+  if (inProgress > 0) counts.push({ text: `${inProgress} in progress`, color: "var(--fg3)" });
+  if (inReview > 0) counts.push({ text: `${inReview} in review`, color: "var(--cyan)" });
+  if (blocked > 0) counts.push({ text: `${blocked} blocked`, color: "var(--red)" });
   return (
-    <div className="flex flex-col gap-2">
-      <div
-        className="flex items-center gap-3 rounded-lg px-3 py-1.5"
-        style={{ background: "var(--panel2)", border: "1px solid var(--border)" }}
-      >
-        <button
-          type="button"
-          onClick={onToggle}
-          aria-expanded={open}
-          className="flex-1 min-w-0 text-left flex items-center gap-2"
-          style={{ cursor: "pointer" }}
-        >
-          <span className="text-xs shrink-0" style={{ color: "var(--dim)" }} aria-hidden="true">
-            {open ? "▾" : "▸"}
-          </span>
+    <>
+      {/* The link sits beside the toggle, not inside it: a link within a button is not a link. */}
+      <div className="relative">
+        <ToggleRow open={open} onToggle={onToggle} style={parent?.url ? { paddingRight: 44 } : undefined}>
           {parent && (
-            <span className="shrink-0">
-              <Chip>{parent.kind}</Chip>
+            <span className="text-[12px] shrink-0" style={{ color: "var(--fg3)" }}>
+              {parent.kind}
             </span>
           )}
-          <span className="truncate font-medium min-w-0" style={{ color: "var(--fg)" }}>
-            {parent ? parent.title : "No parent"}
+          <span className="truncate font-medium min-w-0">{parent ? parent.title : "No parent"}</span>
+          <span className="flex items-center gap-1.5 shrink-0 text-[12px] num">
+            {counts.map((c, i) => (
+              <span key={c.text} className="inline-flex items-center gap-1.5">
+                {i > 0 && (
+                  <span aria-hidden="true" style={{ color: "var(--fg3)" }}>
+                    ·
+                  </span>
+                )}
+                <span style={{ color: c.color }}>{c.text}</span>
+              </span>
+            ))}
           </span>
-          <span className="text-xs shrink-0" style={{ color: "var(--dim)" }}>
-            {rows.length} {rows.length === 1 ? "item" : "items"}
-          </span>
-          {inProgress > 0 && (
-            <span className="text-xs shrink-0" style={{ color: "var(--dim)" }}>
-              {inProgress} in progress
-            </span>
-          )}
-          {inReview > 0 && (
-            <span className="text-xs shrink-0" style={{ color: "var(--cyan)" }}>
-              {inReview} in review
-            </span>
-          )}
-          {blocked > 0 && (
-            <span className="text-xs shrink-0" style={{ color: "var(--red)" }}>
-              {blocked} blocked
-            </span>
-          )}
-        </button>
+        </ToggleRow>
         {parent?.url && (
           <a
             href={parent.url}
             target="_blank"
             rel="noreferrer"
-            className="text-xs shrink-0"
-            style={{ color: "var(--dim)" }}
+            className="ft-btn ft-btn-icon absolute right-1 top-1/2 -translate-y-1/2"
             aria-label={`Open ${parent.kind} ${parent.title} in a new tab`}
             title="Open in a new tab"
           >
-            ↗
+            <Icon name="external" size={14} />
           </a>
         )}
       </div>
-      {open &&
-        rows.map((row, i) => (
-          <WiCard key={`${row.connection_id}:${row.work_item.repository ?? ""}:${row.work_item.id}`} row={row} index={i} />
-        ))}
-    </div>
+      {open && rows.map((row) => <WiListRow key={wiKey(row)} row={row} indent />)}
+    </>
   );
 }
 
-function WiCard({ row, index }: { row: WiRow; index: number }) {
+/** One work item: glyph · key · title · type · assignee · age. Under a group header it is
+ *  indented past the chevron so its glyph lines up with the parent's title. */
+function WiListRow({ row, indent = false }: { row: WiRow; indent?: boolean }) {
   const wi = row.work_item;
-  const color = wiStateColor(wi.state, wi.state_category);
   const open = useWiOpener();
+  const current = useCurrentWi();
+  const blocked = isBlocked(row);
   return (
-    <motion.div
-      initial={{ opacity: 0, y: 6 }}
-      animate={{ opacity: 1, y: 0 }}
-      transition={{ duration: 0.22, delay: Math.min(index * 0.02, 0.3), ease: "easeOut" }}
-      className="flex items-center gap-3 rounded-lg px-3 py-1.5"
-      style={{ background: "var(--card)", border: "1px solid var(--border)" }}
-    >
-      <button
-        onClick={() => open({ conn: row.connection_id, repo: wi.repository, id: wi.id })}
-        className="flex-1 min-w-0 text-left flex items-center gap-2"
-        style={{ cursor: "pointer" }}
-      >
-        <StatusBadge label={wi.state} color={color} />
-        {wi.identifier && <span className="mono text-xs shrink-0" style={{ color: "var(--dim)" }}>{wi.identifier}</span>}
-        <span className="truncate font-medium min-w-0" style={{ color: "var(--fg)" }}>
-          {wi.title}
+    <Row selected={sameRef(current, { conn: row.connection_id, repo: wi.repository, id: wi.id })} onClick={() => open({ conn: row.connection_id, repo: wi.repository, id: wi.id })} className={indent ? "pl-9!" : undefined}>
+      <StatusGlyph glyph={wiStateGlyph(wi.state, wi.state_category)} color={wiStateColor(wi.state, wi.state_category)} title={wi.state} />
+      <span className="mono shrink-0 truncate" style={{ width: 76, color: "var(--fg3)" }}>
+        {wi.identifier}
+      </span>
+      <span className="flex-1 min-w-0 truncate">
+        <span>{wi.title}</span>
+        {blocked && <span style={{ color: "var(--red)" }}> · blocked</span>}
+      </span>
+      {wi.work_item_type && (
+        <span className="text-[12px] shrink-0 whitespace-nowrap" style={{ color: "var(--fg3)" }}>
+          {wi.work_item_type}
         </span>
-        {wi.work_item_type && (
-          <span className="shrink-0 inline-flex items-center gap-1.5" style={{ color: "var(--dim)" }}>
-            <Chip>{wi.work_item_type}</Chip>
-            {wi.work_item_type.toLowerCase() === "bug" && <BugIcon />}
-          </span>
-        )}
-      </button>
-      <div className="flex items-center gap-2 shrink-0">
-        <span className="text-xs whitespace-nowrap" style={{ color: "var(--dim)" }}>
-          {relativeTime(wi.updated_at)}
-        </span>
-        {wi.assignee && <Avatar name={wi.assignee.display_name} />}
-      </div>
-    </motion.div>
-  );
-}
-
-/** Small bug glyph shown inside the [Bug] type chip. Lucide "bug" icon (ISC), inlined so it
- *  inherits the chip's currentColor and stays offline-friendly. */
-function BugIcon() {
-  return (
-    <svg
-      viewBox="0 0 24 24"
-      width="12"
-      height="12"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      aria-hidden="true"
-    >
-      <path d="m8 2 1.88 1.88" />
-      <path d="M14.12 3.88 16 2" />
-      <path d="M9 7.13v-1a3.003 3.003 0 1 1 6 0v1" />
-      <path d="M12 20c-3.3 0-6-2.7-6-6v-3a4 4 0 0 1 4-4h4a4 4 0 0 1 4 4v3c0 3.3-2.7 6-6 6" />
-      <path d="M12 20v-9" />
-      <path d="M6.53 9C4.6 8.8 3 7.1 3 5" />
-      <path d="M6 13H2" />
-      <path d="M3 21c0-2.1 1.7-3.9 3.8-4" />
-      <path d="M20.97 5c0 2.1-1.6 3.8-3.5 4" />
-      <path d="M22 13h-4" />
-      <path d="M17.2 17c2.1.1 3.8 1.9 3.8 4" />
-    </svg>
+      )}
+      <span className="inline-flex shrink-0 justify-center" style={{ width: 18 }}>
+        {wi.assignee && <Avatar name={wi.assignee.display_name} size={18} />}
+      </span>
+      <span className="num text-[12px] shrink-0 text-right whitespace-nowrap" style={{ width: 34, color: "var(--fg3)" }}>
+        {shortAge(wi.updated_at)}
+      </span>
+    </Row>
   );
 }

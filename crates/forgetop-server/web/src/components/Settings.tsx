@@ -4,7 +4,9 @@ import { useQueryClient } from "@tanstack/react-query";
 import { apiPost, useConnections, useHealth, useWriteAction } from "../api";
 import type { ConnectionRow } from "../types";
 import { dropConnectionFromCache } from "../optimistic";
-import { Skeleton, StateCard, StatusBadge } from "./ui";
+import { providerMeta } from "../format";
+import { Icon } from "./icons";
+import { Button, IconButton, SectionHeading, Skeleton, StateCard, StatusBadge } from "./ui";
 import { ErrorState } from "./ErrorState";
 import { ConnectionForm } from "./ConnectionForm";
 
@@ -41,27 +43,23 @@ export function Settings() {
   const healthById = new Map((health.data ?? []).map((h) => [h.connection_id, h.healthy]));
 
   return (
-    <div className="p-5 max-w-4xl mx-auto">
-      <div className="flex items-center justify-between mb-4">
+    <div className="px-6 py-5 max-w-[1280px] mx-auto">
+      <div className="flex items-center justify-between gap-4 mb-3">
         <div>
-          <h2 className="text-sm font-semibold" style={{ color: "var(--fg)" }}>Connections</h2>
-          <p className="text-xs" style={{ color: "var(--dim)" }}>
+          <SectionHeading>Connections</SectionHeading>
+          <p className="m-0 mt-0.5 text-[12px]" style={{ color: "var(--fg3)" }}>
             Shared with the terminal app · tokens are stored in your OS keychain.
           </p>
         </div>
-        <button
-          onClick={() => setEditing(null)}
-          className="rounded-md px-3 py-1.5 text-sm font-medium"
-          style={{ background: "var(--accent)", color: "#0c1a2b" }}
-        >
-          + Add connection
-        </button>
+        <Button primary icon="plus" onClick={() => setEditing(null)}>
+          Add connection
+        </Button>
       </div>
 
       {!data || data.length === 0 ? (
-        <StateCard icon="⊕" title="No connections yet" sub="Add one to start pulling in pull requests, work items, and pipelines." />
+        <StateCard icon={<Icon name="plus" size={24} />} title="No connections yet" sub="Add one to start pulling in pull requests, work items, and pipelines." />
       ) : (
-        <div className="flex flex-col gap-2">
+        <div className="flex flex-col" style={{ borderTop: "1px solid var(--border)" }}>
           {data.map((c) => (
             <ConnectionCard
               key={c.id}
@@ -104,6 +102,7 @@ function ConnectionCard({
 }) {
   const { busy, run } = useWriteAction();
   const [tested, setTested] = useState<boolean | null>(null);
+  const [testing, setTesting] = useState(false);
 
   const del = async () => {
     if (!window.confirm(`Remove "${conn.display_name}"? This also deletes its token from the keychain.`)) return;
@@ -115,49 +114,44 @@ function ConnectionCard({
   };
   const test = async () => {
     setTested(null);
+    setTesting(true);
     try {
       const r = await apiPost<{ healthy: boolean }>("/api/connections/test", { id: conn.id });
       setTested(r.healthy);
     } catch {
       setTested(false);
+    } finally {
+      setTesting(false);
     }
   };
 
   const status = tested ?? healthy; // boolean | undefined
   return (
-    <div className="flex items-center gap-3 rounded-lg px-3 py-2" style={{ background: "var(--card)", border: "1px solid var(--border)" }}>
-      <div className="flex-1 min-w-0 flex items-center gap-2">
-        {/* Status badge follows the app convention (tinted StatusBadge) and sits before the name. */}
-        {status != null && <StatusBadge label={status ? "Connected" : "Auth failed"} color={status ? "var(--green)" : "var(--red)"} />}
+    <div className="flex items-center gap-3 min-h-[44px] px-3" style={{ borderBottom: "1px solid var(--border)" }}>
+      <div className="flex-1 min-w-0 flex items-center gap-3">
+        <span className="inline-block w-1.5 h-1.5 rounded-full shrink-0" style={{ background: providerMeta(conn.provider).color }} title={providerMeta(conn.provider).label} />
         <span className="font-medium truncate" style={{ color: "var(--fg)" }}>{conn.display_name}</span>
-        <span className="text-xs shrink-0" style={{ color: "var(--dim)" }}>
+        {testing ? (
+          <StatusBadge label="Testing" color="var(--blue)" glyph="running" />
+        ) : (
+          status != null && (
+            <StatusBadge
+              label={status ? "Connected" : "Auth failed"}
+              color={status ? "var(--green)" : "var(--red)"}
+              glyph={status ? "check-circle" : "x-circle"}
+            />
+          )
+        )}
+        <span className="text-[12px] truncate" style={{ color: "var(--fg3)" }}>
           {conn.sections.length > 0 ? conn.sections.map((s) => SECTION_LABEL[s] ?? s).join(" · ") : "not shown in any section"}
         </span>
       </div>
-      <div className="flex items-center gap-1.5 shrink-0">
-        <SmallBtn label="Test" onClick={test} disabled={busy} />
-        <SmallBtn label="Edit" onClick={onEdit} disabled={busy} />
-        <SmallBtn label="Delete" onClick={del} disabled={busy} danger />
+      <div className="flex items-center gap-1 shrink-0">
+        <Button quiet sm onClick={test} disabled={busy || testing}>Test</Button>
+        <Button quiet sm onClick={onEdit} disabled={busy}>Edit</Button>
+        <Button danger sm onClick={del} disabled={busy}>Delete</Button>
       </div>
     </div>
-  );
-}
-
-function SmallBtn({ label, onClick, disabled, danger }: { label: string; onClick: () => void; disabled?: boolean; danger?: boolean }) {
-  return (
-    <button
-      onClick={onClick}
-      disabled={disabled}
-      className="text-xs rounded px-2 py-1"
-      style={{
-        color: danger ? "var(--red)" : "var(--dim)",
-        border: "1px solid var(--border)",
-        background: "var(--panel2)",
-        opacity: disabled ? 0.5 : 1,
-      }}
-    >
-      {label}
-    </button>
   );
 }
 
@@ -165,22 +159,24 @@ export function Modal({ title, children, onClose }: { title: string; children: R
   return (
     <motion.div
       className="fixed inset-0 z-50 flex items-start justify-center"
-      style={{ background: "rgba(0,0,0,0.5)", paddingTop: "8vh" }}
+      style={{ background: "rgba(0,0,0,0.4)", paddingTop: "8vh" }}
       initial={{ opacity: 0 }}
       animate={{ opacity: 1 }}
       onClick={onClose}
     >
       <motion.div
+        role="dialog"
+        aria-label={title}
         initial={{ opacity: 0, y: -8, scale: 0.98 }}
         animate={{ opacity: 1, y: 0, scale: 1 }}
         transition={{ duration: 0.15 }}
         onClick={(e) => e.stopPropagation()}
-        className="w-full max-w-lg mx-4 rounded-xl overflow-hidden max-h-[84vh] overflow-y-auto"
-        style={{ background: "var(--panel)", border: "1px solid var(--border)" }}
+        className="w-full max-w-lg mx-4 overflow-hidden max-h-[84vh] overflow-y-auto shadow-2xl"
+        style={{ background: "var(--raised)", border: "1px solid var(--border-strong)", borderRadius: 10 }}
       >
-        <div className="flex items-center justify-between px-5 py-3.5" style={{ borderBottom: "1px solid var(--border)" }}>
-          <span className="font-semibold" style={{ color: "var(--fg)" }}>{title}</span>
-          <button onClick={onClose} className="text-lg leading-none" style={{ color: "var(--dim)" }}>✕</button>
+        <div className="flex items-center justify-between pl-5 pr-3 h-12" style={{ borderBottom: "1px solid var(--border)" }}>
+          <SectionHeading>{title}</SectionHeading>
+          <IconButton icon="x" label="Close" onClick={onClose} />
         </div>
         <div className="p-5">{children}</div>
       </motion.div>

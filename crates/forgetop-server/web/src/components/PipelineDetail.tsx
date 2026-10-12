@@ -1,5 +1,4 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { AnimatePresence } from "framer-motion";
 import { useQueries, useQueryClient } from "@tanstack/react-query";
 import {
   apiGet,
@@ -18,7 +17,7 @@ import {
   usePipelines,
 } from "../api";
 import { unsupportedMessage } from "../capabilities";
-import { fmtSecs, pipeMeta, providerMeta, relativeTime } from "../format";
+import { fmtSecs, pipeMeta, pipeTitle, providerMeta, relativeTime } from "../format";
 import { isActive, rowGates, rowShownStatus, shownStatus } from "../pipeline/grouping";
 import { estimateCandidates, hasTimedJobs, pipelineEstimates, pipelineHistory, type CurrentRun } from "../pipeline/history";
 import { failureSummary, logLines, shortLocation } from "../pipeline/runlog";
@@ -44,11 +43,12 @@ import type {
 } from "../types";
 import { ApprovalBanner } from "./pipeline/ApprovalBanner";
 import { LogPanel } from "./pipeline/LogPanel";
-import { ArtifactsCard, PaneButton, PaneLink, ProblemsCard, statusWord } from "./pipeline/parts";
-import { HistoryStrip } from "./pipeline/RunHistory";
-import { nodeId, RunTimeline } from "./pipeline/RunTimeline";
-import { markCanceled, markRerun, markResponded, NO_CAPS, noteColor, prLink, useNow } from "./pipeline/runState";
-import { Avatar, Chip, SlideOver, StatusBadge } from "./ui";
+import { ArtifactsCard, ExternalIconLink, ProblemsCard, statusWord } from "./pipeline/parts";
+import { HistoryStrip, historyDelta } from "./pipeline/RunHistory";
+import { nodeId, RunTimeline, StageStrip } from "./pipeline/RunTimeline";
+import { markCanceled, markRerun, markResponded, NO_CAPS, NoteLine, prLink, useNow, type Note } from "./pipeline/runState";
+import { Icon } from "./icons";
+import { Avatar, Button, Chip, claimPane, PaneHeader, SlideOver, StatusGlyph, usePaneRegistration } from "./ui";
 
 /** At most `max` characters, the last an ellipsis when cut (the TUI's `truncate`). */
 const truncateChars = (s: string, max: number) => {
@@ -56,21 +56,31 @@ const truncateChars = (s: string, max: number) => {
   return cs.length > max ? `${cs.slice(0, max - 1).join("")}…` : s;
 };
 
+const Sep = () => <span style={{ color: "var(--fg3)" }}>·</span>;
+
 // ---- opener context ----
 
 const PipeOpenerCtx = createContext<(ref: PipeRef) => void>(() => {});
 export const usePipelineOpener = () => useContext(PipeOpenerCtx);
+/** The run open in the pane, so a list can mark its row as selected. */
+const PipeCurrentCtx = createContext<PipeRef | null>(null);
+export const useCurrentPipeline = () => useContext(PipeCurrentCtx);
 
 export function PipelineDetailProvider({ children }: { children: ReactNode }) {
   const [ref, setRef] = useState<PipeRef | null>(null);
-  const open = useCallback((r: PipeRef) => setRef(r), []);
+  const close = useCallback(() => setRef(null), []);
+  usePaneRegistration("pipeline", close);
+  // One pane at a time: opening a run closes a PR or work-item pane (after its guard, if any).
+  const open = useCallback((r: PipeRef) => {
+    if (claimPane("pipeline")) setRef(r);
+  }, []);
   return (
     <PipeOpenerCtx.Provider value={open}>
-      {children}
-      {/* Keyed by run: another run gets a fresh panel, so no frame shows the last run's state. */}
-      <AnimatePresence>
-        {ref && <PipelineDetailPanel key={`${ref.conn}|${ref.repo ?? ""}|${ref.runId}`} pipeRef={ref} onClose={() => setRef(null)} />}
-      </AnimatePresence>
+      <PipeCurrentCtx.Provider value={ref}>
+        {children}
+        {/* Keyed by run: another run gets a fresh panel, so no frame shows the last run's state. */}
+        {ref && <PipelineDetailPanel key={`${ref.conn}|${ref.repo ?? ""}|${ref.runId}`} pipeRef={ref} onClose={close} />}
+      </PipeCurrentCtx.Provider>
     </PipeOpenerCtx.Provider>
   );
 }
@@ -106,7 +116,7 @@ function PipelineDetailPanel({ pipeRef, onClose }: { pipeRef: PipeRef; onClose: 
   const gates = rowGates({ approvals });
 
   const [busy, setBusy] = useState(false);
-  const [note, setNote] = useState<string | null>(null);
+  const [note, setNote] = useState<Note | null>(null);
   const [folds, setFolds] = useState<Record<string, boolean>>({});
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [logTarget, setLogTarget] = useState<LogTarget | null>(null);
@@ -205,16 +215,16 @@ function PipelineDetailPanel({ pipeRef, onClose }: { pipeRef: PipeRef; onClose: 
   ) => {
     setBusy(true);
     if (opts.optimistic) {
-      setNote(`${label} ✓`);
+      setNote({ text: label, tone: "ok" });
       await opts.optimistic();
     } else {
-      setNote(opts.progress ?? null);
+      setNote(opts.progress ? { text: opts.progress, tone: "progress" } : null);
     }
     try {
       const said = await fn();
-      setNote(said ?? `${label} ✓`);
+      setNote({ text: said ?? label, tone: "ok" });
     } catch (e) {
-      setNote(e instanceof Error ? e.message : String(e));
+      setNote({ text: e instanceof Error ? e.message : String(e), tone: "error" });
     } finally {
       refresh();
       setBusy(false);
@@ -249,7 +259,7 @@ function PipelineDetailPanel({ pipeRef, onClose }: { pipeRef: PipeRef; onClose: 
         const r = await rerunPipeline(pipeRef, failedOnly);
         if (startsNew || (r.new_run_id && r.new_run_id !== pipeRef.runId)) {
           qc.invalidateQueries({ queryKey: ["pipelines"] });
-          return "Started a new run ✓";
+          return "Started a new run";
         }
       },
       startsNew
@@ -308,6 +318,7 @@ function PipelineDetailPanel({ pipeRef, onClose }: { pipeRef: PipeRef; onClose: 
 
   const meta = shown ? pipeMeta(shown) : null;
   const name = listRow?.definition_name ?? run?.name ?? run?.definition_id ?? null;
+  const title = run ? pipeTitle(run, listRow?.definition_name) : null;
   const elapsed = run ? runSecs(run, now) : null;
   const pr = run ? prLink(run) : null;
   const parked = run && shown === "Waiting" ? parkedSplit(run, now) : null;
@@ -316,96 +327,98 @@ function PipelineDetailPanel({ pipeRef, onClose }: { pipeRef: PipeRef; onClose: 
     const left = estimates.runMedian - (elapsed ?? 0);
     eta =
       left > 0 ? (
-        <>
-          <span style={{ color: "var(--yellow)" }}>done in ~{fmtSecs(left)}</span>
-          <span>(median of last {estimates.runN})</span>
-        </>
+        <span>
+          <span className="num" style={{ color: "var(--yellow)" }}>
+            done in ~{fmtSecs(left)}
+          </span>{" "}
+          <span style={{ color: "var(--fg3)" }}>(median of last {estimates.runN})</span>
+        </span>
       ) : (
-        <span style={{ color: "var(--yellow)" }}>past the usual {fmtSecs(estimates.runMedian)}</span>
+        <span className="num" style={{ color: "var(--yellow)" }}>
+          past the usual {fmtSecs(estimates.runMedian)}
+        </span>
       );
   }
+  const delta = history ? historyDelta(history) : null;
 
   const who = run?.triggered_by?.display_name;
   const when = run?.finished_at ? `finished ${relativeTime(run.finished_at)}` : run?.started_at ? `started ${relativeTime(run.started_at)}` : null;
-  const facts = [who, when, run?.attempt != null ? `attempt ${run.attempt}` : null].filter(Boolean).join(" · ");
+
+  // The second line: state · workflow · who and what triggered it · commit · time · median.
+  const facts: ReactNode[] = [];
+  if (run && meta && shown) {
+    facts.push(
+      <span key="state" className="font-medium" style={{ color: meta.color }}>
+        {statusWord(shown)}
+      </span>,
+    );
+    if (name && name !== title) facts.push(<span key="name">{name}</span>);
+    if (who || run.event || run.branch)
+      facts.push(
+        <span key="who" className="inline-flex items-center gap-1.5 min-w-0">
+          {who && <Avatar name={who} size={18} />}
+          {who && <span>{who}</span>}
+          {run.event && <span>{run.branch ? `${run.event} to` : run.event}</span>}
+          {run.branch && <Chip title="branch">{run.branch}</Chip>}
+        </span>,
+      );
+    if (run.commit_sha)
+      facts.push(
+        <span key="sha" className="mono" title={run.commit_sha}>
+          {run.commit_sha.slice(0, 7)}
+        </span>,
+      );
+    if (elapsed !== null)
+      facts.push(
+        <span key="elapsed" className="inline-flex items-center gap-1">
+          {active && <span>running</span>}
+          <span className="num" style={{ color: "var(--fg)" }} title="Elapsed">
+            {fmtSecs(elapsed)}
+          </span>
+        </span>,
+      );
+    if (history?.medianSecs != null)
+      facts.push(
+        <span key="median" className="num">
+          median {fmtSecs(history.medianSecs)}
+          {delta && <span style={{ color: delta.color }}> ({delta.text})</span>}
+        </span>,
+      );
+    if (when) facts.push(<span key="when">{when}</span>);
+    if (run.attempt != null && run.attempt > 1) facts.push(<span key="attempt">attempt {run.attempt}</span>);
+    if (run.pull_request != null)
+      facts.push(
+        pr ? (
+          <a key="pr" href={pr} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1" style={{ color: "var(--accent-fg)" }}>
+            PR <span className="mono">#{run.pull_request}</span>
+            <Icon name="external" size={12} />
+          </a>
+        ) : (
+          <span key="pr">
+            PR <span className="mono">#{run.pull_request}</span>
+          </span>
+        ),
+      );
+    if (eta) facts.push(<span key="eta">{eta}</span>);
+    if (parked)
+      facts.push(
+        <span key="parked" className="num" style={{ color: "var(--yellow)" }}>
+          ran {fmtSecs(parked.worked)}, then waiting {fmtSecs(parked.waited)}
+        </span>,
+      );
+  }
 
   const header = (
-    <>
-      {meta && shown && (
-        <div className="flex items-center gap-1.5 shrink-0 mt-0.5">
-          {meta.running && (
-            <span className="spin text-xs" style={{ color: meta.color }} aria-hidden="true">
-              ◐
-            </span>
-          )}
-          <StatusBadge label={meta.running ? statusWord(shown) : `${meta.icon} ${statusWord(shown)}`} color={meta.color} />
-        </div>
-      )}
-      <div className="flex-1 min-w-0 flex flex-col gap-1">
-        <div className="flex items-baseline gap-2.5 flex-wrap">
-          <span className="font-semibold" style={{ color: "var(--fg)" }}>
-            {name ?? (isLoading ? "Loading…" : "Pipeline run")}
-            {run?.number != null && (
-              <span className="mono font-medium ml-1.5" style={{ color: "var(--dim)" }}>
-                #{run.number}
-              </span>
-            )}
-          </span>
-          {elapsed !== null && (
-            <span className="font-semibold" style={{ color: "var(--fg)" }} title="Elapsed">
-              {fmtSecs(elapsed)}
-            </span>
-          )}
-          {run?.event && (
-            <span className="text-xs" style={{ color: "var(--dim)" }}>
-              {run.event} →
-            </span>
-          )}
-          {run?.branch && (
-            <Chip title="branch">
-              <span style={{ color: "var(--cyan)" }}>⑂ {run.branch}</span>
-            </Chip>
-          )}
-        </div>
-        {run && (run.commit_sha || run.title) && (
-          <div className="flex items-baseline gap-2.5 text-[13px] min-w-0">
-            {run.commit_sha && (
-              <span className="mono text-xs shrink-0" style={{ color: "var(--magenta)" }}>
-                {run.commit_sha.slice(0, 7)}
-              </span>
-            )}
-            {run.title && (
-              <span className="truncate" style={{ color: "var(--fg)" }}>
-                {run.title}
-              </span>
-            )}
-          </div>
-        )}
-        {run && (
-          <div className="flex items-center gap-1.5 text-xs flex-wrap" style={{ color: "var(--dim)" }}>
-            {who && <Avatar name={who} size={16} />}
-            {facts && <span>{facts}</span>}
-            {run.pull_request != null &&
-              (pr ? (
-                <a href={pr} target="_blank" rel="noreferrer" style={{ color: "var(--accent)" }}>
-                  {facts && "· "}PR #{run.pull_request} ↗
-                </a>
-              ) : (
-                <span>
-                  {facts && "· "}PR #{run.pull_request}
-                </span>
-              ))}
-            {(eta || parked) && <span>·</span>}
-            {eta}
-            {parked && (
-              <span style={{ color: "var(--yellow)" }}>
-                ran {fmtSecs(parked.worked)}, then waiting {fmtSecs(parked.waited)}
-              </span>
-            )}
-          </div>
-        )}
-      </div>
-    </>
+    <PaneHeader
+      glyph={meta?.glyph}
+      color={meta?.color}
+      title={title ?? (isLoading ? "Loading…" : "Pipeline run")}
+      ident={run?.number != null ? `#${run.number}` : undefined}
+      actions={run?.url ? <ExternalIconLink href={run.url} label={`Open in ${providerLabel}`} /> : undefined}
+    >
+      {facts.length > 0 &&
+        facts.flatMap((f, i) => (i === 0 ? [f] : [<Sep key={`sep${i}`} />, f]))}
+    </PaneHeader>
   );
 
   // ---- failure line and approval banner ----
@@ -428,62 +441,118 @@ function PipelineDetailPanel({ pipeRef, onClose }: { pipeRef: PipeRef; onClose: 
 
   const gate = (supported: boolean, also?: string | null) => (supported ? (also ?? undefined) : unsupported);
   const hasFailedJobs = allJobs.some((j) => j.status === "Failed" || j.status === "Canceled");
-  const artifactsLabel = active
-    ? "⬇ Artifacts · none yet"
-    : artifactsQ.data
-      ? `⬇ Artifacts · ${artifactsQ.data.length}`
-      : "⬇ Artifacts";
+  const artifactsLabel = active ? "Artifacts · none yet" : artifactsQ.data ? `Artifacts · ${artifactsQ.data.length}` : "Artifacts";
+
+  const showHistory = !!history && history.entries.length >= 2;
+  const footer =
+    run && data && shown ? (
+      <>
+        {showHistory && history && (
+          <HistoryStrip
+            history={history}
+            onOpen={(i) => {
+              const r = rows[i];
+              if (r) openRun({ conn: r.connection_id, repo: r.run.repository, runId: r.run.id });
+            }}
+          />
+        )}
+        {note && <NoteLine note={note} className={showHistory ? "ml-3" : undefined} />}
+        <span className="ml-auto flex items-center gap-1.5 shrink-0">
+          <Button
+            quiet
+            aria-pressed={artifactsOpen && !active}
+            disabled={!caps.supports_artifacts || active}
+            title={gate(caps.supports_artifacts, active ? "Artifacts appear once the run finishes" : artifactsOpen ? "Hide artifacts" : "Show artifacts")}
+            onClick={() => setArtifactsOpen((o) => !o)}
+          >
+            {artifactsLabel}
+          </Button>
+          {active ? (
+            <Button danger disabled={busy} onClick={cancel}>
+              Cancel
+            </Button>
+          ) : (
+            <>
+              <Button
+                quiet
+                disabled={busy || !caps.supports_rerun}
+                title={gate(caps.supports_rerun, caps.rerun_starts_new_run ? "Starts a new run" : "Runs it again as the next attempt")}
+                onClick={() => rerun(false)}
+              >
+                Re-run
+              </Button>
+              <Button
+                quiet
+                disabled={busy || !caps.supports_rerun_failed || !hasFailedJobs}
+                title={gate(caps.supports_rerun_failed, hasFailedJobs ? "Runs the failed and canceled jobs again" : "No job failed")}
+                onClick={() => rerun(true)}
+              >
+                Re-run failed jobs
+              </Button>
+            </>
+          )}
+        </span>
+      </>
+    ) : undefined;
 
   return (
-    <SlideOver onClose={onClose} header={header} width="5xl">
+    <SlideOver onClose={onClose} header={header} footer={footer} width="xl" label="Pipeline run">
       {error && (
-        <div className="p-6 text-sm" style={{ color: "var(--red)" }}>
+        <div className="px-5 py-6 text-[13px]" style={{ color: "var(--red)" }}>
           Couldn't load this pipeline run.
         </div>
       )}
       {!data && isLoading && (
-        <div className="p-6 text-sm" style={{ color: "var(--dim)" }}>
+        <div className="px-5 py-6 text-[13px]" style={{ color: "var(--fg3)" }}>
           Loading…
         </div>
       )}
 
       {run && data && shown && (
-        <>
+        <div className="px-5 pt-4 pb-5 flex flex-col gap-4">
           {run.status === "Failed" && (failed || failDetail) && (
             <div
-              className="flex items-center gap-2 px-5 py-2 text-[13px] flex-wrap"
-              style={{ background: "color-mix(in srgb, var(--red) 8%, transparent)", borderBottom: "1px solid color-mix(in srgb, var(--red) 25%, transparent)" }}
+              className="flex items-center gap-2 px-3 py-2.5 text-[12.5px] flex-wrap"
+              style={{
+                borderRadius: 6,
+                border: "1px solid color-mix(in srgb, var(--red) 35%, transparent)",
+                background: "color-mix(in srgb, var(--red) 6%, transparent)",
+              }}
               role="status"
             >
-              <span className="font-bold" style={{ color: "var(--red)" }}>
-                ✗ {failed?.name ?? "Run"} failed
+              <StatusGlyph glyph="x-circle" color="var(--red)" />
+              <span className="font-medium" style={{ color: "var(--fg)" }}>
+                {failed?.name ?? "Run"} failed
               </span>
               {failDetail?.test && (
                 <>
-                  <span style={{ color: "var(--red)" }}>·</span>
-                  <span className="mono text-xs" style={{ color: "var(--fg)" }}>
+                  <Sep />
+                  <span className="mono" style={{ color: "var(--fg)" }}>
                     {failDetail.test}
                   </span>
                 </>
               )}
               {failDetail?.location && (
                 <>
-                  <span style={{ color: "var(--red)" }}>·</span>
-                  <span className="mono text-xs" style={{ color: "var(--red)" }}>
+                  <Sep />
+                  <span className="mono" style={{ color: "var(--red)" }}>
                     {failDetail.location}
                   </span>
                 </>
               )}
               {failMessage && (
                 <>
-                  <span style={{ color: "var(--red)" }}>·</span>
-                  <span className="mono text-xs" style={{ color: "var(--fg)" }}>
+                  <Sep />
+                  <span className="mono" style={{ color: "var(--fg2)" }}>
                     {failMessage}
                   </span>
                 </>
               )}
-              <span className="flex-1" />
-              {failed && <PaneButton label="Jump to error ↓" color="var(--red)" onClick={jumpToError} />}
+              {failed && (
+                <Button quiet sm className="ml-auto" style={{ color: "var(--red)" }} onClick={jumpToError}>
+                  Jump to error
+                </Button>
+              )}
             </div>
           )}
 
@@ -500,66 +569,20 @@ function PipelineDetailPanel({ pipeRef, onClose }: { pipeRef: PipeRef; onClose: 
             />
           )}
           {approvals.length === 0 && !caps.supports_approvals && shown === "Waiting" && (
-            <div className="px-5 py-1.5 text-xs" style={{ color: "var(--dim)", borderBottom: "1px solid var(--border)" }}>
+            <div className="text-[12px]" style={{ color: "var(--fg3)" }}>
               Approvals not supported on {providerLabel}
             </div>
           )}
 
-          <div className="px-5 py-4 flex flex-col gap-3.5">
-            <div className="flex items-center gap-2 flex-wrap">
-              {active ? (
-                <PaneButton label="■ Cancel" color="var(--red)" disabled={busy} onClick={cancel} />
-              ) : (
-                <>
-                  <PaneButton
-                    label="↻ Re-run"
-                    color="var(--accent)"
-                    disabled={busy || !caps.supports_rerun}
-                    title={gate(caps.supports_rerun, caps.rerun_starts_new_run ? "Starts a new run" : "Runs it again as the next attempt")}
-                    onClick={() => rerun(false)}
-                  />
-                  <PaneButton
-                    label="↻ Re-run failed jobs"
-                    color="var(--yellow)"
-                    disabled={busy || !caps.supports_rerun_failed || !hasFailedJobs}
-                    title={gate(caps.supports_rerun_failed, hasFailedJobs ? "Runs the failed and canceled jobs again" : "No job failed")}
-                    onClick={() => rerun(true)}
-                  />
-                </>
-              )}
-              <PaneButton
-                label={artifactsLabel}
-                neutral
-                pressed={artifactsOpen && !active}
-                disabled={!caps.supports_artifacts || active}
-                title={gate(caps.supports_artifacts, active ? "Artifacts appear once the run finishes" : artifactsOpen ? "Hide artifacts" : "Show artifacts")}
-                onClick={() => setArtifactsOpen((o) => !o)}
-              />
-              <span className="flex-1" />
-              {run.url && <PaneLink href={run.url}>Open ↗</PaneLink>}
-            </div>
-            {note && (
-              <div className="text-xs -mt-1.5" style={{ color: noteColor(note) }} role="status">
-                {note}
-              </div>
-            )}
+          <StageStrip run={run} nodes={nodes} />
 
-            {artifactsOpen && !active && caps.supports_artifacts && (
-              <ArtifactsCard artifacts={artifactsQ.data} loading={artifactsQ.isLoading} error={!!artifactsQ.error} />
-            )}
+          {artifactsOpen && !active && caps.supports_artifacts && (
+            <ArtifactsCard artifacts={artifactsQ.data} loading={artifactsQ.isLoading} error={!!artifactsQ.error} />
+          )}
 
-            {!active && annotations.length > 0 && <ProblemsCard annotations={annotations} onOpenJob={openJobLog} />}
+          {!active && annotations.length > 0 && <ProblemsCard annotations={annotations} onOpenJob={openJobLog} />}
 
-            {history && history.entries.length >= 2 && (
-              <HistoryStrip
-                history={history}
-                onOpen={(i) => {
-                  const r = rows[i];
-                  if (r) openRun({ conn: r.connection_id, repo: r.run.repository, runId: r.run.id });
-                }}
-              />
-            )}
-
+          <div className="-mx-2">
             <RunTimeline
               run={run}
               nodes={nodes}
@@ -572,21 +595,21 @@ function PipelineDetailPanel({ pipeRef, onClose }: { pipeRef: PipeRef; onClose: 
               onSelect={onSelect}
               providerLabel={providerLabel}
             />
-
-            {logTarget && (
-              <LogPanel
-                key={`${logTarget.jobId}|${logTarget.step ?? ""}`}
-                pipeRef={pipeRef}
-                jobId={logTarget.jobId}
-                job={logJob}
-                step={logTarget.step}
-                live={logLive}
-                jumpToken={logTarget.jump ? jumpToken : 0}
-                onClose={closeLog}
-              />
-            )}
           </div>
-        </>
+
+          {logTarget && (
+            <LogPanel
+              key={`${logTarget.jobId}|${logTarget.step ?? ""}`}
+              pipeRef={pipeRef}
+              jobId={logTarget.jobId}
+              job={logJob}
+              step={logTarget.step}
+              live={logLive}
+              jumpToken={logTarget.jump ? jumpToken : 0}
+              onClose={closeLog}
+            />
+          )}
+        </div>
       )}
     </SlideOver>
   );

@@ -155,9 +155,10 @@ describe("repository scope", () => {
     // Both rows render — a duplicate React key would have collapsed them into one.
     expect(await screen.findByText("Retries in pay")).toBeInTheDocument();
     expect(await screen.findByText("Retries in web")).toBeInTheDocument();
-    // The repository chip is what tells them apart now the connection label can't.
-    expect(screen.getByText("acme/pay")).toBeInTheDocument();
-    expect(screen.getByText("acme/web")).toBeInTheDocument();
+    // The repository is what tells them apart now the connection label can't: the row prints
+    // its short name and carries the full one as a tooltip.
+    expect(screen.getByTitle("acme/pay")).toHaveTextContent("pay");
+    expect(screen.getByTitle("acme/web")).toHaveTextContent("web");
 
     await userEvent.click(screen.getByText("Retries in web"));
     const detail = fetchMock.mock.calls.map((c) => String(c[0])).find((u) => u.includes("/api/pr/detail"));

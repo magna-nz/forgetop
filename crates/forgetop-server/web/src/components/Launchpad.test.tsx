@@ -10,9 +10,9 @@ const { navigate, openPr, openWi } = vi.hoisted(() => ({
   openWi: vi.fn(),
 }));
 vi.mock("../nav", () => ({ useNavigateSection: () => navigate }));
-vi.mock("./PrDetail", () => ({ usePrOpener: () => openPr }));
-vi.mock("./WiDetail", () => ({ useWiOpener: () => openWi }));
-vi.mock("./PipelineDetail", () => ({ usePipelineOpener: () => vi.fn() }));
+vi.mock("./PrDetail", () => ({ usePrOpener: () => openPr, useCurrentPr: () => null }));
+vi.mock("./WiDetail", () => ({ useWiOpener: () => openWi, useCurrentWi: () => null }));
+vi.mock("./PipelineDetail", () => ({ usePipelineOpener: () => vi.fn(), useCurrentPipeline: () => null }));
 
 // Imported after the mocks so the component picks them up.
 import { Launchpad } from "./Launchpad";
@@ -166,7 +166,25 @@ describe("Launchpad", () => {
     renderWithClient(<Launchpad />);
 
     expect(await screen.findByText("Rotate the KMS signing keys")).toBeInTheDocument();
-    expect(screen.getByText(/checks failing/i)).toBeInTheDocument();
+    // The check status is the row's signal glyph, announced by its accessible name.
+    expect(screen.getByRole("img", { name: /checks failing/i })).toBeInTheDocument();
+  });
+
+  it("names the blocker on a needs-fixing row and a blocked work item, with mono identifiers", async () => {
+    const pr = prRow("needs_fixing", "Bump Next.js to 14.2.5", "1492");
+    pr.pull_request.repository = "acme/payments";
+    pr.pull_request.checks = "Failed";
+    const wi = wiRow("your_work", "Migrate feature flags", "1");
+    wi.work_item.identifier = "ENG-198";
+    wi.work_item.state = "Blocked";
+    mockFetch({ get: { "/api/launchpad": { rows: [pr, wi], more: noOverflow } } });
+    renderWithClient(<Launchpad />);
+
+    expect(await screen.findByText("Bump Next.js to 14.2.5")).toBeInTheDocument();
+    expect(screen.getByText("checks failing")).toBeInTheDocument();
+    expect(screen.getByText("payments #1492")).toBeInTheDocument();
+    expect(screen.getByText("ENG-198")).toBeInTheDocument();
+    expect(screen.getByText("blocked")).toBeInTheDocument();
   });
 
   // The TUI titles pipeline rows from `run.title` via `launchpad::pipe_title`. If this drifts,

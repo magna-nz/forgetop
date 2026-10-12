@@ -1,6 +1,7 @@
 // The run pane's state helpers: what a write does to the cached run detail before the provider
 // answers (the TUI's `mark_rerun` / `mark_canceled`), and small pane-wide utilities.
 import { useEffect, useState } from "react";
+import { Icon } from "../icons";
 import { gateStage, isActive, rowGates, shownStatus } from "../../pipeline/grouping";
 import type { ApprovalDecision, PipelineApproval, PipelineCapabilities, PipelineDetail, PipelineRun, PipelineRunStatus } from "../../types";
 
@@ -88,4 +89,20 @@ export function markResponded(d: PipelineDetail, approval: PipelineApproval, dec
   return { ...d, approvals, run: { ...d.run, status: d.run.status === "Waiting" ? "Running" : d.run.status, stages } };
 }
 
-export const noteColor = (n: string) => (n.endsWith("✓") ? "var(--green)" : n.endsWith("…") ? "var(--dim)" : "var(--red)");
+/** What the last write said: done (or optimistically assumed done), still under way, or failed. */
+export interface Note {
+  text: string;
+  tone: "ok" | "progress" | "error";
+}
+
+export const noteColor = (n: Note) => (n.tone === "ok" ? "var(--green)" : n.tone === "progress" ? "var(--fg3)" : "var(--red)");
+
+/** The note as one 12px line with its glyph. */
+export function NoteLine({ note, className }: { note: Note; className?: string }) {
+  return (
+    <span role="status" className={`inline-flex items-center gap-1.5 text-[12px] min-w-0 ${className ?? ""}`} style={{ color: noteColor(note) }}>
+      <Icon name={note.tone === "ok" ? "check" : note.tone === "progress" ? "running" : "x-circle"} size={13} spin={note.tone === "progress"} />
+      <span className="truncate">{note.text}</span>
+    </span>
+  );
+}

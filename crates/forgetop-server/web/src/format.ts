@@ -17,10 +17,15 @@ import type {
   TimelineEventKind,
   WorkItemStateCategory,
 } from "./types";
+import type { IconName } from "./components/icons";
+
+export type GlyphName = IconName;
 
 export interface Meta {
   label: string;
   icon: string;
+  /** The status drawn as a stroke icon (see components/icons.tsx); the dashboard's rendering. */
+  glyph: GlyphName;
   color: string;
 }
 
@@ -46,29 +51,29 @@ export function providerMeta(p: ProviderType): { label: string; color: string } 
 }
 
 export function prStatusMeta(pr: PullRequest): Meta {
-  if (pr.is_draft) return { label: "draft", icon: "◌", color: V("dim") };
+  if (pr.is_draft) return { label: "draft", glyph: "pr-draft", icon: "◌", color: V("dim") };
   switch (pr.status) {
     case "Open":
-      return { label: "open", icon: "●", color: V("green") };
+      return { label: "open", glyph: "pr-open", icon: "●", color: V("green") };
     case "Merged":
-      return { label: "merged", icon: "✦", color: V("magenta") };
+      return { label: "merged", glyph: "pr-merged", icon: "✦", color: V("magenta") };
     case "Closed":
-      return { label: "closed", icon: "✗", color: V("red") };
+      return { label: "closed", glyph: "pr-closed", icon: "✗", color: V("red") };
     case "Draft":
-      return { label: "draft", icon: "◌", color: V("dim") };
+      return { label: "draft", glyph: "pr-draft", icon: "◌", color: V("dim") };
   }
 }
 
 export function checkMeta(status: CheckStatus): Meta {
   switch (status) {
     case "Passed":
-      return { label: "checks passing", icon: "✓", color: V("green") };
+      return { label: "checks passing", glyph: "check-circle", icon: "✓", color: V("green") };
     case "Failed":
-      return { label: "checks failing", icon: "✗", color: V("red") };
+      return { label: "checks failing", glyph: "x-circle", icon: "✗", color: V("red") };
     case "Pending":
-      return { label: "checks running", icon: "◐", color: V("yellow") };
+      return { label: "checks running", glyph: "running", icon: "◐", color: V("blue") };
     case "None":
-      return { label: "no checks", icon: "·", color: V("dim") };
+      return { label: "no checks", glyph: "circle", icon: "·", color: V("dim") };
   }
 }
 
@@ -76,13 +81,13 @@ export function voteMeta(vote: ReviewVote): Meta {
   switch (vote) {
     case "Approved":
     case "ApprovedWithSuggestions":
-      return { label: "approved", icon: "✓", color: V("green") };
+      return { label: "approved", glyph: "check-circle", icon: "✓", color: V("green") };
     case "Rejected":
-      return { label: "changes requested", icon: "✗", color: V("red") };
+      return { label: "changes requested", glyph: "warning", icon: "✗", color: V("yellow") };
     case "WaitingForAuthor":
-      return { label: "waiting", icon: "…", color: V("yellow") };
+      return { label: "waiting", glyph: "clock", icon: "…", color: V("yellow") };
     case "NoVote":
-      return { label: "no vote", icon: "·", color: V("dim") };
+      return { label: "no vote", glyph: "circle", icon: "·", color: V("dim") };
   }
 }
 
@@ -101,21 +106,21 @@ export function pipeMeta(status: PipelineRunStatus): Meta & { running: boolean }
   const icon = PIPE_ICON[status];
   switch (status) {
     case "Succeeded":
-      return { label: "succeeded", icon, color: V("green"), running: false };
+      return { label: "succeeded", glyph: "check-circle", icon, color: V("green"), running: false };
     case "Running":
-      return { label: "running", icon, color: V("blue"), running: true };
+      return { label: "running", glyph: "running", icon, color: V("blue"), running: true };
     case "Failed":
-      return { label: "failed", icon, color: V("red"), running: false };
+      return { label: "failed", glyph: "x-circle", icon, color: V("red"), running: false };
     case "PartiallySucceeded":
-      return { label: "partial", icon, color: V("yellow"), running: false };
+      return { label: "partial", glyph: "warning", icon, color: V("yellow"), running: false };
     case "Queued":
-      return { label: "queued", icon, color: V("dim"), running: false };
+      return { label: "queued", glyph: "queued", icon, color: V("dim"), running: false };
     case "Canceled":
-      return { label: "canceled", icon, color: V("dim"), running: false };
+      return { label: "canceled", glyph: "blocked", icon, color: V("dim"), running: false };
     case "Waiting":
-      return { label: "waiting", icon, color: V("yellow"), running: false };
+      return { label: "waiting", glyph: "clock", icon, color: V("yellow"), running: false };
     case "Skipped":
-      return { label: "skipped", icon, color: V("dim"), running: false };
+      return { label: "skipped", glyph: "skipped", icon, color: V("dim"), running: false };
   }
 }
 
@@ -222,10 +227,10 @@ function checksClause(pr: PullRequest): string | null {
 export function prSignalMeta(pr: PullRequest): Meta & { spin: boolean } {
   const st = prState(pr);
   if (st.kind === "blocked" && st.blocker === "conflicting") {
-    return { label: "conflicts", icon: "⚠", color: V("yellow"), spin: false };
+    return { label: "conflicts", glyph: "warning", icon: "⚠", color: V("yellow"), spin: false };
   }
   if (st.kind === "blocked" && st.blocker === "changes_requested") {
-    return { label: "changes requested", icon: "⚠", color: V("yellow"), spin: false };
+    return { label: "changes requested", glyph: "warning", icon: "⚠", color: V("yellow"), spin: false };
   }
   if (st.kind === "checks_running") {
     return { ...checkMeta("Pending"), spin: true };
@@ -235,7 +240,7 @@ export function prSignalMeta(pr: PullRequest): Meta & { spin: boolean } {
 
 /** The one-line verdict: where this pull request stands, and why. Same sentences as the TUI's
  *  `pr_state_line`, from the same `prState`. */
-export function prStateLine(pr: PullRequest): { icon: string; text: string; color: string } {
+export function prStateLine(pr: PullRequest): { icon: string; glyph: GlyphName; text: string; color: string } {
   // The raw ref, as the TUI uses — the two must read identically.
   const target = pr.target_ref || "the target branch";
   const by = (r?: Reviewer) => (r ? ` by ${r.user.display_name}` : "");
@@ -243,42 +248,42 @@ export function prStateLine(pr: PullRequest): { icon: string; text: string; colo
   switch (st.kind) {
     case "merged": {
       const age = relativeTime(pr.updated_at);
-      return { icon: "✦", text: `Merged into ${target}${age ? ` ${age} ago` : ""}`, color: V("magenta") };
+      return { icon: "✦", glyph: "pr-merged", text: `Merged into ${target}${age ? ` ${age} ago` : ""}`, color: V("magenta") };
     }
     case "closed":
-      return { icon: "✗", text: "Closed without merging", color: V("red") };
+      return { icon: "✗", glyph: "x-circle", text: "Closed without merging", color: V("red") };
     case "draft":
-      return { icon: "◌", text: "Draft — not open for review yet", color: V("dim") };
+      return { icon: "◌", glyph: "pr-draft", text: "Draft — not open for review yet", color: V("dim") };
     case "blocked":
       switch (st.blocker) {
         case "conflicting":
-          return { icon: "⚠", text: `Blocked — conflicts with ${target}`, color: V("yellow") };
+          return { icon: "⚠", glyph: "warning", text: `Blocked — conflicts with ${target}`, color: V("yellow") };
         case "changes_requested": {
           const who = pr.reviewers.find((r: Reviewer) => r.vote === "Rejected");
-          return { icon: "⚠", text: `Blocked — changes requested${by(who)}`, color: V("yellow") };
+          return { icon: "⚠", glyph: "warning", text: `Blocked — changes requested${by(who)}`, color: V("yellow") };
         }
         case "checks_failing": {
           // The count of failures, never total minus passed: with checks still in flight that
           // subtraction reports work-in-progress as failed.
           const s = pr.check_summary;
           const detail = s && s.failed > 0 ? `${s.failed} of ${summaryTotal(s)} checks failed` : "checks failing";
-          return { icon: "✗", text: `Blocked — ${detail}`, color: V("red") };
+          return { icon: "✗", glyph: "x-circle", text: `Blocked — ${detail}`, color: V("red") };
         }
       }
     // eslint-disable-next-line no-fallthrough
     case "checks_running": {
       const s = pr.check_summary;
       const detail = s ? `${summaryTotal(s) - s.in_progress} of ${summaryTotal(s)} done` : "still running";
-      return { icon: "◐", text: `Checks running — ${detail}`, color: V("blue") };
+      return { icon: "◐", glyph: "running", text: `Checks running — ${detail}`, color: V("blue") };
     }
     case "ready_to_merge": {
       const who = pr.reviewers.find((r: Reviewer) => r.vote === "Approved" || r.vote === "ApprovedWithSuggestions");
       const parts = [checksClause(pr), `approved${by(who)}`].filter(Boolean);
-      return { icon: "✓", text: `Ready to merge — ${parts.join(", ")}`, color: V("green") };
+      return { icon: "✓", glyph: "check-circle", text: `Ready to merge — ${parts.join(", ")}`, color: V("green") };
     }
     case "nothing_blocking": {
       const parts = [checksClause(pr), pr.reviewers.length === 0 ? "no reviews yet" : null].filter(Boolean);
-      return { icon: "✓", text: `Nothing blocking${parts.length ? ` — ${parts.join(", ")}` : ""}`, color: V("green") };
+      return { icon: "✓", glyph: "check-circle", text: `Nothing blocking${parts.length ? ` — ${parts.join(", ")}` : ""}`, color: V("green") };
     }
   }
 }
@@ -299,52 +304,88 @@ export function wiStateColor(state: string, cat: WorkItemStateCategory): string 
   }
 }
 
-export function notificationMeta(kind: NotificationKind): { icon: string; label: string; color: string } {
-  switch (kind) {
-    case "ReviewRequested":
-      return { icon: "◈", label: "Review requested", color: V("accent") };
-    case "Mention":
-      return { icon: "@", label: "Mention", color: V("magenta") };
-    case "Assigned":
-      return { icon: "◎", label: "Assigned", color: V("cyan") };
-    case "CiFailed":
-      return { icon: "✗", label: "CI failed", color: V("red") };
-    case "Comment":
-      return { icon: "❝", label: "Comment", color: V("yellow") };
-    case "StateChange":
-      return { icon: "↻", label: "State change", color: V("green") };
-    case "Other":
-      return { icon: "•", label: "Update", color: V("dim") };
+/** The work-item state as a glyph: blocked always slashes out; otherwise the category. */
+export function wiStateGlyph(state: string, cat: WorkItemStateCategory): GlyphName {
+  if (state.toLowerCase() === "blocked") return "blocked";
+  switch (cat) {
+    case "Completed":
+      return "check-circle";
+    case "Started":
+      return "half";
+    case "Review":
+      return "review";
+    default:
+      return "circle";
   }
 }
 
-export function timelineMeta(kind: TimelineEventKind): { icon: string; color: string } {
+export function notificationMeta(kind: NotificationKind): { icon: string; glyph: GlyphName; label: string; color: string } {
+  switch (kind) {
+    case "ReviewRequested":
+      return { icon: "◈", glyph: "review", label: "Review requested", color: V("blue") };
+    case "Mention":
+      return { icon: "@", glyph: "at", label: "Mention", color: V("magenta") };
+    case "Assigned":
+      return { icon: "◎", glyph: "user", label: "Assigned", color: V("cyan") };
+    case "CiFailed":
+      return { icon: "✗", glyph: "x-circle", label: "CI failed", color: V("red") };
+    case "Comment":
+      return { icon: "❝", glyph: "comment", label: "Comment", color: V("yellow") };
+    case "StateChange":
+      return { icon: "↻", glyph: "refresh", label: "State change", color: V("green") };
+    case "Other":
+      return { icon: "•", glyph: "dot", label: "Update", color: V("dim") };
+  }
+}
+
+export function timelineMeta(kind: TimelineEventKind): { icon: string; glyph: GlyphName; color: string } {
   switch (kind) {
     case "Approved":
-      return { icon: "✓", color: V("green") };
+      return { icon: "✓", glyph: "check-circle", color: V("green") };
     case "ChangesRequested":
-      return { icon: "✗", color: V("red") };
+      return { icon: "✗", glyph: "x-circle", color: V("red") };
     case "Reviewed":
-      return { icon: "◎", color: V("blue") };
+      return { icon: "◎", glyph: "review", color: V("blue") };
     case "Commented":
-      return { icon: "❝", color: V("yellow") };
+      return { icon: "❝", glyph: "comment", color: V("yellow") };
     case "Merged":
-      return { icon: "✦", color: V("magenta") };
+      return { icon: "✦", glyph: "pr-merged", color: V("magenta") };
     case "Closed":
-      return { icon: "⊘", color: V("red") };
+      return { icon: "⊘", glyph: "blocked", color: V("red") };
     case "Reopened":
-      return { icon: "↻", color: V("green") };
+      return { icon: "↻", glyph: "refresh", color: V("green") };
     case "StateChanged":
-      return { icon: "→", color: V("blue") };
+      return { icon: "→", glyph: "arrow-right", color: V("blue") };
     case "Assigned":
-      return { icon: "◎", color: V("cyan") };
+      return { icon: "◎", glyph: "user", color: V("cyan") };
     case "Labeled":
-      return { icon: "▪", color: V("dim") };
+      return { icon: "▪", glyph: "dot", color: V("dim") };
     case "Committed":
-      return { icon: "●", color: V("dim") };
+      return { icon: "●", glyph: "dot", color: V("dim") };
     default:
-      return { icon: "•", color: V("dim") };
+      return { icon: "•", glyph: "dot", color: V("dim") };
   }
+}
+
+/** The last segment of a connection-relative repository (`acme/pay` → `pay`), for display. */
+export function repoShort(repo?: string | null): string {
+  if (!repo) return "";
+  const i = repo.lastIndexOf("/");
+  return i >= 0 ? repo.slice(i + 1) : repo;
+}
+
+/** `relativeTime` squeezed for a narrow column: "12h ago" → "12h", "just now" → "now". */
+export function shortAge(iso?: string | null): string {
+  const t = relativeTime(iso);
+  if (!t) return "";
+  if (t === "just now") return "now";
+  return t.replace(/ ago$/, "");
+}
+
+/** Whether two item references name the same thing: same connection, repository and id. */
+export function sameRef(a: { conn: string; repo?: string | null; id?: string; runId?: string } | null | undefined, b: { conn: string; repo?: string | null; id?: string; runId?: string }): boolean {
+  if (!a) return false;
+  return a.conn === b.conn && (a.repo ?? "") === (b.repo ?? "") && (a.id ?? a.runId) === (b.id ?? b.runId);
 }
 
 export function initials(name: string): string {

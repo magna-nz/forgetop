@@ -1,14 +1,21 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import { useNotifications, usePipelines, usePullRequests, useWorkItems } from "../api";
+import { notificationMeta, pipeMeta, prStatusMeta, wiStateColor, wiStateGlyph } from "../format";
 import { usePrOpener } from "./PrDetail";
+import { Icon } from "./icons";
+import { Kbd, StatusGlyph, type GlyphName } from "./ui";
 import type { SectionId } from "../types";
 
 interface Command {
   id: string;
   label: string;
+  /** Searched but not shown (kind and connection), so typing a connection name still finds it. */
   sublabel?: string;
-  icon: string;
+  /** Mono identifier shown after the title: `#1501`, `OPS-1423`, a repository slug. */
+  ident?: string;
+  glyph: GlyphName;
+  color: string;
   run: () => void;
 }
 
@@ -43,6 +50,8 @@ function fuzzyScore(query: string, text: string): number | null {
   return score - (t.length - q.length) * 0.05;
 }
 
+const NAV_COLOR = "var(--fg2)";
+
 export function CommandPalette({
   open,
   onClose,
@@ -73,44 +82,61 @@ export function CommandPalette({
     };
     const nav: Command[] = [
       // "Command Center" = the launchpad section (code keeps the `launchpad` id).
-      { id: "nav:launchpad", label: "Go to Command Center", icon: "✦", run: go("launchpad") },
-      { id: "nav:prs", label: "Go to Pull Requests", icon: "⇄", run: go("prs") },
-      { id: "nav:wi", label: "Go to Work Items", icon: "◧", run: go("work-items") },
-      { id: "nav:pipes", label: "Go to Pipelines", icon: "⛓", run: go("pipelines") },
-      { id: "nav:notifs", label: "Go to Notifications", icon: "◔", run: go("notifications") },
+      { id: "nav:launchpad", label: "Go to Command Center", glyph: "inbox", color: NAV_COLOR, run: go("launchpad") },
+      { id: "nav:prs", label: "Go to Pull Requests", glyph: "pull-request", color: NAV_COLOR, run: go("prs") },
+      { id: "nav:wi", label: "Go to Work Items", glyph: "circle-dot", color: NAV_COLOR, run: go("work-items") },
+      { id: "nav:pipes", label: "Go to Pipelines", glyph: "workflow", color: NAV_COLOR, run: go("pipelines") },
+      { id: "nav:notifs", label: "Go to Notifications", glyph: "bell", color: NAV_COLOR, run: go("notifications") },
     ];
-    const prItems: Command[] = (prs.data ?? []).map((r) => ({
+    const prItems: Command[] = (prs.data ?? []).map((r) => {
+      const meta = prStatusMeta(r.pull_request);
+      return {
       id: `pr:${r.connection_id}:${r.pull_request.id}`,
       label: r.pull_request.title,
       sublabel: `PR${r.pull_request.number != null ? " #" + r.pull_request.number : ""} · ${r.connection}`,
-      icon: "⇄",
+      ident: r.pull_request.number != null ? `#${r.pull_request.number}` : undefined,
+      glyph: meta.glyph,
+      color: meta.color,
       // PRs open the in-app detail (with the diff + review), like clicking a PR row.
       run: () => {
         openPr({ conn: r.connection_id, repo: r.pull_request.repository, id: r.pull_request.id });
         onClose();
       },
-    }));
+      };
+    });
     const wiItems: Command[] = (wis.data ?? []).map((r) => ({
       id: `wi:${r.connection_id}:${r.work_item.id}`,
       label: r.work_item.title,
       sublabel: `${r.work_item.identifier ?? "Issue"} · ${r.connection}`,
-      icon: "◧",
+      ident: r.work_item.identifier ?? undefined,
+      glyph: wiStateGlyph(r.work_item.state, r.work_item.state_category),
+      color: wiStateColor(r.work_item.state, r.work_item.state_category),
       run: openUrl(r.work_item.url, "work-items"),
     }));
-    const pipeItems: Command[] = (pipes.data ?? []).map((r) => ({
-      id: `pipe:${r.connection_id}:${r.run.id}`,
-      label: r.run.name ?? (r.run.number != null ? `Run #${r.run.number}` : r.run.definition_id),
-      sublabel: `Pipeline · ${r.connection}`,
-      icon: "⛓",
-      run: openUrl(r.run.url, "pipelines"),
-    }));
-    const notifItems: Command[] = (notifs.data ?? []).map((r) => ({
-      id: `notif:${r.connection_id}:${r.notification.id}`,
-      label: r.notification.title,
-      sublabel: `${r.notification.context} · ${r.connection}`,
-      icon: "◔",
-      run: openUrl(r.notification.url, "notifications"),
-    }));
+    const pipeItems: Command[] = (pipes.data ?? []).map((r) => {
+      const meta = pipeMeta(r.run.status);
+      return {
+        id: `pipe:${r.connection_id}:${r.run.id}`,
+        label: r.run.name ?? (r.run.number != null ? `Run #${r.run.number}` : r.run.definition_id),
+        sublabel: `Pipeline · ${r.connection}`,
+        ident: r.run.name != null && r.run.number != null ? `#${r.run.number}` : undefined,
+        glyph: meta.glyph,
+        color: meta.color,
+        run: openUrl(r.run.url, "pipelines"),
+      };
+    });
+    const notifItems: Command[] = (notifs.data ?? []).map((r) => {
+      const meta = notificationMeta(r.notification.kind);
+      return {
+        id: `notif:${r.connection_id}:${r.notification.id}`,
+        label: r.notification.title,
+        sublabel: `${r.notification.context} · ${r.connection}`,
+        ident: r.notification.context,
+        glyph: meta.glyph,
+        color: meta.color,
+        run: openUrl(r.notification.url, "notifications"),
+      };
+    });
     return [...nav, ...prItems, ...wiItems, ...pipeItems, ...notifItems];
   }, [prs.data, wis.data, pipes.data, notifs.data, onNavigate, onClose, openPr]);
 
@@ -157,7 +183,7 @@ export function CommandPalette({
     <AnimatePresence>
       <motion.div
         className="fixed inset-0 z-50 flex items-start justify-center"
-        style={{ background: "rgba(0,0,0,0.5)", paddingTop: "12vh" }}
+        style={{ background: "rgba(0,0,0,0.4)", paddingTop: "18vh" }}
         initial={{ opacity: 0 }}
         animate={{ opacity: 1 }}
         exit={{ opacity: 0 }}
@@ -165,60 +191,88 @@ export function CommandPalette({
         onClick={onClose}
       >
         <motion.div
+          role="dialog"
+          aria-label="Command palette"
           initial={{ opacity: 0, y: -8, scale: 0.98 }}
           animate={{ opacity: 1, y: 0, scale: 1 }}
           transition={{ duration: 0.14, ease: "easeOut" }}
           onClick={(e) => e.stopPropagation()}
           onKeyDown={onKeyDown}
-          className="w-full max-w-xl mx-4 rounded-xl overflow-hidden shadow-2xl"
-          style={{ background: "var(--panel)", border: "1px solid var(--border)" }}
+          className="mx-4 overflow-hidden shadow-2xl"
+          style={{
+            width: 640,
+            maxWidth: "calc(100vw - 2rem)",
+            borderRadius: 10,
+            background: "var(--raised)",
+            border: "1px solid var(--border-strong)",
+          }}
         >
-          <input
-            ref={inputRef}
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            placeholder="Jump to a section or search PRs, issues, pipelines…"
-            className="w-full bg-transparent px-4 py-3.5 text-sm outline-none"
-            style={{ color: "var(--fg)", borderBottom: "1px solid var(--border)" }}
-          />
-          <div className="max-h-80 overflow-auto py-1.5">
+          <div className="flex items-center gap-2.5 h-10 px-3.5" style={{ borderBottom: "1px solid var(--border)" }}>
+            <Icon name="search" size={15} style={{ color: "var(--fg3)" }} />
+            <input
+              ref={inputRef}
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder="Jump to a section or search PRs, issues, pipelines…"
+              aria-label="Search"
+              className="flex-1 min-w-0 h-full bg-transparent text-[13px] outline-none"
+              style={{ color: "var(--fg)" }}
+            />
+          </div>
+          <div className="max-h-80 overflow-auto py-1">
             {results.length === 0 ? (
-              <div className="px-4 py-6 text-center text-sm" style={{ color: "var(--dim)" }}>
+              <div className="px-4 py-6 text-center text-[13px]" style={{ color: "var(--fg3)" }}>
                 No matches
               </div>
             ) : (
               results.map((c, i) => (
                 <button
                   key={c.id}
+                  type="button"
                   onMouseEnter={() => setSelected(i)}
                   onClick={() => c.run()}
-                  className="flex w-full items-center gap-3 px-4 py-2 text-left"
-                  style={{ background: i === selected ? "var(--sel)" : "transparent" }}
+                  className="ft-row"
+                  style={{
+                    height: 36,
+                    borderBottom: 0,
+                    background: i === selected ? "var(--active)" : undefined,
+                  }}
                 >
-                  <span className="w-4 text-center shrink-0" style={{ color: "var(--accent)" }}>
-                    {c.icon}
+                  <StatusGlyph glyph={c.glyph} color={c.color} />
+                  <span className="truncate text-[13px]" style={{ color: "var(--fg)" }}>
+                    {c.label}
                   </span>
-                  <span className="flex-1 min-w-0">
-                    <span className="block truncate text-sm" style={{ color: "var(--fg)" }}>
-                      {c.label}
+                  {c.ident && (
+                    <span className="mono shrink-0 truncate" style={{ color: "var(--fg3)", maxWidth: "40%" }}>
+                      {c.ident}
                     </span>
-                    {c.sublabel && (
-                      <span className="block truncate text-xs" style={{ color: "var(--dim)" }}>
-                        {c.sublabel}
-                      </span>
-                    )}
-                  </span>
+                  )}
+                  {i === selected && (
+                    <span className="ml-auto shrink-0">
+                      <Kbd>↵</Kbd>
+                    </span>
+                  )}
                 </button>
               ))
             )}
           </div>
           <div
-            className="flex items-center gap-3 px-4 py-2 text-xs"
-            style={{ borderTop: "1px solid var(--border)", color: "var(--dim)" }}
+            className="flex items-center gap-4 px-3.5 h-9 text-[12px]"
+            style={{ borderTop: "1px solid var(--border)", color: "var(--fg3)" }}
           >
-            <span>↑↓ navigate</span>
-            <span>↵ open</span>
-            <span>esc close</span>
+            <span className="inline-flex items-center gap-1.5">
+              <Kbd>↑</Kbd>
+              <Kbd>↓</Kbd>
+              navigate
+            </span>
+            <span className="inline-flex items-center gap-1.5">
+              <Kbd>↵</Kbd>
+              open
+            </span>
+            <span className="inline-flex items-center gap-1.5">
+              <Kbd>esc</Kbd>
+              close
+            </span>
           </div>
         </motion.div>
       </motion.div>

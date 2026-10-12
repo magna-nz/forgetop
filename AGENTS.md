@@ -71,11 +71,14 @@ ls crates/forgetop-server/web/dist/assets/index-*.js                # local
   leave the TUI alone (and vice-versa).
 - **Verify live.** For any non-trivial dashboard change, run `--demo` and confirm the behaviour in
   a browser, not just tests. Demo write actions persist within a run via in-memory stores in `demo.rs`.
-- **Dashboard design system** (`crates/forgetop-server/web/src/components/ui.tsx`): use the shared
-  `StatusBadge` (tinted bordered status chip), `Pill` (tinted rounded icon+label "attention" badge),
-  and `Chip` (neutral tag). List rows are slim and single-line; detail panes expose only the actions
-  common to **all** providers for that section (provider-specific extras are shown as info, or gated
-  via `capabilities.ts`).
+- **Dashboard design system** ("Quiet ink", `crates/forgetop-server/web/DESIGN.md` — read it before
+  touching a dashboard screen): rows not cards (`Row`, 36px, hairlines), status as a glyph plus a
+  word (`StatusGlyph`/`StatusBadge` with the `glyph` every `format.ts` meta returns), one accent for
+  the primary action / selected row / focus, IBM Plex with mono for identifiers only, `Button`,
+  `Select`, `Segmented`, `Tabs`, `SectionHeading`/`GroupHeading`, and detail in a split pane
+  (`SlideOver`), never a modal. All of it lives in `components/ui.tsx`, `components/icons.tsx` and
+  `index.css`. Detail panes expose only the actions common to **all** providers for that section
+  (provider-specific extras are shown as info, or gated via `capabilities.ts`).
 - **Match surrounding code.** Read the neighbouring provider/module first and mirror its request
   helpers, error handling, and naming. Don't introduce new patterns without cause.
 - Security: the dashboard binds `127.0.0.1` only, gated by a per-session token. Never widen that.

@@ -1,22 +1,23 @@
 import { useIsFetching, useQueryClient } from "@tanstack/react-query";
-import { AnimatePresence, motion } from "framer-motion";
 import { useEffect, useRef, useState } from "react";
 import { apiPost, useNotifications } from "../api";
 import { notificationMeta, relativeTime, toTime } from "../format";
 import { useNavigateSection } from "../nav";
 import type { NotifRow, SectionId } from "../types";
 import { markNotificationReadInCache } from "../optimistic";
+import { Icon } from "./icons";
 import { usePrOpener } from "./PrDetail";
+import { Button, IconButton, Kbd, StatusGlyph } from "./ui";
 import { useWiOpener } from "./WiDetail";
 
-const META: Record<SectionId, { title: string; subtitle: string }> = {
+const TITLES: Record<SectionId, string> = {
   // "Command Center" is the user-facing name for the launchpad section (code keeps `launchpad`).
-  launchpad: { title: "Command Center", subtitle: "Things that need your attention." },
-  prs: { title: "Pull Requests", subtitle: "Open PRs you author or are asked to review, across every connection." },
-  "work-items": { title: "Work Items", subtitle: "Issues and tickets currently assigned to you." },
-  pipelines: { title: "Pipelines", subtitle: "Recent CI runs across your repositories." },
-  notifications: { title: "Notifications", subtitle: "Review requests, mentions, and CI failures." },
-  settings: { title: "Settings", subtitle: "Manage the connections shared with the terminal app." },
+  launchpad: "Command Center",
+  prs: "Pull Requests",
+  "work-items": "Work Items",
+  pipelines: "Pipelines",
+  notifications: "Notifications",
+  settings: "Settings",
 };
 
 export function TopBar({
@@ -30,7 +31,6 @@ export function TopBar({
   sidebarOpen: boolean;
   onToggleSidebar: () => void;
 }) {
-  const meta = META[section];
   const fetching = useIsFetching() > 0;
   const qc = useQueryClient();
   const { data: notifications } = useNotifications();
@@ -82,96 +82,67 @@ export function TopBar({
   }, [notificationsOpen]);
 
   return (
-    <header
-      className="flex items-center gap-4 px-6 h-14 shrink-0"
-      style={{ background: "var(--panel)", borderBottom: "1px solid var(--border)" }}
-    >
-      <button
-        onClick={onToggleSidebar}
-        title={sidebarOpen ? "Collapse sidebar" : "Expand sidebar"}
-        aria-label={sidebarOpen ? "Collapse sidebar" : "Expand sidebar"}
+    <header className="flex items-center gap-2 px-4 h-12 shrink-0" style={{ borderBottom: "1px solid var(--border)" }}>
+      <IconButton
+        icon="sidebar"
+        label={sidebarOpen ? "Collapse sidebar" : "Expand sidebar"}
         aria-expanded={sidebarOpen}
-        className="-ml-2 flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-base transition-colors"
-        style={{ color: "var(--dim)", border: "1px solid var(--border)", background: "var(--panel2)" }}
-        onMouseEnter={(e) => (e.currentTarget.style.color = "var(--fg)")}
-        onMouseLeave={(e) => (e.currentTarget.style.color = "var(--dim)")}
-      >
-        ☰
-      </button>
-      <div className="min-w-0">
-        <h1 className="text-sm font-semibold leading-tight">{meta.title}</h1>
-        <p className="text-xs truncate" style={{ color: "var(--dim)" }}>
-          {meta.subtitle}
-        </p>
-      </div>
+        onClick={onToggleSidebar}
+        className="-ml-1"
+      />
+      <h1 className="m-0 text-[15px] font-semibold leading-tight ml-1" style={{ letterSpacing: "-0.01em" }}>
+        {TITLES[section]}
+      </h1>
+      {fetching && (
+        <span className="flex items-center gap-1.5 text-[12px] ml-2" style={{ color: "var(--fg3)" }}>
+          <StatusGlyph glyph="running" spin color="var(--fg3)" />
+          syncing
+        </span>
+      )}
 
-      <div className="ml-auto flex items-center gap-3">
-        <AnimatePresence>
-          {fetching && (
-            <motion.span
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              exit={{ opacity: 0 }}
-              className="flex items-center gap-1.5 text-xs"
-              style={{ color: "var(--dim)" }}
-            >
-              <span className="spin" style={{ color: "var(--accent)" }}>
-                ◐
-              </span>
-              syncing
-            </motion.span>
-          )}
-        </AnimatePresence>
-        <button
-          onClick={onOpenPalette}
-          title="Command palette (⌘K)"
-          className="flex items-center gap-2 rounded-md px-2.5 py-1 text-xs transition-colors"
-          style={{ color: "var(--dim)", border: "1px solid var(--border)", background: "var(--panel2)" }}
-          onMouseEnter={(e) => (e.currentTarget.style.color = "var(--fg)")}
-          onMouseLeave={(e) => (e.currentTarget.style.color = "var(--dim)")}
-        >
-          <span>Search</span>
-          <kbd className="mono rounded px-1" style={{ background: "var(--bg)", border: "1px solid var(--border)" }}>
-            ⌘K
-          </kbd>
-        </button>
-        <button
-          onClick={() => qc.invalidateQueries()}
-          title="Refresh now"
-          className="flex items-center gap-1.5 rounded-md px-2.5 py-1 text-xs transition-colors"
-          style={{ color: "var(--dim)", border: "1px solid var(--border)", background: "var(--panel2)" }}
-          onMouseEnter={(e) => (e.currentTarget.style.color = "var(--fg)")}
-          onMouseLeave={(e) => (e.currentTarget.style.color = "var(--dim)")}
-        >
-          ↻ Refresh
-        </button>
+      <div className="ml-auto flex items-center gap-1">
+        <Button quiet icon="search" onClick={onOpenPalette} title="Command palette (⌘K)">
+          Search <Kbd>⌘K</Kbd>
+        </Button>
+        <IconButton icon="refresh" label="Refresh" title="Refresh now" onClick={() => qc.invalidateQueries()} />
         <div className="relative" ref={notificationRef}>
           <button
+            type="button"
             onClick={() => setNotificationsOpen((open) => !open)}
             title="Notifications"
-            aria-label="Notifications"
+            aria-label={unread > 0 ? `Notifications, ${unread} unread` : "Notifications"}
             aria-expanded={notificationsOpen}
-            className="flex items-center gap-1.5 rounded-md px-2 py-1 text-xs transition-colors"
-            style={{ color: unread > 0 ? "var(--fg)" : "var(--dim)", border: "1px solid var(--border)", background: "var(--panel2)", fontWeight: unread > 0 ? 700 : undefined }}
+            className="ft-btn ft-btn-icon relative"
+            style={{ color: unread > 0 ? "var(--fg)" : undefined }}
           >
-            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9" />
-              <path d="M10.3 21a1.94 1.94 0 0 0 3.4 0" />
-            </svg>
+            <Icon name="bell" size={15} />
             {unread > 0 && (
-              <span className="mono rounded-full px-1.5 text-xs" style={{ background: "var(--accent)", color: "#10233b" }}>
+              <span
+                className="num absolute -top-0.5 -right-0.5 min-w-[16px] h-4 px-1 rounded-full text-[10px] font-semibold flex items-center justify-center"
+                style={{ background: "var(--accent)", color: "var(--accent-contrast)" }}
+              >
                 {unread}
               </span>
             )}
           </button>
           {notificationsOpen && (
-            <div className="absolute right-0 top-full z-30 mt-2 w-[340px] overflow-hidden rounded-lg shadow-lg" style={{ background: "var(--panel)", border: "1px solid var(--border)" }}>
-              <div className="px-3 py-2 text-xs font-semibold" style={{ borderBottom: "1px solid var(--border)", color: "var(--fg)" }}>
+            <div
+              className="absolute right-0 top-full z-30 mt-1.5 w-[360px] overflow-hidden rounded-lg shadow-xl"
+              style={{ background: "var(--raised)", border: "1px solid var(--border-strong)" }}
+            >
+              <div className="flex items-center h-9 px-3 text-[12px] font-medium" style={{ borderBottom: "1px solid var(--border)", color: "var(--fg2)" }}>
                 Notifications
+                {unread > 0 && (
+                  <span className="num ml-1.5" style={{ color: "var(--fg3)" }}>
+                    {unread} unread
+                  </span>
+                )}
               </div>
               <div className="max-h-80 overflow-auto">
                 {orderedNotifications.length === 0 ? (
-                  <div className="px-3 py-3 text-xs" style={{ color: "var(--dim)" }}>No notifications</div>
+                  <div className="px-3 py-4 text-[12.5px]" style={{ color: "var(--fg3)" }}>
+                    No notifications
+                  </div>
                 ) : (
                   orderedNotifications.map((row) => {
                     const n = row.notification;
@@ -181,28 +152,33 @@ export function TopBar({
                         key={`${row.connection_id}:${n.id}`}
                         type="button"
                         onClick={() => openNotification(row)}
-                        className="flex w-full items-center gap-2 px-3 py-2 text-left transition-colors"
+                        className="flex w-full items-center gap-2.5 px-3 h-10 text-left transition-colors"
                         style={{ borderBottom: "1px solid var(--border)", cursor: "pointer" }}
-                        onMouseEnter={(e) => (e.currentTarget.style.background = "var(--sel)")}
+                        onMouseEnter={(e) => (e.currentTarget.style.background = "var(--hover)")}
                         onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
                       >
-                        <div className="min-w-0 flex-1">
-                          <div className="truncate text-xs font-medium" style={{ color: n.unread ? "var(--fg)" : "var(--dim)" }}>{n.title}</div>
-                          <div className="text-[11px]" style={{ color: kind.color }}>{kind.label}</div>
-                        </div>
-                        <span className="shrink-0 text-[11px] whitespace-nowrap" style={{ color: "var(--dim)" }}>{relativeTime(n.updated_at)}</span>
+                        <StatusGlyph glyph={kind.glyph} color={n.unread ? kind.color : "var(--fg3)"} title={kind.label} />
+                        <span className="min-w-0 flex-1 truncate text-[12.5px]" style={{ color: n.unread ? "var(--fg)" : "var(--fg2)", fontWeight: n.unread ? 500 : 400 }}>
+                          {n.title}
+                        </span>
+                        <span className="num shrink-0 text-[12px] whitespace-nowrap" style={{ color: "var(--fg3)" }}>
+                          {relativeTime(n.updated_at)}
+                        </span>
                       </button>
                     );
                   })
                 )}
               </div>
               <button
+                type="button"
                 onClick={() => {
                   navigate("notifications");
                   setNotificationsOpen(false);
                 }}
-                className="w-full px-3 py-2 text-left text-xs font-medium transition-colors"
-                style={{ borderTop: "1px solid var(--border)", color: "var(--fg)" }}
+                className="w-full h-9 px-3 text-left text-[12.5px] font-medium transition-colors"
+                style={{ color: "var(--fg2)" }}
+                onMouseEnter={(e) => (e.currentTarget.style.background = "var(--hover)")}
+                onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
               >
                 More →
               </button>
