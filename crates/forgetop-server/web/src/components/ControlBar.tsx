@@ -101,7 +101,7 @@ export function useListView<T>(opts: {
 
   const bar = (
     <div className="w-full max-w-[1280px] mx-auto px-6">
-      <div className="flex items-center gap-1 h-10" style={{ borderBottom: "1px solid var(--border)" }}>
+      <div className="flex flex-wrap items-center gap-x-1 gap-y-1 min-h-10 py-1" style={{ borderBottom: "1px solid var(--border)" }}>
         {opts.views && <div className="self-end flex min-w-0">{opts.views}</div>}
         <div className="ml-auto flex items-center gap-1 min-w-0">
           {opts.extra}
@@ -157,7 +157,7 @@ export function useListView<T>(opts: {
 
 /** A collapsible group header row: the list row look with a chevron, as a real toggle button
  *  carrying `aria-expanded`. (`Row` in ui.tsx takes no aria-expanded; this is the local stand-in
- *  until it does.) `height` overrides the row's 36px — `.ft-row` is unlayered CSS, so a Tailwind
+ *  until it does.) `height` overrides the row's 36px — an inline style, so it wins whatever the
  *  min-height class would not win; it goes inline. */
 export function ToggleRow({
   open,

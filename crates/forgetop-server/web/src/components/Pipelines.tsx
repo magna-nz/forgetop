@@ -254,6 +254,7 @@ function PipeRunRow({ row, now, mode }: { row: PipeRow; now: Date; mode?: GroupM
   const problem = failedProblem(row);
   const secs = runSecs(run, now);
   const gate = row.approvals.find((a) => a.can_respond);
+  const waitingOnOthers = !gate && row.approvals.length > 0;
   const openRun = usePipelineOpener();
   const current = useCurrentPipeline();
   const selected = sameRef(current, { conn: row.connection_id, repo: run.repository, runId: run.id });
@@ -302,8 +303,13 @@ function PipeRunRow({ row, now, mode }: { row: PipeRow; now: Date; mode?: GroupM
           title={`Open the run to approve ${gate.name}`}
           style={{ color: "var(--yellow)", borderColor: "color-mix(in srgb, var(--yellow) 40%, transparent)" }}
         >
-          Approve {gate.name}
+          Open to approve {gate.name}
         </Button>
+      )}
+      {waitingOnOthers && (
+        <span className="text-[12px] shrink-0 whitespace-nowrap" style={{ color: "var(--yellow)" }}>
+          waiting for approval
+        </span>
       )}
       {!child && <StageStrip row={row} />}
       <span className="num text-[12px] shrink-0 whitespace-nowrap text-right" style={{ width: 50, color: meta.running ? "var(--blue)" : "var(--fg3)" }}>

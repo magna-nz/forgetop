@@ -330,6 +330,36 @@ export function Skeleton({ rows = 6 }: { rows?: number }) {
  *  element; without one (tests, storybook-style renders) the pane renders in place. */
 export const PaneSlotContext = createContext<HTMLElement | null>(null);
 
+/** One pane at a time: each detail provider registers how to close its pane, and opening any
+ *  pane closes the others first. A pane may also register a guard that can veto leaving it
+ *  (the PR pane asks before discarding unsubmitted comments). */
+const paneClosers = new Map<string, () => void>();
+let paneGuard: { kind: string; canLeave: () => boolean } | null = null;
+
+export function usePaneRegistration(kind: string, close: () => void) {
+  useEffect(() => {
+    paneClosers.set(kind, close);
+    return () => {
+      paneClosers.delete(kind);
+      if (paneGuard?.kind === kind) paneGuard = null;
+    };
+  }, [kind, close]);
+}
+
+/** Registers (or clears, with `null`) the open pane's leave guard. */
+export function setPaneGuard(kind: string, canLeave: (() => boolean) | null) {
+  paneGuard = canLeave ? { kind, canLeave } : null;
+}
+
+/** Called by an opener before it shows `kind`: asks the open pane's guard, then closes the
+ *  other kinds. Returns false when the guard refused and nothing should open. */
+export function claimPane(kind: string): boolean {
+  if (paneGuard && !paneGuard.canLeave()) return false;
+  paneGuard = null;
+  for (const [k, close] of paneClosers) if (k !== kind) close();
+  return true;
+}
+
 /** The right-hand detail pane, beside the content (never a modal). Esc and ✕ close it. `header`
  *  is the title block (see `PaneHeader`), `footer` the action bar. */
 export function SlideOver({

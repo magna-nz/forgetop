@@ -134,8 +134,10 @@ describe("pipelines list approvals", () => {
     foreign.approvals = [{ id: "g2", name: "deploy-stage", can_respond: false, blocks_run: true }];
     mockFetch({ get: { "/api/pipelines": [answerable, foreign] } });
     render();
-    expect(await screen.findByRole("button", { name: "Approve deploy-prod" })).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /Approve deploy-stage/ })).not.toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: "Open to approve deploy-prod" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /deploy-stage/ })).not.toBeInTheDocument();
+    // A gate someone else must answer still shows as waiting, just not as a button.
+    expect(screen.getByText("waiting for approval")).toBeInTheDocument();
   });
 });
 

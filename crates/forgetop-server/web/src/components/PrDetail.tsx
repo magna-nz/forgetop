@@ -1,4 +1,4 @@
-import { createContext, Fragment, useCallback, useContext, useEffect, useId, useMemo, useState, type ReactNode } from "react";
+import { createContext, Fragment, useCallback, useContext, useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { apiPost, prDetailKey, useConnections, usePrCommitChanges, usePrDetail, usePrFileText, usePrReviewers } from "../api";
 import { checkMeta, checkSummaryOf, providerMeta, prStateLine, prStatusMeta, relativeTime } from "../format";
@@ -7,7 +7,7 @@ import { parsePatch, type DiffLine } from "../diff";
 import { buildDiffTree, collectFiles, filterTree, findMatches, flattenTree, searchFiles, type DiffTreeFile, type DiffTreeFolder, type FileMatch } from "../diffTree";
 import { addPrReply, addPrThreads, isLocalId, localComment, localThread, meAsUser, patchPullRequest, setPrThreadResolved, withVote } from "../optimistic";
 import type { CheckRun, CheckStatus, CommentThread, Commit, FileChange, FileChangeKind, LineComment, PrRef, PrWriteSupport, ProviderType, PullRequest, ReviewVote, Reviewer, TimelineEvent, User } from "../types";
-import { Avatar, Button, Chip, GroupHeading, IconButton, PaneHeader, SlideOver, StatusBadge, StatusGlyph, Tabs, Timeline } from "./ui";
+import { Avatar, Button, Chip, claimPane, GroupHeading, IconButton, PaneHeader, setPaneGuard, SlideOver, StatusBadge, StatusGlyph, Tabs, Timeline, usePaneRegistration } from "./ui";
 import { Icon } from "./icons";
 
 // ---- opener context ----
@@ -20,12 +20,18 @@ export const useCurrentPr = () => useContext(PrCurrentCtx);
 
 export function PrDetailProvider({ children }: { children: ReactNode }) {
   const [ref, setRef] = useState<PrRef | null>(null);
-  const open = useCallback((r: PrRef) => setRef(r), []);
+  const close = useCallback(() => setRef(null), []);
+  usePaneRegistration("pr", close);
+  // Opening a PR closes any other pane first, and asks the open PR pane's guard (unsubmitted
+  // comments) before switching away from it — the same check Esc and ✕ make.
+  const open = useCallback((r: PrRef) => {
+    if (claimPane("pr")) setRef(r);
+  }, []);
   return (
     <PrOpenerCtx.Provider value={open}>
       <PrCurrentCtx.Provider value={ref}>
         {children}
-        {ref && <PrDetailPanel prRef={ref} onClose={() => setRef(null)} />}
+        {ref && <PrDetailPanel prRef={ref} onClose={close} />}
       </PrCurrentCtx.Provider>
     </PrOpenerCtx.Provider>
   );
@@ -68,12 +74,26 @@ function PrDetailPanel({ prRef, onClose }: { prRef: PrRef; onClose: () => void }
 
   // Esc and the pane's ✕ both come through here (SlideOver owns the key listener), so
   // unsubmitted comments are guarded either way.
+  const canLeave = () => pending.length === 0 || window.confirm(`Discard ${pending.length} unsubmitted comment(s)?`);
   const requestClose = () => {
-    if (pending.length > 0 && !window.confirm(`Discard ${pending.length} unsubmitted comment(s)?`)) return;
+    if (!canLeave()) return;
     onClose();
   };
+  // Switching to another PR (a list row, the palette, the bell) goes through the same guard.
+  useEffect(() => {
+    setPaneGuard("pr", pending.length > 0 ? canLeave : null);
+    return () => setPaneGuard("pr", null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pending.length]);
+
+  // A pending delayed close (after a verdict or merge) must not outlive the PR it was for.
+  const closeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => {
+    if (closeTimer.current) clearTimeout(closeTimer.current);
+  }, []);
 
   useEffect(() => {
+    if (closeTimer.current) clearTimeout(closeTimer.current);
     setTab("conversation");
     setPending([]);
     setNote(null);
@@ -128,7 +148,9 @@ function PrDetailPanel({ prRef, onClose }: { prRef: PrRef; onClose: () => void }
   // A verdict/merge action from the action bar closes the pane once it lands (brief delay so the
   // "✓" note flashes first), matching Merge — you've acted on this PR, so return to the list.
   // Only once it lands: a refusal has to stay on screen to be read.
-  const closeSoon = () => setTimeout(onClose, 500);
+  const closeSoon = () => {
+    closeTimer.current = setTimeout(onClose, 500);
+  };
   const markVote = (v: ReviewVote) => {
     if (me) patchPullRequest(qc, prRef, (p) => withVote(p, me, v));
   };

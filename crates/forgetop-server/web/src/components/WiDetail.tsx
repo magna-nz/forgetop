@@ -1,11 +1,10 @@
 import { createContext, useCallback, useContext, useEffect, useState, type ReactNode } from "react";
-import { AnimatePresence } from "framer-motion";
 import { useQueryClient } from "@tanstack/react-query";
 import { apiGet, apiPost, useWiDetail, wiDetailKey } from "../api";
 import { relativeTime, wiStateColor, wiStateGlyph } from "../format";
 import type { CommentThread, User, WiRef, WorkItem } from "../types";
 import { addWiThread, localThread, meAsUser, patchWorkItem } from "../optimistic";
-import { Avatar, Button, GroupHeading, PaneHeader, SlideOver, Timeline } from "./ui";
+import { Avatar, Button, claimPane, GroupHeading, PaneHeader, SlideOver, Timeline, usePaneRegistration } from "./ui";
 import { Icon } from "./icons";
 
 // ---- opener context ----
@@ -18,12 +17,17 @@ export const useCurrentWi = () => useContext(WiCurrentCtx);
 
 export function WiDetailProvider({ children }: { children: ReactNode }) {
   const [ref, setRef] = useState<WiRef | null>(null);
-  const open = useCallback((r: WiRef) => setRef(r), []);
+  const close = useCallback(() => setRef(null), []);
+  usePaneRegistration("wi", close);
+  // One pane at a time: opening a work item closes a PR or run pane (after its guard, if any).
+  const open = useCallback((r: WiRef) => {
+    if (claimPane("wi")) setRef(r);
+  }, []);
   return (
     <WiOpenerCtx.Provider value={open}>
       <WiCurrentCtx.Provider value={ref}>
         {children}
-        <AnimatePresence>{ref && <WiDetailPanel wiRef={ref} onClose={() => setRef(null)} />}</AnimatePresence>
+        {ref && <WiDetailPanel wiRef={ref} onClose={close} />}
       </WiCurrentCtx.Provider>
     </WiOpenerCtx.Provider>
   );

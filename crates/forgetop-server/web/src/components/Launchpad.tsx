@@ -286,7 +286,6 @@ function view(row: LaunchpadRow, bucket: string): RowView {
 
 const capitalize = (s: string): string => (s.length ? s[0].toUpperCase() + s.slice(1) : s);
 
-/** The repository's last segment, for display only (`acme/payments` → `payments`). */
 /// A row's identity within its connection. The repository is part of it: one connection now
 /// spans an account, so `#7` exists in more than one repository and `connection_id:id` alone
 /// stops being unique.

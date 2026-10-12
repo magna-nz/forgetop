@@ -1,5 +1,4 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { AnimatePresence } from "framer-motion";
 import { useQueries, useQueryClient } from "@tanstack/react-query";
 import {
   apiGet,
@@ -49,7 +48,7 @@ import { HistoryStrip, historyDelta } from "./pipeline/RunHistory";
 import { nodeId, RunTimeline, StageStrip } from "./pipeline/RunTimeline";
 import { markCanceled, markRerun, markResponded, NO_CAPS, NoteLine, prLink, useNow, type Note } from "./pipeline/runState";
 import { Icon } from "./icons";
-import { Avatar, Button, Chip, PaneHeader, SlideOver, StatusGlyph } from "./ui";
+import { Avatar, Button, Chip, claimPane, PaneHeader, SlideOver, StatusGlyph, usePaneRegistration } from "./ui";
 
 /** At most `max` characters, the last an ellipsis when cut (the TUI's `truncate`). */
 const truncateChars = (s: string, max: number) => {
@@ -69,15 +68,18 @@ export const useCurrentPipeline = () => useContext(PipeCurrentCtx);
 
 export function PipelineDetailProvider({ children }: { children: ReactNode }) {
   const [ref, setRef] = useState<PipeRef | null>(null);
-  const open = useCallback((r: PipeRef) => setRef(r), []);
+  const close = useCallback(() => setRef(null), []);
+  usePaneRegistration("pipeline", close);
+  // One pane at a time: opening a run closes a PR or work-item pane (after its guard, if any).
+  const open = useCallback((r: PipeRef) => {
+    if (claimPane("pipeline")) setRef(r);
+  }, []);
   return (
     <PipeOpenerCtx.Provider value={open}>
       <PipeCurrentCtx.Provider value={ref}>
-      {children}
-      {/* Keyed by run: another run gets a fresh panel, so no frame shows the last run's state. */}
-      <AnimatePresence>
-        {ref && <PipelineDetailPanel key={`${ref.conn}|${ref.repo ?? ""}|${ref.runId}`} pipeRef={ref} onClose={() => setRef(null)} />}
-      </AnimatePresence>
+        {children}
+        {/* Keyed by run: another run gets a fresh panel, so no frame shows the last run's state. */}
+        {ref && <PipelineDetailPanel key={`${ref.conn}|${ref.repo ?? ""}|${ref.runId}`} pipeRef={ref} onClose={close} />}
       </PipeCurrentCtx.Provider>
     </PipeOpenerCtx.Provider>
   );

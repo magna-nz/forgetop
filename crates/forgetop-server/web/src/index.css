@@ -146,13 +146,15 @@ body {
   text-rendering: optimizeLegibility;
 }
 
-.mono {
-  font-family: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-  font-size: 12px;
-}
+@layer components {
+  .mono {
+    font-family: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 12px;
+  }
 
-.num {
-  font-variant-numeric: tabular-nums;
+  .num {
+    font-variant-numeric: tabular-nums;
+  }
 }
 
 @layer components {

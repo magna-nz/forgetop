@@ -3,7 +3,6 @@ import { pipelineCount } from "../format";
 import { useTheme } from "../theme";
 import type { SectionId } from "../types";
 import { Icon, type IconName } from "./icons";
-import { Kbd } from "./ui";
 
 const NAV: { id: SectionId; label: string; icon: IconName }[] = [
   // "Command Center" is the user-facing name for the launchpad; code keeps the `launchpad` id.
@@ -81,7 +80,7 @@ export function Sidebar({
           <span className="font-semibold text-[14px]" style={{ letterSpacing: "-0.01em" }}>
             forgetop
           </span>
-          <span className="mono ml-auto text-[11px]" style={{ color: "var(--fg3)" }}>
+          <span className="mono ml-auto text-[12px]" style={{ color: "var(--fg3)" }}>
             v{__APP_VERSION__}
           </span>
         </div>
@@ -129,7 +128,7 @@ export function Sidebar({
               onMouseEnter={(e) => (e.currentTarget.style.color = "var(--fg)")}
               onMouseLeave={(e) => (e.currentTarget.style.color = "var(--fg3)")}
             >
-              {theme} <Kbd>t</Kbd>
+              {theme}
             </button>
           </div>
         </div>
