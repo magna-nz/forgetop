@@ -780,6 +780,11 @@ mod tests {
     }
 
     /// The demo PRs are global to the process, so each test picks its own open PR to write to.
+    /// The GitHub connection has exactly four open ones, and `draft_and_close` takes one out of
+    /// the open list for a moment, so the PR tests run one at a time: a listing must never land
+    /// inside that window.
+    static DEMO_PRS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     async fn open_pr(api: &Api, nth: usize) -> String {
         let open: Vec<_> = api.open_prs().await.into_iter().filter(|(_, s)| s == "Open").collect();
         open.get(nth).unwrap_or_else(|| panic!("demo has at least {} open PRs", nth + 1)).0.clone()
@@ -787,6 +792,7 @@ mod tests {
 
     #[tokio::test]
     async fn pr_detail_advertises_the_demo_writes() {
+        let _one_at_a_time = DEMO_PRS.lock().await;
         let api = Api::start().await;
         let id = open_pr(&api, 0).await;
         let writes = &api.detail(&id).await["writes"];
@@ -797,6 +803,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolving_a_thread_flips_it_on_the_next_detail() {
+        let _one_at_a_time = DEMO_PRS.lock().await;
         let api = Api::start().await;
         let id = open_pr(&api, 1).await;
         let thread = |d: &serde_json::Value, t: &str| d["threads"].as_array().unwrap().iter().find(|x| x["id"] == t).cloned().unwrap();
@@ -811,6 +818,7 @@ mod tests {
 
     #[tokio::test]
     async fn draft_and_close_change_the_pr_status() {
+        let _one_at_a_time = DEMO_PRS.lock().await;
         let api = Api::start().await;
         let id = open_pr(&api, 2).await;
         let status = |d: serde_json::Value| d["pull_request"]["status"].as_str().unwrap().to_string();
@@ -833,6 +841,7 @@ mod tests {
 
     #[tokio::test]
     async fn requesting_a_reviewer_adds_them_to_the_pr() {
+        let _one_at_a_time = DEMO_PRS.lock().await;
         let api = Api::start().await;
         let id = open_pr(&api, 3).await;
         let users = api.get(&format!("/api/pr/reviewers?conn=github&id={id}")).await;
