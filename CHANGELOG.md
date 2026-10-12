@@ -9,7 +9,7 @@ Adding a release: one `## <version> — <date>` section, a line per user-visible
 and the pull request each one came from. `git log v<previous>..HEAD --merges` lists the
 candidates.
 
-## 1.8.4 — 2026-10-12
+## 1.9.0 — 2026-10-12
 
 Added
 
