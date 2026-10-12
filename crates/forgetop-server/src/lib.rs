@@ -151,9 +151,12 @@ fn router(state: AppState) -> Router {
         .route("/api/wi/update", post(wi_update))
         .route("/api/pipeline/detail", get(pipeline_detail))
         .route("/api/pipeline/logs", get(pipeline_logs))
+        .route("/api/pipeline/annotations", get(pipeline_annotations))
+        .route("/api/pipeline/artifacts", get(pipeline_artifacts))
         .route("/api/pipeline/approval", post(pipeline_approval))
         .route("/api/pipeline/trigger", post(pipeline_trigger))
         .route("/api/pipeline/cancel", post(pipeline_cancel))
+        .route("/api/pipeline/rerun", post(pipeline_rerun))
         .route("/api/notification/read", post(notification_read))
         .route("/api/providers", get(providers))
         .route("/api/connections", get(list_connections).post(save_connection))
@@ -296,8 +299,13 @@ struct PipelineLogsQuery {
 /// Turns an action outcome into a response: `{ok:true}`, 404 (no such connection/capability),
 /// or 502 (the provider call failed).
 fn action_response(operation: &'static str, result: Result<(), ActionError>) -> Response {
+    action_response_with(operation, result.map(|()| serde_json::json!({ "ok": true })))
+}
+
+/// Like [`action_response`], for an action that reports something back: `Ok` carries the JSON body.
+fn action_response_with(operation: &'static str, result: Result<serde_json::Value, ActionError>) -> Response {
     match result {
-        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Ok(body) => Json(body).into_response(),
         Err(ActionError::NotFound) => (StatusCode::NOT_FOUND, "connection or capability not found").into_response(),
         Err(ActionError::Failed(msg)) => {
             forgetop_core::diag::log(operation, "provider action failed");
@@ -443,6 +451,19 @@ async fn pipeline_logs(State(s): State<AppState>, Query(q): Query<PipelineLogsQu
     }
 }
 
+async fn pipeline_annotations(State(s): State<AppState>, Query(q): Query<RunQuery>) -> Response {
+    match dto::pipeline_annotations(&s.deps.sections, &q.conn, &ItemRef::maybe(q.repo, q.run_id)).await {
+        Some(annotations) => Json(annotations).into_response(),
+        None => (StatusCode::NOT_FOUND, "annotations not available").into_response(),
+    }
+}
+async fn pipeline_artifacts(State(s): State<AppState>, Query(q): Query<RunQuery>) -> Response {
+    match dto::pipeline_artifacts(&s.deps.sections, &q.conn, &ItemRef::maybe(q.repo, q.run_id)).await {
+        Some(artifacts) => Json(artifacts).into_response(),
+        None => (StatusCode::NOT_FOUND, "artifacts not available").into_response(),
+    }
+}
+
 async fn pipeline_approval(State(s): State<AppState>, Json(req): Json<actions::PipelineApprovalReq>) -> Response {
     action_response("dashboard.pipeline_approval", actions::pipeline_approval(&s.deps.sections, req).await)
 }
@@ -451,6 +472,10 @@ async fn pipeline_trigger(State(s): State<AppState>, Json(req): Json<actions::Pi
 }
 async fn pipeline_cancel(State(s): State<AppState>, Json(req): Json<actions::PipelineCancelReq>) -> Response {
     action_response("dashboard.pipeline_cancel", actions::pipeline_cancel(&s.deps.sections, req).await)
+}
+async fn pipeline_rerun(State(s): State<AppState>, Json(req): Json<actions::PipelineRerunReq>) -> Response {
+    let result = actions::pipeline_rerun(&s.deps.sections, req).await;
+    action_response_with("dashboard.pipeline_rerun", result.map(|new_run_id| serde_json::json!({ "ok": true, "new_run_id": new_run_id })))
 }
 
 async fn notification_read(State(s): State<AppState>, Json(req): Json<actions::NotifReadReq>) -> Response {

@@ -53,7 +53,7 @@ export function useListView<T>(opts: {
   /** A dropdown whose options are the distinct values present in the rows (e.g. work-item type).
    *  Only rendered when 2+ distinct values exist, so it reflects what's actually in the list. */
   facet?: { label: string; value: (r: T) => string | null | undefined };
-}): { rows: T[]; bar: React.ReactNode; total: number } {
+}): { rows: T[]; bar: React.ReactNode; total: number; sortIndex: number } {
   const [ctl, patch] = usePref(opts.storageKey, opts.defaultStatus != null ? String(opts.defaultStatus) : "");
   const all = opts.rows ?? [];
 
@@ -126,7 +126,7 @@ export function useListView<T>(opts: {
     </div>
   );
 
-  return { rows: processed, bar, total: all.length };
+  return { rows: processed, bar, total: all.length, sortIndex: sortIdx };
 }
 
 function Select({

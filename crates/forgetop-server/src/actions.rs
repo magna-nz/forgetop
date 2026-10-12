@@ -237,6 +237,19 @@ pub struct PipelineCancelReq {
 }
 
 #[derive(Deserialize)]
+pub struct PipelineRerunReq {
+    pub conn: String,
+    pub run_id: String,
+    /// The item's **connection-relative** repository. Optional: a single-repository connection
+    /// still resolves without it, which is what keeps links written before this change working.
+    #[serde(default)]
+    pub repo: Option<String>,
+    /// Re-run only the failed jobs (the provider must support it).
+    #[serde(default)]
+    pub failed_only: bool,
+}
+
+#[derive(Deserialize)]
 pub struct NotifReadReq {
     pub conn: String,
     pub id: String,
@@ -345,6 +358,13 @@ pub async fn pipeline_trigger(sections: &SectionService, req: PipelineTriggerReq
 pub async fn pipeline_cancel(sections: &SectionService, req: PipelineCancelReq) -> Result<(), ActionError> {
     let source = dto::pipe_source(sections, &req.conn).await.ok_or(ActionError::NotFound)?;
     source.cancel_run(&ItemRef::maybe(req.repo, req.run_id)).await.map_err(failed)
+}
+
+/// Re-runs a run. `Ok(Some(id))` is the new run's id when the provider started a separate run;
+/// `Ok(None)` when the same run was re-queued as its next attempt.
+pub async fn pipeline_rerun(sections: &SectionService, req: PipelineRerunReq) -> Result<Option<String>, ActionError> {
+    let source = dto::pipe_source(sections, &req.conn).await.ok_or(ActionError::NotFound)?;
+    source.rerun_run(&ItemRef::maybe(req.repo, req.run_id), req.failed_only).await.map_err(failed)
 }
 
 pub async fn notif_read(sections: &SectionService, req: NotifReadReq) -> Result<(), ActionError> {

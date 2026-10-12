@@ -1,6 +1,6 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import type { ConnectionRow, FileChange, HealthRow, LaunchpadResponse, NotifRow, PipeRef, PipelineDetail, PipelineSelection, PipeRow, PrDecoration, PrDetail, PrRef, ProviderInfo, PrRow, RepositoryPage, User, WiDetail, WiRef, WiRow } from "./types";
+import type { ApprovalDecision, ConnectionRow, FileChange, HealthRow, LaunchpadResponse, NotifRow, PipeRef, PipelineAnnotation, PipelineArtifact, PipelineDetail, PipelineSelection, PipeRow, PrDecoration, PrDetail, PrRef, ProviderInfo, PrRow, RepositoryPage, User, WiDetail, WiRef, WiRow } from "./types";
 
 // The session token arrives once in the URL (`/?t=…`). We stash it in sessionStorage (so a
 // refresh keeps working) and strip it from the visible URL, then replay it on every API call.
@@ -85,7 +85,7 @@ export function useWriteAction() {
 /** `&repo=…` for an addressed ref, or nothing. A repository is always a query parameter and
  *  never a path segment — an `owner/repo` contains a slash — and it stays optional so every
  *  link written before a connection spanned an account still resolves. */
-const repoParam = (repo?: string | null) => (repo ? `&repo=${encodeURIComponent(repo)}` : "");
+export const repoParam = (repo?: string | null) => (repo ? `&repo=${encodeURIComponent(repo)}` : "");
 
 // Query keys are **positional**, so a key and the invalidation that clears it drift apart
 // silently — the symptom is a detail view that goes stale after a mutation, intermittently.
@@ -184,6 +184,99 @@ export const usePipelineDetail = (ref: PipeRef | null) =>
         `/api/pipeline/detail?conn=${encodeURIComponent(ref!.conn)}&run_id=${encodeURIComponent(ref!.runId)}${repoParam(ref!.repo)}`,
       ),
     enabled: !!ref,
+  });
+
+/** `conn=…&run_id=…[&repo=…]` — the query every per-run pipeline endpoint takes. */
+const runQuery = (ref: PipeRef) =>
+  `conn=${encodeURIComponent(ref.conn)}&run_id=${encodeURIComponent(ref.runId)}${repoParam(ref.repo)}`;
+
+export const pipelineAnnotationsKey = (ref: Pick<PipeRef, "conn" | "repo" | "runId">) => [
+  "pipeline-annotations",
+  ref.conn,
+  ref.repo ?? "",
+  ref.runId,
+];
+export const pipelineArtifactsKey = (ref: Pick<PipeRef, "conn" | "repo" | "runId">) => [
+  "pipeline-artifacts",
+  ref.conn,
+  ref.repo ?? "",
+  ref.runId,
+];
+/** Every job log of one run — the prefix of `pipelineLogsKey`, to clear them together. */
+export const pipelineRunLogsKey = (ref: Pick<PipeRef, "conn" | "repo" | "runId">) => [
+  "pipeline-logs",
+  ref.conn,
+  ref.repo ?? "",
+  ref.runId,
+];
+export const pipelineLogsKey = (ref: Pick<PipeRef, "conn" | "repo" | "runId">, jobId: string | null) => [
+  ...pipelineRunLogsKey(ref),
+  jobId ?? "",
+];
+
+/** The problems a run reported. Like the TUI, fetched only when the caller says so (a finished
+ *  run) and never polled — the caller invalidates it when the run's status changes. */
+export const usePipelineAnnotations = (ref: PipeRef | null, enabled: boolean) =>
+  useQuery({
+    queryKey: ref ? pipelineAnnotationsKey(ref) : ["pipeline-annotations", null],
+    queryFn: () => api<PipelineAnnotation[]>(`/api/pipeline/annotations?${runQuery(ref!)}`),
+    enabled: enabled && !!ref,
+    refetchInterval: false,
+  });
+
+/** The files a run published — fetched lazily, once `enabled` (the artifacts panel opened). */
+export const usePipelineArtifacts = (ref: PipeRef | null, enabled: boolean) =>
+  useQuery({
+    queryKey: ref ? pipelineArtifactsKey(ref) : ["pipeline-artifacts", null],
+    queryFn: () => api<PipelineArtifact[]>(`/api/pipeline/artifacts?${runQuery(ref!)}`),
+    enabled: enabled && !!ref,
+    refetchInterval: false,
+  });
+
+/** One job's log text. A live job is re-fetched whole every 4s (the TUI's `LOG_POLL_TICKS`: the
+ *  provider hands back the whole log on every call); a finished one is fetched once and kept.
+ *  When a job stops being live it is asked once more, so the tail is complete (the TUI's
+ *  `LogView::poll_step`). */
+export const usePipelineLogs = (ref: PipeRef | null, jobId: string | null, live: boolean) => {
+  const q = useQuery({
+    queryKey: ref ? pipelineLogsKey(ref, jobId) : ["pipeline-logs", null],
+    queryFn: () => apiGetText(`/api/pipeline/logs?${runQuery(ref!)}&job=${encodeURIComponent(jobId!)}`),
+    enabled: !!ref && !!jobId,
+    refetchInterval: live ? 4000 : false,
+    staleTime: live ? 0 : Infinity,
+  });
+  const wasLive = useRef(live);
+  const { refetch } = q;
+  const hasData = q.data !== undefined;
+  useEffect(() => {
+    if (wasLive.current && !live && hasData) void refetch();
+    wasLive.current = live;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [live]);
+  return q;
+};
+
+/** Re-runs a finished run (only its failed jobs with `failedOnly`). `new_run_id` is the run the
+ *  provider started, when it started a new one rather than a new attempt of this one. */
+export const rerunPipeline = async (ref: PipeRef, failedOnly: boolean): Promise<{ ok: boolean; new_run_id: string | null }> => {
+  const res = await apiPost<{ ok: boolean; new_run_id?: string | null } | undefined>("/api/pipeline/rerun", {
+    conn: ref.conn,
+    repo: ref.repo ?? undefined,
+    run_id: ref.runId,
+    failed_only: failedOnly,
+  });
+  return { ok: res?.ok ?? true, new_run_id: res?.new_run_id ?? null };
+};
+
+/** Approves or rejects a pending gate — the body of `PipelineApprovalReq` in actions.rs. */
+export const respondPipelineApproval = (ref: PipeRef, approvalId: string, decision: ApprovalDecision, comment?: string) =>
+  apiPost("/api/pipeline/approval", {
+    conn: ref.conn,
+    repo: ref.repo ?? undefined,
+    run_id: ref.runId,
+    approval_id: approvalId,
+    decision,
+    comment: comment ?? undefined,
   });
 
 /** The repositories a connection could fetch from — the scope picker's candidate list. Only the

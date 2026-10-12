@@ -378,3 +378,28 @@ export function relativeTime(iso?: string | null): string {
   if (months < 12) return `${months}mo ago`;
   return `${Math.round(months / 12)}y ago`;
 }
+
+const pad2 = (n: number) => String(n).padStart(2, "0");
+
+/** Elapsed seconds as `45s`, `3m12s`, `1h02m` — the drill-in's one duration format. Mirrors the
+ *  TUI's `fmt_secs` (crates/forgetop-tui/src/ui.rs). */
+export function fmtSecs(secs: number): string {
+  const s = Math.max(0, Math.trunc(secs));
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m${pad2(s % 60)}s`;
+  return `${Math.floor(s / 3600)}h${pad2(Math.floor((s % 3600) / 60))}m`;
+}
+
+/** A time-axis tick: `0s`, `30s`, `1m`, `1m30`, `2h`, `1h05`. Mirrors the TUI's `axis_label`. */
+export function axisLabel(secs: number): string {
+  const s = Math.trunc(secs);
+  if (s < 60) return `${s}s`;
+  if (s < 3600) {
+    const m = Math.floor(s / 60);
+    const r = s % 60;
+    return r === 0 ? `${m}m` : `${m}m${pad2(r)}`;
+  }
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  return m === 0 ? `${h}h` : `${h}h${pad2(m)}`;
+}

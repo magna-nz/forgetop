@@ -28,16 +28,21 @@ export function Timeline({ events }: { events: TimelineEvent[] }) {
   );
 }
 
+/** Literal class strings (not built at runtime) so Tailwind keeps every width. */
+const SLIDE_OVER_WIDTH = { "3xl": "max-w-3xl", "4xl": "max-w-4xl", "5xl": "max-w-5xl" } as const;
+
 /** Right-hand slide-over used by the work-item and pipeline detail views (mirrors PrDetail's
  *  own panel). Backdrop click and Esc both close; `header` and `children` render inside. */
 export function SlideOver({
   onClose,
   header,
   children,
+  width = "3xl",
 }: {
   onClose: () => void;
   header: ReactNode;
   children: ReactNode;
+  width?: keyof typeof SLIDE_OVER_WIDTH;
 }) {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -63,7 +68,7 @@ export function SlideOver({
         exit={{ x: 40, opacity: 0 }}
         transition={{ duration: 0.22, ease: "easeOut" }}
         onClick={(e) => e.stopPropagation()}
-        className="flex flex-col h-full w-full max-w-3xl"
+        className={`flex flex-col h-full w-full ${SLIDE_OVER_WIDTH[width]}`}
         style={{ background: "var(--bg)", borderLeft: "1px solid var(--border)" }}
       >
         <div className="flex items-start gap-3 px-5 py-3.5 shrink-0" style={{ borderBottom: "1px solid var(--border)" }}>
