@@ -100,6 +100,13 @@ for the full bucket rules and keys.
 brew install magna-nz/tap/forgetop
 ```
 
+To upgrade later, refresh Homebrew first. On its own, `brew upgrade` only looks for new
+versions once a day, so it can miss a release that just came out:
+
+```sh
+brew update && brew upgrade forgetop
+```
+
 **Shell installer** (macOS / Linux):
 
 ```sh
