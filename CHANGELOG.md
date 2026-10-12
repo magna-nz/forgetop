@@ -9,6 +9,19 @@ Adding a release: one `## <version> — <date>` section, a line per user-visible
 and the pull request each one came from. `git log v<previous>..HEAD --merges` lists the
 candidates.
 
+## 1.10.1 — 2026-10-13
+
+Changed
+
+- **The dashboard opens warm.** It now reads and writes the same on-disk cache the terminal UI
+  paints from at launch, so whichever frontend you used last leaves the other its last known
+  board: pull requests, work items, pipelines, notifications and the Command Center all show at
+  once, with "from 4m ago · refreshing" in the top bar until the live refresh lands. A list
+  waits a moment for its live fetch and only answers from the cache when the forge is slower
+  than that, so a quick forge still shows live rows on every poll. A standalone
+  `forgetop --dashboard` loads the cache too; `--demo` still caches nothing.
+  ([#241](https://github.com/magna-nz/forgetop/pull/241))
+
 ## 1.10.0 — 2026-10-13
 
 Changed
