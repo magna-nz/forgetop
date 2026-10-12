@@ -87,10 +87,12 @@ pub enum GoTo {
 /// What running a palette entry does. Interpreted by the app.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PaletteTarget {
-    /// Open an already-fetched item, re-resolved by `(kind, id)` from the app's lists.
+    /// Open an already-fetched item, re-resolved from the app's lists. `repo` is part of which
+    /// item it is: a connection spans repositories, so `id` alone can name more than one.
     Item {
         kind: PaletteKind,
         id: String,
+        repo: Option<String>,
         connection_id: String,
     },
     /// Replay this key through the normal key path.
@@ -276,10 +278,11 @@ fn pr_tone(row: &PrRow) -> Tone {
     }
 }
 
-fn item(kind: PaletteKind, id: &str, connection_id: &str, title: String) -> PaletteItem {
+fn item(kind: PaletteKind, id: &str, repo: Option<&str>, connection_id: &str, title: String) -> PaletteItem {
     let target = PaletteTarget::Item {
         kind,
         id: id.to_string(),
+        repo: repo.map(str::to_string),
         connection_id: connection_id.to_string(),
     };
     PaletteItem::new(Group::Item, target, title)
@@ -296,6 +299,7 @@ pub fn pr_candidate(row: &PrRow) -> PaletteItem {
         ..item(
             PaletteKind::Pr,
             &row.pr.id,
+            row.pr.repository.as_deref(),
             &row.connection_id,
             row.pr.title.clone(),
         )
@@ -318,12 +322,14 @@ pub fn wi_candidate(row: &WiRow) -> PaletteItem {
     let ident = row.wi.identifier.as_deref().unwrap_or("");
     let ty = row.wi.work_item_type.as_deref().unwrap_or("");
     PaletteItem {
-        subtitle: subtitle(&[ident, ty, &row.connection]),
+        // The parent too, so a milestone's or epic's name finds everything under it.
+        subtitle: subtitle(&[ident, ty, row.wi.parent.as_ref().map(|p| p.title.as_str()).unwrap_or(""), &row.connection]),
         tone: Some(wi_tone(row)),
         sort_ts: row.wi.updated_at,
         ..item(
             PaletteKind::Wi,
             &row.wi.id,
+            row.wi.repository.as_deref(),
             &row.connection_id,
             row.wi.title.clone(),
         )
@@ -353,7 +359,7 @@ pub fn pipe_candidate(row: &PipeRow) -> PaletteItem {
         subtitle: subtitle(&[run_name, branch, &row.connection]),
         tone: Some(tone),
         sort_ts: row.run.finished_at.or(row.run.started_at),
-        ..item(PaletteKind::Pipe, &row.run.id, &row.connection_id, title)
+        ..item(PaletteKind::Pipe, &row.run.id, row.run.repository.as_deref(), &row.connection_id, title)
     }
 }
 
@@ -789,6 +795,7 @@ mod tests {
         let target = PaletteTarget::Item {
             kind,
             id: format!("{title}-id"),
+            repo: None,
             connection_id: "conn".into(),
         };
         PaletteItem {

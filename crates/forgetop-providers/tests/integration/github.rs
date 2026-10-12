@@ -187,6 +187,22 @@ async fn github_work_item_lifecycle() {
     assert!(found.is_some(), "the assigned issue appears in the mine-only list");
     assert_eq!(wi.get(&ItemRef::new(&id)).await.expect("get").id, id);
 
+    // Work items are not related to repositories: with nothing chosen at all the same issue
+    // still shows, and the row's own address is all it takes to open it.
+    let unscoped = harness::scoped(ProviderType::GitHub, vec![]).expect("an unscoped connection").work_items().expect("work items");
+    let title = format!("{prefix} issue");
+    let row = {
+        let (unscoped, id, title) = (&unscoped, id.as_str(), title.as_str());
+        harness::poll(harness::POLL_LIST, move || async move {
+            let list = unscoped.list(&WorkItemQuery { mine_only: true, ..Default::default() }).await.ok()?;
+            list.into_iter().find(|w| w.id == id && w.title == title)
+        })
+        .await
+        .expect("the assigned issue shows with an empty repository scope")
+    };
+    assert!(row.repository.is_some(), "and names the repository it lives in");
+    assert_eq!(unscoped.get(&row.item_ref()).await.expect("get by the row's own address").title, title);
+
     let states = wi.available_states(&ItemRef::new(&id)).await.expect("available states");
     assert!(states.iter().any(|s| s.eq_ignore_ascii_case("closed")), "closed is an available state, got {states:?}");
 

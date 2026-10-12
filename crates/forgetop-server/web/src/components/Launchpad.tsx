@@ -132,7 +132,7 @@ function BucketGroup({ group, more }: { group: Group; more: LaunchpadMore }) {
       </div>
       <div className="flex flex-col gap-1.5">
         {rows.map((row, i) => (
-          <ItemRow key={`${row.connection_id}:${rowId(row)}`} row={row} index={i} muted={group.muted} />
+          <ItemRow key={`${row.connection_id}:${row.kind}:${rowId(row)}`} row={row} index={i} muted={group.muted} />
         ))}
         {(go || expandMore) && (
           <button

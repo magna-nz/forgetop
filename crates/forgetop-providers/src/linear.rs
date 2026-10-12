@@ -15,8 +15,8 @@ fn prov<E: std::fmt::Display>(e: E) -> Error {
     Error::Provider(e.to_string())
 }
 
-const ISSUE_FIELDS: &str =
-    "id identifier title description url createdAt updatedAt state { name type } assignee { id name displayName avatarUrl }";
+const ISSUE_FIELDS: &str = "id identifier title description url createdAt updatedAt state { name type } \
+     assignee { id name displayName avatarUrl } project { id name url } projectMilestone { id name }";
 
 pub fn map_user(v: &Value) -> User {
     User {
@@ -55,7 +55,29 @@ pub fn map_issue(v: &Value) -> WorkItem {
         created_at: get_date(v, "createdAt"),
         updated_at: get_date(v, "updatedAt"),
         url: get_str(v, "url"),
+        parent: issue_parent(v),
     }
+}
+
+/// The issue's milestone when it has one, otherwise its project. A milestone belongs to exactly
+/// one project and its name is only unique there, so it is titled "Project › Milestone".
+fn issue_parent(v: &Value) -> Option<WorkItemParent> {
+    let project = get_obj(v, "project");
+    let project_name = project.and_then(|p| get_str(p, "name"));
+    let url = project.and_then(|p| get_str(p, "url"));
+    let milestone = get_obj(v, "projectMilestone").and_then(|m| Some((get_str(m, "id")?, get_str(m, "name")?)));
+    if let Some((id, name)) = milestone {
+        return Some(WorkItemParent {
+            kind: "Milestone".into(),
+            id,
+            title: match project_name {
+                Some(project) => format!("{project} › {name}"),
+                None => name,
+            },
+            url,
+        });
+    }
+    Some(WorkItemParent { kind: "Project".into(), id: get_str(project?, "id")?, title: project_name?, url })
 }
 
 pub fn map_comment(v: &Value) -> Comment {
@@ -383,6 +405,37 @@ mod tests {
         assert_eq!(wi.state, "In Progress");
         assert_eq!(wi.state_category, WorkItemStateCategory::Started);
         assert_eq!(wi.assignee.unwrap().display_name, "Dan");
+    }
+
+    #[test]
+    fn an_issue_sits_under_its_milestone_or_failing_that_its_project() {
+        let issue = |extra: &str| -> Value { serde_json::from_str(&format!(r#"{{ "id": "i", "title": "t" {extra} }}"#)).unwrap() };
+        let project = r#", "project": { "id": "p1", "name": "Ledger v2", "url": "https://linear.app/acme/project/ledger" }"#;
+
+        // A milestone's name is only unique inside its project, so the project leads the title.
+        let both = map_issue(&issue(&format!(r#"{project}, "projectMilestone": {{ "id": "m1", "name": "Reconciliation" }}"#)));
+        let parent = both.parent.expect("a milestone");
+        assert_eq!((parent.kind.as_str(), parent.id.as_str(), parent.title.as_str()), ("Milestone", "m1", "Ledger v2 › Reconciliation"));
+        assert_eq!(parent.url.as_deref(), Some("https://linear.app/acme/project/ledger"));
+
+        let only_project = map_issue(&issue(project)).parent.expect("a project");
+        assert_eq!((only_project.kind.as_str(), only_project.id.as_str(), only_project.title.as_str()), ("Project", "p1", "Ledger v2"));
+
+        // A milestone that somehow has no name is not a reason to lose the project.
+        let nameless = map_issue(&issue(&format!(r#"{project}, "projectMilestone": {{ "id": "m1" }}"#))).parent.expect("the project");
+        assert_eq!(nameless.kind, "Project");
+
+        // Linear sends explicit nulls for an issue in neither.
+        assert!(map_issue(&issue(r#", "project": null, "projectMilestone": null"#)).parent.is_none());
+        assert!(map_issue(&issue("")).parent.is_none());
+    }
+
+    #[test]
+    fn the_issue_query_asks_for_the_project_and_milestone() {
+        for field in ["project { id name url }", "projectMilestone { id name }"] {
+            assert!(ISSUE_FIELDS.contains(field), "{field} missing from {ISSUE_FIELDS}");
+        }
+        assert!(!ISSUE_FIELDS.contains('\n') && !ISSUE_FIELDS.contains("  "), "one clean line of GraphQL: {ISSUE_FIELDS:?}");
     }
 
     #[test]

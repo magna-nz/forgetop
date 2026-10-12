@@ -297,6 +297,22 @@ pub struct PullRequest {
     pub url: Option<String>,
 }
 
+/// What a work item sits under: a milestone, an epic, a project, a parent ticket. Every forge
+/// has one and none of them agree on the name, so this carries the forge's own word for it.
+///
+/// It is what the Work Items list groups by. It is **not** a scope: nothing is fetched or
+/// withheld because of it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkItemParent {
+    /// What the forge calls it, for display: "Milestone", "Epic", "Feature", "Project".
+    pub kind: String,
+    /// Its identity within the connection. Two items share a parent when `kind` and `id` match.
+    pub id: String,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkItem {
     pub id: String,
@@ -315,6 +331,9 @@ pub struct WorkItem {
     pub created_at: Option<DateTime<Utc>>,
     pub updated_at: Option<DateTime<Utc>>,
     pub url: Option<String>,
+    /// The milestone, epic or project this sits under, when it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<WorkItemParent>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

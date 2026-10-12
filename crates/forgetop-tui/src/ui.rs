@@ -21,7 +21,7 @@ use crate::app::{
     dashboard_target, first_failed_node, gate_stage, is_error_line, last_activity, match_ranges, pipe_definition_name,
     pr_life, provider_label, run_secs, waiting_secs, App, ArtifactsPanel, ConfigView, DiffFocus, DiffView, FlatNode, Hit,
     LogRow, LogView, LpSlot, PipeGroup, PipeHead, PipeLine, PipeRow, PipelineView, PrLife, PrView, RunHistory, Screen,
-    WiView, LOG_SPLIT_MIN_WIDTH, LOG_TREE_WIDTH, PR_TABS, TABS,
+    WiGroup, WiHead, WiLine, WiView, LOG_SPLIT_MIN_WIDTH, LOG_TREE_WIDTH, PR_TABS, TABS,
 };
 use crate::diff::{cursor_line_label, pending_marks};
 use crate::highlight::{lang_for, HlKind, LineHighlighter};
@@ -1516,19 +1516,21 @@ fn wi_state_color(theme: &Theme, state: &str, cat: WorkItemStateCategory) -> rat
 
 fn render_wis(frame: &mut Frame, area: Rect, app: &mut App) {
     let theme = &app.theme;
-    let idxs = app.filtered_wi_indices();
+    let lines = app.wi_lines();
+    let grouped = app.wi_group != WiGroup::Off;
     let hidden_in_view = app.hidden_states_in_view();
-    let base = if hidden_in_view == 0 {
-        "Work Items · mine".to_string()
-    } else {
-        format!("Work Items · mine · {hidden_in_view} state(s) hidden")
-    };
-    let title = list_title(with_marks(with_sort(with_scope(base, app, 1), app, 1), app), &app.filters[1]);
-    if idxs.is_empty() {
+    let mut base = "Work Items · mine".to_string();
+    if grouped {
+        base.push_str(" · by parent");
+    }
+    if hidden_in_view > 0 {
+        base.push_str(&format!(" · {hidden_in_view} state(s) hidden"));
+    }
+    // No "· Repos · N of M" here: work items aren't presented as belonging to repositories.
+    let title = list_title(with_marks(with_sort(base, app, 1), app), &app.filters[1]);
+    if lines.is_empty() {
         let msg = if !app.filters[1].is_empty() {
             "No matches. Esc clears the filter.".to_string()
-        } else if scope_is_empty(app, 1) {
-            NO_REPOS_HINT.to_string()
         } else if hidden_in_view > 0 {
             "All present states are hidden. Press f to choose states.".to_string()
         } else if app.health.is_empty() {
@@ -1545,20 +1547,24 @@ fn render_wis(frame: &mut Frame, area: Rect, app: &mut App) {
     let inner_w = area.width.saturating_sub(2) as usize;
     let dim = Style::default().fg(theme.dim).add_modifier(Modifier::BOLD);
     let headers = ["State", "Provider", "ID", "Title", "Type", "Assignee", "Updated"];
-    let cells: Vec<Vec<(String, Style)>> = idxs
+    let cells: Vec<Vec<(String, Style)>> = lines
         .iter()
-        .map(|&i| &app.wis[i])
-        .map(|row| {
-            let wi = &row.wi;
-            vec![
-                (format!("● {}", wi.state), Style::default().fg(wi_state_color(theme, &wi.state, wi.state_category))),
-                (provider_tag(row.provider, &row.connection), Style::default().fg(theme.cyan)),
-                (wi.identifier.clone().unwrap_or_default(), Style::default().fg(theme.dim)),
-                (wi.title.clone(), Style::default().fg(theme.fg)),
-                (wi.work_item_type.clone().unwrap_or_default(), Style::default().fg(theme.dim)),
-                (wi.assignee.as_ref().map(|a| a.display_name.clone()).unwrap_or_else(|| "—".into()), Style::default().fg(theme.blue)),
-                (rel_age(wi.updated_at), Style::default().fg(theme.dim)),
-            ]
+        .map(|line| match line {
+            WiLine::Head(h) => wi_head_cells(theme, h),
+            WiLine::Item(i) => {
+                let row = &app.wis[*i];
+                let wi = &row.wi;
+                vec![
+                    (format!("● {}", wi.state), Style::default().fg(wi_state_color(theme, &wi.state, wi.state_category))),
+                    (provider_tag(row.provider, &row.connection), Style::default().fg(theme.cyan)),
+                    (wi.identifier.clone().unwrap_or_default(), Style::default().fg(theme.dim)),
+                    // Under a header an item sits one step in, beneath the header's arrow.
+                    (if grouped { format!("  {}", wi.title) } else { wi.title.clone() }, Style::default().fg(theme.fg)),
+                    (wi.work_item_type.clone().unwrap_or_default(), Style::default().fg(theme.dim)),
+                    (wi.assignee.as_ref().map(|a| a.display_name.clone()).unwrap_or_else(|| "—".into()), Style::default().fg(theme.blue)),
+                    (rel_age(wi.updated_at), Style::default().fg(theme.dim)),
+                ]
+            }
         })
         .collect();
 
@@ -1569,6 +1575,38 @@ fn render_wis(frame: &mut Frame, area: Rect, app: &mut App) {
     let (header, rows) = columnize(dim, &headers, &cells, flex, inner_w, sort);
     let selected = app.selected().and_then(|i| cells.get(i)).map(|r| (flex, r[flex].0.clone()));
     render_inline_list(frame, area, app, &title, header, rows, selected);
+}
+
+/// A Work Items group header, shaped like an item row so each value lands under the heading that
+/// describes it: the roll-up under State, the parent's name and item count under Title, and what
+/// the forge calls it under Type. The count rides in the Title cell because that is the one
+/// column that can never be switched off or shed.
+fn wi_head_cells(theme: &Theme, h: &WiHead) -> Vec<(String, Style)> {
+    let dim = Style::default().fg(theme.dim);
+    // Both figures when both apply; red as soon as anything is blocked.
+    let mut parts = Vec::new();
+    if h.in_progress > 0 {
+        parts.push(format!("{} in progress", h.in_progress));
+    }
+    if h.blocked > 0 {
+        parts.push(format!("{} blocked", h.blocked));
+    }
+    let roll_up = match (parts.is_empty(), h.blocked > 0) {
+        (true, _) => ("○ not started".to_string(), dim),
+        (false, true) => (format!("● {}", parts.join(" · ")), Style::default().fg(theme.red)),
+        (false, false) => (format!("● {}", parts.join(" · ")), Style::default().fg(theme.blue)),
+    };
+    let arrow = if h.expanded { "▾" } else { "▸" };
+    vec![
+        roll_up,
+        // "No parent" gathers what is left from every connection, so it has no one provider.
+        (if h.connection.is_empty() { String::new() } else { provider_tag(h.provider, &h.connection) }, Style::default().fg(theme.cyan)),
+        (String::new(), dim),
+        (format!("{arrow} {} ({})", h.title, h.items), Style::default().fg(theme.fg).add_modifier(Modifier::BOLD)),
+        (h.kind.clone(), dim),
+        (String::new(), dim),
+        (rel_age(h.updated), dim),
+    ]
 }
 
 // ---- Pipelines ----
@@ -2626,6 +2664,8 @@ fn render_wi_view(frame: &mut Frame, area: Rect, theme: &Theme, view: &WiView) -
             format!("   {}", wi.assignee.as_ref().map(|a| a.display_name.clone()).unwrap_or_else(|| "—".into())),
             Style::default().fg(theme.blue),
         ),
+        // The milestone, epic or project it sits under, in the forge's own words.
+        Span::styled(wi.parent.as_ref().map(|p| format!("   {} · {}", p.kind, p.title)).unwrap_or_default(), Style::default().fg(theme.dim)),
     ]);
     frame.render_widget(Paragraph::new(header).block(section_block(theme, &label)), rows[0]);
 
@@ -2902,12 +2942,19 @@ fn base_footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
     // Enter's hint only where it opens the row: focusing the preview and expanding or drilling
     // into a pipeline are left out like the others.
     let preview = app.preview_shown() && app.preview.is_some();
-    if app.active != 2 && !preview {
+    if app.wi_head_selected() {
+        keys.push(("↵", "fold"));
+    } else if app.active != 2 && !preview {
         keys.push(("↵", "open"));
     }
     match app.active {
         0 => keys.extend([("w", "repos"), ("f", "status"), ("S", "sort"), ("c", "columns"), ("o", "browser")]),
-        1 => keys.extend([("w", "repos"), ("f", "states"), ("S", "sort"), ("c", "columns"), ("o", "browser")]),
+        1 => {
+            keys.extend([("f", "states"), ("G", "group"), ("S", "sort"), ("c", "columns"), ("o", "browser")]);
+            if app.wi_group != WiGroup::Off {
+                keys.push(("z/Z", "fold"));
+            }
+        }
         2 => {
             // Until repositories are chosen `w` picks those, since there are no pipelines yet.
             let w = if app.no_repos_chosen(2) { "repos" } else { "pipelines" };
@@ -5633,7 +5680,7 @@ pub(crate) fn help_sections() -> Vec<(&'static str, Vec<(&'static str, &'static 
                 ("P", "Preview while browsing, off / on for this section (Pipelines: on)"),
                 ("/", "Quick-filter the list"),
                 ("S", "Sort by column (re-pick flips direction)"),
-                ("w", "Repositories — which ones this section fetches from (Pipelines: which pipelines)"),
+                ("w", "Repositories — which ones Pull Requests fetch from (Pipelines: which pipelines)"),
                 ("c", "Columns — which ones the list shows"),
                 ("o", "Open selected in browser"),
                 ("v", "Choose which tabs are visible"),
@@ -5694,6 +5741,10 @@ pub(crate) fn help_sections() -> Vec<(&'static str, Vec<(&'static str, &'static 
                 ("f", "Choose which states to show"),
                 ("Space", "Select the row (again to unselect; Esc clears)"),
                 ("b", "Bulk action on the selected rows: set state"),
+                ("G", "Group by parent — milestone, epic or project — or off"),
+                ("Enter  Space", "On a group: expand / collapse it"),
+                ("z  Z", "Collapse / expand every group"),
+                ("o", "On a group: open the milestone, epic or project in the browser"),
             ],
         ),
         (
@@ -5710,7 +5761,7 @@ pub(crate) fn help_sections() -> Vec<(&'static str, Vec<(&'static str, &'static 
             "Pipelines",
             vec![
                 ("w", "Pipelines — add or remove which ones are fetched"),
-                ("G", "Group by pipeline / trigger / branch / off"),
+                ("G", "Group by pipeline / trigger / branch / off (Work Items: by parent / off)"),
                 ("Enter or Space (on a group)", "Expand / collapse"),
                 ("z  Z", "Collapse / expand every group"),
                 ("Enter", "Open the run pane (history, timeline, logs)"),
@@ -6859,6 +6910,79 @@ mod tests {
     }
 
     #[test]
+    fn grouped_work_items_draw_a_header_per_parent_with_its_items_beneath() {
+        use forgetop_core::domain::WorkItemParent;
+        let mut app = App::new("slate");
+        app.screen = Screen::List;
+        app.active = 1;
+        let item = |id: &str, title: &str, state: &str, parent: Option<(&str, &str)>| crate::app::WiRow {
+            connection_id: "c".into(),
+            connection: "GitHub".into(),
+            provider: ProviderType::GitHub,
+            wi: WorkItem {
+                id: id.into(),
+                repository: None,
+                identifier: Some(id.into()),
+                title: title.into(),
+                description: None,
+                state: state.into(),
+                state_category: if state == "Todo" { WorkItemStateCategory::Unstarted } else { WorkItemStateCategory::Started },
+                work_item_type: Some("Bug".into()),
+                assignee: None,
+                created_at: None,
+                updated_at: None,
+                url: None,
+                parent: parent.map(|(kind, title)| WorkItemParent { kind: kind.into(), id: title.into(), title: title.into(), url: None }),
+            },
+        };
+        app.wis = vec![
+            item("#842", "Investigate p99", "In Progress", Some(("Milestone", "Q4 reliability"))),
+            item("#851", "Retry budget", "Blocked", Some(("Milestone", "Q4 reliability"))),
+            item("#9", "Loose end", "Todo", None),
+        ];
+        app.wi_state.select(Some(0));
+
+        // Flat: no header, no indentation, and the footer offers grouping.
+        let flat = render_to_string(&mut app, 160, 24);
+        assert!(flat.contains("Investigate p99") && !flat.contains("Q4 reliability"), "{flat}");
+        assert!(base_footer_keys(&app).contains(&("G", "group")) && !base_footer_keys(&app).contains(&("z/Z", "fold")));
+
+        app.wi_group = WiGroup::Parent;
+        let folded = render_to_string(&mut app, 160, 24);
+        assert!(folded.contains("Work Items · mine · by parent"), "the title says how it is arranged: {folded}");
+        assert!(folded.contains("▸ Q4 reliability (2)") && folded.contains("Milestone"), "{folded}");
+        assert!(folded.contains("● 1 in progress · 1 blocked"), "both figures, not just the worse one: {folded}");
+        assert!(folded.contains("▸ No parent (1)") && folded.contains("○ not started"), "{folded}");
+        assert!(!folded.contains("Investigate p99"), "folded groups show only the parent");
+        assert!(base_footer_keys(&app).contains(&("z/Z", "fold")));
+        assert!(base_footer_keys(&app).contains(&("↵", "fold")) && !base_footer_keys(&app).contains(&("↵", "open")), "Enter folds a header");
+
+        // The count survives switching off every column that can be.
+        app.hidden_cols[1] = ["State", "Provider", "ID", "Type", "Assignee", "Updated"].map(String::from).to_vec();
+        let bare = render_to_string(&mut app, 160, 24);
+        assert!(bare.contains("▸ Q4 reliability (2)"), "{bare}");
+        app.hidden_cols[1].clear();
+
+        app.wi_expanded = app.wis.iter().map(crate::app::wi_group_key).collect();
+        let open = render_to_string(&mut app, 160, 24);
+        assert!(open.contains("▾ Q4 reliability") && open.contains("  Investigate p99") && open.contains("  Retry budget"), "{open}");
+    }
+
+    #[test]
+    fn work_items_never_mention_repositories_in_the_header_or_footer() {
+        let mut app = App::new("slate");
+        app.screen = Screen::List;
+        app.active = 1;
+        // Even were a scope summary to reach this section, and an emptied one at that.
+        app.repo_scope[1] = Some(scope(0, Some(38), false, true));
+        let out = render_to_string(&mut app, 160, 24);
+        assert!(out.contains("Work Items · mine"), "the header still names the section");
+        assert!(!out.contains("Repos"), "but not a repository count");
+        assert!(!out.contains("No repositories selected"), "nor an empty scope as the reason it is empty");
+        assert!(!base_footer_keys(&app).iter().any(|(_, what)| *what == "repos"), "and the footer offers no repos key");
+    }
+
+    #[test]
     fn an_empty_scope_reads_as_a_choice_not_as_an_empty_section() {
         // Nothing was fetched because nothing was asked for. "No pull requests" would say the
         // opposite of what happened, and wouldn't point at the fix.
@@ -7878,6 +8002,7 @@ mod tests {
             created_at: None,
             updated_at: None,
             url: None,
+            parent: None,
         };
         let mut app = App::new("slate"); // defaults to the Launchpad screen
         app.lp = vec![
@@ -8250,6 +8375,7 @@ mod tests {
                 created_at: None,
                 updated_at: None,
                 url: None,
+                parent: None,
             },
             threads: vec![],
             scroll: 0,
@@ -8292,6 +8418,7 @@ mod tests {
                 created_at: None,
                 updated_at: None,
                 url: None,
+                parent: None,
             },
             threads: vec![],
             scroll: 0,
@@ -8435,7 +8562,7 @@ mod tests {
         use crate::overlay::Overlay;
         use crate::palette::{self, Group, PaletteItem, PaletteKind, PaletteTarget, Tone};
 
-        let target = |kind, id: &str| PaletteTarget::Item { kind, id: id.into(), connection_id: "c".into() };
+        let target = |kind, id: &str| PaletteTarget::Item { kind, id: id.into(), repo: None, connection_id: "c".into() };
         let items = vec![
             PaletteItem {
                 tone: Some(Tone::Good),
@@ -8664,6 +8791,7 @@ mod tests {
                 created_at: None,
                 updated_at: None,
                 url: None,
+                parent: None,
             },
             threads: vec![],
             timeline: vec![
@@ -8736,6 +8864,7 @@ mod tests {
                 created_at: None,
                 updated_at: None,
                 url: None,
+                parent: None,
             },
             threads: vec![],
             timeline: vec![],
@@ -9775,6 +9904,7 @@ mod tests {
                     created_at: None,
                     updated_at: None,
                     url: None,
+                    parent: None,
                 },
             })
             .collect();

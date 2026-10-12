@@ -73,7 +73,21 @@ pub fn map_issue(v: &Value, site: &str) -> WorkItem {
         created_at: fields.and_then(|f| jira_date(f, "created")),
         updated_at: fields.and_then(|f| jira_date(f, "updated")),
         url: key.map(|k| format!("{}/browse/{}", site.trim_end_matches('/'), k)),
+        parent: fields.and_then(|f| get_obj(f, "parent")).and_then(|p| issue_parent(p, site)),
     }
+}
+
+/// An issue's `parent`: its epic, or for a sub-task the issue it belongs to. Named by the
+/// parent's own issue type, so an epic reads "Epic" and a story "Story".
+fn issue_parent(parent: &Value, site: &str) -> Option<WorkItemParent> {
+    let key = get_str(parent, "key")?;
+    let fields = get_obj(parent, "fields");
+    Some(WorkItemParent {
+        kind: fields.and_then(|f| get_obj(f, "issuetype")).and_then(|t| get_str(t, "name")).unwrap_or_else(|| "Parent".into()),
+        title: fields.and_then(|f| get_str(f, "summary")).unwrap_or_else(|| key.clone()),
+        url: Some(format!("{}/browse/{}", site.trim_end_matches('/'), key)),
+        id: key,
+    })
 }
 
 pub fn map_comment(v: &Value) -> Comment {
@@ -145,7 +159,7 @@ impl WorkItemSource for JiraWi {
         let body = json!({
             "jql": jql,
             "maxResults": query.limit.unwrap_or(50),
-            "fields": ["summary", "description", "status", "assignee", "issuetype", "created", "updated"],
+            "fields": ["summary", "description", "status", "assignee", "issuetype", "created", "updated", "parent"],
         });
         // `POST /search` was REMOVED by Atlassian (410 Gone) in favour of `/search/jql`:
         // https://developer.atlassian.com/changelog/#CHANGE-2046. Staying on the v2 API keeps
@@ -362,6 +376,27 @@ mod tests {
         assert_eq!(wi.assignee.unwrap().display_name, "Dana");
         assert_eq!(wi.url.as_deref(), Some("https://acme.atlassian.net/browse/ENG-42"));
         assert!(wi.created_at.is_some(), "Jira timestamp should parse");
+    }
+
+    #[test]
+    fn an_issue_sits_under_its_parent_named_by_the_parents_own_type() {
+        let v: Value = serde_json::from_str(
+            r#"{ "key": "OPS-1423", "fields": { "summary": "Collect evidence",
+                 "parent": { "id": "10400", "key": "OPS-1400",
+                             "fields": { "summary": "SOC2 Type II audit", "issuetype": { "name": "Epic" } } } } }"#,
+        )
+        .unwrap();
+        let parent = map_issue(&v, "https://acme.atlassian.net/").parent.expect("an epic");
+        assert_eq!((parent.kind.as_str(), parent.id.as_str(), parent.title.as_str()), ("Epic", "OPS-1400", "SOC2 Type II audit"));
+        assert_eq!(parent.url.as_deref(), Some("https://acme.atlassian.net/browse/OPS-1400"));
+
+        // A parent Jira names only by key still groups, under that key.
+        let bare: Value = serde_json::from_str(r#"{ "key": "OPS-2", "fields": { "summary": "s", "parent": { "key": "OPS-1" } } }"#).unwrap();
+        let parent = map_issue(&bare, "https://acme.atlassian.net").parent.expect("a parent");
+        assert_eq!((parent.kind.as_str(), parent.title.as_str()), ("Parent", "OPS-1"));
+
+        let none: Value = serde_json::from_str(r#"{ "key": "OPS-3", "fields": { "summary": "s" } }"#).unwrap();
+        assert!(map_issue(&none, "https://acme.atlassian.net").parent.is_none());
     }
 
     #[test]

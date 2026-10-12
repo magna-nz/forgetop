@@ -222,9 +222,9 @@ fn take_inline_section<T>(field: &mut Vec<T>, incoming: Vec<T>, errors: &[String
     take_section(field, incoming, errors.len() == errors_before);
 }
 
-/// Whether this provider's work items and pipelines are addressed by *project* rather than by
-/// repository, so their rows' `repository` field holds a Team Project name and a repository
-/// scope entry ("Project/Repo") is not something it can be compared against.
+/// Whether this provider's pipelines are addressed by *project* rather than by repository, so
+/// their rows' `repository` field holds a Team Project name and a repository scope entry
+/// ("Project/Repo") is not something it can be compared against.
 fn project_addressed_sections(provider: ProviderType) -> bool {
     matches!(provider, ProviderType::AzureDevOps)
 }
@@ -520,6 +520,89 @@ impl PipeGroup {
             PipeGroup::Off => PipeGroup::Pipeline,
         }
     }
+}
+
+/// How the Work Items list groups its rows.
+///
+/// Like [`PipeGroup`], grouping is a *view* over the same filtered rows: nothing is fetched or
+/// withheld because of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WiGroup {
+    /// No grouping — one line per work item. The default: the list the tab has always had.
+    #[default]
+    Off,
+    /// One header per parent — the milestone, epic or project each item sits under.
+    Parent,
+}
+
+impl WiGroup {
+    /// The persisted spelling. Kept stable: it lands in the user's config file.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WiGroup::Off => "off",
+            WiGroup::Parent => "parent",
+        }
+    }
+
+    /// Parses a persisted spelling; anything unrecognised is the default, so a config written
+    /// by a newer build does not break an older one.
+    pub fn parse(s: &str) -> WiGroup {
+        match s {
+            "parent" => WiGroup::Parent,
+            _ => WiGroup::Off,
+        }
+    }
+
+    /// The `G` cycle.
+    pub fn next(self) -> WiGroup {
+        match self {
+            WiGroup::Off => WiGroup::Parent,
+            WiGroup::Parent => WiGroup::Off,
+        }
+    }
+}
+
+/// A group header in the Work Items list: one parent and the roll-up of the items beneath it.
+#[derive(Debug, Clone)]
+pub struct WiHead {
+    /// Stable identity, used as the expand/collapse key. Empty for the "No parent" group.
+    pub key: String,
+    /// What the forge calls the parent ("Milestone", "Epic", …). Empty for "No parent".
+    pub kind: String,
+    pub title: String,
+    pub items: usize,
+    /// Items in a started state, not counting the blocked ones.
+    pub in_progress: usize,
+    pub blocked: usize,
+    /// Index into `App::wis` of the most recently updated item beneath — the one the preview
+    /// pane shows, and whose age the header carries.
+    pub latest: usize,
+    pub updated: Option<DateTime<Utc>>,
+    pub expanded: bool,
+    pub provider: ProviderType,
+    /// The connection every item beneath came from; empty when they span several ("No parent").
+    pub connection: String,
+}
+
+/// One rendered line of the Work Items list — see [`PipeLine`] for why lines, not rows.
+#[derive(Debug, Clone)]
+pub enum WiLine {
+    Head(WiHead),
+    /// Index into `App::wis`.
+    Item(usize),
+}
+
+/// What two work items must share to sit under one header: the connection, and the parent's
+/// kind and id. Empty for an item with no parent.
+pub fn wi_group_key(row: &WiRow) -> String {
+    match &row.wi.parent {
+        Some(p) => format!("{}|{}|{}", row.connection_id, p.kind, p.id),
+        None => String::new(),
+    }
+}
+
+fn wi_is_blocked(wi: &WorkItem) -> bool {
+    wi.state.eq_ignore_ascii_case("blocked")
 }
 
 /// A group header in the Pipelines list: the roll-up of the runs beneath it.
@@ -904,6 +987,9 @@ pub struct App {
     pub pipe_sort: Option<SortPref>,
     /// How the Pipelines list is grouped. Persisted.
     pub pipe_group: PipeGroup,
+    /// How the Work Items list is grouped, and which of its groups are open.
+    pub wi_group: WiGroup,
+    pub wi_expanded: HashSet<String>,
     /// The group keys currently *expanded*. Stored as the open set rather than the closed
     /// one so a newly-arrived group lands collapsed — the roll-up is the point of the view,
     /// and a group that opens itself on refresh would undo it.
@@ -3406,6 +3492,8 @@ impl App {
             wi_sort: None,
             pipe_sort: None,
             pipe_group: PipeGroup::default(),
+            wi_group: WiGroup::default(),
+            wi_expanded: HashSet::new(),
             pipe_expanded: HashSet::new(),
             views: [Vec::new(), Vec::new(), Vec::new()],
             view_idx: [0, 0, 0],
@@ -3622,6 +3710,144 @@ impl App {
         }
     }
 
+    /// The Work Items list as rendered lines: group headers plus the items of expanded groups.
+    ///
+    /// Groups come newest-first by their most recently updated item; under an explicit sort they
+    /// come in the order their first item sorts, so the sort orders the groups and the items
+    /// inside each. Items with no parent share one last group.
+    pub fn wi_lines(&self) -> Vec<WiLine> {
+        let idxs = self.filtered_wi_indices();
+        if self.wi_group == WiGroup::Off {
+            return idxs.into_iter().map(WiLine::Item).collect();
+        }
+
+        let mut order: Vec<String> = Vec::new();
+        let mut buckets: HashMap<String, Vec<usize>> = HashMap::new();
+        for i in idxs {
+            let key = wi_group_key(&self.wis[i]);
+            if !buckets.contains_key(&key) {
+                order.push(key.clone());
+            }
+            buckets.entry(key).or_default().push(i);
+        }
+        let latest = |k: &str| buckets[k].iter().copied().max_by_key(|&i| self.wis[i].wi.updated_at).unwrap_or(buckets[k][0]);
+        if self.wi_sort.is_none() {
+            order.sort_by_key(|k| Reverse(self.wis[latest(k)].wi.updated_at));
+        }
+        // Stable, so the groups keep the order just decided and only "No parent" moves.
+        order.sort_by_key(|k| k.is_empty());
+
+        let mut out = Vec::new();
+        for key in order {
+            let members = &buckets[&key];
+            let first = &self.wis[members[0]];
+            let latest_idx = latest(&key);
+            let one_connection = members.iter().all(|&i| self.wis[i].connection_id == first.connection_id);
+            let (kind, title) = match &first.wi.parent {
+                Some(p) => (p.kind.clone(), p.title.clone()),
+                None => (String::new(), "No parent".to_string()),
+            };
+            let head = WiHead {
+                kind,
+                title,
+                items: members.len(),
+                in_progress: members
+                    .iter()
+                    .filter(|&&i| self.wis[i].wi.state_category == WorkItemStateCategory::Started && !wi_is_blocked(&self.wis[i].wi))
+                    .count(),
+                blocked: members.iter().filter(|&&i| wi_is_blocked(&self.wis[i].wi)).count(),
+                latest: latest_idx,
+                updated: self.wis[latest_idx].wi.updated_at,
+                expanded: self.wi_expanded.contains(&key),
+                provider: first.provider,
+                connection: if one_connection { first.connection.clone() } else { String::new() },
+                key,
+            };
+            let expanded = head.expanded;
+            out.push(WiLine::Head(head));
+            if expanded {
+                out.extend(members.iter().map(|&i| WiLine::Item(i)));
+            }
+        }
+        out
+    }
+
+    /// Drops expand state for groups that no longer exist, so one that comes back arrives folded.
+    fn prune_wi_expanded(&mut self) {
+        if self.wi_expanded.is_empty() {
+            return;
+        }
+        let live: HashSet<String> = self.wis.iter().map(wi_group_key).collect();
+        self.wi_expanded.retain(|k| live.contains(k));
+    }
+
+    /// Expands or collapses one group, keeping the cursor on its header.
+    fn toggle_wi_group(&mut self, key: &str) {
+        if !self.wi_expanded.remove(key) {
+            self.wi_expanded.insert(key.to_string());
+        }
+        self.fix_selection();
+        self.ensure_visible();
+    }
+
+    /// Expands or collapses every group at once.
+    fn set_all_wi_groups(&mut self, expand: bool) {
+        if self.wi_group == WiGroup::Off {
+            return;
+        }
+        // The group the cursor is in, so it can be put back on that group's header: the line
+        // index it holds now will mean a different line once every group has changed size.
+        let lines = self.wi_lines();
+        let at = self.wi_state.selected().unwrap_or(0).min(lines.len().saturating_sub(1));
+        let group = lines.iter().take(at + 1).rev().find_map(|l| match l {
+            WiLine::Head(h) => Some(h.key.clone()),
+            WiLine::Item(_) => None,
+        });
+        self.wi_expanded.clear();
+        if expand {
+            self.wi_expanded.extend(lines.into_iter().filter_map(|l| match l {
+                WiLine::Head(h) => Some(h.key),
+                WiLine::Item(_) => None,
+            }));
+        }
+        let header = group.and_then(|key| self.wi_lines().iter().position(|l| matches!(l, WiLine::Head(h) if h.key == key)));
+        if let Some(pos) = header {
+            self.wi_state.select(Some(pos));
+        }
+        self.fix_selection();
+        self.ensure_visible();
+    }
+
+    /// Cycles the grouping mode and persists the choice. Resets the cursor to the top: the line
+    /// it was on does not exist in the new arrangement.
+    async fn cycle_wi_group(&mut self, deps: &AppDeps) {
+        self.wi_group = self.wi_group.next();
+        self.wi_expanded.clear();
+        self.wi_state.select(Some(0));
+        self.list_scroll = 0;
+        self.fix_selection();
+        self.toast = Some(match self.wi_group {
+            WiGroup::Off => "Grouping off".to_string(),
+            WiGroup::Parent => "Grouped by parent — milestone, epic or project".to_string(),
+        });
+        let _ = deps.config.set_work_item_group(Some(self.wi_group.as_str().to_string())).await;
+    }
+
+    /// Enter (or Space) on the Work Items list: a header expands or collapses, an item opens.
+    fn enter_wi_line(&mut self, deps: &AppDeps) {
+        self.lp_origin = false;
+        self.from_inbox = false;
+        let Some(sel) = self.wi_state.selected() else { return };
+        match self.wi_lines().get(sel) {
+            Some(WiLine::Head(h)) => {
+                let key = h.key.clone();
+                self.toggle_wi_group(&key);
+            }
+            Some(WiLine::Item(_)) => self.open_wi_view(deps),
+            None => {}
+        }
+    }
+
     /// The Pipelines list as rendered lines: group headers plus the runs of expanded groups.
     ///
     /// Groups are ordered by their most recent run, newest first — the same "what changed
@@ -3771,7 +3997,7 @@ impl App {
     fn filtered_len(&self, section: usize) -> usize {
         match section {
             0 => self.filtered_pr_indices().len(),
-            1 => self.filtered_wi_indices().len(),
+            1 => self.wi_lines().len(),
             _ => self.pipe_lines().len(),
         }
     }
@@ -3987,6 +4213,13 @@ impl App {
     /// arrive, from the cache or a reload.
     pub fn apply_dismissed_notifications(&mut self, keys: &[String]) {
         self.inbox_dismissed = keys.iter().cloned().collect();
+    }
+
+    /// Applies the persisted Work Items grouping at startup. `None` keeps the default.
+    pub fn apply_wi_group(&mut self, group: Option<String>) {
+        if let Some(g) = group {
+            self.wi_group = WiGroup::parse(&g);
+        }
     }
 
     /// Applies the persisted Pipelines grouping at startup. `None` keeps the default.
@@ -4312,9 +4545,12 @@ impl App {
         }
         // Drop anything already acted on this session (e.g. a PR you've reviewed), or
         // explicitly dismissed by the user via the `D` key.
+        // A dismissal saved before the key named the kind and repository is still honoured.
         self.lp.retain(|e| {
-            let key = launchpad::Entry::key(&e.connection_id, e.item_id());
-            !self.lp_dismissed.contains(&key) && !self.lp_dismissed_persisted.contains(&key)
+            let key = e.dismiss_key();
+            !self.lp_dismissed.contains(&key)
+                && !self.lp_dismissed_persisted.contains(&key)
+                && !self.lp_dismissed_persisted.contains(&e.legacy_key())
         });
         for side in 0..2 {
             let len = self.lp_slots(side).len();
@@ -4326,8 +4562,8 @@ impl App {
 
     /// Removes an item from the Launchpad now that you've acted on it, so it disappears
     /// immediately instead of lingering until the provider's feed catches up.
-    fn dismiss_from_launchpad(&mut self, connection_id: &str, item_id: &str) {
-        self.lp_dismissed.insert(launchpad::Entry::key(connection_id, item_id));
+    fn dismiss_from_launchpad(&mut self, connection_id: &str, kind: launchpad::EntryKind, item: &ItemRef) {
+        self.lp_dismissed.insert(launchpad::Entry::key(connection_id, kind, item.repo.as_deref(), &item.id));
         self.rebuild_launchpad();
     }
 
@@ -4337,8 +4573,7 @@ impl App {
     async fn dismiss_selected_lp_item(&mut self, deps: &AppDeps) {
         let Some(LpSlot::Entry(i)) = self.lp_selected_slot() else { return };
         let Some(entry) = self.lp.get(i) else { return };
-        let key = launchpad::Entry::key(&entry.connection_id, entry.item_id());
-        self.lp_dismissed_persisted.insert(key);
+        self.lp_dismissed_persisted.insert(entry.dismiss_key());
         self.rebuild_launchpad();
 
         let ids: Vec<String> = self.lp_dismissed_persisted.iter().cloned().collect();
@@ -4451,7 +4686,7 @@ impl App {
     fn preview_key(&self) -> Option<String> {
         match self.active {
             0 => self.selected_pr_row().map(|r| pr_detail_cache_key(&r.connection_id, &r.pr.item_ref())),
-            1 => self.selected_wi_row().map(|r| wi_detail_cache_key(&r.connection_id, &r.wi.item_ref())),
+            1 => self.preview_wi_row().map(|r| wi_detail_cache_key(&r.connection_id, &r.wi.item_ref())),
             _ => self.preview_pipe().map(|p| pipeline_detail_cache_key(&p.connection_id, &p.run.item_ref())),
         }
     }
@@ -4473,7 +4708,7 @@ impl App {
                 ))
             }
             1 => {
-                let row = self.selected_wi_row()?;
+                let row = self.preview_wi_row()?;
                 Some(Self::build_wi_view(deps, row.connection_id.clone(), row.wi.clone()))
             }
             _ => {
@@ -4556,7 +4791,7 @@ impl App {
             return;
         }
         let pr = self.selected_pr_row().map(|r| r.pr.clone());
-        let wi = self.selected_wi_row().map(|r| r.wi.clone());
+        let wi = self.preview_wi_row().map(|r| r.wi.clone());
         let Some(p) = self.preview.as_mut() else { return };
         match &mut p.view {
             Screen::PrView(v) => {
@@ -4621,6 +4856,11 @@ impl App {
             && self.pipe_state.selected().is_some_and(|sel| matches!(self.pipe_lines().get(sel), Some(PipeLine::Head(_))))
     }
 
+    /// Whether the Work Items list cursor is on a group header rather than an item.
+    pub fn wi_head_selected(&self) -> bool {
+        self.active == 1 && self.wi_state.selected().is_some_and(|sel| matches!(self.wi_lines().get(sel), Some(WiLine::Head(_))))
+    }
+
     /// Moves the preview's view into the screen, still drawn beside the list. A list that
     /// doesn't preview unasked builds the selected row's view here, so Enter opens the pane
     /// either way. Returns whether there was a view to focus.
@@ -4659,9 +4899,9 @@ impl App {
         let on_list = matches!(self.screen, Screen::List);
         let focused = self.preview_focus && matches!(self.screen, Screen::PrView(_) | Screen::WiView(_) | Screen::Pipeline(_));
         match key {
-            // On a pipeline group header Enter keeps expanding / collapsing the group; it is a
-            // run row that Enter moves into the pane.
-            Key::Enter if on_list && !self.pipe_head_selected() => self.focus_preview(deps),
+            // On a group header — a pipeline's or a work-item parent's — Enter keeps expanding /
+            // collapsing the group; it is a run or item row that Enter moves into the pane.
+            Key::Enter if on_list && !self.pipe_head_selected() && !self.wi_head_selected() => self.focus_preview(deps),
             Key::Char('p') if on_list => {
                 if !self.focus_preview(deps) && self.active < 3 && self.content_w < PREVIEW_MIN_WIDTH {
                     self.toast = Some(format!("The pane needs a terminal at least {PREVIEW_MIN_WIDTH} columns wide."));
@@ -4778,20 +5018,24 @@ impl App {
         self.lp_origin = true; // opened from the Launchpad, so Esc returns there
         self.from_inbox = false;
         let (kind, conn, id) = (entry.kind(), entry.connection_id.clone(), entry.item_id().to_string());
+        // A connection is an account, so two items on it can share a number across repositories:
+        // the row's own repository is part of which one it is.
+        let repo = entry.repository().map(str::to_string);
         match kind {
             launchpad::EntryKind::Pr => {
                 let found = self
                     .lp_prs_review
                     .iter()
                     .chain(self.lp_prs_mine.iter())
-                    .find(|r| r.connection_id == conn && r.pr.id == id)
+                    .find(|r| r.connection_id == conn && r.pr.id == id && r.pr.repository == repo)
                     .map(|r| (pr_label(&r.pr), r.pr.url.clone(), r.pr.clone()));
                 if let Some((label, url, pr)) = found {
                     self.open_pr_view_for(deps, 0, label, url, conn, pr);
                 }
             }
             launchpad::EntryKind::Wi => {
-                if let Some(wi) = self.wis.iter().find(|r| r.connection_id == conn && r.wi.id == id).map(|r| r.wi.clone()) {
+                let found = self.wis.iter().find(|r| r.connection_id == conn && r.wi.id == id && r.wi.repository == repo);
+                if let Some(wi) = found.map(|r| r.wi.clone()) {
                     self.open_wi_view_for(deps, conn, wi);
                 }
             }
@@ -4895,7 +5139,12 @@ impl App {
                 out.push(("Quick filter", c('/')));
                 match s {
                     0 => out.push(("Filter by status", c('f'))),
-                    1 => out.push(("Choose which states to show", c('f'))),
+                    1 => {
+                        out.extend([("Choose which states to show", c('f')), ("Group by parent (milestone, epic, project)", c('G'))]);
+                        if self.wi_group != WiGroup::Off {
+                            out.extend([("Collapse every group", c('z')), ("Expand every group", c('Z'))]);
+                        }
+                    }
                     _ => out.extend([
                         ("Choose pipelines to show", c('w')),
                         ("Trigger a run", c('T')),
@@ -4905,8 +5154,10 @@ impl App {
                     ]),
                 }
                 out.extend([("Sort by column", c('S')), ("Choose columns", c('c'))]);
-                // On Pipelines `w` is the pipeline picker once repositories are chosen.
-                if s != 2 || self.no_repos_chosen(2) {
+                // On Pipelines `w` is the pipeline picker once repositories are chosen. Work
+                // Items has no repositories to choose: what is assigned to you is asked of the
+                // account.
+                if s == 0 || (s == 2 && self.no_repos_chosen(2)) {
                     out.push(("Repositories to fetch", c('w')));
                 }
                 if self.views[s].len() > 1 {
@@ -5137,9 +5388,9 @@ impl App {
     /// Runs a palette entry other than an item (items go through [`Action::OpenItem`]).
     async fn run_palette_target(&mut self, target: PaletteTarget, deps: &AppDeps) {
         match target {
-            PaletteTarget::Item { kind, id, connection_id } => {
+            PaletteTarget::Item { kind, id, repo, connection_id } => {
                 if !self.leave_blocked() {
-                    self.open_palette_item(kind, id, connection_id, deps).await;
+                    self.open_palette_item(kind, id, repo, connection_id, deps).await;
                 }
             }
             PaletteTarget::Key(key) => self.replay_key(key, deps).await,
@@ -5233,8 +5484,9 @@ impl App {
     }
 
     /// Open the item chosen in the palette, re-resolving the full struct from the section
-    /// lists by `(kind, id)` and reusing the same open path as selecting it on its screen.
-    async fn open_palette_item(&mut self, kind: PaletteKind, id: String, conn: String, deps: &AppDeps) {
+    /// lists and reusing the same open path as selecting it on its screen. A pull request or work
+    /// item is matched on its repository too: one connection's `#12` can be several items.
+    async fn open_palette_item(&mut self, kind: PaletteKind, id: String, repo: Option<String>, conn: String, deps: &AppDeps) {
         // Esc from the opened view should return to wherever the palette was invoked from; from
         // an open view, that's where that view itself came from, so its origin is kept.
         match self.screen {
@@ -5251,14 +5503,15 @@ impl App {
                 let found = self
                     .prs
                     .iter()
-                    .find(|r| r.connection_id == conn && r.pr.id == id)
+                    .find(|r| r.connection_id == conn && r.pr.id == id && r.pr.repository == repo)
                     .map(|r| (pr_label(&r.pr), r.pr.url.clone(), r.pr.clone()));
                 if let Some((label, url, pr)) = found {
                     self.open_pr_view_for(deps, 0, label, url, conn, pr);
                 }
             }
             PaletteKind::Wi => {
-                if let Some(wi) = self.wis.iter().find(|r| r.connection_id == conn && r.wi.id == id).map(|r| r.wi.clone()) {
+                let found = self.wis.iter().find(|r| r.connection_id == conn && r.wi.id == id && r.wi.repository == repo);
+                if let Some(wi) = found.map(|r| r.wi.clone()) {
                     self.open_wi_view_for(deps, conn, wi);
                 }
             }
@@ -5676,6 +5929,7 @@ impl App {
             }
         }
         self.prune_pipe_expanded();
+        self.prune_wi_expanded();
         if sections_ok.inbox {
             // A dismissal the feed no longer returns can never match again (new activity is a
             // new key), so forget it rather than letting the saved list grow forever. Only on a
@@ -6900,7 +7154,7 @@ impl App {
                 self.from_inbox = false;
                 match self.active {
                     0 => self.open_pr_view(deps, 0),
-                    1 => self.open_wi_view(deps),
+                    1 => self.enter_wi_line(deps),
                     2 => self.enter_pipeline_line(deps),
                     _ => {}
                 }
@@ -7348,11 +7602,11 @@ impl App {
         self.lp_prs_mine.retain(|r| covered(&r.connection_id, r.pr.repository.as_ref()));
         self.lp_prs_review.retain(|r| covered(&r.connection_id, r.pr.repository.as_ref()));
         retain_pool_rows(&mut self.pr_pool, |r| covered(&r.connection_id, r.pr.repository.as_ref()));
-        // Azure DevOps addresses work items and pipelines by **Team Project**, so their rows
-        // carry a project name where a scope entry holds "Project/Repo" — nothing here could
-        // compare the two without re-deriving that addressing, and a wrong guess would empty
-        // both sections. Those two are left to the reload, which fans out over the projects.
-        self.wis.retain(|r| project_addressed_sections(r.provider) || covered(&r.connection_id, r.wi.repository.as_ref()));
+        // Work items are not related to repositories — a scope change never touches them.
+        // Azure DevOps addresses pipelines by **Team Project**, so their rows carry a project
+        // name where a scope entry holds "Project/Repo" — nothing here could compare the two
+        // without re-deriving that addressing, and a wrong guess would empty the section. Those
+        // are left to the reload, which fans out over the projects.
         self.pipes
             .retain(|r| project_addressed_sections(r.provider) || covered(&r.connection_id, r.run.repository.as_ref()));
         self.rebuild_launchpad();
@@ -7395,10 +7649,10 @@ impl App {
             })
         };
         let pr_ids = cfg.pull_requests.as_ref().map(|b| b.ids()).unwrap_or_default();
-        let wi_ids = cfg.work_items.as_ref().map(|b| b.ids()).unwrap_or_default();
         let pipe_ids =
             cfg.pipelines.as_ref().map(|p| p.subscriptions.iter().map(|s| s.connection_id.clone()).collect()).unwrap_or_default();
-        self.repo_scope = [bound(pr_ids), bound(wi_ids), bound(pipe_ids)];
+        // Work Items never has one: its rows are what is assigned to you across the account.
+        self.repo_scope = [bound(pr_ids), None, bound(pipe_ids)];
         self.pipe_scope = self.pipe_scope_of(deps);
     }
 
@@ -7681,16 +7935,24 @@ impl App {
             // `G` cycles how the Pipelines list is **G**rouped.
             'G' if self.active == 2 => self.cycle_pipe_group(deps).await,
             ' ' if self.active == 2 => self.enter_pipeline_line(deps),
+            // On a Work Items group header Space folds and unfolds, as on Pipelines: a header is
+            // not a row to mark.
+            ' ' if self.wi_head_selected() => self.enter_wi_line(deps),
             // Space marks a row for a bulk action; `b` opens what can be done with the marked.
             // (Pipelines keep Space for their groups: a run has no bulk action to mark it for.)
             ' ' => self.toggle_mark(),
             'b' if self.active < 2 => self.open_bulk_menu(),
             'z' if self.active == 2 => self.set_all_pipe_groups(false),
             'Z' if self.active == 2 => self.set_all_pipe_groups(true),
+            // The same keys group Work Items by parent: milestone, epic or project.
+            'G' if self.active == 1 => self.cycle_wi_group(deps).await,
+            'z' if self.active == 1 => self.set_all_wi_groups(false),
+            'Z' if self.active == 1 => self.set_all_wi_groups(true),
             // `w` = which repositories this section **w**atches — the same key Pipelines uses for
             // which pipelines it watches. Unlike the `f` filter, this gates what is *fetched*,
-            // not what is shown from what was fetched.
-            'w' => self.open_repo_scope(deps).await,
+            // not what is shown from what was fetched. Not on Work Items, which are not related
+            // to repositories.
+            'w' if self.active != 1 => self.open_repo_scope(deps).await,
             // Work-item state/comment (u / c) and PR write actions live inside the
             // opened item's view — press Enter first.
             _ => {}
@@ -9060,6 +9322,8 @@ impl App {
         }
         match self.active {
             0 => self.selected_pr().and_then(|p| p.url.clone()),
+            // On a group header `o` opens the parent itself — the milestone, epic or project.
+            1 if self.wi_head_selected() => self.preview_wi_row().and_then(|r| r.wi.parent.as_ref()).and_then(|p| p.url.clone()),
             1 => self.selected_wi().and_then(|w| w.url.clone()),
             2 => self.pipe_for_action().and_then(|p| p.run.url.clone()),
             _ => None,
@@ -9173,13 +9437,16 @@ impl App {
             1 => " · 1 section".to_string(),
             n => format!(" · {n} sections"),
         };
+        // Repositories only matter to a connection that feeds Pull Requests or Pipelines; one
+        // bound to Work Items alone has none to choose.
+        let repo_scoped = draft.bind_sections.iter().any(|s| !matches!(s, Section::WorkItems));
         self.toast = Some(match &seeded {
-            Some(page) => format!(
+            Some(page) if repo_scoped => format!(
                 "Added {} connection{sections} · {} repositories found — press w to choose",
                 provider.as_str(),
                 page.repositories.len()
             ),
-            None => format!("Added {} connection{sections}", provider.as_str()),
+            _ => format!("Added {} connection{sections}", provider.as_str()),
         });
         self.request_reload(deps);
         self.rebuild_config_view(deps).await;
@@ -9929,8 +10196,8 @@ impl App {
                     self.open_pipeline_subs_for(id, display, deps).await;
                 }
             }
-            Action::OpenItem { kind, id, connection_id } => {
-                self.run_palette_target(PaletteTarget::Item { kind, id, connection_id }, deps).await
+            Action::OpenItem { kind, id, repo, connection_id } => {
+                self.run_palette_target(PaletteTarget::Item { kind, id, repo, connection_id }, deps).await
             }
             Action::Palette(target) => self.run_palette_target(target, deps).await,
             Action::OpenReviewMenu => self.open_review_submit(),
@@ -10083,7 +10350,8 @@ impl App {
         }
         // Reviewing a PR clears it from the Launchpad now; a merge waits for the provider.
         if matches!(call, PrCall::Vote(_) | PrCall::Review { .. }) {
-            pending.dismissed = self.lp_dismissed.insert(launchpad::Entry::key(&conn_id, &item.id));
+            pending.dismissed =
+                self.lp_dismissed.insert(launchpad::Entry::key(&conn_id, launchpad::EntryKind::Pr, item.repo.as_deref(), &item.id));
             self.rebuild_launchpad();
         }
         // On a forge that stops asking for your review once you have given it, the PR leaves
@@ -10217,14 +10485,14 @@ impl App {
                     }
                 }
                 if dismissed {
-                    self.lp_dismissed.remove(&launchpad::Entry::key(&conn_id, &item.id));
+                    self.lp_dismissed.remove(&launchpad::Entry::key(&conn_id, launchpad::EntryKind::Pr, item.repo.as_deref(), &item.id));
                     self.rebuild_launchpad();
                 }
                 self.toast_error(format!("{failed}: {e}"));
             }
             Ok(()) => {
                 if merge {
-                    self.dismiss_from_launchpad(&conn_id, &item.id);
+                    self.dismiss_from_launchpad(&conn_id, launchpad::EntryKind::Pr, &item);
                 }
                 self.toast = Some(done);
                 // The provider's own copy of the PR (status / reviewers / mergeable), with any
@@ -10253,8 +10521,23 @@ impl App {
         if self.active != 1 {
             return None;
         }
-        let idxs = self.filtered_wi_indices();
-        self.wi_state.selected().and_then(|p| idxs.get(p)).and_then(|&i| self.wis.get(i))
+        match self.wi_lines().get(self.wi_state.selected()?)? {
+            WiLine::Item(i) => self.wis.get(*i),
+            // A header is not an item: Enter folds it, and there is nothing to edit.
+            WiLine::Head(_) => None,
+        }
+    }
+
+    /// The work item the preview pane shows for the selected line: the item itself, or for a
+    /// group header its most recently updated one — as a pipeline group previews its latest run.
+    fn preview_wi_row(&self) -> Option<&WiRow> {
+        if self.active != 1 {
+            return None;
+        }
+        match self.wi_lines().get(self.wi_state.selected()?)? {
+            WiLine::Item(i) => self.wis.get(*i),
+            WiLine::Head(h) => self.wis.get(h.latest),
+        }
     }
 
     fn selected_wi(&self) -> Option<&WorkItem> {
@@ -10572,34 +10855,43 @@ impl App {
 
     // ---- bulk actions on marked rows ----
 
-    /// The detail cache key of each row in the active list, in the order shown — what a mark
-    /// is matched against. Only pull requests and work items can be marked.
-    fn visible_row_keys(&self) -> Vec<String> {
+    /// The detail cache key of each line in the active list, in the order shown — what a mark
+    /// is matched against. Only pull requests and work items can be marked, so a Work Items
+    /// group header, which is a line but not an item, has none.
+    fn visible_row_keys(&self) -> Vec<Option<String>> {
         match self.active {
             0 => self
                 .filtered_pr_indices()
                 .into_iter()
-                .map(|i| pr_detail_cache_key(&self.prs[i].connection_id, &self.prs[i].pr.item_ref()))
+                .map(|i| Some(pr_detail_cache_key(&self.prs[i].connection_id, &self.prs[i].pr.item_ref())))
                 .collect(),
             1 => self
-                .filtered_wi_indices()
-                .into_iter()
-                .map(|i| wi_detail_cache_key(&self.wis[i].connection_id, &self.wis[i].wi.item_ref()))
+                .wi_lines()
+                .iter()
+                .map(|line| match line {
+                    WiLine::Item(i) => Some(wi_detail_cache_key(&self.wis[*i].connection_id, &self.wis[*i].wi.item_ref())),
+                    WiLine::Head(_) => None,
+                })
                 .collect(),
             _ => Vec::new(),
         }
     }
 
-    /// Which rows of the active list are marked, in the order shown.
+    /// Which lines of the active list are marked, in the order shown.
     pub fn marked_rows(&self) -> Vec<bool> {
         let Some(marks) = self.marks.get(self.active).filter(|m| !m.is_empty()) else { return Vec::new() };
-        self.visible_row_keys().iter().map(|k| marks.contains(k)).collect()
+        self.visible_row_keys().iter().map(|k| k.as_ref().is_some_and(|k| marks.contains(k))).collect()
     }
 
-    /// How many rows of the active list are marked. Only the ones on screen count — and only
-    /// those are acted on — so a bulk action never changes a row the filter is hiding.
+    /// How many rows of the active list are marked. Only the ones the filters leave count — and
+    /// only those are acted on — so a bulk action never changes a row the filter is hiding. A
+    /// work item folded away inside its group is still listed, so it still counts: folding is
+    /// how the list is arranged, not what is in it.
     pub fn marked_count(&self) -> usize {
-        self.marked_rows().into_iter().filter(|m| *m).count()
+        match self.active {
+            1 => self.marked_wi_rows().len(),
+            _ => self.marked_rows().into_iter().filter(|m| *m).count(),
+        }
     }
 
     /// Marks the row under the cursor for a bulk action, or lets go of it.
@@ -10608,7 +10900,7 @@ impl App {
             return;
         }
         let keys = self.visible_row_keys();
-        let Some(key) = self.selected().and_then(|p| keys.get(p)).cloned() else { return };
+        let Some(key) = self.selected().and_then(|p| keys.get(p)).cloned().flatten() else { return };
         // Marks on items the section no longer lists go quietly, rather than waiting to light
         // up a row that comes back. One a filter is merely hiding is kept: narrowing the list
         // to find the next row to mark mustn't cost the ones already marked.
@@ -11944,13 +12236,15 @@ fn wi_matches(wi: &WorkItem, q: &str) -> bool {
     if q.is_empty() {
         return true;
     }
+    // The parent's name too, so typing a milestone's or epic's name narrows to what is under it.
     let hay = format!(
-        "{} {} {} {} {}",
+        "{} {} {} {} {} {}",
         wi.title,
         wi.identifier.clone().unwrap_or_default(),
         wi.state,
         wi.work_item_type.clone().unwrap_or_default(),
         wi.assignee.as_ref().map(|a| a.display_name.clone()).unwrap_or_default(),
+        wi.parent.as_ref().map(|p| p.title.as_str()).unwrap_or_default(),
     )
     .to_lowercase();
     q.split_whitespace().all(|t| hay.contains(t))
@@ -13416,6 +13710,24 @@ mod tests {
         assert!(app.wis.is_empty());
     }
 
+    /// Work items are not related to repositories: on that tab `w` picks nothing and the palette
+    /// offers no repositories, while Pull Requests keeps both.
+    #[tokio::test]
+    async fn work_items_offer_no_repository_picker() {
+        let deps = test_deps();
+        let mut app = App::new("slate");
+        app.screen = Screen::List;
+        let offers = |app: &App| app.context_actions().iter().any(|(what, _)| *what == "Repositories to fetch");
+
+        app.active = 1;
+        assert!(!offers(&app), "the palette has no repositories entry on Work Items");
+        app.on_key(Key::Char('w'), &deps).await;
+        assert!(app.overlay.is_none() && app.toast.is_none(), "and `w` neither opens a picker nor explains one");
+
+        app.active = 0;
+        assert!(offers(&app), "Pull Requests still chooses its repositories");
+    }
+
     /// Narrowing the scope is knowable; widening it is not, so only rows outside the new set go.
     #[test]
     fn narrowing_the_repository_scope_drops_the_rows_it_no_longer_covers() {
@@ -13436,11 +13748,12 @@ mod tests {
             in_repo("other", Some("acme/legacy")),
         ];
         app.lp_prs_mine = vec![in_repo("c", Some("acme/legacy"))];
-        // Azure addresses work items by Team Project, so this row's "repository" is a project
-        // name that no scope entry could ever match.
+        // Work items are not related to repositories: one living in a repository the scope just
+        // dropped is still assigned to you.
         app.wis = vec![WiRow {
-            provider: ProviderType::AzureDevOps,
-            wi: WorkItem { repository: Some("Payments".into()), ..wi(None) },
+            connection_id: "c".into(),
+            provider: ProviderType::GitHub,
+            wi: WorkItem { repository: Some("acme/legacy".into()), ..wi(None) },
             ..wi_row(wi(None))
         }];
 
@@ -13458,7 +13771,7 @@ mod tests {
             "only this connection's out-of-scope rows go; an unaddressed row can't be placed"
         );
         assert!(app.lp_prs_mine.is_empty(), "the Command Center's PR feeds narrow too");
-        assert_eq!(app.wis.len(), 1, "a project-addressed section is left to the reload");
+        assert_eq!(app.wis.len(), 1, "a scope change never drops a work item");
     }
 
     /// `self.inbox` is this session; the cache is the *next* launch. Without the rewrite,
@@ -13854,6 +14167,7 @@ mod tests {
             created_at: None,
             updated_at: None,
             url: url.map(Into::into),
+            parent: None,
         }
     }
 
@@ -14484,10 +14798,360 @@ mod tests {
         assert_eq!(app.lp.len(), 1, "the PR shows in the review bucket");
 
         // Acting on it removes it immediately, and it stays gone across a refetch.
-        app.dismiss_from_launchpad("c", "pr1");
+        app.dismiss_from_launchpad("c", launchpad::EntryKind::Pr, &ItemRef::new("pr1"));
         assert!(app.lp.is_empty(), "reviewed PR is dismissed");
         app.rebuild_launchpad();
         assert!(app.lp.is_empty(), "still gone until the provider feed catches up");
+    }
+
+    /// A work item on connection `conn`, last updated `hours_ago`, under `parent` (kind, id,
+    /// title) when it has one.
+    fn grouped_wi(id: &str, conn: &str, parent: Option<(&str, &str, &str)>, state: &str, hours_ago: i64) -> WiRow {
+        let started = matches!(state, "In Progress" | "Blocked");
+        WiRow {
+            connection_id: conn.into(),
+            connection: conn.into(),
+            wi: WorkItem {
+                id: id.into(),
+                title: format!("item {id}"),
+                state: state.into(),
+                state_category: if started { WorkItemStateCategory::Started } else { WorkItemStateCategory::Unstarted },
+                updated_at: Some(Utc::now() - chrono::Duration::hours(hours_ago)),
+                parent: parent.map(|(kind, id, title)| WorkItemParent { kind: kind.into(), id: id.into(), title: title.into(), url: None }),
+                ..wi(None)
+            },
+            ..wi_row(wi(None))
+        }
+    }
+
+    /// Two milestones, an epic on another connection, and two loose items.
+    fn grouped_wis() -> Vec<WiRow> {
+        let q4 = Some(("Milestone", "m1", "Q4 reliability"));
+        let ledger = Some(("Milestone", "m2", "Ledger v2 › Reconciliation"));
+        vec![
+            grouped_wi("a", "gh", q4, "In Progress", 30),
+            grouped_wi("loose-new", "gh", None, "Todo", 1),
+            grouped_wi("b", "gh", q4, "Blocked", 5),
+            grouped_wi("c", "ln", ledger, "Todo", 2),
+            grouped_wi("d", "ln", ledger, "In Progress", 50),
+            grouped_wi("e", "jira", Some(("Epic", "OPS-1", "SOC2 audit")), "Todo", 90),
+            grouped_wi("loose-old", "jira", None, "In Progress", 99),
+        ]
+    }
+
+    fn grouped_app() -> App {
+        let mut app = App::new("slate");
+        app.screen = Screen::List;
+        app.active = 1;
+        app.wis = grouped_wis();
+        app.wi_group = WiGroup::Parent;
+        app.fix_selection();
+        app
+    }
+
+    /// Each line as text: `[title n]` for a header, the id for an item.
+    fn wi_line_names(app: &App) -> Vec<String> {
+        app.wi_lines()
+            .iter()
+            .map(|l| match l {
+                WiLine::Head(h) => format!("[{} {}]", h.title, h.items),
+                WiLine::Item(i) => app.wis[*i].wi.id.clone(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn work_items_are_a_flat_list_until_grouping_is_asked_for() {
+        let mut app = grouped_app();
+        app.wi_group = WiGroup::default();
+        assert_eq!(app.wi_group, WiGroup::Off, "flat out of the box");
+        assert_eq!(wi_line_names(&app), ["a", "loose-new", "b", "c", "d", "e", "loose-old"]);
+    }
+
+    #[test]
+    fn grouping_by_parent_shows_only_the_parents_newest_first_and_the_loose_items_last() {
+        let app = grouped_app();
+        // Collapsed: only headers. Ordered by each group's most recent item (2h, 5h, 90h), and
+        // "No parent" last although it holds the newest item of all.
+        assert_eq!(wi_line_names(&app), ["[Ledger v2 › Reconciliation 2]", "[Q4 reliability 2]", "[SOC2 audit 1]", "[No parent 2]"]);
+
+        let heads: Vec<WiHead> = app.wi_lines().into_iter().filter_map(|l| if let WiLine::Head(h) = l { Some(h) } else { None }).collect();
+        let q4 = &heads[1];
+        assert_eq!((q4.kind.as_str(), q4.in_progress, q4.blocked), ("Milestone", 1, 1), "a blocked item is not also in progress");
+        assert_eq!(app.wis[q4.latest].wi.id, "b", "the header speaks for its most recently updated item");
+        assert_eq!(q4.connection, "gh");
+        let loose = &heads[3];
+        assert_eq!((loose.kind.as_str(), loose.connection.as_str(), loose.in_progress), ("", "", 1), "what is left spans connections");
+    }
+
+    #[test]
+    fn the_same_parent_on_another_connection_is_another_group() {
+        let mut app = grouped_app();
+        app.wis = vec![
+            grouped_wi("a", "gh-work", Some(("Milestone", "1", "v2")), "Todo", 1),
+            grouped_wi("b", "gh-personal", Some(("Milestone", "1", "v2")), "Todo", 2),
+            // And the same id under another kind is a different parent too.
+            grouped_wi("c", "gh-work", Some(("Epic", "1", "v2")), "Todo", 3),
+        ];
+        assert_eq!(wi_line_names(&app), ["[v2 1]", "[v2 1]", "[v2 1]"]);
+    }
+
+    #[tokio::test]
+    async fn enter_on_a_work_item_group_expands_it_and_enter_on_an_item_opens_it() {
+        let deps = test_deps();
+        let mut app = grouped_app();
+        assert!(app.selected_wi().is_none(), "a header is not a work item");
+        assert_eq!(app.preview_wi_row().map(|r| r.wi.id.as_str()), Some("c"), "but previews its most recent one");
+
+        app.on_key(Key::Enter, &deps).await;
+        assert!(matches!(app.screen, Screen::List), "Enter on a header opens nothing");
+        assert_eq!(
+            wi_line_names(&app),
+            ["[Ledger v2 › Reconciliation 2]", "c", "d", "[Q4 reliability 2]", "[SOC2 audit 1]", "[No parent 2]"],
+            "it unfolds in place, the others stay folded"
+        );
+        assert_eq!(app.selected(), Some(0), "and the cursor stays on the header");
+
+        // Space folds it again, as on Pipelines.
+        app.on_key(Key::Char(' '), &deps).await;
+        assert_eq!(app.wi_lines().len(), 4);
+
+        app.on_key(Key::Enter, &deps).await;
+        app.on_key(Key::Down, &deps).await;
+        app.on_key(Key::Down, &deps).await;
+        assert_eq!(app.selected_wi().map(|w| w.id.as_str()), Some("d"));
+        // Space folds and unfolds a header; on an item it marks the row for a bulk action, as in
+        // the flat list, and the mark is the item's — not whatever row shares its line number.
+        app.on_key(Key::Char(' '), &deps).await;
+        assert!(matches!(app.screen, Screen::List) && app.wi_lines().len() == 6);
+        assert_eq!(app.marked_rows(), [false, false, true, false, false, false]);
+        assert_eq!(app.marked_wi_rows().iter().map(|r| r.wi.id.as_str()).collect::<Vec<_>>(), ["d"]);
+        // Folded away, it is still listed and still counted; a header is never marked.
+        app.wi_state.select(Some(0));
+        app.on_key(Key::Char(' '), &deps).await;
+        assert_eq!((app.wi_lines().len(), app.marked_count()), (4, 1));
+        assert!(app.marked_rows().iter().all(|m| !m), "no line on screen is the marked item");
+        app.on_key(Key::Char(' '), &deps).await;
+        app.wi_state.select(Some(2));
+        app.on_key(Key::Char(' '), &deps).await;
+        assert_eq!(app.marked_count(), 0, "Space again lets go of it");
+        app.on_key(Key::Enter, &deps).await;
+        let Screen::WiView(v) = &app.screen else { panic!("Enter on an item opens it") };
+        assert_eq!(v.wi.id, "d");
+    }
+
+    #[tokio::test]
+    async fn enter_on_a_work_item_group_expands_it_even_where_the_pane_fits() {
+        // Wide enough for the side pane, where Enter on a row opens the pane: a header must
+        // still unfold rather than open its newest item.
+        let deps = test_deps();
+        let mut app = grouped_app();
+        app.content_w = 200;
+
+        app.on_key(Key::Enter, &deps).await;
+        assert!(matches!(app.screen, Screen::List) && !app.preview_focus, "nothing was opened");
+        assert_eq!(app.wi_lines().len(), 4 + 2, "the group unfolded");
+
+        app.on_key(Key::Down, &deps).await;
+        app.on_key(Key::Enter, &deps).await;
+        let Screen::WiView(v) = &app.screen else { panic!("Enter on an item opens it in the pane") };
+        assert_eq!(v.wi.id, "c");
+        assert!(app.preview_focus);
+    }
+
+    #[tokio::test]
+    async fn z_and_shift_z_fold_and_unfold_every_work_item_group() {
+        let deps = test_deps();
+        let mut app = grouped_app();
+        // From the third header: unfolding everything must leave the cursor on that header, not
+        // on whatever item now sits at its old line number.
+        app.wi_state.select(Some(2));
+        app.on_key(Key::Char('Z'), &deps).await;
+        assert_eq!(app.wi_lines().len(), 4 + 7, "every header and every item");
+        let on = |app: &App| wi_line_names(app)[app.selected().unwrap()].clone();
+        assert_eq!(on(&app), "[SOC2 audit 1]");
+
+        // From an item: folding everything puts the cursor on the header of its own group.
+        app.on_key(Key::Down, &deps).await;
+        assert_eq!(on(&app), "e");
+        app.on_key(Key::Char('z'), &deps).await;
+        assert_eq!(app.wi_lines().len(), 4);
+        assert_eq!(on(&app), "[SOC2 audit 1]");
+    }
+
+    #[tokio::test]
+    async fn shift_g_groups_work_items_by_parent_and_the_choice_is_saved() {
+        let deps = test_deps();
+        let mut app = grouped_app();
+        app.wi_group = WiGroup::Off;
+        app.wi_state.select(Some(5));
+
+        app.on_key(Key::Char('G'), &deps).await;
+        assert_eq!(app.wi_group, WiGroup::Parent);
+        assert_eq!(app.selected(), Some(0), "the cursor returns to the top of the new arrangement");
+        assert_eq!(deps.config.snapshot().ui.work_item_group.as_deref(), Some("parent"), "persisted");
+
+        // A fresh launch reads it back, and an unknown spelling from a newer build is the default.
+        let mut fresh = App::new("slate");
+        fresh.apply_wi_group(deps.config.snapshot().ui.work_item_group);
+        assert_eq!(fresh.wi_group, WiGroup::Parent);
+        fresh.apply_wi_group(Some("by-sprint".into()));
+        assert_eq!(fresh.wi_group, WiGroup::Off);
+
+        app.on_key(Key::Char('Z'), &deps).await;
+        app.on_key(Key::Char('G'), &deps).await;
+        assert_eq!(app.wi_group, WiGroup::Off);
+        assert!(app.wi_expanded.is_empty(), "the next grouping starts folded");
+    }
+
+    #[test]
+    fn a_sort_and_the_filters_apply_before_the_grouping() {
+        let mut app = grouped_app();
+        // Sorted by title, the groups come in the order their first item sorts — "a" then "c"
+        // then "e" — rather than newest first, and the items inside follow the same sort.
+        app.wi_sort = Some(SortPref { key: "title".into(), desc: false });
+        app.wi_expanded = app.wis.iter().map(wi_group_key).collect();
+        assert_eq!(
+            wi_line_names(&app),
+            ["[Q4 reliability 2]", "a", "b", "[Ledger v2 › Reconciliation 2]", "c", "d", "[SOC2 audit 1]", "e", "[No parent 2]", "loose-new", "loose-old"]
+        );
+
+        // A quick filter that leaves a group nothing drops its header; the counts follow. The
+        // parent's own name is searchable, so a milestone can be typed to narrow to it.
+        app.wi_sort = None;
+        app.filters[1] = "reconciliation progress".into();
+        assert_eq!(wi_line_names(&app), ["[Ledger v2 › Reconciliation 1]", "d"]);
+
+        // Hiding a state does the same.
+        app.filters[1].clear();
+        app.wi_hidden_states = ["Todo".to_string()].into_iter().collect();
+        app.wi_expanded.clear();
+        assert_eq!(wi_line_names(&app), ["[Q4 reliability 2]", "[Ledger v2 › Reconciliation 1]", "[No parent 1]"]);
+    }
+
+    #[test]
+    fn a_group_that_leaves_and_returns_comes_back_folded() {
+        let mut app = grouped_app();
+        app.wi_expanded = app.wis.iter().map(wi_group_key).collect();
+        let kept = wi_group_key(&app.wis[0]);
+        let (kept_rows, gone): (Vec<WiRow>, Vec<WiRow>) = std::mem::take(&mut app.wis).into_iter().partition(|r| r.connection_id == "gh");
+        app.wis = kept_rows;
+        app.prune_wi_expanded();
+        assert!(app.wi_expanded.contains(&kept) && app.wi_expanded.len() == 2, "live groups (and No parent) keep their state");
+
+        // The groups that left come back with the next reload — folded, the open one still open.
+        app.wis.extend(gone);
+        let open: Vec<String> = app
+            .wi_lines()
+            .into_iter()
+            .filter_map(|l| if let WiLine::Head(h) = l { h.expanded.then_some(h.title) } else { None })
+            .collect();
+        assert_eq!(open, ["Q4 reliability", "No parent"]);
+    }
+
+    #[test]
+    fn o_on_a_group_header_is_the_parents_own_page_and_the_quick_filter_finds_it_by_name() {
+        let mut app = grouped_app();
+        for row in &mut app.wis {
+            row.wi.url = Some(format!("https://example.test/item/{}", row.wi.id));
+            if let Some(p) = &mut row.wi.parent {
+                p.url = Some(format!("https://example.test/parent/{}", p.id));
+            }
+        }
+        assert_eq!(app.selected_url().as_deref(), Some("https://example.test/parent/m2"), "the milestone, not an item in it");
+        app.wi_expanded.insert(wi_group_key(&app.wis[3]));
+        app.wi_state.select(Some(1));
+        assert_eq!(app.selected_url().as_deref(), Some("https://example.test/item/c"));
+        // "No parent" has no page of its own.
+        app.wi_state.select(Some(app.wi_lines().len() - 1));
+        assert_eq!(app.selected_url(), None);
+
+        // The parent's name narrows the list in either arrangement; its kind is not text to match.
+        app.wi_group = WiGroup::Off;
+        app.filters[1] = "soc2".into();
+        assert_eq!(wi_line_names(&app), ["e"]);
+        app.filters[1] = "milestone".into();
+        assert!(app.wi_lines().is_empty());
+    }
+
+    /// Two work items on one connection sharing a number, in different repositories.
+    fn twin_work_items() -> Vec<WiRow> {
+        ["acme/pay", "acme/ledger"]
+            .into_iter()
+            .map(|repo| wi_row(WorkItem { id: "12".into(), repository: Some(repo.into()), title: repo.into(), ..wi(None) }))
+            .collect()
+    }
+
+    fn lp_repos(app: &App) -> Vec<Option<&str>> {
+        app.lp.iter().map(|e| e.repository()).collect()
+    }
+
+    #[tokio::test]
+    async fn dismissing_an_item_leaves_its_namesake_in_another_repository() {
+        let deps = test_deps();
+        let mut app = App::new("slate");
+        app.screen = Screen::Launchpad;
+        app.wis = twin_work_items();
+        app.rebuild_launchpad();
+        assert_eq!(app.lp.len(), 2, "both #12s show");
+        // Work items sit in the right-hand column.
+        app.lp_side = (0..2).find(|&side| !app.lp_slots(side).is_empty()).expect("a column holds them");
+        let dismissed = app.lp_selected_slot().and_then(|s| match s {
+            LpSlot::Entry(i) => app.lp[i].repository().map(str::to_string),
+            _ => None,
+        });
+
+        app.on_key(Key::Char('D'), &deps).await;
+
+        assert_eq!(app.lp.len(), 1, "only the selected one goes");
+        assert_ne!(lp_repos(&app)[0].map(str::to_string), dismissed, "and it is the other that stays");
+
+        // Saved under a key naming the kind and repository, so it still hides one item — the
+        // same one — on the next launch.
+        let saved = deps.config.snapshot().ui.dismissed_launchpad_items;
+        let mut fresh = App::new("slate");
+        fresh.apply_dismissed_launchpad_items(&saved);
+        fresh.wis = twin_work_items();
+        fresh.rebuild_launchpad();
+        assert_eq!(lp_repos(&fresh), lp_repos(&app));
+    }
+
+    #[test]
+    fn a_dismissal_saved_before_keys_named_the_repository_still_hides_what_it_hid() {
+        // "connection:id" is all an older config holds. Dropping it would bring back everything
+        // the user dismissed, so it keeps its old reach: every item with that id.
+        let mut app = App::new("slate");
+        app.apply_dismissed_launchpad_items(&["c:12".to_string()]);
+        app.wis = twin_work_items();
+        app.wis.push(wi_row(WorkItem { id: "13".into(), repository: Some("acme/pay".into()), ..wi(None) }));
+        app.rebuild_launchpad();
+        assert_eq!(app.lp.iter().map(|e| e.item_id()).collect::<Vec<_>>(), vec!["13"]);
+    }
+
+    #[tokio::test]
+    async fn the_palette_opens_the_item_in_the_repository_it_listed() {
+        let deps = test_deps();
+        let mut app = App::new("slate");
+        app.screen = Screen::List;
+        app.wis = twin_work_items();
+        let mut same_number = pr(None);
+        same_number.id = "12".into();
+        app.prs = ["acme/pay", "acme/ledger"]
+            .into_iter()
+            .map(|repo| pr_row(PullRequest { repository: Some(repo.into()), ..same_number.clone() }))
+            .collect();
+
+        // The second of each pair: a bare-id lookup would open the first.
+        for row in [crate::palette::wi_candidate(&app.wis[1]), crate::palette::pr_candidate(&app.prs[1])] {
+            app.run_palette_target(row.target, &deps).await;
+            let opened = match &app.screen {
+                Screen::WiView(v) => v.wi.repository.clone(),
+                Screen::PrView(v) => v.pr.repository.clone(),
+                _ => panic!("the palette should have opened the item"),
+            };
+            assert_eq!(opened.as_deref(), Some("acme/ledger"));
+            app.screen = Screen::List;
+        }
     }
 
     #[tokio::test]
@@ -20207,7 +20871,7 @@ mod tests {
     }
 
     fn on_launchpad(app: &App) -> bool {
-        !app.lp_dismissed.contains(&launchpad::Entry::key("c", "1"))
+        !app.lp_dismissed.contains(&launchpad::Entry::key("c", launchpad::EntryKind::Pr, None, "1"))
     }
 
     /// Waits for the provider's answer to a write, skipping the background fetches it starts.

@@ -86,7 +86,8 @@ pub struct UiState {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hidden_work_item_states: Vec<String>,
     /// Launchpad items the user has explicitly dismissed from Command Center's
-    /// "Needs you" list ("connection_id:item_id" keys, see launchpad::Entry::key).
+    /// "Needs you" list ("connection_id:kind:repository:item_id" keys, see launchpad::Entry::key;
+    /// older "connection_id:item_id" keys are still read, see launchpad::Entry::legacy_key).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dismissed_launchpad_items: Vec<String>,
     /// Notifications the user dismissed from the TUI inbox ("connection_id:id:updated_at"
@@ -104,6 +105,10 @@ pub struct UiState {
     /// or "off" for the ungrouped list. Unknown values fall back to the default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pipeline_group: Option<String>,
+    /// How the Work Items list is grouped: "off" (default) for the flat list, or "parent" for
+    /// one header per milestone / epic / project. Unknown values fall back to the default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_item_group: Option<String>,
     /// Columns the user has switched off in the terminal's list tables, by header name
     /// ("Provider", "Author", …), one list per section in tab order (Pull Requests, Work Items,
     /// Pipelines). `None` means never chosen, and each frontend's defaults apply.

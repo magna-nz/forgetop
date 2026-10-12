@@ -7,8 +7,8 @@ import { setConnectionScopeInCache } from "../optimistic";
 
 /** Queries invalidated when the scope changes. The scope gates **fetching**, so every list that
  *  fetches has to go back to the provider — unlike the view tabs, which narrow rows already in
- *  hand. */
-const AFFECTED = ["prs", "work-items", "pipelines", "launchpad", "connections"];
+ *  hand. Work items are not among them: they are not related to repositories. */
+const AFFECTED = ["prs", "pipelines", "launchpad", "connections"];
 
 /** How many repositories a connection currently fetches from.
  *
@@ -35,15 +35,16 @@ export interface RepoScopeState {
   noneSelected: boolean;
 }
 
-/** The three sections a connection can be bound to, as the connections API spells them. */
-export type ScopeSection = "pull_requests" | "work_items" | "pipelines";
+/** The sections a repository scope governs, as the connections API spells them. Work items are
+ *  not one: what is assigned to you is asked of the account, whatever repositories are chosen. */
+export type ScopeSection = "pull_requests" | "pipelines";
 
 /**
  * The per-connection repository scope, surfaced as a filter control.
  *
- * The scope is per connection rather than per lens, so pull requests, work items and pipelines
- * all read the same "the repositories I'm working in" — no wondering why a repository appears in
- * one lens and not another.
+ * The scope is per connection rather than per lens, so pull requests and pipelines both read the
+ * same "the repositories I'm working in" — no wondering why a repository appears in one lens and
+ * not the other.
  *
  * Connections come from the section's **binding**, not from the loaded rows: an empty scope
  * returns no rows at all, and a control derived from rows would vanish exactly when the user

@@ -120,7 +120,26 @@ pub fn map_issue(v: &Value, repo: Option<&str>) -> WorkItem {
         created_at: get_date(v, "created_at"),
         updated_at: get_date(v, "updated_at"),
         url: get_str(v, "web_url"),
+        // The milestone when it has one; otherwise its epic, which only paid tiers return.
+        parent: issue_parent(v, "milestone", "Milestone", "web_url").or_else(|| issue_parent(v, "epic", "Epic", "url")),
     }
+}
+
+/// The `field` object of an issue (`milestone` or `epic`) as the issue's parent.
+fn issue_parent(v: &Value, field: &str, kind: &str, url_field: &str) -> Option<WorkItemParent> {
+    let p = get_obj(v, field)?;
+    // An epic's `url` is a path on the host ("/groups/acme/-/epics/1"). Left as it is, a browser
+    // would resolve it against whatever page showed it, so it is put on the issue's own host —
+    // or dropped when that cannot be told.
+    let url = get_str(p, url_field).and_then(|url| match url.strip_prefix('/') {
+        Some(path) => {
+            let issue = get_str(v, "web_url")?;
+            let host_end = issue.find("://").map(|i| i + 3).and_then(|start| issue[start..].find('/').map(|i| start + i))?;
+            Some(format!("{}/{path}", &issue[..host_end]))
+        }
+        None => Some(url),
+    });
+    Some(WorkItemParent { kind: kind.into(), id: get_i64(p, "id")?.to_string(), title: get_str(p, "title")?, url })
 }
 
 pub fn gl_pipeline_status(status: Option<&str>) -> PipelineRunStatus {
@@ -969,18 +988,25 @@ impl PullRequestSource for GitLabPr {
 #[async_trait]
 impl WorkItemSource for GitLabWi {
     async fn list(&self, query: &WorkItemQuery) -> Result<Vec<WorkItem>> {
+        let state = if query.include_completed { "all" } else { "opened" };
+        let per_page = query.limit.unwrap_or(50);
+        // Work items are not related to repositories: what is assigned to you is asked of the
+        // account in one call, whatever the repository scope holds — including nothing. Each
+        // issue names its own project in `references.full`.
+        if query.mine_only {
+            let url =
+                format!("{}/issues?scope=assigned_to_me&state={state}&order_by=updated_at&sort=desc&per_page={per_page}", self.0.base);
+            let v = self.0.get_json(&url).await?;
+            return Ok(v.as_array().unwrap_or(&vec![]).iter().map(|i| map_issue(i, None)).collect());
+        }
+        // Every issue, assigned or not, is only ever a project's question: instance-wide
+        // `scope=all` is every public issue on the host.
         let scope = &self.0.scope;
         if scope.is_empty() {
             return Ok(Vec::new());
         }
-        let state = if query.include_completed { "all" } else { "opened" };
-        let per_page = query.limit.unwrap_or(50);
-        let mine = query.mine_only;
         let rows = fan_out(scope, "gitlab.work_items.list", |project| async move {
-            let mut url = self.0.project_path(&project, &format!("/issues?state={state}&per_page={per_page}"));
-            if mine {
-                url.push_str("&scope=assigned_to_me");
-            }
+            let url = self.0.project_path(&project, &format!("/issues?state={state}&per_page={per_page}"));
             let v = self.0.get_json(&url).await?;
             Ok(v.as_array().unwrap_or(&vec![]).iter().map(|i| map_issue(i, Some(&project))).collect())
         })
@@ -1646,6 +1672,66 @@ mod tests {
             reviewable: tokio::sync::Mutex::new(HashMap::new()),
         });
         (forge, GitLabPr(client))
+    }
+
+    #[test]
+    fn an_issue_sits_under_its_milestone_or_failing_that_its_epic() {
+        let milestone = r#""milestone": { "id": 44, "iid": 2, "title": "Infra cost review", "web_url": "https://gitlab.com/acme/-/milestones/2" }"#;
+        let epic = r#""epic": { "id": 7, "iid": 1, "title": "Cloud spend", "url": "/groups/acme/-/epics/1" }"#;
+        let issue = |extra: &str| -> Value {
+            let web_url = "https://gitlab.example.com/acme/pay/-/issues/4";
+            serde_json::from_str(&format!(r#"{{ "iid": 4, "title": "t", "state": "opened", "web_url": "{web_url}", {extra} }}"#)).unwrap()
+        };
+
+        let both = map_issue(&issue(&format!("{milestone}, {epic}")), None).parent.expect("a milestone");
+        assert_eq!((both.kind.as_str(), both.id.as_str(), both.title.as_str()), ("Milestone", "44", "Infra cost review"));
+        assert_eq!(both.url.as_deref(), Some("https://gitlab.com/acme/-/milestones/2"));
+
+        let only_epic = map_issue(&issue(&format!(r#""milestone": null, {epic}"#)), None).parent.expect("an epic");
+        assert_eq!((only_epic.kind.as_str(), only_epic.id.as_str(), only_epic.title.as_str()), ("Epic", "7", "Cloud spend"));
+        // GitLab gives an epic a path, not a link: it is put on the issue's host, so a frontend
+        // never resolves it against its own address.
+        assert_eq!(only_epic.url.as_deref(), Some("https://gitlab.example.com/groups/acme/-/epics/1"));
+        let hostless: Value = serde_json::from_str(&format!(r#"{{ "iid": 4, "title": "t", "state": "opened", {epic} }}"#)).unwrap();
+        assert_eq!(map_issue(&hostless, None).parent.expect("still an epic").url, None, "no host to put it on");
+
+        // The free tier sends no epic at all.
+        assert!(map_issue(&issue(r#""milestone": null"#), None).parent.is_none());
+    }
+
+    #[tokio::test]
+    async fn assigned_issues_are_asked_of_the_account_not_of_the_repository_scope() {
+        // Work items are not related to repositories: nothing is chosen here, and what is
+        // assigned to you still shows.
+        let forge = crate::test_http::FakeForge::start();
+        forge.route(
+            "/issues",
+            serde_json::json!([{ "iid": 4, "title": "ledger drift", "state": "opened", "updated_at": "2026-09-02T00:00:00Z",
+                                 "references": { "full": "acme/ledger#4" } }]),
+        );
+        forge.route(
+            &format!("/projects/{}/issues/4", encode_project("acme/ledger")),
+            serde_json::json!({ "iid": 4, "title": "ledger drift", "state": "opened" }),
+        );
+        let wi = GitLabWi(Arc::new(GitLabClient {
+            http: reqwest::Client::new(),
+            base: forge.base().to_string(),
+            scope: vec![],
+            self_username: tokio::sync::Mutex::new(None),
+            reviewable: tokio::sync::Mutex::new(HashMap::new()),
+        }));
+
+        let rows = wi.list(&WorkItemQuery { mine_only: true, include_completed: false, limit: Some(50) }).await.unwrap();
+        assert_eq!(rows.iter().map(|w| (w.repository.as_deref(), w.id.as_str())).collect::<Vec<_>>(), vec![(Some("acme/ledger"), "4")]);
+        let asked = forge.requests();
+        assert_eq!(asked.len(), 1, "one call, no per-project list: {asked:?}");
+        for needle in ["GET /issues?", "scope=assigned_to_me", "state=opened", "order_by=updated_at", "per_page=50"] {
+            assert!(asked[0].contains(needle), "{needle} missing from {}", asked[0]);
+        }
+
+        // A row from a project nobody chose still opens: it carries its own address.
+        assert_eq!(wi.get(&rows[0].item_ref()).await.unwrap().id, "4");
+        assert_eq!(forge.requests_to("/projects/").len(), 1);
     }
 
     fn query(filter: PullRequestFilter, include_completed: bool) -> PullRequestQuery {
