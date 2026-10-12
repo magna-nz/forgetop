@@ -9,6 +9,14 @@ Adding a release: one `## <version> — <date>` section, a line per user-visible
 and the pull request each one came from. `git log v<previous>..HEAD --merges` lists the
 candidates.
 
+## Unreleased
+
+Changed
+
+- **Confirm dialogs show Enter, not `y`.** In the terminal UI, the approve, merge, rerun,
+  cancel and other confirm prompts now read `↵ confirm  Esc cancel`. Enter always
+  confirmed; `y` still does too, but the dialog no longer shows it.
+
 ## 1.8.1 — 2026-10-12
 
 Fixed
