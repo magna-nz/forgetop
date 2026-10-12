@@ -21,6 +21,10 @@ Changed
   than that, so a quick forge still shows live rows on every poll. A standalone
   `forgetop --dashboard` loads the cache too; `--demo` still caches nothing.
   ([#241](https://github.com/magna-nz/forgetop/pull/241))
+- **The detail pane is resizable.** Drag its left edge, or press `←` to expand and `→` to
+  shrink from anywhere outside a text field (the pane footer says so); double-click the edge to
+  reset. The width is remembered per pane, and the list beside it always keeps room. The sidebar
+  mark is now the README logo. ([#242](https://github.com/magna-nz/forgetop/pull/242))
 
 ## 1.10.0 — 2026-10-13
 
