@@ -18,7 +18,7 @@ Changed
   right-hand side instead of a full-screen view, so you never leave the page. Esc (or `p`)
   closes the pane onto the same row. In a pull request's pane Tab walks its tabs, as it does in
   a list's pane. A terminal too narrow for the pane still opens the item full-screen.
-  ([#PR](https://github.com/magna-nz/forgetop/pull/PR))
+  ([#234](https://github.com/magna-nz/forgetop/pull/234))
 - **Confirm dialogs show Enter, not `y`.** In the terminal UI, the approve, merge, rerun,
   cancel and other confirm prompts now read `↵ confirm  Esc cancel`. Enter always
   confirmed; `y` still does too, but the dialog no longer shows it.
