@@ -225,7 +225,7 @@ impl Overlay {
         match self {
             // Closing says what Esc keeps, since "cancel" next to "close" reads both ways.
             Overlay::Confirm { action: Action::PrSetClosed(true), .. } => vec![("↵", "close"), ("Esc", "keep open")],
-            Overlay::Confirm { .. } => vec![("y", "confirm"), ("Esc", "cancel")],
+            Overlay::Confirm { .. } => vec![("↵", "confirm"), ("Esc", "cancel")],
             Overlay::Picker { .. } => vec![("↑↓", "choose"), ("↵", "select"), ("Esc", "cancel")],
             Overlay::Input { .. } => vec![("Esc", "cancel"), ("↵", "submit")],
             Overlay::Toggle { filter: Some(_), .. } => {
@@ -1001,9 +1001,10 @@ mod tests {
     }
 
     #[test]
-    fn confirm_yes_submits_and_esc_cancels() {
+    fn confirm_enter_submits_and_esc_cancels() {
         let mut yes = Overlay::Confirm { title: "t".into(), message: "m".into(), action: Action::PrVote(ReviewVote::Approved) };
-        assert!(matches!(yes.handle(Key::Char('y')), Outcome::Submit(Action::PrVote(ReviewVote::Approved))));
+        assert_eq!(yes.hint()[0], ("↵", "confirm"), "the dialog advertises Enter");
+        assert!(matches!(yes.handle(Key::Enter), Outcome::Submit(Action::PrVote(ReviewVote::Approved))));
 
         let mut no = Overlay::Confirm { title: "t".into(), message: "m".into(), action: Action::PrVote(ReviewVote::Approved) };
         assert!(matches!(no.handle(Key::Escape), Outcome::Cancel));
