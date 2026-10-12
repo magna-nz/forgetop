@@ -4,6 +4,8 @@ import { apiPost, fetchConnectionRepositories, useConnections } from "../api";
 import { isRepoAddressed } from "../capabilities";
 import type { ConnectionRow, RepositoryPage } from "../types";
 import { setConnectionScopeInCache } from "../optimistic";
+import { Icon } from "./icons";
+import { Button, GroupHeading } from "./ui";
 
 /** Queries invalidated when the scope changes. The scope gates **fetching**, so every list that
  *  fetches has to go back to the provider — unlike the view tabs, which narrow rows already in
@@ -135,21 +137,14 @@ function RepoScopeButton({
 
   return (
     <div className="relative" ref={ref}>
-      <button
-        onClick={onToggle}
-        aria-expanded={open}
-        title="Which repositories this connection fetches from"
-        className="rounded-md px-2.5 py-1.5 text-xs transition-colors"
-        style={{ color: "var(--dim)", border: "1px solid var(--border)", background: "var(--card)" }}
-        onMouseEnter={(e) => (e.currentTarget.style.color = "var(--fg)")}
-        onMouseLeave={(e) => (e.currentTarget.style.color = "var(--dim)")}
-      >
+      <Button quiet onClick={onToggle} aria-expanded={open} title="Which repositories this connection fetches from">
         {label}
-      </button>
+        <Icon name="chevron-down" size={12} style={{ color: "var(--fg3)" }} />
+      </Button>
       {open && (
         <div
-          className="absolute z-30 mt-1.5 w-80 rounded-lg p-2 shadow-lg"
-          style={{ background: "var(--panel)", border: "1px solid var(--border)" }}
+          className="absolute z-30 mt-1.5 w-80 p-2 shadow-2xl"
+          style={{ background: "var(--raised)", border: "1px solid var(--border-strong)", borderRadius: 10 }}
         >
           {connections.map((c, i) => (
             <ConnectionScope key={c.id} connection={c} page={pages[i]} showName={connections.length > 1} />
@@ -206,49 +201,46 @@ function ConnectionScope({
 
   return (
     <div className="flex flex-col gap-1.5">
-      {showName && (
-        <span className="px-1 text-xs font-medium" style={{ color: "var(--dim)" }}>
-          {connection.display_name}
-        </span>
-      )}
+      {showName && <GroupHeading>{connection.display_name}</GroupHeading>}
       <input
         value={query}
         onChange={(e) => setQuery(e.target.value)}
         placeholder="Search repositories…"
-        className="rounded-md px-2 py-1.5 text-xs outline-none"
-        style={{ background: "var(--card)", color: "var(--fg)", border: "1px solid var(--border)" }}
+        className="ft-input w-full"
       />
       <div className="max-h-64 overflow-y-auto flex flex-col">
         {page === undefined ? (
-          <span className="px-1 py-2 text-xs" style={{ color: "var(--dim)" }}>
+          <span className="px-1 py-2 text-[12px]" style={{ color: "var(--fg3)" }}>
             Loading repositories…
           </span>
         ) : shown.length === 0 ? (
-          <span className="px-1 py-2 text-xs" style={{ color: "var(--dim)" }}>
+          <span className="px-1 py-2 text-[12px]" style={{ color: "var(--fg3)" }}>
             {all.length === 0
               ? "No repositories found for this connection's credentials."
               : "Nothing matches that search."}
           </span>
         ) : (
           shown.map((repo) => (
-            <label
-              key={repo}
-              className="flex items-center gap-2 rounded-md px-1.5 py-1 text-xs cursor-pointer"
-              style={{ color: "var(--fg)" }}
-            >
-              <input type="checkbox" checked={chosen.includes(repo)} disabled={busy} onChange={() => toggle(repo)} />
+            <label key={repo} className="ft-row min-h-[32px]" style={{ padding: "0 6px" }}>
+              <input
+                type="checkbox"
+                style={{ accentColor: "var(--accent)" }}
+                checked={chosen.includes(repo)}
+                disabled={busy}
+                onChange={() => toggle(repo)}
+              />
               <span className="truncate mono">{repo}</span>
             </label>
           ))
         )}
       </div>
       {page?.truncated && (
-        <span className="px-1 text-xs" style={{ color: "var(--dim)" }}>
+        <span className="px-1 text-[12px]" style={{ color: "var(--fg3)" }}>
           Showing the {page.repositories.length} most recently active — search doesn't reach past them.
         </span>
       )}
       {error && (
-        <span className="px-1 text-xs" style={{ color: "var(--red)" }}>
+        <span className="px-1 text-[12px]" style={{ color: "var(--red)" }}>
           {error}
         </span>
       )}

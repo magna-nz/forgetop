@@ -3,6 +3,8 @@ import { useQueries, useQueryClient } from "@tanstack/react-query";
 import { apiPost, fetchPipelineSelection, useConnections } from "../api";
 import type { ConnectionRow, PipelineDefinition, PipelineSelection } from "../types";
 import { setPipelineSelectionInCache } from "../optimistic";
+import { Icon } from "./icons";
+import { Button, GroupHeading } from "./ui";
 
 /** Queries that go back to the provider when the selection changes. The selection gates
  *  **fetching**, so the lists it feeds have to refetch; the picker's own query is edited in place
@@ -116,21 +118,14 @@ function PipelineScopeButton({
 
   return (
     <div className="relative" ref={ref}>
-      <button
-        onClick={onToggle}
-        aria-expanded={open}
-        title="Which pipelines this list fetches runs of"
-        className="rounded-md px-2.5 py-1.5 text-xs transition-colors"
-        style={{ color: "var(--dim)", border: "1px solid var(--border)", background: "var(--card)" }}
-        onMouseEnter={(e) => (e.currentTarget.style.color = "var(--fg)")}
-        onMouseLeave={(e) => (e.currentTarget.style.color = "var(--dim)")}
-      >
+      <Button quiet onClick={onToggle} aria-expanded={open} title="Which pipelines this list fetches runs of">
         {label}
-      </button>
+        <Icon name="chevron-down" size={12} style={{ color: "var(--fg3)" }} />
+      </Button>
       {open && (
         <div
-          className="absolute z-30 mt-1.5 w-96 max-w-[calc(100vw-2rem)] rounded-lg p-2 shadow-lg flex flex-col gap-3"
-          style={{ background: "var(--panel)", border: "1px solid var(--border)" }}
+          className="absolute z-30 mt-1.5 w-96 max-w-[calc(100vw-2rem)] p-2 shadow-2xl flex flex-col gap-3"
+          style={{ background: "var(--raised)", border: "1px solid var(--border-strong)", borderRadius: 10 }}
         >
           {connections.map((c, i) => (
             <ConnectionPipelines
@@ -209,51 +204,43 @@ function ConnectionPipelines({
 
   return (
     <div className="flex flex-col gap-1.5">
-      {showName && (
-        <span className="px-1 text-xs font-medium" style={{ color: "var(--dim)" }}>
-          {connection.display_name}
-        </span>
-      )}
+      {showName && <GroupHeading>{connection.display_name}</GroupHeading>}
       <div className="flex items-center gap-1.5">
         <input
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           placeholder="Search pipelines…"
           aria-label={`Search ${connection.display_name} pipelines`}
-          className="flex-1 min-w-0 rounded-md px-2 py-1.5 text-xs outline-none"
-          style={{ background: "var(--card)", color: "var(--fg)", border: "1px solid var(--border)" }}
+          className="ft-input flex-1 min-w-0"
         />
-        <button
-          onClick={toggleShown}
-          disabled={shown.length === 0}
-          className="shrink-0 rounded-md px-2 py-1.5 text-xs"
-          style={{ color: "var(--dim)", border: "1px solid var(--border)", background: "var(--card)" }}
-        >
+        <Button sm onClick={toggleShown} disabled={shown.length === 0} className="shrink-0">
           {allShown ? "None" : "All"}
-        </button>
+        </Button>
       </div>
       <div className="max-h-72 overflow-y-auto flex flex-col">
         {selection === undefined ? (
-          <span className="px-1 py-2 text-xs" style={{ color: failed ? "var(--red)" : "var(--dim)" }}>
+          <span className="px-1 py-2 text-[12px]" style={{ color: failed ? "var(--red)" : "var(--fg3)" }}>
             {failed ? "Couldn't list this connection's pipelines." : "Loading pipelines…"}
           </span>
         ) : shown.length === 0 ? (
-          <span className="px-1 py-2 text-xs" style={{ color: "var(--dim)" }}>
+          <span className="px-1 py-2 text-[12px]" style={{ color: "var(--fg3)" }}>
             {defs.length === 0 ? "No pipelines found for this connection." : "Nothing matches that search."}
           </span>
         ) : (
           shown.map((d) => {
             const loc = pipelineLocation(d);
             return (
-              <label
-                key={d.id}
-                className="flex items-center gap-2 rounded-md px-1.5 py-1 text-xs cursor-pointer min-w-0"
-                style={{ color: "var(--fg)" }}
-              >
-                <input type="checkbox" checked={ticked(d)} onChange={() => toggle(d)} aria-label={d.name} />
+              <label key={d.id} className="ft-row min-h-[32px] min-w-0" style={{ padding: "0 6px" }}>
+                <input
+                  type="checkbox"
+                  style={{ accentColor: "var(--accent)" }}
+                  checked={ticked(d)}
+                  onChange={() => toggle(d)}
+                  aria-label={d.name}
+                />
                 <span className="truncate">{d.name}</span>
                 {loc && (
-                  <span className="truncate mono" style={{ color: "var(--dim)" }}>
+                  <span className="truncate mono" style={{ color: "var(--fg3)" }}>
                     {loc}
                   </span>
                 )}
@@ -263,7 +250,7 @@ function ConnectionPipelines({
         )}
       </div>
       {error && (
-        <span className="px-1 text-xs" style={{ color: "var(--red)" }}>
+        <span className="px-1 text-[12px]" style={{ color: "var(--red)" }}>
           {error}
         </span>
       )}

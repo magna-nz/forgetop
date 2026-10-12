@@ -1,25 +1,26 @@
 import { useState } from "react";
 import { usePrDecoration, usePullRequests, type PrView } from "../api";
-import { prSignalMeta, prState, prStatusMeta, relativeTime, toTime, voteMeta } from "../format";
+import { prSignalMeta, prState, prStatusMeta, toTime } from "../format";
 import type { PrRow } from "../types";
-import { Avatar, Chip, List, Pill, Row, Skeleton, StateCard, StatusBadge } from "./ui";
+import { Icon } from "./icons";
+import { Chip, List, Row, Skeleton, StateCard, StatusGlyph, Tabs } from "./ui";
 import { ErrorState } from "./ErrorState";
 import { usePrOpener } from "./PrDetail";
-import { useListView } from "./ControlBar";
+import { shortAge, useListView } from "./ControlBar";
 import { useRepoScope } from "./RepoScope";
 
 const PR_VIEWS: { key: PrView; label: string }[] = [
-  { key: "all", label: "All Pull Requests" },
-  { key: "yours", label: "Your PRs" },
-  { key: "merged", label: "Recently merged by you" },
+  { key: "all", label: "All" },
+  { key: "yours", label: "Mine" },
   { key: "review_requested", label: "Review requested" },
+  { key: "merged", label: "Merged" },
 ];
 
-const EMPTY: Record<PrView, { icon: string; title: string; sub: string }> = {
-  all: { icon: "◇", title: "No open pull requests", sub: "PRs you author or are asked to review show up here." },
-  yours: { icon: "◇", title: "No open PRs of yours", sub: "Pull requests you've opened that are still open show up here." },
-  merged: { icon: "✓", title: "Nothing merged recently", sub: "Pull requests you authored that have merged show up here." },
-  review_requested: { icon: "◇", title: "No review requests", sub: "Pull requests waiting on your review show up here." },
+const EMPTY: Record<PrView, { title: string; sub: string }> = {
+  all: { title: "No open pull requests", sub: "PRs you author or are asked to review show up here." },
+  yours: { title: "No open PRs of yours", sub: "Pull requests you've opened that are still open show up here." },
+  merged: { title: "Nothing merged recently", sub: "Pull requests you authored that have merged show up here." },
+  review_requested: { title: "No review requests", sub: "Pull requests waiting on your review show up here." },
 };
 
 function usePrView(): [PrView, (v: PrView) => void] {
@@ -63,11 +64,23 @@ export function PullRequests() {
       { label: "Oldest", cmp: (a, b) => toTime(a.pull_request.updated_at) - toTime(b.pull_request.updated_at) },
       { label: "Title A–Z", cmp: (a, b) => a.pull_request.title.localeCompare(b.pull_request.title) },
     ],
+    // Only the view being shown has been fetched, so only its tab carries a count.
+    views: (
+      <Tabs
+        label="Pull request views"
+        value={view}
+        onChange={setView}
+        tabs={PR_VIEWS.map((v) => ({ id: v.key, label: v.label, count: v.key === view && data ? data.length : undefined }))}
+      />
+    ),
+    // With nothing selected the picker is the empty state's action; one copy of it is enough.
+    extra: scope.noneSelected ? null : scope.control,
   });
 
   return (
     <>
-      <ViewTabs view={view} onChange={setView} />
+      {/* The bar stays up in every state: the views are how you leave an empty one. */}
+      {bar}
       {isLoading ? (
         <Skeleton />
       ) : error ? (
@@ -75,52 +88,33 @@ export function PullRequests() {
       ) : scope.noneSelected ? (
         // Distinct from "no pull requests": nothing was fetched because nothing was asked for.
         <StateCard
-          icon="◍"
+          icon={<Icon name="pull-request" size={24} />}
           title="No repositories selected"
           sub="This connection spans your whole account — choose which repositories it fetches from."
           action={scope.control}
         />
       ) : !data || data.length === 0 ? (
-        <StateCard icon={EMPTY[view].icon} title={EMPTY[view].title} sub={EMPTY[view].sub} />
+        <StateCard icon={<Icon name="pull-request" size={24} />} title={EMPTY[view].title} sub={EMPTY[view].sub} />
       ) : (
-        <>
-          <div className="flex flex-wrap items-center gap-2 px-5 pt-4 max-w-5xl mx-auto">{scope.control}</div>
-          {bar}
-          <List>
-            {rows.map((row, i) => (
-              <PrCard key={rowKey(row)} row={row} index={i} />
-            ))}
-          </List>
-        </>
+        <List>
+          {rows.map((row) => (
+            <PrListRow key={rowKey(row)} row={row} />
+          ))}
+        </List>
       )}
     </>
   );
 }
 
-function ViewTabs({ view, onChange }: { view: PrView; onChange: (v: PrView) => void }) {
-  return (
-    <div className="flex px-5 pt-4 max-w-5xl mx-auto">
-      <div className="inline-flex rounded-lg p-0.5" style={{ background: "var(--panel2)", border: "1px solid var(--border)" }}>
-        {PR_VIEWS.map((v) => {
-          const active = v.key === view;
-          return (
-            <button
-              key={v.key}
-              onClick={() => onChange(v.key)}
-              aria-pressed={active}
-              className="text-xs font-medium rounded-md px-3 py-1.5 transition-colors whitespace-nowrap"
-              style={{ background: active ? "var(--accent)" : "transparent", color: active ? "var(--bg)" : "var(--dim)" }}
-            >
-              {v.label}
-            </button>
-          );
-        })}
-      </div>
-    </div>
-  );
+/** The last segment of a connection-relative repository (`acme/pay` → `pay`), for display only. */
+function repoShort(repo?: string | null): string {
+  if (!repo) return "";
+  return repo.slice(repo.lastIndexOf("/") + 1);
 }
 
-function PrCard({ row, index }: { row: PrRow; index: number }) {
+/** One pull request: glyph · title · identifier · signal · age, and — unless `dense` — a second
+ *  line with the author and the size of the change. */
+function PrListRow({ row, dense = false }: { row: PrRow; dense?: boolean }) {
   const pr = row.pull_request;
   // The list endpoint no longer pays for the decorated fields (GitHub omits them from `/pulls`
   // entirely), so each visible row fetches its own — bounded by what's on screen rather than
@@ -137,71 +131,63 @@ function PrCard({ row, index }: { row: PrRow; index: number }) {
   // so asking the undecorated PR what stops it would answer from missing data.
   const decorated = { ...pr, checks: checkStatus, mergeable };
   const signal = prSignalMeta(decorated);
+  // A blocker always shows; "no checks" stays silent, since it says nothing.
+  const showSignal = checkStatus !== "None" || prState(decorated).kind === "blocked";
+  const draft = pr.is_draft || pr.status === "Draft";
+  const repo = repoShort(pr.repository);
+  const ident = [repo, pr.number != null ? `#${pr.number}` : ""].filter(Boolean).join(" ");
   const open = usePrOpener();
   return (
-    <Row index={index} dense onClick={() => open({ conn: row.connection_id, repo: pr.repository, id: pr.id })}>
-      <div className="flex items-start gap-3">
-        <div className="flex-1 min-w-0">
-          <div className="flex items-center gap-2">
-            <StatusBadge label={cap(status.label)} color={status.color} />
-            <span className="truncate font-medium" style={{ color: "var(--fg)" }}>
-              {pr.title}
-            </span>
-          </div>
-          <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1.5">
-            {pr.number != null && <span className="mono text-xs" style={{ color: "var(--dim)" }}>#{pr.number}</span>}
-            {/* With one connection spanning an account, the connection label no longer
-                distinguishes rows — the repository is what tells them apart. */}
-            {pr.repository && <Chip title="Repository">{pr.repository}</Chip>}
-            {pr.source_ref && (
-              <Chip title="source → target">
-                {shortRef(pr.source_ref)} <span style={{ color: "var(--dim)" }}>→</span> {shortRef(pr.target_ref) || "?"}
-              </Chip>
-            )}
-            <span className="mono text-xs">
-              <span style={{ color: "var(--green)" }}>+{additions}</span>{" "}
-              <span style={{ color: "var(--red)" }}>−{deletions}</span>
-            </span>
-            {/* A blocker always shows; "no checks" stays silent, since it says nothing. */}
-            {(checkStatus !== "None" || prState(decorated).kind === "blocked") && (
-              <Pill icon={signal.icon} label={signal.label} color={signal.color} spin={signal.spin} />
-            )}
-            {pr.reviewers.length > 0 && <Reviewers reviewers={pr.reviewers} />}
-            {pr.labels.slice(0, 3).map((l) => (
-              <Chip key={l}>{l}</Chip>
-            ))}
-            {mergeable === "Mergeable" && <Pill icon="✓" label="Mergeable" color="var(--magenta)" />}
-          </div>
-        </div>
-        <div className="flex flex-col items-end gap-2 shrink-0">
-          <span className="text-xs whitespace-nowrap" style={{ color: "var(--dim)" }}>
-            {relativeTime(pr.updated_at)}
+    <Row dense={dense} onClick={() => open({ conn: row.connection_id, repo: pr.repository, id: pr.id })}>
+      <StatusGlyph glyph={status.glyph} color={status.color} title={status.label} />
+      <span className="flex-1 min-w-0 flex flex-col">
+        <span className="flex items-center gap-2 min-w-0">
+          <span className="truncate min-w-0">
+            <span>{pr.title}</span>
+            {draft && <span style={{ color: "var(--fg3)" }}> · draft</span>}
           </span>
-          <Avatar name={pr.author.display_name} />
-        </div>
-      </div>
+          {pr.labels.slice(0, 3).map((l) => (
+            <Chip key={l} className="hidden xl:inline-flex shrink-0">
+              {l}
+            </Chip>
+          ))}
+        </span>
+        {!dense && (
+          <span className="truncate text-[12px]" style={{ color: "var(--fg3)" }}>
+            {pr.author.display_name} ·{" "}
+            <span className="num" style={{ color: "var(--green)" }}>
+              +{additions}
+            </span>{" "}
+            <span className="num" style={{ color: "var(--red)" }}>
+              −{deletions}
+            </span>
+            {mergeable === "Mergeable" && (
+              <>
+                {" · "}
+                <span>mergeable</span>
+              </>
+            )}
+          </span>
+        )}
+      </span>
+      {/* With one connection spanning an account, the connection label no longer distinguishes
+          rows — the repository is what tells them apart. */}
+      {ident && (
+        <span className="mono shrink-0 whitespace-nowrap" style={{ color: "var(--fg3)" }} title={pr.repository ?? undefined}>
+          {ident}
+        </span>
+      )}
+      <span className="inline-flex shrink-0" style={{ width: 14 }} title={showSignal ? signal.label : undefined}>
+        {showSignal && (
+          <>
+            <StatusGlyph glyph={signal.glyph} color={signal.color} spin={signal.spin} />
+            <span className="sr-only">{signal.label}</span>
+          </>
+        )}
+      </span>
+      <span className="num text-[12px] shrink-0 text-right whitespace-nowrap" style={{ width: 34, color: "var(--fg3)" }}>
+        {shortAge(pr.updated_at)}
+      </span>
     </Row>
   );
 }
-
-function Reviewers({ reviewers }: { reviewers: PrRow["pull_request"]["reviewers"] }) {
-  return (
-    <span className="inline-flex items-center gap-1.5">
-      {reviewers.slice(0, 4).map((r, i) => {
-        const v = voteMeta(r.vote);
-        return (
-          <span key={i} title={`${r.user.display_name} — ${v.label}`} className="inline-flex items-center gap-0.5 text-xs" style={{ color: v.color }}>
-            {v.icon}
-          </span>
-        );
-      })}
-    </span>
-  );
-}
-
-function shortRef(ref?: string | null): string {
-  if (!ref) return "";
-  return ref.replace(/^refs\/heads\//, "");
-}
-
-const cap = (s: string): string => (s.length ? s[0].toUpperCase() + s.slice(1) : s);

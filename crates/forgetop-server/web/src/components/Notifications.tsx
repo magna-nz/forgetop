@@ -1,11 +1,11 @@
 import { useState } from "react";
-import { motion } from "framer-motion";
 import { useQueryClient } from "@tanstack/react-query";
 import { apiPost, useNotifications } from "../api";
 import { notificationMeta, relativeTime, toTime } from "../format";
 import type { NotifRow } from "../types";
 import { markNotificationReadInCache } from "../optimistic";
-import { List, Skeleton, StateCard } from "./ui";
+import { Icon } from "./icons";
+import { IconButton, List, Skeleton, StateCard, StatusGlyph } from "./ui";
 import { ErrorState } from "./ErrorState";
 import { useListView } from "./ControlBar";
 import { usePrOpener } from "./PrDetail";
@@ -35,21 +35,21 @@ export function Notifications() {
   if (isLoading) return <Skeleton />;
   if (error) return <ErrorState error={error} />;
   if (!data || data.length === 0)
-    return <StateCard icon="✓" title="Inbox zero" sub="Review requests, mentions, and CI failures land here." />;
+    return <StateCard icon={<Icon name="check-circle" size={24} />} title="Inbox zero" sub="Review requests, mentions, and CI failures land here." />;
 
   return (
     <>
       {bar}
       <List>
-        {rows.map((row, i) => (
-          <NotifCard key={`${row.connection_id}:${row.notification.id}`} row={row} index={i} />
+        {rows.map((row) => (
+          <NotifRowItem key={`${row.connection_id}:${row.notification.id}`} row={row} />
         ))}
       </List>
     </>
   );
 }
 
-function NotifCard({ row, index }: { row: NotifRow; index: number }) {
+function NotifRowItem({ row }: { row: NotifRow }) {
   const n = row.notification;
   const meta = notificationMeta(n.kind);
   const qc = useQueryClient();
@@ -71,7 +71,7 @@ function NotifCard({ row, index }: { row: NotifRow; index: number }) {
     }
   };
 
-  // Explicit "✓ read" button — shows a busy state.
+  // Explicit mark-as-read button — shows a busy state.
   const markRead = async () => {
     setBusy(true);
     try {
@@ -102,57 +102,49 @@ function NotifCard({ row, index }: { row: NotifRow; index: number }) {
             }
           : null;
 
+  // Unread rows read at full weight, read ones recede. Age is a fixed-width tabular column.
   const body = (
     <>
-      <div className="flex items-center gap-2">
-        <span className="truncate font-medium" style={{ color: n.unread ? "var(--fg)" : "var(--dim)" }}>
-          {n.title}
-        </span>
-      </div>
-      <div className="mt-0.5 flex flex-wrap items-center gap-x-3 gap-y-1">
-        <span className="text-xs font-medium" style={{ color: meta.color }}>
-          {meta.label}
-        </span>
-        <span className="text-xs" style={{ color: "var(--dim)" }}>
-          {n.context}
-        </span>
-      </div>
+      <StatusGlyph glyph={meta.glyph} color={n.unread ? meta.color : "var(--fg3)"} />
+      <span className="truncate" style={{ color: n.unread ? "var(--fg)" : "var(--fg2)", fontWeight: n.unread ? 500 : 400 }}>
+        {n.title}
+      </span>
+      <span className="shrink-0 text-[12px]" style={{ color: "var(--fg3)" }}>
+        {meta.label}
+      </span>
+      <span className="truncate text-[12px]" style={{ color: "var(--fg3)" }}>
+        {n.context}
+      </span>
     </>
   );
+  const bodyClass = "flex flex-1 min-w-0 items-center gap-2.5 self-stretch text-left";
 
+  // The row is a div carrying the shared `ft-row` look: a `Row` is itself a button or link, and
+  // the mark-as-read button beside the open target can't nest inside it.
   return (
-    <motion.div
-      initial={{ opacity: 0, y: 6 }}
-      animate={{ opacity: 1, y: 0 }}
-      transition={{ duration: 0.22, delay: Math.min(index * 0.02, 0.3), ease: "easeOut" }}
-      className="group flex items-center gap-3 rounded-lg px-3 py-2"
-      style={{ background: "var(--card)", border: "1px solid var(--border)" }}
-    >
+    <div className="ft-row group">
       {openInApp ? (
-        <button onClick={openInApp} className="flex-1 min-w-0 text-left" style={{ cursor: "pointer" }}>
+        <button type="button" onClick={openInApp} className={bodyClass} style={{ cursor: "pointer" }}>
           {body}
         </button>
       ) : (
-        <a href={n.url ?? undefined} onClick={onOpen} target="_blank" rel="noreferrer" className="flex-1 min-w-0" style={{ cursor: n.url ? "pointer" : "default" }}>
+        <a href={n.url ?? undefined} onClick={onOpen} target="_blank" rel="noreferrer" className={bodyClass} style={{ cursor: n.url ? "pointer" : "default" }}>
           {body}
         </a>
       )}
-      <div className="flex items-center gap-3 shrink-0">
-        {n.unread && (
-          <button
-            onClick={markRead}
-            disabled={busy}
-            title="Mark as read"
-            className="text-xs rounded px-2 py-1 opacity-0 group-hover:opacity-100 transition-opacity"
-            style={{ color: "var(--dim)", border: "1px solid var(--border)", background: "var(--panel2)" }}
-          >
-            ✓ read
-          </button>
-        )}
-        <span className="text-xs whitespace-nowrap" style={{ color: "var(--dim)" }}>
-          {relativeTime(n.updated_at)}
-        </span>
-      </div>
-    </motion.div>
+      {n.unread && (
+        <IconButton
+          icon="check"
+          label="Mark as read"
+          title="Mark as read"
+          onClick={markRead}
+          disabled={busy}
+          className="opacity-0 group-hover:opacity-100 focus-visible:opacity-100 transition-opacity"
+        />
+      )}
+      <span className="num shrink-0 w-14 text-right text-[12px] whitespace-nowrap" style={{ color: "var(--fg3)" }}>
+        {relativeTime(n.updated_at)}
+      </span>
+    </div>
   );
 }

@@ -78,16 +78,18 @@ describe("PullRequests", () => {
     });
     renderWithClient(<PullRequests />);
 
-    for (const label of ["All Pull Requests", "Your PRs", "Recently merged by you", "Review requested"]) {
-      expect(screen.getByRole("button", { name: label })).toBeInTheDocument();
+    for (const label of ["All", "Mine", "Review requested", "Merged"]) {
+      expect(screen.getByRole("tab", { name: label })).toBeInTheDocument();
     }
 
-    // Defaults to All → shows the open PR.
+    // Defaults to All → shows the open PR, and only the fetched view carries a count.
     expect(await screen.findByText("An open PR")).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "All 1" })).toHaveAttribute("aria-selected", "true");
 
     // Switching view refetches for that slice.
-    await userEvent.click(screen.getByRole("button", { name: "Recently merged by you" }));
+    await userEvent.click(screen.getByRole("tab", { name: "Merged" }));
     expect(await screen.findByText("A merged PR")).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Merged 1" })).toHaveAttribute("aria-selected", "true");
   });
 
   it("shows a view-specific empty state", async () => {
@@ -96,15 +98,15 @@ describe("PullRequests", () => {
     expect(await screen.findByText("No open pull requests")).toBeInTheDocument();
   });
 
-  it("badges a mergeable PR and omits the badge otherwise", async () => {
+  it("notes a mergeable PR and omits the note otherwise", async () => {
     const blocked = pr("2", "A blocked PR");
     blocked.pull_request.mergeable = "Blocked";
     mockFetch({ get: { "view=all": [pr("1", "A mergeable PR"), blocked] } });
     renderWithClient(<PullRequests />);
 
-    // The mergeable PR carries exactly one "Mergeable" badge; the blocked one carries none.
+    // The mergeable PR's second line says so, once; the blocked one's does not.
     expect(await screen.findByText("A mergeable PR")).toBeInTheDocument();
     expect(await screen.findByText("A blocked PR")).toBeInTheDocument();
-    expect(screen.getAllByText("Mergeable")).toHaveLength(1);
+    expect(screen.getAllByText("mergeable")).toHaveLength(1);
   });
 });

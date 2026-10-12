@@ -155,6 +155,7 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
+@layer components {
 /* ---- primitives (see components/ui.tsx) ------------------------------------------------ */
 
 /* A list row: 36px, hairline-separated, hover tint, accent wash when selected. */
@@ -386,6 +387,7 @@ kbd.ft-kbd {
     width: 100%;
     z-index: 40;
   }
+}
 }
 
 ::-webkit-scrollbar {

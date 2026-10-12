@@ -1,5 +1,6 @@
 import { useMemo, useState } from "react";
 import { apiPost, useProviders } from "../api";
+import { Button, Select } from "./ui";
 import type { ConnectionRow, FieldKey, ProviderInfo } from "../types";
 
 const SECTION_LABEL: Record<string, string> = {
@@ -75,23 +76,24 @@ export function ConnectionForm({
   return (
     <div className="flex flex-col gap-4">
       <label className="flex flex-col gap-1">
-        <span className="text-xs font-medium" style={{ color: "var(--dim)" }}>Provider</span>
-        <select
+        <span className="text-[12px] font-medium" style={{ color: "var(--fg2)" }}>Provider</span>
+        <Select
+          label="Provider"
           value={provider}
           onChange={(e) => onProvider(e.target.value)}
           disabled={editing}
-          className="rounded-md px-3 py-2 text-sm outline-none"
-          style={{ background: "var(--card)", color: "var(--fg)", border: "1px solid var(--border)", opacity: editing ? 0.7 : 1 }}
+          className="self-start"
+          style={{ border: "1px solid var(--border-strong)", opacity: editing ? 0.7 : 1 }}
         >
           {(providers ?? []).map((p) => (
             <option key={p.provider} value={p.provider}>{p.label}</option>
           ))}
-        </select>
+        </Select>
       </label>
 
       {(info?.fields ?? []).map((f) => (
         <label key={f.key} className="flex flex-col gap-1">
-          <span className="text-xs font-medium" style={{ color: "var(--dim)" }}>
+          <span className="text-[12px] font-medium" style={{ color: "var(--fg2)" }}>
             {f.label}
             {f.required && !f.secret && <span style={{ color: "var(--red)" }}> *</span>}
           </span>
@@ -101,21 +103,21 @@ export function ConnectionForm({
             onChange={(e) => set(f.key, e.target.value)}
             placeholder={f.secret && editing ? "Leave blank to keep the current token" : ""}
             autoComplete={f.secret ? "new-password" : "off"}
-            className="rounded-md px-3 py-2 text-sm outline-none"
-            style={{ background: "var(--card)", color: "var(--fg)", border: "1px solid var(--border)" }}
+            className="ft-input"
           />
-          <span className="text-xs" style={{ color: "var(--dim)" }}>{f.help}</span>
+          <span className="text-[12px]" style={{ color: "var(--fg3)" }}>{f.help}</span>
         </label>
       ))}
 
       {(info?.sections.length ?? 0) > 0 && (
         <div className="flex flex-col gap-1.5">
-          <span className="text-xs font-medium" style={{ color: "var(--dim)" }}>Show in</span>
+          <span className="text-[12px] font-medium" style={{ color: "var(--fg2)" }}>Show in</span>
           <div className="flex flex-wrap gap-3">
             {(info?.sections ?? []).map((s) => (
-              <label key={s} className="flex items-center gap-1.5 text-sm cursor-pointer" style={{ color: "var(--fg)" }}>
+              <label key={s} className="flex items-center gap-1.5 text-[13px] cursor-pointer" style={{ color: "var(--fg)" }}>
                 <input
                   type="checkbox"
+                  style={{ accentColor: "var(--accent)" }}
                   checked={binds.has(s)}
                   onChange={(e) =>
                     setBinds((prev) => {
@@ -133,28 +135,18 @@ export function ConnectionForm({
         </div>
       )}
 
-      {error && <div className="text-xs" style={{ color: "var(--red)" }}>{error}</div>}
+      {error && <div className="text-[12px]" style={{ color: "var(--red)" }}>{error}</div>}
 
       <div className="flex items-center gap-2 pt-1">
-        <button
-          onClick={save}
-          disabled={busy || missing.length > 0 || needsToken}
-          className="rounded-md px-3.5 py-2 text-sm font-medium"
-          style={{
-            background: "var(--accent)",
-            color: "#0c1a2b",
-            opacity: busy || missing.length > 0 || needsToken ? 0.5 : 1,
-            cursor: busy || missing.length > 0 || needsToken ? "not-allowed" : "pointer",
-          }}
-        >
+        <Button primary onClick={save} disabled={busy || missing.length > 0 || needsToken}>
           {busy ? "Saving…" : editing ? "Save changes" : "Add connection"}
-        </button>
+        </Button>
         {onCancel && (
-          <button onClick={onCancel} className="rounded-md px-3.5 py-2 text-sm" style={{ color: "var(--dim)", border: "1px solid var(--border)" }}>
+          <Button quiet onClick={onCancel}>
             Cancel
-          </button>
+          </Button>
         )}
-        <span className="text-xs ml-auto" style={{ color: "var(--dim)" }}>Token is stored in your OS keychain.</span>
+        <span className="text-[12px] ml-auto" style={{ color: "var(--fg3)" }}>Token is stored in your OS keychain.</span>
       </div>
     </div>
   );
