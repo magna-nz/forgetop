@@ -9,6 +9,17 @@ Adding a release: one `## <version> — <date>` section, a line per user-visible
 and the pull request each one came from. `git log v<previous>..HEAD --merges` lists the
 candidates.
 
+## 1.8.2 — 2026-10-12
+
+Changed
+
+- **The Command Center opens items in a pane.** In the terminal UI, Enter on a pull request,
+  work item or pipeline run in the Command Center opens it in a pane over the Command Center's
+  right-hand side instead of a full-screen view, so you never leave the page. Esc (or `p`)
+  closes the pane onto the same row. In a pull request's pane Tab walks its tabs, as it does in
+  a list's pane. A terminal too narrow for the pane still opens the item full-screen.
+  ([#PR](https://github.com/magna-nz/forgetop/pull/PR))
+
 ## 1.8.1 — 2026-10-12
 
 Fixed

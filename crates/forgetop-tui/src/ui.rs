@@ -195,8 +195,8 @@ fn render_tabs(frame: &mut Frame, area: Rect, app: &App) {
     let titles: Vec<Line> = tab_titles(app).into_iter().map(Line::from).collect();
     let selected = if matches!(app.screen, Screen::Inbox) {
         titles.len() // Inbox isn't a section tab — highlight none of them
-    } else if matches!(app.screen, Screen::Launchpad) {
-        0
+    } else if matches!(app.screen, Screen::Launchpad) || app.lp_pane {
+        0 // an item open in a pane over the Command Center is still on the Command Center
     } else {
         // An open item lights its own section, not whatever list is behind it: a PR opened
         // from the Command Center belongs to Pull Requests, which is also where Tab leaves from.
@@ -355,6 +355,10 @@ fn render_content(frame: &mut Frame, area: Rect, app: &mut App) {
         && matches!(app.screen, Screen::PrView(_) | Screen::WiView(_) | Screen::Pipeline(_));
     // Unfocused, the split waits for a built preview (the anim tick builds it within a frame):
     // an empty list, or one whose row can't be previewed, keeps the full width.
+    if app.lp_pane && area.width >= crate::app::PREVIEW_MIN_WIDTH {
+        render_launchpad_pane(frame, area, app);
+        return;
+    }
     if focused || (matches!(app.screen, Screen::List) && app.preview_shown() && app.preview.is_some()) {
         render_split(frame, area, app, focused);
         return;
@@ -433,6 +437,27 @@ fn render_split(frame: &mut Frame, area: Rect, app: &mut App, focused: bool) {
     let (active, idle) = if focused { (pane, list) } else { (list, pane) };
     mark_focus(frame, active, &app.theme);
     mark_idle(frame, idle, &app.theme);
+}
+
+/// An item opened from the Command Center, in a pane over its right-hand side. Every kind gets
+/// the width an open PR gets beside a list — a pipeline included, so the pane is the same size
+/// whatever is opened from here. The Command Center stays drawn, dimmed, as what Esc returns to;
+/// it takes no clicks while the pane has the keys.
+fn render_launchpad_pane(frame: &mut Frame, area: Rect, app: &mut App) {
+    let pane_w = area.width * 70 / 100;
+    let pane = Rect { x: area.right() - pane_w, width: pane_w, ..area };
+    let rest = Rect { width: area.width - pane_w, ..area };
+
+    HITS_MUTED.with(|m| m.set(true));
+    render_launchpad(frame, area, app);
+    HITS_MUTED.with(|m| m.set(false));
+
+    frame.render_widget(ratatui::widgets::Clear, pane);
+    IN_PANE.with(|c| c.set(true));
+    app.detail_scroll_max = render_item_view(frame, pane, &app.theme, &app.screen, app.anim);
+    IN_PANE.with(|c| c.set(false));
+    mark_focus(frame, pane, &app.theme);
+    mark_idle(frame, rest, &app.theme);
 }
 
 /// Ends each list row the pane cuts short with `…` in the last column left showing, so a
