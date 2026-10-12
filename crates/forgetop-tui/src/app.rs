@@ -337,6 +337,10 @@ pub enum AppEvent {
     /// The provider answered a work-item write sent by [`App::execute_wi_action`], with the item
     /// re-read after an accepted one.
     WiActionDone { token: u64, result: std::result::Result<(), String>, fresh: Option<Box<WorkItem>> },
+    /// What each marked work item can move to, asked for by [`App::open_bulk_wi_state`]: one
+    /// `(current state, the provider's states)` per item. `marked` is the selection it was
+    /// asked for — if that has changed since, the answer is for another question.
+    BulkStatesLoaded { marked: Vec<String>, answers: Vec<(String, Vec<String>)> },
     /// A finished run's problems, fetched apart from its detail. `None` means the call failed.
     PipelineAnnotationsLoaded { key: String, annotations: Option<Vec<PipelineAnnotation>> },
     /// A changed file's full text, fetched to reveal the unchanged lines between its hunks. `key`
@@ -1029,6 +1033,13 @@ pub struct App {
     /// Optimistic PR and work-item changes held against stale refreshes, by the item's detail
     /// cache key.
     held_items: HashMap<String, ItemHold>,
+    /// Rows marked with Space for a bulk action, by section (0 = pull requests, 1 = work
+    /// items), as detail cache keys: rows are replaced wholesale on every refresh and move with
+    /// the sort, so a mark has to name the item rather than where it sits.
+    marks: [HashSet<String>; 2],
+    /// Bulk writes still waiting on answers, by run.
+    bulk_runs: HashMap<u64, BulkRun>,
+    next_bulk_run: u64,
     /// A write landed while a refresh was already out: that refresh was asked for before the
     /// write, so another one follows it.
     reload_again: bool,
@@ -3447,6 +3458,9 @@ impl App {
             item_actions: HashMap::new(),
             next_item_action: 0,
             held_items: HashMap::new(),
+            marks: Default::default(),
+            bulk_runs: HashMap::new(),
+            next_bulk_run: 0,
             reload_again: false,
             follow_new_run: None,
             annotations_asked: std::cell::RefCell::new(HashMap::new()),
@@ -3783,6 +3797,11 @@ impl App {
     /// the Command Center. Neither key quits — leaving the app is Ctrl-C, so a stray keypress
     /// can't tear down a session.
     fn leave_section_list(&mut self) {
+        // Rows marked for a bulk action are let go first: Esc backs out one thing at a time.
+        if self.marked_count() > 0 {
+            self.marks[self.active].clear();
+            return;
+        }
         if self.filters[self.active].is_empty() {
             self.screen = Screen::Launchpad;
         } else {
@@ -4260,6 +4279,12 @@ impl App {
             AppEvent::PipelineRunActionDone { token, result } => self.finish_run_action(token, result, deps),
             AppEvent::PrActionDone { token, result, fresh } => self.finish_pr_action(token, result, fresh.map(|p| *p), deps),
             AppEvent::WiActionDone { token, result, fresh } => self.finish_wi_action(token, result, fresh.map(|w| *w), deps),
+            AppEvent::BulkStatesLoaded { marked, answers } => {
+                // Only for the selection still on screen, and never over another overlay.
+                if self.overlay.is_none() && matches!(self.screen, Screen::List) && marked == self.marked_wi_keys() {
+                    self.show_bulk_wi_states(&answers);
+                }
+            }
             AppEvent::PipelineAnnotationsLoaded { key, annotations } => self.apply_pipeline_annotations(deps, key, annotations),
             AppEvent::FileTextLoaded { key, path, sha, text } => {
                 self.with_preview_screen(&key.clone(), |app| app.apply_file_text(&key, path, sha, text));
@@ -7656,6 +7681,10 @@ impl App {
             // `G` cycles how the Pipelines list is **G**rouped.
             'G' if self.active == 2 => self.cycle_pipe_group(deps).await,
             ' ' if self.active == 2 => self.enter_pipeline_line(deps),
+            // Space marks a row for a bulk action; `b` opens what can be done with the marked.
+            // (Pipelines keep Space for their groups: a run has no bulk action to mark it for.)
+            ' ' => self.toggle_mark(),
+            'b' if self.active < 2 => self.open_bulk_menu(),
             'z' if self.active == 2 => self.set_all_pipe_groups(false),
             'Z' if self.active == 2 => self.set_all_pipe_groups(true),
             // `w` = which repositories this section **w**atches — the same key Pipelines uses for
@@ -9868,6 +9897,8 @@ impl App {
             | Action::WiSetTitle(_)
             | Action::WiSetDescription(_) => self.execute_wi_action(action, deps).await,
             Action::WiEdit(field) => self.start_wi_edit(field),
+            Action::OpenBulkAction { .. } => self.open_bulk_wi_state(deps).await,
+            Action::BulkWiSetState(state) => self.execute_bulk_wi_state(state, deps).await,
             Action::PipelineTrigger { .. } => self.execute_pipeline_action(action, deps).await,
             Action::PipelineRerun { .. } | Action::PipelineCancel { .. } => {
                 self.execute_pipeline_run_action(action, deps).await
@@ -10414,43 +10445,8 @@ impl App {
             _ => return,
         };
 
-        let token = self.next_item_action;
-        self.next_item_action += 1;
-        let key = wi_detail_cache_key(&conn_id, &item);
-        let mut pending = PendingItemAction::new(conn_id.clone(), item.clone(), key.clone());
-        match &call {
-            WiCall::Edit(edit) => {
-                pending.wi = self.shown_wi(&conn_id, &item).cloned();
-                let edit = edit.clone();
-                self.patch_wi(&conn_id, &item, |wi| edit.apply(wi));
-                self.hold(&key).edits.push((token, edit));
-            }
-            WiCall::Comment(body) => {
-                let id = format!("{}0", local_prefix(token));
-                let author = me_user(self.me_on(&conn_id).as_deref());
-                let held = HeldComment::Thread(CommentThread {
-                    id: id.clone(),
-                    comments: vec![Comment { id, author, body: body.clone(), created_at: Some(Utc::now()) }],
-                    file_path: None,
-                    line: None,
-                    is_resolved: false,
-                    is_resolvable: true,
-                });
-                for v in self.item_views_mut() {
-                    if let Screen::WiView(v) = v {
-                        if v.connection_id == conn_id && v.wi.item_ref() == item {
-                            held.show_on(&mut v.threads);
-                        }
-                    }
-                }
-                let seen = self.shown_threads(&key);
-                let held = held.counted(&seen);
-                self.hold(&key).comments.push(held);
-            }
-        }
-        self.toast = Some(done.clone());
-        pending.done = done;
-        self.item_actions.insert(token, pending);
+        let token = self.stage_wi_call(&conn_id, &item, &call, None);
+        self.toast = Some(done);
 
         let Some(tx) = self.job_tx.clone() else {
             // No event loop to answer on (a bare harness): ask inline.
@@ -10465,10 +10461,53 @@ impl App {
         });
     }
 
+    /// Shows a work-item write on screen and files it as in flight, returning the token its
+    /// answer will carry. `batch` is the bulk run it belongs to, if any.
+    fn stage_wi_call(&mut self, conn_id: &str, item: &ItemRef, call: &WiCall, batch: Option<u64>) -> u64 {
+        let token = self.next_item_action;
+        self.next_item_action += 1;
+        let key = wi_detail_cache_key(conn_id, item);
+        let mut pending = PendingItemAction::new(conn_id.to_string(), item.clone(), key.clone());
+        pending.batch = batch;
+        match call {
+            WiCall::Edit(edit) => {
+                pending.wi = self.shown_wi(conn_id, item).cloned();
+                let edit = edit.clone();
+                self.patch_wi(conn_id, item, |wi| edit.apply(wi));
+                self.hold(&key).edits.push((token, edit));
+            }
+            WiCall::Comment(body) => {
+                let id = format!("{}0", local_prefix(token));
+                let author = me_user(self.me_on(conn_id).as_deref());
+                let held = HeldComment::Thread(CommentThread {
+                    id: id.clone(),
+                    comments: vec![Comment { id, author, body: body.clone(), created_at: Some(Utc::now()) }],
+                    file_path: None,
+                    line: None,
+                    is_resolved: false,
+                    is_resolvable: true,
+                });
+                for v in self.item_views_mut() {
+                    if let Screen::WiView(v) = v {
+                        if v.connection_id == conn_id && &v.wi.item_ref() == item {
+                            held.show_on(&mut v.threads);
+                        }
+                    }
+                }
+                let seen = self.shown_threads(&key);
+                let held = held.counted(&seen);
+                self.hold(&key).comments.push(held);
+            }
+        }
+        self.item_actions.insert(token, pending);
+        token
+    }
+
     /// Folds in the provider's answer to a work-item write.
     fn finish_wi_action(&mut self, token: u64, result: std::result::Result<(), String>, fresh: Option<WorkItem>, deps: &AppDeps) {
         let Some(pending) = self.item_actions.remove(&token) else { return };
-        let PendingItemAction { conn_id, item, key, done: _, failed, wi, .. } = pending;
+        let PendingItemAction { conn_id, item, key, done: _, failed, wi, batch, .. } = pending;
+        let run = batch.and_then(|b| self.bulk_answered(b, result.is_ok()));
         match result {
             Err(e) => {
                 let undo = self.held_items.get_mut(&key).and_then(|hold| hold.forget(token));
@@ -10487,7 +10526,18 @@ impl App {
                         }
                     }
                 }
-                self.toast_error(format!("{failed}: {e}"));
+                match run {
+                    // One line for the run, counting up as refusals land: each would otherwise
+                    // overwrite the last and read as a single failure.
+                    Some(run) => {
+                        self.toast_error(format!("{failed} for {} of {}: {e}", run.failed, run.total));
+                        // The ones that were accepted still need the refresh the last answer owes.
+                        if run.left == 0 && run.failed < run.total {
+                            self.reload_after_write(deps);
+                        }
+                    }
+                    None => self.toast_error(format!("{failed}: {e}")),
+                }
             }
             Ok(()) => {
                 // The provider's own copy settles what can't be guessed here — which bucket a
@@ -10508,9 +10558,229 @@ impl App {
                 }
                 // Every write lands in the item's history, so the Activity section is re-read.
                 self.refresh_item_views(&key, deps);
-                self.reload_after_write(deps);
+                // A bulk run refreshes once, on its last answer, not once per item. Its hold is
+                // gone all the same, so a refresh already out — asked for before the write — must
+                // still be followed by another, or it would show the old state until then.
+                if run.is_none_or(|run| run.left == 0) {
+                    self.reload_after_write(deps);
+                } else if self.reloading {
+                    self.reload_again = true;
+                }
             }
         }
+    }
+
+    // ---- bulk actions on marked rows ----
+
+    /// The detail cache key of each row in the active list, in the order shown — what a mark
+    /// is matched against. Only pull requests and work items can be marked.
+    fn visible_row_keys(&self) -> Vec<String> {
+        match self.active {
+            0 => self
+                .filtered_pr_indices()
+                .into_iter()
+                .map(|i| pr_detail_cache_key(&self.prs[i].connection_id, &self.prs[i].pr.item_ref()))
+                .collect(),
+            1 => self
+                .filtered_wi_indices()
+                .into_iter()
+                .map(|i| wi_detail_cache_key(&self.wis[i].connection_id, &self.wis[i].wi.item_ref()))
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Which rows of the active list are marked, in the order shown.
+    pub fn marked_rows(&self) -> Vec<bool> {
+        let Some(marks) = self.marks.get(self.active).filter(|m| !m.is_empty()) else { return Vec::new() };
+        self.visible_row_keys().iter().map(|k| marks.contains(k)).collect()
+    }
+
+    /// How many rows of the active list are marked. Only the ones on screen count — and only
+    /// those are acted on — so a bulk action never changes a row the filter is hiding.
+    pub fn marked_count(&self) -> usize {
+        self.marked_rows().into_iter().filter(|m| *m).count()
+    }
+
+    /// Marks the row under the cursor for a bulk action, or lets go of it.
+    pub(crate) fn toggle_mark(&mut self) {
+        if self.active > 1 {
+            return;
+        }
+        let keys = self.visible_row_keys();
+        let Some(key) = self.selected().and_then(|p| keys.get(p)).cloned() else { return };
+        // Marks on items the section no longer lists go quietly, rather than waiting to light
+        // up a row that comes back. One a filter is merely hiding is kept: narrowing the list
+        // to find the next row to mark mustn't cost the ones already marked.
+        let listed: HashSet<String> = match self.active {
+            0 => self.prs.iter().map(|r| pr_detail_cache_key(&r.connection_id, &r.pr.item_ref())).collect(),
+            _ => self.wis.iter().map(|r| wi_detail_cache_key(&r.connection_id, &r.wi.item_ref())).collect(),
+        };
+        let marks = &mut self.marks[self.active];
+        marks.retain(|k| listed.contains(k));
+        if !marks.remove(&key) {
+            marks.insert(key);
+        }
+    }
+
+    /// The marked work-item rows, in the order shown.
+    fn marked_wi_rows(&self) -> Vec<&WiRow> {
+        if self.active != 1 {
+            return Vec::new();
+        }
+        self.filtered_wi_indices()
+            .into_iter()
+            .map(|i| &self.wis[i])
+            .filter(|r| self.marks[1].contains(&wi_detail_cache_key(&r.connection_id, &r.wi.item_ref())))
+            .collect()
+    }
+
+    /// The marked work items' keys, in the order shown: the selection, as something to compare.
+    fn marked_wi_keys(&self) -> Vec<String> {
+        self.marked_wi_rows().iter().map(|r| wi_detail_cache_key(&r.connection_id, &r.wi.item_ref())).collect()
+    }
+
+    /// `b`: what can be done with the marked rows.
+    fn open_bulk_menu(&mut self) {
+        let n = self.marked_count();
+        if n == 0 {
+            self.toast = Some("Nothing selected — Space selects a row".into());
+            return;
+        }
+        if self.active != 1 {
+            self.toast = Some("No bulk actions for pull requests yet".into());
+            return;
+        }
+        self.overlay = Some(Overlay::Picker {
+            title: format!("Bulk action — {}", count_noun(n, "work item")),
+            items: vec!["Set state…".into()],
+            selected: 0,
+            kind: PickerKind::BulkAction,
+        });
+    }
+
+    /// State picker for the marked work items: the states every one of them can move to.
+    ///
+    /// What an item can move to is its own provider's answer — a Jira issue's transitions, a
+    /// Linear team's workflow, an Azure work-item type's — so each is asked, and only what they
+    /// all share is offered: a state one of them can't take would be a refusal waiting to
+    /// happen. That is a round-trip per item, so it is asked in the background and the picker
+    /// opens when the answers are in ([`AppEvent::BulkStatesLoaded`]).
+    async fn open_bulk_wi_state(&mut self, deps: &AppDeps) {
+        let targets: Vec<(String, ItemRef, String)> =
+            self.marked_wi_rows().iter().map(|r| (r.connection_id.clone(), r.wi.item_ref(), r.wi.state.clone())).collect();
+        if targets.is_empty() {
+            self.toast = Some("Nothing selected".into());
+            return;
+        }
+        let Some(tx) = self.job_tx.clone() else {
+            // No event loop to answer on (a bare harness): ask inline.
+            let answers = bulk_wi_states(deps, targets).await;
+            self.show_bulk_wi_states(&answers);
+            return;
+        };
+        self.toast = Some("Checking states…".into());
+        let (deps, marked) = (deps.clone(), self.marked_wi_keys());
+        tokio::spawn(async move {
+            let answers = bulk_wi_states(&deps, targets).await;
+            let _ = tx.send(AppEvent::BulkStatesLoaded { marked, answers });
+        });
+    }
+
+    /// Opens the bulk state picker on what the marked items' providers answered.
+    fn show_bulk_wi_states(&mut self, answers: &[(String, Vec<String>)]) {
+        let mut states = match shared_states(answers) {
+            Some(shared) if shared.is_empty() => {
+                self.toast = Some("The selected items share no state they can all move to".into());
+                return;
+            }
+            Some(shared) => shared,
+            None => Vec::new(),
+        };
+        // No provider named any: the states on screen stand in, as they do for one item.
+        if states.is_empty() {
+            states = self.distinct_wi_states();
+            if states.len() < 2 {
+                states = vec!["Todo".into(), "In Progress".into(), "Done".into()];
+            }
+        }
+        self.toast = None;
+        self.overlay = Some(Overlay::Picker {
+            title: format!("Set state — {}", count_noun(answers.len(), "work item")),
+            items: states,
+            selected: 0,
+            kind: PickerKind::BulkWorkItemState,
+        });
+    }
+
+    /// Moves every marked work item to `state`. Optimistic like a single write — each row
+    /// shows the state at once and is held against stale refreshes — with the provider asked
+    /// for each in the background, a few at a time; one it refuses goes back on its own.
+    async fn execute_bulk_wi_state(&mut self, state: String, deps: &AppDeps) {
+        let marked = self.marked_wi_rows().len();
+        // An item already there has nothing to be asked for.
+        let targets: Vec<(String, ItemRef)> = self
+            .marked_wi_rows()
+            .iter()
+            .filter(|r| r.wi.state != state)
+            .map(|r| (r.connection_id.clone(), r.wi.item_ref()))
+            .collect();
+        self.marks[1].clear();
+        if targets.is_empty() {
+            self.toast = Some(if marked == 0 { "Nothing selected".into() } else { format!("Already {state}") });
+            return;
+        }
+
+        let batch = self.next_bulk_run;
+        self.next_bulk_run += 1;
+        self.bulk_runs.insert(batch, BulkRun { total: targets.len(), left: targets.len(), failed: 0 });
+        let call = |state: &str| WiCall::Edit(WiEdit::State(state.to_string()));
+        let jobs: Vec<(u64, String, ItemRef)> = targets
+            .into_iter()
+            .map(|(conn_id, item)| {
+                let token = self.stage_wi_call(&conn_id, &item, &call(&state), Some(batch));
+                self.item_actions.get_mut(&token).expect("just staged").failed = "State change refused";
+                (token, conn_id, item)
+            })
+            .collect();
+        self.toast = Some(format!("State → {state} · {}", count_noun(jobs.len(), "work item")));
+        self.fix_selection();
+
+        let Some(tx) = self.job_tx.clone() else {
+            // No event loop to answer on (a bare harness): ask inline.
+            for (token, conn_id, item) in jobs {
+                let (result, fresh) = wi_action_call(deps, &conn_id, &item, &call(&state)).await;
+                self.finish_wi_action(token, result, fresh, deps);
+            }
+            return;
+        };
+        let deps = deps.clone();
+        tokio::spawn(async move {
+            let gate = Arc::new(tokio::sync::Semaphore::new(BULK_CONCURRENCY));
+            for (token, conn_id, item) in jobs {
+                let Ok(permit) = gate.clone().acquire_owned().await else { return };
+                let (deps, tx, call) = (deps.clone(), tx.clone(), call(&state));
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    let (result, fresh) = wi_action_call(&deps, &conn_id, &item, &call).await;
+                    let _ = tx.send(AppEvent::WiActionDone { token, result, fresh: fresh.map(Box::new) });
+                });
+            }
+        });
+    }
+
+    /// Counts one answer into its bulk run, returning where the run now stands.
+    fn bulk_answered(&mut self, batch: u64, ok: bool) -> Option<BulkRun> {
+        let run = self.bulk_runs.get_mut(&batch)?;
+        run.left = run.left.saturating_sub(1);
+        if !ok {
+            run.failed += 1;
+        }
+        let now = *run;
+        if now.left == 0 {
+            self.bulk_runs.remove(&batch);
+        }
+        Some(now)
     }
 
     // ---- optimistic PR / work-item writes: shared plumbing ----
@@ -11373,6 +11643,72 @@ impl ItemHold {
 /// the old state.
 const ITEM_HOLD_SECS: i64 = 60;
 
+/// How many of a bulk action's provider calls run at once.
+const BULK_CONCURRENCY: usize = 4;
+
+/// A bulk action whose answers are still coming in.
+#[derive(Clone, Copy)]
+struct BulkRun {
+    total: usize,
+    /// Answers still owed.
+    left: usize,
+    failed: usize,
+}
+
+/// `"1 work item"`, `"3 work items"`.
+fn count_noun(n: usize, noun: &str) -> String {
+    format!("{n} {noun}{}", if n == 1 { "" } else { "s" })
+}
+
+/// What each of `targets` can move to — `(its current state, its provider's states)` — asked a
+/// few at a time. A provider that fails or names none answers with an empty list.
+async fn bulk_wi_states(deps: &AppDeps, targets: Vec<(String, ItemRef, String)>) -> Vec<(String, Vec<String>)> {
+    let feeds = detail_or_default(deps.sections.work_item_feeds().await, DIAG_WI_FEEDS);
+    let gate = Arc::new(tokio::sync::Semaphore::new(BULK_CONCURRENCY));
+    let asks: Vec<_> = targets
+        .into_iter()
+        .map(|(conn_id, item, current)| {
+            let source = feeds.iter().find(|f| f.connection.connection_id() == conn_id).map(|f| f.source.clone());
+            let gate = gate.clone();
+            let ask = tokio::spawn(async move {
+                let _permit = gate.acquire_owned().await;
+                match source {
+                    Some(source) => detail_or_default(source.available_states(&item).await, DIAG_WI_STATES),
+                    None => Vec::new(),
+                }
+            });
+            (current, ask)
+        })
+        .collect();
+    let mut answers = Vec::new();
+    for (current, ask) in asks {
+        answers.push((current, ask.await.unwrap_or_default()));
+    }
+    answers
+}
+
+/// The states every item can end up in, in the first answer's order. Each answer is an item's
+/// `(current state, the states its provider offers)`. An item is already in its current state,
+/// so that counts as one it can take whether or not the provider lists it — Jira names only
+/// where an issue can *move*, and without this two issues in different states could never be
+/// brought to either one's. An empty list is a provider that names no states and narrows
+/// nothing; `None` means none of them named any.
+fn shared_states(answers: &[(String, Vec<String>)]) -> Option<Vec<String>> {
+    let reachable = |(current, offered): &(String, Vec<String>)| {
+        let mut all = offered.clone();
+        if !current.is_empty() && !all.contains(current) {
+            all.push(current.clone());
+        }
+        all
+    };
+    let mut named = answers.iter().filter(|(_, offered)| !offered.is_empty()).map(reachable);
+    let mut shared = named.next()?;
+    for answer in named {
+        shared.retain(|s| answer.contains(s));
+    }
+    Some(shared)
+}
+
 /// A PR or work-item write in flight: what to undo, and what to say when the provider answers.
 struct PendingItemAction {
     conn_id: String,
@@ -11397,6 +11733,8 @@ struct PendingItemAction {
     pr_edit: Option<PrEdit>,
     /// The thread this action resolved (`true`) or reopened, to flip back on a refusal.
     thread_state: Option<(String, bool)>,
+    /// The bulk run this write is one item of.
+    batch: Option<u64>,
 }
 
 impl PendingItemAction {
@@ -11414,6 +11752,7 @@ impl PendingItemAction {
             dismissed: false,
             pr_edit: None,
             thread_state: None,
+            batch: None,
         }
     }
 }
@@ -19440,6 +19779,8 @@ mod tests {
     struct ItemCalls {
         log: Arc<std::sync::Mutex<Vec<String>>>,
         refuse: bool,
+        /// Refuse only the writes whose logged call contains this (one item of several).
+        refuse_matching: Option<String>,
         /// When set, every write waits for this before answering — to see the screen mid-flight.
         gate: Option<Arc<tokio::sync::Notify>>,
         /// What `get` answers with after a write.
@@ -19451,7 +19792,15 @@ mod tests {
 
     impl ItemCalls {
         fn new() -> Self {
-            ItemCalls { log: Arc::default(), refuse: false, gate: None, pr: pr(None), wi: wi(None), users: Vec::new() }
+            ItemCalls {
+                log: Arc::default(),
+                refuse: false,
+                refuse_matching: None,
+                gate: None,
+                pr: pr(None),
+                wi: wi(None),
+                users: Vec::new(),
+            }
         }
 
         fn gated() -> (Self, Arc<tokio::sync::Notify>) {
@@ -19467,8 +19816,9 @@ mod tests {
             if let Some(gate) = &self.gate {
                 gate.notified().await;
             }
+            let refused = self.refuse || self.refuse_matching.as_ref().is_some_and(|m| call.contains(m));
             self.log.lock().unwrap().push(call);
-            if self.refuse {
+            if refused {
                 Err(forgetop_core::Error::Provider("the provider said no".into()))
             } else {
                 Ok(())
@@ -19540,8 +19890,9 @@ mod tests {
         async fn list(&self, _query: &WorkItemQuery) -> forgetop_core::Result<Vec<WorkItem>> {
             Ok(Vec::new())
         }
-        async fn get(&self, _item: &ItemRef) -> forgetop_core::Result<WorkItem> {
-            Ok(self.0.wi.clone())
+        async fn get(&self, item: &ItemRef) -> forgetop_core::Result<WorkItem> {
+            // The item asked about, so that several rows don't all come back as one.
+            Ok(WorkItem { id: item.id.clone(), ..self.0.wi.clone() })
         }
         async fn threads(&self, _item: &ItemRef) -> forgetop_core::Result<Vec<CommentThread>> {
             Ok(Vec::new())
@@ -21118,5 +21469,274 @@ mod tests {
         for key in ['D', 'X', '@', 'R'] {
             assert!(!keys.contains(&Key::Char(key)), "nothing the connection can't do: {key}");
         }
+    }
+
+    // ---- bulk actions on marked rows ----
+
+    /// The Work Items list holding one `Todo` item per id, cursor on the first.
+    fn wi_list_app(ids: &[&str]) -> App {
+        let mut app = App::new("slate");
+        app.active = 1;
+        app.screen = Screen::List;
+        app.wis = ids.iter().map(|id| wi_row(WorkItem { id: id.to_string(), ..wi(None) })).collect();
+        app.wi_state.select(Some(0));
+        app
+    }
+
+    /// Marks the rows at these positions, leaving the cursor on the last.
+    fn mark_rows(app: &mut App, rows: &[usize]) {
+        for &row in rows {
+            app.wi_state.select(Some(row));
+            app.toggle_mark();
+        }
+    }
+
+    fn wi_states(app: &App) -> Vec<(&str, &str)> {
+        app.wis.iter().map(|r| (r.wi.id.as_str(), r.wi.state.as_str())).collect()
+    }
+
+    #[tokio::test]
+    async fn space_marks_the_row_under_the_cursor_and_escape_lets_go_before_it_leaves() {
+        let deps = test_deps();
+        let mut app = wi_list_app(&["a", "b", "c"]);
+
+        app.on_key(Key::Char(' '), &deps).await;
+        app.on_key(Key::Down, &deps).await;
+        app.on_key(Key::Down, &deps).await;
+        app.on_key(Key::Char(' '), &deps).await;
+        assert_eq!(app.marked_rows(), vec![true, false, true]);
+
+        app.on_key(Key::Char(' '), &deps).await;
+        assert_eq!(app.marked_rows(), vec![true, false, false], "Space again lets go of the row");
+
+        app.on_key(Key::Escape, &deps).await;
+        assert_eq!(app.marked_count(), 0);
+        assert!(matches!(app.screen, Screen::List), "the first Esc only clears the selection");
+        app.on_key(Key::Escape, &deps).await;
+        assert!(matches!(app.screen, Screen::Launchpad), "the next one steps back");
+    }
+
+    #[tokio::test]
+    async fn space_marks_nothing_on_the_pipelines_list() {
+        let deps = test_deps();
+        let mut app = App::new("slate");
+        app.active = index_of(Section::Pipelines);
+        app.screen = Screen::List;
+        app.on_key(Key::Char(' '), &deps).await;
+        assert_eq!(app.marked_count(), 0);
+        assert!(app.marks.iter().all(HashSet::is_empty));
+    }
+
+    #[test]
+    fn a_mark_follows_its_item_through_a_refresh_and_a_resort() {
+        let mut app = wi_list_app(&["a", "b", "c"]);
+        mark_rows(&mut app, &[0]);
+
+        // The refresh lands the same items in another order: the mark is on `a`, not on row 0.
+        app.wis = ["c", "b", "a"].iter().map(|id| wi_row(WorkItem { id: id.to_string(), ..wi(None) })).collect();
+        assert_eq!(app.marked_rows(), vec![false, false, true]);
+
+        // One that names the same id in another repository is a different item.
+        app.wis[2].wi.repository = Some("acme/other".into());
+        assert_eq!(app.marked_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn the_bulk_key_asks_for_a_selection_then_offers_the_states() {
+        let deps = deps_with_items(ItemCalls::new()).await;
+        let mut app = wi_list_app(&["a", "b"]);
+        app.wis[1].wi.state = "Doing".into();
+
+        app.on_key(Key::Char('b'), &deps).await;
+        assert!(app.overlay.is_none());
+        assert!(app.toast.as_deref().is_some_and(|t| t.contains("Space")), "{:?}", app.toast);
+
+        mark_rows(&mut app, &[0, 1]);
+        app.on_key(Key::Char('b'), &deps).await;
+        match &app.overlay {
+            Some(Overlay::Picker { title, items, kind: PickerKind::BulkAction, .. }) => {
+                assert_eq!(title, "Bulk action — 2 work items");
+                assert_eq!(items, &vec!["Set state…".to_string()]);
+            }
+            _ => panic!("expected the bulk-action menu"),
+        }
+
+        app.on_key(Key::Enter, &deps).await;
+        match &app.overlay {
+            // This provider names no states, so the ones on screen stand in — as for one item.
+            Some(Overlay::Picker { title, items, kind: PickerKind::BulkWorkItemState, .. }) => {
+                assert_eq!(title, "Set state — 2 work items");
+                assert_eq!(items, &vec!["Todo".to_string(), "Doing".to_string()]);
+            }
+            _ => panic!("expected the state picker"),
+        }
+        assert_eq!(app.marked_count(), 2, "still selected until a state is chosen");
+    }
+
+    #[test]
+    fn only_the_states_every_selected_item_can_end_up_in_are_offered() {
+        let s = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        let item = |current: &str, offered: &[&str]| (current.to_string(), s(offered));
+        assert_eq!(
+            shared_states(&[item("Todo", &["Todo", "Doing", "Done"]), item("Done", &["Done", "Todo"])]),
+            Some(s(&["Todo", "Done"]))
+        );
+        assert_eq!(shared_states(&[item("Todo", &["Todo"]), item("open", &["open", "closed"])]), Some(Vec::new()), "nothing in common");
+        assert_eq!(shared_states(&[item("Todo", &["Todo", "Done"]), item("x", &[])]), Some(s(&["Todo", "Done"])), "no answer narrows nothing");
+        assert_eq!(shared_states(&[item("a", &[]), item("b", &[])]), None, "nobody named any");
+
+        // Jira names only where an issue can move, never where it is. The one already In
+        // Progress can still "take" In Progress, and the one already Done can take Done.
+        assert_eq!(
+            shared_states(&[item("To Do", &["In Progress", "Done"]), item("In Progress", &["To Do", "Done"])]),
+            Some(s(&["In Progress", "Done", "To Do"]))
+        );
+        assert_eq!(
+            shared_states(&[
+                item("To Do", &["In Progress", "Done"]),
+                item("In Progress", &["To Do", "Done"]),
+                item("Done", &["To Do", "In Progress"]),
+            ]),
+            Some(s(&["In Progress", "Done", "To Do"]))
+        );
+    }
+
+    #[tokio::test]
+    async fn the_state_picker_opens_when_the_answers_land_and_only_for_the_selection_asked_about() {
+        let deps = deps_with_items(ItemCalls::new()).await;
+        let mut app = wi_list_app(&["a", "b", "c"]);
+        mark_rows(&mut app, &[0, 1]);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.job_tx = Some(tx);
+
+        app.execute_action(Action::OpenBulkAction { index: 0 }, &deps).await;
+        assert!(app.overlay.is_none(), "the key handler doesn't wait on the providers");
+        assert_eq!(app.toast.as_deref(), Some("Checking states…"));
+        let event = rx.recv().await.expect("the states");
+
+        // The selection grew while they were out: that answer is for another question.
+        mark_rows(&mut app, &[2]);
+        app.on_event(event, &deps);
+        assert!(app.overlay.is_none());
+
+        app.execute_action(Action::OpenBulkAction { index: 0 }, &deps).await;
+        let event = rx.recv().await.expect("the states");
+        app.on_event(event, &deps);
+        assert!(matches!(&app.overlay, Some(Overlay::Picker { kind: PickerKind::BulkWorkItemState, title, .. }) if title == "Set state — 3 work items"));
+    }
+
+    #[tokio::test]
+    async fn a_filter_keeps_the_marks_it_hides_and_q_clears_them_like_escape() {
+        let deps = test_deps();
+        let mut app = wi_list_app(&["a", "b", "c"]);
+        app.wis[2].wi.title = "needle".into();
+        mark_rows(&mut app, &[0, 1]);
+
+        // Narrow to `c` and mark it: `a` and `b` are out of sight, not let go of.
+        app.filters[1] = "needle".into();
+        app.wi_state.select(Some(0));
+        app.on_key(Key::Char(' '), &deps).await;
+        assert_eq!(app.marked_rows(), vec![true]);
+        app.filters[1].clear();
+        assert_eq!(app.marked_rows(), vec![true, true, true]);
+
+        // One whose item has left the section altogether does go.
+        app.wis.remove(0);
+        app.wi_state.select(Some(0));
+        app.toggle_mark();
+        assert_eq!(app.marks[1].len(), 1, "b unmarked, a pruned, c kept");
+
+        app.on_key(Key::Char('q'), &deps).await;
+        assert_eq!(app.marked_count(), 0);
+        assert!(matches!(app.screen, Screen::List));
+    }
+
+    #[tokio::test]
+    async fn a_refresh_out_during_a_bulk_run_is_followed_by_another_as_each_item_lands() {
+        let (calls, gate) = ItemCalls::gated();
+        let deps = deps_with_items(calls.clone()).await;
+        let mut app = wi_list_app(&["a", "b"]);
+        mark_rows(&mut app, &[0, 1]);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.job_tx = Some(tx);
+        app.execute_action(Action::BulkWiSetState("Done".into()), &deps).await;
+
+        // A refresh asked for before the writes is still out when the first answer lands,
+        // letting go of that row's hold: it must not be the last word on it.
+        app.reloading = true;
+        gate.notify_one();
+        let event = answer(&mut rx).await;
+        app.on_event(event, &deps);
+        assert!(app.reload_again, "the stale refresh is followed by another");
+        assert_eq!(app.bulk_runs.len(), 1, "one answer still owed");
+    }
+
+    #[tokio::test]
+    async fn a_bulk_state_change_shows_on_every_marked_row_before_the_provider_answers() {
+        let (mut calls, gate) = ItemCalls::gated();
+        calls.wi = WorkItem { state: "Done".into(), state_category: WorkItemStateCategory::Completed, ..wi(None) };
+        let deps = deps_with_items(calls.clone()).await;
+        let mut app = wi_list_app(&["a", "b", "c"]);
+        mark_rows(&mut app, &[0, 2]);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.job_tx = Some(tx);
+
+        app.execute_action(Action::BulkWiSetState("Done".into()), &deps).await;
+        assert!(calls.calls().is_empty(), "the provider hasn't answered yet");
+        assert_eq!(wi_states(&app), vec![("a", "Done"), ("b", "Todo"), ("c", "Done")]);
+        assert_eq!(app.toast.as_deref(), Some("State → Done · 2 work items"));
+        assert_eq!(app.marked_count(), 0, "the selection is spent");
+
+        // A refresh asked for before the writes still says Todo: neither row flips back.
+        let mut r = reloaded_with_health(Vec::new());
+        r.wis = ["a", "b", "c"].iter().map(|id| wi_row(WorkItem { id: id.to_string(), ..wi(None) })).collect();
+        app.on_event(AppEvent::Reloaded(Box::new(r)), &deps);
+        assert_eq!(wi_states(&app), vec![("a", "Done"), ("b", "Todo"), ("c", "Done")]);
+
+        for _ in 0..2 {
+            gate.notify_one();
+            let event = answer(&mut rx).await;
+            app.on_event(event, &deps);
+        }
+        let mut asked = calls.calls();
+        asked.sort();
+        assert_eq!(asked, vec!["state a Done".to_string(), "state c Done".to_string()], "one call per marked item");
+        assert_eq!(app.wis[0].wi.state_category, WorkItemStateCategory::Completed, "the provider's bucket for it");
+        assert!(app.held_items.is_empty(), "their copies showed the change");
+        assert!(app.item_actions.is_empty() && app.bulk_runs.is_empty(), "nothing left in flight");
+    }
+
+    #[tokio::test]
+    async fn an_item_refused_in_a_bulk_change_goes_back_on_its_own() {
+        let calls = ItemCalls { refuse_matching: Some("state b".into()), ..ItemCalls::new() };
+        let deps = deps_with_items(calls.clone()).await;
+        let mut app = wi_list_app(&["a", "b", "c"]);
+        mark_rows(&mut app, &[0, 1, 2]);
+
+        app.execute_action(Action::BulkWiSetState("Done".into()), &deps).await;
+        assert_eq!(wi_states(&app), vec![("a", "Done"), ("b", "Todo"), ("c", "Done")]);
+        let toast = app.toast.clone().unwrap_or_default();
+        assert!(toast.contains("1 of 3") && toast.contains("the provider said no"), "{toast}");
+        assert_eq!(calls.calls().len(), 3);
+        assert!(app.bulk_runs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_bulk_change_leaves_alone_what_the_filter_hides_and_what_is_already_there() {
+        let calls = ItemCalls::new();
+        let deps = deps_with_items(calls.clone()).await;
+        let mut app = wi_list_app(&["a", "b", "c"]);
+        app.wis[0].wi.title = "keep".into();
+        app.wis[1].wi.title = "keep".into();
+        app.wis[1].wi.state = "Done".into();
+        mark_rows(&mut app, &[0, 1, 2]);
+
+        // `c` is marked but filtered off screen: a bulk action never reaches a row out of sight.
+        app.filters[1] = "keep".into();
+        assert_eq!(app.marked_count(), 2);
+        app.execute_action(Action::BulkWiSetState("Done".into()), &deps).await;
+        assert_eq!(calls.calls(), vec!["state a Done".to_string()], "b was already Done; c was hidden");
+        assert_eq!(app.wis[2].wi.state, "Todo");
+        assert_eq!(app.toast.as_deref(), Some("State → Done · 1 work item"));
     }
 }

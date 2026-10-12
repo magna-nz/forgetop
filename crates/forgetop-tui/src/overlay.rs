@@ -27,6 +27,10 @@ pub enum Action {
     /// the app says so and keeps the picker. `label` is the row as shown.
     PrRequestReviewer { id: Option<String>, label: String },
     WiSetState(String),
+    /// From the bulk-action menu: open the chosen action (by index) for the marked rows.
+    OpenBulkAction { index: usize },
+    /// Move every marked work item to this state.
+    BulkWiSetState(String),
     WiComment(String),
     /// Assign the open work item to the user with this id (`None` = unassign). `label` is the
     /// name to show for it, so the change can be reflected before the provider answers.
@@ -145,6 +149,10 @@ pub struct ToggleItem {
 pub enum PickerKind {
     PrMergeStrategy,
     WorkItemState,
+    /// What to do with the rows marked in a list. Resolves to the picked index.
+    BulkAction,
+    /// The state to move every marked work item to.
+    BulkWorkItemState,
     /// Which field of the open work item to edit (Title / Description).
     WorkItemEdit,
     /// The verdict for submitting a batch of pending line comments.
@@ -487,6 +495,8 @@ fn resolve_picker(kind: PickerKind, selected: usize, items: &[String]) -> Action
             Action::PrMerge(strategy)
         }
         PickerKind::WorkItemState => Action::WiSetState(items.get(selected).cloned().unwrap_or_default()),
+        PickerKind::BulkAction => Action::OpenBulkAction { index: selected },
+        PickerKind::BulkWorkItemState => Action::BulkWiSetState(items.get(selected).cloned().unwrap_or_default()),
         PickerKind::WorkItemEdit => match selected {
             1 => Action::WiEdit(WiField::Description),
             _ => Action::WiEdit(WiField::Title),
