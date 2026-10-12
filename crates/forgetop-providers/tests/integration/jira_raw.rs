@@ -54,6 +54,20 @@ impl JiraRaw {
         self.send(Method::POST, &format!("{}/issue", self.api), Some(body)).await["key"].as_str().expect("issue key").to_string()
     }
 
+    /// Creates a Sub-task assigned to `assignee` under the issue `parent`; returns its key. A
+    /// sub-task rather than a task under an epic: the test project has no Epic type, and both
+    /// hang off the same `parent` field.
+    pub async fn create_subtask(&self, summary: &str, assignee: &str, parent: &str) -> String {
+        let body = json!({ "fields": {
+            "project": { "key": self.project },
+            "summary": summary,
+            "issuetype": { "name": "Sub-task" },
+            "assignee": { "accountId": assignee },
+            "parent": { "key": parent }
+        }});
+        self.send(Method::POST, &format!("{}/issue", self.api), Some(body)).await["key"].as_str().expect("issue key").to_string()
+    }
+
     pub async fn delete_issue(&self, key: &str) {
         let _ = self.http.delete(format!("{}/issue/{key}", self.api)).send().await;
     }

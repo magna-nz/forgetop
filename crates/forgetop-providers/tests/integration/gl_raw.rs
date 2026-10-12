@@ -95,6 +95,18 @@ impl GlRaw {
         v["iid"].as_i64().expect("issue iid")
     }
 
+    /// Creates a project milestone; returns its (id, web_url).
+    pub async fn create_milestone(&self, title: &str) -> (i64, String) {
+        let v = self.send(Method::POST, &self.url("/milestones"), Some(json!({ "title": title }))).await;
+        (v["id"].as_i64().expect("milestone id"), v["web_url"].as_str().expect("milestone web_url").to_string())
+    }
+
+    /// Creates an issue assigned to `assignee_id` under milestone `milestone_id`; returns its iid.
+    pub async fn create_issue_in_milestone(&self, title: &str, assignee_id: i64, milestone_id: i64) -> i64 {
+        let body = json!({ "title": title, "assignee_ids": [assignee_id], "milestone_id": milestone_id });
+        self.send(Method::POST, &self.url("/issues"), Some(body)).await["iid"].as_i64().expect("issue iid")
+    }
+
     /// Creates a pipeline on `git_ref` (its `.gitlab-ci.yml` must exist there).
     /// Returns the pipeline id, or `Err(body)` — e.g. when GitLab.com blocks CI on an
     /// unvalidated account ("Identity verification is required"), which the caller
@@ -115,12 +127,25 @@ impl GlRaw {
     pub async fn delete_issue(&self, iid: i64) {
         self.try_send(Method::DELETE, &self.url(&format!("/issues/{iid}")), None).await;
     }
+    pub async fn delete_milestone(&self, id: i64) {
+        self.try_send(Method::DELETE, &self.url(&format!("/milestones/{id}")), None).await;
+    }
     pub async fn delete_pipeline(&self, id: i64) {
         self.try_send(Method::DELETE, &self.url(&format!("/pipelines/{id}")), None).await;
     }
 
-    /// Best-effort cleanup of `forgetop-it-*` branches left by earlier runs.
+    /// Best-effort cleanup of `forgetop-it-*` branches and milestones left by earlier runs.
     pub async fn sweep(&self) {
+        let (_, text) = self.raw(Method::GET, &self.url("/milestones?per_page=100&search=forgetop-it-"), None).await;
+        if let Ok(Value::Array(list)) = serde_json::from_str::<Value>(&text) {
+            for m in list {
+                if m["title"].as_str().is_some_and(|t| t.starts_with(harness::SWEEP_PREFIX)) {
+                    if let Some(id) = m["id"].as_i64() {
+                        self.delete_milestone(id).await;
+                    }
+                }
+            }
+        }
         let v = self.send(Method::GET, &self.url("/repository/branches?per_page=100&search=forgetop-it-"), None).await;
         if let Some(list) = v.as_array() {
             for b in list {

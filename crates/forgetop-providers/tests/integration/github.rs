@@ -162,6 +162,41 @@ async fn github_pull_request_lifecycle() {
     raw.delete_ref(&branch).await;
 }
 
+/// The one thing fixtures cannot prove: that a real issue under a real milestone comes back
+/// naming that milestone as its parent — from the account-wide list and from a single read.
+#[tokio::test]
+async fn github_issue_names_its_milestone_as_its_parent() {
+    let gh = skip_if_none!(harness::github(), "github");
+    let raw = GhRaw::from_env().expect("github raw client");
+    let prefix = harness::run_prefix();
+
+    let (_id, login) = raw.me().await;
+    let milestone_title = format!("{prefix} milestone");
+    let (milestone, milestone_id, milestone_url) = raw.create_milestone(&milestone_title).await;
+    let title = format!("{prefix} milestone issue");
+    let number = raw.create_issue_in_milestone(&title, &login, milestone).await;
+    let id = number.to_string();
+
+    let wi = gh.conn.work_items().expect("github work items");
+    let listed = {
+        let (wi, id, title) = (&wi, id.as_str(), title.as_str());
+        harness::poll(harness::POLL_LIST, move || async move {
+            let list = wi.list(&WorkItemQuery { mine_only: true, ..Default::default() }).await.ok()?;
+            list.into_iter().find(|w| w.id == id && w.title == title)
+        })
+        .await
+    };
+    let got = wi.get(&ItemRef::new(&id)).await;
+
+    // Torn down before anything is asserted, so a failure leaks no fixture.
+    raw.close_issue(number).await;
+    raw.delete_milestone(milestone).await;
+
+    let expected = WorkItemParent { kind: "Milestone".into(), id: milestone_id.to_string(), title: milestone_title, url: Some(milestone_url) };
+    assert_eq!(listed.expect("the issue appears in the mine-only list").parent, Some(expected.clone()), "from the list");
+    assert_eq!(got.expect("get").parent, Some(expected), "from a single read");
+}
+
 #[tokio::test]
 async fn github_work_item_lifecycle() {
     let gh = skip_if_none!(harness::github(), "github");

@@ -107,6 +107,41 @@ async fn gitlab_merge_request_lifecycle() {
     raw.delete_branch(&branch).await;
 }
 
+/// A real issue under a real milestone comes back naming that milestone as its parent — from
+/// the account-wide list and from a single read.
+#[tokio::test]
+async fn gitlab_issue_names_its_milestone_as_its_parent() {
+    let gl = skip_if_none!(harness::gitlab(), "gitlab");
+    let raw = GlRaw::from_env().expect("gitlab raw");
+    let prefix = harness::run_prefix();
+
+    let (uid, _name) = raw.me().await;
+    let milestone_title = format!("{prefix} milestone");
+    let (milestone_id, milestone_url) = raw.create_milestone(&milestone_title).await;
+    let title = format!("{prefix} milestone issue");
+    let iid = raw.create_issue_in_milestone(&title, uid, milestone_id).await;
+    let id = iid.to_string();
+
+    let wi = gl.conn.work_items().expect("gitlab issues");
+    let listed = {
+        let (wi, id, title) = (&wi, id.as_str(), title.as_str());
+        harness::poll(harness::POLL_LIST, move || async move {
+            let list = wi.list(&WorkItemQuery { mine_only: true, ..Default::default() }).await.ok()?;
+            list.into_iter().find(|w| w.id == id && w.title == title)
+        })
+        .await
+    };
+    let got = wi.get(&ItemRef::new(&id)).await;
+
+    // Torn down before anything is asserted, so a failure leaks no fixture.
+    raw.delete_issue(iid).await;
+    raw.delete_milestone(milestone_id).await;
+
+    let expected = WorkItemParent { kind: "Milestone".into(), id: milestone_id.to_string(), title: milestone_title, url: Some(milestone_url) };
+    assert_eq!(listed.expect("the issue appears in the mine-only list").parent, Some(expected.clone()), "from the list");
+    assert_eq!(got.expect("get").parent, Some(expected), "from a single read");
+}
+
 #[tokio::test]
 async fn gitlab_issue_lifecycle() {
     let gl = skip_if_none!(harness::gitlab(), "gitlab");
