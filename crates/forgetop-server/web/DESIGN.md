@@ -31,7 +31,10 @@ a marketing dashboard. Everything below is already implemented in `src/index.css
 10. **Filters are quiet menus** (`<Select>`: a native select dressed as a text button), grouping
     is a `<Segmented>` control, views are `<Tabs>`. Never a raw `<select>` with browser chrome.
 11. **Detail is a split pane**, never a modal: `<SlideOver>` renders beside the content and the
-    list shrinks. No backdrop, no dimming. Esc and the ✕ close it.
+    list shrinks. No backdrop, no dimming. Esc and the ✕ close it. Its left edge is a grip: drag
+    to resize, `←` expands and `→` shrinks (from anywhere outside a text field; the footer says
+    so), double-click resets; the width is remembered per pane size and the content column
+    always keeps 320px.
 12. **No emoji or text glyphs as icons.** Use `<Icon name=…>`.
 13. **Empty and loading states** use `<StateCard>` and `<Skeleton>` (both restyled); keep them.
 

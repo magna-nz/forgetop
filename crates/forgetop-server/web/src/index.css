@@ -384,14 +384,46 @@ kbd.ft-kbd {
 .ft-pane-xl {
   width: min(820px, 58vw);
 }
-@media (max-width: 900px) {
-  .ft-pane {
-    position: fixed;
-    inset: 0 0 0 auto;
-    width: 100%;
-    z-index: 40;
+/* The grip on the pane's left edge: drag to resize. Wider than it looks for an easy grab. */
+  .ft-pane-grip {
+    position: absolute;
+    left: -4px;
+    top: 0;
+    bottom: 0;
+    width: 8px;
+    cursor: col-resize;
+    z-index: 2;
+    touch-action: none;
   }
-}
+  .ft-pane-grip::after {
+    content: "";
+    position: absolute;
+    left: 3px;
+    top: 0;
+    bottom: 0;
+    width: 2px;
+    background: transparent;
+    transition: background-color 120ms ease-out;
+  }
+  .ft-pane-grip:hover::after,
+  .ft-pane-grip[data-dragging]::after,
+  .ft-pane-grip:focus-visible::after {
+    background: var(--accent);
+  }
+  .ft-pane-grip:focus-visible {
+    outline: none;
+  }
+  @media (max-width: 900px) {
+    .ft-pane {
+      position: fixed;
+      inset: 0 0 0 auto;
+      width: 100% !important;
+      z-index: 40;
+    }
+    .ft-pane-grip {
+      display: none;
+    }
+  }
 }
 
 ::-webkit-scrollbar {
