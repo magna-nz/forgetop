@@ -56,7 +56,7 @@ describe("every status meta names a glyph the icon set draws", () => {
     expect(wiStateGlyph("Done", "Completed")).toBe("check-circle");
     expect(wiStateGlyph("In Progress", "Started")).toBe("half");
     expect(wiStateGlyph("In Review", "Review")).toBe("review");
-    expect(wiStateGlyph("Todo", "Proposed")).toBe("circle");
+    expect(wiStateGlyph("Todo", "Unstarted")).toBe("circle");
     expect(known.has(prSignalMeta(pr({ checks: "Failed" })).glyph)).toBe(true);
   });
 
