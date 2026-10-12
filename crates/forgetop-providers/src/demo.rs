@@ -247,7 +247,8 @@ fn linear_wis() -> Vec<WorkItem> {
     vec![
         // A Linear milestone lives inside one project, so it reads "Project › Milestone".
         under(wi("ENG-231", "Design the ledger reconciliation job", "In Progress", C::Started, "Story", true, 4), "Milestone", "ms-reconciliation", "Ledger v2 › Reconciliation"),
-        under(wi("ENG-245", "Spike: event sourcing for the payments ledger", "Todo", C::Unstarted, "Spike", true, 28), "Milestone", "ms-reconciliation", "Ledger v2 › Reconciliation"),
+        // Past the doing and waiting on someone else: its own colour, and its own roll-up count.
+        under(wi("ENG-245", "Spike: event sourcing for the payments ledger", "In Review", C::Review, "Spike", true, 28), "Milestone", "ms-reconciliation", "Ledger v2 › Reconciliation"),
         // In a project but no milestone yet.
         under(wi("ENG-250", "Add SLO dashboards for the charge API", "Backlog", C::Backlog, "Task", true, 50), "Project", "proj-charge-obs", "Charge API observability"),
         // Loose: no project at all.
@@ -1096,6 +1097,7 @@ fn demo_state_category(state: &str) -> WorkItemStateCategory {
         "backlog" => C::Backlog,
         "todo" | "to do" | "new" => C::Unstarted,
         "triage" => C::Triage,
+        other if state_name_is_review(other) => C::Review,
         _ => C::Started,
     }
 }

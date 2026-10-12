@@ -15,7 +15,7 @@ use chrono::{DateTime, Utc};
 
 use crate::domain::{
     CheckStatus, MergeableState, PipelineRun, PipelineRunStatus, ProviderType, PullRequest, PullRequestStatus,
-    ReviewVote, User, WorkItem, WorkItemStateCategory,
+    ReviewVote, User, WorkItem,
 };
 
 /// The action bucket an item lands in. [`Bucket::ORDER`] is the display/urgency order — the
@@ -485,11 +485,12 @@ pub struct Launchpad {
     pub overflow: Overflow,
 }
 
-/// In-progress work items sort before the rest of "Assigned to you" — `Started` is the
-/// provider-neutral in-progress category, so this is correct for every provider.
+/// In-flight work items sort before the rest of "Assigned to you" — being worked on, or past
+/// that and in review. Both are provider-neutral categories, so this is correct for every
+/// provider.
 fn wi_in_progress_rank(e: &Entry) -> u8 {
     match &e.item {
-        EntryItem::Wi(wi) if wi.state_category == WorkItemStateCategory::Started => 0,
+        EntryItem::Wi(wi) if wi.state_category.is_active() => 0,
         _ => 1,
     }
 }

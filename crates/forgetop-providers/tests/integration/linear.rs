@@ -1,6 +1,6 @@
 //! Linear live tests: work items only (Linear has no PRs/pipelines).
 
-use forgetop_core::domain::WorkItemParent;
+use forgetop_core::domain::{WorkItemParent, WorkItemStateCategory};
 use forgetop_core::provider::*;
 
 use crate::harness;
@@ -61,6 +61,49 @@ async fn linear_issue_names_its_milestone_or_project_as_its_parent() {
     assert_eq!(a.parent, Some(under_milestone.clone()), "the milestone, titled with its project, from the list");
     assert_eq!(b.parent, Some(under_project), "the project, for an issue with no milestone");
     assert_eq!(got.expect("get").parent, Some(under_milestone), "from a single read");
+}
+
+/// In review is told from in progress by the team's real workflow order, not by state names:
+/// an issue in the team's first started state is in progress, one in a later started state is
+/// in review — from the list and from a single read.
+#[tokio::test]
+async fn linear_tells_in_review_from_in_progress_by_workflow_order() {
+    let ln = skip_if_none!(harness::linear(), "linear");
+    let raw = LnRaw::from_env().expect("linear raw");
+    let prefix = harness::run_prefix();
+
+    let me = raw.viewer_id().await;
+    let team = raw.team_id().await;
+    let started = raw.started_states(&team).await;
+    let [first, .., last] = started.as_slice() else {
+        eprintln!("SKIP linear in-review: the team has fewer than two started states");
+        return;
+    };
+    let doing = raw.create_issue_in_state(&team, &format!("{prefix} doing"), &me, first).await;
+    let reviewing = raw.create_issue_in_state(&team, &format!("{prefix} reviewing"), &me, last).await;
+
+    let wi = ln.conn.work_items().expect("linear work items");
+    let listed = {
+        let (wi, a, b) = (&wi, doing.as_str(), reviewing.as_str());
+        harness::poll(harness::POLL_LIST, move || async move {
+            let list = wi.list(&WorkItemQuery { mine_only: true, include_completed: true, limit: Some(100) }).await.ok()?;
+            let category = |id: &str| list.iter().find(|w| w.id == id).map(|w| w.state_category);
+            Some((category(a)?, category(b)?))
+        })
+        .await
+    };
+    let got = wi.get(&ItemRef::new(&reviewing)).await.map(|w| w.state_category);
+
+    // Torn down before anything is asserted, so a failure leaks no fixture.
+    raw.try_archive_issue(&doing).await;
+    raw.try_archive_issue(&reviewing).await;
+
+    assert_eq!(
+        listed.expect("both issues appear in the mine-only list"),
+        (WorkItemStateCategory::Started, WorkItemStateCategory::Review),
+        "the first started state is in progress, a later one in review"
+    );
+    assert_eq!(got.expect("get"), WorkItemStateCategory::Review, "from a single read");
 }
 
 #[tokio::test]

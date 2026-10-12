@@ -62,8 +62,58 @@ pub enum WorkItemStateCategory {
     Backlog,
     Unstarted,
     Started,
+    /// Past the doing: the work is done and waits on someone else — review, QA, verification.
+    /// Still open and still in flight, so whatever treats [`Started`](Self::Started) as active
+    /// asks [`is_active`](Self::is_active) and gets this too. What sets it apart is told from
+    /// the forge where the forge knows (Linear's state order, Azure's Resolved) and from the
+    /// state's name where it doesn't ([`state_name_is_review`]).
+    Review,
     Completed,
     Canceled,
+}
+
+impl WorkItemStateCategory {
+    /// In flight: being worked on, or past that and awaiting review.
+    pub fn is_active(self) -> bool {
+        matches!(self, WorkItemStateCategory::Started | WorkItemStateCategory::Review)
+    }
+}
+
+/// Whether a state's *name* says the doing is over and it waits on someone else: "In Review",
+/// "Code review", "Ready for QA", "Testing", "Awaiting approval".
+///
+/// State names are whatever a team typed, so this is the fallback for a forge that gives no
+/// order among its in-progress states (Jira), never the first thing asked. It matches whole
+/// words, so "Latest" is not "test" and "Preview" is not "review".
+pub fn state_name_is_review(name: &str) -> bool {
+    const WORDS: [&str; 12] =
+        ["review", "reviewing", "qa", "test", "testing", "verify", "verifying", "verification", "uat", "approval", "resolved", "validation"];
+    name.split(|c: char| !c.is_alphanumeric()).any(|word| WORDS.iter().any(|w| word.eq_ignore_ascii_case(w)))
+}
+
+#[cfg(test)]
+mod state_tests {
+    use super::*;
+
+    #[test]
+    fn a_review_state_is_told_by_whole_words_in_its_name() {
+        for name in ["In Review", "Code review", "Ready for QA", "Testing", "In test", "Awaiting approval", "UAT", "Resolved", "to-verify"] {
+            assert!(state_name_is_review(name), "{name}");
+        }
+        // Not by letters that merely appear inside another word.
+        for name in ["In Progress", "Doing", "Latest", "Preview build", "Contested", "Ready for dev", "Blocked", ""] {
+            assert!(!state_name_is_review(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn in_review_is_still_in_flight_and_reads_back_from_json() {
+        assert!(WorkItemStateCategory::Started.is_active() && WorkItemStateCategory::Review.is_active());
+        assert!(!WorkItemStateCategory::Unstarted.is_active() && !WorkItemStateCategory::Completed.is_active());
+        let json = serde_json::to_string(&WorkItemStateCategory::Review).unwrap();
+        assert_eq!(json, "\"Review\"");
+        assert_eq!(serde_json::from_str::<WorkItemStateCategory>(&json).unwrap(), WorkItemStateCategory::Review);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

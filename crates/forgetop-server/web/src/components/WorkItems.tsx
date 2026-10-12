@@ -64,7 +64,8 @@ export function WorkItems() {
       { label: "Title A–Z", cmp: (a, b) => a.work_item.title.localeCompare(b.work_item.title) },
     ],
     statuses: [
-      { label: "In progress", match: (r) => r.work_item.state_category === "Started" },
+      // In flight: being worked on, or past that and in review.
+      { label: "In progress", match: (r) => r.work_item.state_category === "Started" || r.work_item.state_category === "Review" },
       { label: "Blocked", match: (r) => r.work_item.state.toLowerCase() === "blocked" },
       { label: "Not started", match: (r) => ["Unstarted", "Backlog", "Triage"].includes(r.work_item.state_category) },
     ],
@@ -127,9 +128,10 @@ export function WorkItems() {
 function WiGroupSection({ group, open, onToggle }: { group: WiGroup; open: boolean; onToggle: () => void }) {
   const { parent, rows } = group;
   const blocked = rows.filter((r) => r.work_item.state.toLowerCase() === "blocked").length;
-  const inProgress = rows.filter(
-    (r) => r.work_item.state_category === "Started" && r.work_item.state.toLowerCase() !== "blocked",
-  ).length;
+  const unblockedIn = (category: string) =>
+    rows.filter((r) => r.work_item.state_category === category && r.work_item.state.toLowerCase() !== "blocked").length;
+  const inProgress = unblockedIn("Started");
+  const inReview = unblockedIn("Review");
   return (
     <div className="flex flex-col gap-2">
       <div
@@ -160,6 +162,11 @@ function WiGroupSection({ group, open, onToggle }: { group: WiGroup; open: boole
           {inProgress > 0 && (
             <span className="text-xs shrink-0" style={{ color: "var(--dim)" }}>
               {inProgress} in progress
+            </span>
+          )}
+          {inReview > 0 && (
+            <span className="text-xs shrink-0" style={{ color: "var(--cyan)" }}>
+              {inReview} in review
             </span>
           )}
           {blocked > 0 && (

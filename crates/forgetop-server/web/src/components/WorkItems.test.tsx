@@ -151,6 +151,8 @@ describe("work items grouped by parent", () => {
           wi("3", "C", { parent: q4, state: "blocked", category: "Started" }),
           wi("4", "D", { parent: q4, state: "Open", category: "Unstarted" }),
           wi("5", "E", { parent: ledger, state: "Open", category: "Unstarted" }),
+          // Past the doing: counted on its own, not as in progress.
+          wi("6", "F", { parent: q4, state: "In Review", category: "Review" }),
         ],
       },
     });
@@ -159,6 +161,7 @@ describe("work items grouped by parent", () => {
     await choose("parent");
     const q4Header = screen.getByRole("button", { name: /Q4 reliability/ });
     expect(within(q4Header).getByText("2 in progress")).toBeInTheDocument();
+    expect(within(q4Header).getByText("1 in review")).toBeInTheDocument();
     expect(within(q4Header).getByText("1 blocked")).toBeInTheDocument();
     const ledgerHeader = screen.getByRole("button", { name: /Ledger v2/ });
     expect(ledgerHeader).not.toHaveTextContent("in progress");

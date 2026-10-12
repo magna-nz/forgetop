@@ -115,9 +115,13 @@ pub fn map_pull_request(v: &Value, repo: Option<&str>) -> PullRequest {
 pub fn map_state(state: &str) -> WorkItemStateCategory {
     match state.to_ascii_lowercase().as_str() {
         "new" | "proposed" | "to do" => WorkItemStateCategory::Unstarted,
-        "active" | "committed" | "in progress" | "doing" | "resolved" => WorkItemStateCategory::Started,
+        "active" | "committed" | "in progress" | "doing" => WorkItemStateCategory::Started,
+        // Azure's own stage between the doing and done: the fix is in and awaits verification.
+        "resolved" => WorkItemStateCategory::Review,
         "closed" | "done" | "completed" => WorkItemStateCategory::Completed,
         "removed" => WorkItemStateCategory::Canceled,
+        // A process's own states ("In Review", "Ready for QA") are told by their names.
+        other if state_name_is_review(other) => WorkItemStateCategory::Review,
         _ => WorkItemStateCategory::Backlog,
     }
 }
@@ -2140,6 +2144,16 @@ mod tests {
         let asked = forge.requests();
         assert_eq!(asked.len(), 2, "one read per call, each for every distinct parent: {asked:?}");
         assert!(asked[1].contains("ids=100,200") && asked[1].contains("errorPolicy=omit"), "{}", asked[1]);
+    }
+
+    #[test]
+    fn resolved_and_review_named_states_are_in_review() {
+        assert_eq!(map_state("Active"), WorkItemStateCategory::Started);
+        assert_eq!(map_state("Resolved"), WorkItemStateCategory::Review);
+        assert_eq!(map_state("In Review"), WorkItemStateCategory::Review);
+        assert_eq!(map_state("Ready for QA"), WorkItemStateCategory::Review);
+        assert_eq!(map_state("Done"), WorkItemStateCategory::Completed);
+        assert_eq!(map_state("Design"), WorkItemStateCategory::Backlog);
     }
 
     #[test]

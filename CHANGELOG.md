@@ -24,6 +24,13 @@ Added
   name, and an opened work item names its parent. The dashboard has the same grouping under a
   "Group" control, with a link to each parent.
   ([#237](https://github.com/magna-nz/forgetop/pull/237))
+- **In review has its own colour.** A work item that is past the doing and waiting on someone
+  else — in review, in QA, awaiting verification — now shows in cyan rather than the blue of
+  in progress, in both the terminal UI and the dashboard, and a group's roll-up counts it on
+  its own ("1 in progress · 2 in review"). Linear tells them apart by the team's own workflow
+  order, so it works whatever the states are called; Azure DevOps by its Resolved stage; Jira
+  by the status name. GitHub and GitLab issues are only open or closed, so nothing changes
+  there. ([#237](https://github.com/magna-nz/forgetop/pull/237))
 
 Changed
 

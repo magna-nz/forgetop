@@ -575,6 +575,8 @@ pub struct WiHead {
     pub items: usize,
     /// Items in a started state, not counting the blocked ones.
     pub in_progress: usize,
+    /// Items past the doing and awaiting review, not counting the blocked ones.
+    pub in_review: usize,
     pub blocked: usize,
     /// Index into `App::wis` of the most recently updated item beneath — the one the preview
     /// pane shows, and whose age the header carries.
@@ -3753,14 +3755,15 @@ impl App {
                 Some(p) => (p.kind.clone(), p.title.clone()),
                 None => (String::new(), "No parent".to_string()),
             };
+            let unblocked_in = |category: WorkItemStateCategory| {
+                members.iter().filter(|&&i| self.wis[i].wi.state_category == category && !wi_is_blocked(&self.wis[i].wi)).count()
+            };
             let head = WiHead {
                 kind,
                 title,
                 items: members.len(),
-                in_progress: members
-                    .iter()
-                    .filter(|&&i| self.wis[i].wi.state_category == WorkItemStateCategory::Started && !wi_is_blocked(&self.wis[i].wi))
-                    .count(),
+                in_progress: unblocked_in(WorkItemStateCategory::Started),
+                in_review: unblocked_in(WorkItemStateCategory::Review),
                 blocked: members.iter().filter(|&&i| wi_is_blocked(&self.wis[i].wi)).count(),
                 latest: latest_idx,
                 updated: self.wis[latest_idx].wi.updated_at,
@@ -12381,8 +12384,9 @@ fn wi_state_rank(c: WorkItemStateCategory) -> u8 {
         WorkItemStateCategory::Backlog => 1,
         WorkItemStateCategory::Unstarted => 2,
         WorkItemStateCategory::Started => 3,
-        WorkItemStateCategory::Completed => 4,
-        WorkItemStateCategory::Canceled => 5,
+        WorkItemStateCategory::Review => 4,
+        WorkItemStateCategory::Completed => 5,
+        WorkItemStateCategory::Canceled => 6,
     }
 }
 
@@ -14819,7 +14823,11 @@ mod tests {
     /// A work item on connection `conn`, last updated `hours_ago`, under `parent` (kind, id,
     /// title) when it has one.
     fn grouped_wi(id: &str, conn: &str, parent: Option<(&str, &str, &str)>, state: &str, hours_ago: i64) -> WiRow {
-        let started = matches!(state, "In Progress" | "Blocked");
+        let category = match state {
+            "In Progress" | "Blocked" => WorkItemStateCategory::Started,
+            "In Review" => WorkItemStateCategory::Review,
+            _ => WorkItemStateCategory::Unstarted,
+        };
         WiRow {
             connection_id: conn.into(),
             connection: conn.into(),
@@ -14827,7 +14835,7 @@ mod tests {
                 id: id.into(),
                 title: format!("item {id}"),
                 state: state.into(),
-                state_category: if started { WorkItemStateCategory::Started } else { WorkItemStateCategory::Unstarted },
+                state_category: category,
                 updated_at: Some(Utc::now() - chrono::Duration::hours(hours_ago)),
                 parent: parent.map(|(kind, id, title)| WorkItemParent { kind: kind.into(), id: id.into(), title: title.into(), url: None }),
                 ..wi(None)
@@ -14913,6 +14921,26 @@ mod tests {
         assert_eq!(q4.connection, "gh");
         let loose = &heads[3];
         assert_eq!((loose.kind.as_str(), loose.connection.as_str(), loose.in_progress), ("", "", 1), "what is left spans connections");
+    }
+
+    #[test]
+    fn a_group_counts_in_review_apart_from_in_progress() {
+        let mut app = grouped_app();
+        let q4 = Some(("Milestone", "m1", "Q4 reliability"));
+        app.wis = vec![
+            grouped_wi("a", "gh", q4, "In Progress", 1),
+            grouped_wi("b", "gh", q4, "In Review", 2),
+            grouped_wi("c", "gh", q4, "In Review", 3),
+            grouped_wi("d", "gh", q4, "Blocked", 4),
+            grouped_wi("e", "gh", q4, "Todo", 5),
+        ];
+        let Some(WiLine::Head(h)) = app.wi_lines().into_iter().next() else { panic!("a header") };
+        assert_eq!((h.items, h.in_progress, h.in_review, h.blocked), (5, 1, 2, 1));
+
+        // Sorted by state, in review comes after in progress and before done.
+        let rank = |c| wi_state_rank(c);
+        assert!(rank(WorkItemStateCategory::Started) < rank(WorkItemStateCategory::Review));
+        assert!(rank(WorkItemStateCategory::Review) < rank(WorkItemStateCategory::Completed));
     }
 
     #[test]

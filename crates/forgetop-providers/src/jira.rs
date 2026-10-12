@@ -51,6 +51,15 @@ pub fn map_state_category(key: Option<&str>) -> WorkItemStateCategory {
     }
 }
 
+/// Jira sorts every status into one of three categories and gives no order among the
+/// in-progress ones, so which of them come after the doing is read from the status name.
+fn review_by_name(category: WorkItemStateCategory, name: Option<&str>) -> WorkItemStateCategory {
+    match category {
+        WorkItemStateCategory::Started if name.is_some_and(state_name_is_review) => WorkItemStateCategory::Review,
+        other => other,
+    }
+}
+
 /// Maps a Jira issue. `site` is the base site URL used to build the browse link.
 pub fn map_issue(v: &Value, site: &str) -> WorkItem {
     let fields = get_obj(v, "fields");
@@ -67,7 +76,7 @@ pub fn map_issue(v: &Value, site: &str) -> WorkItem {
         title: fields.and_then(|f| get_str(f, "summary")).unwrap_or_else(|| "(untitled)".into()),
         description: fields.and_then(|f| get_str(f, "description")),
         state: status.and_then(|s| get_str(s, "name")).unwrap_or_else(|| "Unknown".into()),
-        state_category: map_state_category(category.as_deref()),
+        state_category: review_by_name(map_state_category(category.as_deref()), status.and_then(|s| get_str(s, "name")).as_deref()),
         work_item_type: fields.and_then(|f| get_obj(f, "issuetype")).and_then(|t| get_str(t, "name")),
         assignee: fields.and_then(|f| get_obj(f, "assignee")).map(map_user),
         created_at: fields.and_then(|f| jira_date(f, "created")),
@@ -397,6 +406,20 @@ mod tests {
 
         let none: Value = serde_json::from_str(r#"{ "key": "OPS-3", "fields": { "summary": "s" } }"#).unwrap();
         assert!(map_issue(&none, "https://acme.atlassian.net").parent.is_none());
+    }
+
+    #[test]
+    fn an_in_progress_status_named_for_review_is_in_review() {
+        let status = |name: &str, key: &str| -> Value {
+            serde_json::from_str(&format!(r#"{{ "key": "A-1", "fields": {{ "summary": "s", "status": {{ "name": "{name}", "statusCategory": {{ "key": "{key}" }} }} }} }}"#)).unwrap()
+        };
+        let cat = |name: &str, key: &str| map_issue(&status(name, key), "https://acme.atlassian.net").state_category;
+        assert_eq!(cat("In Progress", "indeterminate"), WorkItemStateCategory::Started);
+        assert_eq!(cat("In Review", "indeterminate"), WorkItemStateCategory::Review);
+        assert_eq!(cat("Ready for QA", "indeterminate"), WorkItemStateCategory::Review);
+        // Only an in-progress status can be in review: the name never overrides Jira's category.
+        assert_eq!(cat("To review", "new"), WorkItemStateCategory::Unstarted);
+        assert_eq!(cat("Reviewed", "done"), WorkItemStateCategory::Completed);
     }
 
     #[test]

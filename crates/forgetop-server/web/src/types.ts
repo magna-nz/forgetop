@@ -9,6 +9,8 @@ export type WorkItemStateCategory =
   | "Backlog"
   | "Unstarted"
   | "Started"
+  /** Past the doing and awaiting review, QA or verification — still open and in flight. */
+  | "Review"
   | "Completed"
   | "Canceled";
 export type PipelineRunStatus = "Queued" | "Running" | "Waiting" | "Succeeded" | "PartiallySucceeded" | "Failed" | "Canceled" | "Skipped";

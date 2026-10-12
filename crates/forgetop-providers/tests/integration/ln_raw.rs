@@ -89,6 +89,28 @@ impl LnRaw {
         d["issueCreate"]["issue"]["id"].as_str().expect("issue id").to_string()
     }
 
+    /// The ids of `team`'s started workflow states, in the team's own order — the doing first,
+    /// whatever comes after it (review, QA…) next.
+    pub async fn started_states(&self, team: &str) -> Vec<String> {
+        let q = "query($t:ID!){ workflowStates(first: 50, filter: { type: { eq: \"started\" }, team: { id: { eq: $t } } }) { nodes { id position } } }";
+        let d = self.query(q, json!({ "t": team })).await;
+        let mut states: Vec<(f64, String)> = d["workflowStates"]["nodes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|n| Some((n["position"].as_f64()?, n["id"].as_str()?.to_string())))
+            .collect();
+        states.sort_by(|a, b| a.0.total_cmp(&b.0));
+        states.into_iter().map(|(_, id)| id).collect()
+    }
+
+    /// Creates an issue assigned to `assignee`, already in workflow state `state`; returns its id.
+    pub async fn create_issue_in_state(&self, team: &str, title: &str, assignee: &str, state: &str) -> String {
+        let m = "mutation($t:String!,$n:String!,$a:String!,$s:String!){ issueCreate(input:{teamId:$t,title:$n,assigneeId:$a,stateId:$s}){ issue { id } } }";
+        let d = self.query(m, json!({ "t": team, "n": title, "a": assignee, "s": state })).await;
+        d["issueCreate"]["issue"]["id"].as_str().expect("issue id").to_string()
+    }
+
     /// Best-effort: deletes a project, and its milestones with it.
     pub async fn delete_project(&self, id: &str) {
         let _ = self.try_query("mutation($id:String!){ projectDelete(id:$id){ success } }", json!({ "id": id })).await;

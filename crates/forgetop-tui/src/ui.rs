@@ -1510,6 +1510,9 @@ fn wi_state_color(theme: &Theme, state: &str, cat: WorkItemStateCategory) -> rat
     match cat {
         WorkItemStateCategory::Completed => theme.green,
         WorkItemStateCategory::Started => theme.blue,
+        // Past the doing and waiting on someone else: between the blue of doing and the green
+        // of done.
+        WorkItemStateCategory::Review => theme.cyan,
         _ => theme.dim,
     }
 }
@@ -1584,18 +1587,27 @@ fn render_wis(frame: &mut Frame, area: Rect, app: &mut App) {
 /// column that can never be switched off or shed.
 fn wi_head_cells(theme: &Theme, h: &WiHead) -> Vec<(String, Style)> {
     let dim = Style::default().fg(theme.dim);
-    // Both figures when both apply; red as soon as anything is blocked.
+    // Every figure that applies; coloured by the most pressing: red as soon as anything is
+    // blocked, else the blue of work under way, else the cyan of work only awaiting review.
     let mut parts = Vec::new();
     if h.in_progress > 0 {
         parts.push(format!("{} in progress", h.in_progress));
     }
+    if h.in_review > 0 {
+        parts.push(format!("{} in review", h.in_review));
+    }
     if h.blocked > 0 {
         parts.push(format!("{} blocked", h.blocked));
     }
-    let roll_up = match (parts.is_empty(), h.blocked > 0) {
-        (true, _) => ("○ not started".to_string(), dim),
-        (false, true) => (format!("● {}", parts.join(" · ")), Style::default().fg(theme.red)),
-        (false, false) => (format!("● {}", parts.join(" · ")), Style::default().fg(theme.blue)),
+    let color = match (h.blocked > 0, h.in_progress > 0) {
+        (true, _) => theme.red,
+        (false, true) => theme.blue,
+        (false, false) => theme.cyan,
+    };
+    let roll_up = if parts.is_empty() {
+        ("○ not started".to_string(), dim)
+    } else {
+        (format!("● {}", parts.join(" · ")), Style::default().fg(color))
     };
     let arrow = if h.expanded { "▾" } else { "▸" };
     vec![
@@ -6975,6 +6987,39 @@ mod tests {
         let loose = render_to_string(&mut app, 160, 24);
         assert!(loose.contains("Loose end") && !loose.contains("No parent") && !loose.contains("by parent"), "{loose}");
         assert!(!base_footer_keys(&app).contains(&("z/Z", "fold")));
+    }
+
+    #[test]
+    fn in_review_has_its_own_colour_between_doing_and_done() {
+        let theme = Theme::by_name("slate");
+        let color = |state: &str, cat| wi_state_color(&theme, state, cat);
+        assert_eq!(color("In Progress", WorkItemStateCategory::Started), theme.blue);
+        assert_eq!(color("In Review", WorkItemStateCategory::Review), theme.cyan);
+        assert_eq!(color("Done", WorkItemStateCategory::Completed), theme.green);
+        assert_ne!(theme.cyan, theme.blue, "the two must be told apart at a glance");
+        // Blocked still wins, whatever the stage.
+        assert_eq!(color("Blocked", WorkItemStateCategory::Review), theme.red);
+
+        // A group header counts them apart, and takes the review colour only when nothing
+        // beneath is still being worked on.
+        let head = |in_progress, in_review, blocked| WiHead {
+            key: "k".into(),
+            kind: "Milestone".into(),
+            title: "M".into(),
+            items: 5,
+            in_progress,
+            in_review,
+            blocked,
+            latest: 0,
+            updated: None,
+            expanded: false,
+            provider: ProviderType::Linear,
+            connection: "Linear".into(),
+        };
+        let roll = |h: &WiHead| wi_head_cells(&theme, h)[0].clone();
+        assert_eq!(roll(&head(1, 2, 0)), ("● 1 in progress · 2 in review".to_string(), Style::default().fg(theme.blue)));
+        assert_eq!(roll(&head(0, 2, 0)), ("● 2 in review".to_string(), Style::default().fg(theme.cyan)));
+        assert_eq!(roll(&head(1, 1, 1)).1, Style::default().fg(theme.red));
     }
 
     #[test]

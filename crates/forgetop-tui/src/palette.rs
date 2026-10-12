@@ -313,7 +313,7 @@ fn wi_tone(row: &WiRow) -> Tone {
     }
     match row.wi.state_category {
         WorkItemStateCategory::Completed => Tone::Good,
-        WorkItemStateCategory::Started => Tone::Active,
+        WorkItemStateCategory::Started | WorkItemStateCategory::Review => Tone::Active,
         _ => Tone::Neutral,
     }
 }

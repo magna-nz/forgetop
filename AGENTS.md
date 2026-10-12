@@ -120,7 +120,13 @@ whole workspace. So a repository is a **per-call address**, never connection ide
   word for it: a GitHub/GitLab milestone (GitLab falls back to the epic), a Jira `parent`, a
   Linear milestone (else project), an Azure `System.Parent` named by one extra batch read. Both
   frontends group by `(connection, kind, id)` as a view over the rows already fetched — the TUI
-  via `App::wi_lines` (mirroring `pipe_lines`), the dashboard in `WorkItems.tsx`.
+  via `App::wi_lines` (mirroring `pipe_lines`), the dashboard in `WorkItems.tsx`. Grouping is
+  the default, and a list in which nothing has a parent stays flat.
+- **`WorkItemStateCategory::Review` is "past the doing, waiting on someone else".** It is still
+  in flight: code that means "active" asks `is_active()`, not `== Started`. A provider sets it
+  from what the forge knows first — Linear's workflow-state `position` (any started state after
+  the team's first), Azure's `Resolved` — and only falls back to `state_name_is_review` on the
+  state's name where the forge gives no order (Jira).
 - ⚠️ **The demo provider cannot catch an addressing bug** — it never resolves a repository, so
   `--demo` passes whether or not addressing is right. Prove addressing with fixtures or the live
   suite (`tests/integration/scope.rs`).
