@@ -291,6 +291,9 @@ export function wiStateColor(state: string, cat: WorkItemStateCategory): string 
       return V("green");
     case "Started":
       return V("blue");
+    // Past the doing and waiting on someone else: between the blue of doing and the green of done.
+    case "Review":
+      return V("cyan");
     default:
       return V("dim");
   }

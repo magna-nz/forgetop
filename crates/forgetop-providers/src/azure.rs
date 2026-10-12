@@ -115,9 +115,13 @@ pub fn map_pull_request(v: &Value, repo: Option<&str>) -> PullRequest {
 pub fn map_state(state: &str) -> WorkItemStateCategory {
     match state.to_ascii_lowercase().as_str() {
         "new" | "proposed" | "to do" => WorkItemStateCategory::Unstarted,
-        "active" | "committed" | "in progress" | "doing" | "resolved" => WorkItemStateCategory::Started,
+        "active" | "committed" | "in progress" | "doing" => WorkItemStateCategory::Started,
+        // Azure's own stage between the doing and done: the fix is in and awaits verification.
+        "resolved" => WorkItemStateCategory::Review,
         "closed" | "done" | "completed" => WorkItemStateCategory::Completed,
         "removed" => WorkItemStateCategory::Canceled,
+        // A process's own states ("In Review", "Ready for QA") are told by their names.
+        other if state_name_is_review(other) => WorkItemStateCategory::Review,
         _ => WorkItemStateCategory::Backlog,
     }
 }
@@ -127,7 +131,8 @@ fn field_str(fields: &Value, name: &str) -> Option<String> {
 }
 
 /// `project` is the Team Project the item belongs to — Azure work items are project-addressed,
-/// not repo-addressed, so a bare project name is the correct address here.
+/// not repo-addressed, so a bare project name is the correct address here. The item's own
+/// `System.TeamProject` wins, which is all an organization-wide listing has to go on.
 pub fn map_work_item(v: &Value, project: Option<&str>) -> WorkItem {
     let fields = get_obj(v, "fields").unwrap_or(v);
     let state = field_str(fields, "System.State").unwrap_or_else(|| "New".into());
@@ -147,7 +152,31 @@ pub fn map_work_item(v: &Value, project: Option<&str>) -> WorkItem {
         created_at: get_date(fields, "System.CreatedDate"),
         updated_at: get_date(fields, "System.ChangedDate"),
         url: get_str(v, "url"),
+        // The item carries only its parent's id; `AzureClient::name_parents` fills in the rest.
+        // Until then the id stands in for the title, which still groups siblings together.
+        parent: parent_id(v, fields).map(|id| WorkItemParent {
+            kind: "Parent".into(),
+            id: id.to_string(),
+            title: format!("#{id}"),
+            url: None,
+        }),
     }
+}
+
+/// Asks a work-item read for the item's links as well as its fields: the parent is one of them.
+const WITH_LINKS: &str = "$expand=relations";
+
+/// The id of a work item's parent.
+///
+/// Read from the hierarchy link itself, which is there the moment the link is made. The
+/// `System.Parent` field says the same thing but a live read of a freshly linked item came back
+/// without it, so it is only the fallback for a read that carries no links.
+fn parent_id(v: &Value, fields: &Value) -> Option<i64> {
+    let linked = get_arr(v, "relations")
+        .iter()
+        .filter(|r| get_str(r, "rel").as_deref() == Some("System.LinkTypes.Hierarchy-Reverse"))
+        .find_map(|r| get_str(r, "url")?.rsplit('/').next()?.parse::<i64>().ok());
+    linked.or_else(|| fields.get("System.Parent").and_then(Value::as_i64))
 }
 
 /// Azure pipelines are project-addressed too, so `project` is a bare Team Project name.
@@ -447,6 +476,18 @@ fn split_project_repo(entry: &str) -> (String, String) {
     }
 }
 
+const WIQL_OPEN_ONLY: &str = "[System.State] NOT IN ('Closed', 'Done', 'Removed')";
+
+/// The WIQL for what is assigned to the signed-in user across the organization. It names no
+/// project — `@project` only resolves on a project-scoped request, and this one has none.
+fn assigned_wiql(include_completed: bool) -> String {
+    let mut conditions = vec!["[System.AssignedTo] = @me"];
+    if !include_completed {
+        conditions.push(WIQL_OPEN_ONLY);
+    }
+    format!("SELECT [System.Id] FROM WorkItems WHERE {} ORDER BY [System.ChangedDate] DESC", conditions.join(" AND "))
+}
+
 /// The Team Project half of a scope entry. Work items and pipelines are addressed by this.
 fn project_part(entry: &str) -> String {
     split_project_repo(entry).0
@@ -538,6 +579,39 @@ impl AzureClient {
 
     fn resolve(&self, item: &ItemRef) -> Result<String> {
         scope::resolve_repo(item, &self.scope)
+    }
+
+    /// Names the parents of `rows`. A work item carries only its parent's id, so the titles and
+    /// types (Epic, Feature, …) take one batch read for all of them. Best-effort: when the read
+    /// fails the "#id" placeholders stay, and the rows still group correctly.
+    async fn name_parents(&self, rows: &mut [WorkItem]) {
+        let mut ids: Vec<&str> = Vec::new();
+        for id in rows.iter().filter_map(|w| w.parent.as_ref()).map(|p| p.id.as_str()) {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        if ids.is_empty() {
+            return;
+        }
+        // `errorPolicy=omit`: a parent the token cannot read must not fail the others.
+        let url = format!(
+            "{}/_apis/wit/workitems?ids={}&fields=System.Title,System.WorkItemType&errorPolicy=omit&{API}",
+            self.base,
+            ids.join(",")
+        );
+        let Ok(v) = self.get_json(&url).await else { return };
+        let named: std::collections::HashMap<String, &Value> =
+            get_arr(&v, "value").iter().filter_map(|p| Some((get_i64(p, "id")?.to_string(), get_obj(p, "fields")?))).collect();
+        for parent in rows.iter_mut().filter_map(|w| w.parent.as_mut()) {
+            let Some(fields) = named.get(&parent.id) else { continue };
+            if let Some(title) = field_str(fields, "System.Title") {
+                parent.title = title;
+            }
+            if let Some(kind) = field_str(fields, "System.WorkItemType") {
+                parent.kind = kind;
+            }
+        }
     }
 
     /// The distinct Team Projects the scope covers, in first-seen order.
@@ -1210,21 +1284,36 @@ impl PullRequestSource for AzurePr {
 #[async_trait]
 impl WorkItemSource for AzureWi {
     async fn list(&self, query: &WorkItemQuery) -> Result<Vec<WorkItem>> {
-        // Work items are project-addressed, so this fans out over the scope's *distinct projects*
-        // — not its repositories. Two repositories in one project must not query it twice.
+        let top = query.limit.unwrap_or(50);
+        // Work items are not related to repositories: what is assigned to you is asked of the
+        // organization in one query, whatever the repository scope holds — including nothing.
+        // No project segment in the path and no `@project` clause is what makes it org-wide.
+        if query.mine_only {
+            let wiql = assigned_wiql(query.include_completed);
+            let ids_v = self.0.post_json_read(&format!("{}/_apis/wit/wiql?$top={top}&{API}", self.0.base), json!({ "query": wiql })).await?;
+            let ids: Vec<String> = get_arr(&ids_v, "workItems").iter().filter_map(|w| get_i64(w, "id")).map(|n| n.to_string()).collect();
+            if ids.is_empty() {
+                return Ok(vec![]);
+            }
+            let v = self.0.get_json(&format!("{}/_apis/wit/workitems?ids={}&{WITH_LINKS}&{API}", self.0.base, ids.join(","))).await?;
+            // The batch read answers in id order, not the query's.
+            let mut rows: Vec<WorkItem> = get_arr(&v, "value").iter().map(|w| map_work_item(w, None)).collect();
+            rows.sort_by_key(|wi| std::cmp::Reverse(wi.updated_at));
+            self.0.name_parents(&mut rows).await;
+            return Ok(rows);
+        }
+        // Every item, assigned or not, is a project's question, so this fans out over the scope's
+        // *distinct projects* — not its repositories. Two repositories in one project must not
+        // query it twice.
         let projects = self.0.projects();
         if projects.is_empty() {
             return Ok(Vec::new());
         }
-        let mut conditions = vec!["[System.TeamProject] = @project".to_string()];
-        if query.mine_only {
-            conditions.push("[System.AssignedTo] = @me".into());
-        }
+        let mut conditions = vec!["[System.TeamProject] = @project"];
         if !query.include_completed {
-            conditions.push("[System.State] NOT IN ('Closed', 'Done', 'Removed')".into());
+            conditions.push(WIQL_OPEN_ONLY);
         }
         let wiql = format!("SELECT [System.Id] FROM WorkItems WHERE {} ORDER BY [System.ChangedDate] DESC", conditions.join(" AND "));
-        let top = query.limit.unwrap_or(50);
         let rows = fan_out(&projects, "azure.work_items.list", |project| {
             let wiql = wiql.clone();
             async move {
@@ -1234,17 +1323,21 @@ impl WorkItemSource for AzureWi {
                 if ids.is_empty() {
                     return Ok(vec![]);
                 }
-                let v = self.0.get_json(&format!("{}/_apis/wit/workitems?ids={}&{API}", self.0.base, ids.join(","))).await?;
+                let v = self.0.get_json(&format!("{}/_apis/wit/workitems?ids={}&{WITH_LINKS}&{API}", self.0.base, ids.join(","))).await?;
                 Ok(get_arr(&v, "value").iter().map(|w| map_work_item(w, Some(&project))).collect())
             }
         })
         .await;
-        Ok(sort_and_cap(rows, projects.len(), query.limit, |wi| wi.updated_at))
+        let mut rows = sort_and_cap(rows, projects.len(), query.limit, |wi| wi.updated_at);
+        self.0.name_parents(&mut rows).await;
+        Ok(rows)
     }
     async fn get(&self, item: &ItemRef) -> Result<WorkItem> {
         // Work items are addressable organization-wide by id, so no project segment is needed.
-        let v = self.0.get_json(&format!("{}/_apis/wit/workitems/{}?{API}", self.0.base, item.id)).await?;
-        Ok(map_work_item(&v, item.repo.as_deref()))
+        let v = self.0.get_json(&format!("{}/_apis/wit/workitems/{}?{WITH_LINKS}&{API}", self.0.base, item.id)).await?;
+        let mut wi = map_work_item(&v, item.repo.as_deref());
+        self.0.name_parents(std::slice::from_mut(&mut wi)).await;
+        Ok(wi)
     }
     async fn threads(&self, _item: &ItemRef) -> Result<Vec<CommentThread>> {
         Ok(vec![])
@@ -1644,10 +1737,11 @@ mod tests {
     }
 
     #[test]
-    fn work_items_and_pipelines_fan_out_over_distinct_projects_not_repositories() {
-        // Two repositories in one Team Project. Work items and pipelines are project-addressed,
-        // so querying per repository would hit Payments twice and return every item and every
-        // pipeline definition twice. The distinct-project list is what prevents that.
+    fn project_addressed_calls_fan_out_over_distinct_projects_not_repositories() {
+        // Two repositories in one Team Project. Pipelines are project-addressed, so querying per
+        // repository would hit Payments twice and return every pipeline definition twice. The
+        // distinct-project list is what prevents that. (Assigned work items don't fan out at
+        // all — they are asked of the organization.)
         let client = client_with_scope(&["Payments/pay-api", "Payments/pay-web", "Ledger/ledger"]);
         assert_eq!(client.projects(), vec!["Payments".to_string(), "Ledger".to_string()]);
     }
@@ -2023,6 +2117,130 @@ mod tests {
             people: Default::default(),
         });
         (forge, AzurePr(client))
+    }
+
+    #[tokio::test]
+    async fn parents_are_named_in_one_batch_read_and_a_failed_read_keeps_the_grouping() {
+        let forge = crate::test_http::FakeForge::start();
+        let client = AzureClient {
+            http: reqwest::Client::new(),
+            base: forge.base().to_string(),
+            scope: vec![],
+            self_id: tokio::sync::Mutex::new(None),
+            people: Default::default(),
+        };
+        let item = |id: i64, parent: Option<i64>| {
+            let mut fields = serde_json::json!({ "System.Title": "t", "System.State": "Active" });
+            if let Some(p) = parent {
+                fields["System.Parent"] = p.into();
+            }
+            map_work_item(&serde_json::json!({ "id": id, "fields": fields }), None)
+        };
+        let mut rows = vec![item(1, Some(100)), item(2, Some(100)), item(3, Some(200)), item(4, None)];
+        // Straight from the mapper the id stands in: siblings already share a parent.
+        assert_eq!(rows[0].parent, rows[1].parent);
+        assert_eq!(rows[0].parent.as_ref().map(|p| p.title.as_str()), Some("#100"));
+
+        // The forge is unreachable for parents: nothing is lost, the placeholders stay.
+        client.name_parents(&mut rows).await;
+        assert_eq!(rows[2].parent.as_ref().map(|p| (p.kind.as_str(), p.title.as_str())), Some(("Parent", "#200")));
+
+        // It answers, omitting 200 (a parent the token cannot read comes back as null).
+        forge.route(
+            "/_apis/wit/workitems",
+            serde_json::json!({ "value": [
+                { "id": 100, "fields": { "System.Title": "Ledger v2", "System.WorkItemType": "Epic" } }, null ] }),
+        );
+        client.name_parents(&mut rows).await;
+        let named = |i: usize| rows[i].parent.as_ref().map(|p| (p.kind.as_str(), p.id.as_str(), p.title.as_str()));
+        assert_eq!(named(0), Some(("Epic", "100", "Ledger v2")));
+        assert_eq!(named(1), named(0), "siblings are named alike");
+        assert_eq!(named(2), Some(("Parent", "200", "#200")), "the unreadable one keeps its placeholder");
+        assert_eq!(named(3), None);
+        let asked = forge.requests();
+        assert_eq!(asked.len(), 2, "one read per call, each for every distinct parent: {asked:?}");
+        assert!(asked[1].contains("ids=100,200") && asked[1].contains("errorPolicy=omit"), "{}", asked[1]);
+    }
+
+    #[test]
+    fn the_parent_is_read_from_the_hierarchy_link_and_only_then_from_the_field() {
+        let link = |rel: &str, id: i64| serde_json::json!({ "rel": rel, "url": format!("https://dev.azure.com/contoso/_apis/wit/workItems/{id}") });
+        let item = |relations: Vec<Value>, field: Option<i64>| {
+            let mut fields = serde_json::json!({ "System.Title": "t", "System.State": "Active" });
+            if let Some(p) = field {
+                fields["System.Parent"] = p.into();
+            }
+            map_work_item(&serde_json::json!({ "id": 1, "fields": fields, "relations": relations }), None).parent.map(|p| p.id)
+        };
+        // The link alone is enough — a live read of a freshly linked item had no field.
+        assert_eq!(item(vec![link("System.LinkTypes.Hierarchy-Reverse", 550)], None).as_deref(), Some("550"));
+        // A child link, a related link and an attachment are not a parent.
+        let others = vec![link("System.LinkTypes.Hierarchy-Forward", 7), link("System.LinkTypes.Related", 8), link("AttachedFile", 9)];
+        assert_eq!(item(others.clone(), None), None);
+        // The link wins over the field; the field stands in for a read that carries no links.
+        assert_eq!(item(vec![link("System.LinkTypes.Hierarchy-Reverse", 550)], Some(1)).as_deref(), Some("550"));
+        assert_eq!(item(others, Some(42)).as_deref(), Some("42"));
+        assert_eq!(item(vec![], None), None);
+    }
+
+    #[test]
+    fn resolved_and_review_named_states_are_in_review() {
+        assert_eq!(map_state("Active"), WorkItemStateCategory::Started);
+        assert_eq!(map_state("Resolved"), WorkItemStateCategory::Review);
+        assert_eq!(map_state("In Review"), WorkItemStateCategory::Review);
+        assert_eq!(map_state("Ready for QA"), WorkItemStateCategory::Review);
+        assert_eq!(map_state("Done"), WorkItemStateCategory::Completed);
+        assert_eq!(map_state("Design"), WorkItemStateCategory::Backlog);
+    }
+
+    #[test]
+    fn the_assigned_query_names_the_user_and_no_project() {
+        let open = assigned_wiql(false);
+        assert!(open.contains("[System.AssignedTo] = @me"), "{open}");
+        assert!(!open.contains("@project") && !open.contains("TeamProject"), "organization-wide: {open}");
+        assert!(open.contains("NOT IN ('Closed', 'Done', 'Removed')"), "{open}");
+        assert!(open.ends_with("ORDER BY [System.ChangedDate] DESC"), "{open}");
+        assert!(!assigned_wiql(true).contains("NOT IN"), "completed items are kept when asked for");
+    }
+
+    #[tokio::test]
+    async fn assigned_work_items_are_asked_of_the_organization_not_of_the_repository_scope() {
+        // Work items are not related to repositories: nothing is chosen here, and what is
+        // assigned to you still shows.
+        let forge = crate::test_http::FakeForge::start();
+        forge.route("/_apis/wit/wiql", serde_json::json!({ "workItems": [ { "id": 55 }, { "id": 9 } ] }));
+        // The batch read answers in id order, whatever the query asked for.
+        forge.route(
+            "/_apis/wit/workitems",
+            serde_json::json!({ "value": [
+                { "id": 9, "fields": { "System.Title": "older", "System.State": "Active", "System.TeamProject": "Ledger",
+                                       "System.ChangedDate": "2026-09-01T00:00:00Z" } },
+                { "id": 55, "fields": { "System.Title": "newer", "System.State": "Active", "System.TeamProject": "Payments",
+                                        "System.ChangedDate": "2026-09-02T00:00:00Z", "System.Parent": 100 } } ] }),
+        );
+        let wi = AzureWi(Arc::new(AzureClient {
+            http: reqwest::Client::new(),
+            base: forge.base().to_string(),
+            scope: vec![],
+            self_id: tokio::sync::Mutex::new(None),
+            people: Default::default(),
+        }));
+
+        let rows = wi.list(&WorkItemQuery { mine_only: true, include_completed: false, limit: Some(50) }).await.unwrap();
+        assert_eq!(
+            rows.iter().map(|w| (w.repository.as_deref(), w.id.as_str())).collect::<Vec<_>>(),
+            vec![(Some("Payments"), "55"), (Some("Ledger"), "9")],
+            "newest first, each naming its own Team Project"
+        );
+        let asked = forge.requests();
+        assert_eq!(asked.len(), 3, "one query, one batch read, one read naming the parents: {asked:?}");
+        assert!(asked[0].starts_with("POST /_apis/wit/wiql?$top=50"), "organization-wide, no project segment: {}", asked[0]);
+        assert!(asked[1].starts_with("GET /_apis/wit/workitems?ids=55,9&$expand=relations"), "the links come with it: {}", asked[1]);
+        // The listing itself goes on to name its parents; an answer that names none (this fake
+        // returns the items again) leaves the placeholder rather than failing the list.
+        assert!(asked[2].starts_with("GET /_apis/wit/workitems?ids=100&fields=System.Title,System.WorkItemType"), "{}", asked[2]);
+        assert_eq!(rows[0].parent.as_ref().map(|p| p.title.as_str()), Some("#100"));
+        assert!(rows[1].parent.is_none());
     }
 
     fn pr_query(filter: PullRequestFilter, include_completed: bool) -> PullRequestQuery {

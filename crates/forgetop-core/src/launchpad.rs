@@ -15,7 +15,7 @@ use chrono::{DateTime, Utc};
 
 use crate::domain::{
     CheckStatus, MergeableState, PipelineRun, PipelineRunStatus, ProviderType, PullRequest, PullRequestStatus,
-    ReviewVote, User, WorkItem, WorkItemStateCategory,
+    ReviewVote, User, WorkItem,
 };
 
 /// The action bucket an item lands in. [`Bucket::ORDER`] is the display/urgency order — the
@@ -323,6 +323,15 @@ pub enum EntryKind {
 }
 
 impl EntryKind {
+    /// A stable machine-readable tag for the kind — part of a saved dismissal's key.
+    pub fn tag(&self) -> &'static str {
+        match self {
+            EntryKind::Pr => "pr",
+            EntryKind::Wi => "wi",
+            EntryKind::Pipe => "pipe",
+        }
+    }
+
     /// Short type badge shown on each row.
     pub fn label(&self) -> &'static str {
         match self {
@@ -386,10 +395,35 @@ impl Entry {
         }
     }
 
-    /// Stable identity of the underlying item, used to dismiss it from the Launchpad once you've
-    /// acted on it (e.g. reviewed the PR) even before the next refetch.
-    pub fn key(connection_id: &str, item_id: &str) -> String {
-        format!("{connection_id}:{item_id}")
+    /// The repository (or project) the underlying item lives in, when it names one.
+    pub fn repository(&self) -> Option<&str> {
+        match &self.item {
+            EntryItem::Pr(pr) => pr.repository.as_deref(),
+            EntryItem::Wi(wi) => wi.repository.as_deref(),
+            EntryItem::Pipe { run, .. } => run.repository.as_deref(),
+        }
+    }
+
+    /// Stable identity of an item, used to dismiss it from the Launchpad once you've acted on it
+    /// (e.g. reviewed the PR) even before the next refetch.
+    ///
+    /// The kind and the repository are part of it: a connection is an account, so `#12` names
+    /// more than one item on it — an issue in each of two repositories, or an issue and a pull
+    /// request — and a key without them would dismiss them all.
+    pub fn key(connection_id: &str, kind: EntryKind, repo: Option<&str>, item_id: &str) -> String {
+        format!("{connection_id}:{}:{}:{item_id}", kind.tag(), repo.unwrap_or(""))
+    }
+
+    /// This entry's [`Entry::key`].
+    pub fn dismiss_key(&self) -> String {
+        Self::key(&self.connection_id, self.kind(), self.repository(), self.item_id())
+    }
+
+    /// The key a dismissal was saved under before the kind and repository joined it. Saved
+    /// dismissals in this spelling are still honoured, and hide what they always hid — every
+    /// item with that id on the connection — so nothing a user dismissed comes back.
+    pub fn legacy_key(&self) -> String {
+        format!("{}:{}", self.connection_id, self.item_id())
     }
 }
 
@@ -451,11 +485,12 @@ pub struct Launchpad {
     pub overflow: Overflow,
 }
 
-/// In-progress work items sort before the rest of "Assigned to you" — `Started` is the
-/// provider-neutral in-progress category, so this is correct for every provider.
+/// In-flight work items sort before the rest of "Assigned to you" — being worked on, or past
+/// that and in review. Both are provider-neutral categories, so this is correct for every
+/// provider.
 fn wi_in_progress_rank(e: &Entry) -> u8 {
     match &e.item {
-        EntryItem::Wi(wi) if wi.state_category == WorkItemStateCategory::Started => 0,
+        EntryItem::Wi(wi) if wi.state_category.is_active() => 0,
         _ => 1,
     }
 }
@@ -595,6 +630,23 @@ mod tests {
         User { id: id.into(), display_name: id.into(), handle: None, avatar_url: None }
     }
 
+    #[test]
+    fn a_dismissal_key_tells_apart_items_that_share_an_id() {
+        // A connection is an account: `#12` is an issue in each of two repositories, and a pull
+        // request in one of them.
+        let keys = [
+            Entry::key("c", EntryKind::Wi, Some("acme/pay"), "12"),
+            Entry::key("c", EntryKind::Wi, Some("acme/ledger"), "12"),
+            Entry::key("c", EntryKind::Pr, Some("acme/pay"), "12"),
+            Entry::key("c", EntryKind::Wi, None, "12"),
+            Entry::key("other", EntryKind::Wi, Some("acme/pay"), "12"),
+        ];
+        let distinct: std::collections::HashSet<_> = keys.iter().collect();
+        assert_eq!(distinct.len(), keys.len(), "{keys:?}");
+        // And none of them is the spelling an older dismissal was saved under.
+        assert!(!keys.contains(&"c:12".to_string()));
+    }
+
     fn authored(draft: bool, votes: &[ReviewVote], checks: CheckStatus, mergeable: MergeableState) -> PullRequest {
         PullRequest {
             repository: None,
@@ -671,6 +723,7 @@ mod tests {
             created_at: None,
             updated_at: Some(Utc::now() - chrono::Duration::hours(updated_h)),
             url: None,
+            parent: None,
         };
         WiInput { connection_id: "c".into(), connection: "GH".into(), provider: ProviderType::GitHub, wi }
     }

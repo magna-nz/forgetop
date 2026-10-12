@@ -124,6 +124,35 @@ async fn azure_pull_request_lifecycle() {
     assert!(merged.is_some(), "the PR reads back as merged");
 }
 
+/// A real work item under a real Epic comes back naming it as its parent. The item itself only
+/// carries the parent's id, so this is what proves the batch read that names parents — its URL,
+/// its field list — against the real service, from a single read and from the list.
+#[tokio::test]
+async fn azure_work_item_names_its_epic_as_its_parent() {
+    let az = skip_if_none!(harness::azure(), "azure");
+    let raw = AzRaw::from_env().expect("azure raw");
+    let prefix = harness::run_prefix();
+
+    let epic_title = format!("{prefix} epic");
+    let (epic, child) = raw.create_epic_with_child(&epic_title, &format!("{prefix} epic task")).await;
+    let id = child.to_string();
+
+    let wi = az.conn.work_items().expect("azure work items");
+    let got = wi.get(&ItemRef::new(&id)).await;
+    // Listed broadly, like the lifecycle test: robust across identity quirks.
+    let listed = wi.list(&WorkItemQuery { mine_only: false, include_completed: true, limit: Some(100) }).await;
+
+    // Torn down before anything is asserted, so a failure leaks no fixture. Child first.
+    raw.delete_work_item(child).await;
+    raw.delete_work_item(epic).await;
+
+    let expected = WorkItemParent { kind: "Epic".into(), id: epic.to_string(), title: epic_title, url: None };
+    assert_eq!(got.expect("get").parent, Some(expected.clone()), "from a single read");
+    let listed = listed.expect("list");
+    let row = listed.iter().find(|w| w.id == id).expect("the created work item appears in the list");
+    assert_eq!(row.parent, Some(expected), "from the list");
+}
+
 #[tokio::test]
 async fn azure_work_item_lifecycle() {
     let az = skip_if_none!(harness::azure(), "azure");

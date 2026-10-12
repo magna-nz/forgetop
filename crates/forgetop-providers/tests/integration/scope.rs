@@ -6,7 +6,7 @@
 //! behaviour is proved against a real API.
 
 use forgetop_core::domain::ProviderType;
-use forgetop_core::provider::{PullRequestQuery, RepositoryPage};
+use forgetop_core::provider::{PullRequestQuery, RepositoryPage, WorkItemQuery};
 
 use crate::harness;
 
@@ -182,4 +182,38 @@ async fn an_empty_scope_fetches_nothing_without_erroring() {
         .await
         .expect("an empty scope is not an error");
     assert!(rows.is_empty());
+}
+
+/// Work items are not related to repositories: with nothing chosen at all, what is assigned to
+/// you is still asked of the account — one call that must be accepted by the real API — and
+/// every row that comes back names where it lives, since that is all that addresses it.
+async fn assigned_work_items_ignore_an_empty_scope(provider: ProviderType, name: &str, detail: &str) {
+    let Some(conn) = harness::scoped(provider, vec![]) else {
+        harness::skip_absent(name, detail);
+        return;
+    };
+    let rows = conn
+        .work_items()
+        .expect("the provider has work items")
+        .list(&WorkItemQuery { mine_only: true, include_completed: false, limit: Some(50) })
+        .await
+        .expect("the account-wide assigned query is accepted with an empty scope");
+    for wi in &rows {
+        assert!(wi.repository.as_deref().is_some_and(|r| !r.is_empty()), "'{}' names no repository to address it by", wi.title);
+    }
+}
+
+#[tokio::test]
+async fn github_assigned_issues_ignore_an_empty_scope() {
+    assigned_work_items_ignore_an_empty_scope(ProviderType::GitHub, "github", "no FORGETOP_IT_GITHUB_* credentials").await;
+}
+
+#[tokio::test]
+async fn gitlab_assigned_issues_ignore_an_empty_scope() {
+    assigned_work_items_ignore_an_empty_scope(ProviderType::GitLab, "gitlab", "no FORGETOP_IT_GITLAB_* credentials").await;
+}
+
+#[tokio::test]
+async fn azure_assigned_work_items_ignore_an_empty_scope() {
+    assigned_work_items_ignore_an_empty_scope(ProviderType::AzureDevOps, "azure", "no FORGETOP_IT_AZURE_* credentials").await;
 }

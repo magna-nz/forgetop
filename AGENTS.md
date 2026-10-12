@@ -106,8 +106,28 @@ whole workspace. So a repository is a **per-call address**, never connection ide
 - **List calls fan out** over the scope (`providers::scope::fan_out`, bounded concurrency), and
   sort + cap **once across the scope** (`sort_and_cap`) — never per repository.
 - **Jira and Linear are out of scope permanently** — project- and team-addressed, so a repository
-  scope has nothing to govern. **Azure work items and pipelines are project-addressed**: fan them
-  out over the scope's *distinct projects*, not its repositories.
+  scope has nothing to govern. **Azure pipelines are project-addressed**: fan them out over the
+  scope's *distinct projects*, not its repositories.
+- **Work items are not related to repositories.** The list every frontend shows — what is assigned
+  to you — is one account-wide call per connection (GitHub `/issues?filter=assigned`, GitLab
+  `/issues?scope=assigned_to_me`, Azure an organization-level WIQL), whatever the scope holds,
+  including nothing. Neither frontend offers a repository control on Work Items. A row still
+  carries the repository or project it lives in, read from the response, because its `ItemRef`
+  is addressed by it — that is addressing, not scope. Only the unused `mine_only: false` query
+  still fans out over the scope.
+- **A work item's `parent` is for grouping, never for fetching.** `WorkItem.parent`
+  (`WorkItemParent { kind, id, title, url }`) is what the item sits under, in the forge's own
+  word for it: a GitHub/GitLab milestone (GitLab falls back to the epic), a Jira `parent`, a
+  Linear milestone (else project), an Azure hierarchy link (read with `$expand=relations`;
+  `System.Parent` is only the fallback) named by one extra batch read. Both
+  frontends group by `(connection, kind, id)` as a view over the rows already fetched — the TUI
+  via `App::wi_lines` (mirroring `pipe_lines`), the dashboard in `WorkItems.tsx`. Grouping is
+  the default, and a list in which nothing has a parent stays flat.
+- **`WorkItemStateCategory::Review` is "past the doing, waiting on someone else".** It is still
+  in flight: code that means "active" asks `is_active()`, not `== Started`. A provider sets it
+  from what the forge knows first — Linear's workflow-state `position` (any started state after
+  the team's first), Azure's `Resolved` — and only falls back to `state_name_is_review` on the
+  state's name where the forge gives no order (Jira).
 - ⚠️ **The demo provider cannot catch an addressing bug** — it never resolves a repository, so
   `--demo` passes whether or not addressing is right. Prove addressing with fixtures or the live
   suite (`tests/integration/scope.rs`).

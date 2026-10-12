@@ -15,8 +15,8 @@ fn prov<E: std::fmt::Display>(e: E) -> Error {
     Error::Provider(e.to_string())
 }
 
-const ISSUE_FIELDS: &str =
-    "id identifier title description url createdAt updatedAt state { name type } assignee { id name displayName avatarUrl }";
+const ISSUE_FIELDS: &str = "id identifier title description url createdAt updatedAt state { name type position } team { id } \
+     assignee { id name displayName avatarUrl } project { id name url } projectMilestone { id name }";
 
 pub fn map_user(v: &Value) -> User {
     User {
@@ -55,6 +55,52 @@ pub fn map_issue(v: &Value) -> WorkItem {
         created_at: get_date(v, "createdAt"),
         updated_at: get_date(v, "updatedAt"),
         url: get_str(v, "url"),
+        parent: issue_parent(v),
+    }
+}
+
+/// The issue's milestone when it has one, otherwise its project. A milestone belongs to exactly
+/// one project and its name is only unique there, so it is titled "Project › Milestone".
+fn issue_parent(v: &Value) -> Option<WorkItemParent> {
+    let project = get_obj(v, "project");
+    let project_name = project.and_then(|p| get_str(p, "name"));
+    let url = project.and_then(|p| get_str(p, "url"));
+    let milestone = get_obj(v, "projectMilestone").and_then(|m| Some((get_str(m, "id")?, get_str(m, "name")?)));
+    if let Some((id, name)) = milestone {
+        return Some(WorkItemParent {
+            kind: "Milestone".into(),
+            id,
+            title: match project_name {
+                Some(project) => format!("{project} › {name}"),
+                None => name,
+            },
+            url,
+        });
+    }
+    Some(WorkItemParent { kind: "Project".into(), id: get_str(project?, "id")?, title: project_name?, url })
+}
+
+/// Each team's first started state, by position: team id → that position.
+pub type FirstStarted = std::collections::HashMap<String, f64>;
+
+/// Tells in review from in progress for an issue already mapped as started.
+///
+/// Linear orders a team's workflow states, so this needs no guessing at names: the first
+/// started state is the doing ("In Progress"), and any started state after it ("In Review",
+/// "Ready to deploy") is past it. Only when the team's order is not known — the lookup failed —
+/// does the state's name decide.
+pub fn settle_review(wi: &mut WorkItem, v: &Value, first_started: &FirstStarted) {
+    if wi.state_category != WorkItemStateCategory::Started {
+        return;
+    }
+    let position = get_obj(v, "state").and_then(|s| s.get("position")).and_then(Value::as_f64);
+    let first = get_obj(v, "team").and_then(|t| get_str(t, "id")).and_then(|team| first_started.get(&team).copied());
+    let past_the_first = match (position, first) {
+        (Some(position), Some(first)) => position > first,
+        _ => state_name_is_review(&wi.state),
+    };
+    if past_the_first {
+        wi.state_category = WorkItemStateCategory::Review;
     }
 }
 
@@ -105,9 +151,41 @@ const NOTIFICATIONS_QUERY: &str = r#"query { notifications(first: 50) { nodes { 
 pub struct LinearClient {
     http: reqwest::Client,
     base: String,
+    /// Each team's first started state, asked for once: workflows change rarely, and it is what
+    /// tells in review from in progress on every issue after.
+    first_started: tokio::sync::Mutex<Option<FirstStarted>>,
 }
 
 impl LinearClient {
+    /// Each team's first started workflow state. Best-effort: a failed lookup is not cached and
+    /// answers empty, which leaves [`settle_review`] to go by state names for this call.
+    async fn first_started(&self) -> FirstStarted {
+        let mut guard = self.first_started.lock().await;
+        if let Some(known) = guard.as_ref() {
+            return known.clone();
+        }
+        let gql = r#"query { workflowStates(first: 250, filter: { type: { eq: "started" } }) { nodes { position team { id } } } }"#;
+        let Ok(data) = self.query(gql, Value::Null).await else { return FirstStarted::new() };
+        let mut firsts = FirstStarted::new();
+        for state in get_obj(&data, "workflowStates").map(|s| get_arr(s, "nodes")).unwrap_or_default() {
+            let (Some(team), Some(position)) =
+                (get_obj(state, "team").and_then(|t| get_str(t, "id")), state.get("position").and_then(Value::as_f64))
+            else {
+                continue;
+            };
+            firsts.entry(team).and_modify(|first| *first = first.min(position)).or_insert(position);
+        }
+        *guard = Some(firsts.clone());
+        firsts
+    }
+
+    /// Maps an issue, telling in review from in progress by its team's state order.
+    fn map_issue_in_order(v: &Value, first_started: &FirstStarted) -> WorkItem {
+        let mut wi = map_issue(v);
+        settle_review(&mut wi, v, first_started);
+        wi
+    }
+
     async fn query(&self, query: &str, variables: Value) -> Result<Value> {
         let resp = self.http.post(&self.base).json(&json!({ "query": query, "variables": variables })).send().await.map_err(prov)?;
         if !resp.status().is_success() {
@@ -136,13 +214,17 @@ impl WorkItemSource for LinearWi {
         };
         let gql = format!("query Issues($first:Int!,$filter:IssueFilter){{ issues(first:$first,filter:$filter){{ nodes {{ {ISSUE_FIELDS} }} }} }}");
         let data = self.0.query(&gql, json!({ "first": query.limit.unwrap_or(50), "filter": filter })).await?;
-        Ok(get_obj(&data, "issues").map(|i| get_arr(i, "nodes").iter().map(map_issue).collect()).unwrap_or_default())
+        let firsts = self.0.first_started().await;
+        Ok(get_obj(&data, "issues")
+            .map(|i| get_arr(i, "nodes").iter().map(|v| LinearClient::map_issue_in_order(v, &firsts)).collect())
+            .unwrap_or_default())
     }
     async fn get(&self, item: &ItemRef) -> Result<WorkItem> {
         let id: &str = &item.id;
         let gql = format!("query Issue($id:String!){{ issue(id:$id){{ {ISSUE_FIELDS} }} }}");
         let data = self.0.query(&gql, json!({ "id": id })).await?;
-        get_obj(&data, "issue").map(map_issue).ok_or_else(|| Error::NotFound(id.into()))
+        let firsts = self.0.first_started().await;
+        get_obj(&data, "issue").map(|v| LinearClient::map_issue_in_order(v, &firsts)).ok_or_else(|| Error::NotFound(id.into()))
     }
     async fn threads(&self, item: &ItemRef) -> Result<Vec<CommentThread>> {
         let id: &str = &item.id;
@@ -336,7 +418,11 @@ impl ProviderFactory for LinearFactory {
             headers.insert(AUTHORIZATION, key.parse().map_err(prov)?);
         }
         let http = crate::http_client(headers).map_err(prov)?;
-        let client = Arc::new(LinearClient { http, base: connection.base_url.clone().unwrap_or_else(|| "https://api.linear.app/graphql".into()) });
+        let client = Arc::new(LinearClient {
+            http,
+            base: connection.base_url.clone().unwrap_or_else(|| "https://api.linear.app/graphql".into()),
+            first_started: tokio::sync::Mutex::new(None),
+        });
         Ok(Arc::new(LinearConnection { id: connection.id.clone(), display_name: connection.display_name.clone(), client, caps: linear_capabilities() }))
     }
 }
@@ -383,6 +469,62 @@ mod tests {
         assert_eq!(wi.state, "In Progress");
         assert_eq!(wi.state_category, WorkItemStateCategory::Started);
         assert_eq!(wi.assignee.unwrap().display_name, "Dan");
+    }
+
+    #[test]
+    fn an_issue_sits_under_its_milestone_or_failing_that_its_project() {
+        let issue = |extra: &str| -> Value { serde_json::from_str(&format!(r#"{{ "id": "i", "title": "t" {extra} }}"#)).unwrap() };
+        let project = r#", "project": { "id": "p1", "name": "Ledger v2", "url": "https://linear.app/acme/project/ledger" }"#;
+
+        // A milestone's name is only unique inside its project, so the project leads the title.
+        let both = map_issue(&issue(&format!(r#"{project}, "projectMilestone": {{ "id": "m1", "name": "Reconciliation" }}"#)));
+        let parent = both.parent.expect("a milestone");
+        assert_eq!((parent.kind.as_str(), parent.id.as_str(), parent.title.as_str()), ("Milestone", "m1", "Ledger v2 › Reconciliation"));
+        assert_eq!(parent.url.as_deref(), Some("https://linear.app/acme/project/ledger"));
+
+        let only_project = map_issue(&issue(project)).parent.expect("a project");
+        assert_eq!((only_project.kind.as_str(), only_project.id.as_str(), only_project.title.as_str()), ("Project", "p1", "Ledger v2"));
+
+        // A milestone that somehow has no name is not a reason to lose the project.
+        let nameless = map_issue(&issue(&format!(r#"{project}, "projectMilestone": {{ "id": "m1" }}"#))).parent.expect("the project");
+        assert_eq!(nameless.kind, "Project");
+
+        // Linear sends explicit nulls for an issue in neither.
+        assert!(map_issue(&issue(r#", "project": null, "projectMilestone": null"#)).parent.is_none());
+        assert!(map_issue(&issue("")).parent.is_none());
+    }
+
+    #[test]
+    fn a_started_state_after_the_teams_first_is_in_review() {
+        let issue = |name: &str, kind: &str, position: f64, team: &str| -> Value {
+            serde_json::json!({ "id": "i", "title": "t", "state": { "name": name, "type": kind, "position": position }, "team": { "id": team } })
+        };
+        let firsts: FirstStarted = [("eng".to_string(), 2.0), ("ops".to_string(), 7.0)].into_iter().collect();
+        let cat = |v: &Value, firsts: &FirstStarted| LinearClient::map_issue_in_order(v, firsts).state_category;
+
+        // By position, whatever the team called its states.
+        assert_eq!(cat(&issue("Doing", "started", 2.0, "eng"), &firsts), WorkItemStateCategory::Started);
+        assert_eq!(cat(&issue("Shipping soon", "started", 3.0, "eng"), &firsts), WorkItemStateCategory::Review);
+        // The first started state is the doing even when its name sounds like review…
+        assert_eq!(cat(&issue("Review", "started", 7.0, "ops"), &firsts), WorkItemStateCategory::Started);
+        // …and positions are per team: 3.0 is before ops' first.
+        assert_eq!(cat(&issue("In Progress", "started", 3.0, "ops"), &firsts), WorkItemStateCategory::Started);
+        // Only a started state can be in review.
+        assert_eq!(cat(&issue("Todo", "unstarted", 9.0, "eng"), &firsts), WorkItemStateCategory::Unstarted);
+        assert_eq!(cat(&issue("Done", "completed", 9.0, "eng"), &firsts), WorkItemStateCategory::Completed);
+
+        // The order unknown (the lookup failed, or a team it did not cover): the name decides.
+        let unknown = FirstStarted::new();
+        assert_eq!(cat(&issue("In Review", "started", 3.0, "eng"), &unknown), WorkItemStateCategory::Review);
+        assert_eq!(cat(&issue("In Progress", "started", 3.0, "eng"), &unknown), WorkItemStateCategory::Started);
+    }
+
+    #[test]
+    fn the_issue_query_asks_for_the_project_and_milestone() {
+        for field in ["project { id name url }", "projectMilestone { id name }", "state { name type position }", "team { id }"] {
+            assert!(ISSUE_FIELDS.contains(field), "{field} missing from {ISSUE_FIELDS}");
+        }
+        assert!(!ISSUE_FIELDS.contains('\n') && !ISSUE_FIELDS.contains("  "), "one clean line of GraphQL: {ISSUE_FIELDS:?}");
     }
 
     #[test]

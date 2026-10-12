@@ -146,6 +146,9 @@ pub fn map_commit(v: &Value) -> Commit {
     }
 }
 
+/// `repo` is the repository the issue was asked of. An account-wide listing has none to pass, so
+/// the issue's own `repository` (or its `repository_url`) names where it lives — the row still
+/// needs that to be addressed, though nothing chose it.
 pub fn map_issue(v: &Value, repo: Option<&str>) -> WorkItem {
     let state = get_str(v, "state").unwrap_or_else(|| "open".into());
     let reason = get_str(v, "state_reason");
@@ -160,7 +163,14 @@ pub fn map_issue(v: &Value, repo: Option<&str>) -> WorkItem {
     };
     let number = get_i64(v, "number");
     WorkItem {
-        repository: repo.map(str::to_string),
+        repository: repo
+            .map(str::to_string)
+            .or_else(|| get_obj(v, "repository").and_then(|r| get_str(r, "full_name")))
+            .or_else(|| {
+                get_str(v, "repository_url")
+                    .and_then(|url| url.split_once("/repos/").map(|(_, repo)| repo.trim_matches('/').to_string()))
+            })
+            .filter(|repo| !repo.is_empty()),
         id: number.map(|n| n.to_string()).unwrap_or_else(|| "0".into()),
         identifier: number.map(|n| format!("#{n}")),
         title: get_str(v, "title").unwrap_or_else(|| "(untitled)".into()),
@@ -172,6 +182,15 @@ pub fn map_issue(v: &Value, repo: Option<&str>) -> WorkItem {
         created_at: get_date(v, "created_at"),
         updated_at: get_date(v, "updated_at"),
         url: get_str(v, "html_url"),
+        // A milestone's `id` is unique across GitHub; its `number` only within its repository.
+        parent: get_obj(v, "milestone").and_then(|m| {
+            Some(WorkItemParent {
+                kind: "Milestone".into(),
+                id: get_i64(m, "id")?.to_string(),
+                title: get_str(m, "title")?,
+                url: get_str(m, "html_url"),
+            })
+        }),
     }
 }
 
@@ -1453,29 +1472,28 @@ impl PullRequestSource for GitHubPr {
 #[async_trait]
 impl WorkItemSource for GitHubWi {
     async fn list(&self, query: &WorkItemQuery) -> Result<Vec<WorkItem>> {
+        let state = if query.include_completed { "all" } else { "open" };
+        let per_page = query.limit.unwrap_or(50);
+        // Work items are not related to repositories: what is assigned to you is asked of the
+        // account in one call, whatever the repository scope holds — including nothing.
+        // `pulls=false` keeps assigned pull requests from taking the page's slots; the filter
+        // below stays for a host that ignores it.
+        if query.mine_only {
+            let url = format!(
+                "{}/issues?filter=assigned&pulls=false&state={state}&sort=updated&direction=desc&per_page={per_page}",
+                self.0.base
+            );
+            let v = self.0.get_json(&url).await?;
+            return Ok(v.as_array().unwrap_or(&vec![]).iter().filter(|e| !is_pull_request(e)).map(|i| map_issue(i, None)).collect());
+        }
+        // Every issue, assigned or not, has no account-wide question to ask — only a repository's.
         let scope = &self.0.scope;
         if scope.is_empty() {
             return Ok(Vec::new());
         }
-        let state = if query.include_completed { "all" } else { "open" };
-        let per_page = query.limit.unwrap_or(50);
-        // The repo issues endpoint rejects `@me` (422) — it needs the actual login.
-        let me = if query.mine_only { self.0.self_login().await? } else { None };
-        let rows = fan_out(scope, "github.work_items.list", |repo| {
-            let me = me.clone();
-            async move {
-                let mut url = self.0.repo_path(&repo, &format!("/issues?state={state}&per_page={per_page}"));
-                if let Some(login) = &me {
-                    url.push_str(&format!("&assignee={login}"));
-                }
-                let v = self.0.get_json(&url).await?;
-                Ok(v.as_array()
-                    .unwrap_or(&vec![])
-                    .iter()
-                    .filter(|e| !is_pull_request(e))
-                    .map(|i| map_issue(i, Some(&repo)))
-                    .collect())
-            }
+        let rows = fan_out(scope, "github.work_items.list", |repo| async move {
+            let v = self.0.get_json(&self.0.repo_path(&repo, &format!("/issues?state={state}&per_page={per_page}"))).await?;
+            Ok(v.as_array().unwrap_or(&vec![]).iter().filter(|e| !is_pull_request(e)).map(|i| map_issue(i, Some(&repo))).collect())
         })
         .await;
         Ok(sort_and_cap(rows, scope.len(), query.limit, |wi| wi.updated_at))
@@ -2328,6 +2346,53 @@ mod tests {
 
     fn pr_query(filter: PullRequestFilter, include_completed: bool) -> PullRequestQuery {
         PullRequestQuery { filter, include_completed, limit: None, decorate: false }
+    }
+
+    #[test]
+    fn an_issue_sits_under_its_milestone() {
+        let v = serde_json::json!({ "number": 12, "title": "t", "state": "open",
+            "milestone": { "id": 9001, "number": 3, "title": "Q4 reliability", "html_url": "https://github.com/acme/pay/milestone/3" } });
+        let parent = map_issue(&v, Some("acme/pay")).parent.expect("a milestone");
+        // The id, not the number: milestone 3 exists in every repository that has three.
+        assert_eq!((parent.kind.as_str(), parent.id.as_str(), parent.title.as_str()), ("Milestone", "9001", "Q4 reliability"));
+        assert_eq!(parent.url.as_deref(), Some("https://github.com/acme/pay/milestone/3"));
+
+        let none = serde_json::json!({ "number": 13, "title": "t", "state": "open", "milestone": null });
+        assert!(map_issue(&none, Some("acme/pay")).parent.is_none());
+    }
+
+    #[tokio::test]
+    async fn assigned_issues_are_asked_of_the_account_not_of_the_repository_scope() {
+        // Work items are not related to repositories: nothing is chosen here, and what is
+        // assigned to you still shows.
+        let (forge, pr) = forge_and_client(&[]);
+        forge.route(
+            "/issues",
+            serde_json::json!([
+                { "number": 12, "title": "ledger drift", "state": "open", "updated_at": "2026-09-02T00:00:00Z",
+                  "repository": { "full_name": "acme/ledger" } },
+                { "number": 7, "title": "a pull request", "state": "open", "repository": { "full_name": "acme/pay" }, "pull_request": {} },
+                { "number": 3, "title": "named by url", "state": "open", "repository_url": format!("{}/repos/acme/pay", forge.base()) },
+            ]),
+        );
+        forge.route("/repos/acme/ledger/issues/12", serde_json::json!({ "number": 12, "title": "ledger drift", "state": "open" }));
+        let wi = GitHubWi(pr.0.clone());
+
+        let rows = wi.list(&WorkItemQuery { mine_only: true, include_completed: false, limit: Some(50) }).await.unwrap();
+        assert_eq!(
+            rows.iter().map(|w| (w.repository.as_deref(), w.id.as_str())).collect::<Vec<_>>(),
+            vec![(Some("acme/ledger"), "12"), (Some("acme/pay"), "3")],
+            "each issue names where it lives, and the pull request is left out"
+        );
+        let asked = forge.requests();
+        assert_eq!(asked.len(), 1, "one call, no /user and no per-repository list: {asked:?}");
+        for needle in ["GET /issues?", "filter=assigned", "pulls=false", "state=open", "per_page=50"] {
+            assert!(asked[0].contains(needle), "{needle} missing from {}", asked[0]);
+        }
+
+        // A row from a repository nobody chose still opens: it carries its own address.
+        assert_eq!(wi.get(&rows[0].item_ref()).await.unwrap().repository.as_deref(), Some("acme/ledger"));
+        assert_eq!(forge.requests_to("/repos/acme/ledger/issues/12").len(), 1);
     }
 
     #[tokio::test]

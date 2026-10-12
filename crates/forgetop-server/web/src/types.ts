@@ -9,6 +9,8 @@ export type WorkItemStateCategory =
   | "Backlog"
   | "Unstarted"
   | "Started"
+  /** Past the doing and awaiting review, QA or verification — still open and in flight. */
+  | "Review"
   | "Completed"
   | "Canceled";
 export type PipelineRunStatus = "Queued" | "Running" | "Waiting" | "Succeeded" | "PartiallySucceeded" | "Failed" | "Canceled" | "Skipped";
@@ -70,6 +72,17 @@ export interface PullRequest {
   url?: string | null;
 }
 
+/** What a work item sits under, in the forge's own words (a milestone, epic, project or parent
+ *  ticket). Mirrors the Rust `WorkItemParent`. */
+export interface WorkItemParent {
+  /** Display word: "Milestone", "Epic", "Feature", "Project", "Parent". */
+  kind: string;
+  /** Identity within the connection. */
+  id: string;
+  title: string;
+  url?: string | null;
+}
+
 export interface WorkItem {
   id: string;
   /** The repository this lives in, **connection-relative** (`acme/pay`). Undefined for
@@ -85,6 +98,8 @@ export interface WorkItem {
   created_at?: string | null;
   updated_at?: string | null;
   url?: string | null;
+  /** What this item sits under, if the forge says. Omitted when it has no parent. */
+  parent?: WorkItemParent | null;
 }
 
 export interface PipelineStep {

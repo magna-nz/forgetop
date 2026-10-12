@@ -76,7 +76,7 @@ pub enum Action {
     OpenPipelineSubs { index: usize },
     /// Jump to an item chosen in the command palette. The app re-resolves the full
     /// PR / work item / pipeline from its lists by `(kind, id)` and opens its view.
-    OpenItem { kind: PaletteKind, id: String, connection_id: String },
+    OpenItem { kind: PaletteKind, id: String, repo: Option<String>, connection_id: String },
     /// Run any other palette entry (an action's key, a destination, a view, a filter, a
     /// theme, a keybinding, a command). Interpreted by the app.
     Palette(PaletteTarget),
@@ -470,9 +470,12 @@ impl Overlay {
                     Outcome::Keep
                 }
                 Key::Enter => match results.get(*selected).map(|&i| &candidates[i].target) {
-                    Some(PaletteTarget::Item { kind, id, connection_id }) => {
-                        Outcome::Submit(Action::OpenItem { kind: *kind, id: id.clone(), connection_id: connection_id.clone() })
-                    }
+                    Some(PaletteTarget::Item { kind, id, repo, connection_id }) => Outcome::Submit(Action::OpenItem {
+                        kind: *kind,
+                        id: id.clone(),
+                        repo: repo.clone(),
+                        connection_id: connection_id.clone(),
+                    }),
                     Some(target) => Outcome::Submit(Action::Palette(target.clone())),
                     None => Outcome::Keep, // no matches — swallow Enter
                 },
@@ -738,7 +741,7 @@ mod tests {
     }
 
     fn pitem(kind: PaletteKind, id: &str, title: &str) -> PaletteItem {
-        let target = PaletteTarget::Item { kind, id: id.into(), connection_id: "c".into() };
+        let target = PaletteTarget::Item { kind, id: id.into(), repo: None, connection_id: "c".into() };
         PaletteItem::new(crate::palette::Group::Item, target, title)
     }
 

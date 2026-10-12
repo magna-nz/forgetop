@@ -128,6 +128,28 @@ impl AzRaw {
         serde_json::from_str::<Value>(&text).unwrap()["id"].as_i64().expect("work item id")
     }
 
+    /// Creates an Epic and a Task beneath it; returns their ids as (epic, task). The link is the
+    /// hierarchy one the provider reads back as `System.Parent`.
+    pub async fn create_epic_with_child(&self, epic_title: &str, child_title: &str) -> (i64, i64) {
+        let create = |kind: &'static str, patch: Value| async move {
+            let url = self.proj(&format!("/_apis/wit/workitems/${kind}?{API}"));
+            let (status, text) = self.raw(Method::POST, &url, Some(patch), "application/json-patch+json").await;
+            assert!(status.is_success(), "create {kind} -> {status}: {text}");
+            serde_json::from_str::<Value>(&text).unwrap()["id"].as_i64().expect("work item id")
+        };
+        let epic = create("Epic", json!([{ "op": "add", "path": "/fields/System.Title", "value": epic_title }])).await;
+        let parent = json!({ "rel": "System.LinkTypes.Hierarchy-Reverse", "url": format!("{}/_apis/wit/workItems/{epic}", self.base) });
+        let child = create(
+            "Task",
+            json!([
+                { "op": "add", "path": "/fields/System.Title", "value": child_title },
+                { "op": "add", "path": "/relations/-", "value": parent }
+            ]),
+        )
+        .await;
+        (epic, child)
+    }
+
     /// Queues a run of a pipeline; returns the build/run id.
     pub async fn queue_pipeline(&self, pipeline_id: &str) -> String {
         let v = self.send(Method::POST, &self.proj(&format!("/_apis/pipelines/{pipeline_id}/runs?{API}")), Some(json!({}))).await;

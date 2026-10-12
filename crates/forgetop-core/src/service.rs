@@ -366,6 +366,13 @@ impl ConfigService {
         self.persist(cfg).await
     }
 
+    /// Persists how the Work Items list is grouped (`None` restores the default).
+    pub async fn set_work_item_group(&self, group: Option<String>) -> Result<()> {
+        let mut cfg = self.snapshot();
+        cfg.ui.work_item_group = group;
+        self.persist(cfg).await
+    }
+
     /// Replaces a connection's tracked pipeline definitions with an explicit set
     /// (turns off auto-discovery). An empty list tracks nothing.
     pub async fn set_pipeline_definitions(&self, connection_id: &str, definition_ids: Vec<String>) -> Result<()> {

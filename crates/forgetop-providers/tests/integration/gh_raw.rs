@@ -150,6 +150,23 @@ impl GhRaw {
         v["number"].as_i64().expect("issue number")
     }
 
+    /// Creates a milestone; returns its (number, id, html_url). The number addresses it within
+    /// the repository; the id is what is unique across GitHub.
+    pub async fn create_milestone(&self, title: &str) -> (i64, i64, String) {
+        let v = self.send(Method::POST, &self.url("/milestones"), Some(json!({ "title": title }))).await;
+        (
+            v["number"].as_i64().expect("milestone number"),
+            v["id"].as_i64().expect("milestone id"),
+            v["html_url"].as_str().expect("milestone html_url").to_string(),
+        )
+    }
+
+    /// Creates an issue assigned to `assignee` under milestone `milestone`; returns its number.
+    pub async fn create_issue_in_milestone(&self, title: &str, assignee: &str, milestone: i64) -> i64 {
+        let body = json!({ "title": title, "assignees": [assignee], "milestone": milestone, "body": "forgetop integration fixture" });
+        self.send(Method::POST, &self.url("/issues"), Some(body)).await["number"].as_i64().expect("issue number")
+    }
+
     /// Creates/updates a deployment environment requiring `reviewer_id` to approve.
     /// Note: required reviewers on **public** repos are free; on private repos they
     /// need a paid plan — the approval test needs a public container repo.
@@ -196,6 +213,9 @@ impl GhRaw {
     pub async fn close_issue(&self, number: i64) {
         self.try_send(Method::PATCH, &self.url(&format!("/issues/{number}")), Some(json!({ "state": "closed" }))).await;
     }
+    pub async fn delete_milestone(&self, number: i64) {
+        self.try_send(Method::DELETE, &self.url(&format!("/milestones/{number}")), None).await;
+    }
     pub async fn delete_environment(&self, name: &str) {
         self.try_send(Method::DELETE, &self.url(&format!("/environments/{name}")), None).await;
     }
@@ -222,6 +242,17 @@ impl GhRaw {
             for e in list {
                 if let Some(name) = e["name"].as_str().filter(|n| n.starts_with(harness::SWEEP_PREFIX)) {
                     self.delete_environment(name).await;
+                }
+            }
+        }
+        // Milestones.
+        let milestones = self.send(Method::GET, &self.url("/milestones?state=all&per_page=100"), None).await;
+        if let Some(list) = milestones.as_array() {
+            for m in list {
+                if m["title"].as_str().is_some_and(|t| t.starts_with(harness::SWEEP_PREFIX)) {
+                    if let Some(n) = m["number"].as_i64() {
+                        self.delete_milestone(n).await;
+                    }
                 }
             }
         }

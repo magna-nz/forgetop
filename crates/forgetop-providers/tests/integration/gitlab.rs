@@ -107,6 +107,41 @@ async fn gitlab_merge_request_lifecycle() {
     raw.delete_branch(&branch).await;
 }
 
+/// A real issue under a real milestone comes back naming that milestone as its parent — from
+/// the account-wide list and from a single read.
+#[tokio::test]
+async fn gitlab_issue_names_its_milestone_as_its_parent() {
+    let gl = skip_if_none!(harness::gitlab(), "gitlab");
+    let raw = GlRaw::from_env().expect("gitlab raw");
+    let prefix = harness::run_prefix();
+
+    let (uid, _name) = raw.me().await;
+    let milestone_title = format!("{prefix} milestone");
+    let (milestone_id, milestone_url) = raw.create_milestone(&milestone_title).await;
+    let title = format!("{prefix} milestone issue");
+    let iid = raw.create_issue_in_milestone(&title, uid, milestone_id).await;
+    let id = iid.to_string();
+
+    let wi = gl.conn.work_items().expect("gitlab issues");
+    let listed = {
+        let (wi, id, title) = (&wi, id.as_str(), title.as_str());
+        harness::poll(harness::POLL_LIST, move || async move {
+            let list = wi.list(&WorkItemQuery { mine_only: true, ..Default::default() }).await.ok()?;
+            list.into_iter().find(|w| w.id == id && w.title == title)
+        })
+        .await
+    };
+    let got = wi.get(&ItemRef::new(&id)).await;
+
+    // Torn down before anything is asserted, so a failure leaks no fixture.
+    raw.delete_issue(iid).await;
+    raw.delete_milestone(milestone_id).await;
+
+    let expected = WorkItemParent { kind: "Milestone".into(), id: milestone_id.to_string(), title: milestone_title, url: Some(milestone_url) };
+    assert_eq!(listed.expect("the issue appears in the mine-only list").parent, Some(expected.clone()), "from the list");
+    assert_eq!(got.expect("get").parent, Some(expected), "from a single read");
+}
+
 #[tokio::test]
 async fn gitlab_issue_lifecycle() {
     let gl = skip_if_none!(harness::gitlab(), "gitlab");
@@ -121,6 +156,22 @@ async fn gitlab_issue_lifecycle() {
     let list = wi.list(&WorkItemQuery { mine_only: true, ..Default::default() }).await.expect("list");
     assert!(list.iter().any(|w| w.id == id), "assigned issue appears in mine-only list");
     assert_eq!(wi.get(&ItemRef::new(&id)).await.expect("get").id, id);
+
+    // Work items are not related to repositories: with nothing chosen at all the same issue
+    // still shows, and the row's own address is all it takes to open it.
+    let unscoped = harness::scoped(ProviderType::GitLab, vec![]).expect("an unscoped connection").work_items().expect("work items");
+    let title = format!("{prefix} issue");
+    let row = {
+        let (unscoped, id, title) = (&unscoped, id.as_str(), title.as_str());
+        harness::poll(harness::POLL_LIST, move || async move {
+            let list = unscoped.list(&WorkItemQuery { mine_only: true, ..Default::default() }).await.ok()?;
+            list.into_iter().find(|w| w.id == id && w.title == title)
+        })
+        .await
+        .expect("the assigned issue shows with an empty repository scope")
+    };
+    assert!(row.repository.is_some(), "and names the repository it lives in");
+    assert_eq!(unscoped.get(&row.item_ref()).await.expect("get by the row's own address").title, title);
 
     let states = wi.available_states(&ItemRef::new(&id)).await.expect("available states");
     let closed = states.iter().find(|s| s.eq_ignore_ascii_case("closed")).cloned().unwrap_or_else(|| "closed".into());

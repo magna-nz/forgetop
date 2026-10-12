@@ -170,7 +170,15 @@ fn wi(id: &str, title: &str, state: &str, cat: WorkItemStateCategory, ty: &str, 
         created_at: Some(now - chrono::Duration::days(4)),
         updated_at: Some(now - chrono::Duration::hours(updated_h)),
         url: Some(format!("https://example.test/issue/{id}")),
+        parent: None,
     }
+}
+
+/// Puts a demo work item under a milestone, epic or project — each forge in its own words, so
+/// the Work Items grouping has something believable to group by. A few are left without one.
+fn under(mut wi: WorkItem, kind: &str, id: &str, title: &str) -> WorkItem {
+    wi.parent = Some(WorkItemParent { kind: kind.into(), id: id.into(), title: title.into(), url: Some(format!("https://example.test/{id}")) });
+    wi
 }
 
 use CheckStatus as CS;
@@ -199,8 +207,8 @@ fn github_prs() -> Vec<PullRequest> {
 fn github_wis() -> Vec<WorkItem> {
     use WorkItemStateCategory as C;
     vec![
-        wi("#842", "Investigate elevated p99 on POST /charge", "In Progress", C::Started, "Bug", true, 3),
-        wi("#851", "Add retry-budget metrics to the sync worker", "Todo", C::Unstarted, "Task", true, 26),
+        under(wi("#842", "Investigate elevated p99 on POST /charge", "In Progress", C::Started, "Bug", true, 3), "Milestone", "milestone-14", "Q4 reliability"),
+        under(wi("#851", "Add retry-budget metrics to the sync worker", "Todo", C::Unstarted, "Task", true, 26), "Milestone", "milestone-14", "Q4 reliability"),
         // Unassigned (not yours) — the mine-only filter drops it.
         wi("#860", "Flaky test: webhook_delivery_spec", "Backlog", C::Backlog, "Bug", false, 30),
     ]
@@ -220,7 +228,7 @@ fn gitlab_prs() -> Vec<PullRequest> {
 
 fn gitlab_wis() -> Vec<WorkItem> {
     use WorkItemStateCategory as C;
-    vec![wi("#77", "Right-size the staging cluster", "In Progress", C::Started, "Task", true, 5)]
+    vec![under(wi("#77", "Right-size the staging cluster", "In Progress", C::Started, "Task", true, 5), "Milestone", "milestone-9", "Infra cost review")]
 }
 
 /// Bitbucket — the data team's dbt/ingestion repo (`northwind-data`).
@@ -237,9 +245,13 @@ fn bitbucket_prs() -> Vec<PullRequest> {
 fn linear_wis() -> Vec<WorkItem> {
     use WorkItemStateCategory as C;
     vec![
-        wi("ENG-231", "Design the ledger reconciliation job", "In Progress", C::Started, "Story", true, 4),
-        wi("ENG-245", "Spike: event sourcing for the payments ledger", "Todo", C::Unstarted, "Spike", true, 28),
-        wi("ENG-250", "Add SLO dashboards for the charge API", "Backlog", C::Backlog, "Task", true, 50),
+        // A Linear milestone lives inside one project, so it reads "Project › Milestone".
+        under(wi("ENG-231", "Design the ledger reconciliation job", "In Progress", C::Started, "Story", true, 4), "Milestone", "ms-reconciliation", "Ledger v2 › Reconciliation"),
+        // Past the doing and waiting on someone else: its own colour, and its own roll-up count.
+        under(wi("ENG-245", "Spike: event sourcing for the payments ledger", "In Review", C::Review, "Spike", true, 28), "Milestone", "ms-reconciliation", "Ledger v2 › Reconciliation"),
+        // In a project but no milestone yet.
+        under(wi("ENG-250", "Add SLO dashboards for the charge API", "Backlog", C::Backlog, "Task", true, 50), "Project", "proj-charge-obs", "Charge API observability"),
+        // Loose: no project at all.
         wi("ENG-198", "Migrate feature flags to OpenFeature", "Blocked", C::Started, "Story", true, 18),
     ]
 }
@@ -248,9 +260,9 @@ fn linear_wis() -> Vec<WorkItem> {
 fn jira_wis() -> Vec<WorkItem> {
     use WorkItemStateCategory as C;
     vec![
-        wi("OPS-1423", "SOC2: collect access-review evidence for Q3", "In Progress", C::Started, "Task", true, 2),
+        under(wi("OPS-1423", "SOC2: collect access-review evidence for Q3", "In Progress", C::Started, "Task", true, 2), "Epic", "OPS-1400", "SOC2 Type II audit"),
         wi("SEC-88", "INC-4821 postmortem action items", "To Do", C::Unstarted, "Bug", true, 22),
-        wi("OPS-1440", "Upgrade Vault to 1.16", "Backlog", C::Backlog, "Task", true, 60),
+        under(wi("OPS-1440", "Upgrade Vault to 1.16", "Backlog", C::Backlog, "Task", true, 60), "Epic", "OPS-1390", "Platform upgrades"),
     ]
 }
 
@@ -1085,6 +1097,7 @@ fn demo_state_category(state: &str) -> WorkItemStateCategory {
         "backlog" => C::Backlog,
         "todo" | "to do" | "new" => C::Unstarted,
         "triage" => C::Triage,
+        other if state_name_is_review(other) => C::Review,
         _ => C::Started,
     }
 }

@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import { screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { PullRequests } from "./PullRequests";
+import { WorkItems } from "./WorkItems";
 import { PrDetailProvider } from "./PrDetail";
 import { renderWithClient, mockFetch } from "../test/util";
 
@@ -53,6 +54,22 @@ const connection = (repoScope: string[] | null): any => ({
 });
 
 describe("repository scope", () => {
+  it("never reaches work items, even when every repository is unticked", async () => {
+    // Work items are not related to repositories: an emptied scope is not why the list is empty,
+    // and there is no repositories control to offer.
+    mockFetch({
+      get: {
+        "/api/work-items": [],
+        "/api/connections/repositories": { repositories: ["acme/pay", "acme/web"], truncated: false },
+        "/api/connections": [{ ...connection([]), sections: ["pull_requests", "work_items"] }],
+      },
+    });
+    renderWithClient(<WorkItems />);
+    expect(await screen.findByText("No work items assigned")).toBeInTheDocument();
+    expect(screen.queryByText("No repositories selected")).not.toBeInTheDocument();
+    expect(screen.queryByText(/Repos ·/)).not.toBeInTheDocument();
+  });
+
   it("distinguishes 'no repositories selected' from 'no pull requests'", async () => {
     // An empty scope is a real, chosen state: nothing was fetched because nothing was asked for.
     // Saying "No open pull requests" here would tell the user the opposite of what happened.

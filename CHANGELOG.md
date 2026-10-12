@@ -9,6 +9,48 @@ Adding a release: one `## <version> — <date>` section, a line per user-visible
 and the pull request each one came from. `git log v<previous>..HEAD --merges` lists the
 candidates.
 
+## 1.9.0 — 2026-10-12
+
+Added
+
+- **Group work items by what they sit under.** Work Items can now be grouped by parent — a
+  GitHub or GitLab milestone, a Jira epic, a Linear milestone or project, an Azure DevOps
+  Feature or Epic. Items with no parent share a last "No parent" group. It is how the list
+  opens whenever something in it has a parent; a list with none stays the plain list. Grouping
+  only rearranges the items already listed. In the terminal UI each parent is one line with
+  its item count and how many are in progress or blocked; `G` switches grouping off and on,
+  Enter or Space opens a parent to the items beneath, `z` / `Z` fold or unfold them all, and
+  `o` opens the parent in the browser. There the quick filter and Ctrl-K also find items by their parent's
+  name, and an opened work item names its parent. The dashboard has the same grouping under a
+  "Group" control, with a link to each parent.
+  ([#237](https://github.com/magna-nz/forgetop/pull/237))
+- **In review has its own colour.** A work item that is past the doing and waiting on someone
+  else — in review, in QA, awaiting verification — now shows in cyan rather than the blue of
+  in progress, in both the terminal UI and the dashboard, and a group's roll-up counts it on
+  its own ("1 in progress · 2 in review"). Linear tells them apart by the team's own workflow
+  order, so it works whatever the states are called; Azure DevOps by its Resolved stage; Jira
+  by the status name. GitHub and GitLab issues are only open or closed, so nothing changes
+  there. ([#237](https://github.com/magna-nz/forgetop/pull/237))
+
+Changed
+
+- **Work items are no longer tied to repositories.** The Work Items list now shows everything
+  assigned to you across the account — GitHub and GitLab issues, Azure DevOps work items —
+  whichever repositories a connection has chosen, including none. Before, an issue only showed
+  if its repository was ticked. The repository count, the `w` picker and the "No repositories
+  selected" message are gone from Work Items in both the terminal UI and the dashboard; Pull
+  Requests and Pipelines keep them.
+  ([#237](https://github.com/magna-nz/forgetop/pull/237))
+
+Fixed
+
+- **Items that share a number no longer stand in for each other.** In the terminal UI, opening
+  a pull request or work item from the Ctrl-K palette or the Command Center now opens the one
+  you picked when another on the same connection has the same number in a different repository,
+  and dismissing one from the Command Center (`D`) no longer hides the other — or a pull request
+  with that number. Dismissals you already saved keep hiding what they hid.
+  ([#237](https://github.com/magna-nz/forgetop/pull/237))
+
 ## 1.8.3 — 2026-10-12
 
 Added
