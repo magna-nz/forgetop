@@ -9,6 +9,25 @@ Adding a release: one `## <version> — <date>` section, a line per user-visible
 and the pull request each one came from. `git log v<previous>..HEAD --merges` lists the
 candidates.
 
+## 1.9.1 — 2026-10-12
+
+Added
+
+- **The dashboard's Pipelines section catches up with the terminal UI.** The list groups runs
+  by pipeline (the default), by trigger or by branch, or stays flat, under a "Group" control
+  that is remembered. A group header carries the most recent run's status and age, how many
+  runs beneath it failed, a stage strip and an approval pill, and opens to its runs; every row
+  shows its stage strip and elapsed time. A run opens in a wider pane with its event, branch,
+  commit, who started it, attempt and pull request; a red line naming the failed step, test
+  and file for a failed run; a Problems card of the provider's annotations; a history strip of
+  recent runs on the branch with a duration sparkline, median and last failure; the stages,
+  jobs and steps as a folding tree with duration bars on one time axis, estimated finishes
+  and the critical path while a run is in flight, and a gate banner with Approve / Reject
+  where the provider allows it; and a log panel under the tree, sectioned per step, with
+  search, a first-error jump, follow and wrap. Re-run, re-run failed jobs, cancel and
+  artifacts are offered by what each provider supports. The terminal UI is unchanged.
+  ([#238](https://github.com/magna-nz/forgetop/pull/238))
+
 ## 1.9.0 — 2026-10-12
 
 Added
