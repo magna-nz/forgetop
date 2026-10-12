@@ -155,3 +155,72 @@ describe("SlideOver", () => {
     expect(onClose).toHaveBeenCalledTimes(2);
   });
 });
+
+describe("SlideOver resize grip", () => {
+  // jsdom has no PointerEvent; a MouseEvent carries the clientX the grip reads.
+  if (!("PointerEvent" in window)) (window as unknown as { PointerEvent: typeof MouseEvent }).PointerEvent = MouseEvent;
+
+  it("drags the pane wider, remembers it per size, and resets on double-click", async () => {
+    Object.defineProperty(window, "innerWidth", { value: 1400, configurable: true });
+    render(
+      <SlideOver onClose={() => {}} width="md" header={<span>h</span>}>
+        body
+      </SlideOver>,
+    );
+    const pane = screen.getByRole("region", { name: "Details" });
+    const grip = screen.getByRole("separator", { name: "Resize pane" });
+    expect(pane).not.toHaveStyle({ width: "700px" });
+    // jsdom has no layout: the pane's right edge reads as 0, so the viewport's 1400 stands in and
+    // a drag computes the width from the pointer — pointer at 700 means a 700px pane.
+    fireEvent.pointerDown(grip, { button: 0, pointerId: 1, clientX: 1400 });
+    fireEvent.pointerMove(grip, { clientX: 700 });
+    fireEvent.pointerUp(grip);
+    expect(pane).toHaveStyle({ width: "700px" });
+    expect(localStorage.getItem("forgetop:pane:md")).toBe("700");
+
+    // Keyboard: ← expands, → shrinks, by 24px — on the grip, and from anywhere on the page
+    // that is not a text field. The footer says so.
+    grip.focus();
+    fireEvent.keyDown(grip, { key: "ArrowLeft" });
+    expect(pane).toHaveStyle({ width: "724px" });
+    fireEvent.keyDown(grip, { key: "ArrowRight" });
+    fireEvent.keyDown(grip, { key: "ArrowRight" });
+    expect(pane).toHaveStyle({ width: "676px" });
+    fireEvent.keyDown(document.body, { key: "ArrowLeft" });
+    expect(pane).toHaveStyle({ width: "700px" });
+    const input = document.createElement("input");
+    document.body.appendChild(input);
+    fireEvent.keyDown(input, { key: "ArrowLeft" });
+    expect(pane).toHaveStyle({ width: "700px" });
+    input.remove();
+    expect(pane.textContent).toContain("expand");
+    expect(pane.textContent).toContain("shrink");
+
+    // The content column keeps at least 320px: a drag past that is clamped.
+    fireEvent.pointerDown(grip, { button: 0, pointerId: 1, clientX: 1400 });
+    fireEvent.pointerMove(grip, { clientX: 10 });
+    fireEvent.pointerUp(grip);
+    expect(pane).toHaveStyle({ width: "1080px" });
+
+    fireEvent.doubleClick(grip);
+    expect(pane.style.width).toBe("");
+    expect(localStorage.getItem("forgetop:pane:md")).toBeNull();
+  });
+
+  it("opens at the remembered width for its size only", () => {
+    localStorage.setItem("forgetop:pane:xl", "800");
+    const { unmount } = render(
+      <SlideOver onClose={() => {}} width="xl" header={<span>h</span>}>
+        body
+      </SlideOver>,
+    );
+    expect(screen.getByRole("region", { name: "Details" })).toHaveStyle({ width: "800px" });
+    unmount();
+    render(
+      <SlideOver onClose={() => {}} width="md" header={<span>h</span>}>
+        body
+      </SlideOver>,
+    );
+    expect(screen.getByRole("region", { name: "Details" }).style.width).toBe("");
+  });
+});
