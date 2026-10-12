@@ -22,6 +22,7 @@ Added
   parent in the browser. There the quick filter and Ctrl-K also find items by their parent's
   name, and an opened work item names its parent. The dashboard has the same grouping under a
   "Group" control, with a link to each parent.
+  ([#237](https://github.com/magna-nz/forgetop/pull/237))
 
 Changed
 
@@ -31,6 +32,7 @@ Changed
   if its repository was ticked. The repository count, the `w` picker and the "No repositories
   selected" message are gone from Work Items in both the terminal UI and the dashboard; Pull
   Requests and Pipelines keep them.
+  ([#237](https://github.com/magna-nz/forgetop/pull/237))
 
 Fixed
 
@@ -39,6 +41,7 @@ Fixed
   you picked when another on the same connection has the same number in a different repository,
   and dismissing one from the Command Center (`D`) no longer hides the other — or a pull request
   with that number. Dismissals you already saved keep hiding what they hid.
+  ([#237](https://github.com/magna-nz/forgetop/pull/237))
 
 ## 1.8.3 — 2026-10-12
 
