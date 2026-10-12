@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import type { ApprovalDecision, ConnectionRow, FileChange, HealthRow, LaunchpadResponse, NotifRow, PipeRef, PipelineAnnotation, PipelineArtifact, PipelineDetail, PipelineSelection, PipeRow, PrDecoration, PrDetail, PrRef, ProviderInfo, PrRow, RepositoryPage, User, WiDetail, WiRef, WiRow } from "./types";
 
@@ -28,7 +28,75 @@ async function api<T>(path: string): Promise<T> {
   if (!res.ok) {
     throw new ApiError(res.status, res.status === 401 ? "Unauthorized — reopen the dashboard from forgetop." : `${res.status} ${res.statusText}`);
   }
+  noteCacheHeader(path, res);
   return (await res.json()) as T;
+}
+
+// ---- the shared cache ----------------------------------------------------------------------
+//
+// A list the server answered from the cache it shares with the terminal UI carries this header
+// with the time that data was fetched. The page shows it at once, and while it is older than a
+// poll interval polls fast until a live answer (no header) replaces it.
+
+const FETCHED_AT_HEADER = "x-forgetop-fetched-at";
+/** How old a cached answer may be before the page treats it as stale and polls for a live one. */
+export const STALE_AFTER_MS = 30_000;
+const POLL_MS = 15_000;
+const STALE_POLL_MS = 2_000;
+
+/** path → when the data in the last answer was fetched, for answers that came from the cache. */
+const cachedAt = new Map<string, number>();
+const listeners = new Set<() => void>();
+
+function noteCacheHeader(path: string, res: Response) {
+  const at = res.headers?.get?.(FETCHED_AT_HEADER);
+  const t = at ? Date.parse(at) : NaN;
+  const before = cachedAt.get(path);
+  if (Number.isFinite(t)) cachedAt.set(path, t);
+  else cachedAt.delete(path);
+  if (before !== cachedAt.get(path)) listeners.forEach((l) => l());
+}
+
+/** Whether the last answer for `path` came from the cache and is older than `STALE_AFTER_MS`. */
+export function isStale(path: string, now = Date.now()): boolean {
+  const t = cachedAt.get(path);
+  return t != null && now - t > STALE_AFTER_MS;
+}
+
+/** The age of the oldest stale list on screen, in ms, or null when everything is live. */
+export function oldestStaleAgeMs(now = Date.now()): number | null {
+  let oldest: number | null = null;
+  for (const t of cachedAt.values()) {
+    if (now - t > STALE_AFTER_MS && (oldest === null || t < oldest)) oldest = t;
+  }
+  return oldest === null ? null : now - oldest;
+}
+
+const subscribe = (l: () => void) => {
+  listeners.add(l);
+  return () => {
+    listeners.delete(l);
+  };
+};
+let snapshot = 0;
+const bump = () => {
+  snapshot++;
+};
+listeners.add(bump);
+
+/** Re-renders when a list's cache status changes; returns the oldest stale age (see above). */
+export function useCacheStatus(): number | null {
+  useSyncExternalStore(subscribe, () => snapshot);
+  return oldestStaleAgeMs();
+}
+
+/** Query options for a polled list: fast polls while its last answer was stale from the cache. */
+function listQuery<T>(key: readonly unknown[], path: string) {
+  return {
+    queryKey: key,
+    queryFn: () => api<T>(path),
+    refetchInterval: () => (isStale(path) ? STALE_POLL_MS : POLL_MS),
+  };
 }
 
 /** GET a token-authenticated JSON endpoint (for lazy fetches outside the query cache). */
@@ -298,16 +366,14 @@ export const useConnectionRepositories = (connectionId: string | null) =>
     staleTime: 5 * 60_000,
   });
 
-export const useLaunchpad = () => useQuery({ queryKey: ["launchpad"], queryFn: () => api<LaunchpadResponse>("/api/launchpad") });
+export const useLaunchpad = () => useQuery(listQuery<LaunchpadResponse>(["launchpad"], "/api/launchpad"));
 export const useHealth = () => useQuery({ queryKey: ["health"], queryFn: () => api<HealthRow[]>("/api/health") });
 export const useProviders = () =>
   useQuery({ queryKey: ["providers"], queryFn: () => api<ProviderInfo[]>("/api/providers"), staleTime: Infinity });
 export const useConnections = () => useQuery({ queryKey: ["connections"], queryFn: () => api<ConnectionRow[]>("/api/connections") });
 /** Which slice of pull requests the PR page shows; maps to the backend `?view=` param. */
 export type PrView = "all" | "yours" | "merged" | "review_requested";
-export const usePullRequests = (view: PrView = "all") =>
-  useQuery({ queryKey: ["prs", view], queryFn: () => api<PrRow[]>(`/api/pull-requests?view=${view}`) });
-export const useWorkItems = () => useQuery({ queryKey: ["work-items"], queryFn: () => api<WiRow[]>("/api/work-items") });
-export const usePipelines = () => useQuery({ queryKey: ["pipelines"], queryFn: () => api<PipeRow[]>("/api/pipelines") });
-export const useNotifications = () =>
-  useQuery({ queryKey: ["notifications"], queryFn: () => api<NotifRow[]>("/api/notifications") });
+export const usePullRequests = (view: PrView = "all") => useQuery(listQuery<PrRow[]>(["prs", view], `/api/pull-requests?view=${view}`));
+export const useWorkItems = () => useQuery(listQuery<WiRow[]>(["work-items"], "/api/work-items"));
+export const usePipelines = () => useQuery(listQuery<PipeRow[]>(["pipelines"], "/api/pipelines"));
+export const useNotifications = () => useQuery(listQuery<NotifRow[]>(["notifications"], "/api/notifications"));

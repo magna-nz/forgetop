@@ -67,6 +67,14 @@ ls crates/forgetop-server/web/dist/assets/index-*.js                # local
 ## Conventions
 - **Two frontends, no logic fork.** Behaviour that both should share lives in `forgetop-core`
   (e.g. Command Center caps/ordering). Don't duplicate it in a frontend.
+- **One cache for both frontends.** `CacheStore` (`forgetop-core/src/cache.rs`, one `cache.json`
+  per install) is what the TUI paints at launch, and the dashboard reads and writes the same
+  entries under the TUI's keys (`list.work_items`, `list.pipelines`, `list.inbox`,
+  `list.prs.<Filter>.<completed>`, `list.launchpad.*`; the TUI-only `list.prs.pool` is read, never
+  written). The translation between the TUI's row shapes and the dashboard DTOs lives in
+  `forgetop-server/src/cached.rs` — change keys or shapes on both sides together. A list request
+  waits `FORGETOP_CACHE_WAIT_MS` (1.5s) for its live fetch, then answers from the cache with an
+  `x-forgetop-fetched-at` header while the fetch writes back; last writer wins.
 - **Scope discipline.** If a task says "dashboard" or "pane", change only the web dashboard —
   leave the TUI alone (and vice-versa).
 - **Verify live.** For any non-trivial dashboard change, run `--demo` and confirm the behaviour in

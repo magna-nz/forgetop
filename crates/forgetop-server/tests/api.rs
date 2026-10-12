@@ -44,7 +44,7 @@ async fn demo_deps(seed: bool) -> Deps {
     let resolver = Arc::new(ConnectionResolver::new(config.clone(), registry, secrets.clone()));
     let sections = Arc::new(SectionService::new(config.clone(), resolver.clone()));
     let health = Arc::new(ConnectionHealthService::new(config.clone(), resolver));
-    Deps { sections, health, config, secrets }
+    Deps { sections, health, config, secrets, cache: std::sync::Arc::new(forgetop_core::cache::CacheStore::disabled()) }
 }
 
 async fn empty_deps() -> Deps {

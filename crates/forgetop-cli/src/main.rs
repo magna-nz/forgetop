@@ -80,16 +80,22 @@ async fn run() -> Result<()> {
 
     let sections = Arc::new(SectionService::new(config.clone(), resolver.clone()));
     let health = Arc::new(ConnectionHealthService::new(config.clone(), resolver));
+    // Demo data is canned and instant, so it has nothing to gain from a cache — and a disabled
+    // store keeps `--demo` to its promise of writing nothing to disk. Both frontends share the
+    // one store: the TUI loads it at launch, a standalone dashboard loads it here.
+    let cache = Arc::new(if demo { CacheStore::disabled() } else { CacheStore::at_default_path() });
     let server_deps = forgetop_server::Deps {
         sections: sections.clone(),
         health: health.clone(),
         config: config.clone(),
         secrets: secrets.clone(),
+        cache: cache.clone(),
     };
 
     // Dashboard-only, and only when asked for explicitly: `forgetop --dashboard`. Runs the web UI
     // headless (no TUI, so no TTY needed). Plain `forgetop` always launches the TUI.
     if args.iter().any(|a| a == "--dashboard") {
+        cache.load().await;
         return forgetop_server::serve_blocking(server_deps, forgetop_server::DEFAULT_PORT, |url| {
             println!("forgetop dashboard: {url}\n(Ctrl-C to stop)");
             let _ = open::that(url);
@@ -111,9 +117,6 @@ async fn run() -> Result<()> {
     let dashboard_url = spawn_dashboard(server_deps).await;
 
     let theme = config.snapshot().ui.theme.clone().unwrap_or_else(|| "slate".into());
-    // Demo data is canned and instant, so it has nothing to gain from a cache — and a disabled
-    // store keeps `--demo` to its promise of writing nothing to disk.
-    let cache = Arc::new(if demo { CacheStore::disabled() } else { CacheStore::at_default_path() });
     let deps = AppDeps { sections, health, config, cache };
     forgetop_tui::run(deps, &theme, dashboard_url).await
 }
