@@ -169,11 +169,13 @@ describe("PrDetail action bar", () => {
     );
     expect(await screen.findByText("Timeline")).toBeInTheDocument();
     expect(screen.getByText("approved these changes")).toBeInTheDocument();
-    expect(screen.getByText("Reviewers")).toBeInTheDocument();
+    // Each reviewer is an avatar and their vote word; the name is there for assistive tech.
+    expect(screen.getByText("approved")).toBeInTheDocument();
+    expect(screen.getByText("requested changes")).toBeInTheDocument();
     expect(screen.getByText("Marcus Lee")).toBeInTheDocument();
   });
 
-  it("action bar checks badge shows failures and opens a checks popover", async () => {
+  it("the footer names the failed check, and opens the Checks tab", async () => {
     const d = detail("Open");
     d.checks = [
       { name: "build", status: "Passed", url: null },
@@ -185,7 +187,9 @@ describe("PrDetail action bar", () => {
         <Opener conn="c" id="1" />
       </PrDetailProvider>,
     );
-    await userEvent.click(await screen.findByRole("button", { name: /1 check failed/i }));
+    expect(await screen.findByRole("tab", { name: /Checks.*1 failed/ })).toBeInTheDocument();
+    await userEvent.click(await screen.findByRole("button", { name: /integration failed.*1 of 2 passed/i }));
+    expect(screen.getByRole("tab", { name: /Checks/ })).toHaveAttribute("aria-selected", "true");
     expect(await screen.findByRole("link", { name: /integration/i })).toHaveAttribute("href", "https://ci.test/integration");
   });
 
@@ -201,7 +205,7 @@ describe("PrDetail action bar", () => {
         <Opener conn="c" id="1" />
       </PrDetailProvider>,
     );
-    await userEvent.click(await screen.findByRole("button", { name: /files/i }));
+    await userEvent.click(await screen.findByRole("tab", { name: /files/i }));
     // First file's diff is shown by default (its header carries the full path).
     expect(await screen.findByText("src/a.rs")).toBeInTheDocument();
     // Clicking the second file in the list switches the shown diff.
@@ -223,7 +227,7 @@ describe("PrDetail action bar", () => {
         <Opener conn="c" id="1" />
       </PrDetailProvider>,
     );
-    await userEvent.click(await screen.findByRole("button", { name: /files/i }));
+    await userEvent.click(await screen.findByRole("tab", { name: /files/i }));
     // The diff header carries the full path, so it's distinct from the nav row's bare name.
     expect(await screen.findByText("src/alpha.rs")).toBeInTheDocument();
     expect(screen.queryByText("src/zebra.rs")).not.toBeInTheDocument();
@@ -243,7 +247,7 @@ describe("PrDetail action bar", () => {
         <Opener conn="c" id="1" />
       </PrDetailProvider>,
     );
-    await userEvent.click(await screen.findByRole("button", { name: /commits/i }));
+    await userEvent.click(await screen.findByRole("tab", { name: /commits/i }));
     await userEvent.click(await screen.findByRole("button", { name: /Add retry policy/i }));
     // Now on the Files tab, scoped to that commit's diff, with a way back.
     expect(await screen.findByText("Showing commit")).toBeInTheDocument();
@@ -263,7 +267,7 @@ describe("PrDetail action bar", () => {
         <Opener conn="c" id="1" />
       </PrDetailProvider>,
     );
-    await userEvent.click(await screen.findByRole("button", { name: /files/i }));
+    await userEvent.click(await screen.findByRole("tab", { name: /files/i }));
     const folder = await screen.findByRole("button", { name: /src/ });
     expect(folder).toHaveAttribute("aria-expanded", "true");
     expect(screen.getByRole("button", { name: /a\.rs/i })).toBeInTheDocument();
@@ -285,18 +289,18 @@ describe("PrDetail action bar", () => {
         <Opener conn="c" id="1" />
       </PrDetailProvider>,
     );
-    await userEvent.click(await screen.findByRole("button", { name: /files/i }));
+    await userEvent.click(await screen.findByRole("tab", { name: /files/i }));
     const folderBefore = await screen.findByRole("button", { name: /src/ });
     expect(folderBefore).toHaveAttribute("aria-expanded", "true");
 
     // Search down to one match, then fold "src" while that search is active.
-    await userEvent.type(await screen.findByPlaceholderText("Search files…"), "needle");
+    await userEvent.type(await screen.findByPlaceholderText("Filter files"), "needle");
     const folderDuring = await screen.findByRole("button", { name: /src/ });
     await userEvent.click(folderDuring);
     expect(folderDuring).toHaveAttribute("aria-expanded", "false");
 
     // Clearing the search restores the fold from before it — "src" is open again, both files back.
-    await userEvent.clear(screen.getByPlaceholderText("Search files…"));
+    await userEvent.clear(screen.getByPlaceholderText("Filter files"));
     const folderAfter = await screen.findByRole("button", { name: /src/ });
     expect(folderAfter).toHaveAttribute("aria-expanded", "true");
     expect(screen.getByRole("button", { name: /alpha\.rs/i })).toBeInTheDocument();
@@ -315,8 +319,8 @@ describe("PrDetail action bar", () => {
         <Opener conn="c" id="1" />
       </PrDetailProvider>,
     );
-    await userEvent.click(await screen.findByRole("button", { name: /files/i }));
-    await userEvent.type(await screen.findByPlaceholderText("Search files…"), "needle");
+    await userEvent.click(await screen.findByRole("tab", { name: /files/i }));
+    await userEvent.type(await screen.findByPlaceholderText("Filter files"), "needle");
     expect(await screen.findByText("1 hit")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /beta\.rs/i })).not.toBeInTheDocument();
     expect(screen.getByText("1 file hidden")).toBeInTheDocument();
@@ -333,7 +337,7 @@ describe("PrDetail action bar", () => {
         <Opener conn="c" id="1" />
       </PrDetailProvider>,
     );
-    await userEvent.click(await screen.findByRole("button", { name: /files/i }));
+    await userEvent.click(await screen.findByRole("tab", { name: /files/i }));
     expect(await screen.findByText(/old/)).toBeInTheDocument();
     expect(screen.getByText(/new/)).toBeInTheDocument();
     expect(screen.getByText("context")).toBeInTheDocument();
@@ -361,13 +365,13 @@ describe("PrDetail action bar", () => {
         <Opener conn="c" id="1" />
       </PrDetailProvider>,
     );
-    await userEvent.click(await screen.findByRole("button", { name: /files/i }));
+    await userEvent.click(await screen.findByRole("tab", { name: /files/i }));
     // The gap before the deletion-only hunk runs through its own line (2..5, inclusive).
-    await userEvent.click(await screen.findByText("⋯ 4 unchanged lines"));
+    await userEvent.click(await screen.findByText("4 unchanged lines"));
     expect(await screen.findByText("line2")).toBeInTheDocument();
     expect(screen.getByText("line5")).toBeInTheDocument();
     // The next gap starts right after it (6..8), not one line early.
-    await userEvent.click(await screen.findByText("⋯ 3 unchanged lines"));
+    await userEvent.click(await screen.findByText("3 unchanged lines"));
     expect(await screen.findByText("line6")).toBeInTheDocument();
     expect(screen.getByText("line8")).toBeInTheDocument();
   });
@@ -392,9 +396,9 @@ describe("PrDetail action bar", () => {
         <Opener conn="c" id="1" />
       </PrDetailProvider>,
     );
-    await userEvent.click(await screen.findByRole("button", { name: /files/i }));
+    await userEvent.click(await screen.findByRole("tab", { name: /files/i }));
     // The gap being clicked (lines 2-9) is itself well within bounds...
-    await userEvent.click(await screen.findByText("⋯ 8 unchanged lines"));
+    await userEvent.click(await screen.findByText("8 unchanged lines"));
     // ...but the file's text is still unusable: another hunk in the same file overflows it.
     expect(await screen.findByText("context isn't available for this file")).toBeInTheDocument();
   });
@@ -408,11 +412,11 @@ describe("PrDetail action bar", () => {
         <Opener conn="c" id="1" />
       </PrDetailProvider>,
     );
-    await userEvent.click(await screen.findByRole("button", { name: /files/i }));
+    await userEvent.click(await screen.findByRole("tab", { name: /files/i }));
     // Before the first hunk (which starts at line 5): lines 1-4.
-    expect(await screen.findByText("⋯ 4 unchanged lines")).toBeInTheDocument();
+    expect(await screen.findByText("4 unchanged lines")).toBeInTheDocument();
     // Between the two hunks: lines 6-19.
-    expect(await screen.findByText("⋯ 14 unchanged lines")).toBeInTheDocument();
+    expect(await screen.findByText("14 unchanged lines")).toBeInTheDocument();
   });
 
   it("Files tab: a gap row reveals 10 lines from each edge, leaving the middle collapsed", async () => {
@@ -425,8 +429,8 @@ describe("PrDetail action bar", () => {
         <Opener conn="c" id="1" />
       </PrDetailProvider>,
     );
-    await userEvent.click(await screen.findByRole("button", { name: /files/i }));
-    const gapRow = await screen.findByText("⋯ 25 unchanged lines");
+    await userEvent.click(await screen.findByRole("tab", { name: /files/i }));
+    const gapRow = await screen.findByText("25 unchanged lines");
     await userEvent.click(gapRow);
     // 10 lines revealed from the top edge (new lines 2-11) and from the bottom edge (17-26).
     expect(await screen.findByText("line2")).toBeInTheDocument();
@@ -434,7 +438,7 @@ describe("PrDetail action bar", () => {
     expect(screen.getByText("line17")).toBeInTheDocument();
     expect(screen.getByText("line26")).toBeInTheDocument();
     // The untouched middle (new lines 12-16) still collapses behind its own, smaller gap row.
-    const middleGap = await screen.findByText("⋯ 5 unchanged lines");
+    const middleGap = await screen.findByText("5 unchanged lines");
     await userEvent.click(middleGap);
     expect(await screen.findByText("line16")).toBeInTheDocument();
     expect(screen.queryByText(/unchanged lines/)).not.toBeInTheDocument();
@@ -450,8 +454,8 @@ describe("PrDetail action bar", () => {
         <Opener conn="c" id="1" />
       </PrDetailProvider>,
     );
-    await userEvent.click(await screen.findByRole("button", { name: /files/i }));
-    await screen.findByText("⋯ 25 unchanged lines");
+    await userEvent.click(await screen.findByRole("tab", { name: /files/i }));
+    await screen.findByText("25 unchanged lines");
     await userEvent.click(screen.getByRole("button", { name: "Show all 25 unchanged lines" }));
     expect(await screen.findByText("line16")).toBeInTheDocument();
     expect(await screen.findByText("line2")).toBeInTheDocument();
@@ -469,8 +473,8 @@ describe("PrDetail action bar", () => {
         <Opener conn="c" id="1" />
       </PrDetailProvider>,
     );
-    await userEvent.click(await screen.findByRole("button", { name: /files/i }));
-    await userEvent.click(await screen.findByText("⋯ 4 unchanged lines"));
+    await userEvent.click(await screen.findByRole("tab", { name: /files/i }));
+    await userEvent.click(await screen.findByText("4 unchanged lines"));
     expect(await screen.findByText("context isn't available for this file")).toBeInTheDocument();
   });
 
@@ -485,8 +489,8 @@ describe("PrDetail action bar", () => {
         <Opener conn="c" id="1" />
       </PrDetailProvider>,
     );
-    await userEvent.click(await screen.findByRole("button", { name: /files/i }));
-    await userEvent.click(await screen.findByText("⋯ 4 unchanged lines"));
+    await userEvent.click(await screen.findByRole("tab", { name: /files/i }));
+    await userEvent.click(await screen.findByText("4 unchanged lines"));
     expect(await screen.findByText("context isn't available for this file")).toBeInTheDocument();
   });
 
@@ -509,7 +513,7 @@ describe("PrDetail action bar", () => {
     );
 
     // Open the reply box on the thread, type, and send.
-    await userEvent.click(await screen.findByRole("button", { name: "↳ Reply" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Reply…" }));
     await userEvent.type(screen.getByPlaceholderText("Reply…"), "Good point");
     await userEvent.click(screen.getByRole("button", { name: "Reply" }));
 
@@ -564,7 +568,7 @@ describe("PrDetail action bar", () => {
     await userEvent.click(screen.getByRole("button", { name: "Comment" }));
     expect(await screen.findByText("Ship it")).toBeInTheDocument();
     expect(screen.getByText("Posting…")).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "↳ Reply" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Reply…" })).not.toBeInTheDocument();
     expect(posts.find((p) => p.url.includes("/api/pr/comment"))?.body).toMatchObject({ body: "Ship it" });
     post.release();
   });
@@ -629,8 +633,10 @@ describe("PrDetail action bar", () => {
       </PrDetailProvider>,
     );
 
+    // Convert to draft and Close are folded into the footer's More menu.
+    await userEvent.click(await screen.findByRole("button", { name: "More" }));
     expect(await screen.findByRole("button", { name: "Convert to draft" })).toBeInTheDocument();
-    await userEvent.click(screen.getByRole("button", { name: "Close" }));
+    await userEvent.click(screen.getByRole("button", { name: "Close pull request" }));
     expect(posts.some((p) => p.url.includes("/api/pr/closed"))).toBe(false);
     await userEvent.click(screen.getByRole("button", { name: "Confirm close" }));
     expect(posts.find((p) => p.url.includes("/api/pr/closed"))?.body).toMatchObject({ closed: true });
@@ -659,7 +665,7 @@ describe("PrDetail action bar", () => {
     await userEvent.click(screen.getByRole("button", { name: "Resolve" }));
     expect(posts.find((p) => p.url.includes("/api/pr/resolve-thread"))?.body).toMatchObject({ id: "1450", thread_id: "t-7", resolved: true });
     expect(await screen.findByText("Resolved")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Reopen" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Unresolve" })).toBeInTheDocument();
     expect(screen.getByText("Comments · 1 open")).toBeInTheDocument();
     post.release();
   });
@@ -719,7 +725,8 @@ describe("PrDetail action bar", () => {
     );
 
     const message = "GitHub currently does not support this feature";
-    for (const name of ["Convert to draft", "Close"]) {
+    await userEvent.click(await screen.findByRole("button", { name: "More" }));
+    for (const name of ["Convert to draft", "Close pull request"]) {
       const button = await screen.findByRole("button", { name });
       expect(button).toBeDisabled();
       await waitFor(() => expect(button).toHaveAttribute("title", message));
@@ -774,5 +781,62 @@ describe("PrDetail action bar", () => {
     const reopen = await screen.findByRole("button", { name: "Reopen" });
     expect(reopen).toBeDisabled();
     await waitFor(() => expect(reopen).toHaveAttribute("title", "GitHub currently does not support this feature"));
+  });
+
+  // ---- the redesigned pane: More menu, Viewed, Esc ----
+
+  it("More folds the rare state changes away and toggles them open and shut", async () => {
+    mockFetch({ get: { "/api/pr/detail": detail("Open") } });
+    renderWithClient(
+      <PrDetailProvider>
+        <Opener conn="c" id="1" />
+      </PrDetailProvider>,
+    );
+    const more = await screen.findByRole("button", { name: "More" });
+    expect(more).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByRole("button", { name: "Convert to draft" })).not.toBeInTheDocument();
+    await userEvent.click(more);
+    expect(more).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByRole("button", { name: "Convert to draft" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Close pull request" })).toBeInTheDocument();
+    await userEvent.click(more);
+    expect(more).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByRole("button", { name: "Close pull request" })).not.toBeInTheDocument();
+  });
+
+  it("Files tab: Viewed is ticked per file and counted in the file list", async () => {
+    const d = detail("Open");
+    d.changes = [
+      { path: "src/a.rs", kind: "Modified", additions: 1, deletions: 1, patch: "@@ -1 +1 @@\n-old\n+newA" },
+      { path: "src/b.rs", kind: "Added", additions: 2, deletions: 0, patch: "@@ -0,0 +1,2 @@\n+newB\n+two" },
+    ];
+    mockFetch({ get: { "/api/pr/detail": d } });
+    renderWithClient(
+      <PrDetailProvider>
+        <Opener conn="c" id="1" />
+      </PrDetailProvider>,
+    );
+    await userEvent.click(await screen.findByRole("tab", { name: /files/i }));
+    expect(await screen.findByText("0 of 2 viewed")).toBeInTheDocument();
+    await userEvent.click(screen.getByLabelText("Viewed"));
+    expect(screen.getByLabelText("Viewed")).toBeChecked();
+    expect(screen.getByText("1 of 2 viewed")).toBeInTheDocument();
+    // Another file has its own tick; the first keeps its own.
+    await userEvent.click(screen.getByRole("button", { name: /b\.rs/i }));
+    expect(screen.getByLabelText("Viewed")).not.toBeChecked();
+    await userEvent.click(screen.getByRole("button", { name: /a\.rs/i }));
+    expect(screen.getByLabelText("Viewed")).toBeChecked();
+  });
+
+  it("Esc closes the pane", async () => {
+    mockFetch({ get: { "/api/pr/detail": detail("Open") } });
+    renderWithClient(
+      <PrDetailProvider>
+        <Opener conn="c" id="1" />
+      </PrDetailProvider>,
+    );
+    expect(await screen.findByText("Cache the customer risk score")).toBeInTheDocument();
+    await userEvent.keyboard("{Escape}");
+    expect(screen.queryByText("Cache the customer risk score")).not.toBeInTheDocument();
   });
 });

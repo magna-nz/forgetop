@@ -1,14 +1,14 @@
-import { createContext, Fragment, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
-import { AnimatePresence, motion } from "framer-motion";
+import { createContext, Fragment, useCallback, useContext, useEffect, useId, useMemo, useState, type ReactNode } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { apiPost, prDetailKey, useConnections, usePrCommitChanges, usePrDetail, usePrFileText, usePrReviewers } from "../api";
-import { checkMeta, checkSummaryOf, prStateLine, prStatusMeta, relativeTime, voteMeta } from "../format";
+import { checkMeta, checkSummaryOf, providerMeta, prStateLine, prStatusMeta, relativeTime } from "../format";
 import { providerSupports, unsupportedMessage } from "../capabilities";
 import { parsePatch, type DiffLine } from "../diff";
 import { buildDiffTree, collectFiles, filterTree, findMatches, flattenTree, searchFiles, type DiffTreeFile, type DiffTreeFolder, type FileMatch } from "../diffTree";
 import { addPrReply, addPrThreads, isLocalId, localComment, localThread, meAsUser, patchPullRequest, setPrThreadResolved, withVote } from "../optimistic";
-import type { CheckRun, CommentThread, Commit, FileChange, FileChangeKind, LineComment, PrRef, PrWriteSupport, ProviderType, PullRequest, ReviewVote, Reviewer, TimelineEvent, User } from "../types";
-import { Avatar, Chip, Pill, StatusBadge, Timeline } from "./ui";
+import type { CheckRun, CheckStatus, CommentThread, Commit, FileChange, FileChangeKind, LineComment, PrRef, PrWriteSupport, ProviderType, PullRequest, ReviewVote, Reviewer, TimelineEvent, User } from "../types";
+import { Avatar, Button, Chip, GroupHeading, IconButton, PaneHeader, SlideOver, StatusBadge, StatusGlyph, Tabs, Timeline } from "./ui";
+import { Icon } from "./icons";
 
 // ---- opener context ----
 
@@ -21,20 +21,23 @@ export function PrDetailProvider({ children }: { children: ReactNode }) {
   return (
     <PrOpenerCtx.Provider value={open}>
       {children}
-      <AnimatePresence>{ref && <PrDetailPanel prRef={ref} onClose={() => setRef(null)} />}</AnimatePresence>
+      {ref && <PrDetailPanel prRef={ref} onClose={() => setRef(null)} />}
     </PrOpenerCtx.Provider>
   );
 }
 
 // ---- panel ----
 
-type Tab = "conversation" | "commits" | "files";
+type Tab = "conversation" | "commits" | "checks" | "files";
 
 /** What a detail without a `writes` field (an older server) supports: nothing optional. */
 const NO_WRITES: PrWriteSupport = { resolve_threads: false, draft: false, close: false, reopen: false, request_reviewer: false };
 
 /** Signature of a thread resolve/reopen handler; absent where the provider can't do it. */
 type OnResolve = (threadId: string, resolved: boolean) => void;
+
+/** A muted middle-dot separator for the header's meta lines. */
+const Sep = () => <span style={{ color: "var(--fg3)" }}>·</span>;
 
 function PrDetailPanel({ prRef, onClose }: { prRef: PrRef; onClose: () => void }) {
   const { data, isLoading, error } = usePrDetail(prRef);
@@ -45,6 +48,8 @@ function PrDetailPanel({ prRef, onClose }: { prRef: PrRef; onClose: () => void }
   const [pending, setPending] = useState<LineComment[]>([]);
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState<string | null>(null);
+  // The footer's "More" menu: the rare state changes (convert to draft, close).
+  const [moreOpen, setMoreOpen] = useState(false);
   // When set, the Files tab shows a single commit's diff instead of the whole-PR changes.
   const [commitScope, setCommitScope] = useState<{ sha: string; label: string } | null>(null);
   const commitChanges = usePrCommitChanges(prRef, commitScope?.sha ?? null);
@@ -56,6 +61,8 @@ function PrDetailPanel({ prRef, onClose }: { prRef: PrRef; onClose: () => void }
     return () => clearTimeout(t);
   }, [confirmClose]);
 
+  // Esc and the pane's ✕ both come through here (SlideOver owns the key listener), so
+  // unsubmitted comments are guarded either way.
   const requestClose = () => {
     if (pending.length > 0 && !window.confirm(`Discard ${pending.length} unsubmitted comment(s)?`)) return;
     onClose();
@@ -67,17 +74,8 @@ function PrDetailPanel({ prRef, onClose }: { prRef: PrRef; onClose: () => void }
     setNote(null);
     setCommitScope(null);
     setConfirmClose(false);
+    setMoreOpen(false);
   }, [prRef.conn, prRef.id]);
-
-  // Esc closes (guarding unsubmitted comments via requestClose).
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") requestClose();
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pending.length]);
 
   const refresh = () => {
     qc.invalidateQueries({ queryKey: prDetailKey(prRef) });
@@ -238,312 +236,351 @@ function PrDetailPanel({ prRef, onClose }: { prRef: PrRef; onClose: () => void }
   const pr = data?.pull_request;
   const isDraft = !!pr && (pr.status === "Draft" || pr.is_draft);
   const onResolve = writes.resolve_threads ? resolveThread : undefined;
+  const status = pr ? prStatusMeta(pr) : null;
+  const providerLabel = provider ? providerMeta(provider).label : "provider";
+  const failedChecks = data ? data.checks.filter((c) => c.status === "Failed").length : 0;
 
-  return (
-    <motion.div
-      className="fixed inset-0 z-40 flex justify-end"
-      style={{ background: "rgba(0,0,0,0.5)" }}
-      initial={{ opacity: 0 }}
-      animate={{ opacity: 1 }}
-      exit={{ opacity: 0 }}
-      transition={{ duration: 0.15 }}
-      onClick={requestClose}
-    >
-      <motion.div
-        initial={{ x: 40, opacity: 0.6 }}
-        animate={{ x: 0, opacity: 1 }}
-        exit={{ x: 40, opacity: 0 }}
-        transition={{ duration: 0.22, ease: "easeOut" }}
-        onClick={(e) => e.stopPropagation()}
-        className="flex flex-col h-full w-full max-w-4xl"
-        style={{ background: "var(--bg)", borderLeft: "1px solid var(--border)" }}
-      >
-        {/* header */}
-        <div className="flex items-start gap-3 px-5 py-3.5 shrink-0" style={{ borderBottom: "1px solid var(--border)" }}>
-          {pr && <Pill icon={prStatusMeta(pr).icon} label={prStatusMeta(pr).label} color={prStatusMeta(pr).color} />}
-          <div className="flex-1 min-w-0">
-            <div className="font-medium truncate" style={{ color: "var(--fg)" }}>
-              {pr?.title ?? (isLoading ? "Loading…" : "Pull request")}
-            </div>
-            {pr && (
-              <div className="flex items-center gap-2 mt-1 text-xs" style={{ color: "var(--dim)" }}>
-                {pr.number != null && <span className="mono">#{pr.number}</span>}
-                {pr.source_ref && (
-                  <Chip>
-                    {shortRef(pr.source_ref)} → {shortRef(pr.target_ref) || "?"}
-                  </Chip>
-                )}
-                <span>{relativeTime(pr.updated_at)}</span>
-              </div>
-            )}
-          </div>
-          {pr?.url && (
-            <a href={pr.url} target="_blank" rel="noreferrer" title="Open in provider" className="text-sm px-2 py-1" style={{ color: "var(--dim)" }}>
-              ↗
+  const header = (
+    <>
+      <PaneHeader
+        glyph={status?.glyph}
+        color={status?.color}
+        title={pr?.title ?? (isLoading ? "Loading…" : "Pull request")}
+        ident={pr?.number != null ? `#${pr.number}` : undefined}
+        actions={
+          pr?.url ? (
+            // A link out, so a real anchor dressed as the icon button.
+            <a
+              href={pr.url}
+              target="_blank"
+              rel="noreferrer"
+              aria-label={`Open on ${providerLabel}`}
+              title={`Open on ${providerLabel}`}
+              className="ft-btn ft-btn-icon"
+            >
+              <Icon name="external" size={15} />
             </a>
-          )}
-          <button onClick={requestClose} className="text-lg px-2 leading-none" style={{ color: "var(--dim)" }} title="Close (Esc)">
-            ✕
-          </button>
-        </div>
-
-        {error && <div className="p-6 text-sm" style={{ color: "var(--red)" }}>Couldn't load this pull request.</div>}
-
-        {pr && data && (
-          <>
-            <StateLine pr={pr} checks={data.checks} />
-
-            <MetaBar
-              author={pr.author.display_name}
+          ) : undefined
+        }
+      >
+        {pr && data && <MetaLine pr={pr} changes={data.changes} />}
+      </PaneHeader>
+      {pr && data && (
+        <StateLine
+          pr={pr}
+          checks={data.checks}
+          request={
+            <RequestReviewer
+              prRef={prRef}
+              author={pr.author}
               reviewers={pr.reviewers}
-              request={
-                <RequestReviewer
-                  prRef={prRef}
-                  author={pr.author}
-                  reviewers={pr.reviewers}
-                  supported={writes.request_reviewer}
-                  unsupportedTitle={unsupported}
-                  busy={busy}
-                  onPick={requestReviewer}
-                />
-              }
+              supported={writes.request_reviewer}
+              unsupportedTitle={unsupported}
+              busy={busy}
+              onPick={requestReviewer}
             />
+          }
+        />
+      )}
+      {pr && data && (
+        // Pulled down onto the header's hairline, so the active tab's underline sits on it.
+        <Tabs
+          label="Pull request sections"
+          className="mt-3.5 -mb-3"
+          value={tab}
+          onChange={setTab}
+          tabs={[
+            { id: "conversation", label: "Conversation", count: data.threads.filter((t) => !t.file_path).length },
+            { id: "commits", label: "Commits", count: data.commits.length },
+            {
+              id: "checks",
+              label: "Checks",
+              count: failedChecks > 0 ? `${failedChecks} failed` : data.checks.length,
+              countColor: failedChecks > 0 ? "var(--red)" : undefined,
+            },
+            { id: "files", label: "Files", count: data.changes.length },
+          ]}
+        />
+      )}
+    </>
+  );
 
-            {/* tabs */}
-            <div className="flex items-center gap-1 px-4 shrink-0" style={{ borderBottom: "1px solid var(--border)" }}>
-              {(["conversation", "commits", "files"] as Tab[]).map((t) => (
-                <button
-                  key={t}
-                  onClick={() => setTab(t)}
-                  className="px-3 py-2 text-sm capitalize rounded-t-md transition-colors"
-                  style={{
-                    color: tab === t ? "var(--fg)" : "var(--dim)",
-                    borderBottom: tab === t ? "2px solid var(--accent)" : "2px solid transparent",
-                  }}
-                  onMouseEnter={(e) => {
-                    e.currentTarget.style.background = "var(--card)";
-                    if (tab !== t) e.currentTarget.style.color = "var(--fg)";
-                  }}
-                  onMouseLeave={(e) => {
-                    e.currentTarget.style.background = "transparent";
-                    if (tab !== t) e.currentTarget.style.color = "var(--dim)";
+  const footer =
+    pr && data ? (
+      <div className="flex items-center gap-2 flex-wrap w-full min-w-0">
+        <div className="flex items-center gap-3 min-w-0 flex-wrap">
+          <ChecksSummary checks={data.checks} provider={provider} onOpen={() => setTab("checks")} />
+          {pr.status !== "Merged" && pr.status !== "Closed" && pending.length > 0 && (
+            <>
+              <span className="inline-flex items-center gap-1.5 text-[12.5px]" style={{ color: "var(--fg2)" }}>
+                <StatusGlyph glyph="comment" color="var(--yellow)" />
+                <span className="num">{pending.length} pending</span>
+              </span>
+              <Button disabled={busy} onClick={() => submitReview("NoVote")}>
+                Submit comments
+              </Button>
+            </>
+          )}
+          {note && (
+            <span className="text-[12.5px]" style={{ color: noteColor(note) }}>
+              {note}
+            </span>
+          )}
+        </div>
+        <div className="ml-auto flex items-center gap-1.5 shrink-0">
+          {pr.status === "Merged" ? (
+            <Button disabled={busy} onClick={revert}>
+              Revert
+            </Button>
+          ) : pr.status === "Closed" ? (
+            <Button primary disabled={busy || !writes.reopen} title={gate(writes.reopen)} onClick={reopenPr}>
+              Reopen
+            </Button>
+          ) : pending.length > 0 ? (
+            <>
+              <Button disabled={busy} onClick={() => submitReview("Rejected")}>
+                Request changes
+              </Button>
+              <Button primary disabled={busy} onClick={() => submitReview("Approved")}>
+                Approve
+              </Button>
+            </>
+          ) : isDraft ? (
+            <Button primary disabled={busy || !writes.draft} title={gate(writes.draft)} onClick={markReady}>
+              Ready for review
+            </Button>
+          ) : (
+            <>
+              <MoreMenu open={moreOpen} onToggle={setMoreOpen}>
+                <Button
+                  quiet
+                  style={MENU_ITEM}
+                  disabled={busy || !writes.draft}
+                  title={gate(writes.draft)}
+                  onClick={() => {
+                    setMoreOpen(false);
+                    convertToDraft();
                   }}
                 >
-                  {t}
-                  {t === "files" && ` (${data.changes.length})`}
-                  {t === "commits" && ` (${data.commits.length})`}
-                </button>
-              ))}
-            </div>
-
-            <div className="flex-1 overflow-auto">
-              {tab === "files" && (
-                <FilesTab
-                  key={commitScope?.sha ?? "all"}
-                  prRef={prRef}
-                  sha={commitScope?.sha ?? null}
-                  changes={commitScope ? (commitChanges.data ?? []) : data.changes}
-                  threads={data.threads}
-                  pending={pending}
-                  busy={busy}
-                  onReply={reply}
-                  onResolve={onResolve}
-                  onAddPending={(c) => setPending((p) => [...p, c])}
-                  onRemovePending={(i) => setPending((p) => p.filter((_, k) => k !== i))}
-                  scope={
-                    commitScope
-                      ? { label: commitScope.label, loading: commitChanges.isLoading, onClear: () => setCommitScope(null) }
-                      : undefined
-                  }
-                />
-              )}
-              {tab === "conversation" && (
-                <ConversationTab
-                  threads={data.threads}
-                  description={pr.description}
-                  timeline={data.timeline}
-                  busy={busy}
-                  onReply={reply}
-                  onResolve={onResolve}
-                  onComment={comment}
-                />
-              )}
-              {tab === "commits" && (
-                <CommitsTab
-                  commits={data.commits}
-                  onSelect={(sha, label) => {
-                    setCommitScope({ sha, label });
-                    setTab("files");
-                  }}
-                />
-              )}
-            </div>
-
-            {/* action bar */}
-            <div className="flex items-center gap-2 px-4 py-3 shrink-0 flex-wrap" style={{ borderTop: "1px solid var(--border)" }}>
-              <ChecksBadge
-                checks={data.checks}
-                provider={provider}
-                onUnsupported={() => provider && setNote(unsupportedMessage(provider))}
-              />
-              {pr.status === "Merged" ? (
-                <div className="ml-auto flex gap-2">
-                  <ActionButton disabled={busy} onClick={revert} label="Revert" color="var(--red)" primary />
-                </div>
-              ) : pr.status === "Closed" ? (
-                <div className="ml-auto flex gap-2">
-                  <ActionButton disabled={busy || !writes.reopen} title={gate(writes.reopen)} onClick={reopenPr} label="Reopen" color="var(--green)" primary />
-                </div>
-              ) : pending.length > 0 ? (
-                <>
-                  <span className="text-sm" style={{ color: "var(--accent)" }}>
-                    {pending.length} pending comment{pending.length > 1 ? "s" : ""}
-                  </span>
-                  <div className="ml-auto flex gap-2">
-                    <ActionButton disabled={busy} onClick={() => submitReview("NoVote")} label="Submit comments" />
-                    <ActionButton disabled={busy} onClick={() => submitReview("Rejected")} label="Request changes" color="var(--red)" />
-                    <ActionButton disabled={busy} onClick={() => submitReview("Approved")} label="Approve" color="var(--green)" primary />
-                  </div>
-                </>
-              ) : isDraft ? (
-                <div className="ml-auto flex gap-2">
-                  <ActionButton
-                    disabled={busy || !writes.draft}
-                    title={gate(writes.draft)}
-                    onClick={markReady}
-                    label="Ready for review"
-                    color="var(--green)"
-                    primary
-                  />
-                </div>
-              ) : (
-                <div className="ml-auto flex gap-2 flex-wrap justify-end">
-                  <ActionButton disabled={busy || !writes.draft} title={gate(writes.draft)} onClick={convertToDraft} label="Convert to draft" />
-                  <ActionButton
+                  Convert to draft
+                </Button>
+                {confirmClose ? (
+                  <Button
+                    danger
+                    style={MENU_ITEM}
                     disabled={busy || !writes.close}
-                    title={gate(writes.close) ?? (confirmClose ? "Click again to close without merging" : "Close without merging")}
-                    onClick={confirmClose ? closePr : () => setConfirmClose(true)}
-                    label={confirmClose ? "Confirm close" : "Close"}
-                    color="var(--red)"
-                    primary={confirmClose}
-                  />
-                  <ActionButton disabled={busy} onClick={() => vote("Rejected")} label="Request changes" color="var(--red)" />
-                  <ActionButton disabled={busy} onClick={() => vote("Approved")} label="Approve" color="var(--green)" />
-                  <ActionButton
-                    disabled={busy || pr.mergeable === "Conflicting" || pr.mergeable === "Blocked"}
-                    title={
-                      pr.mergeable === "Conflicting"
-                        ? "This PR has merge conflicts"
-                        : pr.mergeable === "Blocked"
-                          ? "This PR is blocked (branch policy or draft)"
-                          : undefined
-                    }
-                    onClick={merge}
-                    label="Merge"
-                    color="var(--magenta)"
-                    primary
-                  />
-                </div>
-              )}
-            </div>
-            {note && (
-              <div className="px-4 pb-2 text-xs" style={{ color: noteColor(note) }}>
-                {note}
-              </div>
-            )}
-          </>
-        )}
-      </motion.div>
-    </motion.div>
-  );
-}
+                    title={gate(writes.close) ?? "Click again to close without merging"}
+                    onClick={() => {
+                      setMoreOpen(false);
+                      closePr();
+                    }}
+                  >
+                    Confirm close
+                  </Button>
+                ) : (
+                  <Button
+                    quiet
+                    style={MENU_ITEM}
+                    disabled={busy || !writes.close}
+                    title={gate(writes.close) ?? "Close without merging"}
+                    onClick={() => setConfirmClose(true)}
+                  >
+                    Close pull request
+                  </Button>
+                )}
+              </MoreMenu>
+              <Button disabled={busy} onClick={() => vote("Rejected")}>
+                Request changes
+              </Button>
+              <Button disabled={busy} onClick={() => vote("Approved")}>
+                Approve
+              </Button>
+              <Button
+                primary
+                disabled={busy || pr.mergeable === "Conflicting" || pr.mergeable === "Blocked"}
+                title={
+                  pr.mergeable === "Conflicting"
+                    ? "This PR has merge conflicts"
+                    : pr.mergeable === "Blocked"
+                      ? "This PR is blocked (branch policy or draft)"
+                      : undefined
+                }
+                onClick={merge}
+              >
+                Merge
+              </Button>
+            </>
+          )}
+        </div>
+      </div>
+    ) : undefined;
 
-/** A done note is green, one still under way dim, anything else is an error. */
-const noteColor = (note: string) => (note.endsWith("✓") ? "var(--green)" : note.endsWith("…") ? "var(--dim)" : "var(--red)");
-
-function ActionButton({
-  label,
-  onClick,
-  disabled,
-  color = "var(--fg)",
-  primary = false,
-  title,
-}: {
-  label: string;
-  onClick: () => void;
-  disabled?: boolean;
-  color?: string;
-  primary?: boolean;
-  title?: string;
-}) {
   return (
-    <button
-      onClick={onClick}
-      disabled={disabled}
-      title={title}
-      className="rounded-md px-3 py-1.5 text-sm font-medium transition-opacity"
-      style={{
-        color: primary ? "#12151b" : color,
-        background: primary ? color : "var(--panel2)",
-        border: `1px solid ${primary ? color : "var(--border)"}`,
-        opacity: disabled ? 0.45 : 1,
-        cursor: disabled ? "not-allowed" : "pointer",
-      }}
-    >
-      {label}
-    </button>
+    <SlideOver width="xl" label="Pull request" onClose={requestClose} header={header} footer={footer}>
+      {error && (
+        <div className="px-5 py-6 text-[13px]" style={{ color: "var(--red)" }}>
+          Couldn't load this pull request.
+        </div>
+      )}
+      {pr && data && (
+        <>
+          {tab === "files" && (
+            <FilesTab
+              key={commitScope?.sha ?? "all"}
+              prRef={prRef}
+              sha={commitScope?.sha ?? null}
+              changes={commitScope ? (commitChanges.data ?? []) : data.changes}
+              threads={data.threads}
+              pending={pending}
+              busy={busy}
+              onReply={reply}
+              onResolve={onResolve}
+              onAddPending={(c) => setPending((p) => [...p, c])}
+              onRemovePending={(i) => setPending((p) => p.filter((_, k) => k !== i))}
+              scope={
+                commitScope ? { label: commitScope.label, loading: commitChanges.isLoading, onClear: () => setCommitScope(null) } : undefined
+              }
+            />
+          )}
+          {tab === "conversation" && (
+            <ConversationTab
+              threads={data.threads}
+              description={pr.description}
+              timeline={data.timeline}
+              busy={busy}
+              onReply={reply}
+              onResolve={onResolve}
+              onComment={comment}
+            />
+          )}
+          {tab === "commits" && (
+            <CommitsTab
+              commits={data.commits}
+              onSelect={(sha, label) => {
+                setCommitScope({ sha, label });
+                setTab("files");
+              }}
+            />
+          )}
+          {tab === "checks" && <ChecksTab checks={data.checks} provider={provider} />}
+        </>
+      )}
+    </SlideOver>
   );
 }
 
-/** The header meta bar: who opened the PR + the reviewers with their vote marks (✓ / ✗ / ·). */
+/** A done note is green, one still under way muted, anything else is an error. */
+const noteColor = (note: string) => (note.endsWith("✓") ? "var(--green)" : note.endsWith("…") ? "var(--fg3)" : "var(--red)");
+
+/** A footer-menu entry: a quiet button stretched to the menu's width, label on the left. */
+const MENU_ITEM = { width: "100%", justifyContent: "flex-start" } as const;
+
+/** "More ▾": the rare actions, folded out of the footer. Opens upward (the footer is at the
+ *  bottom of the pane); a click anywhere else closes it. */
+function MoreMenu({ open, onToggle, children }: { open: boolean; onToggle: (open: boolean) => void; children: ReactNode }) {
+  return (
+    <span className="relative inline-flex">
+      <Button quiet aria-expanded={open} onClick={() => onToggle(!open)}>
+        More
+        <Icon name="chevron-down" size={12} />
+      </Button>
+      {open && (
+        <>
+          <div className="fixed inset-0" style={{ zIndex: 20 }} onClick={() => onToggle(false)} />
+          <div
+            className="absolute right-0 bottom-full mb-1.5 flex flex-col gap-0.5 rounded-md p-1 shadow-lg"
+            style={{ zIndex: 21, minWidth: 190, background: "var(--raised)", border: "1px solid var(--border-strong)" }}
+          >
+            {children}
+          </div>
+        </>
+      )}
+    </span>
+  );
+}
+
+/** The header's second line: who opened it and when, the branches, and the size of the change. */
+function MetaLine({ pr, changes }: { pr: PullRequest; changes: FileChange[] }) {
+  // The PR's own counts, or the changes' when the provider didn't fill them in.
+  const fromChanges = pr.changed_files === 0 && changes.length > 0;
+  const files = fromChanges ? changes.length : pr.changed_files;
+  const adds = fromChanges ? changes.reduce((n, c) => n + c.additions, 0) : pr.additions;
+  const dels = fromChanges ? changes.reduce((n, c) => n + c.deletions, 0) : pr.deletions;
+  const age = relativeTime(pr.created_at);
+  return (
+    <>
+      <Avatar name={pr.author.display_name} size={20} />
+      <span>
+        {pr.author.display_name} opened{age ? ` ${age}` : ""}
+      </span>
+      {pr.source_ref && (
+        <>
+          <Sep />
+          <Chip>{shortRef(pr.source_ref)}</Chip>
+          <Icon name="arrow-right" size={12} style={{ color: "var(--fg3)" }} />
+          <Chip>{shortRef(pr.target_ref) || "?"}</Chip>
+        </>
+      )}
+      <Sep />
+      <span className="num">
+        {files} file{files === 1 ? "" : "s"}
+      </span>
+      <span className="num" style={{ color: "var(--green)" }}>
+        +{adds}
+      </span>
+      <span className="num" style={{ color: "var(--red)" }}>
+        −{dels}
+      </span>
+    </>
+  );
+}
+
+/** A reviewer's vote, as the word the header line uses. */
+function voteWord(vote: ReviewVote): string {
+  switch (vote) {
+    case "Approved":
+    case "ApprovedWithSuggestions":
+      return "approved";
+    case "Rejected":
+      return "requested changes";
+    case "WaitingForAuthor":
+      return "waiting";
+    case "NoVote":
+      return "pending";
+  }
+}
+
 /** Where this pull request stands, in one line — the same verdict the TUI shows above its tabs,
- *  and the same one the Command Center row and the PR list abbreviate. Without it the panel made
- *  you assemble the answer from the reviewer icons, the merge button's tooltip and the checks
- *  badge. */
-function StateLine({ pr, checks }: { pr: PullRequest; checks: CheckRun[] }) {
+ *  and the same one the Command Center row and the PR list abbreviate — followed by who is
+ *  reviewing and how they voted, and the control to ask someone else. */
+function StateLine({ pr, checks, request }: { pr: PullRequest; checks: CheckRun[]; request: ReactNode }) {
   // The detail endpoint returns the runs but not always the summary; completing it here lets the
   // line say "1 of 8 failed" instead of just "failing". The judgement itself is unchanged.
   const withSummary = pr.check_summary ?? (checks.length > 0 ? checkSummaryOf(checks) : null);
-  const { icon, text, color } = prStateLine({ ...pr, check_summary: withSummary });
+  const { glyph, text, color } = prStateLine({ ...pr, check_summary: withSummary });
   return (
-    <div
-      className="flex items-center gap-2 px-5 py-2 text-sm font-medium shrink-0"
-      style={{ color, borderBottom: "1px solid var(--border)" }}
-    >
-      <span aria-hidden="true">{icon}</span>
-      <span>{text}</span>
+    <div className="flex items-center gap-2 flex-wrap mt-2.5 text-[12.5px]">
+      <StatusGlyph glyph={glyph} color={color} />
+      <span style={{ color }}>{text}</span>
+      <Sep />
+      {pr.reviewers.map((r: Reviewer, i) => {
+        const word = voteWord(r.vote);
+        return (
+          <span key={i} className="inline-flex items-center gap-1.5" style={{ color: "var(--fg2)" }} title={`${r.user.display_name} — ${word}`}>
+            <Avatar name={r.user.display_name} size={16} />
+            <span className="sr-only">{r.user.display_name}</span>
+            {word}
+          </span>
+        );
+      })}
+      {request}
     </div>
   );
 }
 
-function MetaBar({ author, reviewers, request }: { author: string; reviewers: Reviewer[]; request?: ReactNode }) {
-  return (
-    <div className="flex items-center gap-x-5 gap-y-1 px-5 py-2.5 flex-wrap text-xs shrink-0" style={{ borderBottom: "1px solid var(--border)", color: "var(--dim)" }}>
-      <span className="flex items-center gap-1.5">
-        <Avatar name={author} size={18} /> opened by <span style={{ color: "var(--fg)" }}>{author}</span>
-      </span>
-      {(reviewers.length > 0 || request) && (
-        <span className="flex items-center gap-x-3 gap-y-1 flex-wrap">
-          <span className="uppercase tracking-wider text-[10px]">Reviewers</span>
-          {reviewers.map((r, i) => {
-            const v = voteMeta(r.vote);
-            return (
-              <span key={i} className="flex items-center gap-1" title={`${r.user.display_name} — ${v.label}`}>
-                <span className="w-3 text-center" style={{ color: r.vote === "NoVote" ? "var(--dim)" : v.color }}>{r.vote === "NoVote" ? "·" : v.icon}</span>
-                <span style={{ color: "var(--fg)" }}>{r.user.display_name}</span>
-              </span>
-            );
-          })}
-          {request}
-        </span>
-      )}
-    </div>
-  );
-}
-
-/** "Request reviewer ▾": a searchable menu of the people who can review this PR, fetched the
- *  first time it opens and kept for the session. The author is left out (no forge lets you
- *  review your own PR); anyone already reviewing is listed but can't be picked again. */
+/** "+ reviewer": a searchable menu of the people who can review this PR, fetched the first time
+ *  it opens and kept for the session. The author is left out (no forge lets you review your own
+ *  PR); anyone already reviewing is listed but can't be picked again. */
 function RequestReviewer({
   prRef,
   author,
@@ -581,66 +618,76 @@ function RequestReviewer({
   };
 
   return (
-    <span className="relative">
-      <button
+    <span className="relative inline-flex">
+      <Button
+        quiet
+        sm
+        icon="plus"
+        aria-label="Request reviewer"
+        aria-expanded={open}
         onClick={() => {
           setWanted(true);
           setOpen((o) => !o);
         }}
         disabled={disabled}
         title={supported ? "Ask someone to review this pull request" : unsupportedTitle}
-        className="rounded px-1.5 py-0.5"
-        style={{
-          color: "var(--dim)",
-          border: "1px solid var(--border)",
-          background: "var(--panel2)",
-          opacity: supported ? 1 : 0.55,
-          cursor: disabled ? "not-allowed" : "pointer",
-        }}
       >
-        Request reviewer ▾
-      </button>
+        reviewer
+      </Button>
       {open && (
         <>
           <div className="fixed inset-0" style={{ zIndex: 20 }} onClick={close} />
           <div
-            className="absolute left-0 top-full mt-1 w-60 rounded-md py-1 shadow-lg normal-case tracking-normal"
-            style={{ zIndex: 21, background: "var(--panel)", border: "1px solid var(--border)" }}
+            className="absolute left-0 top-full mt-1 w-64 rounded-md py-1 shadow-lg"
+            style={{ zIndex: 21, background: "var(--raised)", border: "1px solid var(--border-strong)" }}
           >
-            <div className="px-2 pb-1">
+            <div className="px-1.5 pb-1">
               <input
                 autoFocus
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
                 placeholder="Search people…"
-                className="w-full rounded px-2 py-1 text-xs outline-none"
-                style={{ background: "var(--bg)", color: "var(--fg)", border: "1px solid var(--border)" }}
+                aria-label="Search people"
+                className="ft-input w-full"
               />
             </div>
-            <div className="max-h-56 overflow-auto">
-              {users.isLoading && <div className="px-3 py-1.5" style={{ color: "var(--dim)" }}>Loading…</div>}
-              {users.isError && <div className="px-3 py-1.5" style={{ color: "var(--red)" }}>Couldn't load reviewers</div>}
+            <div className="max-h-56 overflow-auto text-[12.5px]">
+              {users.isLoading && (
+                <div className="px-3 py-1.5" style={{ color: "var(--fg3)" }}>
+                  Loading…
+                </div>
+              )}
+              {users.isError && (
+                <div className="px-3 py-1.5" style={{ color: "var(--red)" }}>
+                  Couldn't load reviewers
+                </div>
+              )}
               {!users.isLoading && !users.isError && list.length === 0 && (
-                <div className="px-3 py-1.5" style={{ color: "var(--dim)" }}>No one to request</div>
+                <div className="px-3 py-1.5" style={{ color: "var(--fg3)" }}>
+                  No one to request
+                </div>
               )}
               {list.map((u) => {
                 const requested = already.has(u.id);
                 return (
                   <button
                     key={u.id}
+                    type="button"
                     disabled={requested || busy}
                     onClick={() => {
                       onPick(u);
                       close();
                     }}
-                    className="flex items-center gap-2 w-full text-left px-3 py-1.5"
-                    style={{ color: requested ? "var(--dim)" : "var(--fg)", cursor: requested ? "default" : "pointer" }}
-                    onMouseEnter={(e) => !requested && (e.currentTarget.style.background = "var(--sel)")}
-                    onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+                    className={`flex items-center gap-2 w-full text-left px-3 ${requested ? "" : "hover:bg-[var(--hover)]"}`}
+                    style={{ height: 30, color: requested ? "var(--fg3)" : "var(--fg)", cursor: requested ? "default" : "pointer" }}
                   >
                     <Avatar name={u.display_name} size={18} />
                     <span className="flex-1 truncate">{u.display_name}</span>
-                    {requested && <span className="text-[10px] shrink-0">reviewing</span>}
+                    {requested && (
+                      <span className="text-[12px] shrink-0" style={{ color: "var(--fg3)" }}>
+                        reviewing
+                      </span>
+                    )}
                   </button>
                 );
               })}
@@ -652,60 +699,69 @@ function RequestReviewer({
   );
 }
 
-/** Action-bar checks badge: green "all passed" / red "N failed"; click opens a popover of every
- *  check. Greyed with the standard message when the provider can't report checks. */
-function ChecksBadge({ checks, provider, onUnsupported }: { checks: CheckRun[]; provider: ProviderType | undefined; onUnsupported: () => void }) {
-  const [open, setOpen] = useState(false);
+/** Footer, left: what failed, and how many passed. Clicking it opens the Checks tab. Nothing when
+ *  no check failed (the state line and the Checks tab carry the rest). */
+function ChecksSummary({ checks, provider, onOpen }: { checks: CheckRun[]; provider: ProviderType | undefined; onOpen: () => void }) {
   const supported = provider ? providerSupports(provider, "checks") : true;
-  const base = "flex items-center gap-1.5 rounded-md px-2.5 py-1 text-xs font-medium whitespace-nowrap";
-  if (!supported) {
-    return (
-      <button onClick={onUnsupported} title={provider ? unsupportedMessage(provider) : undefined} className={base} style={{ opacity: 0.55, cursor: "not-allowed", color: "var(--dim)", border: "1px solid var(--border)", background: "var(--panel2)" }}>
-        Checks
-      </button>
-    );
-  }
-  if (checks.length === 0) {
-    return <span className={base} style={{ color: "var(--dim)", border: "1px solid var(--border)", background: "var(--panel2)" }}>No checks</span>;
-  }
-  const failed = checks.filter((c) => c.status === "Failed").length;
-  const color = failed > 0 ? "var(--red)" : "var(--green)";
-  const label = failed > 0 ? `${failed} check${failed > 1 ? "s" : ""} failed` : "All checks passed";
+  const failed = checks.filter((c) => c.status === "Failed");
+  if (!supported || failed.length === 0) return null;
+  const passed = checks.filter((c) => c.status === "Passed").length;
+  const what = failed.length === 1 ? `${failed[0].name} failed` : `${failed.length} checks failed`;
   return (
-    <div className="relative">
-      <button
-        onClick={() => setOpen((o) => !o)}
-        className={base}
-        style={{ color, background: `color-mix(in srgb, ${color} 14%, transparent)`, border: `1px solid color-mix(in srgb, ${color} 30%, transparent)`, cursor: "pointer" }}
-      >
-        {failed > 0 ? "✗" : "✓"} {label}
-      </button>
-      {open && (
-        <>
-          <div className="fixed inset-0" style={{ zIndex: 20 }} onClick={() => setOpen(false)} />
-          <div className="absolute bottom-full left-0 mb-2 w-72 rounded-lg p-1 max-h-64 overflow-auto shadow-2xl" style={{ zIndex: 21, background: "var(--panel)", border: "1px solid var(--border)" }}>
-            {checks.map((c, i) => {
-              const m = checkMeta(c.status);
-              const inner = (
-                <>
-                  <span className="shrink-0" style={{ color: m.color }}>{m.icon}</span>
-                  <span className="flex-1 truncate" style={{ color: "var(--fg)" }}>{c.name}</span>
-                  <span className="capitalize shrink-0" style={{ color: m.color }}>{c.status.toLowerCase()}</span>
-                  {c.url && <span className="shrink-0" style={{ color: "var(--dim)" }}>↗</span>}
-                </>
-              );
-              const cls = "flex items-center gap-2 rounded px-2 py-1.5 text-xs";
-              return c.url ? (
-                <a key={i} href={c.url} target="_blank" rel="noreferrer" className={cls + " transition-colors"} onMouseEnter={(e) => (e.currentTarget.style.background = "var(--sel)")} onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}>
-                  {inner}
-                </a>
-              ) : (
-                <div key={i} className={cls}>{inner}</div>
-              );
-            })}
+    <Button quiet onClick={onOpen} title="Show checks" style={{ paddingLeft: 0, color: "var(--red)" }}>
+      <StatusGlyph glyph="x-circle" color="var(--red)" />
+      <span>{what}</span>
+      <span className="num" style={{ color: "var(--fg3)" }}>
+        · {passed} of {checks.length} passed
+      </span>
+    </Button>
+  );
+}
+
+/** A check run's status, as the word its row shows. */
+function checkWord(status: CheckStatus): string {
+  switch (status) {
+    case "Passed":
+      return "passed";
+    case "Failed":
+      return "failed";
+    case "Pending":
+      return "running";
+    case "None":
+      return "neutral";
+  }
+}
+
+/** The Checks tab: one row per check run, linking out to the run where the provider gives a URL.
+ *  Greyed with the standard message when the provider can't report checks. */
+function ChecksTab({ checks, provider }: { checks: CheckRun[]; provider: ProviderType | undefined }) {
+  const supported = provider ? providerSupports(provider, "checks") : true;
+  if (!supported && provider) return <Empty text={unsupportedMessage(provider)} />;
+  if (checks.length === 0) return <Empty text="No checks reported for this pull request." />;
+  return (
+    <div className="flex flex-col px-2 py-2">
+      {checks.map((c, i) => {
+        const m = checkMeta(c.status);
+        const inner = (
+          <>
+            <StatusGlyph glyph={m.glyph} color={m.color} spin={c.status === "Pending"} />
+            <span className="flex-1 truncate">{c.name}</span>
+            <span className="text-[12px] shrink-0" style={{ color: m.color }}>
+              {checkWord(c.status)}
+            </span>
+            {c.url && <Icon name="external" size={13} style={{ color: "var(--fg3)" }} />}
+          </>
+        );
+        return c.url ? (
+          <a key={i} href={c.url} target="_blank" rel="noreferrer" className="ft-row" style={{ minHeight: 32 }}>
+            {inner}
+          </a>
+        ) : (
+          <div key={i} className="ft-row" style={{ minHeight: 32, cursor: "default" }}>
+            {inner}
           </div>
-        </>
-      )}
+        );
+      })}
     </div>
   );
 }
@@ -747,6 +803,9 @@ function FilesTab({
   // `folded`/`search_folded` split (crates/forgetop-tui/src/app.rs).
   const [searchClosed, setSearchClosed] = useState<Set<string>>(() => new Set());
   const [query, setQuery] = useState("");
+  // Files ticked "Viewed", by path. A reading aid for this pane only: nothing is sent anywhere,
+  // and it starts empty for each diff (the tab remounts per commit scope).
+  const [viewed, setViewed] = useState<Set<string>>(() => new Set());
 
   const tree = useMemo(() => buildDiffTree(changes), [changes]);
   // `null` means "not searching" (show everything, respect `closed`); otherwise only files in
@@ -763,6 +822,7 @@ function FilesTab({
   const totalFiles = changes.length;
   const visibleFiles = matches ? matches.size : totalFiles;
   const hiddenCount = Math.max(0, totalFiles - visibleFiles);
+  const viewedCount = changes.filter((c) => viewed.has(c.path)).length;
 
   // Every edit to the query starts its search-time folds fresh (mirrors the TUI's
   // `search_changed`), so a fold made under one query never carries into the next, and the
@@ -790,20 +850,33 @@ function FilesTab({
     });
   };
 
+  const setFileViewed = (path: string, on: boolean) =>
+    setViewed((s) => {
+      const next = new Set(s);
+      if (on) next.add(path);
+      else next.delete(path);
+      return next;
+    });
+
   // Scoped to one commit: show a banner with a way back to the whole-PR diff.
   const banner = scope && (
-    <div className="flex items-center gap-3 rounded-lg px-3 py-2 text-xs" style={{ background: "var(--panel2)", border: "1px solid var(--border)" }}>
-      <span style={{ color: "var(--dim)" }}>Showing commit</span>
-      <span className="mono truncate" style={{ color: "var(--fg)" }}>{scope.label}</span>
-      <button onClick={scope.onClear} className="ml-auto shrink-0" style={{ color: "var(--accent)" }}>
-        ← Show all files
-      </button>
+    <div
+      className="flex items-center gap-3 rounded-md px-3 text-[12.5px]"
+      style={{ height: 34, background: "var(--hover)", border: "1px solid var(--border)" }}
+    >
+      <span style={{ color: "var(--fg3)" }}>Showing commit</span>
+      <span className="mono truncate" style={{ color: "var(--fg)" }}>
+        {scope.label}
+      </span>
+      <Button quiet sm className="ml-auto shrink-0" onClick={scope.onClear}>
+        Show all files
+      </Button>
     </div>
   );
 
   if (scope?.loading || changes.length === 0) {
     return (
-      <div className="p-4 flex flex-col gap-4">
+      <div className="px-5 py-4 flex flex-col gap-4">
         {banner}
         {scope?.loading ? <Empty text="Loading commit diff…" /> : <Empty text={scope ? "No per-commit diff available for this provider." : "No file changes to show."} />}
       </div>
@@ -816,33 +889,34 @@ function FilesTab({
 
   return (
     <div className="flex flex-col h-full">
-      {banner && <div className="px-4 pt-4 shrink-0">{banner}</div>}
+      {banner && <div className="px-5 pt-3 shrink-0">{banner}</div>}
       <div className="flex flex-1 min-h-0">
         {/* file tree */}
-        <nav className="w-60 shrink-0 overflow-auto p-2 flex flex-col gap-0.5" style={{ borderRight: "1px solid var(--border)" }}>
-          <input
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Escape" && query) {
-                e.stopPropagation();
-                setQuery("");
-              }
-            }}
-            placeholder="Search files…"
-            aria-label="Search files"
-            className="rounded-md px-2 py-1.5 text-xs outline-none mb-1"
-            style={{ background: "var(--card)", color: "var(--fg)", border: "1px solid var(--border)" }}
-          />
+        <nav
+          aria-label="Changed files"
+          className="shrink-0 overflow-auto flex flex-col gap-px"
+          style={{ width: 220, padding: "12px 10px", borderRight: "1px solid var(--border)" }}
+        >
+          <span className="relative flex items-center mb-1.5 shrink-0">
+            <Icon name="search" size={12} className="pointer-events-none absolute" style={{ left: 9, color: "var(--fg3)" }} />
+            <input
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Escape" && query) {
+                  e.stopPropagation();
+                  setQuery("");
+                }
+              }}
+              placeholder="Filter files"
+              aria-label="Filter files"
+              className="ft-input w-full"
+              style={{ paddingLeft: 26 }}
+            />
+          </span>
           {rows.map(({ depth, node }) =>
             node.type === "folder" ? (
-              <FolderRow
-                key={node.path}
-                node={node}
-                depth={depth}
-                open={!activeClosed.has(node.path)}
-                onToggle={() => toggleFolder(node.path)}
-              />
+              <FolderRow key={node.path} node={node} depth={depth} open={!activeClosed.has(node.path)} onToggle={() => toggleFolder(node.path)} />
             ) : (
               <FileRow
                 key={node.path}
@@ -856,13 +930,16 @@ function FilesTab({
             ),
           )}
           {hiddenCount > 0 && (
-            <div className="px-2 py-1 text-[10px]" style={{ color: "var(--dim)" }}>
+            <div className="px-2.5 py-1 text-[12px]" style={{ color: "var(--fg3)" }}>
               {hiddenCount} file{hiddenCount === 1 ? "" : "s"} hidden
             </div>
           )}
+          <div className="mt-auto px-2.5 pt-2 text-[12px] num shrink-0" style={{ color: "var(--fg3)" }}>
+            {viewedCount} of {totalFiles} viewed
+          </div>
         </nav>
         {/* selected file's diff */}
-        <div className="flex-1 overflow-auto p-4 min-w-0">
+        <div className="flex-1 overflow-auto min-w-0" style={{ padding: "12px 18px 12px 14px" }}>
           <FileDiff
             key={file.path}
             prRef={prRef}
@@ -876,6 +953,8 @@ function FilesTab({
             onAddPending={onAddPending}
             onRemovePending={onRemovePending}
             searchQuery={query}
+            viewed={viewed.has(file.path)}
+            onViewed={(on) => setFileViewed(file.path, on)}
           />
         </div>
       </div>
@@ -883,34 +962,23 @@ function FilesTab({
   );
 }
 
-/** A folder row in the Files-tab tree. Starts open; clicking toggles it. Folded, it shows the
- *  aggregate file count and +/- it's hiding, mirroring the folder-count convention used
- *  elsewhere in the dashboard. */
-function FolderRow({
-  node,
-  depth,
-  open,
-  onToggle,
-}: {
-  node: DiffTreeFolder;
-  depth: number;
-  open: boolean;
-  onToggle: () => void;
-}) {
+/** A folder row in the Files-tab tree: a muted directory label that folds. Starts open; clicking
+ *  toggles it. Folded, it shows the aggregate file count and +/- it's hiding, mirroring the
+ *  folder-count convention used elsewhere in the dashboard. */
+function FolderRow({ node, depth, open, onToggle }: { node: DiffTreeFolder; depth: number; open: boolean; onToggle: () => void }) {
   return (
     <button
+      type="button"
       onClick={onToggle}
       aria-expanded={open}
       title={node.path}
-      className="flex items-center gap-1.5 rounded-md py-1.5 text-left w-full transition-colors"
-      style={{ paddingLeft: 8 + depth * 14, paddingRight: 8 }}
-      onMouseEnter={(e) => (e.currentTarget.style.background = "var(--card)")}
-      onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+      className="flex items-center gap-1.5 w-full text-left rounded-[5px] shrink-0 hover:bg-[var(--hover)]"
+      style={{ height: 24, paddingLeft: 6 + depth * 12, paddingRight: 8, marginTop: 4, fontSize: 12, color: "var(--fg3)" }}
     >
-      <span className="shrink-0 text-xs w-3 text-center" style={{ color: "var(--dim)" }}>{open ? "▾" : "▸"}</span>
-      <span className="truncate text-xs flex-1" style={{ color: "var(--fg)" }}>{node.name}</span>
+      <Icon name={open ? "chevron-down" : "chevron-right"} size={12} />
+      <span className="truncate flex-1">{node.name}/</span>
       {!open && (
-        <span className="mono text-[10px] shrink-0 flex items-center gap-1" style={{ color: "var(--dim)" }}>
+        <span className="mono num shrink-0 flex items-center gap-1">
           {node.fileCount}
           <span style={{ color: "var(--green)" }}>+{node.additions}</span>
           <span style={{ color: "var(--red)" }}>−{node.deletions}</span>
@@ -920,7 +988,7 @@ function FolderRow({
   );
 }
 
-/** A file row in the Files-tab tree. Normally shows its +/-; while searching, shows its hit
+/** A file row in the Files-tab tree: change letter · name · +/-. While searching, shows its hit
  *  count (path hits + patch hits) instead, with matches in its name highlighted. */
 function FileRow({
   node,
@@ -942,28 +1010,35 @@ function FileRow({
   const hits = match ? match.pathHits + match.patchHits : 0;
   return (
     <button
+      type="button"
       onClick={onSelect}
       title={f.path}
-      className="flex items-center gap-2 rounded-md py-1.5 text-left w-full transition-colors"
-      style={{ background: active ? "var(--sel)" : "transparent", paddingLeft: 8 + depth * 14, paddingRight: 8 }}
-      onMouseEnter={(e) => !active && (e.currentTarget.style.background = "var(--card)")}
-      onMouseLeave={(e) => !active && (e.currentTarget.style.background = "transparent")}
+      aria-current={active || undefined}
+      className={`flex items-center gap-2 w-full text-left rounded-[5px] shrink-0 ${active ? "" : "hover:bg-[var(--hover)]"}`}
+      style={{
+        height: 26,
+        paddingLeft: 10 + depth * 12,
+        paddingRight: 8,
+        fontSize: 12.5,
+        color: active ? "var(--fg)" : "var(--fg2)",
+        background: active ? "var(--active)" : undefined,
+      }}
     >
-      <span className="mono text-xs shrink-0 w-3 text-center" style={{ color: k.color }} title={f.kind}>{k.letter}</span>
-      <span className="flex flex-col min-w-0 flex-1">
-        <span className="truncate text-xs" style={{ color: "var(--fg)" }}>
-          {match ? <Highlighted text={node.name} query={query} /> : node.name}
-        </span>
-        <span className="truncate text-[10px] mono">
-          {match ? (
-            <span style={{ color: "var(--dim)" }}>{hits} hit{hits === 1 ? "" : "s"}</span>
-          ) : (
-            <>
-              <span style={{ color: "var(--green)" }}>+{f.additions}</span> <span style={{ color: "var(--red)" }}>−{f.deletions}</span>
-            </>
-          )}
-        </span>
+      <span className="mono shrink-0 text-center font-medium" style={{ width: 12, color: k.color }} title={f.kind}>
+        {k.letter}
       </span>
+      <span className="truncate flex-1 min-w-0">{match ? <Highlighted text={node.name} query={query} /> : node.name}</span>
+      {match ? (
+        <span className="mono num shrink-0" style={{ color: "var(--fg3)" }}>
+          {hits} hit{hits === 1 ? "" : "s"}
+        </span>
+      ) : (
+        <span className="mono num shrink-0">
+          {f.additions > 0 && <span style={{ color: "var(--green)" }}>+{f.additions}</span>}
+          {f.additions > 0 && f.deletions > 0 && " "}
+          {f.deletions > 0 && <span style={{ color: "var(--red)" }}>−{f.deletions}</span>}
+        </span>
+      )}
     </button>
   );
 }
@@ -1000,6 +1075,13 @@ function kindTag(kind: FileChangeKind): { letter: string; color: string } {
 /** A hunk header's range, lifted out of its `DiffLine` for the gap arithmetic below. */
 type HunkMeta = { oldStart: number; oldCount: number; newStart: number; newCount: number };
 
+/** Diff-line geometry, shared by patch lines and revealed context lines. */
+const LINE_H = 21;
+const NUM_W = 38;
+const GUTTER_W = 20;
+/** Where a card under a diff line (thread, pending comment, composer) starts: past the gutter. */
+const CARD_MARGIN = `4px 12px 4px ${NUM_W + GUTTER_W}px`;
+
 function FileDiff({
   prRef,
   sha,
@@ -1012,6 +1094,8 @@ function FileDiff({
   onAddPending,
   onRemovePending,
   searchQuery,
+  viewed,
+  onViewed,
 }: {
   prRef: PrRef;
   sha: string | null;
@@ -1024,7 +1108,10 @@ function FileDiff({
   onAddPending: (c: LineComment) => void;
   onRemovePending: (index: number) => void;
   searchQuery: string;
+  viewed: boolean;
+  onViewed: (on: boolean) => void;
 }) {
+  const viewedId = useId();
   const [composeLine, setComposeLine] = useState<number | null>(null);
   const [draft, setDraft] = useState("");
   // Fetched once, lazily, the first time any gap in this file is clicked — shared by every gap.
@@ -1100,61 +1187,73 @@ function FileDiff({
   };
 
   const renderDiffLine = (ln: DiffLine, key: string) => {
-    const bg = ln.kind === "add" ? "rgba(135,215,135,0.10)" : ln.kind === "del" ? "rgba(255,135,135,0.10)" : "transparent";
+    const bg = ln.kind === "add" ? "var(--diff-add)" : ln.kind === "del" ? "var(--diff-del)" : "transparent";
+    const numColor = ln.kind === "add" ? "var(--green)" : ln.kind === "del" ? "var(--red)" : "var(--fg3)";
     const marker = ln.kind === "add" ? "+" : ln.kind === "del" ? "−" : ln.kind === "hunk" ? "" : " ";
-    const color = ln.kind === "hunk" ? "var(--cyan)" : ln.kind === "meta" ? "var(--dim)" : "var(--fg)";
+    const color = ln.kind === "hunk" ? "var(--blue)" : ln.kind === "meta" ? "var(--fg3)" : "var(--fg)";
     const canComment = (ln.kind === "add" || ln.kind === "context") && ln.newLine != null;
     const lineThreads = ln.newLine != null ? fileThreads.filter((t) => t.line === ln.newLine) : [];
     const linePending = ln.newLine != null ? pending.map((p, idx) => ({ p, idx })).filter((x) => x.p.path === file.path && x.p.line === ln.newLine) : [];
     return (
       <div key={key}>
-        <div
-          className="group flex items-stretch"
-          style={{ background: bg, borderLeft: `2px solid ${ln.kind === "add" ? "var(--green)" : ln.kind === "del" ? "var(--red)" : "transparent"}` }}
-        >
-          <span className="w-10 text-right pr-2 select-none shrink-0" style={{ color: "var(--dim)" }}>
-            {ln.newLine ?? ln.oldLine ?? ""}
+        <div className="group mono flex items-stretch" style={{ background: bg, minHeight: LINE_H, lineHeight: `${LINE_H}px` }}>
+          <span className="text-right select-none shrink-0 num" style={{ width: NUM_W, paddingRight: 10, color: numColor }}>
+            {ln.kind === "hunk" ? "" : (ln.newLine ?? ln.oldLine ?? "")}
           </span>
-          {canComment ? (
-            <span className="w-6 shrink-0 flex items-center justify-center">
+          <span className="shrink-0 flex items-center justify-center" style={{ width: GUTTER_W }}>
+            {canComment && (
               <button
-                className="flex items-center justify-center rounded opacity-0 group-hover:opacity-100 transition-opacity hover:brightness-110"
-                style={{ width: 16, height: 16, background: "var(--accent)", color: "var(--bg)", fontWeight: 600, lineHeight: 1 }}
+                type="button"
+                className="flex items-center justify-center rounded opacity-0 group-hover:opacity-100 focus-visible:opacity-100 transition-opacity"
+                style={{ width: 16, height: 16, background: "var(--blue)", color: "var(--bg)" }}
                 title="Comment on this line"
                 aria-label="Comment on this line"
                 onClick={() => setComposeLine(ln.newLine!)}
               >
-                +
+                <Icon name="plus" size={11} strokeWidth={2} />
               </button>
-            </span>
-          ) : (
-            <span className="w-6 shrink-0" />
-          )}
+            )}
+          </span>
           <span className="pr-3 whitespace-pre" style={{ color }}>
             {marker}
             {searchQuery ? <Highlighted text={ln.text} query={searchQuery} /> : ln.text}
           </span>
         </div>
         {lineThreads.map((t) => (
-          <ThreadBox key={t.id} thread={t} busy={busy} onReply={onReply} onResolve={onResolve} />
+          <div key={t.id} style={{ margin: CARD_MARGIN }}>
+            <ThreadBox thread={t} busy={busy} onReply={onReply} onResolve={onResolve} />
+          </div>
         ))}
         {linePending.map(({ p, idx }) => (
-          <PendingBox key={idx} body={p.body} onRemove={() => onRemovePending(idx)} />
+          <div key={idx} style={{ margin: CARD_MARGIN }}>
+            <PendingBox body={p.body} onRemove={() => onRemovePending(idx)} />
+          </div>
         ))}
         {composeLine === ln.newLine && canComment && (
-          <div className="p-2" style={{ background: "var(--panel)" }}>
+          <div className="flex flex-col gap-2" style={{ margin: CARD_MARGIN }}>
             <textarea
               autoFocus
               value={draft}
               onChange={(e) => setDraft(e.target.value)}
               placeholder="Leave a comment on this line…"
-              className="w-full rounded p-2 text-xs outline-none"
-              style={{ background: "var(--bg)", color: "var(--fg)", border: "1px solid var(--border)" }}
+              aria-label="Comment on this line"
+              className="ft-input w-full"
               rows={2}
             />
-            <div className="flex gap-2 mt-1.5">
-              <ActionButton label="Add comment" onClick={() => commit(ln.newLine!)} primary color="var(--accent)" />
-              <ActionButton label="Cancel" onClick={() => { setDraft(""); setComposeLine(null); }} />
+            <div className="flex items-center gap-1.5">
+              <Button primary sm onClick={() => commit(ln.newLine!)}>
+                Add comment
+              </Button>
+              <Button
+                quiet
+                sm
+                onClick={() => {
+                  setDraft("");
+                  setComposeLine(null);
+                }}
+              >
+                Cancel
+              </Button>
             </div>
           </div>
         )}
@@ -1163,42 +1262,58 @@ function FileDiff({
   };
 
   return (
-    <div className="rounded-lg overflow-hidden" style={{ border: "1px solid var(--border)" }}>
-      <div className="flex items-center gap-3 px-3 py-2 text-sm" style={{ background: "var(--panel)", borderBottom: "1px solid var(--border)" }}>
-        <span className="mono truncate" style={{ color: "var(--fg)" }}>{file.path}</span>
-        <span className="mono text-xs ml-auto shrink-0">
-          <span style={{ color: "var(--green)" }}>+{file.additions}</span> <span style={{ color: "var(--red)" }}>−{file.deletions}</span>
+    <div>
+      <div
+        className="flex items-center gap-2.5 px-2.5 rounded-t-md"
+        style={{ height: 30, background: "var(--hover)", border: "1px solid var(--border)" }}
+      >
+        <span className="mono truncate" style={{ color: "var(--fg)" }}>
+          {file.path}
+        </span>
+        <span className="num text-[12px] shrink-0" style={{ color: "var(--green)" }}>
+          +{file.additions}
+        </span>
+        {file.deletions > 0 && (
+          <span className="num text-[12px] shrink-0" style={{ color: "var(--red)" }}>
+            −{file.deletions}
+          </span>
+        )}
+        <span className="ml-auto inline-flex items-center gap-1.5 text-[12px] shrink-0" style={{ color: "var(--fg3)" }}>
+          <input id={viewedId} type="checkbox" checked={viewed} onChange={(e) => onViewed(e.target.checked)} style={{ margin: 0 }} />
+          <label htmlFor={viewedId}>Viewed</label>
         </span>
       </div>
-      {lines.length === 0 ? (
-        <div className="px-3 py-2 text-xs" style={{ color: "var(--dim)" }}>
-          {file.kind} — no inline diff available.
-        </div>
-      ) : (
-        <div className="mono text-xs overflow-x-auto">
-          {preamble.map((ln, i) => renderDiffLine(ln, `pre-${i}`))}
-          {hunks.map((h, i) => (
-            <Fragment key={i}>
-              {gaps
-                .filter((g) => g.beforeIndex === i)
-                .map((g) => (
-                  <GapRow
-                    key={`gap-${i}`}
-                    newStart={g.newStart}
-                    newCount={g.newCount}
-                    fileLines={fileLines}
-                    requested={textRequested}
-                    loading={textRequested && fileText.isLoading}
-                    unavailable={textUnavailable}
-                    onRequestText={() => setTextRequested(true)}
-                    highlightQuery={searchQuery}
-                  />
-                ))}
-              {h.lines.map((ln, li) => renderDiffLine(ln, `${i}-${li}`))}
-            </Fragment>
-          ))}
-        </div>
-      )}
+      <div className="rounded-b-md overflow-x-auto py-1.5" style={{ border: "1px solid var(--border)", borderTop: 0 }}>
+        {lines.length === 0 ? (
+          <div className="px-3 py-1 text-[12.5px]" style={{ color: "var(--fg3)" }}>
+            {file.kind} — no inline diff available.
+          </div>
+        ) : (
+          <>
+            {preamble.map((ln, i) => renderDiffLine(ln, `pre-${i}`))}
+            {hunks.map((h, i) => (
+              <Fragment key={i}>
+                {gaps
+                  .filter((g) => g.beforeIndex === i)
+                  .map((g) => (
+                    <GapRow
+                      key={`gap-${i}`}
+                      newStart={g.newStart}
+                      newCount={g.newCount}
+                      fileLines={fileLines}
+                      requested={textRequested}
+                      loading={textRequested && fileText.isLoading}
+                      unavailable={textUnavailable}
+                      onRequestText={() => setTextRequested(true)}
+                      highlightQuery={searchQuery}
+                    />
+                  ))}
+                {h.lines.map((ln, li) => renderDiffLine(ln, `${i}-${li}`))}
+              </Fragment>
+            ))}
+          </>
+        )}
+      </div>
     </div>
   );
 }
@@ -1228,10 +1343,11 @@ function GapRow({
 }) {
   const [revealed, setRevealed] = useState(false);
   const [all, setAll] = useState(false);
+  const strip = { minHeight: 24, paddingLeft: NUM_W + GUTTER_W - 18, paddingRight: 10, color: "var(--fg3)" } as const;
 
   if (requested && !loading && unavailable) {
     return (
-      <div className="px-2 py-1 text-[11px] italic" style={{ color: "var(--dim)" }}>
+      <div className="flex items-center text-[12px] italic" style={strip}>
         context isn't available for this file
       </div>
     );
@@ -1239,21 +1355,24 @@ function GapRow({
 
   if (!revealed) {
     return (
-      <div className="flex items-center gap-2 w-full px-2 py-1 text-[11px]" style={{ color: "var(--dim)", background: "var(--panel2)" }}>
+      <div className="flex items-center gap-2 w-full text-[12px]" style={{ ...strip, background: "var(--hover)" }}>
         <button
-          className="flex-1 text-left"
+          type="button"
+          className="flex-1 flex items-center gap-1.5 text-left hover:text-[var(--fg)]"
+          style={{ minHeight: 24 }}
           aria-label={newCount > 20 ? "Show 10 more unchanged lines" : `Show all ${newCount} unchanged lines`}
           onClick={() => {
             onRequestText();
             setRevealed(true);
           }}
         >
-          ⋯ {newCount} unchanged line{newCount === 1 ? "" : "s"}
+          <Icon name="chevron-down" size={12} /> {newCount} unchanged line{newCount === 1 ? "" : "s"}
         </button>
         {newCount > 20 && (
-          <button
-            className="shrink-0 underline"
-            style={{ color: "var(--accent)" }}
+          <Button
+            quiet
+            sm
+            className="shrink-0"
             aria-label={`Show all ${newCount} unchanged lines`}
             onClick={() => {
               onRequestText();
@@ -1262,7 +1381,7 @@ function GapRow({
             }}
           >
             Show all
-          </button>
+          </Button>
         )}
       </div>
     );
@@ -1270,7 +1389,7 @@ function GapRow({
 
   if (loading) {
     return (
-      <div className="px-2 py-1 text-[11px]" style={{ color: "var(--dim)" }}>
+      <div className="flex items-center text-[12px]" style={strip}>
         loading…
       </div>
     );
@@ -1311,9 +1430,11 @@ function sliceContextLines(fileLines: string[], start: number, count: number, hi
     const newLine = start + i;
     const text = fileLines[newLine - 1] ?? "";
     out.push(
-      <div key={`ctx-${newLine}`} className="flex items-stretch">
-        <span className="w-10 text-right pr-2 select-none shrink-0" style={{ color: "var(--dim)" }}>{newLine}</span>
-        <span className="w-6 shrink-0" />
+      <div key={`ctx-${newLine}`} className="mono flex items-stretch" style={{ minHeight: LINE_H, lineHeight: `${LINE_H}px` }}>
+        <span className="text-right select-none shrink-0 num" style={{ width: NUM_W, paddingRight: 10, color: "var(--fg3)" }}>
+          {newLine}
+        </span>
+        <span className="shrink-0" style={{ width: GUTTER_W }} />
         <span className="pr-3 whitespace-pre" style={{ color: "var(--fg)" }}>
           {" "}
           {highlightQuery ? <Highlighted text={text} query={highlightQuery} /> : text}
@@ -1324,6 +1445,8 @@ function sliceContextLines(fileLines: string[], start: number, count: number, hi
   return out;
 }
 
+/** A comment thread, as a small card: each comment's author, age and body; the thread's state
+ *  and Resolve on the first line; Reply at the foot. Used in the diff and on Conversation. */
 function ThreadBox({
   thread,
   busy,
@@ -1345,67 +1468,93 @@ function ThreadBox({
     setDraft("");
     setReplying(false);
   };
+  const controls = (
+    <span className="ml-auto flex items-center gap-2 shrink-0">
+      <StatusBadge
+        glyph={thread.is_resolved ? "check-circle" : "circle"}
+        label={thread.is_resolved ? "Resolved" : "Open"}
+        color={thread.is_resolved ? "var(--green)" : "var(--yellow)"}
+      />
+      {onResolve && thread.is_resolvable !== false && !isLocalId(thread.id) && (
+        <Button quiet sm disabled={busy} onClick={() => onResolve(thread.id, !thread.is_resolved)}>
+          {thread.is_resolved ? "Unresolve" : "Resolve"}
+        </Button>
+      )}
+    </span>
+  );
   return (
-    <div className="px-3 py-2 text-xs" style={{ background: "var(--panel)", borderTop: "1px solid var(--border)" }}>
-      <div className="flex items-center gap-2 pb-1">
-        <StatusBadge label={thread.is_resolved ? "Resolved" : "Open"} color={thread.is_resolved ? "var(--green)" : "var(--yellow)"} />
-        {onResolve && thread.is_resolvable !== false && !isLocalId(thread.id) && (
-          <button
-            className="ml-auto text-xs rounded px-1.5 py-0.5"
-            disabled={busy}
-            style={{ color: "var(--accent)", border: "1px solid var(--border)", background: "var(--panel2)", opacity: busy ? 0.45 : 1 }}
-            onClick={() => onResolve(thread.id, !thread.is_resolved)}
-          >
-            {thread.is_resolved ? "Reopen" : "Resolve"}
-          </button>
-        )}
-      </div>
-      {thread.comments.map((c) => (
-        <div key={c.id} className="flex gap-2 py-0.5">
-          <Avatar name={c.author.display_name} size={16} />
-          <span>
-            <span className="font-medium" style={{ color: "var(--fg)" }}>{c.author.display_name}</span>{" "}
-            <span style={{ color: "var(--dim)" }}>{c.body}</span>
-          </span>
-        </div>
-      ))}
+    <div className="rounded-md px-2.5 py-2 text-[12.5px]" style={{ background: "var(--hover)", border: "1px solid var(--border)" }}>
+      {thread.comments.length === 0 && <div className="flex items-center gap-2">{controls}</div>}
+      {thread.comments.map((c, i) => {
+        const age = relativeTime(c.created_at);
+        return (
+          <div key={c.id} className={i > 0 ? "mt-2.5" : undefined}>
+            <div className="flex items-center gap-2" style={{ minHeight: 22 }}>
+              <Avatar name={c.author.display_name} size={16} />
+              <span className="font-medium" style={{ color: "var(--fg)" }}>
+                {c.author.display_name}
+              </span>
+              {age && <span style={{ color: "var(--fg3)" }}>{age}</span>}
+              {i === 0 && controls}
+            </div>
+            <div className="mt-1 whitespace-pre-wrap" style={{ color: "var(--fg)" }}>
+              {c.body}
+            </div>
+          </div>
+        );
+      })}
       {isLocalId(thread.id) ? (
-        <div className="mt-1 text-xs" style={{ color: "var(--dim)" }}>
+        <div className="mt-1.5" style={{ color: "var(--fg3)" }}>
           Posting…
         </div>
       ) : replying ? (
-        <div className="mt-1.5 flex flex-col gap-1.5">
+        <div className="mt-2 flex flex-col gap-2">
           <textarea
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
             placeholder="Reply…"
+            aria-label="Reply"
             rows={2}
             autoFocus
-            className="w-full rounded p-2 text-xs outline-none"
-            style={{ background: "var(--card)", color: "var(--fg)", border: "1px solid var(--border)" }}
+            className="ft-input w-full"
           />
-          <div className="flex items-center gap-2">
-            <ActionButton label="Reply" disabled={busy || !draft.trim()} primary color="var(--accent)" onClick={submit} />
-            <button className="text-xs" style={{ color: "var(--dim)" }} onClick={() => { setReplying(false); setDraft(""); }}>
+          <div className="flex items-center gap-1.5">
+            <Button sm disabled={busy || !draft.trim()} onClick={submit}>
+              Reply
+            </Button>
+            <Button
+              quiet
+              sm
+              onClick={() => {
+                setReplying(false);
+                setDraft("");
+              }}
+            >
               Cancel
-            </button>
+            </Button>
           </div>
         </div>
       ) : (
-        <button className="mt-1 text-xs" style={{ color: "var(--accent)" }} onClick={() => setReplying(true)}>
-          ↳ Reply
-        </button>
+        <Button quiet sm className="mt-1.5" style={{ marginLeft: -8 }} onClick={() => setReplying(true)}>
+          Reply…
+        </Button>
       )}
     </div>
   );
 }
 
+/** A line comment buffered for the review, not yet sent. */
 function PendingBox({ body, onRemove }: { body: string; onRemove: () => void }) {
   return (
-    <div className="flex items-center gap-2 px-3 py-2 text-xs" style={{ background: "rgba(95,175,255,0.10)", borderTop: "1px solid var(--border)" }}>
-      <span className="rounded px-1.5 py-0.5" style={{ background: "var(--accent)", color: "#12151b" }}>pending</span>
-      <span className="flex-1" style={{ color: "var(--fg)" }}>{body}</span>
-      <button onClick={onRemove} style={{ color: "var(--dim)" }} title="Remove">✕</button>
+    <div className="flex items-center gap-2 rounded-md px-2.5 py-1 text-[12.5px]" style={{ background: "var(--hover)", border: "1px solid var(--border)" }}>
+      <StatusGlyph glyph="clock" color="var(--yellow)" />
+      <span className="shrink-0" style={{ color: "var(--yellow)" }}>
+        Pending
+      </span>
+      <span className="flex-1 min-w-0 whitespace-pre-wrap" style={{ color: "var(--fg)" }}>
+        {body}
+      </span>
+      <IconButton icon="x" label="Remove pending comment" size={13} onClick={onRemove} />
     </div>
   );
 }
@@ -1435,40 +1584,43 @@ function ConversationTab({
   // ones a review leaves waiting on you.
   const openCount = threads.filter((t) => !t.is_resolved).length;
   return (
-    <div className="p-4 flex flex-col gap-3 max-w-3xl">
+    <div className="px-5 py-4 flex flex-col gap-5">
       {description && (
-        <div className="rounded-lg p-3 text-sm whitespace-pre-wrap" style={{ background: "var(--card)", border: "1px solid var(--border)", color: "var(--fg)" }}>
+        <div className="text-[13px] whitespace-pre-wrap" style={{ color: "var(--fg)", lineHeight: 1.55 }}>
           {description}
         </div>
       )}
       {timeline.length > 0 && <Timeline events={timeline} />}
-      <div className="text-[11px] font-semibold uppercase tracking-wider px-1" style={{ color: "var(--dim)" }}>
-        {openCount > 0 ? `Comments · ${openCount} open` : "Comments"}
+      <div className="flex flex-col gap-2">
+        <GroupHeading>{openCount > 0 ? `Comments · ${openCount} open` : "Comments"}</GroupHeading>
+        {general.length === 0 && (
+          <div className="text-[12.5px]" style={{ color: "var(--fg3)" }}>
+            No comments yet.
+          </div>
+        )}
+        {general.map((t) => (
+          <ThreadBox key={t.id} thread={t} busy={busy} onReply={onReply} onResolve={onResolve} />
+        ))}
       </div>
-      {general.length === 0 && <div className="text-xs px-1" style={{ color: "var(--dim)" }}>No comments yet.</div>}
-      {general.map((t) => (
-        <ThreadBox key={t.id} thread={t} busy={busy} onReply={onReply} onResolve={onResolve} />
-      ))}
-      <div className="mt-2">
+      <div className="flex flex-col gap-2">
         <textarea
           value={draft}
           onChange={(e) => setDraft(e.target.value)}
           placeholder="Add a comment…"
+          aria-label="Add a comment"
           rows={3}
-          className="w-full rounded-lg p-3 text-sm outline-none"
-          style={{ background: "var(--card)", color: "var(--fg)", border: "1px solid var(--border)" }}
+          className="ft-input w-full"
         />
-        <div className="mt-2">
-          <ActionButton
-            label="Comment"
+        <div>
+          <Button
             disabled={busy || !draft.trim()}
-            primary
-            color="var(--accent)"
             onClick={() => {
               onComment(draft.trim());
               setDraft("");
             }}
-          />
+          >
+            Comment
+          </Button>
         </div>
       </div>
     </div>
@@ -1478,23 +1630,30 @@ function ConversationTab({
 function CommitsTab({ commits, onSelect }: { commits: Commit[]; onSelect: (sha: string, label: string) => void }) {
   if (commits.length === 0) return <Empty text="No commits to show." />;
   return (
-    <div className="p-4 flex flex-col gap-1.5 max-w-3xl">
+    <div className="flex flex-col px-2 py-2">
       {commits.map((c) => {
         const first = c.message.split("\n")[0];
+        const age = relativeTime(c.date);
         return (
           <button
             key={c.sha}
+            type="button"
             onClick={() => onSelect(c.sha, `${c.sha.slice(0, 7)} ${first}`)}
             title="View this commit's diff"
-            className="group flex items-center gap-3 rounded-lg px-3 py-2 text-left w-full transition-colors"
-            style={{ background: "var(--card)", border: "1px solid var(--border)", cursor: "pointer" }}
-            onMouseEnter={(e) => (e.currentTarget.style.background = "var(--card-hover)")}
-            onMouseLeave={(e) => (e.currentTarget.style.background = "var(--card)")}
+            className="ft-row group"
+            style={{ minHeight: 32 }}
           >
-            <span className="mono text-xs shrink-0" style={{ color: "var(--cyan)" }}>{c.sha.slice(0, 7)}</span>
-            <span className="flex-1 truncate text-sm" style={{ color: "var(--fg)" }}>{first}</span>
-            <span className="text-xs shrink-0" style={{ color: "var(--dim)" }}>{c.author}</span>
-            <span className="text-xs shrink-0 opacity-0 transition-opacity group-hover:opacity-100" style={{ color: "var(--accent)" }}>diff →</span>
+            <span className="mono shrink-0" style={{ color: "var(--fg3)" }}>
+              {c.sha.slice(0, 7)}
+            </span>
+            <span className="flex-1 truncate">{first}</span>
+            <span className="text-[12px] shrink-0" style={{ color: "var(--fg2)" }}>
+              {c.author}
+            </span>
+            <span className="num text-[12px] shrink-0 text-right" style={{ width: 56, color: "var(--fg3)" }}>
+              {age}
+            </span>
+            <Icon name="arrow-right" size={13} className="opacity-0 group-hover:opacity-100 transition-opacity" style={{ color: "var(--fg3)" }} />
           </button>
         );
       })}
@@ -1504,7 +1663,7 @@ function CommitsTab({ commits, onSelect }: { commits: Commit[]; onSelect: (sha: 
 
 function Empty({ text }: { text: string }) {
   return (
-    <div className="py-16 text-center text-sm" style={{ color: "var(--dim)" }}>
+    <div className="py-16 text-center text-[13px]" style={{ color: "var(--fg3)" }}>
       {text}
     </div>
   );
