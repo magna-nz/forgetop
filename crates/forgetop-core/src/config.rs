@@ -105,8 +105,8 @@ pub struct UiState {
     /// or "off" for the ungrouped list. Unknown values fall back to the default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pipeline_group: Option<String>,
-    /// How the Work Items list is grouped: "off" (default) for the flat list, or "parent" for
-    /// one header per milestone / epic / project. Unknown values fall back to the default.
+    /// How the Work Items list is grouped: "parent" (default) for one header per milestone /
+    /// epic / project, or "off" for the flat list. Unknown values fall back to the default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub work_item_group: Option<String>,
     /// Columns the user has switched off in the terminal's list tables, by header name

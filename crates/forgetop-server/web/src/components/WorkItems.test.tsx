@@ -43,12 +43,25 @@ const rowsFixture = [
 const choose = (mode: string) => userEvent.selectOptions(screen.getByLabelText("Group"), mode);
 const headers = () => screen.queryAllByRole("button", { expanded: false }).concat(screen.queryAllByRole("button", { expanded: true }));
 
+// Most tests start from the flat list and switch grouping on, so they start with Off chosen;
+// the ones about the default clear it again.
 beforeEach(() => {
   localStorage.clear();
+  localStorage.setItem("forgetop:work-items:group", "off");
 });
 
 describe("work items grouped by parent", () => {
-  it("is flat by default: every title shown, no group headers", async () => {
+  it("is grouped by parent by default, collapsed to the parents", async () => {
+    localStorage.clear();
+    mockFetch({ get: { "/api/work-items": rowsFixture } });
+    renderWithClient(<WorkItems />);
+    expect(await screen.findByRole("button", { name: /Q4 reliability/ })).toHaveAttribute("aria-expanded", "false");
+    expect(screen.getByLabelText("Group")).toHaveValue("parent");
+    expect(headers()).toHaveLength(3);
+    expect(screen.queryByText("Alpha one")).not.toBeInTheDocument();
+  });
+
+  it("is flat once Off is chosen: every title shown, no group headers", async () => {
     mockFetch({ get: { "/api/work-items": rowsFixture } });
     renderWithClient(<WorkItems />);
     for (const t of ["Alpha one", "No parent one", "Beta one", "Alpha two"]) {
@@ -167,15 +180,16 @@ describe("work items grouped by parent", () => {
     expect(screen.queryByRole("link", { name: /Ledger v2/ })).not.toBeInTheDocument();
   });
 
-  it("shows a single 'No parent' group when no row has a parent", async () => {
+  it("stays a plain list when no row has a parent, even with grouping on", async () => {
+    // Nothing to group by: a lone "No parent" section over everything would only hide the list.
+    localStorage.clear();
     mockFetch({ get: { "/api/work-items": [wi("1", "Lonely"), wi("2", "Also lonely")] } });
     renderWithClient(<WorkItems />);
-    await screen.findByText("Lonely");
-    await choose("parent");
-    const hs = headers();
-    expect(hs).toHaveLength(1);
-    expect(hs[0]).toHaveTextContent("No parent");
-    expect(hs[0]).toHaveTextContent("2 items");
+    expect(await screen.findByText("Lonely")).toBeInTheDocument();
+    expect(screen.getByText("Also lonely")).toBeInTheDocument();
+    expect(screen.getByLabelText("Group")).toHaveValue("parent");
+    expect(headers()).toHaveLength(0);
+    expect(screen.queryByText("No parent")).not.toBeInTheDocument();
   });
 
   it("remembers the choice in a fresh render", async () => {
@@ -186,9 +200,17 @@ describe("work items grouped by parent", () => {
     expect(localStorage.getItem("forgetop:work-items:group")).toBe("parent");
     first.unmount();
 
-    renderWithClient(<WorkItems />);
+    const second = renderWithClient(<WorkItems />);
     expect(await screen.findByRole("button", { name: /Q4 reliability/ })).toBeInTheDocument();
     expect(screen.getByLabelText("Group")).toHaveValue("parent");
     expect(screen.queryByText("Alpha one")).not.toBeInTheDocument();
+
+    // And turning it off is remembered just the same, against the default.
+    await choose("off");
+    expect(localStorage.getItem("forgetop:work-items:group")).toBe("off");
+    second.unmount();
+    renderWithClient(<WorkItems />);
+    expect(await screen.findByText("Alpha one")).toBeInTheDocument();
+    expect(screen.getByLabelText("Group")).toHaveValue("off");
   });
 });

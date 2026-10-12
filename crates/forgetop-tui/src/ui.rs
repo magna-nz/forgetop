@@ -21,7 +21,7 @@ use crate::app::{
     dashboard_target, first_failed_node, gate_stage, is_error_line, last_activity, match_ranges, pipe_definition_name,
     pr_life, provider_label, run_secs, waiting_secs, App, ArtifactsPanel, ConfigView, DiffFocus, DiffView, FlatNode, Hit,
     LogRow, LogView, LpSlot, PipeGroup, PipeHead, PipeLine, PipeRow, PipelineView, PrLife, PrView, RunHistory, Screen,
-    WiGroup, WiHead, WiLine, WiView, LOG_SPLIT_MIN_WIDTH, LOG_TREE_WIDTH, PR_TABS, TABS,
+    WiHead, WiLine, WiView, LOG_SPLIT_MIN_WIDTH, LOG_TREE_WIDTH, PR_TABS, TABS,
 };
 use crate::diff::{cursor_line_label, pending_marks};
 use crate::highlight::{lang_for, HlKind, LineHighlighter};
@@ -1517,7 +1517,8 @@ fn wi_state_color(theme: &Theme, state: &str, cat: WorkItemStateCategory) -> rat
 fn render_wis(frame: &mut Frame, area: Rect, app: &mut App) {
     let theme = &app.theme;
     let lines = app.wi_lines();
-    let grouped = app.wi_group != WiGroup::Off;
+    // Grouped only when there is something to group by: see `App::wi_lines`.
+    let grouped = lines.iter().any(|l| matches!(l, WiLine::Head(_)));
     let hidden_in_view = app.hidden_states_in_view();
     let mut base = "Work Items · mine".to_string();
     if grouped {
@@ -2951,7 +2952,7 @@ fn base_footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
         0 => keys.extend([("w", "repos"), ("f", "status"), ("S", "sort"), ("c", "columns"), ("o", "browser")]),
         1 => {
             keys.extend([("f", "states"), ("G", "group"), ("S", "sort"), ("c", "columns"), ("o", "browser")]);
-            if app.wi_group != WiGroup::Off {
+            if app.wi_grouped() {
                 keys.push(("z/Z", "fold"));
             }
         }
@@ -6943,11 +6944,12 @@ mod tests {
         app.wi_state.select(Some(0));
 
         // Flat: no header, no indentation, and the footer offers grouping.
+        app.wi_group = crate::app::WiGroup::Off;
         let flat = render_to_string(&mut app, 160, 24);
         assert!(flat.contains("Investigate p99") && !flat.contains("Q4 reliability"), "{flat}");
         assert!(base_footer_keys(&app).contains(&("G", "group")) && !base_footer_keys(&app).contains(&("z/Z", "fold")));
 
-        app.wi_group = WiGroup::Parent;
+        app.wi_group = crate::app::WiGroup::Parent;
         let folded = render_to_string(&mut app, 160, 24);
         assert!(folded.contains("Work Items · mine · by parent"), "the title says how it is arranged: {folded}");
         assert!(folded.contains("▸ Q4 reliability (2)") && folded.contains("Milestone"), "{folded}");
@@ -6966,6 +6968,13 @@ mod tests {
         app.wi_expanded = app.wis.iter().map(crate::app::wi_group_key).collect();
         let open = render_to_string(&mut app, 160, 24);
         assert!(open.contains("▾ Q4 reliability") && open.contains("  Investigate p99") && open.contains("  Retry budget"), "{open}");
+
+        // Grouping on, but nothing left that has a parent: the plain list, and a title and
+        // footer that do not claim an arrangement that is not there.
+        app.wis.retain(|r| r.wi.parent.is_none());
+        let loose = render_to_string(&mut app, 160, 24);
+        assert!(loose.contains("Loose end") && !loose.contains("No parent") && !loose.contains("by parent"), "{loose}");
+        assert!(!base_footer_keys(&app).contains(&("z/Z", "fold")));
     }
 
     #[test]

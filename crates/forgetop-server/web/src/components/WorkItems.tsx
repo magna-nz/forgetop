@@ -11,11 +11,12 @@ import { useWiOpener } from "./WiDetail";
 const GROUP_KEY = "forgetop:work-items:group";
 type GroupMode = "off" | "parent";
 
+/** Grouped by parent unless the viewer chose otherwise. */
 function readGroupMode(): GroupMode {
   try {
-    return localStorage.getItem(GROUP_KEY) === "parent" ? "parent" : "off";
+    return localStorage.getItem(GROUP_KEY) === "off" ? "off" : "parent";
   } catch {
-    return "off";
+    return "parent";
   }
 }
 
@@ -26,8 +27,12 @@ interface WiGroup {
 }
 
 /** Buckets already-sorted rows by parent identity. Groups keep the order of their first row;
- *  parentless rows form one final group. Rows keep their order within a group. */
+ *  parentless rows form one final group. Rows keep their order within a group.
+ *
+ *  Empty when no row has a parent: there is nothing to group by, and a lone "No parent" section
+ *  over the whole list would only hide it. That is what lets grouping be the default. */
 function groupByParent(rows: WiRow[]): WiGroup[] {
+  if (!rows.some((r) => r.work_item.parent)) return [];
   const groups = new Map<string, WiGroup>();
   const none: WiGroup = { key: "none", parent: null, rows: [] };
   for (const row of rows) {
@@ -101,13 +106,13 @@ export function WorkItems() {
             className="rounded-md px-2 py-1 text-xs outline-none"
             style={{ background: "var(--panel2)", color: "var(--fg)", border: "1px solid var(--border)" }}
           >
-            <option value="off">Off</option>
             <option value="parent">Parent</option>
+            <option value="off">Off</option>
           </select>
         </label>
       </div>
       <List>
-        {mode === "parent"
+        {groups.length > 0
           ? groups.map((g) => (
               <WiGroupSection key={g.key} group={g} open={expanded.has(g.key)} onToggle={() => toggle(g.key)} />
             ))

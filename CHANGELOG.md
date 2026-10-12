@@ -15,11 +15,12 @@ Added
 
 - **Group work items by what they sit under.** Work Items can now be grouped by parent — a
   GitHub or GitLab milestone, a Jira epic, a Linear milestone or project, an Azure DevOps
-  Feature or Epic. Items with no parent share a last "No parent" group. Grouping is off by
-  default and only rearranges the items already listed. In the terminal UI press `G`: each
-  parent becomes one line with its item count and how many are in progress or blocked; Enter
-  or Space opens it to the items beneath, `z` / `Z` fold or unfold them all, and `o` opens the
-  parent in the browser. There the quick filter and Ctrl-K also find items by their parent's
+  Feature or Epic. Items with no parent share a last "No parent" group. It is how the list
+  opens whenever something in it has a parent; a list with none stays the plain list. Grouping
+  only rearranges the items already listed. In the terminal UI each parent is one line with
+  its item count and how many are in progress or blocked; `G` switches grouping off and on,
+  Enter or Space opens a parent to the items beneath, `z` / `Z` fold or unfold them all, and
+  `o` opens the parent in the browser. There the quick filter and Ctrl-K also find items by their parent's
   name, and an opened work item names its parent. The dashboard has the same grouping under a
   "Group" control, with a link to each parent.
   ([#237](https://github.com/magna-nz/forgetop/pull/237))

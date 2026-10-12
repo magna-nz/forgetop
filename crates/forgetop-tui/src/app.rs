@@ -528,10 +528,12 @@ impl PipeGroup {
 /// withheld because of it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WiGroup {
-    /// No grouping — one line per work item. The default: the list the tab has always had.
-    #[default]
+    /// No grouping — one line per work item.
     Off,
-    /// One header per parent — the milestone, epic or project each item sits under.
+    /// One header per parent — the milestone, epic or project each item sits under. The
+    /// default: the list opens on what the work is for, folded, and the items are a key away.
+    /// It only takes effect when something listed has a parent (see [`App::wi_lines`]).
+    #[default]
     Parent,
 }
 
@@ -548,16 +550,16 @@ impl WiGroup {
     /// by a newer build does not break an older one.
     pub fn parse(s: &str) -> WiGroup {
         match s {
-            "parent" => WiGroup::Parent,
-            _ => WiGroup::Off,
+            "off" => WiGroup::Off,
+            _ => WiGroup::Parent,
         }
     }
 
-    /// The `G` cycle.
+    /// The `G` cycle: the default first, the ungrouped list last.
     pub fn next(self) -> WiGroup {
         match self {
-            WiGroup::Off => WiGroup::Parent,
             WiGroup::Parent => WiGroup::Off,
+            WiGroup::Off => WiGroup::Parent,
         }
     }
 }
@@ -3715,9 +3717,13 @@ impl App {
     /// Groups come newest-first by their most recently updated item; under an explicit sort they
     /// come in the order their first item sorts, so the sort orders the groups and the items
     /// inside each. Items with no parent share one last group.
+    ///
+    /// When nothing listed has a parent there is nothing to group by, and the list stays flat:
+    /// a lone "No parent" header over everything would hide the list behind a line that says
+    /// nothing. That is what lets grouping be the default for forges that have no parents.
     pub fn wi_lines(&self) -> Vec<WiLine> {
         let idxs = self.filtered_wi_indices();
-        if self.wi_group == WiGroup::Off {
+        if self.wi_group == WiGroup::Off || !idxs.iter().any(|&i| self.wis[i].wi.parent.is_some()) {
             return idxs.into_iter().map(WiLine::Item).collect();
         }
 
@@ -3790,9 +3796,15 @@ impl App {
         self.ensure_visible();
     }
 
+    /// Whether the Work Items list is drawn as groups right now: grouping is on and something
+    /// listed has a parent to group by.
+    pub fn wi_grouped(&self) -> bool {
+        self.wi_lines().iter().any(|l| matches!(l, WiLine::Head(_)))
+    }
+
     /// Expands or collapses every group at once.
     fn set_all_wi_groups(&mut self, expand: bool) {
-        if self.wi_group == WiGroup::Off {
+        if !self.wi_grouped() {
             return;
         }
         // The group the cursor is in, so it can be put back on that group's header: the line
@@ -5141,7 +5153,7 @@ impl App {
                     0 => out.push(("Filter by status", c('f'))),
                     1 => {
                         out.extend([("Choose which states to show", c('f')), ("Group by parent (milestone, epic, project)", c('G'))]);
-                        if self.wi_group != WiGroup::Off {
+                        if self.wi_grouped() {
                             out.extend([("Collapse every group", c('z')), ("Expand every group", c('Z'))]);
                         }
                     }
@@ -14861,10 +14873,29 @@ mod tests {
     }
 
     #[test]
-    fn work_items_are_a_flat_list_until_grouping_is_asked_for() {
-        let mut app = grouped_app();
-        app.wi_group = WiGroup::default();
-        assert_eq!(app.wi_group, WiGroup::Off, "flat out of the box");
+    fn work_items_open_grouped_by_parent_and_stay_flat_when_nothing_has_one() {
+        let mut app = App::new("slate");
+        assert_eq!(app.wi_group, WiGroup::Parent, "grouped by parent out of the box");
+        app.screen = Screen::List;
+        app.active = 1;
+        app.wis = grouped_wis();
+        assert_eq!(app.wi_lines().len(), 4, "only the parents, folded");
+        assert!(app.wi_grouped());
+
+        // Nothing listed has a parent — GitHub issues with no milestone, say. A lone "No parent"
+        // header over the whole list would say nothing, so the list is simply the list.
+        app.wis.retain(|r| r.wi.parent.is_none());
+        assert_eq!(wi_line_names(&app), ["loose-new", "loose-old"]);
+        assert!(!app.wi_grouped());
+
+        // The same when a filter leaves only parentless items on screen.
+        app.wis = grouped_wis();
+        app.filters[1] = "loose".into();
+        assert_eq!(wi_line_names(&app), ["loose-new", "loose-old"]);
+
+        // And `G` still turns grouping off outright.
+        app.filters[1].clear();
+        app.wi_group = WiGroup::Off;
         assert_eq!(wi_line_names(&app), ["a", "loose-new", "b", "c", "d", "e", "loose-old"]);
     }
 
@@ -14995,8 +15026,10 @@ mod tests {
         let mut fresh = App::new("slate");
         fresh.apply_wi_group(deps.config.snapshot().ui.work_item_group);
         assert_eq!(fresh.wi_group, WiGroup::Parent);
+        fresh.apply_wi_group(Some("off".into()));
+        assert_eq!(fresh.wi_group, WiGroup::Off, "a saved Off is kept");
         fresh.apply_wi_group(Some("by-sprint".into()));
-        assert_eq!(fresh.wi_group, WiGroup::Off);
+        assert_eq!(fresh.wi_group, WiGroup::Parent);
 
         app.on_key(Key::Char('Z'), &deps).await;
         app.on_key(Key::Char('G'), &deps).await;
