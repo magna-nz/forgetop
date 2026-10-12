@@ -16,6 +16,7 @@ Changed
 - **Confirm dialogs show Enter, not `y`.** In the terminal UI, the approve, merge, rerun,
   cancel and other confirm prompts now read `↵ confirm  Esc cancel`. Enter always
   confirmed; `y` still does too, but the dialog no longer shows it.
+  ([#233](https://github.com/magna-nz/forgetop/pull/233))
 
 ## 1.8.1 — 2026-10-12
 
