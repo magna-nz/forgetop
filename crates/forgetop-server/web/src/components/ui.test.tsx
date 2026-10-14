@@ -1,7 +1,26 @@
-import { fireEvent, render, screen, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
-import { Button, IconButton, PaneHeader, PaneSlotContext, Row, Segmented, Select, SlideOver, StatusBadge, StatusGlyph, Tabs } from "./ui";
+import {
+  Button,
+  ContextMenu,
+  copyText,
+  IconButton,
+  type MenuEntry,
+  notify,
+  PaneHeader,
+  PaneSlotContext,
+  Row,
+  RowMenuButton,
+  Segmented,
+  Select,
+  SlideOver,
+  StatusBadge,
+  StatusGlyph,
+  Tabs,
+  Toasts,
+  useContextMenu,
+} from "./ui";
 
 describe("Button", () => {
   it("is a real button with one class per variant", () => {
@@ -222,5 +241,338 @@ describe("SlideOver resize grip", () => {
       </SlideOver>,
     );
     expect(screen.getByRole("region", { name: "Details" }).style.width).toBe("");
+  });
+});
+
+/** A row wired the way the lists wire it: right-click, Shift+F10 and the ⋯ open one menu. */
+function MenuRow({ items, onRowClick = () => {} }: { items: MenuEntry[] | (() => MenuEntry[]); onRowClick?: () => void }) {
+  const menu = useContextMenu();
+  return (
+    <>
+      <Row onClick={onRowClick} onContextMenu={menu.onContextMenu} onKeyDown={menu.onKeyDown} menuOpen={menu.open} label="Refactor the retry queue">
+        Refactor the retry queue
+        <RowMenuButton onOpen={menu.openAt} />
+      </Row>
+      <ContextMenu anchor={menu.anchor} onClose={menu.close} items={items} label="Pull request actions" />
+    </>
+  );
+}
+
+const rowButton = () => screen.getByRole("button", { name: "Refactor the retry queue" });
+
+describe("ContextMenu", () => {
+  it("right-click prevents the native menu, opens the labelled menu and marks the row", () => {
+    const onRowClick = vi.fn();
+    const items = vi.fn((): MenuEntry[] => [{ label: "Open", hint: "↵" }, { label: "Copy link", hint: "y" }]);
+    render(<MenuRow items={items} onRowClick={onRowClick} />);
+    expect(items).not.toHaveBeenCalled();
+    expect(rowButton()).not.toHaveAttribute("data-menu-open");
+    const notPrevented = fireEvent.contextMenu(rowButton(), { clientX: 40, clientY: 60 });
+    expect(notPrevented).toBe(false);
+    const menu = screen.getByRole("menu", { name: "Pull request actions" });
+    expect(document.body).toContainElement(menu);
+    expect(within(menu).getAllByRole("menuitem").map((m) => m.textContent)).toEqual(["Open↵", "Copy linky"]);
+    // The accessible name is the label alone; the hint is announced as a shortcut.
+    expect(within(menu).getByRole("menuitem", { name: "Copy link" })).toHaveAttribute("aria-keyshortcuts", "y");
+    expect(within(menu).getByRole("menuitem", { name: "Open" })).toHaveFocus();
+    expect(rowButton()).toHaveAttribute("data-menu-open", "true");
+    expect(items).toHaveBeenCalledTimes(1);
+    expect(onRowClick).not.toHaveBeenCalled();
+  });
+
+  it("arrow keys wrap, skip separators but not disabled items, and one item is the tab stop", async () => {
+    render(<MenuRow items={[{ label: "Open" }, { type: "separator" }, { label: "Approve" }, { label: "Merge", disabled: "Checks failed" }]} />);
+    fireEvent.contextMenu(rowButton());
+    const item = (name: string) => screen.getByRole("menuitem", { name });
+    expect(screen.getAllByRole("separator")).toHaveLength(1);
+    expect(item("Open")).toHaveFocus();
+    await userEvent.keyboard("{ArrowDown}");
+    expect(item("Approve")).toHaveFocus();
+    await userEvent.keyboard("{ArrowDown}");
+    expect(item("Merge")).toHaveFocus();
+    expect(screen.getAllByRole("menuitem").filter((m) => m.tabIndex === 0)).toEqual([item("Merge")]);
+    await userEvent.keyboard("{ArrowDown}");
+    expect(item("Open")).toHaveFocus();
+    await userEvent.keyboard("{ArrowUp}");
+    expect(item("Merge")).toHaveFocus();
+  });
+
+  it("typing a key jumps to the item with that hint, else the one whose label starts with it", async () => {
+    render(<MenuRow items={[{ label: "Open" }, { label: "Copy link", hint: "y" }, { label: "Merge" }, { label: "Close", hint: "X" }]} />);
+    fireEvent.contextMenu(rowButton());
+    await userEvent.keyboard("y");
+    expect(screen.getByRole("menuitem", { name: "Copy link" })).toHaveFocus();
+    await userEvent.keyboard("m");
+    expect(screen.getByRole("menuitem", { name: "Merge" })).toHaveFocus();
+    await userEvent.keyboard("X");
+    expect(screen.getByRole("menuitem", { name: "Close" })).toHaveFocus();
+  });
+
+  it("Enter runs the item and closes the menu", async () => {
+    const onSelect = vi.fn();
+    render(<MenuRow items={[{ label: "Open" }, { label: "Copy link", onSelect }]} />);
+    fireEvent.contextMenu(rowButton());
+    await userEvent.keyboard("{ArrowDown}{Enter}");
+    expect(onSelect).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("menu")).toBeNull();
+    expect(rowButton()).not.toHaveAttribute("data-menu-open");
+  });
+
+  it("Esc closes and returns focus to the row; Shift+F10 opens it from the row", async () => {
+    const onEscapeOutside = vi.fn();
+    window.addEventListener("keydown", onEscapeOutside);
+    render(<MenuRow items={[{ label: "Open" }]} />);
+    rowButton().focus();
+    await userEvent.keyboard("{Shift>}{F10}{/Shift}");
+    expect(screen.getByRole("menuitem", { name: "Open" })).toHaveFocus();
+    await userEvent.keyboard("{Escape}");
+    expect(screen.queryByRole("menu")).toBeNull();
+    expect(rowButton()).toHaveFocus();
+    // The menu's Esc is its own: an open pane's Esc listener on the window never hears it.
+    expect(onEscapeOutside.mock.calls.filter(([e]) => (e as KeyboardEvent).key === "Escape")).toHaveLength(0);
+    window.removeEventListener("keydown", onEscapeOutside);
+  });
+
+  it("a click outside closes it", async () => {
+    render(<MenuRow items={[{ label: "Open" }]} />);
+    fireEvent.contextMenu(rowButton());
+    expect(screen.getByRole("menu")).toBeInTheDocument();
+    fireEvent.mouseDown(document.body);
+    expect(screen.queryByRole("menu")).toBeNull();
+  });
+
+  it("a disabled item keeps its reason as the tooltip, stays focusable and does not run", async () => {
+    const onSelect = vi.fn();
+    render(<MenuRow items={[{ label: "Merge", disabled: "Checks are still running", onSelect }]} />);
+    fireEvent.contextMenu(rowButton());
+    const merge = screen.getByRole("menuitem", { name: "Merge" });
+    expect(merge).toHaveAttribute("aria-disabled", "true");
+    expect(merge).toHaveAttribute("title", "Checks are still running");
+    expect(merge).not.toHaveAttribute("disabled");
+    expect(merge).toHaveFocus();
+    await userEvent.click(merge);
+    await userEvent.keyboard("{Enter}");
+    expect(onSelect).not.toHaveBeenCalled();
+    expect(screen.getByRole("menu")).toBeInTheDocument();
+  });
+
+  it("a checked entry is a menuitemcheckbox", () => {
+    render(<MenuRow items={[{ label: 'Hide "Done" items', checked: true }, { label: 'Hide "Todo" items', checked: false }]} />);
+    fireEvent.contextMenu(rowButton());
+    expect(screen.getByRole("menuitemcheckbox", { name: 'Hide "Done" items' })).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByRole("menuitemcheckbox", { name: 'Hide "Todo" items' })).toHaveAttribute("aria-checked", "false");
+  });
+
+  it("a confirm item needs a second click, shows the confirm label in between and stays open", async () => {
+    const onSelect = vi.fn();
+    render(<MenuRow items={[{ label: "Open" }, { label: "Close pull request", danger: true, confirm: "Click again to close", onSelect }]} />);
+    fireEvent.contextMenu(rowButton());
+    await userEvent.click(screen.getByRole("menuitem", { name: "Close pull request" }));
+    expect(onSelect).not.toHaveBeenCalled();
+    const armed = screen.getByRole("menuitem", { name: "Click again to close" });
+    expect(armed).toHaveAttribute("data-danger");
+    expect(screen.getByRole("menu")).toBeInTheDocument();
+    await userEvent.click(armed);
+    expect(onSelect).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("menu")).toBeNull();
+  });
+
+  it("an armed confirm reverts after 4 seconds", () => {
+    vi.useFakeTimers();
+    try {
+      const onSelect = vi.fn();
+      render(<MenuRow items={[{ label: "Cancel run", danger: true, confirm: "Click again to cancel", onSelect }]} />);
+      fireEvent.contextMenu(rowButton());
+      fireEvent.click(screen.getByRole("menuitem", { name: "Cancel run" }));
+      expect(screen.getByRole("menuitem", { name: "Click again to cancel" })).toBeInTheDocument();
+      act(() => {
+        vi.advanceTimersByTime(4000);
+      });
+      fireEvent.click(screen.getByRole("menuitem", { name: "Cancel run" }));
+      expect(onSelect).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("a submenu loader runs when it opens, shows Loading… then its items; ← returns to the parent", async () => {
+    let resolve: (v: MenuEntry[]) => void = () => {};
+    const loader = vi.fn(() => new Promise<MenuEntry[]>((r) => (resolve = r)));
+    const onSelect = vi.fn();
+    render(<MenuRow items={[{ label: "Open" }, { label: "Request reviewer", icon: "user-plus", submenu: loader }]} />);
+    fireEvent.contextMenu(rowButton());
+    expect(loader).not.toHaveBeenCalled();
+    const parent = screen.getByRole("menuitem", { name: "Request reviewer" });
+    expect(parent).toHaveAttribute("aria-haspopup", "menu");
+    expect(parent).toHaveAttribute("aria-expanded", "false");
+    await userEvent.keyboard("{ArrowDown}{ArrowRight}");
+    expect(loader).toHaveBeenCalledTimes(1);
+    expect(parent).toHaveAttribute("aria-expanded", "true");
+    const sub = screen.getByRole("menu", { name: "Request reviewer" });
+    expect(within(sub).getByRole("menuitem", { name: "Loading…" })).toHaveFocus();
+    await act(async () => resolve([{ label: "Ada Lovelace", value: "ada", onSelect }]));
+    const ada = await screen.findByRole("menuitem", { name: "Ada Lovelace" });
+    expect(ada).toHaveAccessibleDescription("ada");
+    expect(ada).toHaveFocus();
+    await userEvent.keyboard("{ArrowLeft}");
+    expect(screen.queryByRole("menu", { name: "Request reviewer" })).toBeNull();
+    expect(parent).toHaveFocus();
+    await userEvent.keyboard("{Enter}");
+    // Reopened from the cache: the loader is not called again within one open menu.
+    await userEvent.click(await screen.findByRole("menuitem", { name: "Ada Lovelace" }));
+    expect(loader).toHaveBeenCalledTimes(1);
+    expect(onSelect).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("menu")).toBeNull();
+  });
+
+  it("hovering a submenu parent opens it after a beat, without taking focus from the parent", () => {
+    vi.useFakeTimers();
+    try {
+      render(<MenuRow items={[{ label: "Open" }, { label: "Assign", submenu: [{ label: "Unassigned" }] }]} />);
+      fireEvent.contextMenu(rowButton());
+      const parent = screen.getByRole("menuitem", { name: "Assign" });
+      fireEvent.mouseEnter(parent);
+      expect(parent).toHaveFocus();
+      expect(screen.queryByRole("menu", { name: "Assign" })).toBeNull();
+      act(() => {
+        vi.advanceTimersByTime(120);
+      });
+      expect(screen.getByRole("menu", { name: "Assign" })).toBeInTheDocument();
+      expect(parent).toHaveFocus();
+      // Moving to another item closes it after the same beat.
+      fireEvent.mouseEnter(screen.getByRole("menuitem", { name: "Open" }));
+      act(() => {
+        vi.advanceTimersByTime(120);
+      });
+      expect(screen.queryByRole("menu", { name: "Assign" })).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("flips up and left at the viewport edge and stays inside it", () => {
+    Object.defineProperty(window, "innerWidth", { value: 1024, configurable: true });
+    Object.defineProperty(window, "innerHeight", { value: 768, configurable: true });
+    const real = HTMLElement.prototype.getBoundingClientRect;
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
+      return this.classList.contains("ft-menu") ? new DOMRect(0, 0, 260, 200) : real.call(this);
+    });
+    render(<MenuRow items={[{ label: "Open" }]} />);
+    fireEvent.contextMenu(rowButton(), { clientX: 1000, clientY: 700 });
+    expect(screen.getByRole("menu")).toHaveStyle({ left: "740px", top: "500px" });
+    expect(screen.getByRole("menu").style.visibility).toBe("");
+    fireEvent.mouseDown(document.body);
+    fireEvent.contextMenu(rowButton(), { clientX: 30, clientY: 40 });
+    expect(screen.getByRole("menu")).toHaveStyle({ left: "30px", top: "40px" });
+  });
+
+  it("a submenu whose loader rejects says it couldn't load", async () => {
+    render(<MenuRow items={[{ label: "Move to", submenu: () => Promise.reject(new Error("502 from the forge")) }]} />);
+    fireEvent.contextMenu(rowButton());
+    await userEvent.keyboard("{ArrowRight}");
+    const failed = await screen.findByRole("menuitem", { name: "Couldn't load" });
+    expect(failed).toHaveAttribute("title", "502 from the forge");
+  });
+});
+
+describe("RowMenuButton", () => {
+  it("click and Enter call onOpen with the element and never reach the row", async () => {
+    const onOpen = vi.fn();
+    const onRowClick = vi.fn();
+    render(
+      <Row onClick={onRowClick}>
+        title
+        <RowMenuButton onOpen={onOpen} />
+      </Row>,
+    );
+    const dots = screen.getByTitle("More actions");
+    expect(dots.tagName).toBe("SPAN");
+    expect(dots).toHaveAttribute("tabindex", "-1");
+    expect(dots).toHaveAttribute("aria-hidden", "true");
+    expect(dots).toHaveClass("ft-row-menu");
+    await userEvent.click(dots);
+    expect(onOpen).toHaveBeenCalledWith(dots);
+    dots.focus();
+    await userEvent.keyboard("{Enter}");
+    expect(onOpen).toHaveBeenCalledTimes(2);
+    expect(onRowClick).not.toHaveBeenCalled();
+  });
+
+  it("opens the row's menu anchored to itself, and focus returns to it", async () => {
+    const onRowClick = vi.fn();
+    render(<MenuRow items={[{ label: "Open" }]} onRowClick={onRowClick} />);
+    const dots = screen.getByTitle("More actions");
+    await userEvent.click(dots);
+    expect(screen.getByRole("menuitem", { name: "Open" })).toHaveFocus();
+    await userEvent.keyboard("{Escape}");
+    expect(dots).toHaveFocus();
+    expect(onRowClick).not.toHaveBeenCalled();
+  });
+});
+
+describe("Row menu state", () => {
+  it("menuOpen sets data-menu-open", () => {
+    render(
+      <>
+        <Row onClick={() => {}} menuOpen>
+          Open one
+        </Row>
+        <Row href="https://example.test/pr/1" menuOpen>
+          Linked one
+        </Row>
+        <Row onClick={() => {}}>Closed one</Row>
+      </>,
+    );
+    expect(screen.getByRole("button", { name: "Open one" })).toHaveAttribute("data-menu-open", "true");
+    expect(screen.getByRole("link", { name: "Linked one" })).toHaveAttribute("data-menu-open", "true");
+    expect(screen.getByRole("button", { name: "Closed one" })).not.toHaveAttribute("data-menu-open");
+  });
+});
+
+describe("notify / Toasts", () => {
+  it("shows a status note, an error as an alert, and lets each go after its time", () => {
+    vi.useFakeTimers();
+    try {
+      render(<Toasts />);
+      act(() => notify("Copied link"));
+      expect(screen.getByRole("status")).toHaveTextContent("Copied link");
+      act(() => notify("Couldn't merge: blocked by branch policy", { error: true }));
+      const alert = screen.getByRole("alert");
+      expect(alert).toHaveTextContent("Couldn't merge: blocked by branch policy");
+      expect(alert).toHaveAttribute("data-error");
+      act(() => {
+        vi.advanceTimersByTime(4000);
+      });
+      expect(screen.queryByRole("status")).toBeNull();
+      expect(screen.getByRole("alert")).toBeInTheDocument();
+      act(() => {
+        vi.advanceTimersByTime(4000);
+      });
+      expect(screen.queryByRole("alert")).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("copyText", () => {
+  it("falls back to the selection copy when the clipboard API refuses, and only reports a failure when both do", async () => {
+    const writeText = vi.fn().mockRejectedValue(new Error("Write permission denied."));
+    vi.stubGlobal("navigator", { ...navigator, clipboard: { writeText } });
+    const exec = vi.fn().mockReturnValue(true);
+    document.execCommand = exec;
+    try {
+      render(<Toasts />);
+      await act(() => copyText("https://example.test/pr/1", "link"));
+      expect(writeText).toHaveBeenCalledWith("https://example.test/pr/1");
+      expect(exec).toHaveBeenCalledWith("copy");
+      expect(screen.getByRole("status")).toHaveTextContent("Copied link");
+
+      exec.mockReturnValue(false);
+      await act(() => copyText("#7", "#7"));
+      expect(screen.getByRole("alert")).toHaveTextContent("Couldn't copy #7");
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });

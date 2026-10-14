@@ -1,8 +1,13 @@
-import { describe, it, expect, beforeEach } from "vitest";
-import { screen, within } from "@testing-library/react";
+import { describe, it, expect, beforeEach, vi } from "vitest";
+import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { WorkItems } from "./WorkItems";
 import { renderWithClient, mockFetch } from "../test/util";
+
+const openWi = vi.fn();
+vi.mock("./WiDetail", () => ({ useWiOpener: () => openWi, useCurrentWi: () => null }));
+
+// Imported after the mock so the rows pick it up.
+import { WorkItems } from "./WorkItems";
 
 interface Opts {
   conn?: string;
@@ -46,6 +51,7 @@ const headers = () => screen.queryAllByRole("button", { expanded: false }).conca
 // Most tests start from the flat list and switch grouping on, so they start with Off chosen;
 // the ones about the default clear it again.
 beforeEach(() => {
+  openWi.mockClear();
   localStorage.clear();
   localStorage.setItem("forgetop:work-items:group", "off");
 });
@@ -168,6 +174,28 @@ describe("work items grouped by parent", () => {
     expect(ledgerHeader).not.toHaveTextContent("blocked");
   });
 
+  it("right-clicking a parent header offers the section and the parent, without toggling it", async () => {
+    mockFetch({ get: { "/api/prefs": { hidden_work_item_states: [] }, "/api/work-items": rowsFixture } });
+    renderWithClient(<WorkItems />);
+    await screen.findByText("Alpha one");
+    await choose("parent");
+    const q4Header = screen.getByRole("button", { name: /Q4 reliability/ });
+    fireEvent.contextMenu(q4Header);
+    const m = screen.getByRole("menu", { name: "Milestone actions" });
+    expect(within(m).getByRole("menuitem", { name: "Expand" })).toBeInTheDocument();
+    expect(within(m).getByRole("menuitem", { name: "Open milestone in GitHub" })).not.toHaveAttribute("aria-disabled");
+    expect(within(m).getByRole("menuitem", { name: "Copy link" })).toBeInTheDocument();
+    expect(q4Header).toHaveAttribute("aria-expanded", "false");
+    expect(openWi).not.toHaveBeenCalled();
+
+    await userEvent.click(within(m).getByRole("menuitem", { name: "Expand all" }));
+    expect(q4Header).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByRole("button", { name: /Ledger v2/ })).toHaveAttribute("aria-expanded", "true");
+    // A parent the provider gave no link for keeps the items, disabled with the reason.
+    fireEvent.contextMenu(screen.getByRole("button", { name: /Ledger v2/ }));
+    expect(screen.getByRole("menuitem", { name: "Open epic in GitHub" })).toHaveAttribute("aria-disabled", "true");
+  });
+
   it("links the parent out in a new tab without toggling the section", async () => {
     mockFetch({ get: { "/api/work-items": rowsFixture } });
     renderWithClient(<WorkItems />);
@@ -215,5 +243,46 @@ describe("work items grouped by parent", () => {
     renderWithClient(<WorkItems />);
     expect(await screen.findByText("Alpha one")).toBeInTheDocument();
     expect(screen.getByLabelText("Group")).toHaveValue("off");
+  });
+});
+
+describe("work items hidden by state", () => {
+  it("drops a hidden state's rows, and its chip shows them again (posting the list without it)", async () => {
+    const prefs = { hidden_work_item_states: ["Review"] };
+    const { posts } = mockFetch({
+      get: { "/api/prefs": prefs, "/api/work-items": rowsFixture },
+      // The server saves what it is sent, so the refetch after the write agrees with it.
+      onPost: (url, body) => {
+        if (url.includes("/api/prefs/hidden-work-item-state")) {
+          const { state, hidden } = body as { state: string; hidden: boolean };
+          prefs.hidden_work_item_states = prefs.hidden_work_item_states.filter((s) => s !== state).concat(hidden ? [state] : []);
+        }
+      },
+    });
+    renderWithClient(<WorkItems />);
+    const chip = await screen.findByRole("button", { name: 'Show "Review"' });
+    expect(screen.getByText("Alpha one")).toBeInTheDocument();
+    expect(screen.queryByText("Alpha two")).not.toBeInTheDocument();
+
+    await userEvent.click(chip);
+    await waitFor(() => expect(posts.find((p) => p.url.includes("/api/prefs/hidden-work-item-state"))?.body).toEqual({ state: "Review", hidden: false }));
+    expect(await screen.findByText("Alpha two")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: 'Show "Review"' })).not.toBeInTheDocument();
+  });
+
+  it("right-click opens the row's actions without opening the pane", async () => {
+    mockFetch({ get: { "/api/prefs": { hidden_work_item_states: [] }, "/api/work-items": rowsFixture } });
+    renderWithClient(<WorkItems />);
+    const row = (await screen.findByText("No parent one")).closest("button")!;
+    fireEvent.contextMenu(row);
+    const menu = screen.getByRole("menu", { name: "Work item actions" });
+    expect(within(menu).getByRole("menuitem", { name: "Open" })).toBeInTheDocument();
+    expect(row).toHaveAttribute("data-menu-open", "true");
+    expect(openWi).not.toHaveBeenCalled();
+
+    // A plain click still opens the pane.
+    await userEvent.keyboard("{Escape}");
+    await userEvent.click(row);
+    expect(openWi).toHaveBeenCalledWith({ conn: "c1", repo: undefined, id: "2" });
   });
 });

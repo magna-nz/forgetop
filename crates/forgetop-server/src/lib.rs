@@ -14,6 +14,7 @@ use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
 use axum::Router;
 use forgetop_core::cache::CacheStore;
+use forgetop_core::launchpad::{Entry, EntryKind};
 use forgetop_core::provider::{ItemRef, PrDecoration};
 use forgetop_core::secret::SecretStore;
 use forgetop_core::service::{ConfigService, ConnectionHealthService, SectionService};
@@ -145,6 +146,9 @@ fn router(state: AppState) -> Router {
         .route("/api/pipelines", get(pipelines))
         .route("/api/notifications", get(notifications))
         .route("/api/launchpad", get(launchpad))
+        .route("/api/launchpad/dismiss", post(dismiss_launchpad_item))
+        .route("/api/prefs", get(prefs))
+        .route("/api/prefs/hidden-work-item-state", post(set_hidden_work_item_state))
         .route("/api/pr/detail", get(pr_detail))
         .route("/api/pr/decoration", get(pr_decoration))
         .route("/api/pr/commit-changes", get(pr_commit_changes))
@@ -316,8 +320,10 @@ async fn notifications(State(s): State<AppState>) -> Response {
     serve_cached(&s, "notifications", hit, |s: AppState| async move { dto::notifications(&s.deps.sections, &s.deps.cache).await }).await
 }
 async fn launchpad(State(s): State<AppState>) -> Response {
-    let hit = cached::launchpad(&s.deps.cache);
-    serve_cached(&s, "launchpad", hit, |s: AppState| async move { dto::launchpad(&s.deps.sections, &s.deps.cache).await }).await
+    // Read once, so the cached answer and the live fetch hide the same entries.
+    let dismissed = Arc::new(s.deps.config.snapshot().ui.dismissed_launchpad_items);
+    let hit = cached::launchpad(&s.deps.cache, &dismissed);
+    serve_cached(&s, "launchpad", hit, move |s: AppState| async move { dto::launchpad(&s.deps.sections, &s.deps.cache, &dismissed).await }).await
 }
 
 /// Query params identifying an item within a connection (`?conn=…&id=…&repo=…`).
@@ -704,6 +710,53 @@ async fn set_pipeline_selection(State(s): State<AppState>, Json(req): Json<Pipel
     }
 }
 
+#[derive(Deserialize)]
+struct DismissLaunchpadReq {
+    conn: String,
+    /// `"pr"`, `"wi"` or `"pipe"` — the tag of a `launchpad::EntryKind`.
+    kind: String,
+    #[serde(default)]
+    repo: Option<String>,
+    id: String,
+}
+
+/// Permanently dismisses one Command Center item, under the same key the TUI's `D` writes.
+async fn dismiss_launchpad_item(State(s): State<AppState>, Json(req): Json<DismissLaunchpadReq>) -> Response {
+    let kind = match req.kind.as_str() {
+        "pr" => EntryKind::Pr,
+        "wi" => EntryKind::Wi,
+        "pipe" => EntryKind::Pipe,
+        other => return (StatusCode::BAD_REQUEST, format!("unknown launchpad kind `{other}`")).into_response(),
+    };
+    let key = Entry::key(&req.conn, kind, req.repo.as_deref(), &req.id);
+    // Merged into the saved list, not written over it: the TUI adds to the same list.
+    match s.deps.config.dismiss_launchpad_item(key).await {
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
+    }
+}
+
+/// View preferences the dashboard shares with the TUI.
+async fn prefs(State(s): State<AppState>) -> Response {
+    let ui = s.deps.config.snapshot().ui;
+    Json(serde_json::json!({ "hidden_work_item_states": ui.hidden_work_item_states })).into_response()
+}
+
+#[derive(Deserialize)]
+struct HiddenWorkItemStateReq {
+    state: String,
+    hidden: bool,
+}
+
+/// Hides or shows one work-item state. One state at a time, merged into the saved list, so the
+/// dashboard never writes over what the TUI's "Show states" picker has set meanwhile.
+async fn set_hidden_work_item_state(State(s): State<AppState>, Json(req): Json<HiddenWorkItemStateReq>) -> Response {
+    match s.deps.config.set_hidden_work_item_state(&req.state, req.hidden).await {
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Err(e) => (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! The optional pull-request writes (resolve a thread, draft, close/reopen, request a
@@ -928,6 +981,40 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    /// A dismissal hides the entry on the cached path too, by the current key or the legacy one.
+    #[tokio::test]
+    async fn the_cached_launchpad_drops_dismissed_entries() {
+        let (cache, path) = scratch_cache();
+        let api = Api::start_with(deps_with(cache.clone()).await).await;
+        let _ = api.get_raw("/api/launchpad").await;
+        let all = cached::launchpad(&cache, &[]).expect("launchpad from cache").value;
+        let first = serde_json::to_value(&all.rows[0]).unwrap();
+        let (conn, id) = (first["connection_id"].as_str().unwrap().to_string(), first[match first["kind"].as_str().unwrap() {
+            "pr" => "pull_request",
+            "wi" => "work_item",
+            _ => "run",
+        }]["id"]
+            .as_str()
+            .unwrap()
+            .to_string());
+        let legacy = cached::launchpad(&cache, &[format!("{conn}:{id}")]).expect("launchpad from cache").value;
+        assert!(legacy.rows.len() < all.rows.len(), "the legacy key hides the entry");
+        // The current key (kind and repository included) hides it too.
+        let kind = first["kind"].as_str().unwrap();
+        let item = &first[match kind {
+            "pr" => "pull_request",
+            "wi" => "work_item",
+            _ => "run",
+        }];
+        let repo = item["repository"].as_str().unwrap_or("");
+        let current = cached::launchpad(&cache, &[format!("{conn}:{kind}:{repo}:{id}")]).expect("launchpad from cache").value;
+        assert_eq!(current.rows.len(), legacy.rows.len(), "the current key hides the same entry");
+        // A key that matches nothing hides nothing.
+        let other = cached::launchpad(&cache, &["nope:pr::0".to_string()]).expect("launchpad from cache").value;
+        assert_eq!(other.rows.len(), all.rows.len());
+        let _ = std::fs::remove_file(path);
+    }
+
     /// Every list the dashboard fetches lands in the cache under the key the TUI reads at launch.
     #[tokio::test]
     async fn live_fetches_write_the_terminal_ui_keys() {
@@ -947,7 +1034,7 @@ mod tests {
         assert!(cache.get::<Vec<dto::NotifRow>>(cached::KEY_INBOX).is_some());
         // The Command Center rebuilt from those entries is the one the live build produced.
         let live: serde_json::Value = api.get_raw("/api/launchpad").await.json().await.unwrap();
-        let from_cache = cached::launchpad(&cache).expect("launchpad from cache");
+        let from_cache = cached::launchpad(&cache, &[]).expect("launchpad from cache");
         assert_eq!(serde_json::to_value(&from_cache.value).unwrap(), live);
         let _ = std::fs::remove_file(path);
     }

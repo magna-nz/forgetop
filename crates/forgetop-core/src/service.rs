@@ -24,6 +24,9 @@ pub struct ConfigService {
     /// `ConfigService`, so this is how a connection added in the browser reaches the
     /// terminal without waiting for the refresh tick.
     data_changed: watch::Sender<u64>,
+    /// Serialises the read-modify-write UI edits (`update_ui`): the TUI and the dashboard
+    /// share this service and each adds to the same lists, so two edits must not race.
+    ui_writes: tokio::sync::Mutex<()>,
 }
 
 impl ConfigService {
@@ -34,6 +37,7 @@ impl ConfigService {
             registry,
             config: Mutex::new(ForgetopConfig::default()),
             data_changed: watch::channel(0).0,
+            ui_writes: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -323,6 +327,38 @@ impl ConfigService {
         let mut cfg = self.snapshot();
         cfg.ui.dismissed_launchpad_items = dismissed;
         self.persist(cfg).await
+    }
+
+    /// Edits the UI preferences in place: the saved state is read, `edit` is applied to it, and
+    /// the result is persisted, all under one lock. This is how a list both frontends add to
+    /// (Command Center dismissals, hidden work-item states) takes an entry without dropping what
+    /// the other frontend added since this one last looked.
+    pub async fn update_ui(&self, edit: impl FnOnce(&mut UiState)) -> Result<()> {
+        let _serial = self.ui_writes.lock().await;
+        let mut cfg = self.snapshot();
+        edit(&mut cfg.ui);
+        self.persist(cfg).await
+    }
+
+    /// Records one Command Center dismissal (a `launchpad::Entry::key`), keeping every other.
+    pub async fn dismiss_launchpad_item(&self, key: String) -> Result<()> {
+        self.update_ui(|ui| {
+            if !ui.dismissed_launchpad_items.contains(&key) {
+                ui.dismissed_launchpad_items.push(key);
+            }
+        })
+        .await
+    }
+
+    /// Hides or shows one work-item state, keeping every other state's setting.
+    pub async fn set_hidden_work_item_state(&self, state: &str, hidden: bool) -> Result<()> {
+        self.update_ui(|ui| {
+            ui.hidden_work_item_states.retain(|s| s != state);
+            if hidden {
+                ui.hidden_work_item_states.push(state.to_string());
+            }
+        })
+        .await
     }
 
     pub async fn set_dismissed_notifications(&self, dismissed: Vec<String>) -> Result<()> {

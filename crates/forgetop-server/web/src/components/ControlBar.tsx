@@ -1,4 +1,4 @@
-import { useMemo, useState, type CSSProperties, type ReactNode } from "react";
+import { useMemo, useState, type CSSProperties, type KeyboardEvent, type MouseEvent, type ReactNode } from "react";
 import { Icon } from "./icons";
 import { Select } from "./ui";
 
@@ -159,21 +159,39 @@ export function useListView<T>(opts: {
  *  carrying `aria-expanded`. (`Row` in ui.tsx takes no aria-expanded; this is the local stand-in
  *  until it does.) `height` overrides the row's 36px — an inline style, so it wins whatever the
  *  min-height class would not win; it goes inline. */
+/** A group header that expands and collapses its section. `onContextMenu`, `onKeyDown` and
+ *  `menuOpen` take a `useContextMenu()`'s handlers, the way `Row` does, so a header can carry
+ *  a menu of its own (expand all, open the parent, …). */
 export function ToggleRow({
   open,
   onToggle,
   height,
   style,
+  onContextMenu,
+  onKeyDown,
+  menuOpen = false,
   children,
 }: {
   open: boolean;
   onToggle: () => void;
   height?: number;
   style?: CSSProperties;
+  onContextMenu?: (e: MouseEvent) => void;
+  onKeyDown?: (e: KeyboardEvent) => void;
+  menuOpen?: boolean;
   children: ReactNode;
 }) {
   return (
-    <button type="button" className="ft-row" aria-expanded={open} onClick={onToggle} style={{ ...(height ? { minHeight: height } : {}), ...style }}>
+    <button
+      type="button"
+      className="ft-row"
+      aria-expanded={open}
+      onClick={onToggle}
+      onContextMenu={onContextMenu}
+      onKeyDown={onKeyDown}
+      data-menu-open={menuOpen ? "true" : undefined}
+      style={{ ...(height ? { minHeight: height } : {}), ...style }}
+    >
       <Icon name={open ? "chevron-down" : "chevron-right"} size={14} style={{ color: "var(--fg3)" }} />
       {children}
     </button>

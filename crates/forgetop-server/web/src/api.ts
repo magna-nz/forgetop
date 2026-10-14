@@ -409,3 +409,11 @@ export const usePullRequests = (view: PrView = "all") => useQuery(listQuery<PrRo
 export const useWorkItems = () => useQuery(listQuery<WiRow[]>(["work-items"], "/api/work-items"));
 export const usePipelines = () => useQuery(listQuery<PipeRow[]>(["pipelines"], "/api/pipelines"));
 export const useNotifications = () => useQuery(listQuery<NotifRow[]>(["notifications"], "/api/notifications"));
+
+/** The viewer's saved view preferences (`GET /api/prefs`), shared with the TUI's config. */
+export interface Prefs {
+  /** Work-item states the Work Items list hides, matched exactly against `WorkItem.state`. */
+  hidden_work_item_states: string[];
+}
+export const prefsKey = ["prefs"];
+export const usePrefs = () => useQuery({ queryKey: prefsKey, queryFn: () => api<Prefs>("/api/prefs") });

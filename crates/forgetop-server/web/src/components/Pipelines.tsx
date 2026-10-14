@@ -1,17 +1,19 @@
-import { useMemo, useState, type MouseEvent } from "react";
+import { useMemo, useRef, useState, type MouseEvent } from "react";
 import { usePipelines } from "../api";
-import { fmtSecs, pipeMeta, sameRef, toTime } from "../format";
+import { fmtSecs, pipeMeta, providerMeta, sameRef, toTime } from "../format";
 import type { PipelineRunStatus, PipeRow } from "../types";
 import { groupPipelines, listStrip, parseGroupMode, pipeDefinitionName, rowGates, rowShownStatus } from "../pipeline/grouping";
 import type { GroupMode, PipeGroup } from "../pipeline/grouping";
 import { runSecs } from "../pipeline/timeline";
 import { Icon } from "./icons";
-import { Avatar, Button, Chip, List, Segmented, Skeleton, StateCard, StatusGlyph } from "./ui";
+import { Avatar, Button, Chip, ContextMenu, copyText, List, RowMenuButton, Segmented, Skeleton, StateCard, StatusGlyph, useContextMenu, type MenuEntry } from "./ui";
 import { ErrorState } from "./ErrorState";
 import { shortAge, ToggleRow, useListView, type SortOption } from "./ControlBar";
 import { useCurrentPipeline, usePipelineOpener } from "./PipelineDetail";
 import { useRepoScope } from "./RepoScope";
 import { usePipelineScope } from "./PipelineScope";
+import { usePipelineRowMenu } from "./rowMenus/pipeline";
+import { openExternal } from "./rowMenus/shared";
 
 const GROUP_KEY = "forgetop:pipelines:group";
 
@@ -129,7 +131,16 @@ export function Pipelines() {
       <List>
         {groups.length > 0
           ? groups.map((g) => (
-              <PipeGroupSection key={g.key} group={g} mode={mode} now={now} open={expanded.has(g.key)} onToggle={() => toggle(g.key)} />
+              <PipeGroupSection
+                key={g.key}
+                group={g}
+                mode={mode}
+                now={now}
+                open={expanded.has(g.key)}
+                onToggle={() => toggle(g.key)}
+                onExpandAll={() => setExpanded(new Set(groups.map((x) => x.key)))}
+                onCollapseAll={() => setExpanded(new Set())}
+              />
             ))
           : rows.map((row) => <PipeRunRow key={rowKey(row)} row={row} now={now} />)}
       </List>
@@ -143,19 +154,46 @@ function PipeGroupSection({
   now,
   open,
   onToggle,
+  onExpandAll,
+  onCollapseAll,
 }: {
   group: PipeGroup;
   mode: GroupMode;
   now: Date;
   open: boolean;
   onToggle: () => void;
+  onExpandAll: () => void;
+  onCollapseAll: () => void;
 }) {
   const meta = pipeMeta(group.status);
   const latest = group.latest;
   const branch = latest.run.branch;
+  const menu = useContextMenu();
+  const openRun = usePipelineOpener();
+  // The header's own menu: the section, then its latest run — the one the header describes.
+  // Each run beneath keeps its own row menu.
+  const groupMenu = (): MenuEntry[] => {
+    const url = latest.run.url ?? null;
+    const noLink = url ? false : "No link from the provider";
+    const entries: MenuEntry[] = [
+      { label: open ? "Collapse" : "Expand", icon: open ? "chevron-down" : "chevron-right", hint: "↵", onSelect: onToggle },
+      { label: "Expand all", onSelect: onExpandAll },
+      { label: "Collapse all", onSelect: onCollapseAll },
+      { type: "separator" },
+      {
+        label: "Open latest run",
+        icon: "open-pane",
+        onSelect: () => openRun({ conn: latest.connection_id, repo: latest.run.repository, runId: latest.run.id }),
+      },
+      { label: `Open in ${providerMeta(latest.provider).label}`, icon: "external", hint: "o", disabled: noLink, onSelect: () => openExternal(url!) },
+      { label: "Copy link", icon: "link", hint: "y", disabled: noLink, onSelect: () => copyText(url!, "link") },
+    ];
+    if (branch) entries.push({ label: "Copy branch", icon: "git-branch", value: branch, onSelect: () => copyText(branch, "branch") });
+    return entries;
+  };
   return (
     <>
-      <ToggleRow open={open} onToggle={onToggle} height={40}>
+      <ToggleRow open={open} onToggle={onToggle} onContextMenu={menu.onContextMenu} onKeyDown={menu.onKeyDown} menuOpen={menu.open} height={40}>
         <StatusGlyph glyph={meta.glyph} color={meta.color} spin={meta.running} title={meta.label} />
         <span className="truncate font-semibold min-w-0 shrink">{group.subject}</span>
         {group.repo && (
@@ -192,6 +230,7 @@ function PipeGroupSection({
           {shortAge(group.started)}
         </span>
       </ToggleRow>
+      <ContextMenu anchor={menu.anchor} onClose={menu.close} label="Pipeline actions" items={groupMenu} />
       {open && group.rows.map((row) => <PipeRunRow key={rowKey(row)} row={row} now={now} mode={mode} />)}
     </>
   );
@@ -244,7 +283,8 @@ function failedProblem(row: PipeRow): string | null {
 /** One run. Flat (no `mode`) it names its pipeline and carries its stage strip; under a header
  *  (34px, indented past the header's chevron and glyph) it names the pipeline only when that is
  *  what varies within the group. The row opens the run; the Approve button, shown only for a gate
- *  this user can answer, opens it too — the decision itself is taken in the pane's gate banner. */
+ *  this user can answer, opens it too — the decision itself is taken in the pane's gate banner.
+ *  Right-click, Shift+F10 or the ⋯ at the right edge opens the run's menu without opening it. */
 function PipeRunRow({ row, now, mode }: { row: PipeRow; now: Date; mode?: GroupMode }) {
   const run = row.run;
   const child = mode !== undefined;
@@ -263,64 +303,89 @@ function PipeRunRow({ row, now, mode }: { row: PipeRow; now: Date; mode?: GroupM
     e.stopPropagation();
     fn();
   };
+  const menu = useContextMenu();
+  const build = usePipelineRowMenu();
+  const rowEl = useRef<HTMLDivElement>(null);
+  const runButton = useRef<HTMLButtonElement>(null);
 
   return (
     // The whole row is a click target for the mouse; the inner button is the keyboard and
     // screen-reader target. They are siblings of the Approve button, never its parent.
-    <div className="ft-row" data-selected={selected || undefined} style={{ minHeight: child ? 34 : 36, paddingLeft: child ? 44 : 12 }} onClick={open}>
-      <button
-        type="button"
-        onClick={stop(open)}
-        className="flex items-center gap-2.5 flex-1 min-w-0 text-left rounded outline-none focus-visible:outline-2 focus-visible:outline-[var(--accent)]"
-        style={{ background: "transparent", border: 0, padding: 0, color: "inherit", font: "inherit", cursor: "pointer" }}
+    <>
+      <div
+        ref={rowEl}
+        className="ft-row"
+        data-selected={selected || undefined}
+        data-menu-open={menu.open ? "true" : undefined}
+        style={{ minHeight: child ? 34 : 36, paddingLeft: child ? 44 : 12 }}
+        onClick={open}
+        onContextMenu={menu.onContextMenu}
+        onKeyDown={menu.onKeyDown}
       >
-        <StatusGlyph glyph={meta.glyph} color={meta.color} spin={meta.running} title={meta.label} />
-        {runName && (
-          <span className="mono shrink-0 whitespace-nowrap" style={{ color: "var(--fg3)", minWidth: 30 }}>
-            {runName}
-          </span>
-        )}
-        {pipelineName && <span className="font-medium shrink-0 whitespace-nowrap">{pipelineName}</span>}
-        <span className="flex-1 min-w-0 truncate">
-          {run.title && <span>{run.title}</span>}
-          {problem && <span style={{ color: "var(--red)" }}>{run.title ? " " : ""}· {problem}</span>}
-        </span>
-        {run.branch && (
-          <Chip title="branch" className="shrink-0 max-w-[200px] truncate">
-            {run.branch}
-          </Chip>
-        )}
-        {run.commit_sha && (
-          <span className="mono shrink-0" style={{ color: "var(--fg3)" }}>
-            {run.commit_sha.slice(0, 7)}
-          </span>
-        )}
-      </button>
-      {gate && (
-        <Button
-          sm
+        <button
+          ref={runButton}
+          type="button"
           onClick={stop(open)}
-          title={`Open the run to approve ${gate.name}`}
-          style={{ color: "var(--yellow)", borderColor: "color-mix(in srgb, var(--yellow) 40%, transparent)" }}
+          className="flex items-center gap-2.5 flex-1 min-w-0 text-left rounded outline-none focus-visible:outline-2 focus-visible:outline-[var(--accent)]"
+          style={{ background: "transparent", border: 0, padding: 0, color: "inherit", font: "inherit", cursor: "pointer" }}
         >
-          Open to approve {gate.name}
-        </Button>
-      )}
-      {waitingOnOthers && (
-        <span className="text-[12px] shrink-0 whitespace-nowrap" style={{ color: "var(--yellow)" }}>
-          waiting for approval
+          <StatusGlyph glyph={meta.glyph} color={meta.color} spin={meta.running} title={meta.label} />
+          {runName && (
+            <span className="mono shrink-0 whitespace-nowrap" style={{ color: "var(--fg3)", minWidth: 30 }}>
+              {runName}
+            </span>
+          )}
+          {pipelineName && <span className="font-medium shrink-0 whitespace-nowrap">{pipelineName}</span>}
+          <span className="flex-1 min-w-0 truncate">
+            {run.title && <span>{run.title}</span>}
+            {problem && <span style={{ color: "var(--red)" }}>{run.title ? " " : ""}· {problem}</span>}
+          </span>
+          {run.branch && (
+            <Chip title="branch" className="shrink-0 max-w-[200px] truncate">
+              {run.branch}
+            </Chip>
+          )}
+          {run.commit_sha && (
+            <span className="mono shrink-0" style={{ color: "var(--fg3)" }}>
+              {run.commit_sha.slice(0, 7)}
+            </span>
+          )}
+        </button>
+        {gate && (
+          <Button
+            sm
+            onClick={stop(open)}
+            title={`Open the run to approve ${gate.name}`}
+            style={{ color: "var(--yellow)", borderColor: "color-mix(in srgb, var(--yellow) 40%, transparent)" }}
+          >
+            Open to approve {gate.name}
+          </Button>
+        )}
+        {waitingOnOthers && (
+          <span className="text-[12px] shrink-0 whitespace-nowrap" style={{ color: "var(--yellow)" }}>
+            waiting for approval
+          </span>
+        )}
+        {!child && <StageStrip row={row} />}
+        <span className="num text-[12px] shrink-0 whitespace-nowrap text-right" style={{ width: 50, color: meta.running ? "var(--blue)" : "var(--fg3)" }}>
+          {secs !== null ? fmtSecs(secs) : ""}
         </span>
-      )}
-      {!child && <StageStrip row={row} />}
-      <span className="num text-[12px] shrink-0 whitespace-nowrap text-right" style={{ width: 50, color: meta.running ? "var(--blue)" : "var(--fg3)" }}>
-        {secs !== null ? fmtSecs(secs) : ""}
-      </span>
-      <span className="num text-[12px] shrink-0 whitespace-nowrap text-right" style={{ width: 30, color: "var(--fg3)" }}>
-        {shortAge(run.finished_at ?? run.started_at)}
-      </span>
-      <span className="inline-flex shrink-0 justify-center" style={{ width: 18 }}>
-        {run.triggered_by && <Avatar name={run.triggered_by.display_name} size={18} />}
-      </span>
-    </div>
+        <span className="num text-[12px] shrink-0 whitespace-nowrap text-right" style={{ width: 30, color: "var(--fg3)" }}>
+          {shortAge(run.finished_at ?? run.started_at)}
+        </span>
+        <span className="inline-flex shrink-0 justify-center" style={{ width: 18 }}>
+          {run.triggered_by && <Avatar name={run.triggered_by.display_name} size={18} />}
+        </span>
+        <RowMenuButton onOpen={menu.openAt} />
+      </div>
+      <ContextMenu
+        anchor={menu.anchor}
+        onClose={menu.close}
+        label="Pipeline run actions"
+        items={() => build(row)}
+        // The row itself takes no focus; a menu opened on it hands focus back to the run's button.
+        returnFocusTo={menu.anchor?.origin === rowEl.current ? runButton.current : undefined}
+      />
+    </>
   );
 }

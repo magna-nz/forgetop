@@ -1,5 +1,6 @@
-import { useLayoutEffect, useRef, useState, type ReactNode } from "react";
-import { useLaunchpad } from "../api";
+import { useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useQueryClient } from "@tanstack/react-query";
+import { apiPost, useLaunchpad } from "../api";
 import {
   pipeMeta,
   pipeTitle,
@@ -14,23 +15,46 @@ import {
   wiStateGlyph,
   type GlyphName,
 } from "../format";
-import type { LaunchpadMore, LaunchpadRow, SectionId } from "../types";
-import { Button, GroupHeading, Row, SectionHeading, Skeleton, StateCard, StatusGlyph } from "./ui";
+import type { LaunchpadMore, LaunchpadResponse, LaunchpadRow, SectionId } from "../types";
+import {
+  Button,
+  ContextMenu,
+  GroupHeading,
+  Row,
+  RowMenuButton,
+  SectionHeading,
+  Skeleton,
+  StateCard,
+  StatusGlyph,
+  useContextMenu,
+  type MenuEntry,
+} from "./ui";
 import { Icon } from "./icons";
 import { ErrorState } from "./ErrorState";
 import { useCurrentPr, usePrOpener } from "./PrDetail";
 import { useCurrentWi, useWiOpener } from "./WiDetail";
 import { useCurrentPipeline, usePipelineOpener } from "./PipelineDetail";
 import { useNavigateSection } from "../nav";
+import { usePrRowMenu } from "./rowMenus/pr";
+import { useWiRowMenu } from "./rowMenus/wi";
+import { usePipelineRowMenu } from "./rowMenus/pipeline";
+import { useRowWrite } from "./rowMenus/shared";
+
+/** Rows acted on this session (a PR you have just reviewed or merged): kept out of the Command
+ *  Center until the page reloads, the TUI's `lp_dismissed`, because the forge's feed can keep
+ *  ranking them for a while after the write. A permanent dismissal goes to the server instead. */
+const actedThisSession = new Set<string>();
+const rowKey = (row: LaunchpadRow) => `${row.connection_id}:${row.kind}:${rowId(row)}`;
 
 export function Launchpad() {
   const { data, isLoading, error } = useLaunchpad();
+  const rows = useMemo(() => data?.rows.filter((r) => !actedThisSession.has(rowKey(r))) ?? [], [data]);
   if (isLoading) return <Skeleton />;
   if (error) return <ErrorState error={error} />;
-  if (!data || data.rows.length === 0)
+  if (!data || rows.length === 0)
     return <StateCard icon={<Icon name="check-circle" size={24} />} title="All clear" sub="Nothing needs your attention right now." />;
 
-  return <Columns rows={data.rows} more={data.more} />;
+  return <Columns rows={rows} more={data.more} />;
 }
 
 /** The right column's reference lists, which get a column of their own when the width allows. */
@@ -250,6 +274,38 @@ function ItemRow({ row, bucket }: { row: LaunchpadRow; bucket: string }) {
         ? () => openWi({ conn: row.connection_id, repo: row.work_item.repository, id: row.work_item.id })
         : () => openPipe({ conn: row.connection_id, repo: row.run.repository, runId: row.run.id });
 
+  const menu = useContextMenu();
+  const buildPr = usePrRowMenu();
+  const buildWi = useWiRowMenu();
+  const buildPipe = usePipelineRowMenu();
+  const write = useRowWrite();
+  const qc = useQueryClient();
+  // Drops this row from the Command Center at once and keeps it out for the rest of the
+  // session (the TUI's `lp_dismissed`): the forge may keep ranking a PR you have just reviewed
+  // until its own feed catches up. A poll already in flight is cancelled first so it cannot land
+  // over the edit.
+  const dropRow = () => {
+    actedThisSession.add(rowKey(row));
+    void qc.cancelQueries({ queryKey: ["launchpad"] });
+    qc.setQueriesData<LaunchpadResponse>({ queryKey: ["launchpad"] }, (lp) =>
+      lp && { ...lp, rows: lp.rows.filter((r) => r !== row && !sameItem(r, row)) },
+    );
+  };
+  const dismiss = () =>
+    write("Dismissed", () => apiPost("/api/launchpad/dismiss", { conn: row.connection_id, kind: row.kind, ...itemAddress(row) }), {
+      optimistic: dropRow,
+      invalidate: [["launchpad"]],
+    }).then(() => undefined);
+  // The muted reference lists ("Recent…") are not asking for anything, so there is nothing to dismiss.
+  const extra: MenuEntry[] | undefined = row.muted
+    ? undefined
+    : [{ type: "separator" }, { label: "Dismiss from Command Center", icon: "minus-circle", hint: "D", onSelect: dismiss }];
+  const menuLabel = row.kind === "pr" ? "Pull request actions" : row.kind === "wi" ? "Work item actions" : "Pipeline run actions";
+  // A PR leaves its bucket as soon as you act on it (the TUI does the same after a vote); work
+  // items and runs are patched in place by their builders' optimistic writes.
+  const build = (): MenuEntry[] =>
+    row.kind === "pr" ? buildPr(row, { onActed: dropRow, extra }) : row.kind === "wi" ? buildWi(row, { extra }) : buildPipe(row, { extra });
+
   const ident: ReactNode = v.ident ? (
     <span className="mono shrink-0 truncate" style={{ color: "var(--fg3)", width: v.keyFirst ? 76 : undefined, maxWidth: v.keyFirst ? undefined : "40%" }}>
       {v.ident}
@@ -259,24 +315,28 @@ function ItemRow({ row, bucket }: { row: LaunchpadRow; bucket: string }) {
   ) : null;
 
   return (
-    <Row onClick={onClick} selected={selected}>
-      <StatusGlyph glyph={v.glyph} color={v.color} spin={v.spin} title={v.glyphTitle} />
-      {v.keyFirst && ident}
-      <span className="flex-1 min-w-0 truncate">
-        {v.title}
-        {v.note && (
-          <span style={{ color: v.noteColor ?? "var(--fg3)" }}>
-            <span aria-hidden="true">{" · "}</span>
-            {v.note}
-          </span>
-        )}
-      </span>
-      {!v.keyFirst && ident}
-      {v.signal && <StatusGlyph glyph={v.signal.glyph} color={v.signal.color} spin={v.signal.spin} title={v.signal.title} />}
-      <span className="num shrink-0 text-right text-[12px]" style={{ width: 34, color: "var(--fg3)" }}>
-        {v.age}
-      </span>
-    </Row>
+    <>
+      <Row onClick={onClick} selected={selected} onContextMenu={menu.onContextMenu} onKeyDown={menu.onKeyDown} menuOpen={menu.open}>
+        <StatusGlyph glyph={v.glyph} color={v.color} spin={v.spin} title={v.glyphTitle} />
+        {v.keyFirst && ident}
+        <span className="flex-1 min-w-0 truncate">
+          {v.title}
+          {v.note && (
+            <span style={{ color: v.noteColor ?? "var(--fg3)" }}>
+              <span aria-hidden="true">{" · "}</span>
+              {v.note}
+            </span>
+          )}
+        </span>
+        {!v.keyFirst && ident}
+        {v.signal && <StatusGlyph glyph={v.signal.glyph} color={v.signal.color} spin={v.signal.spin} title={v.signal.title} />}
+        <span className="num shrink-0 text-right text-[12px]" style={{ width: 34, color: "var(--fg3)" }}>
+          {v.age}
+        </span>
+        <RowMenuButton onOpen={menu.openAt} />
+      </Row>
+      <ContextMenu anchor={menu.anchor} onClose={menu.close} label={menuLabel} items={build} />
+    </>
   );
 }
 
@@ -350,4 +410,16 @@ function rowId(row: LaunchpadRow): string {
   if (row.kind === "pr") return `${row.pull_request.repository ?? ""}:${row.pull_request.id}`;
   if (row.kind === "wi") return `${row.work_item.repository ?? ""}:${row.work_item.id}`;
   return `${row.run.repository ?? ""}:${row.run.id}`;
+}
+
+/** The repository and id a row's item is addressed by — what `/api/launchpad/dismiss` keys on. */
+function itemAddress(row: LaunchpadRow): { repo: string | null; id: string } {
+  if (row.kind === "pr") return { repo: row.pull_request.repository ?? null, id: row.pull_request.id };
+  if (row.kind === "wi") return { repo: row.work_item.repository ?? null, id: row.work_item.id };
+  return { repo: row.run.repository ?? null, id: row.run.id };
+}
+
+/** Whether two rows draw the same item (the same PR can sit in more than one bucket). */
+function sameItem(a: LaunchpadRow, b: LaunchpadRow): boolean {
+  return a.connection_id === b.connection_id && a.kind === b.kind && rowId(a) === rowId(b);
 }

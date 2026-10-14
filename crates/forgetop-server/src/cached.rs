@@ -188,7 +188,7 @@ pub fn notifications(cache: &CacheStore) -> Option<Cached<Vec<NotifRow>>> {
 /// The Command Center from the cached lists. Needs both PR slices (the TUI's launchpad keys, or
 /// the pool to derive them from); work items and pipelines fall back to empty, and the response
 /// is dated by its oldest part so the page knows how old what it shows is.
-pub fn launchpad(cache: &CacheStore) -> Option<Cached<dto::LaunchpadResponse>> {
+pub fn launchpad(cache: &CacheStore, dismissed: &[String]) -> Option<Cached<dto::LaunchpadResponse>> {
     let slice = |key: &str, filter: PullRequestFilter, completed: bool| -> Option<(Vec<PrInput>, DateTime<Utc>)> {
         if let Some(entry) = cache.get::<Vec<TuiPrRow>>(key) {
             return Some((entry.value.into_iter().map(pr_input).collect(), entry.fetched_at));
@@ -218,7 +218,7 @@ pub fn launchpad(cache: &CacheStore) -> Option<Cached<dto::LaunchpadResponse>> {
         }
         None => Vec::new(),
     };
-    Some(Cached { value: dto::build_launchpad(&review, &mine, &wis, &pipes), fetched_at })
+    Some(Cached { value: dto::build_launchpad(&review, &mine, &wis, &pipes, dismissed), fetched_at })
 }
 
 // ---- writing ----

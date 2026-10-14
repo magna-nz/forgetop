@@ -210,7 +210,8 @@ body {
   cursor: pointer;
   transition: background-color 80ms ease-out;
 }
-.ft-row:hover {
+.ft-row:hover,
+.ft-row[data-menu-open="true"] {
   background: var(--hover);
 }
 .ft-row[aria-current="true"],
@@ -221,6 +222,42 @@ body {
 .ft-row:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: -2px;
+}
+
+/* The ⋯ at a row's right edge (RowMenuButton): there only while the row is hovered or focused,
+   or its menu is open. Always there where nothing can hover. */
+.ft-row-menu {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  flex-shrink: 0;
+  border-radius: 4px;
+  color: var(--fg2);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 80ms ease-out, background-color 80ms ease-out;
+}
+.ft-row:hover .ft-row-menu,
+.ft-row:focus-within .ft-row-menu,
+.ft-row[data-menu-open="true"] .ft-row-menu,
+.ft-row-menu:focus-visible {
+  opacity: 1;
+}
+.ft-row-menu:hover,
+.ft-row[data-menu-open="true"] .ft-row-menu {
+  background: var(--active);
+  color: var(--fg);
+}
+.ft-row-menu:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+@media (hover: none) {
+  .ft-row-menu {
+    opacity: 1;
+  }
 }
 
 /* Buttons: one filled per screen, outlined for secondary, quiet for rare, danger for destructive. */
@@ -457,6 +494,137 @@ kbd.ft-kbd {
       display: none;
     }
   }
+
+/* Context menu (ContextMenu in ui.tsx): a raised panel at the pointer. Hover and focus share
+   one tint; no accent inside a menu. */
+.ft-menu {
+  position: fixed;
+  z-index: 50;
+  display: flex;
+  flex-direction: column;
+  width: max-content;
+  min-width: 248px;
+  max-width: 272px;
+  max-height: calc(100vh - 16px);
+  overflow-y: auto;
+  padding: 4px;
+  background: var(--raised);
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.5);
+}
+.ft-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+  width: 100%;
+  height: 28px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--fg);
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.ft-menu-item:hover,
+.ft-menu-item:focus,
+.ft-menu-item[aria-expanded="true"] {
+  background: var(--active);
+  outline: none;
+}
+.ft-menu-item[data-danger] {
+  color: var(--red);
+}
+.ft-menu-item[aria-disabled="true"] {
+  color: var(--fg3);
+  cursor: default;
+}
+.ft-menu-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  flex-shrink: 0;
+}
+.ft-menu-check {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 12px;
+  height: 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: 3px;
+}
+.ft-menu-label {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ft-menu-value {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 45%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--fg2);
+}
+.ft-menu-hint {
+  flex-shrink: 0;
+  min-width: 12px;
+  text-align: right;
+  font-family: "IBM Plex Mono", ui-monospace, Menlo, monospace;
+  font-size: 12px;
+  color: var(--fg3);
+}
+.ft-menu-tick,
+.ft-menu-sub {
+  flex-shrink: 0;
+  color: var(--fg3);
+}
+.ft-menu-sep {
+  flex-shrink: 0;
+  height: 1px;
+  margin: 4px 0;
+  background: var(--border);
+}
+.ft-menu-empty {
+  padding: 4px 8px;
+  color: var(--fg3);
+}
+
+/* Toasts (notify / Toasts in ui.tsx): quiet notes, bottom-left, newest at the bottom. */
+.ft-toasts {
+  position: fixed;
+  left: 16px;
+  bottom: 16px;
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  pointer-events: none;
+}
+.ft-toast {
+  max-width: 420px;
+  padding: 7px 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  background: var(--raised);
+  color: var(--fg);
+  font-size: 13px;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
+  pointer-events: auto;
+  animation: fade-in 0.18s ease-out;
+}
+.ft-toast[data-error] {
+  color: var(--red);
+}
 }
 
 ::-webkit-scrollbar {

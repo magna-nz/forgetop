@@ -3,11 +3,12 @@ import { usePrDecoration, usePullRequests, type PrView } from "../api";
 import { prSignalMeta, prState, prStatusMeta, repoShort, sameRef, toTime } from "../format";
 import type { PrRow } from "../types";
 import { Icon } from "./icons";
-import { Chip, List, Row, Skeleton, StateCard, StatusGlyph, Tabs } from "./ui";
+import { Chip, ContextMenu, List, Row, RowMenuButton, Skeleton, StateCard, StatusGlyph, Tabs, useContextMenu } from "./ui";
 import { ErrorState } from "./ErrorState";
 import { useCurrentPr, usePrOpener } from "./PrDetail";
 import { shortAge, useListView } from "./ControlBar";
 import { useRepoScope } from "./RepoScope";
+import { usePrRowMenu } from "./rowMenus/pr";
 
 const PR_VIEWS: { key: PrView; label: string }[] = [
   { key: "all", label: "All" },
@@ -132,57 +133,71 @@ function PrListRow({ row, dense = false }: { row: PrRow; dense?: boolean }) {
   const ident = [repo, pr.number != null ? `#${pr.number}` : ""].filter(Boolean).join(" ");
   const open = usePrOpener();
   const current = useCurrentPr();
+  const menu = useContextMenu();
+  const build = usePrRowMenu();
   return (
-    <Row dense={dense} selected={sameRef(current, { conn: row.connection_id, repo: pr.repository, id: pr.id })} onClick={() => open({ conn: row.connection_id, repo: pr.repository, id: pr.id })}>
-      <StatusGlyph glyph={status.glyph} color={status.color} title={status.label} />
-      <span className="flex-1 min-w-0 flex flex-col">
-        <span className="flex items-center gap-2 min-w-0">
-          <span className="truncate min-w-0">
-            <span>{pr.title}</span>
-            {draft && <span style={{ color: "var(--fg3)" }}> · draft</span>}
-          </span>
-          {pr.labels.slice(0, 3).map((l) => (
-            <Chip key={l} className="hidden xl:inline-flex shrink-0">
-              {l}
-            </Chip>
-          ))}
-        </span>
-        {!dense && (
-          <span className="truncate text-[12px]" style={{ color: "var(--fg3)" }}>
-            {pr.author.display_name} ·{" "}
-            <span className="num" style={{ color: "var(--green)" }}>
-              +{additions}
-            </span>{" "}
-            <span className="num" style={{ color: "var(--red)" }}>
-              −{deletions}
+    <>
+      <Row
+        dense={dense}
+        selected={sameRef(current, { conn: row.connection_id, repo: pr.repository, id: pr.id })}
+        onClick={() => open({ conn: row.connection_id, repo: pr.repository, id: pr.id })}
+        onContextMenu={menu.onContextMenu}
+        onKeyDown={menu.onKeyDown}
+        menuOpen={menu.open}
+      >
+        <StatusGlyph glyph={status.glyph} color={status.color} title={status.label} />
+        <span className="flex-1 min-w-0 flex flex-col">
+          <span className="flex items-center gap-2 min-w-0">
+            <span className="truncate min-w-0">
+              <span>{pr.title}</span>
+              {draft && <span style={{ color: "var(--fg3)" }}> · draft</span>}
             </span>
-            {mergeable === "Mergeable" && (
-              <>
-                {" · "}
-                <span>mergeable</span>
-              </>
-            )}
+            {pr.labels.slice(0, 3).map((l) => (
+              <Chip key={l} className="hidden xl:inline-flex shrink-0">
+                {l}
+              </Chip>
+            ))}
+          </span>
+          {!dense && (
+            <span className="truncate text-[12px]" style={{ color: "var(--fg3)" }}>
+              {pr.author.display_name} ·{" "}
+              <span className="num" style={{ color: "var(--green)" }}>
+                +{additions}
+              </span>{" "}
+              <span className="num" style={{ color: "var(--red)" }}>
+                −{deletions}
+              </span>
+              {mergeable === "Mergeable" && (
+                <>
+                  {" · "}
+                  <span>mergeable</span>
+                </>
+              )}
+            </span>
+          )}
+        </span>
+        {/* With one connection spanning an account, the connection label no longer distinguishes
+            rows — the repository is what tells them apart. */}
+        {ident && (
+          <span className="mono shrink-0 whitespace-nowrap" style={{ color: "var(--fg3)" }} title={pr.repository ?? undefined}>
+            {ident}
           </span>
         )}
-      </span>
-      {/* With one connection spanning an account, the connection label no longer distinguishes
-          rows — the repository is what tells them apart. */}
-      {ident && (
-        <span className="mono shrink-0 whitespace-nowrap" style={{ color: "var(--fg3)" }} title={pr.repository ?? undefined}>
-          {ident}
+        <span className="inline-flex shrink-0" style={{ width: 14 }} title={showSignal ? signal.label : undefined}>
+          {showSignal && (
+            <>
+              <StatusGlyph glyph={signal.glyph} color={signal.color} spin={signal.spin} />
+              <span className="sr-only">{signal.label}</span>
+            </>
+          )}
         </span>
-      )}
-      <span className="inline-flex shrink-0" style={{ width: 14 }} title={showSignal ? signal.label : undefined}>
-        {showSignal && (
-          <>
-            <StatusGlyph glyph={signal.glyph} color={signal.color} spin={signal.spin} />
-            <span className="sr-only">{signal.label}</span>
-          </>
-        )}
-      </span>
-      <span className="num text-[12px] shrink-0 text-right whitespace-nowrap" style={{ width: 34, color: "var(--fg3)" }}>
-        {shortAge(pr.updated_at)}
-      </span>
-    </Row>
+        <span className="num text-[12px] shrink-0 text-right whitespace-nowrap" style={{ width: 34, color: "var(--fg3)" }}>
+          {shortAge(pr.updated_at)}
+        </span>
+        <RowMenuButton onOpen={menu.openAt} />
+      </Row>
+      {/* The menu sees the decorated PR, so Merge's reason comes from fetched checks/mergeable. */}
+      <ContextMenu anchor={menu.anchor} onClose={menu.close} label="Pull request actions" items={() => build({ ...row, pull_request: decorated })} />
+    </>
   );
 }

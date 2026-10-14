@@ -16,6 +16,7 @@ import type { CheckStatus, NotificationKind, PipelineRunStatus, PullRequest, Rev
 const NAMES: IconName[] = [
   "inbox", "pull-request", "circle-dot", "workflow", "settings", "search", "refresh", "bell", "sidebar",
   "chevron-down", "chevron-right", "external", "x", "plus", "check", "comment", "at", "arrow-right", "user",
+  "user-plus", "copy", "link", "dots", "pencil", "shield", "logs", "rerun", "square", "minus-circle", "git-branch", "open-pane",
   "pr-open", "pr-draft", "pr-merged", "pr-closed", "check-circle", "x-circle", "running", "queued", "clock",
   "warning", "half", "circle", "blocked", "skipped", "dot", "review",
 ];

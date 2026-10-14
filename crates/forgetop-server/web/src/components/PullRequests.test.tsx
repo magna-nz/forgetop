@@ -1,8 +1,13 @@
-import { describe, it, expect } from "vitest";
-import { screen } from "@testing-library/react";
+import { describe, it, expect, vi } from "vitest";
+import { fireEvent, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { PullRequests } from "./PullRequests";
 import { renderWithClient, mockFetch } from "../test/util";
+
+const openPr = vi.fn();
+vi.mock("./PrDetail", () => ({ usePrOpener: () => openPr, useCurrentPr: () => null }));
+
+// Imported after the mock so the rows pick it up.
+import { PullRequests } from "./PullRequests";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const pr = (id: string, title: string, status = "Open"): any => ({
@@ -108,5 +113,18 @@ describe("PullRequests", () => {
     expect(await screen.findByText("A mergeable PR")).toBeInTheDocument();
     expect(await screen.findByText("A blocked PR")).toBeInTheDocument();
     expect(screen.getAllByText("mergeable")).toHaveLength(1);
+  });
+
+  it("right-clicking a row opens its actions menu without opening the pane", async () => {
+    openPr.mockClear();
+    mockFetch({ get: { "view=all": [pr("1", "A PR to act on")] } });
+    renderWithClient(<PullRequests />);
+
+    const title = await screen.findByText("A PR to act on");
+    fireEvent.contextMenu(title.closest("button")!);
+    const menu = screen.getByRole("menu", { name: "Pull request actions" });
+    expect(menu).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "Approve" })).toBeInTheDocument();
+    expect(openPr).not.toHaveBeenCalled();
   });
 });

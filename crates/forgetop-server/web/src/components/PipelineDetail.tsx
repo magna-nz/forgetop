@@ -60,7 +60,13 @@ const Sep = () => <span style={{ color: "var(--fg3)" }}>·</span>;
 
 // ---- opener context ----
 
-const PipeOpenerCtx = createContext<(ref: PipeRef) => void>(() => {});
+/** What the pane does once the run has loaded, beyond opening: `showLog` lands on the failing
+ *  job's log (a row's "Show failing log"). Applied again on every open, so it works on a run that
+ *  is already open and whose log the user has since left. */
+export interface PipeOpenOptions {
+  showLog?: boolean;
+}
+const PipeOpenerCtx = createContext<(ref: PipeRef, opts?: PipeOpenOptions) => void>(() => {});
 export const usePipelineOpener = () => useContext(PipeOpenerCtx);
 /** The run open in the pane, so a list can mark its row as selected. */
 const PipeCurrentCtx = createContext<PipeRef | null>(null);
@@ -68,18 +74,22 @@ export const useCurrentPipeline = () => useContext(PipeCurrentCtx);
 
 export function PipelineDetailProvider({ children }: { children: ReactNode }) {
   const [ref, setRef] = useState<PipeRef | null>(null);
+  // Bumped on each open that asks for the log, so the panel applies it once per request.
+  const [showLogReq, setShowLogReq] = useState(0);
   const close = useCallback(() => setRef(null), []);
   usePaneRegistration("pipeline", close);
   // One pane at a time: opening a run closes a PR or work-item pane (after its guard, if any).
-  const open = useCallback((r: PipeRef) => {
-    if (claimPane("pipeline")) setRef(r);
+  const open = useCallback((r: PipeRef, opts?: PipeOpenOptions) => {
+    if (!claimPane("pipeline")) return;
+    setRef(r);
+    if (opts?.showLog) setShowLogReq((n) => n + 1);
   }, []);
   return (
     <PipeOpenerCtx.Provider value={open}>
       <PipeCurrentCtx.Provider value={ref}>
         {children}
         {/* Keyed by run: another run gets a fresh panel, so no frame shows the last run's state. */}
-        {ref && <PipelineDetailPanel key={`${ref.conn}|${ref.repo ?? ""}|${ref.runId}`} pipeRef={ref} onClose={close} />}
+        {ref && <PipelineDetailPanel key={`${ref.conn}|${ref.repo ?? ""}|${ref.runId}`} pipeRef={ref} showLogReq={showLogReq} onClose={close} />}
       </PipeCurrentCtx.Provider>
     </PipeOpenerCtx.Provider>
   );
@@ -94,7 +104,7 @@ interface LogTarget {
 
 // ---- panel ----
 
-function PipelineDetailPanel({ pipeRef, onClose }: { pipeRef: PipeRef; onClose: () => void }) {
+function PipelineDetailPanel({ pipeRef, showLogReq, onClose }: { pipeRef: PipeRef; showLogReq: number; onClose: () => void }) {
   const { data, isLoading, error } = usePipelineDetail(pipeRef);
   const connections = useConnections();
   const pipes = usePipelines();
@@ -147,6 +157,19 @@ function PipelineDetailPanel({ pipeRef, onClose }: { pipeRef: PipeRef; onClose: 
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [run, runKey]);
+
+  // Opened with "Show failing log": land on the failing job's log at its first error, once per
+  // request and once the run is here. Nothing to show on a run that has not failed.
+  const appliedShowLog = useRef(0);
+  useEffect(() => {
+    if (!run || showLogReq === 0 || appliedShowLog.current === showLogReq) return;
+    appliedShowLog.current = showLogReq;
+    const t = failedTarget(run);
+    if (t) {
+      setLogTarget({ jobId: t.jobId, step: t.step, jump: true });
+      setJumpToken((n) => n + 1);
+    }
+  }, [run, showLogReq]);
 
   // A run's problems are fetched once it finishes and re-read whenever its status moves on. Its
   // logs are re-read once it finishes: one fetched while it ran may be missing the tail.

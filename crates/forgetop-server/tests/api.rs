@@ -802,3 +802,128 @@ async fn pipeline_selection_is_opt_in_and_survives_a_connection_resave() {
     let missing = hdr(client.get(format!("{base}/api/pipelines/definitions?id=nope"))).send().await.unwrap();
     assert_eq!(missing.status(), 404);
 }
+
+/// The address of a launchpad row, as `(connection_id, kind, repository, id)` — what the
+/// dismiss route takes.
+fn launchpad_address(row: &serde_json::Value) -> (String, String, Option<String>, String) {
+    let kind = row["kind"].as_str().expect("row kind").to_string();
+    let item = &row[match kind.as_str() {
+        "pr" => "pull_request",
+        "wi" => "work_item",
+        _ => "run",
+    }];
+    (
+        row["connection_id"].as_str().unwrap().to_string(),
+        kind,
+        item["repository"].as_str().map(str::to_string),
+        item["id"].as_str().unwrap().to_string(),
+    )
+}
+
+/// Whether `rows` still holds the row at this address.
+fn has_row(rows: &serde_json::Value, addr: &(String, String, Option<String>, String)) -> bool {
+    rows["rows"].as_array().unwrap().iter().any(|r| &launchpad_address(r) == addr)
+}
+
+#[tokio::test]
+async fn dismissing_a_launchpad_row_hides_it_from_the_next_fetch() {
+    let deps = demo_deps(true).await;
+    let server = spawn(deps.clone(), 0).await.expect("server binds");
+    let base = format!("http://127.0.0.1:{}", server.port);
+    let client = reqwest::Client::new();
+    let tok = server.token.clone();
+    let hdr = |r: reqwest::RequestBuilder| r.header("x-forgetop-token", &tok);
+    let fetch = || async { hdr(client.get(format!("{base}/api/launchpad"))).send().await.unwrap().json::<serde_json::Value>().await.unwrap() };
+
+    let before = fetch().await;
+    let rows = before["rows"].as_array().unwrap();
+    assert!(!rows.is_empty(), "the demo Command Center has rows");
+    let addr = launchpad_address(&rows[0]);
+
+    let body = serde_json::json!({ "conn": addr.0, "kind": addr.1, "repo": addr.2, "id": addr.3 });
+    let url = format!("{base}/api/launchpad/dismiss");
+    let r = hdr(client.post(&url)).json(&body).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.json::<serde_json::Value>().await.unwrap(), serde_json::json!({ "ok": true }));
+    assert!(!has_row(&fetch().await, &addr), "the dismissed row is gone");
+    // What was saved is one key, this item's. (Not a row count: the demo's write stores are
+    // process-wide, so a test answering a gate or closing a PR meanwhile legitimately moves
+    // other rows between buckets and in or out of the capped lists.)
+    let saved = || deps.config.snapshot().ui.dismissed_launchpad_items;
+    let key = format!("{}:{}:{}:{}", addr.0, addr.1, addr.2.as_deref().unwrap_or(""), addr.3);
+    assert_eq!(saved(), vec![key.clone()], "exactly this item's key is saved");
+
+    // Dismissing again is harmless, and the key is saved once.
+    assert_eq!(hdr(client.post(&url)).json(&body).send().await.unwrap().status(), 200);
+    assert!(!has_row(&fetch().await, &addr));
+    assert_eq!(saved(), vec![key]);
+
+    // The route sits behind the session token like every other.
+    assert_eq!(client.post(&url).json(&body).send().await.unwrap().status(), 401);
+}
+
+#[tokio::test]
+async fn a_legacy_dismissal_key_also_hides_a_launchpad_row() {
+    let deps = demo_deps(true).await;
+    let config = deps.config.clone();
+    let server = spawn(deps, 0).await.expect("server binds");
+    let base = format!("http://127.0.0.1:{}", server.port);
+    let client = reqwest::Client::new();
+    let tok = server.token.clone();
+    let fetch = || async {
+        client.get(format!("{base}/api/launchpad")).header("x-forgetop-token", &tok).send().await.unwrap().json::<serde_json::Value>().await.unwrap()
+    };
+
+    let rows = fetch().await;
+    let addr = launchpad_address(&rows["rows"][0]);
+    // The spelling saved before the kind and repository joined the key.
+    config.set_dismissed_launchpad_items(vec![format!("{}:{}", addr.0, addr.3)]).await.unwrap();
+    assert!(!has_row(&fetch().await, &addr), "a legacy `<conn>:<id>` key hides the entry");
+}
+
+#[tokio::test]
+async fn an_unknown_dismiss_kind_is_a_bad_request_and_saves_nothing() {
+    let deps = demo_deps(true).await;
+    let config = deps.config.clone();
+    let server = spawn(deps, 0).await.expect("server binds");
+    let r = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{}/api/launchpad/dismiss", server.port))
+        .header("x-forgetop-token", &server.token)
+        .json(&serde_json::json!({ "conn": "github", "kind": "nope", "repo": null, "id": "1" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+    assert!(config.snapshot().ui.dismissed_launchpad_items.is_empty());
+}
+
+#[tokio::test]
+async fn prefs_reflect_the_hidden_work_item_states() {
+    let server = spawn(demo_deps(false).await, 0).await.expect("server binds");
+    let base = format!("http://127.0.0.1:{}", server.port);
+    let client = reqwest::Client::new();
+    let tok = server.token.clone();
+    let prefs = || async {
+        let r = client.get(format!("{base}/api/prefs")).header("x-forgetop-token", &tok).send().await.unwrap();
+        assert_eq!(r.status(), 200);
+        r.json::<serde_json::Value>().await.unwrap()
+    };
+    let post = |state: &'static str, hidden: bool| {
+        client
+            .post(format!("{base}/api/prefs/hidden-work-item-state"))
+            .header("x-forgetop-token", &tok)
+            .json(&serde_json::json!({ "state": state, "hidden": hidden }))
+            .send()
+    };
+
+    assert_eq!(prefs().await, serde_json::json!({ "hidden_work_item_states": [] }));
+    let r = post("Done", true).await.unwrap();
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.json::<serde_json::Value>().await.unwrap(), serde_json::json!({ "ok": true }));
+    // One state at a time, merged: hiding a second keeps the first, hiding it twice keeps one.
+    post("Closed", true).await.unwrap();
+    post("Closed", true).await.unwrap();
+    assert_eq!(prefs().await["hidden_work_item_states"], serde_json::json!(["Done", "Closed"]));
+    post("Done", false).await.unwrap();
+    assert_eq!(prefs().await["hidden_work_item_states"], serde_json::json!(["Closed"]), "showing one keeps the other hidden");
+}
