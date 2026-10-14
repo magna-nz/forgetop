@@ -9,6 +9,29 @@ Adding a release: one `## <version> — <date>` section, a line per user-visible
 and the pull request each one came from. `git log v<previous>..HEAD --merges` lists the
 candidates.
 
+## 1.10.2 — 2026-10-14
+
+Added
+
+- **Terraform syntax highlighting, in both frontends.** `.tf`, `.tfvars` and `.hcl` diffs now
+  colour block types, meta-arguments, strings with `${…}` interpolation, comments, numbers,
+  types, function calls and `var.`/`local.`/`data.` references. The tokenizer the terminal UI
+  already used moves into the shared core, and the dashboard — which had no syntax colour at
+  all — now asks it over `POST /api/highlight`, so every language the TUI highlights (Rust,
+  TypeScript, Python, Go, Java, C#, JSON, YAML, TOML, Markdown, shell, and now HCL) is coloured
+  the same way in the browser's diff view, expanded context lines included.
+  ([#245](https://github.com/magna-nz/forgetop/pull/245))
+- **Markdown everywhere a body appears.** The dashboard renders pull request descriptions,
+  work item descriptions and comments as GitHub-flavoured markdown — tables, task lists,
+  strikethrough, line breaks kept, HTML comments hidden, only external links followed — and
+  the terminal UI now renders comment bodies, not only descriptions.
+  ([#246](https://github.com/magna-nz/forgetop/pull/246))
+
+Changed
+
+- **The Command Center uses the width.** Its columns stretch to the dashboard's full width
+  instead of stopping at a fixed measure. ([#244](https://github.com/magna-nz/forgetop/pull/244))
+
 ## 1.10.1 — 2026-10-13
 
 Changed
