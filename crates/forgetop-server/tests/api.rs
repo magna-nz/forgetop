@@ -683,6 +683,38 @@ async fn pr_file_text_endpoint_returns_a_files_full_text() {
 }
 
 #[tokio::test]
+async fn highlight_endpoint_tokenises_lines_with_the_shared_grammars() {
+    let server = spawn(empty_deps().await, 0).await.expect("server binds");
+    let base = format!("http://127.0.0.1:{}", server.port);
+    let client = reqwest::Client::new();
+    let tok = server.token.clone();
+    let post = |body: serde_json::Value| client.post(format!("{base}/api/highlight")).header("x-forgetop-token", &tok).json(&body).send();
+
+    // A Terraform file: every line comes back as spans that cover it, in UTF-16 units.
+    let lines = [r#"resource "azurerm_cdn_frontdoor_origin" "web" {"#, "\tenabled = true // 🚀 live", "  count = length(var.zones)"];
+    let resp: serde_json::Value =
+        post(serde_json::json!({ "path": "terraform/modules/web/main.tf", "lines": lines })).await.unwrap().json().await.unwrap();
+    assert_eq!(resp["lang"], "hcl", "{resp}");
+    let spans = resp["lines"].as_array().expect("one entry per line");
+    assert_eq!(spans.len(), lines.len());
+    for (line, spans) in lines.iter().zip(spans) {
+        let total: u64 = spans.as_array().unwrap().iter().map(|s| s[0].as_u64().unwrap()).sum();
+        assert_eq!(total, line.encode_utf16().count() as u64, "{line:?}: {spans}");
+    }
+    assert_eq!(spans[0][0], serde_json::json!([8, "keyword"]), "`resource` opens the line: {}", spans[0]);
+    assert!(spans[1].as_array().unwrap().iter().any(|s| s[1] == "comment"), "{}", spans[1]);
+    assert!(spans[2].as_array().unwrap().iter().any(|s| s[1] == "func"), "`length(`: {}", spans[2]);
+
+    // A language the grammars don't cover: both fields null, so the client paints plain text.
+    let resp: serde_json::Value = post(serde_json::json!({ "path": "notes.txt", "lines": ["hello"] })).await.unwrap().json().await.unwrap();
+    assert_eq!(resp, serde_json::json!({ "lang": null, "lines": null }));
+
+    // Token-gated like every other API route.
+    let bare = client.post(format!("{base}/api/highlight")).json(&serde_json::json!({ "path": "a.rs", "lines": [] })).send().await.unwrap();
+    assert_eq!(bare.status(), 401);
+}
+
+#[tokio::test]
 async fn notifications_carry_drill_in_targets_and_mark_read() {
     let server = spawn(demo_deps(true).await, 0).await.expect("server binds");
     let base = format!("http://127.0.0.1:{}", server.port);

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import type { ApprovalDecision, ConnectionRow, FileChange, HealthRow, LaunchpadResponse, NotifRow, PipeRef, PipelineAnnotation, PipelineArtifact, PipelineDetail, PipelineSelection, PipeRow, PrDecoration, PrDetail, PrRef, ProviderInfo, PrRow, RepositoryPage, User, WiDetail, WiRef, WiRow } from "./types";
+import type { ApprovalDecision, ConnectionRow, FileChange, HealthRow, Highlight, HlSpan, LaunchpadResponse, NotifRow, PipeRef, PipelineAnnotation, PipelineArtifact, PipelineDetail, PipelineSelection, PipeRow, PrDecoration, PrDetail, PrRef, ProviderInfo, PrRow, RepositoryPage, User, WiDetail, WiRef, WiRow } from "./types";
 
 // The session token arrives once in the URL (`/?t=…`). We stash it in sessionStorage (so a
 // refresh keeps working) and strip it from the visible URL, then replay it on every API call.
@@ -217,6 +217,38 @@ export const usePrFileText = (ref: PrRef | null, path: string | null, sha: strin
           repoParam(ref!.repo),
       ),
     enabled: enabled && !!ref && !!path,
+    staleTime: Infinity,
+    retry: false,
+  });
+
+/** A cheap, stable digest of `lines` for a query key — the text itself would make the key
+ *  as big as the file. FNV-1a over the joined text; collisions only cost a wrong colour. */
+function digestLines(lines: string[]): string {
+  let h = 0x811c9dc5;
+  for (const line of lines) {
+    for (let i = 0; i < line.length; i++) {
+      h ^= line.charCodeAt(i);
+      h = Math.imul(h, 0x01000193);
+    }
+    h ^= 0x0a; // the newline between lines
+    h = Math.imul(h, 0x01000193);
+  }
+  return `${lines.length}:${(h >>> 0).toString(16)}`;
+}
+
+/** Syntax spans for `lines` as the file at `path`, tokenised by the server with the grammars
+ *  the TUI paints its diffs with (`POST /api/highlight`). `data` is one span list per line,
+ *  or `null` — an unknown language, or an answer without spans — which paints the text plain,
+ *  exactly as before. Keyed on the text's digest rather than the PR, so reopening a file
+ *  reuses the answer and another commit's patch is its own entry. */
+export const useHighlight = (path: string | null, lines: string[] | null) =>
+  useQuery({
+    queryKey: ["highlight", path ?? "", lines ? digestLines(lines) : ""],
+    queryFn: async (): Promise<HlSpan[][] | null> => {
+      const res = await apiPost<Highlight>("/api/highlight", { path, lines });
+      return Array.isArray(res?.lines) ? res.lines : null;
+    },
+    enabled: !!path && !!lines && lines.length > 0,
     staleTime: Infinity,
     retry: false,
   });

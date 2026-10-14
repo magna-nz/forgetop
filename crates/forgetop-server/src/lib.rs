@@ -149,6 +149,7 @@ fn router(state: AppState) -> Router {
         .route("/api/pr/decoration", get(pr_decoration))
         .route("/api/pr/commit-changes", get(pr_commit_changes))
         .route("/api/pr/file-text", get(pr_file_text))
+        .route("/api/highlight", post(highlight))
         .route("/api/pr/vote", post(pr_vote))
         .route("/api/pr/merge", post(pr_merge))
         .route("/api/pr/revert", post(pr_revert))
@@ -421,6 +422,20 @@ async fn pr_file_text(State(s): State<AppState>, Query(q): Query<FileTextQuery>)
         Some(text) => ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], text).into_response(),
         None => (StatusCode::NOT_FOUND, "file text not available").into_response(),
     }
+}
+
+/// Source lines to syntax-highlight, and the path whose extension picks the language.
+#[derive(Deserialize)]
+struct HighlightReq {
+    path: String,
+    lines: Vec<String>,
+}
+
+/// `POST /api/highlight`: the dashboard sends the lines of a diff (or of a file whose gaps it
+/// is expanding) and gets back per-line `[len, kind]` spans — see [`dto::Highlight`]. Pure
+/// CPU over the request body, no provider involved; the same grammars the TUI uses.
+async fn highlight(Json(req): Json<HighlightReq>) -> Json<dto::Highlight> {
+    Json(dto::highlight(&req.path, &req.lines))
 }
 
 async fn pr_detail(State(s): State<AppState>, Query(q): Query<ItemQuery>) -> Response {

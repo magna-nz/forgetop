@@ -1,15 +1,16 @@
 import { createContext, Fragment, useCallback, useContext, useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { apiPost, prDetailKey, useConnections, usePrCommitChanges, usePrDetail, usePrFileText, usePrReviewers } from "../api";
+import { apiPost, prDetailKey, useConnections, useHighlight, usePrCommitChanges, usePrDetail, usePrFileText, usePrReviewers } from "../api";
 import { checkMeta, checkSummaryOf, providerMeta, prStateLine, prStatusMeta, relativeTime } from "../format";
 import { providerSupports, unsupportedMessage } from "../capabilities";
 import { parsePatch, type DiffLine } from "../diff";
 import { buildDiffTree, collectFiles, filterTree, findMatches, flattenTree, searchFiles, type DiffTreeFile, type DiffTreeFolder, type FileMatch } from "../diffTree";
 import { addPrReply, addPrThreads, isLocalId, localComment, localThread, meAsUser, patchPullRequest, setPrThreadResolved, withVote } from "../optimistic";
-import type { CheckRun, CheckStatus, CommentThread, Commit, FileChange, FileChangeKind, LineComment, PrRef, PrWriteSupport, ProviderType, PullRequest, ReviewVote, Reviewer, TimelineEvent, User } from "../types";
+import type { CheckRun, CheckStatus, CommentThread, Commit, FileChange, FileChangeKind, HlSpan, LineComment, PrRef, PrWriteSupport, ProviderType, PullRequest, ReviewVote, Reviewer, TimelineEvent, User } from "../types";
 import { Markdown } from "./Markdown";
 import { Avatar, Button, Chip, claimPane, GroupHeading, IconButton, PaneHeader, setPaneGuard, SlideOver, StatusBadge, StatusGlyph, Tabs, Timeline, usePaneRegistration } from "./ui";
 import { Icon } from "./icons";
+import { renderSpans } from "./syntax";
 
 // ---- opener context ----
 
@@ -1148,6 +1149,17 @@ function FileDiff({
   const lines = useMemo(() => (file.patch ? parsePatch(file.patch) : []), [file.patch]);
   const fileThreads = threads.filter((t) => t.file_path === file.path && t.line != null);
 
+  // Syntax colour, from the server's shared grammars: one request for the patch's lines (hunk
+  // headers included — they tokenise harmlessly and keep the indices parallel), and one for
+  // the full text once a gap has fetched it. Either answer missing paints that text plain.
+  const patchTexts = useMemo(() => lines.map((l) => l.text), [lines]);
+  const patchSpans = useHighlight(file.path, patchTexts).data ?? null;
+  const spansFor = useMemo(() => {
+    const m = new Map<DiffLine, HlSpan[]>();
+    if (patchSpans) lines.forEach((ln, i) => patchSpans[i] && m.set(ln, patchSpans[i]));
+    return m;
+  }, [lines, patchSpans]);
+
   // Group the flat line list back into per-hunk chunks (header line included) so the gaps
   // between them — the unchanged lines a hunk header doesn't carry — can be worked out. A
   // provider without hunk headers at all (Azure's patches have none) puts everything in
@@ -1190,6 +1202,7 @@ function FileDiff({
   }, [hunks]);
 
   const fileLines = useMemo(() => (fileText.data != null ? fileText.data.split("\n") : null), [fileText.data]);
+  const fileSpans = useHighlight(file.path, fileLines).data ?? null;
 
   // The fetched text might no longer be this diff's base (the PR moved on since) — if a hunk's
   // own first line disagrees with what the fetch says is there, or any gap/hunk range runs
@@ -1244,7 +1257,11 @@ function FileDiff({
           </span>
           <span className="pr-3 whitespace-pre" style={{ color }}>
             {marker}
-            {searchQuery ? <Highlighted text={ln.text} query={searchQuery} /> : ln.text}
+            {searchQuery ? (
+              <Highlighted text={ln.text} query={searchQuery} />
+            ) : (
+              renderSpans(ln.text, ln.kind === "add" || ln.kind === "del" || ln.kind === "context" ? spansFor.get(ln) : null)
+            )}
           </span>
         </div>
         {lineThreads.map((t) => (
@@ -1334,6 +1351,7 @@ function FileDiff({
                       unavailable={textUnavailable}
                       onRequestText={() => setTextRequested(true)}
                       highlightQuery={searchQuery}
+                      fileSpans={fileSpans}
                     />
                   ))}
                 {h.lines.map((ln, li) => renderDiffLine(ln, `${i}-${li}`))}
@@ -1359,6 +1377,7 @@ function GapRow({
   unavailable,
   onRequestText,
   highlightQuery,
+  fileSpans,
 }: {
   newStart: number;
   newCount: number;
@@ -1368,6 +1387,8 @@ function GapRow({
   unavailable: boolean;
   onRequestText: () => void;
   highlightQuery: string;
+  /** Syntax spans parallel to `fileLines`, or null to paint the revealed lines plain. */
+  fileSpans: HlSpan[][] | null;
 }) {
   const [revealed, setRevealed] = useState(false);
   const [all, setAll] = useState(false);
@@ -1426,7 +1447,7 @@ function GapRow({
   if (!fileLines) return null;
 
   if (all || newCount <= 20) {
-    return <>{sliceContextLines(fileLines, newStart, newCount, highlightQuery)}</>;
+    return <>{sliceContextLines(fileLines, newStart, newCount, highlightQuery, fileSpans)}</>;
   }
 
   // More than 20 lines and not "show all": reveal 10 from each edge, and leave the untouched
@@ -1434,7 +1455,7 @@ function GapRow({
   const middleCount = newCount - 20;
   return (
     <>
-      {sliceContextLines(fileLines, newStart, 10, highlightQuery)}
+      {sliceContextLines(fileLines, newStart, 10, highlightQuery, fileSpans)}
       <GapRow
         newStart={newStart + 10}
         newCount={middleCount}
@@ -1444,15 +1465,16 @@ function GapRow({
         unavailable={false}
         onRequestText={() => {}}
         highlightQuery={highlightQuery}
+        fileSpans={fileSpans}
       />
-      {sliceContextLines(fileLines, newStart + newCount - 10, 10, highlightQuery)}
+      {sliceContextLines(fileLines, newStart + newCount - 10, 10, highlightQuery, fileSpans)}
     </>
   );
 }
 
 /** Renders `count` lines of `fileLines` starting at new-side line `start` as plain context
  *  rows — no gutter comment button, since revealed lines don't need a composer. */
-function sliceContextLines(fileLines: string[], start: number, count: number, highlightQuery: string) {
+function sliceContextLines(fileLines: string[], start: number, count: number, highlightQuery: string, fileSpans: HlSpan[][] | null) {
   const out: ReactNode[] = [];
   for (let i = 0; i < count; i++) {
     const newLine = start + i;
@@ -1465,7 +1487,7 @@ function sliceContextLines(fileLines: string[], start: number, count: number, hi
         <span className="shrink-0" style={{ width: GUTTER_W }} />
         <span className="pr-3 whitespace-pre" style={{ color: "var(--fg)" }}>
           {" "}
-          {highlightQuery ? <Highlighted text={text} query={highlightQuery} /> : text}
+          {highlightQuery ? <Highlighted text={text} query={highlightQuery} /> : renderSpans(text, fileSpans?.[newLine - 1])}
         </span>
       </div>,
     );

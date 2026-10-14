@@ -214,6 +214,61 @@ describe("PrDetail action bar", () => {
     expect(screen.queryByText("src/a.rs")).not.toBeInTheDocument();
   });
 
+  it("Files tab: diff lines are syntax-coloured from /api/highlight, keyed to the file's path", async () => {
+    const d = detail("Open");
+    d.changes = [
+      { path: "infra/main.tf", kind: "Modified", additions: 1, deletions: 1, patch: '@@ -1 +1 @@\n-old = 1\n+resource "aws_s3_bucket" "logs" {' },
+    ];
+    const { posts } = mockFetch({
+      get: { "/api/pr/detail": d },
+      onPost: (url, body) => {
+        if (!url.includes("/api/highlight")) return undefined;
+        // Spans parallel to the request's lines: the hunk header, the removed and the added line.
+        const lines = (body as { lines: string[] }).lines;
+        expect(lines).toEqual(["@@ -1 +1 @@", "old = 1", 'resource "aws_s3_bucket" "logs" {']);
+        return {
+          lang: "hcl",
+          lines: [
+            [[12, "plain"]],
+            [[6, "plain"], [1, "number"]],
+            [[8, "keyword"], [1, "plain"], [15, "str"], [1, "plain"], [6, "str"], [2, "plain"]],
+          ],
+        };
+      },
+    });
+    renderWithClient(
+      <PrDetailProvider>
+        <Opener conn="c" id="1" />
+      </PrDetailProvider>,
+    );
+    await userEvent.click(await screen.findByRole("tab", { name: /files/i }));
+    expect(await screen.findByText("infra/main.tf")).toBeInTheDocument();
+    // The request names the file, so the server picks the grammar by its extension.
+    await waitFor(() => expect(posts.find((p) => p.url.includes("/api/highlight"))?.body).toMatchObject({ path: "infra/main.tf" }));
+    // The added line's keyword and labels are coloured; the removed line's number too.
+    const keyword = await screen.findByText("resource", { selector: ".syn-keyword" });
+    expect(keyword).toBeInTheDocument();
+    expect(screen.getByText('"aws_s3_bucket"', { selector: ".syn-str" })).toBeInTheDocument();
+    expect(screen.getByText("1", { selector: ".syn-number" })).toBeInTheDocument();
+    // The line still reads as one run of text (nothing dropped around the spans).
+    expect(keyword.parentElement?.textContent).toBe('+resource "aws_s3_bucket" "logs" {');
+  });
+
+  it("Files tab: a file the server has no grammar for renders plain", async () => {
+    const d = detail("Open");
+    d.changes = [{ path: "notes.txt", kind: "Added", additions: 1, deletions: 0, patch: "@@ -0,0 +1 @@\n+resource is a word" }];
+    const { posts } = mockFetch({ get: { "/api/pr/detail": d }, onPost: () => ({ lang: null, lines: null }) });
+    renderWithClient(
+      <PrDetailProvider>
+        <Opener conn="c" id="1" />
+      </PrDetailProvider>,
+    );
+    await userEvent.click(await screen.findByRole("tab", { name: /files/i }));
+    expect(await screen.findByText(/resource is a word/)).toBeInTheDocument();
+    await waitFor(() => expect(posts.some((p) => p.url.includes("/api/highlight"))).toBe(true));
+    expect(document.querySelector("[class^='syn-']")).toBeNull();
+  });
+
   it("Files tab: the default selection is the first file in tree order, not the list's own order", async () => {
     const d = detail("Open");
     // The provider lists "zebra.rs" first; tree order (alphabetical) puts "alpha.rs" first.

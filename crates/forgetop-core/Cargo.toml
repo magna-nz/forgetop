@@ -19,6 +19,7 @@ dirs.workspace = true
 regex.workspace = true
 fs2.workspace = true
 futures-util.workspace = true
+synoptic.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
