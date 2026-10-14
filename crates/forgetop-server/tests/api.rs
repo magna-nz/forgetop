@@ -827,7 +827,8 @@ fn has_row(rows: &serde_json::Value, addr: &(String, String, Option<String>, Str
 
 #[tokio::test]
 async fn dismissing_a_launchpad_row_hides_it_from_the_next_fetch() {
-    let server = spawn(demo_deps(true).await, 0).await.expect("server binds");
+    let deps = demo_deps(true).await;
+    let server = spawn(deps.clone(), 0).await.expect("server binds");
     let base = format!("http://127.0.0.1:{}", server.port);
     let client = reqwest::Client::new();
     let tok = server.token.clone();
@@ -845,15 +846,17 @@ async fn dismissing_a_launchpad_row_hides_it_from_the_next_fetch() {
     assert_eq!(r.status(), 200);
     assert_eq!(r.json::<serde_json::Value>().await.unwrap(), serde_json::json!({ "ok": true }));
     assert!(!has_row(&fetch().await, &addr), "the dismissed row is gone");
-    // A dismissal is by item, so every row drawing it goes (one item can sit in two buckets —
-    // a PR of yours that also needs fixing); nothing else does.
-    let others: Vec<_> = rows.iter().map(launchpad_address).filter(|a| a != &addr).collect();
-    let after: Vec<_> = fetch().await["rows"].as_array().unwrap().iter().map(launchpad_address).collect();
-    assert_eq!(after.len(), others.len(), "and nothing else went with it\n dismissed: {addr:?}\n expected: {others:#?}\n got: {after:#?}");
+    // What was saved is one key, this item's. (Not a row count: the demo's write stores are
+    // process-wide, so a test answering a gate or closing a PR meanwhile legitimately moves
+    // other rows between buckets and in or out of the capped lists.)
+    let saved = || deps.config.snapshot().ui.dismissed_launchpad_items;
+    let key = format!("{}:{}:{}:{}", addr.0, addr.1, addr.2.as_deref().unwrap_or(""), addr.3);
+    assert_eq!(saved(), vec![key.clone()], "exactly this item's key is saved");
 
     // Dismissing again is harmless, and the key is saved once.
     assert_eq!(hdr(client.post(&url)).json(&body).send().await.unwrap().status(), 200);
     assert!(!has_row(&fetch().await, &addr));
+    assert_eq!(saved(), vec![key]);
 
     // The route sits behind the session token like every other.
     assert_eq!(client.post(&url).json(&body).send().await.unwrap().status(), 401);
