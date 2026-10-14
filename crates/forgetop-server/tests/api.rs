@@ -845,7 +845,10 @@ async fn dismissing_a_launchpad_row_hides_it_from_the_next_fetch() {
     assert_eq!(r.status(), 200);
     assert_eq!(r.json::<serde_json::Value>().await.unwrap(), serde_json::json!({ "ok": true }));
     assert!(!has_row(&fetch().await, &addr), "the dismissed row is gone");
-    assert_eq!(fetch().await["rows"].as_array().unwrap().len(), rows.len() - 1, "and nothing else went with it");
+    // A dismissal is by item, so every row drawing it goes (one item can sit in two buckets —
+    // a PR of yours that also needs fixing); nothing else does.
+    let others = rows.iter().filter(|r| launchpad_address(r) != addr).count();
+    assert_eq!(fetch().await["rows"].as_array().unwrap().len(), others, "and nothing else went with it");
 
     // Dismissing again is harmless, and the key is saved once.
     assert_eq!(hdr(client.post(&url)).json(&body).send().await.unwrap().status(), 200);
