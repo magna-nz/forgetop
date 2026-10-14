@@ -174,6 +174,28 @@ describe("work items grouped by parent", () => {
     expect(ledgerHeader).not.toHaveTextContent("blocked");
   });
 
+  it("right-clicking a parent header offers the section and the parent, without toggling it", async () => {
+    mockFetch({ get: { "/api/prefs": { hidden_work_item_states: [] }, "/api/work-items": rowsFixture } });
+    renderWithClient(<WorkItems />);
+    await screen.findByText("Alpha one");
+    await choose("parent");
+    const q4Header = screen.getByRole("button", { name: /Q4 reliability/ });
+    fireEvent.contextMenu(q4Header);
+    const m = screen.getByRole("menu", { name: "Milestone actions" });
+    expect(within(m).getByRole("menuitem", { name: "Expand" })).toBeInTheDocument();
+    expect(within(m).getByRole("menuitem", { name: "Open milestone in GitHub" })).not.toHaveAttribute("aria-disabled");
+    expect(within(m).getByRole("menuitem", { name: "Copy link" })).toBeInTheDocument();
+    expect(q4Header).toHaveAttribute("aria-expanded", "false");
+    expect(openWi).not.toHaveBeenCalled();
+
+    await userEvent.click(within(m).getByRole("menuitem", { name: "Expand all" }));
+    expect(q4Header).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByRole("button", { name: /Ledger v2/ })).toHaveAttribute("aria-expanded", "true");
+    // A parent the provider gave no link for keeps the items, disabled with the reason.
+    fireEvent.contextMenu(screen.getByRole("button", { name: /Ledger v2/ }));
+    expect(screen.getByRole("menuitem", { name: "Open epic in GitHub" })).toHaveAttribute("aria-disabled", "true");
+  });
+
   it("links the parent out in a new tab without toggling the section", async () => {
     mockFetch({ get: { "/api/work-items": rowsFixture } });
     renderWithClient(<WorkItems />);

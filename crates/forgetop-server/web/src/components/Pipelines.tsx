@@ -1,18 +1,19 @@
 import { useMemo, useRef, useState, type MouseEvent } from "react";
 import { usePipelines } from "../api";
-import { fmtSecs, pipeMeta, sameRef, toTime } from "../format";
+import { fmtSecs, pipeMeta, providerMeta, sameRef, toTime } from "../format";
 import type { PipelineRunStatus, PipeRow } from "../types";
 import { groupPipelines, listStrip, parseGroupMode, pipeDefinitionName, rowGates, rowShownStatus } from "../pipeline/grouping";
 import type { GroupMode, PipeGroup } from "../pipeline/grouping";
 import { runSecs } from "../pipeline/timeline";
 import { Icon } from "./icons";
-import { Avatar, Button, Chip, ContextMenu, List, RowMenuButton, Segmented, Skeleton, StateCard, StatusGlyph, useContextMenu } from "./ui";
+import { Avatar, Button, Chip, ContextMenu, copyText, List, RowMenuButton, Segmented, Skeleton, StateCard, StatusGlyph, useContextMenu, type MenuEntry } from "./ui";
 import { ErrorState } from "./ErrorState";
 import { shortAge, ToggleRow, useListView, type SortOption } from "./ControlBar";
 import { useCurrentPipeline, usePipelineOpener } from "./PipelineDetail";
 import { useRepoScope } from "./RepoScope";
 import { usePipelineScope } from "./PipelineScope";
 import { usePipelineRowMenu } from "./rowMenus/pipeline";
+import { openExternal } from "./rowMenus/shared";
 
 const GROUP_KEY = "forgetop:pipelines:group";
 
@@ -130,7 +131,16 @@ export function Pipelines() {
       <List>
         {groups.length > 0
           ? groups.map((g) => (
-              <PipeGroupSection key={g.key} group={g} mode={mode} now={now} open={expanded.has(g.key)} onToggle={() => toggle(g.key)} />
+              <PipeGroupSection
+                key={g.key}
+                group={g}
+                mode={mode}
+                now={now}
+                open={expanded.has(g.key)}
+                onToggle={() => toggle(g.key)}
+                onExpandAll={() => setExpanded(new Set(groups.map((x) => x.key)))}
+                onCollapseAll={() => setExpanded(new Set())}
+              />
             ))
           : rows.map((row) => <PipeRunRow key={rowKey(row)} row={row} now={now} />)}
       </List>
@@ -144,19 +154,46 @@ function PipeGroupSection({
   now,
   open,
   onToggle,
+  onExpandAll,
+  onCollapseAll,
 }: {
   group: PipeGroup;
   mode: GroupMode;
   now: Date;
   open: boolean;
   onToggle: () => void;
+  onExpandAll: () => void;
+  onCollapseAll: () => void;
 }) {
   const meta = pipeMeta(group.status);
   const latest = group.latest;
   const branch = latest.run.branch;
+  const menu = useContextMenu();
+  const openRun = usePipelineOpener();
+  // The header's own menu: the section, then its latest run — the one the header describes.
+  // Each run beneath keeps its own row menu.
+  const groupMenu = (): MenuEntry[] => {
+    const url = latest.run.url ?? null;
+    const noLink = url ? false : "No link from the provider";
+    const entries: MenuEntry[] = [
+      { label: open ? "Collapse" : "Expand", icon: open ? "chevron-down" : "chevron-right", hint: "↵", onSelect: onToggle },
+      { label: "Expand all", onSelect: onExpandAll },
+      { label: "Collapse all", onSelect: onCollapseAll },
+      { type: "separator" },
+      {
+        label: "Open latest run",
+        icon: "open-pane",
+        onSelect: () => openRun({ conn: latest.connection_id, repo: latest.run.repository, runId: latest.run.id }),
+      },
+      { label: `Open in ${providerMeta(latest.provider).label}`, icon: "external", hint: "o", disabled: noLink, onSelect: () => openExternal(url!) },
+      { label: "Copy link", icon: "link", hint: "y", disabled: noLink, onSelect: () => copyText(url!, "link") },
+    ];
+    if (branch) entries.push({ label: "Copy branch", icon: "git-branch", value: branch, onSelect: () => copyText(branch, "branch") });
+    return entries;
+  };
   return (
     <>
-      <ToggleRow open={open} onToggle={onToggle} height={40}>
+      <ToggleRow open={open} onToggle={onToggle} onContextMenu={menu.onContextMenu} onKeyDown={menu.onKeyDown} menuOpen={menu.open} height={40}>
         <StatusGlyph glyph={meta.glyph} color={meta.color} spin={meta.running} title={meta.label} />
         <span className="truncate font-semibold min-w-0 shrink">{group.subject}</span>
         {group.repo && (
@@ -193,6 +230,7 @@ function PipeGroupSection({
           {shortAge(group.started)}
         </span>
       </ToggleRow>
+      <ContextMenu anchor={menu.anchor} onClose={menu.close} label="Pipeline actions" items={groupMenu} />
       {open && group.rows.map((row) => <PipeRunRow key={rowKey(row)} row={row} now={now} mode={mode} />)}
     </>
   );

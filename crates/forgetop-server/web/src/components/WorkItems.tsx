@@ -1,13 +1,14 @@
 import { useCallback, useMemo, useState } from "react";
 import { usePrefs, useWorkItems } from "../api";
-import { sameRef, toTime, wiStateColor, wiStateGlyph } from "../format";
+import { providerMeta, sameRef, toTime, wiStateColor, wiStateGlyph } from "../format";
 import type { WiRow, WorkItemParent } from "../types";
 import { Icon } from "./icons";
-import { Avatar, Button, ContextMenu, List, Row, RowMenuButton, Select, Skeleton, StateCard, StatusGlyph, useContextMenu } from "./ui";
+import { Avatar, Button, ContextMenu, copyText, List, Row, RowMenuButton, Select, Skeleton, StateCard, StatusGlyph, useContextMenu, type MenuEntry } from "./ui";
 import { ErrorState } from "./ErrorState";
 import { shortAge, ToggleRow, useListView } from "./ControlBar";
 import { useCurrentWi, useWiOpener } from "./WiDetail";
 import { useToggleHiddenState, useWiRowMenu } from "./rowMenus/wi";
+import { openExternal } from "./rowMenus/shared";
 
 const GROUP_KEY = "forgetop:work-items:group";
 type GroupMode = "off" | "parent";
@@ -122,7 +123,16 @@ export function WorkItems() {
       {bar}
       <List>
         {groups.length > 0
-          ? groups.map((g) => <WiGroupSection key={g.key} group={g} open={expanded.has(g.key)} onToggle={() => toggle(g.key)} />)
+          ? groups.map((g) => (
+              <WiGroupSection
+                key={g.key}
+                group={g}
+                open={expanded.has(g.key)}
+                onToggle={() => toggle(g.key)}
+                onExpandAll={() => setExpanded(new Set(groups.map((x) => x.key)))}
+                onCollapseAll={() => setExpanded(new Set())}
+              />
+            ))
           : rows.map((row) => <WiListRow key={wiKey(row)} row={row} />)}
       </List>
     </>
@@ -133,8 +143,40 @@ const wiKey = (row: WiRow) => `${row.connection_id}:${row.work_item.repository ?
 
 const isBlocked = (row: WiRow) => row.work_item.state.toLowerCase() === "blocked";
 
-function WiGroupSection({ group, open, onToggle }: { group: WiGroup; open: boolean; onToggle: () => void }) {
+function WiGroupSection({
+  group,
+  open,
+  onToggle,
+  onExpandAll,
+  onCollapseAll,
+}: {
+  group: WiGroup;
+  open: boolean;
+  onToggle: () => void;
+  onExpandAll: () => void;
+  onCollapseAll: () => void;
+}) {
   const { parent, rows } = group;
+  const menu = useContextMenu();
+  // The header's own menu: the section, then the parent it stands for. The items beneath keep
+  // their own row menus.
+  const groupMenu = (): MenuEntry[] => {
+    const provider = providerMeta(rows[0].provider).label;
+    const entries: MenuEntry[] = [
+      { label: open ? "Collapse" : "Expand", icon: open ? "chevron-down" : "chevron-right", hint: "↵", onSelect: onToggle },
+      { label: "Expand all", onSelect: onExpandAll },
+      { label: "Collapse all", onSelect: onCollapseAll },
+    ];
+    if (parent) {
+      const noLink = parent.url ? false : "No link from the provider";
+      entries.push(
+        { type: "separator" },
+        { label: `Open ${parent.kind.toLowerCase()} in ${provider}`, icon: "external", hint: "o", disabled: noLink, onSelect: () => openExternal(parent.url!) },
+        { label: "Copy link", icon: "link", hint: "y", disabled: noLink, onSelect: () => copyText(parent.url!, "link") },
+      );
+    }
+    return entries;
+  };
   const blocked = rows.filter(isBlocked).length;
   const unblockedIn = (category: string) => rows.filter((r) => r.work_item.state_category === category && !isBlocked(r)).length;
   const inProgress = unblockedIn("Started");
@@ -147,7 +189,14 @@ function WiGroupSection({ group, open, onToggle }: { group: WiGroup; open: boole
     <>
       {/* The link sits beside the toggle, not inside it: a link within a button is not a link. */}
       <div className="relative">
-        <ToggleRow open={open} onToggle={onToggle} style={parent?.url ? { paddingRight: 44 } : undefined}>
+        <ToggleRow
+          open={open}
+          onToggle={onToggle}
+          onContextMenu={menu.onContextMenu}
+          onKeyDown={menu.onKeyDown}
+          menuOpen={menu.open}
+          style={parent?.url ? { paddingRight: 44 } : undefined}
+        >
           {parent && (
             <span className="text-[12px] shrink-0" style={{ color: "var(--fg3)" }}>
               {parent.kind}
@@ -180,6 +229,7 @@ function WiGroupSection({ group, open, onToggle }: { group: WiGroup; open: boole
           </a>
         )}
       </div>
+      <ContextMenu anchor={menu.anchor} onClose={menu.close} label={parent ? `${parent.kind} actions` : "Group actions"} items={groupMenu} />
       {open && rows.map((row) => <WiListRow key={wiKey(row)} row={row} indent />)}
     </>
   );

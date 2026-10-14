@@ -79,6 +79,28 @@ describe("pipelines list grouping", () => {
     expect(screen.queryByText("CI run 1")).not.toBeInTheDocument();
   });
 
+  it("right-clicking a header offers the section and its latest run, without toggling it", async () => {
+    mockFetch({ get: { "/api/pipelines": rowsFixture } });
+    render();
+    const ci = await screen.findByRole("button", { name: /\bCI\b/ });
+    fireEvent.contextMenu(ci);
+    const m = screen.getByRole("menu", { name: "Pipeline actions" });
+    expect(within(m).getByRole("menuitem", { name: "Expand" })).toBeInTheDocument();
+    expect(within(m).getByRole("menuitem", { name: "Open latest run" })).toBeInTheDocument();
+    expect(within(m).getByRole("menuitem", { name: "Copy link" })).toBeInTheDocument();
+    expect(ci).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByText("CI run 2")).not.toBeInTheDocument();
+
+    await userEvent.click(within(m).getByRole("menuitem", { name: "Expand all" }));
+    expect(ci).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getAllByRole("button", { expanded: true })).toHaveLength(2);
+    expect(screen.getByText("CI run 2")).toBeInTheDocument();
+
+    fireEvent.contextMenu(ci);
+    await userEvent.click(screen.getByRole("menuitem", { name: "Collapse all" }));
+    expect(screen.getAllByRole("button", { expanded: false })).toHaveLength(2);
+  });
+
   it("expanding a header reveals its runs", async () => {
     mockFetch({ get: { "/api/pipelines": rowsFixture } });
     render();
