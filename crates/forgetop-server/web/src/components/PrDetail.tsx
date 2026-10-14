@@ -7,6 +7,7 @@ import { parsePatch, type DiffLine } from "../diff";
 import { buildDiffTree, collectFiles, filterTree, findMatches, flattenTree, searchFiles, type DiffTreeFile, type DiffTreeFolder, type FileMatch } from "../diffTree";
 import { addPrReply, addPrThreads, isLocalId, localComment, localThread, meAsUser, patchPullRequest, setPrThreadResolved, withVote } from "../optimistic";
 import type { CheckRun, CheckStatus, CommentThread, Commit, FileChange, FileChangeKind, LineComment, PrRef, PrWriteSupport, ProviderType, PullRequest, ReviewVote, Reviewer, TimelineEvent, User } from "../types";
+import { Markdown } from "./Markdown";
 import { Avatar, Button, Chip, claimPane, GroupHeading, IconButton, PaneHeader, setPaneGuard, SlideOver, StatusBadge, StatusGlyph, Tabs, Timeline, usePaneRegistration } from "./ui";
 import { Icon } from "./icons";
 
@@ -1524,9 +1525,7 @@ function ThreadBox({
               {age && <span style={{ color: "var(--fg3)" }}>{age}</span>}
               {i === 0 && controls}
             </div>
-            <div className="mt-1 whitespace-pre-wrap" style={{ color: "var(--fg)" }}>
-              {c.body}
-            </div>
+            <Markdown className="mt-1" source={c.body} />
           </div>
         );
       })}
@@ -1612,11 +1611,7 @@ function ConversationTab({
   const openCount = threads.filter((t) => !t.is_resolved).length;
   return (
     <div className="px-5 py-4 flex flex-col gap-5">
-      {description && (
-        <div className="text-[13px] whitespace-pre-wrap" style={{ color: "var(--fg)", lineHeight: 1.55 }}>
-          {description}
-        </div>
-      )}
+      <Markdown source={description} />
       {timeline.length > 0 && <Timeline events={timeline} />}
       <div className="flex flex-col gap-2">
         <GroupHeading>{openCount > 0 ? `Comments · ${openCount} open` : "Comments"}</GroupHeading>

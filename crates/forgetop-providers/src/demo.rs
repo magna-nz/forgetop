@@ -1551,7 +1551,7 @@ impl PullRequestSource for DemoPr {
                 comments: vec![Comment {
                     id: "c1".into(),
                     author: bob(),
-                    body: "One nit on the jitter — cap the backoff so it can't grow unbounded.".into(),
+                    body: "One nit on the jitter — cap the backoff so it can't grow **unbounded**. Something like `min(delay, 30s)`.".into(),
                     created_at: Some(base() - chrono::Duration::hours(2)),
                 }],
                 file_path: Some("src/http/retry.rs".into()),
@@ -1579,7 +1579,7 @@ impl PullRequestSource for DemoPr {
                 comments: vec![Comment {
                     id: "c3".into(),
                     author: dev(),
-                    body: "Thanks for the quick turnaround on this.".into(),
+                    body: "Thanks for the quick turnaround on this.\n\n- [x] replay path\n- [ ] load test against staging — still running".into(),
                     created_at: Some(base() - chrono::Duration::hours(2)),
                 }],
                 file_path: None,
