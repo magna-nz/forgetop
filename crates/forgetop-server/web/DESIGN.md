@@ -70,6 +70,11 @@ Four themes keep their names (slate = default, dark, light, matrix) and all defi
 Sidebar 240px (`--panel`), top bar 48px with the page title on the left and Search ⌘K,
 refresh and the bell on the right. Content scrolls inside `main`; the pane slot sits to its
 right. Lists are full-width inside a `max-w-[1280px]` container with 24px side padding.
+The Command Center is the exception: it is left-aligned and uncapped as a whole, with each
+column capped at 720px so a row never stretches past one eye-span on a wide monitor. It draws
+one column under 900px, two up to 1520px, and three beyond — the third takes the muted
+"Recent" lists (recently merged, recent pipelines) so the two columns of work stay level;
+narrower, those fold back under "Your work".
 
 ## Reference mockups
 

@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from "react";
+import { useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { useLaunchpad } from "../api";
 import {
   pipeMeta,
@@ -30,13 +30,55 @@ export function Launchpad() {
   if (!data || data.rows.length === 0)
     return <StateCard icon={<Icon name="check-circle" size={24} />} title="All clear" sub="Nothing needs your attention right now." />;
 
-  const left = groupByBucket(data.rows.filter((r) => r.column === 0));
-  const right = groupByBucket(data.rows.filter((r) => r.column === 1));
+  return <Columns rows={data.rows} more={data.more} />;
+}
 
+/** The right column's reference lists, which get a column of their own when the width allows. */
+const RECENT_BUCKETS = new Set(["recently_merged", "recent_pipelines"]);
+
+/** How many columns a grid this wide draws: one under 900px, two up to 1520px, three beyond. The
+ *  third carries the muted "Recent" lists so the two columns of work stay level; narrower, those
+ *  fold back under "Your work". Width 0 (jsdom, first paint) draws the single column. */
+const columnsFor = (width: number): 1 | 2 | 3 => (width >= 1520 ? 3 : width >= 900 ? 2 : 1);
+
+/** Width of an element, tracked (0 where ResizeObserver isn't available, e.g. jsdom). */
+function useWidth<T extends HTMLElement>(): [React.RefObject<T>, number] {
+  const ref = useRef<T>(null);
+  const [w, setW] = useState(0);
+  useLayoutEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    setW(el.getBoundingClientRect().width);
+    if (typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver((entries) => {
+      const width = entries[0]?.borderBoxSize?.[0]?.inlineSize ?? el.getBoundingClientRect().width;
+      setW(width);
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+  return [ref, w];
+}
+
+function Columns({ rows, more }: { rows: LaunchpadRow[]; more: LaunchpadMore }) {
+  const [ref, width] = useWidth<HTMLDivElement>();
+  const cols = columnsFor(width);
+  const left = groupByBucket(rows.filter((r) => r.column === 0));
+  const rightRows = rows.filter((r) => r.column === 1);
+  const yours = groupByBucket(cols === 3 ? rightRows.filter((r) => !RECENT_BUCKETS.has(r.bucket)) : rightRows);
+  const recent = cols === 3 ? groupByBucket(rightRows.filter((r) => RECENT_BUCKETS.has(r.bucket))) : null;
+
+  // Left-aligned and uncapped as a whole; each column caps at 720px so a row never stretches
+  // past one eye-span on a wide monitor — the spare width goes to the right edge, not the rows.
   return (
-    <div className="grid @[900px]:grid-cols-2 gap-x-11 gap-y-8 max-w-[1280px] mx-auto px-7 py-5">
-      <Column heading="Needs you" groups={left} emptyHint="Nothing waiting on you." more={data.more} />
-      <Column heading="Your work" groups={right} emptyHint="No open work." more={data.more} />
+    <div
+      ref={ref}
+      className="grid gap-x-11 gap-y-8 px-7 py-5 justify-start"
+      style={{ gridTemplateColumns: `repeat(${cols}, minmax(0, 720px))` }}
+    >
+      <Column heading="Needs you" groups={left} emptyHint="Nothing waiting on you." more={more} />
+      <Column heading="Your work" groups={yours} emptyHint="No open work." more={more} />
+      {recent && <Column heading="Recent" groups={recent} emptyHint="Nothing recent." more={more} muted />}
     </div>
   );
 }
@@ -100,11 +142,26 @@ function groupByBucket(rows: LaunchpadRow[]): Group[] {
   return groups;
 }
 
-function Column({ heading, groups, emptyHint, more }: { heading: string; groups: Group[]; emptyHint: string; more: LaunchpadMore }) {
+function Column({
+  heading,
+  groups,
+  emptyHint,
+  more,
+  muted,
+}: {
+  heading: string;
+  groups: Group[];
+  emptyHint: string;
+  more: LaunchpadMore;
+  /** A column of reference lists: its heading reads as quiet as its groups do. */
+  muted?: boolean;
+}) {
   const total = groups.reduce((n, g) => n + g.rows.length, 0);
   return (
     <section className="min-w-0">
-      <SectionHeading count={total}>{heading}</SectionHeading>
+      <SectionHeading count={total}>
+        <span style={muted ? { color: "var(--fg2)" } : undefined}>{heading}</span>
+      </SectionHeading>
       {groups.length === 0 ? (
         <p className="mt-3 text-[13px]" style={{ color: "var(--fg3)" }}>
           {emptyHint}
