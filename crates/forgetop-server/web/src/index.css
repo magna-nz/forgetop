@@ -155,6 +155,39 @@ body {
   .num {
     font-variant-numeric: tabular-nums;
   }
+
+  /* Syntax colours for diff lines — one class per token kind `/api/highlight` returns (see
+     types.ts `HlKind`), on the same palette slots the TUI's `hl_style` uses, so a file reads
+     the same in both frontends. Plain runs carry no class and inherit the line's colour. */
+  .syn-keyword {
+    color: var(--magenta);
+  }
+  .syn-type {
+    color: var(--cyan);
+  }
+  .syn-str {
+    color: var(--green);
+  }
+  .syn-comment {
+    color: var(--fg3);
+  }
+  .syn-number {
+    color: var(--yellow);
+  }
+  .syn-func {
+    color: var(--blue);
+  }
+  .syn-heading {
+    color: var(--magenta);
+    font-weight: 600;
+  }
+  .syn-link {
+    color: var(--blue);
+    text-decoration: underline;
+  }
+  .syn-emph {
+    font-weight: 600;
+  }
 }
 
 @layer components {

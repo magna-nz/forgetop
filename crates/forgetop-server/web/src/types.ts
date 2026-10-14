@@ -501,3 +501,19 @@ export interface RepositoryPage {
    *  than presenting a cap as a total. Truncation must never be silent. */
   truncated: boolean;
 }
+
+// ---- syntax highlighting (`POST /api/highlight`, dto.rs `Highlight`) ----
+
+/** A token kind from `forgetop_core::highlight::HlKind`, serialised lowercase. The TUI and
+ *  the dashboard colour these from the same palette slots (`.syn-<kind>` in index.css). */
+export type HlKind = "keyword" | "type" | "str" | "comment" | "number" | "func" | "punct" | "heading" | "link" | "emph" | "plain";
+
+/** One run of a line: its length in UTF-16 code units (what `String.slice` counts) and kind. */
+export type HlSpan = [number, HlKind];
+
+/** The response: `lines` is parallel to the request's lines, or `null` (with `lang`) for a
+ *  language the shared grammars don't cover — paint the text plain. */
+export interface Highlight {
+  lang: string | null;
+  lines: HlSpan[][] | null;
+}

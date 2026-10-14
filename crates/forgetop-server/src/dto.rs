@@ -7,6 +7,7 @@ use forgetop_core::domain::{
     CheckRun, CommentThread, Commit, FileChange, Notification, PipelineAnnotation, PipelineApproval,
     PipelineArtifact, PipelineRun, ProviderType, PullRequest, PullRequestStatus, TimelineEvent, TimelineEventKind, WorkItem,
 };
+use forgetop_core::highlight::{lang_for, HlKind, LineHighlighter};
 use forgetop_core::filter::run_triggered_by;
 use forgetop_core::launchpad::{self, EntryItem, PipeInput, PrInput, WiInput};
 use forgetop_core::provider::{
@@ -800,4 +801,26 @@ mod tests {
             .unwrap();
         assert!(!bb.pull_requests().unwrap().list_omits_decoration(), "Bitbucket fills them from the list");
     }
+}
+
+// ---- syntax highlighting ----
+
+/// One file's source lines tokenised for the dashboard's diff view: the `POST /api/highlight`
+/// response. `lines` is parallel to the request's, each a list of `[len, kind]` spans that
+/// cover that line, `len` in UTF-16 code units (what the browser slices by). Both fields are
+/// `null` for a language the shared grammars don't cover, and the dashboard paints the text
+/// plain, as it did before.
+#[derive(Debug, Clone, Serialize)]
+pub struct Highlight {
+    pub lang: Option<&'static str>,
+    pub lines: Option<Vec<Vec<(usize, HlKind)>>>,
+}
+
+/// Tokenises `lines` as the file at `path` with the grammar the TUI paints its diffs with
+/// (`forgetop_core::highlight`), so both frontends colour a file identically.
+pub fn highlight(path: &str, lines: &[String]) -> Highlight {
+    let plain = Highlight { lang: None, lines: None };
+    let Some(lang) = lang_for(path) else { return plain };
+    let Some(mut hl) = LineHighlighter::new(lang) else { return plain };
+    Highlight { lang: Some(lang.name()), lines: Some(lines.iter().map(|l| hl.spans(l)).collect()) }
 }

@@ -1382,6 +1382,65 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 tokio-test = "0.4"
 "#;
 
+const FRONTDOOR_TF: &str = r#"# Front Door origin for the payments API, reached over Private Link so the
+# origin never exposes a public endpoint (INF-1067).
+
+terraform {
+  required_version = ">= 1.6"
+  required_providers {
+    azurerm = {
+      source  = "hashicorp/azurerm"
+      version = "~> 3.100"
+    }
+  }
+}
+
+locals {
+  origin_host = "payments-api.internal.example.net"
+  tags = {
+    service = "payments"
+    owner   = "platform"
+  }
+}
+
+resource "azurerm_cdn_frontdoor_origin" "payments" {
+  name                          = "payments-api"
+  cdn_frontdoor_origin_group_id = azurerm_cdn_frontdoor_origin_group.payments.id
+  enabled                       = true
+  host_name                     = local.origin_host
+  http_port                     = 80
+  https_port                    = 443
+  priority                      = 1
+  weight                        = 1000
+
+  private_link {
+    request_message        = "Approved by Terraform for Azure Front Door"
+    target_type            = "sites"
+    location               = var.location
+    private_link_target_id = azurerm_linux_web_app.payments.id
+  }
+}
+
+resource "terraform_data" "approve_private_endpoint_connections" {
+  for_each = var.private_link_origins
+
+  input = {
+    origin_id = azurerm_cdn_frontdoor_origin.payments.id
+    target    = each.value.target_id
+  }
+
+  provisioner "local-exec" {
+    command = "${path.module}/scripts/approve-private-link.sh"
+    environment = {
+      PL_KEY             = each.key
+      PL_ORIGIN_ID       = self.input.origin_id
+      PL_EXPECTED_TARGET = self.input.target
+      PL_TIMEOUT_SECONDS = 600 # ten minutes, the ARM request can sit Pending a while
+    }
+  }
+}
+"#;
+
 /// The full text of a demo pull request's file at its head, for the paths `changes()` lists.
 fn demo_file_text(path: &str) -> Option<&'static str> {
     Some(match path {
@@ -1391,6 +1450,7 @@ fn demo_file_text(path: &str) -> Option<&'static str> {
         "src/providers/gitlab/auth.rs" => GITLAB_AUTH_RS,
         "docs/retry.md" => RETRY_MD,
         "Cargo.toml" => CARGO_TOML,
+        "infra/frontdoor.tf" => FRONTDOOR_TF,
         _ => return None,
     })
 }
@@ -1790,6 +1850,62 @@ impl PullRequestSource for DemoPr {
                      +tokio = { version = \"1\", features = [\"rt-multi-thread\", \"macros\", \"time\"] }\n\
                      \x20\n\
                      \x20[dev-dependencies]\n"
+                        .into(),
+                ),
+            },
+            FileChange {
+                path: "infra/frontdoor.tf".into(),
+                kind: FileChangeKind::Modified,
+                additions: 30,
+                deletions: 3,
+                patch: Some(
+                    "@@ -1,11 +1,12 @@\n\
+                     -# Front Door origin for the payments API (INF-1067).\n\
+                     +# Front Door origin for the payments API, reached over Private Link so the\n\
+                     +# origin never exposes a public endpoint (INF-1067).\n\
+                     \x20\n\
+                     \x20terraform {\n\
+                     -  required_version = \">= 1.5\"\n\
+                     +  required_version = \">= 1.6\"\n\
+                     \x20  required_providers {\n\
+                     \x20    azurerm = {\n\
+                     \x20      source  = \"hashicorp/azurerm\"\n\
+                     -      version = \"~> 3.90\"\n\
+                     +      version = \"~> 3.100\"\n\
+                     \x20    }\n\
+                     \x20  }\n\
+                     \x20}\n\
+                     @@ -27,4 +28,30 @@\n\
+                     \x20  https_port                    = 443\n\
+                     \x20  priority                      = 1\n\
+                     \x20  weight                        = 1000\n\
+                     +\n\
+                     +  private_link {\n\
+                     +    request_message        = \"Approved by Terraform for Azure Front Door\"\n\
+                     +    target_type            = \"sites\"\n\
+                     +    location               = var.location\n\
+                     +    private_link_target_id = azurerm_linux_web_app.payments.id\n\
+                     +  }\n\
+                     \x20}\n\
+                     +\n\
+                     +resource \"terraform_data\" \"approve_private_endpoint_connections\" {\n\
+                     +  for_each = var.private_link_origins\n\
+                     +\n\
+                     +  input = {\n\
+                     +    origin_id = azurerm_cdn_frontdoor_origin.payments.id\n\
+                     +    target    = each.value.target_id\n\
+                     +  }\n\
+                     +\n\
+                     +  provisioner \"local-exec\" {\n\
+                     +    command = \"${path.module}/scripts/approve-private-link.sh\"\n\
+                     +    environment = {\n\
+                     +      PL_KEY             = each.key\n\
+                     +      PL_ORIGIN_ID       = self.input.origin_id\n\
+                     +      PL_EXPECTED_TARGET = self.input.target\n\
+                     +      PL_TIMEOUT_SECONDS = 600 # ten minutes, the ARM request can sit Pending a while\n\
+                     +    }\n\
+                     +  }\n\
+                     +}\n"
                         .into(),
                 ),
             },

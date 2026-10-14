@@ -716,6 +716,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "synoptic",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -773,7 +774,6 @@ dependencies = [
  "ratatui",
  "serde",
  "serde_json",
- "synoptic",
  "tempfile",
  "tokio",
 ]

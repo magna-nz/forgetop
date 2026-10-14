@@ -2,6 +2,7 @@
 
 use chrono::{DateTime, Utc};
 use forgetop_core::domain::*;
+use forgetop_core::highlight::{lang_for, HlKind, LineHighlighter};
 use forgetop_core::launchpad::{pr_approved_by, pr_changes_requested_by, pr_state, PrBlocker, PrState};
 use forgetop_core::provider::PrWriteSupport;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -24,7 +25,6 @@ use crate::app::{
     WiHead, WiLine, WiView, LOG_SPLIT_MIN_WIDTH, LOG_TREE_WIDTH, PR_TABS, TABS,
 };
 use crate::diff::{cursor_line_label, pending_marks};
-use crate::highlight::{lang_for, HlKind, LineHighlighter};
 use crate::overlay::Overlay;
 use crate::palette::{parse_query, PaletteItem, Tone};
 use crate::theme::{check_icon, pipeline_glyph, Theme};
@@ -8656,7 +8656,7 @@ mod tests {
 
     #[test]
     fn patch_line_highlights_code_after_the_diff_marker() {
-        use crate::highlight::{Lang, LineHighlighter};
+        use forgetop_core::highlight::{Lang, LineHighlighter};
         let theme = Theme::by_name("slate");
         let mut hl = LineHighlighter::new(Lang::Rust).unwrap();
         let line = patch_line_hl(&theme, "+let n = 5;", Some(&mut hl));
@@ -8675,7 +8675,7 @@ mod tests {
 
     #[test]
     fn patch_line_styles_markup_kinds_with_modifiers() {
-        use crate::highlight::{Lang, LineHighlighter};
+        use forgetop_core::highlight::{Lang, LineHighlighter};
         let theme = Theme::by_name("slate");
         let mut hl = LineHighlighter::new(Lang::Markdown).unwrap();
         let line = patch_line_hl(&theme, "+# Title", Some(&mut hl));
@@ -8691,7 +8691,7 @@ mod tests {
 
     #[test]
     fn patch_line_headers_and_unknown_langs_stay_flat() {
-        use crate::highlight::{Lang, LineHighlighter};
+        use forgetop_core::highlight::{Lang, LineHighlighter};
         let theme = Theme::by_name("slate");
         let mut hl = LineHighlighter::new(Lang::Rust).unwrap();
         // A hunk header stays accent even with a highlighter available.
