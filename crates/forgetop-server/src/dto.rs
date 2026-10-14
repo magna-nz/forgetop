@@ -384,7 +384,7 @@ pub struct LaunchpadResponse {
     pub more: LaunchpadMore,
 }
 
-pub async fn launchpad(sections: &SectionService, cache: &CacheStore) -> LaunchpadResponse {
+pub async fn launchpad(sections: &SectionService, cache: &CacheStore, dismissed: &[String]) -> LaunchpadResponse {
     let review = pr_inputs(sections, PullRequestFilter::ReviewRequested, false).await;
     let mine = pr_inputs(sections, PullRequestFilter::Mine, true).await;
     let wis = wi_inputs(sections).await;
@@ -397,15 +397,17 @@ pub async fn launchpad(sections: &SectionService, cache: &CacheStore) -> Launchp
     cached::store_work_items(cache, &wis, now);
     cached::store_pipelines(cache, &pipe_rows, now);
     let pipes: Vec<PipeInput> = pipe_rows.into_iter().map(cached::pipe_input).collect();
-    build_launchpad(&review, &mine, &wis, &pipes)
+    build_launchpad(&review, &mine, &wis, &pipes, dismissed)
 }
 
-/// The Command Center from its inputs — live or cached, the same build.
-pub fn build_launchpad(review: &[PrInput], mine: &[PrInput], wis: &[WiInput], pipes: &[PipeInput]) -> LaunchpadResponse {
+/// The Command Center from its inputs — live or cached, the same build. Entries the user
+/// dismissed are dropped, by the current key or the legacy `"<conn>:<id>"` one (the TUI's rule).
+pub fn build_launchpad(review: &[PrInput], mine: &[PrInput], wis: &[WiInput], pipes: &[PipeInput], dismissed: &[String]) -> LaunchpadResponse {
     let built = launchpad::build(review, mine, wis, pipes);
     let rows = built
         .entries
         .into_iter()
+        .filter(|e| !dismissed.contains(&e.dismiss_key()) && !dismissed.contains(&e.legacy_key()))
         .map(|e| LaunchpadRow {
             bucket: e.bucket.key(),
             bucket_title: e.bucket.title(),

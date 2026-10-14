@@ -1,9 +1,14 @@
 import {
   createContext,
+  useCallback,
   useContext,
   useEffect,
+  useId,
+  useLayoutEffect,
+  useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
   type ButtonHTMLAttributes,
   type CSSProperties,
   type ReactNode,
@@ -253,11 +258,16 @@ export function Divider({ className }: { className?: string }) {
 }
 
 /** A list row: 36px, hairline below, hover tint, accent wash when selected. A click handler
- *  opens the in-app detail; otherwise `href` links out to the provider. */
+ *  opens the in-app detail; otherwise `href` links out to the provider. `onContextMenu` and
+ *  `onKeyDown` take a `useContextMenu()`'s handlers; `menuOpen` keeps the hover tint (and the
+ *  row's `RowMenuButton`) showing while that menu is open. */
 export function Row({
   children,
   href,
   onClick,
+  onContextMenu,
+  onKeyDown,
+  menuOpen = false,
   dense = false,
   selected = false,
   className,
@@ -269,6 +279,9 @@ export function Row({
   index?: number;
   href?: string | null;
   onClick?: () => void;
+  onContextMenu?: (e: React.MouseEvent) => void;
+  onKeyDown?: (e: React.KeyboardEvent) => void;
+  menuOpen?: boolean;
   dense?: boolean;
   selected?: boolean;
   className?: string;
@@ -276,15 +289,24 @@ export function Row({
 }) {
   void _index;
   const cls = `ft-row ${dense ? "min-h-[32px]" : ""} ${className ?? ""}`;
+  const menuProps = { onContextMenu, onKeyDown, "data-menu-open": menuOpen ? "true" : undefined };
   if (onClick) {
     return (
-      <button type="button" className={cls} onClick={onClick} data-selected={selected || undefined} aria-label={label}>
+      <button type="button" className={cls} onClick={onClick} data-selected={selected || undefined} aria-label={label} {...menuProps}>
         {children}
       </button>
     );
   }
   return (
-    <a className={cls} href={href ?? undefined} target={href ? "_blank" : undefined} rel="noreferrer" data-selected={selected || undefined} aria-label={label}>
+    <a
+      className={cls}
+      href={href ?? undefined}
+      target={href ? "_blank" : undefined}
+      rel="noreferrer"
+      data-selected={selected || undefined}
+      aria-label={label}
+      {...menuProps}
+    >
       {children}
     </a>
   );
@@ -633,4 +655,707 @@ export function Timeline({ events }: { events: TimelineEvent[] }) {
       })}
     </div>
   );
+}
+
+/* ---- context menus --------------------------------------------------------------------- */
+
+/** One line of a row's context menu. Group order is navigate+copy · act · view preference ·
+ *  destructive, with a separator between groups; leading, trailing and doubled separators are
+ *  dropped, so a builder can emit a group's separator without checking the group is empty. */
+export type MenuEntry =
+  | { type: "separator" }
+  | {
+      type?: "item";
+      /** Stable key; defaults to the label when it is a string. */
+      id?: string;
+      label: ReactNode;
+      icon?: IconName;
+      /** Colour for the icon only (a status colour var); default currentColor. */
+      iconColor?: string;
+      /** Trailing mono text (an identifier, a branch). Rendered in --fg2, truncated. */
+      value?: string;
+      /** Keyboard hint shown right-aligned in mono, e.g. "↵", "o", "y", "D", "X". */
+      hint?: string;
+      /** A string disables the item and becomes its tooltip (the reason). */
+      disabled?: string | false;
+      /** Red text + icon; confirm-in-place when `confirm` is set. */
+      danger?: boolean;
+      /** Label shown after the first click; the second click within 4s runs onSelect. */
+      confirm?: string;
+      /** Renders role=menuitemcheckbox with a checkbox glyph. */
+      checked?: boolean;
+      /** Submenu items, or a loader called when the submenu opens (shows "Loading…" meanwhile,
+       *  "Couldn't load" on rejection). The entry gets a chevron and aria-haspopup. */
+      submenu?: MenuEntry[] | (() => Promise<MenuEntry[]>);
+      /** Runs on activation; the menu closes first unless `keepOpen`. */
+      onSelect?: () => void | Promise<void>;
+      keepOpen?: boolean;
+    };
+
+type MenuItemEntry = Exclude<MenuEntry, { type: "separator" }>;
+
+export interface MenuAnchor {
+  /** Viewport coordinates of the pointer, or an element to anchor below-left of. */
+  x?: number;
+  y?: number;
+  el?: HTMLElement | null;
+  /** The element the menu was opened from (the row); focus returns there on close unless
+   *  `ContextMenu` is given `returnFocusTo`. `useContextMenu` fills it in. */
+  origin?: HTMLElement | null;
+}
+
+/** Headless state for one row's menu. */
+export function useContextMenu(): {
+  open: boolean;
+  anchor: MenuAnchor | null;
+  /** Attach to the row: `onContextMenu={menu.onContextMenu}`; prevents the native menu. */
+  onContextMenu: (e: React.MouseEvent) => void;
+  /** Attach to the row: `onKeyDown={menu.onKeyDown}` — Shift+F10 / ContextMenu key. */
+  onKeyDown: (e: React.KeyboardEvent) => void;
+  /** Open anchored to an element (the ⋯ button). */
+  openAt: (el: HTMLElement) => void;
+  close: () => void;
+} {
+  const [anchor, setAnchor] = useState<MenuAnchor | null>(null);
+  const onContextMenu = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setAnchor({ x: e.clientX, y: e.clientY, origin: e.currentTarget as HTMLElement });
+  }, []);
+  const onKeyDown = useCallback((e: React.KeyboardEvent) => {
+    if ((e.shiftKey && e.key === "F10") || e.key === "ContextMenu") {
+      e.preventDefault();
+      e.stopPropagation();
+      const row = e.currentTarget as HTMLElement;
+      setAnchor({ el: row, origin: row });
+    }
+  }, []);
+  const openAt = useCallback((el: HTMLElement) => setAnchor({ el, origin: el }), []);
+  const close = useCallback(() => setAnchor(null), []);
+  return { open: anchor != null, anchor, onContextMenu, onKeyDown, openAt, close };
+}
+
+/** The floating menu. Renders nothing when `anchor` is null. Portals to document.body. */
+export function ContextMenu(props: {
+  anchor: MenuAnchor | null;
+  onClose: () => void;
+  /** Built lazily on open so a row never pays for a closed menu. */
+  items: MenuEntry[] | (() => MenuEntry[]);
+  /** aria-label of the menu, e.g. "Pull request actions". */
+  label: string;
+  /** Element to return focus to on close (the row); defaults to the previously focused one. */
+  returnFocusTo?: HTMLElement | null;
+}): ReactNode {
+  if (!props.anchor) return null;
+  return createPortal(<MenuRoot {...props} anchor={props.anchor} />, document.body);
+}
+
+const isSeparator = (e: MenuEntry | undefined): e is { type: "separator" } => e?.type === "separator";
+
+/** Drops leading, trailing and doubled separators. */
+function tidyEntries(entries: MenuEntry[]): MenuEntry[] {
+  const out: MenuEntry[] = [];
+  for (const e of entries) {
+    if (isSeparator(e)) {
+      if (out.length > 0 && !isSeparator(out[out.length - 1])) out.push(e);
+    } else out.push(e);
+  }
+  while (isSeparator(out[out.length - 1])) out.pop();
+  return out;
+}
+
+const itemIndexes = (entries: MenuEntry[]) => entries.flatMap((e, i) => (isSeparator(e) ? [] : [i]));
+const errorText = (e: unknown) => (e instanceof Error ? e.message : String(e));
+
+/** Runs an item's action; a throw or rejection becomes an error toast rather than vanishing. */
+function runAction(fn: (() => void | Promise<void>) | undefined) {
+  if (!fn) return;
+  try {
+    const r = fn();
+    if (r && typeof r.then === "function") r.then(undefined, (e: unknown) => notify(errorText(e), { error: true }));
+  } catch (e) {
+    notify(errorText(e), { error: true });
+  }
+}
+
+const MENU_EDGE = 8;
+const SUBMENU_HOVER_MS = 120;
+const CONFIRM_MS = 4000;
+
+type MenuPlace = { anchor: MenuAnchor } | { beside: () => HTMLElement | null | undefined };
+
+/** Where a `w`×`h` panel goes: at the pointer, below-left of an element, or to the right of a
+ *  parent item — flipped up/left when it would overflow, then clamped inside the viewport. */
+function placeMenu(w: number, h: number, place: MenuPlace): { left: number; top: number } {
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+  let left: number;
+  let top: number;
+  if ("beside" in place) {
+    const r = place.beside()?.getBoundingClientRect();
+    if (!r) return { left: MENU_EDGE, top: MENU_EDGE };
+    // 5px up: the panel's 1px border and 4px inset line its first item up with the parent.
+    left = r.right + 2;
+    top = r.top - 5;
+    if (left + w > vw - MENU_EDGE) left = r.left - w - 2;
+  } else if (place.anchor.el) {
+    const r = place.anchor.el.getBoundingClientRect();
+    left = r.left;
+    top = r.bottom + 4;
+    if (left + w > vw - MENU_EDGE) left = r.right - w;
+    if (top + h > vh - MENU_EDGE) top = r.top - h - 4;
+  } else {
+    left = place.anchor.x ?? 0;
+    top = place.anchor.y ?? 0;
+    if (left + w > vw - MENU_EDGE) left -= w;
+    if (top + h > vh - MENU_EDGE) top -= h;
+  }
+  const clamp = (v: number, max: number) => Math.max(MENU_EDGE, Math.min(v, max));
+  return { left: clamp(left, vw - w - MENU_EDGE), top: clamp(top, vh - h - MENU_EDGE) };
+}
+
+/** The open menu: the root panel plus any submenu, the close-on-outside listeners, and
+ *  returning focus when it goes. Mounted only while open, so `items()` runs once per open (and
+ *  again only when the caller re-renders with a new `items`). */
+function MenuRoot({
+  anchor,
+  onClose,
+  items,
+  label,
+  returnFocusTo,
+}: {
+  anchor: MenuAnchor;
+  onClose: () => void;
+  items: MenuEntry[] | (() => MenuEntry[]);
+  label: string;
+  returnFocusTo?: HTMLElement | null;
+}) {
+  const layerRef = useRef<HTMLDivElement>(null);
+  const entries = useMemo(() => tidyEntries(typeof items === "function" ? items() : items), [items]);
+  // Read during the first render, before the menu takes focus.
+  const [previous] = useState(() => (document.activeElement instanceof HTMLElement ? document.activeElement : null));
+  const focusTarget = returnFocusTo ?? anchor.origin ?? previous;
+  const focusTargetRef = useRef(focusTarget);
+  focusTargetRef.current = focusTarget;
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+  // Whether closing hands focus back. A click elsewhere or the window losing focus does not:
+  // the user has put focus somewhere else on purpose.
+  const restoreRef = useRef(true);
+  const close = useCallback((restore: boolean) => {
+    restoreRef.current = restore;
+    onCloseRef.current();
+  }, []);
+  // Which panel holds focus (0 = root): the one roving tab stop lives there.
+  const [focusDepth, setFocusDepth] = useState(0);
+
+  useEffect(() => {
+    const inside = (t: EventTarget | null) => t instanceof Node && !!layerRef.current?.contains(t);
+    const onDown = (e: MouseEvent) => {
+      if (!inside(e.target)) close(false);
+    };
+    const onScroll = (e: Event) => {
+      if (!inside(e.target)) close(inside(document.activeElement));
+    };
+    const onResize = () => close(inside(document.activeElement));
+    const onBlur = () => close(false);
+    document.addEventListener("mousedown", onDown, true);
+    window.addEventListener("scroll", onScroll, true);
+    window.addEventListener("resize", onResize);
+    window.addEventListener("blur", onBlur);
+    return () => {
+      document.removeEventListener("mousedown", onDown, true);
+      window.removeEventListener("scroll", onScroll, true);
+      window.removeEventListener("resize", onResize);
+      window.removeEventListener("blur", onBlur);
+    };
+  }, [close]);
+
+  useEffect(
+    () => () => {
+      const t = focusTargetRef.current;
+      if (restoreRef.current && t && t.isConnected && t !== document.body) t.focus({ preventScroll: true });
+    },
+    [],
+  );
+
+  // The menu is rendered from inside a row in the React tree: keep its events from bubbling
+  // there (a click would open the pane), and from the window listeners (Esc closes the pane,
+  // ←/→ resize it).
+  const stop = (e: React.SyntheticEvent) => e.stopPropagation();
+  return (
+    <div
+      ref={layerRef}
+      className="ft-menu-layer"
+      onClick={stop}
+      onMouseDown={stop}
+      onPointerDown={stop}
+      onKeyDown={stop}
+      onContextMenu={(e) => {
+        e.preventDefault();
+        e.stopPropagation();
+      }}
+    >
+      <MenuPanel
+        entries={entries}
+        label={label}
+        depth={0}
+        place={{ anchor }}
+        autoFocus={1}
+        focusDepth={focusDepth}
+        setFocusDepth={setFocusDepth}
+        close={close}
+      />
+    </div>
+  );
+}
+
+type SubmenuState = {
+  index: number;
+  /** Bumped to move focus into the submenu; 0 while it is only hover-opened. */
+  focusReq: number;
+} & ({ state: "loading" } | { state: "error"; error: string } | { state: "ready"; entries: MenuEntry[] });
+
+/** One `role="menu"` panel (the root or a submenu) with its roving focus, keyboard model,
+ *  confirm-in-place and its own open submenu. */
+function MenuPanel({
+  entries,
+  label,
+  depth,
+  place,
+  autoFocus,
+  focusDepth,
+  setFocusDepth,
+  close,
+  onBack,
+  onPanelEnter,
+}: {
+  entries: MenuEntry[];
+  label: string;
+  depth: number;
+  place: MenuPlace;
+  /** Non-zero: the active item takes focus once the panel is placed (again on each change). */
+  autoFocus: number;
+  focusDepth: number;
+  setFocusDepth: (depth: number) => void;
+  close: (restore: boolean) => void;
+  /** ← in a submenu: close it and focus its parent item. */
+  onBack?: () => void;
+  /** The pointer reached this submenu: the parent keeps it open. */
+  onPanelEnter?: () => void;
+}) {
+  const uid = useId();
+  const panelRef = useRef<HTMLDivElement>(null);
+  const itemEls = useRef<(HTMLButtonElement | null)[]>([]);
+  const indexes = itemIndexes(entries);
+  const [pos, setPos] = useState<{ left: number; top: number } | null>(null);
+  const [activeState, setActive] = useState(indexes[0] ?? -1);
+  const active = indexes.includes(activeState) ? activeState : (indexes[0] ?? -1);
+  const [armed, setArmed] = useState<number | null>(null);
+  const [sub, setSub] = useState<SubmenuState | null>(null);
+  const subRef = useRef(sub);
+  subRef.current = sub;
+  const focusDepthRef = useRef(focusDepth);
+  focusDepthRef.current = focusDepth;
+  const hoverTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const armTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const loaded = useRef(new Map<number, MenuEntry[]>());
+  const subToken = useRef(0);
+
+  const clearHover = () => {
+    if (hoverTimer.current !== undefined) clearTimeout(hoverTimer.current);
+    hoverTimer.current = undefined;
+  };
+  useEffect(
+    () => () => {
+      clearHover();
+      if (armTimer.current !== undefined) clearTimeout(armTimer.current);
+    },
+    [],
+  );
+
+  // Measure after render and place; until then the panel is laid out but hidden, so it never
+  // flashes at 0,0. Width is max-content, so the measurement does not depend on where it sits.
+  useLayoutEffect(() => {
+    const el = panelRef.current;
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    const next = placeMenu(r.width, r.height, place);
+    setPos((cur) => (cur && cur.left === next.left && cur.top === next.top ? cur : next));
+  });
+  const placed = pos !== null;
+  // A hidden element cannot take focus, so focus waits for placement.
+  useLayoutEffect(() => {
+    if (placed && autoFocus > 0) itemEls.current[active]?.focus({ preventScroll: true });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [placed, autoFocus]);
+
+  const focusIndex = (i: number) => {
+    if (i < 0) return;
+    setActive(i);
+    itemEls.current[i]?.focus({ preventScroll: true });
+  };
+
+  const settle = (index: number, token: number, next: SubmenuState) => {
+    if (subToken.current !== token) return;
+    // Focus follows the content in only if it was already inside the submenu.
+    const into = focusDepthRef.current > depth;
+    setSub((s) => (s && s.index === index ? { ...next, focusReq: into ? s.focusReq + 1 : 0 } : s));
+  };
+
+  const openSub = (i: number, focus: boolean) => {
+    clearHover();
+    const e = entries[i];
+    if (!e || isSeparator(e) || !e.submenu || e.disabled) return;
+    const cur = subRef.current;
+    if (cur && cur.index === i) {
+      if (focus) setSub({ ...cur, focusReq: cur.focusReq + 1 });
+      return;
+    }
+    const token = ++subToken.current;
+    const focusReq = focus ? 1 : 0;
+    const source = e.submenu;
+    const cached = Array.isArray(source) ? source : loaded.current.get(i);
+    if (cached) {
+      setSub({ index: i, focusReq, state: "ready", entries: cached });
+      return;
+    }
+    if (Array.isArray(source)) return;
+    setSub({ index: i, focusReq, state: "loading" });
+    source().then(
+      (list) => {
+        loaded.current.set(i, list);
+        settle(i, token, { index: i, focusReq: 0, state: "ready", entries: list });
+      },
+      (err: unknown) => settle(i, token, { index: i, focusReq: 0, state: "error", error: errorText(err) || "Couldn't load" }),
+    );
+  };
+
+  const closeSub = () => {
+    clearHover();
+    subToken.current++;
+    setSub(null);
+  };
+
+  const move = (to: number) => {
+    if (indexes.length === 0) return;
+    closeSub();
+    focusIndex(indexes[(to + indexes.length) % indexes.length]);
+  };
+
+  const activate = (i: number, fromKeyboard: boolean) => {
+    const e = entries[i];
+    if (!e || isSeparator(e) || e.disabled) return;
+    if (e.submenu) {
+      openSub(i, fromKeyboard);
+      return;
+    }
+    if (e.confirm && armed !== i) {
+      setArmed(i);
+      if (armTimer.current !== undefined) clearTimeout(armTimer.current);
+      armTimer.current = setTimeout(() => setArmed(null), CONFIRM_MS);
+      return;
+    }
+    setArmed(null);
+    if (!e.keepOpen) close(true);
+    runAction(e.onSelect);
+  };
+
+  const onKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    const at = indexes.indexOf(active);
+    const entry = entries[active];
+    const item = entry && !isSeparator(entry) ? entry : null;
+    switch (e.key) {
+      case "ArrowDown":
+        e.preventDefault();
+        move(at + 1);
+        return;
+      case "ArrowUp":
+        e.preventDefault();
+        move(at - 1);
+        return;
+      case "Home":
+        e.preventDefault();
+        move(0);
+        return;
+      case "End":
+        e.preventDefault();
+        move(indexes.length - 1);
+        return;
+      case "ArrowRight":
+        e.preventDefault();
+        if (item?.submenu && !item.disabled) openSub(active, true);
+        return;
+      case "ArrowLeft":
+        e.preventDefault();
+        onBack?.();
+        return;
+      case "Escape":
+      case "Tab":
+        e.preventDefault();
+        close(true);
+        return;
+    }
+    // Enter and Space reach the focused <button> as a native click.
+    if (e.key.length !== 1 || e.key === " " || e.metaKey || e.ctrlKey || e.altKey) return;
+    // Type-ahead: the item whose hint is that key, else the first whose label starts with it.
+    const byHint = indexes.find((i) => (entries[i] as MenuItemEntry).hint === e.key);
+    const key = e.key.toLowerCase();
+    const byLabel = indexes.find((i) =>
+      (itemEls.current[i]?.querySelector(".ft-menu-label")?.textContent ?? "").trim().toLowerCase().startsWith(key),
+    );
+    const to = byHint ?? byLabel;
+    if (to !== undefined) {
+      e.preventDefault();
+      if (to !== active) closeSub();
+      focusIndex(to);
+    }
+  };
+
+  const onItemEnter = (i: number) => {
+    focusIndex(i);
+    clearHover();
+    const e = entries[i] as MenuItemEntry;
+    if (e.submenu && !e.disabled) {
+      if (subRef.current?.index !== i) hoverTimer.current = setTimeout(() => openSub(i, false), SUBMENU_HOVER_MS);
+    } else if (subRef.current) {
+      hoverTimer.current = setTimeout(closeSub, SUBMENU_HOVER_MS);
+    }
+  };
+
+  let subPanel: ReactNode = null;
+  if (sub) {
+    const parent = entries[sub.index];
+    if (parent && !isSeparator(parent)) {
+      const live = Array.isArray(parent.submenu) ? parent.submenu : null;
+      const subEntries: MenuEntry[] =
+        sub.state === "loading"
+          ? [{ id: "loading", label: "Loading…", disabled: "Loading…" }]
+          : sub.state === "error"
+            ? [{ id: "error", label: "Couldn't load", disabled: sub.error }]
+            : (() => {
+                const list = tidyEntries(live ?? sub.entries);
+                return list.length > 0 ? list : [{ id: "empty", label: "Nothing to choose", disabled: "Nothing to choose" }];
+              })();
+      const index = sub.index;
+      subPanel = (
+        <MenuPanel
+          key={`${index}:${sub.state}`}
+          entries={subEntries}
+          label={typeof parent.label === "string" ? parent.label : "Submenu"}
+          depth={depth + 1}
+          place={{ beside: () => itemEls.current[index] }}
+          autoFocus={sub.focusReq}
+          focusDepth={focusDepth}
+          setFocusDepth={setFocusDepth}
+          close={close}
+          onBack={() => {
+            closeSub();
+            focusIndex(index);
+          }}
+          onPanelEnter={clearHover}
+        />
+      );
+    }
+  }
+
+  return (
+    <>
+      <div
+        ref={panelRef}
+        role="menu"
+        aria-label={label}
+        aria-orientation="vertical"
+        className="ft-menu"
+        data-depth={depth}
+        style={pos ? { left: pos.left, top: pos.top } : { left: 0, top: 0, visibility: "hidden" }}
+        onKeyDown={onKeyDown}
+        onMouseEnter={onPanelEnter}
+      >
+        {entries.map((entry, i) => {
+          if (isSeparator(entry)) return <div key={`sep-${i}`} role="separator" className="ft-menu-sep" />;
+          const disabled = entry.disabled || null;
+          const isArmed = armed === i && !!entry.confirm;
+          const hasSub = !!entry.submenu;
+          const checkbox = entry.checked !== undefined;
+          // A disabled item reads as disabled: the status colour is dropped with the action.
+          const iconColor = disabled || entry.danger ? undefined : entry.iconColor;
+          const valueId = entry.value ? `${uid}-v${i}` : undefined;
+          return (
+            <button
+              key={`${i}:${entry.id ?? (typeof entry.label === "string" ? entry.label : "")}`}
+              ref={(el) => {
+                itemEls.current[i] = el;
+              }}
+              type="button"
+              role={checkbox ? "menuitemcheckbox" : "menuitem"}
+              aria-checked={checkbox ? entry.checked : undefined}
+              aria-disabled={disabled ? "true" : undefined}
+              aria-haspopup={hasSub ? "menu" : undefined}
+              aria-expanded={hasSub ? sub?.index === i : undefined}
+              aria-keyshortcuts={entry.hint}
+              aria-describedby={valueId}
+              title={disabled ?? undefined}
+              tabIndex={i === active && focusDepth === depth ? 0 : -1}
+              className="ft-menu-item"
+              data-danger={entry.danger || undefined}
+              data-armed={isArmed || undefined}
+              onClick={(ev) => activate(i, ev.detail === 0)}
+              onFocus={() => {
+                setActive(i);
+                setFocusDepth(depth);
+              }}
+              onMouseEnter={() => onItemEnter(i)}
+            >
+              <span className="ft-menu-icon" aria-hidden="true">
+                {entry.icon ? (
+                  <Icon name={entry.icon} size={14} style={iconColor ? { color: iconColor } : undefined} />
+                ) : checkbox ? (
+                  <span className="ft-menu-check">{entry.checked && <Icon name="check" size={10} strokeWidth={2} />}</span>
+                ) : null}
+              </span>
+              <span className="ft-menu-label">{isArmed ? entry.confirm : entry.label}</span>
+              {entry.value && (
+                // Out of the name (the label is the name) but still the description.
+                <span id={valueId} className="ft-menu-value mono" aria-hidden="true">
+                  {entry.value}
+                </span>
+              )}
+              {checkbox && entry.icon && entry.checked && <Icon name="check" size={13} className="ft-menu-tick" />}
+              {entry.hint && (
+                <span className="ft-menu-hint" aria-hidden="true">
+                  {entry.hint}
+                </span>
+              )}
+              {hasSub && <Icon name="chevron-right" size={12} className="ft-menu-sub" />}
+            </button>
+          );
+        })}
+        {entries.length === 0 && (
+          <div className="ft-menu-empty" role="none">
+            No actions
+          </div>
+        )}
+      </div>
+      {subPanel}
+    </>
+  );
+}
+
+/** The ⋯ affordance at a row's right edge. Hidden until the row is hovered/focused or the menu
+ *  is open (CSS). Clicking it calls `onOpen(buttonEl)` and stops propagation so the row's own
+ *  click (open the pane) does not fire.
+ *
+ *  It is a `<span role="button" tabIndex={0}>` rather than a `<button>` because it renders inside
+ *  the row, which is itself a `<button>` (or an `<a>`), and interactive content nested in either
+ *  is invalid HTML; so it reproduces Enter/Space activation by hand, and stops those events (and
+ *  the click) from propagating — and prevents the click's default, so an `<a>` row does not
+ *  navigate — because the row would otherwise treat them as its own activation. */
+export function RowMenuButton({ onOpen, label = "More actions" }: { onOpen: (el: HTMLElement) => void; label?: string }): ReactNode {
+  return (
+    <span
+      role="button"
+      // Out of the tab order and the accessibility tree: it is the pointer's way to the menu a
+      // keyboard user opens with Shift+F10 / the Menu key, and a second tab stop per row (plus
+      // "More actions" on every row's name) would cost more than it gives.
+      tabIndex={-1}
+      aria-hidden="true"
+      title={label}
+      className="ft-row-menu"
+      onClick={(e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        onOpen(e.currentTarget);
+      }}
+      onKeyDown={(e) => {
+        if (e.key !== "Enter" && e.key !== " ") return;
+        e.preventDefault();
+        e.stopPropagation();
+        onOpen(e.currentTarget);
+      }}
+    >
+      <Icon name="dots" size={14} />
+    </span>
+  );
+}
+
+/* ---- toasts ---------------------------------------------------------------------------- */
+
+type Toast = { id: number; message: string; error: boolean };
+const TOAST_MS = 4000;
+const TOAST_ERROR_MS = 8000;
+const TOAST_MAX = 4;
+let toasts: Toast[] = [];
+let toastSeq = 0;
+const toastListeners = new Set<() => void>();
+const emitToasts = () => toastListeners.forEach((l) => l());
+const subscribeToasts = (l: () => void) => {
+  toastListeners.add(l);
+  return () => {
+    toastListeners.delete(l);
+  };
+};
+const toastSnapshot = () => toasts;
+
+/** Shows a quiet bottom-left note for 4s (8s and red for errors). */
+export function notify(message: string, opts?: { error?: boolean }): void {
+  const error = !!opts?.error;
+  const id = ++toastSeq;
+  toasts = [...toasts, { id, message, error }].slice(-TOAST_MAX);
+  emitToasts();
+  setTimeout(
+    () => {
+      toasts = toasts.filter((t) => t.id !== id);
+      emitToasts();
+    },
+    error ? TOAST_ERROR_MS : TOAST_MS,
+  );
+}
+
+/** Mounted once in App.tsx, beside the pane slot. Newest at the bottom. */
+export function Toasts(): ReactNode {
+  const list = useSyncExternalStore(subscribeToasts, toastSnapshot, toastSnapshot);
+  return (
+    <div className="ft-toasts">
+      {list.map((t) => (
+        <div key={t.id} role={t.error ? "alert" : "status"} className="ft-toast" data-error={t.error || undefined}>
+          {t.message}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/** Copies text and notifies "Copied <what>" or the failure. The async clipboard API is tried
+ *  first; where it is missing, or refuses (an embedded or unfocused page denies the write
+ *  permission), the selection-based copy is the fallback before giving up. */
+export async function copyText(text: string, what: string): Promise<void> {
+  try {
+    try {
+      if (!navigator.clipboard?.writeText) throw new Error("no clipboard API");
+      await navigator.clipboard.writeText(text);
+    } catch {
+      copyWithTextarea(text);
+    }
+    notify(`Copied ${what}`);
+  } catch (e) {
+    notify(`Couldn't copy ${what}: ${errorText(e)}`, { error: true });
+  }
+}
+
+/** Where the async clipboard API is missing or refused: copy through a selected, off-screen
+ *  textarea. */
+function copyWithTextarea(text: string) {
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.setAttribute("readonly", "");
+  ta.style.position = "fixed";
+  ta.style.opacity = "0";
+  document.body.appendChild(ta);
+  ta.select();
+  try {
+    if (!document.execCommand("copy")) throw new Error("the browser refused");
+  } finally {
+    ta.remove();
+  }
 }

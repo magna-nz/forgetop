@@ -24,6 +24,18 @@ export type IconName =
   | "at"
   | "arrow-right"
   | "user"
+  | "user-plus"
+  | "copy"
+  | "link"
+  | "dots"
+  | "pencil"
+  | "shield"
+  | "logs"
+  | "rerun"
+  | "square"
+  | "minus-circle"
+  | "git-branch"
+  | "open-pane"
   // status
   | "pr-open"
   | "pr-draft"
@@ -64,6 +76,20 @@ const PATHS: Record<IconName, string> = {
   at: '<circle cx="8" cy="8" r="2.5"/><path d="M10.5 8v1a1.5 1.5 0 0 0 3 0V8a5.5 5.5 0 1 0-2.2 4.4"/>',
   "arrow-right": '<path d="M3 8h10M9 4l4 4-4 4"/>',
   user: '<circle cx="8" cy="5.5" r="2.75"/><path d="M2.75 14a5.25 5.25 0 0 1 10.5 0"/>',
+  "user-plus": '<circle cx="6.5" cy="5.5" r="2.5"/><path d="M2 13.5a4.5 4.5 0 0 1 9 0"/><path d="M12.5 5v4M10.5 7h4"/>',
+  copy: '<rect x="5.5" y="5.5" width="8" height="8" rx="1.5"/><path d="M10.5 5.5V4A1.5 1.5 0 0 0 9 2.5H4A1.5 1.5 0 0 0 2.5 4v5A1.5 1.5 0 0 0 4 10.5h1.5"/>',
+  link: '<path d="M6.8 9.2a2.6 2.6 0 0 0 3.7 0l2.2-2.2a2.6 2.6 0 0 0-3.7-3.7l-.9.9"/><path d="M9.2 6.8a2.6 2.6 0 0 0-3.7 0L3.3 9a2.6 2.6 0 0 0 3.7 3.7l.9-.9"/>',
+  dots: '<circle cx="3.5" cy="8" r="1.15" fill="currentColor" stroke="none"/><circle cx="8" cy="8" r="1.15" fill="currentColor" stroke="none"/><circle cx="12.5" cy="8" r="1.15" fill="currentColor" stroke="none"/>',
+  pencil: '<path d="M10.5 2.5l3 3L6 13H3v-3z"/><path d="M9 4l3 3"/>',
+  shield: '<path d="M8 1.75 13 3.5v4c0 3.2-2.1 5.6-5 6.75C5.1 13.1 3 10.7 3 7.5v-4z"/>',
+  logs: '<rect x="2.5" y="2.5" width="11" height="11" rx="1.5"/><path d="M5 6h6M5 8.5h6M5 11h3.5"/>',
+  // A run arrow round a play mark: distinct from `refresh` (reload the list) on purpose.
+  rerun: '<path d="M3 8a5 5 0 1 0 1.5-3.6"/><path d="M3 2v3h3"/><path d="M7 6.2v3.6L10 8z"/>',
+  square: '<rect x="4" y="4" width="8" height="8" rx="1.5"/>',
+  "minus-circle": '<circle cx="8" cy="8" r="6"/><path d="M5.5 8h5"/>',
+  "git-branch":
+    '<circle cx="4.5" cy="3.5" r="1.5"/><circle cx="4.5" cy="12.5" r="1.5"/><circle cx="11.5" cy="5" r="1.5"/><path d="M4.5 5v6M11.5 6.5c0 3-7 2-7 4.5"/>',
+  "open-pane": '<rect x="2" y="3" width="12" height="10" rx="1.5"/><path d="M9.5 3v10"/>',
   "pr-open":
     '<circle cx="4" cy="3.5" r="1.75"/><circle cx="4" cy="12.5" r="1.75"/><circle cx="12" cy="12.5" r="1.75"/><path d="M4 5.25v5.5M12 10.75V7a2 2 0 0 0-2-2H8.5M10 3 8 5l2 2"/>',
   "pr-draft":

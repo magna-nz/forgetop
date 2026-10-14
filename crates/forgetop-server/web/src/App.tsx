@@ -13,7 +13,7 @@ import { WorkItems } from "./components/WorkItems";
 import { Pipelines } from "./components/Pipelines";
 import { Notifications } from "./components/Notifications";
 import { Settings } from "./components/Settings";
-import { PaneSlotContext } from "./components/ui";
+import { PaneSlotContext, Toasts } from "./components/ui";
 import { NavContext } from "./nav";
 import type { SectionId } from "./types";
 
@@ -102,6 +102,7 @@ export default function App() {
                       </div>
                     </div>
                     <div ref={setPaneSlot} className="flex shrink-0 min-h-0 h-full" data-testid="pane-slot" />
+                    <Toasts />
                   </div>
                 </main>
                 <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} onNavigate={setSection} />

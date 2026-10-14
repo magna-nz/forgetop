@@ -5,12 +5,22 @@ import userEvent from "@testing-library/user-event";
 import { WiDetailProvider, useWiOpener } from "./WiDetail";
 import { renderWithClient, mockFetch } from "../test/util";
 
-function Opener({ conn, id }: { conn: string; id: string }) {
+function Opener({ conn, id, intent }: { conn: string; id: string; intent?: "edit" | "comment" }) {
   const open = useWiOpener();
   useEffect(() => {
-    open({ conn, id });
-  }, [open, conn, id]);
+    open({ conn, id }, intent);
+  }, [open, conn, id, intent]);
   return null;
+}
+
+/** Opens the item again on a click — a second open of the item already in the pane. */
+function OpenButton({ conn, id, intent }: { conn: string; id: string; intent: "edit" | "comment" }) {
+  const open = useWiOpener();
+  return (
+    <button type="button" onClick={() => open({ conn, id }, intent)}>
+      Reopen with {intent}
+    </button>
+  );
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -151,5 +161,52 @@ describe("WiDetail", () => {
     expect(await screen.findByText("On it")).toBeInTheDocument();
     expect(within(screen.getByRole("status")).getByText("Comment posted")).toBeInTheDocument();
     release();
+  });
+
+  it("opening with the edit intent shows the edit form once the item loads", async () => {
+    mockFetch({ get: { "/api/wi/detail": detail() } });
+    renderWithClient(
+      <WiDetailProvider>
+        <Opener conn="c" id="w1" intent="edit" />
+      </WiDetailProvider>,
+    );
+    expect(await screen.findByRole("textbox", { name: "Title" })).toHaveValue("Original title");
+    expect(screen.getByRole("textbox", { name: "Description" })).toHaveValue("Original description");
+    expect(screen.queryByRole("button", { name: "Edit" })).not.toBeInTheDocument();
+  });
+
+  it("opening with the comment intent focuses the comment box", async () => {
+    mockFetch({ get: { "/api/wi/detail": detail() } });
+    renderWithClient(
+      <WiDetailProvider>
+        <Opener conn="c" id="w1" intent="comment" />
+      </WiDetailProvider>,
+    );
+    const box = await screen.findByRole("textbox", { name: "Add a comment" });
+    await waitFor(() => expect(box).toHaveFocus());
+    expect(screen.getByRole("button", { name: "Edit" })).toBeInTheDocument();
+  });
+
+  it("reopening the open item with another intent still applies it", async () => {
+    mockFetch({ get: { "/api/wi/detail": detail() } });
+    renderWithClient(
+      <WiDetailProvider>
+        <Opener conn="c" id="w1" />
+        <OpenButton conn="c" id="w1" intent="edit" />
+      </WiDetailProvider>,
+    );
+    await screen.findByRole("button", { name: "Edit" });
+    expect(screen.queryByRole("textbox", { name: "Title" })).not.toBeInTheDocument();
+    // No intent: neither the editor nor the comment box takes over.
+    expect(screen.getByRole("textbox", { name: "Add a comment" })).not.toHaveFocus();
+
+    await userEvent.click(screen.getByRole("button", { name: "Reopen with edit" }));
+    expect(await screen.findByRole("textbox", { name: "Title" })).toBeInTheDocument();
+
+    // Cancel, then the same intent again: it is a new open, so it applies again.
+    await userEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("textbox", { name: "Title" })).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Reopen with edit" }));
+    expect(await screen.findByRole("textbox", { name: "Title" })).toBeInTheDocument();
   });
 });

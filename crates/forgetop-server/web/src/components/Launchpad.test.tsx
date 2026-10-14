@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { screen, waitFor } from "@testing-library/react";
+import { fireEvent, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { renderWithClient, mockFetch } from "../test/util";
 
@@ -210,5 +210,92 @@ describe("Launchpad", () => {
     expect(await screen.findByText("Integration")).toBeInTheDocument();
     expect(screen.queryByText(/Integration · Integration/)).not.toBeInTheDocument();
     expect(screen.getByText(/^main/)).toBeInTheDocument();
+  });
+
+  it("right-clicking a PR row opens its actions with Dismiss, without opening the pane", async () => {
+    openPr.mockClear();
+    mockFetch({ get: { "/api/launchpad": { rows: [prRow("needs_review", "Review me", "7")], more: noOverflow } } });
+    renderWithClient(<Launchpad />);
+
+    const title = await screen.findByText("Review me");
+    fireEvent.contextMenu(title.closest("button")!);
+    expect(screen.getByRole("menu", { name: "Pull request actions" })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "Dismiss from Command Center" })).toBeInTheDocument();
+    expect(openPr).not.toHaveBeenCalled();
+  });
+
+  it("dismissing a row drops it at once and posts the dismissal", async () => {
+    const row = prRow("needs_review", "Dismiss me", "7");
+    row.pull_request.repository = "acme/payments";
+    const keep = prRow("needs_review", "Keep me", "8");
+    // Held so the screen is read before the refetch the write triggers.
+    let release: () => void = () => {};
+    const held = new Promise<void>((r) => (release = r));
+    const { posts } = mockFetch({
+      get: { "/api/launchpad": { rows: [row, keep], more: noOverflow } },
+      onPost: () => held,
+    });
+    renderWithClient(<Launchpad />);
+
+    fireEvent.contextMenu((await screen.findByText("Dismiss me")).closest("button")!);
+    await userEvent.click(screen.getByRole("menuitem", { name: "Dismiss from Command Center" }));
+
+    await waitFor(() => expect(screen.queryByText("Dismiss me")).not.toBeInTheDocument());
+    expect(screen.getByText("Keep me")).toBeInTheDocument();
+    expect(posts).toEqual([{ url: "/api/launchpad/dismiss", body: { conn: "c", kind: "pr", repo: "acme/payments", id: "7" } }]);
+    release();
+  });
+
+  it("offers no Dismiss on a row in a muted bucket", async () => {
+    const row = prRow("recently_merged", "Merged already", "9");
+    row.muted = true;
+    row.column = 1;
+    row.pull_request.status = "Merged";
+    mockFetch({ get: { "/api/launchpad": { rows: [row], more: noOverflow } } });
+    renderWithClient(<Launchpad />);
+
+    fireEvent.contextMenu((await screen.findByText("Merged already")).closest("button")!);
+    expect(screen.getByRole("menu", { name: "Pull request actions" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "Dismiss from Command Center" })).not.toBeInTheDocument();
+  });
+
+  it("approving a PR row removes it from the Command Center before the vote resolves", async () => {
+    let release: () => void = () => {};
+    const held = new Promise<void>((r) => (release = r));
+    const { posts } = mockFetch({
+      get: { "/api/launchpad": { rows: [prRow("needs_review", "Approve me", "11")], more: noOverflow } },
+      onPost: () => held,
+    });
+    renderWithClient(<Launchpad />);
+
+    fireEvent.contextMenu((await screen.findByText("Approve me")).closest("button")!);
+    await userEvent.click(screen.getByRole("menuitem", { name: "Approve" }));
+
+    await waitFor(() => expect(screen.queryByText("Approve me")).not.toBeInTheDocument());
+    expect(posts.map((p) => p.url)).toEqual(["/api/pr/vote"]);
+    release();
+  });
+
+  it("right-clicking a work-item row opens its work item actions", async () => {
+    openWi.mockClear();
+    mockFetch({ get: { "/api/launchpad": { rows: [wiRow("your_work", "Act on me", "5")], more: noOverflow } } });
+    renderWithClient(<Launchpad />);
+
+    fireEvent.contextMenu((await screen.findByText("Act on me")).closest("button")!);
+    expect(screen.getByRole("menu", { name: "Work item actions" })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "Dismiss from Command Center" })).toBeInTheDocument();
+    expect(openWi).not.toHaveBeenCalled();
+  });
+
+  it("the row's ⋯ button opens the same menu without opening the pane", async () => {
+    openPr.mockClear();
+    mockFetch({ get: { "/api/launchpad": { rows: [prRow("needs_review", "Dots me", "12")], more: noOverflow } } });
+    renderWithClient(<Launchpad />);
+
+    await screen.findByText("Dots me");
+    await userEvent.click(screen.getAllByTitle("More actions")[0]);
+    expect(screen.getByRole("menu", { name: "Pull request actions" })).toBeInTheDocument();
+    expect(screen.getByRole("menuitem", { name: "Dismiss from Command Center" })).toBeInTheDocument();
+    expect(openPr).not.toHaveBeenCalled();
   });
 });

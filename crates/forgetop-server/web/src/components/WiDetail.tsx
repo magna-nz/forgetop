@@ -1,4 +1,4 @@
-import { createContext, useCallback, useContext, useEffect, useState, type ReactNode } from "react";
+import { createContext, useCallback, useContext, useEffect, useRef, useState, type ReactNode } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { apiGet, apiPost, useWiDetail, wiDetailKey } from "../api";
 import { relativeTime, wiStateColor, wiStateGlyph } from "../format";
@@ -10,7 +10,17 @@ import { Icon } from "./icons";
 
 // ---- opener context ----
 
-const WiOpenerCtx = createContext<(ref: WiRef) => void>(() => {});
+/** What the pane does once the item has loaded: enter the title/description editor, or focus
+ *  the comment box. A row's context menu passes one ("Edit title & description…", "Comment…"). */
+export type WiOpenIntent = "edit" | "comment";
+/** The intent beside a sequence number, so opening the same item again — with the same intent
+ *  or another — applies it again rather than being taken for the open already applied. */
+interface PendingIntent {
+  kind: WiOpenIntent;
+  seq: number;
+}
+
+const WiOpenerCtx = createContext<(ref: WiRef, intent?: WiOpenIntent) => void>(() => {});
 export const useWiOpener = () => useContext(WiOpenerCtx);
 /** The work item open in the pane, so a list can mark its row as selected. */
 const WiCurrentCtx = createContext<WiRef | null>(null);
@@ -18,17 +28,24 @@ export const useCurrentWi = () => useContext(WiCurrentCtx);
 
 export function WiDetailProvider({ children }: { children: ReactNode }) {
   const [ref, setRef] = useState<WiRef | null>(null);
-  const close = useCallback(() => setRef(null), []);
+  const [intent, setIntent] = useState<PendingIntent | null>(null);
+  const seq = useRef(0);
+  const close = useCallback(() => {
+    setRef(null);
+    setIntent(null);
+  }, []);
   usePaneRegistration("wi", close);
   // One pane at a time: opening a work item closes a PR or run pane (after its guard, if any).
-  const open = useCallback((r: WiRef) => {
-    if (claimPane("wi")) setRef(r);
+  const open = useCallback((r: WiRef, kind?: WiOpenIntent) => {
+    if (!claimPane("wi")) return;
+    setRef(r);
+    setIntent(kind ? { kind, seq: ++seq.current } : null);
   }, []);
   return (
     <WiOpenerCtx.Provider value={open}>
       <WiCurrentCtx.Provider value={ref}>
         {children}
-        {ref && <WiDetailPanel wiRef={ref} onClose={close} />}
+        {ref && <WiDetailPanel wiRef={ref} intent={intent} onClose={close} />}
       </WiCurrentCtx.Provider>
     </WiOpenerCtx.Provider>
   );
@@ -70,17 +87,30 @@ interface Note {
   ok: boolean;
 }
 
-function WiDetailPanel({ wiRef, onClose }: { wiRef: WiRef; onClose: () => void }) {
+function WiDetailPanel({ wiRef, intent, onClose }: { wiRef: WiRef; intent: PendingIntent | null; onClose: () => void }) {
   const { data, isLoading, error } = useWiDetail(wiRef);
   const qc = useQueryClient();
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState<Note | null>(null);
   const [editing, setEditing] = useState(false);
+  /** Bumped to focus the comment box (a "comment" intent). */
+  const [commentFocus, setCommentFocus] = useState(0);
+  const appliedIntent = useRef<number | null>(null);
 
   useEffect(() => {
     setNote(null);
     setEditing(false);
   }, [wiRef.conn, wiRef.id]);
+
+  // Declared after the reset above, so on a fresh open the reset runs first and the intent wins.
+  // It waits for the item: the editor and the comment box only exist once it has loaded.
+  const loaded = !!data;
+  useEffect(() => {
+    if (!intent || !loaded || appliedIntent.current === intent.seq) return;
+    appliedIntent.current = intent.seq;
+    if (intent.kind === "edit") setEditing(true);
+    else setCommentFocus(intent.seq);
+  }, [intent, loaded]);
 
   const refresh = () => {
     qc.invalidateQueries({ queryKey: wiDetailKey(wiRef) });
@@ -261,6 +291,7 @@ function WiDetailPanel({ wiRef, onClose }: { wiRef: WiRef; onClose: () => void }
           <Comments
             threads={data.threads}
             busy={busy}
+            autoFocus={commentFocus}
             onComment={(body) => {
               // Who you are isn't known here, so the placeholder reads "You" until the refetch
               // brings the provider's copy with your name on it.
@@ -433,8 +464,23 @@ function EditFields({ wi, busy, onSave, onCancel }: { wi: WorkItem; busy: boolea
 
 // ---- comments ----
 
-function Comments({ threads, busy, onComment }: { threads: CommentThread[]; busy: boolean; onComment: (body: string) => void }) {
+/** `autoFocus`: each new non-zero value focuses the composer (the pane opened to comment). */
+function Comments({
+  threads,
+  busy,
+  autoFocus = 0,
+  onComment,
+}: {
+  threads: CommentThread[];
+  busy: boolean;
+  autoFocus?: number;
+  onComment: (body: string) => void;
+}) {
   const [draft, setDraft] = useState("");
+  const composer = useRef<HTMLTextAreaElement>(null);
+  useEffect(() => {
+    if (autoFocus) composer.current?.focus();
+  }, [autoFocus]);
   const count = threads.reduce((n, t) => n + t.comments.length, 0);
   return (
     <div className="flex flex-col gap-2">
@@ -469,6 +515,7 @@ function Comments({ threads, busy, onComment }: { threads: CommentThread[]; busy
         </div>
       ))}
       <textarea
+        ref={composer}
         value={draft}
         onChange={(e) => setDraft(e.target.value)}
         placeholder="Add a comment…"

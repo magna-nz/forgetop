@@ -1063,6 +1063,10 @@ pub struct App {
     /// Items the user explicitly dismissed from Command Center via the `D` key.
     /// Persisted to config so they stay hidden across restarts.
     lp_dismissed_persisted: HashSet<String>,
+    /// The hidden-state list as last read from the shared config, so a change made in the
+    /// dashboard is told apart from one made here (a saved view sets `wi_hidden_states`
+    /// without saving it, and must not be undone by the next sync).
+    shared_hidden_states_seen: Vec<String>,
     /// Notifications dismissed from the inbox (`d` / `D`), keyed by [`inbox_dismiss_key`].
     /// Persisted to config so they stay hidden across restarts.
     inbox_dismissed: HashSet<String>,
@@ -3525,6 +3529,7 @@ impl App {
             lp_sel: [0, 0],
             lp_dismissed: HashSet::new(),
             lp_dismissed_persisted: HashSet::new(),
+            shared_hidden_states_seen: Vec::new(),
             inbox_dismissed: HashSet::new(),
             lp_origin: false,
             from_inbox: false,
@@ -4216,6 +4221,24 @@ impl App {
     /// Applies persisted hidden work-item-state preferences at startup.
     pub fn apply_hidden_work_item_states(&mut self, hidden: &[String]) {
         self.wi_hidden_states = hidden.iter().cloned().collect();
+        self.shared_hidden_states_seen = hidden.to_vec();
+    }
+
+    /// Takes in what the other frontend saved since this one last looked: Command Center
+    /// dismissals and hidden work-item states live in the config both share, and the dashboard
+    /// adds to them while the TUI runs. Called on every reload, so a dismissal made in the
+    /// browser leaves the terminal's Command Center within one refresh. Cheap when nothing
+    /// changed; a changed list replaces the local copy (what was dismissed here is in the saved
+    /// list too, since every write merges).
+    pub fn sync_shared_prefs(&mut self, deps: &AppDeps) {
+        let ui = deps.config.snapshot().ui;
+        let dismissed: HashSet<String> = ui.dismissed_launchpad_items.iter().cloned().collect();
+        if dismissed != self.lp_dismissed_persisted {
+            self.lp_dismissed_persisted = dismissed;
+        }
+        if ui.hidden_work_item_states != self.shared_hidden_states_seen {
+            self.apply_hidden_work_item_states(&ui.hidden_work_item_states);
+        }
     }
 
     /// Applies persisted Command Center dismissals at startup (seeds the in-memory set;
@@ -4588,11 +4611,12 @@ impl App {
     async fn dismiss_selected_lp_item(&mut self, deps: &AppDeps) {
         let Some(LpSlot::Entry(i)) = self.lp_selected_slot() else { return };
         let Some(entry) = self.lp.get(i) else { return };
-        self.lp_dismissed_persisted.insert(entry.dismiss_key());
+        let key = entry.dismiss_key();
+        self.lp_dismissed_persisted.insert(key.clone());
         self.rebuild_launchpad();
 
-        let ids: Vec<String> = self.lp_dismissed_persisted.iter().cloned().collect();
-        if let Err(e) = deps.config.set_dismissed_launchpad_items(ids).await {
+        // Merged into the saved list: the dashboard adds to the same one.
+        if let Err(e) = deps.config.dismiss_launchpad_item(key).await {
             self.toast = Some(format!("Couldn't save: {e}"));
         }
     }
@@ -5924,6 +5948,8 @@ impl App {
         // response that landed late must not outrank one that was asked for later.
         let fetched_at = r.requested_at;
         let sections_ok = r.sections_ok;
+        // What the dashboard dismissed or hid since the last reload applies to these rows.
+        self.sync_shared_prefs(deps);
         // The cache is protected from a failed section by the flags below; the screen has to be
         // protected too, or a total outage on the first refresh after launch wipes the rows the
         // cache just seeded and leaves the user staring at the blank screen this all exists to
@@ -9589,17 +9615,31 @@ impl App {
     /// becomes hidden; states not present now are left untouched.
     async fn apply_wi_states(&mut self, shown_ids: Vec<String>, deps: &AppDeps) {
         let shown: HashSet<String> = shown_ids.into_iter().collect();
-        for state in self.distinct_wi_states() {
-            if shown.contains(&state) {
-                self.wi_hidden_states.remove(&state);
+        let in_view = self.distinct_wi_states();
+        for state in &in_view {
+            if shown.contains(state) {
+                self.wi_hidden_states.remove(state);
             } else {
-                self.wi_hidden_states.insert(state);
+                self.wi_hidden_states.insert(state.clone());
             }
         }
-        let hidden: Vec<String> = self.wi_hidden_states.iter().cloned().collect();
-        if let Err(e) = deps.config.set_hidden_work_item_states(hidden).await {
+        // Only the states in view are decided here; the saved list keeps whatever else it holds
+        // (a state hidden from the dashboard, or one not fetched right now).
+        let saved = deps
+            .config
+            .update_ui(|ui| {
+                for state in &in_view {
+                    ui.hidden_work_item_states.retain(|s| s != state);
+                    if !shown.contains(state) {
+                        ui.hidden_work_item_states.push(state.clone());
+                    }
+                }
+            })
+            .await;
+        if let Err(e) = saved {
             self.toast = Some(format!("Couldn't save: {e}"));
         } else {
+            self.shared_hidden_states_seen = deps.config.snapshot().ui.hidden_work_item_states;
             let n = self.hidden_states_in_view();
             self.toast = Some(if n == 0 { "Showing all states".into() } else { format!("{n} state(s) hidden") });
         }
@@ -15175,6 +15215,35 @@ mod tests {
         fresh.wis = twin_work_items();
         fresh.rebuild_launchpad();
         assert_eq!(lp_repos(&fresh), lp_repos(&app));
+    }
+
+    /// The dashboard writes to the same dismissal list while the TUI runs: a `D` here keeps what
+    /// the browser dismissed, and the next reload takes the browser's dismissal in.
+    #[tokio::test]
+    async fn dismissals_are_shared_with_the_dashboard_both_ways() {
+        let deps = test_deps();
+        let mut app = App::new("slate");
+        app.screen = Screen::Launchpad;
+        app.wis = twin_work_items();
+        app.rebuild_launchpad();
+        assert_eq!(app.lp.len(), 2);
+
+        // The browser dismisses the ledger twin (the key the server builds for it).
+        let browser_key = launchpad::Entry::key("c", launchpad::EntryKind::Wi, Some("acme/ledger"), "12");
+        deps.config.dismiss_launchpad_item(browser_key.clone()).await.unwrap();
+        // Not visible until the next reload syncs the shared list…
+        assert_eq!(app.lp.len(), 2);
+        app.sync_shared_prefs(&deps);
+        app.rebuild_launchpad();
+        assert_eq!(lp_repos(&app), vec![Some("acme/pay")], "the browser's dismissal hides the ledger twin");
+
+        // …and a `D` here adds to that list rather than writing over it.
+        app.lp_side = (0..2).find(|&side| !app.lp_slots(side).is_empty()).expect("a column holds it");
+        app.on_key(Key::Char('D'), &deps).await;
+        assert!(app.lp.is_empty());
+        let saved = deps.config.snapshot().ui.dismissed_launchpad_items;
+        assert!(saved.contains(&browser_key), "the browser's dismissal survives the TUI's save: {saved:?}");
+        assert_eq!(saved.len(), 2, "{saved:?}");
     }
 
     #[test]

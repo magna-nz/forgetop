@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from "vitest";
-import { screen, within } from "@testing-library/react";
+import { fireEvent, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { Pipelines } from "./Pipelines";
 import { PipelineDetailProvider } from "./PipelineDetail";
@@ -138,6 +138,34 @@ describe("pipelines list approvals", () => {
     expect(screen.queryByRole("button", { name: /deploy-stage/ })).not.toBeInTheDocument();
     // A gate someone else must answer still shows as waiting, just not as a button.
     expect(screen.getByText("waiting for approval")).toBeInTheDocument();
+  });
+});
+
+describe("pipelines list row menu", () => {
+  it("right-clicking a run opens its actions without opening the pane", async () => {
+    localStorage.setItem("forgetop:pipelines:group", "off");
+    const { fetchMock } = mockFetch({ get: { "/api/pipelines": rowsFixture } });
+    render();
+    const title = await screen.findByText("Release run 7");
+    const row = title.closest(".ft-row") as HTMLElement;
+    fireEvent.contextMenu(title);
+    const menu = screen.getByRole("menu", { name: "Pipeline run actions" });
+    expect(within(menu).getByRole("menuitem", { name: "Cancel run" })).toBeInTheDocument();
+    expect(row).toHaveAttribute("data-menu-open", "true");
+    expect(row).not.toHaveAttribute("data-selected");
+    // The pane would fetch the run's detail the moment it opened.
+    expect(fetchMock.mock.calls.some(([u]) => String(u).includes("/api/pipeline/detail"))).toBe(false);
+  });
+
+  it("the ⋯ button opens the same menu", async () => {
+    localStorage.setItem("forgetop:pipelines:group", "off");
+    mockFetch({ get: { "/api/pipelines": rowsFixture } });
+    render();
+    const title = await screen.findByText("CI run 1");
+    const row = title.closest(".ft-row") as HTMLElement;
+    await userEvent.click(within(row).getByTitle("More actions"));
+    expect(screen.getByRole("menu", { name: "Pipeline run actions" })).toBeInTheDocument();
+    expect(row).not.toHaveAttribute("data-selected");
   });
 });
 

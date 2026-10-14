@@ -1,12 +1,13 @@
-import { useMemo, useState } from "react";
-import { useWorkItems } from "../api";
+import { useCallback, useMemo, useState } from "react";
+import { usePrefs, useWorkItems } from "../api";
 import { sameRef, toTime, wiStateColor, wiStateGlyph } from "../format";
 import type { WiRow, WorkItemParent } from "../types";
 import { Icon } from "./icons";
-import { Avatar, List, Row, Select, Skeleton, StateCard, StatusGlyph } from "./ui";
+import { Avatar, Button, ContextMenu, List, Row, RowMenuButton, Select, Skeleton, StateCard, StatusGlyph, useContextMenu } from "./ui";
 import { ErrorState } from "./ErrorState";
 import { shortAge, ToggleRow, useListView } from "./ControlBar";
 import { useCurrentWi, useWiOpener } from "./WiDetail";
+import { useToggleHiddenState, useWiRowMenu } from "./rowMenus/wi";
 
 const GROUP_KEY = "forgetop:work-items:group";
 type GroupMode = "off" | "parent";
@@ -51,6 +52,14 @@ function groupByParent(rows: WiRow[]): WiGroup[] {
 
 export function WorkItems() {
   const { data, isLoading, error } = useWorkItems();
+  const hiddenStates = usePrefs().data?.hidden_work_item_states;
+  const toggleHidden = useToggleHiddenState();
+  // The hidden states are a view preference (shared with the TUI): their rows are dropped before
+  // the list view sees them, so its count and the groups agree with what is shown.
+  const visible = useMemo(
+    () => (hiddenStates?.length ? data?.filter((r) => !hiddenStates.includes(r.work_item.state)) : data),
+    [data, hiddenStates],
+  );
   const [mode, setMode] = useState<GroupMode>(readGroupMode);
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set());
   const chooseMode = (m: GroupMode) => {
@@ -63,7 +72,7 @@ export function WorkItems() {
   };
   const { rows, bar } = useListView<WiRow>({
     storageKey: "work-items",
-    rows: data,
+    rows: visible,
     connId: (r) => r.connection_id,
     connLabel: (r) => r.connection,
     sorts: [
@@ -80,10 +89,17 @@ export function WorkItems() {
     statusLabel: "Show",
     facet: { label: "Type", value: (r) => r.work_item.work_item_type },
     extra: (
-      <Select label="Group" value={mode} onChange={(e) => chooseMode(e.target.value === "parent" ? "parent" : "off")}>
-        <option value="parent">By parent</option>
-        <option value="off">Flat</option>
-      </Select>
+      <>
+        <Select label="Group" value={mode} onChange={(e) => chooseMode(e.target.value === "parent" ? "parent" : "off")}>
+          <option value="parent">By parent</option>
+          <option value="off">Flat</option>
+        </Select>
+        {(hiddenStates ?? []).map((state) => (
+          <Button key={state} quiet sm icon="x" aria-label={`Show "${state}"`} title={`Show "${state}" items`} onClick={() => void toggleHidden(state)}>
+            {state}
+          </Button>
+        ))}
+      </>
     ),
   });
 
@@ -175,28 +191,42 @@ function WiListRow({ row, indent = false }: { row: WiRow; indent?: boolean }) {
   const wi = row.work_item;
   const open = useWiOpener();
   const current = useCurrentWi();
+  const menu = useContextMenu();
+  const build = useWiRowMenu();
+  const items = useCallback(() => build(row), [build, row]);
   const blocked = isBlocked(row);
   return (
-    <Row selected={sameRef(current, { conn: row.connection_id, repo: wi.repository, id: wi.id })} onClick={() => open({ conn: row.connection_id, repo: wi.repository, id: wi.id })} className={indent ? "pl-9!" : undefined}>
-      <StatusGlyph glyph={wiStateGlyph(wi.state, wi.state_category)} color={wiStateColor(wi.state, wi.state_category)} title={wi.state} />
-      <span className="mono shrink-0 truncate" style={{ width: 76, color: "var(--fg3)" }}>
-        {wi.identifier}
-      </span>
-      <span className="flex-1 min-w-0 truncate">
-        <span>{wi.title}</span>
-        {blocked && <span style={{ color: "var(--red)" }}> · blocked</span>}
-      </span>
-      {wi.work_item_type && (
-        <span className="text-[12px] shrink-0 whitespace-nowrap" style={{ color: "var(--fg3)" }}>
-          {wi.work_item_type}
+    <>
+      <Row
+        selected={sameRef(current, { conn: row.connection_id, repo: wi.repository, id: wi.id })}
+        onClick={() => open({ conn: row.connection_id, repo: wi.repository, id: wi.id })}
+        onContextMenu={menu.onContextMenu}
+        onKeyDown={menu.onKeyDown}
+        menuOpen={menu.open}
+        className={indent ? "pl-9!" : undefined}
+      >
+        <StatusGlyph glyph={wiStateGlyph(wi.state, wi.state_category)} color={wiStateColor(wi.state, wi.state_category)} title={wi.state} />
+        <span className="mono shrink-0 truncate" style={{ width: 76, color: "var(--fg3)" }}>
+          {wi.identifier}
         </span>
-      )}
-      <span className="inline-flex shrink-0 justify-center" style={{ width: 18 }}>
-        {wi.assignee && <Avatar name={wi.assignee.display_name} size={18} />}
-      </span>
-      <span className="num text-[12px] shrink-0 text-right whitespace-nowrap" style={{ width: 34, color: "var(--fg3)" }}>
-        {shortAge(wi.updated_at)}
-      </span>
-    </Row>
+        <span className="flex-1 min-w-0 truncate">
+          <span>{wi.title}</span>
+          {blocked && <span style={{ color: "var(--red)" }}> · blocked</span>}
+        </span>
+        {wi.work_item_type && (
+          <span className="text-[12px] shrink-0 whitespace-nowrap" style={{ color: "var(--fg3)" }}>
+            {wi.work_item_type}
+          </span>
+        )}
+        <span className="inline-flex shrink-0 justify-center" style={{ width: 18 }}>
+          {wi.assignee && <Avatar name={wi.assignee.display_name} size={18} />}
+        </span>
+        <span className="num text-[12px] shrink-0 text-right whitespace-nowrap" style={{ width: 34, color: "var(--fg3)" }}>
+          {shortAge(wi.updated_at)}
+        </span>
+        <RowMenuButton onOpen={menu.openAt} />
+      </Row>
+      <ContextMenu anchor={menu.anchor} onClose={menu.close} label="Work item actions" items={items} />
+    </>
   );
 }
