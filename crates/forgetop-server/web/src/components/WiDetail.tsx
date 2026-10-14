@@ -4,6 +4,7 @@ import { apiGet, apiPost, useWiDetail, wiDetailKey } from "../api";
 import { relativeTime, wiStateColor, wiStateGlyph } from "../format";
 import type { CommentThread, User, WiRef, WorkItem } from "../types";
 import { addWiThread, localThread, meAsUser, patchWorkItem } from "../optimistic";
+import { Markdown } from "./Markdown";
 import { Avatar, Button, claimPane, GroupHeading, PaneHeader, SlideOver, Timeline, usePaneRegistration } from "./ui";
 import { Icon } from "./icons";
 
@@ -239,11 +240,7 @@ function WiDetailPanel({ wiRef, onClose }: { wiRef: WiRef; onClose: () => void }
               }}
             />
           ) : (
-            wi.description && (
-              <div className="text-[13px] whitespace-pre-wrap" style={{ color: "var(--fg)" }}>
-                {wi.description}
-              </div>
-            )
+            <Markdown source={wi.description} />
           )}
 
           {facts.length > 0 && (
@@ -466,9 +463,7 @@ function Comments({ threads, busy, onComment }: { threads: CommentThread[]; busy
                   </span>
                 )}
               </div>
-              <div className="text-[13px] whitespace-pre-wrap" style={{ color: "var(--fg)" }}>
-                {c.body}
-              </div>
+              <Markdown source={c.body} />
             </div>
           ))}
         </div>

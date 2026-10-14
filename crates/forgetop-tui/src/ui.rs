@@ -5,7 +5,7 @@ use forgetop_core::domain::*;
 use forgetop_core::launchpad::{pr_approved_by, pr_changes_requested_by, pr_state, PrBlocker, PrState};
 use forgetop_core::provider::PrWriteSupport;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, BorderType, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState, Tabs, Wrap,
@@ -2241,6 +2241,22 @@ fn field_styled(theme: &Theme, label: &str, value: String, color: ratatui::style
     ])
 }
 
+/// A comment body as styled lines, rendered like a description (`**x**` bold, `- [x]` ticked)
+/// rather than shown as written. Each line is prefixed with `lead`, which is told whether the
+/// line is a blank one (between paragraphs, or inside a code block): a blank line must stay
+/// empty rather than carry the indent, because the pane's word wrapper (`trim: false`) renders
+/// a whitespace-only line as two rows.
+fn body_lines(body: &str, theme: &Theme, base: Color, lead: impl Fn(bool) -> Vec<Span<'static>>) -> Vec<Line<'static>> {
+    crate::markdown::render(body, theme, base)
+        .into_iter()
+        .map(|l| {
+            let mut spans = lead(l.spans.iter().all(|s| s.content.trim().is_empty()));
+            spans.extend(l.spans);
+            Line::from(spans)
+        })
+        .collect()
+}
+
 fn comment_lines(theme: &Theme, threads: &[CommentThread]) -> Vec<Line<'static>> {
     let total: usize = threads.iter().map(|t| t.comments.len()).sum();
     let mut heading = vec![Span::styled(format!("Comments ({total})"), Style::default().fg(theme.accent).add_modifier(Modifier::BOLD))];
@@ -2251,9 +2267,7 @@ fn comment_lines(theme: &Theme, threads: &[CommentThread]) -> Vec<Line<'static>>
     for thread in threads {
         for c in &thread.comments {
             lines.push(Line::from(Span::styled(format!("{}:", c.author.display_name), Style::default().fg(theme.blue))));
-            for l in c.body.lines() {
-                lines.push(Line::from(Span::styled(format!("  {l}"), Style::default().fg(theme.fg))));
-            }
+            lines.extend(body_lines(&c.body, theme, theme.fg, |blank| if blank { vec![] } else { vec![Span::raw("  ")] }));
         }
     }
     lines
@@ -2496,9 +2510,15 @@ fn pr_comment_lines(theme: &Theme, threads: &[CommentThread], sel: Option<usize>
             if i > 0 {
                 lines.push(Line::from(vec![bar(), Span::styled(format!("{}:", c.author.display_name), Style::default().fg(theme.blue))]));
             }
-            for l in c.body.lines() {
-                lines.push(Line::from(vec![bar(), Span::styled(format!("  {l}"), Style::default().fg(body_fg))]));
-            }
+            lines.extend(body_lines(&c.body, theme, body_fg, |blank| {
+                // The selected thread's bar runs down its blank lines too, but without the
+                // trailing space the unselected bar has: a whitespace-only line would wrap to two rows.
+                match (blank, selected) {
+                    (true, true) => vec![Span::styled("▌", Style::default().fg(theme.accent))],
+                    (true, false) => vec![],
+                    (false, _) => vec![bar(), Span::raw("  ")],
+                }
+            }));
         }
     }
     (lines, starts)
@@ -3698,6 +3718,65 @@ fn render_diff_patch(frame: &mut Frame, area: Rect, theme: &Theme, diff: &DiffVi
     hit_rows(body, scroll as usize, row_hit);
 }
 
+/// Wrap a styled line to `width` display columns on word boundaries, keeping each word's
+/// style. The line's own leading indent (a nested list's) survives; whitespace that lands on a
+/// wrap is dropped, and a word wider than the line is split so the box frame stays aligned.
+fn wrap_spans(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<'static>>> {
+    if width == 0 {
+        return vec![spans.to_vec()];
+    }
+    let mut rows: Vec<Vec<Span<'static>>> = Vec::new();
+    let mut cur: Vec<Span<'static>> = Vec::new();
+    let mut cur_w = 0usize;
+    let push = |cur: &mut Vec<Span<'static>>, text: &str, style: Style| match cur.last_mut() {
+        Some(last) if last.style == style => last.content.to_mut().push_str(text),
+        _ => cur.push(Span::styled(text.to_string(), style)),
+    };
+    for span in spans {
+        let text: &str = &span.content;
+        let mut rest = text;
+        while !rest.is_empty() {
+            let ws = rest.starts_with(char::is_whitespace);
+            let end = rest.find(|c: char| c.is_whitespace() != ws).unwrap_or(rest.len());
+            let (token, tail) = rest.split_at(end);
+            rest = tail;
+            let w = token.chars().count();
+            if ws {
+                let leading = rows.is_empty() && cur.is_empty();
+                if leading || cur_w + w <= width {
+                    push(&mut cur, token, span.style);
+                    cur_w += w;
+                } else {
+                    rows.push(std::mem::take(&mut cur));
+                    cur_w = 0;
+                }
+                continue;
+            }
+            if cur_w + w > width && cur_w > 0 {
+                // Trailing whitespace on the row would show as a ragged gap before the frame.
+                while cur.last().is_some_and(|s| s.content.trim().is_empty()) {
+                    cur.pop();
+                }
+                rows.push(std::mem::take(&mut cur));
+                cur_w = 0;
+            }
+            let mut word = token;
+            while word.chars().count() > width {
+                let cut = word.char_indices().nth(width).map(|(i, _)| i).unwrap_or(word.len());
+                let (head, tail) = word.split_at(cut);
+                rows.push(vec![Span::styled(head.to_string(), span.style)]);
+                word = tail;
+            }
+            push(&mut cur, word, span.style);
+            cur_w += word.chars().count();
+        }
+    }
+    if !cur.is_empty() || rows.is_empty() {
+        rows.push(cur);
+    }
+    rows
+}
+
 /// Wrap `s` to `width` display columns on word boundaries.
 fn wrap_words(s: &str, width: usize) -> Vec<String> {
     if width == 0 {
@@ -3730,7 +3809,10 @@ fn wrap_words(s: &str, width: usize) -> Vec<String> {
 /// the code. `header` is the state line; `bodies` are the comment texts (`author: body`).
 fn inline_box(theme: &Theme, border: ratatui::style::Color, header: &str, bodies: &[String], width: usize) -> Vec<Line<'static>> {
     let head = vec![Span::styled(header.to_string(), Style::default().fg(border).bg(theme.panel).add_modifier(Modifier::BOLD))];
-    boxed(theme, border, head, None, bodies, theme.fg, width, false)
+    // A draft is shown as typed: its own author knows what the markup will become.
+    let bodies: Vec<Vec<Line<'static>>> =
+        bodies.iter().map(|b| b.lines().map(|l| Line::from(Span::styled(l.to_string(), Style::default().fg(theme.fg)))).collect()).collect();
+    boxed(theme, border, head, None, &bodies, width, false)
 }
 
 /// An existing thread beneath its diff line: `● open · N comments` (amber dot) or a dim
@@ -3750,22 +3832,34 @@ fn thread_box(theme: &Theme, t: &CommentThread, selected: bool, resolve: bool, w
             Span::styled(format!(" open · {n} {noun}"), Style::default().fg(border).bg(bg).add_modifier(Modifier::BOLD)),
         ]
     };
-    let bodies: Vec<String> = t.comments.iter().map(|c| format!("{}: {}", c.author.display_name, c.body)).collect();
+    // `author: ` opens the body's first line; the body itself is rendered markdown, as in the
+    // Conversation tab.
+    let bodies: Vec<Vec<Line<'static>>> = t
+        .comments
+        .iter()
+        .map(|c| {
+            let mut lines = crate::markdown::render(&c.body, theme, body_fg);
+            let author = Span::styled(format!("{}: ", c.author.display_name), Style::default().fg(body_fg));
+            match lines.first_mut() {
+                Some(first) => first.spans.insert(0, author),
+                None => lines.push(Line::from(author)),
+            }
+            lines
+        })
+        .collect();
     let hint = selected.then(|| thread_hint(resolve && t.is_resolvable, t.is_resolved));
-    boxed(theme, border, head, hint, &bodies, body_fg, width, selected)
+    boxed(theme, border, head, hint, &bodies, width, selected)
 }
 
 /// The box [`inline_box`] and [`thread_box`] draw: `head` on the first row with `hint`
-/// right-aligned beside it (dropped when it doesn't fit), then the wrapped `bodies` in
-/// `body_fg`. `bar` draws a `▌` down the left in place of the indent, keeping the width.
-#[allow(clippy::too_many_arguments)]
+/// right-aligned beside it (dropped when it doesn't fit), then each body's styled lines,
+/// wrapped to the box. `bar` draws a `▌` down the left in place of the indent, keeping the width.
 fn boxed(
     theme: &Theme,
     border: ratatui::style::Color,
     mut head: Vec<Span<'static>>,
     hint: Option<&str>,
-    bodies: &[String],
-    body_fg: ratatui::style::Color,
+    bodies: &[Vec<Line<'static>>],
     width: usize,
     bar: bool,
 ) -> Vec<Line<'static>> {
@@ -3785,9 +3879,14 @@ fn boxed(
     }
     // Inner content rows: the header, then wrapped comments.
     let mut rows: Vec<Vec<Span<'static>>> = vec![head];
-    for b in bodies {
-        for chunk in wrap_words(b, content_w) {
-            rows.push(vec![Span::styled(chunk, Style::default().fg(body_fg).bg(bg))]);
+    for body in bodies {
+        for line in body {
+            for mut chunk in wrap_spans(&line.spans, content_w) {
+                for s in &mut chunk {
+                    s.style = s.style.bg(bg);
+                }
+                rows.push(chunk);
+            }
         }
     }
 
@@ -9919,6 +10018,67 @@ mod tests {
         assert!(out.contains("▌"), "and a bar");
         let Screen::PrView(v) = &app.screen else { unreachable!() };
         assert_eq!(v.conv_layout.borrow().rows.len(), 2, "where both general threads landed, for the scroll-follow");
+    }
+
+    #[test]
+    fn comment_bodies_render_their_markdown_under_the_thread_bar() {
+        let theme = Theme::by_name("slate");
+        let plain = |l: &Line| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>();
+        let mut t = pr_thread("g1", None, false);
+        t.comments[0].body = "**Nit:** cap the backoff.\n\n- [x] bounded\n- [ ] jittered".into();
+        t.comments.push(Comment {
+            id: "g1-c2".into(),
+            author: User { id: "u2".into(), display_name: "Marcus Lee".into(), handle: None, avatar_url: None },
+            body: "Done in `a1b2c3d`.".into(),
+            created_at: None,
+        });
+        let (lines, starts) = pr_comment_lines(&theme, &[t.clone(), pr_thread("g2", None, true)], Some(0), "r reply", 120);
+        let rows: Vec<String> = lines.iter().map(plain).collect();
+        let first = rows.iter().position(|r| r.contains("Nit: cap the backoff.")).expect("the markup is rendered, not shown");
+        assert!(!rows.iter().any(|r| r.contains("**") || r.contains("- [x]") || r.contains('`')), "{rows:?}");
+        assert!(rows.iter().any(|r| r.contains("☑ bounded")) && rows.iter().any(|r| r.contains("☐ jittered")), "{rows:?}");
+        assert!(rows.iter().any(|r| r.contains("a1b2c3d")), "inline code keeps its text: {rows:?}");
+        let second = rows.iter().position(|r| r.contains("Marcus Lee:")).expect("the second comment's author");
+        for r in &rows[first..second] {
+            assert!(r.starts_with("▌ ") || r == "▌", "the selected thread's bar runs down every body line, blank ones too: {r:?}");
+            assert!(r.trim() != "▌" || r == "▌", "a blank line carries no indent (the pane would wrap it to two rows): {r:?}");
+        }
+        assert!(rows[first..second].contains(&"▌".to_string()), "the paragraph gap is a bar-only line: {rows:?}");
+        let (unselected, _) = pr_comment_lines(&theme, &[t.clone()], None, "", 120);
+        assert!(unselected.iter().map(plain).any(|r| r.is_empty()), "an unselected thread's paragraph gap is an empty line");
+        let head_of = |needle: &str| rows.iter().position(|r| r.contains(needle)).unwrap();
+        assert_eq!(starts, vec![head_of("● open  Elena Sokolova"), head_of("○ resolved")], "the cursor index still lands on each general thread's first line");
+        let bold = lines[first].spans.iter().find(|s| s.content.as_ref() == "Nit:").expect("the bold run is its own span");
+        assert!(bold.style.add_modifier.contains(Modifier::BOLD));
+
+        let wi: Vec<String> = comment_lines(&theme, &[t]).iter().map(plain).collect();
+        assert!(wi.iter().any(|r| r == "  Nit: cap the backoff."), "work-item comments render the same way, indented: {wi:?}");
+        assert!(wi.iter().any(|r| r.contains("☑ bounded")), "{wi:?}");
+        assert!(wi.iter().any(|r| r.is_empty()), "and its paragraph gap is an empty line: {wi:?}");
+    }
+
+    #[test]
+    fn diff_thread_boxes_render_markdown_and_keep_their_frame() {
+        let theme = Theme::by_name("slate");
+        let plain = |l: &Line| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>();
+        let mut t = pr_thread("f1", Some("a.rs"), false);
+        t.comments[0].body = "A **bold** nit on a line that is certainly far too long to fit inside this narrow box.\n\n- [x] done\n- [ ] averyveryveryveryveryveryveryverylongidentifier".into();
+        let width = 40;
+        let lines = thread_box(&theme, &t, true, true, width);
+        let rows: Vec<String> = lines.iter().map(plain).collect();
+        let box_w = width - 3;
+        for r in &rows {
+            assert_eq!(r.chars().count(), 2 + box_w, "every row spans the full box, bar included: {r:?}");
+        }
+        let text = rows.join("\n");
+        assert!(text.contains("Elena Sokolova: A bold nit"), "{text}");
+        assert!(!text.contains("**") && !text.contains("- ["), "{text}");
+        assert!(text.contains("☑ done"), "{text}");
+        assert!(rows.iter().any(|r| r.contains("│ averyvery")), "a word wider than the box is split rather than breaking the frame: {text}");
+        let bold = lines.iter().flat_map(|l| l.spans.iter()).find(|s| s.content.as_ref() == "bold").expect("the bold word keeps its own span");
+        assert!(bold.style.add_modifier.contains(Modifier::BOLD) && bold.style.bg == Some(theme.panel));
+        let blank_rows = rows.iter().filter(|r| r.trim_start_matches("▌ │").trim_end_matches('│').trim().is_empty()).count();
+        assert_eq!(blank_rows, 1, "one blank row between paragraphs: {text}");
     }
 
     #[test]

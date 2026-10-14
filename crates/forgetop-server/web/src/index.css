@@ -473,3 +473,138 @@ kbd.ft-kbd {
 .pulse {
   animation: pulse-dot 1.4s ease-in-out infinite;
 }
+
+/* ---- rendered markdown (components/Markdown.tsx) ---------------------------------------- */
+/* Forge bodies and comments. Stays inside the type scale: 13px body, headings at the section
+   (14px/600) and body-bold (13px/600) sizes, mono for code only. Blocks are separated by a
+   single 8px gap, hairlines where the markup draws a line. */
+@layer components {
+  .md {
+    font-size: 13px;
+    line-height: 1.55;
+    color: var(--fg);
+    overflow-wrap: anywhere;
+  }
+  .md > :first-child {
+    margin-top: 0;
+  }
+  .md > :last-child {
+    margin-bottom: 0;
+  }
+  .md p,
+  .md ul,
+  .md ol,
+  .md pre,
+  .md blockquote,
+  .md table {
+    margin: 0 0 8px;
+  }
+  .md h1,
+  .md h2,
+  .md h3,
+  .md h4,
+  .md h5,
+  .md h6 {
+    margin: 12px 0 4px;
+    font-weight: 600;
+    line-height: 1.3;
+  }
+  .md h1,
+  .md h2 {
+    font-size: 14px;
+  }
+  .md h3,
+  .md h4,
+  .md h5,
+  .md h6 {
+    font-size: 13px;
+  }
+  .md a {
+    color: var(--accent-fg);
+    text-decoration: none;
+  }
+  .md a:hover {
+    text-decoration: underline;
+  }
+  .md ul,
+  .md ol {
+    padding-left: 20px;
+  }
+  .md ul {
+    list-style: disc;
+  }
+  .md ol {
+    list-style: decimal;
+  }
+  .md li + li {
+    margin-top: 2px;
+  }
+  .md li > p {
+    margin: 0;
+  }
+  .md li > ul,
+  .md li > ol {
+    margin: 2px 0 0;
+  }
+  /* GFM task items (remark-gfm's class, so a loose list with a <p> inside matches too): the
+     glyph replaces the bullet. */
+  .md li.task-list-item {
+    list-style: none;
+    margin-left: -20px;
+  }
+  .md .md-task {
+    display: inline-flex;
+    vertical-align: -2px;
+    margin-right: 6px;
+  }
+  .md code {
+    padding: 1px 4px;
+    border-radius: 4px;
+    background: var(--hover);
+  }
+  .md pre {
+    padding: 8px 10px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: var(--hover);
+    overflow-x: auto;
+    line-height: 1.45;
+  }
+  .md pre code {
+    padding: 0;
+    background: transparent;
+  }
+  .md blockquote {
+    padding: 0 0 0 10px;
+    border-left: 2px solid var(--border-strong);
+    color: var(--fg2);
+  }
+  .md hr {
+    margin: 10px 0;
+    border: 0;
+    border-top: 1px solid var(--border);
+  }
+  .md table {
+    border-collapse: collapse;
+    font-size: 12px;
+  }
+  .md th,
+  .md td {
+    padding: 4px 10px 4px 0;
+    border-bottom: 1px solid var(--border);
+    text-align: left;
+    vertical-align: top;
+  }
+  .md th {
+    font-weight: 500;
+    color: var(--fg2);
+  }
+  .md del {
+    color: var(--fg3);
+  }
+  /* Raw HTML the forge body carried, shown as written rather than rendered. */
+  .md .md-raw {
+    color: var(--fg3);
+    white-space: pre-wrap;
+  }
+}
