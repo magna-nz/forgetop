@@ -9,6 +9,30 @@ Adding a release: one `## <version> — <date>` section, a line per user-visible
 and the pull request each one came from. `git log v<previous>..HEAD --merges` lists the
 candidates.
 
+## 1.11.0 — 2026-10-14
+
+Added
+
+- **Right-click menus on every dashboard row.** Each row in the Command Center, Pull Requests,
+  Work Items and Pipelines lists opens a context menu on right-click, on a hover-only `⋯`
+  button at its edge, or on Shift+F10 — without changing the selection or opening the pane.
+  Pull requests: open, open in the forge, copy link or number, approve, request changes, merge
+  (disabled with the reason when it can't), request a reviewer, draft or ready, reopen, revert,
+  close with a second click to confirm. Work items: move to a state, assign, edit the title and
+  description or comment (the pane opens in that mode), and hide a state from the list, with
+  chips in the control bar to show it again. Pipeline runs: copy the commit or branch, approve
+  or reject a gate, re-run, re-run failed jobs, cancel with confirmation, show the failing log,
+  open the run's pull request. Group headers — a work item's parent, a pipeline — expand or
+  collapse one or all sections and open or copy what they stand for. Every action posts what
+  the detail pane posts, shows at once where the outcome is known, and reports in a quiet
+  toast. ([#247](https://github.com/magna-nz/forgetop/pull/247))
+- **Dismiss from the Command Center, in the browser too.** A dashboard row's "Dismiss from
+  Command Center" writes the same list the terminal UI's `D` key does, and the two frontends
+  now read it live: a dismissal (or a hidden work-item state) made in either one reaches the
+  other within a refresh, and neither writes over what the other added. The dashboard also
+  stops showing items the terminal UI had already dismissed.
+  ([#247](https://github.com/magna-nz/forgetop/pull/247))
+
 ## 1.10.2 — 2026-10-14
 
 Added
