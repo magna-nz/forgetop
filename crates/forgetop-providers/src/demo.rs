@@ -2905,11 +2905,16 @@ impl NotificationSource for DemoNotifications {
         demo_latency().await;
         // A check suite's run, as GitHub's `actions/runs?check_suite_id=` answers it.
         if let Some(run) = n.detail_ref.as_deref().and_then(|r| r.strip_prefix("demo:ci-")) {
+            // What the run says about itself, as GitHub's runs list does: number, trigger, commit.
+            let excerpt = pipeline_runs_for(&self.conn).into_iter().find(|r| r.id == run).map(|r| {
+                let said: Vec<String> = [r.number.map(|n| format!("Run #{n}")), r.event.clone(), r.title.clone()].into_iter().flatten().collect();
+                said.join(" · ")
+            });
             return Ok(NotificationDetail {
                 actor: Some("sam".into()),
+                excerpt,
                 target: Some(NotificationTarget::Run { id: run.into() }),
                 url: Some(format!("https://example.test/northwind/payments/actions/runs/{run}")),
-                ..Default::default()
             });
         }
         // Like GitHub, a mention's comment is only named as its target once read.

@@ -661,6 +661,14 @@ fn ci_outcome(title: &str) -> Option<&'static str> {
     })
 }
 
+/// The workflow and branch a CI notification's title names: "CI workflow run failed for
+/// main branch" → ("CI", "main"). `None` for a title of another shape.
+fn ci_title(title: &str) -> Option<(String, String)> {
+    let (workflow, rest) = title.split_once(" workflow run ")?;
+    let branch = rest.split_once(" for ")?.1.strip_suffix(" branch")?;
+    (!workflow.is_empty() && !branch.is_empty()).then(|| (workflow.to_string(), branch.to_string()))
+}
+
 /// Map a GitHub notification thread (`GET /notifications`) to a [`Notification`].
 pub fn map_notification(v: &Value) -> Notification {
     let subject = get_obj(v, "subject");
@@ -738,12 +746,21 @@ pub fn map_notification(v: &Value) -> Notification {
     }
     // A CI notification names a check suite, which nothing here opens; the run it belongs to is
     // one `actions/runs?check_suite_id=` away, asked by `detail()` for the row in hand only.
+    // GitHub usually sends a check suite with no URL at all, so the run is found from what the
+    // title says — its workflow and branch — among the repository's recent runs instead.
     if item_type == NotificationItemType::Pipeline {
-        detail_ref = subject
+        let suite = subject
             .and_then(|s| get_str(s, "url"))
             .and_then(|u| u.rsplit_once("/check-suites/").map(|(repo_api, id)| (repo_api.to_string(), id.to_string())))
             .filter(|(_, id)| !id.is_empty() && id.chars().all(|c| c.is_ascii_digit()))
             .map(|(repo_api, id)| format!("{repo_api}/actions/runs?check_suite_id={id}"));
+        detail_ref = suite.or_else(|| {
+            let repo_api = repo.and_then(|r| get_str(r, "url"))?;
+            Some(match ci_title(&title) {
+                Some((_, branch)) => format!("{repo_api}/actions/runs?branch={}&per_page=30", content::encode_path(&branch, false)),
+                None => format!("{repo_api}/actions/runs?per_page=30"),
+            })
+        });
     }
     Notification {
         id: get_str(v, "id").unwrap_or_default(),
@@ -788,12 +805,46 @@ fn mentions_a_team(body: &str) -> bool {
 /// The run a check suite belongs to, from `GET …/actions/runs?check_suite_id=<id>`: where a CI
 /// notification opens, and its page on GitHub in place of the repository's.
 pub fn map_suite_run_detail(v: &Value) -> NotificationDetail {
-    let Some(run) = get_arr(v, "workflow_runs").first().cloned() else { return NotificationDetail::default() };
+    get_arr(v, "workflow_runs").first().map(run_detail).unwrap_or_default()
+}
+
+/// The run a CI notification is about, among a repository's recent runs (`GET …/actions/runs`):
+/// the title's workflow, ended the way the title says, finished nearest the notification's time.
+pub fn find_notified_run(v: &Value, n: &Notification) -> NotificationDetail {
+    let workflow = ci_title(&n.title).map(|(w, _)| w);
+    let conclusion = match ci_outcome(&n.title) {
+        Some("failed") => Some("failure"),
+        Some("timed out") => Some("timed_out"),
+        Some("cancelled") => Some("cancelled"),
+        Some("succeeded") => Some("success"),
+        Some("skipped") => Some("skipped"),
+        _ => None,
+    };
+    let at = n.updated_at.map(|t| t.timestamp()).unwrap_or(i64::MAX);
+    get_arr(v, "workflow_runs")
+        .iter()
+        .filter(|r| workflow.as_deref().is_none_or(|w| get_str(r, "name").as_deref() == Some(w)))
+        .filter(|r| conclusion.is_none_or(|c| get_str(r, "conclusion").as_deref() == Some(c)))
+        .min_by_key(|r| get_date(r, "updated_at").map_or(i64::MAX, |t| (t.timestamp() - at).abs()))
+        .map(run_detail)
+        .unwrap_or_default()
+}
+
+/// What a workflow run says about itself, for a CI notification's preview: who started it, the
+/// run and its commit, where it opens, and its page.
+fn run_detail(run: &Value) -> NotificationDetail {
+    let number = get_i64(run, "run_number").map(|n| format!("Run #{n}"));
+    let event = get_str(run, "event");
+    let commit = get_obj(run, "head_commit")
+        .and_then(|c| get_str(c, "message"))
+        .and_then(|m| m.lines().next().map(str::to_string))
+        .filter(|m| !m.trim().is_empty());
+    let said: Vec<String> = [number, event, commit].into_iter().flatten().collect();
     NotificationDetail {
-        actor: get_obj(&run, "triggering_actor").or_else(|| get_obj(&run, "actor")).and_then(|a| get_str(a, "login")),
-        target: get_i64(&run, "id").map(|id| NotificationTarget::Run { id: id.to_string() }),
-        url: get_str(&run, "html_url"),
-        ..Default::default()
+        actor: get_obj(run, "triggering_actor").or_else(|| get_obj(run, "actor")).and_then(|a| get_str(a, "login")),
+        excerpt: (!said.is_empty()).then(|| said.join(" · ")).as_deref().and_then(content::comment_excerpt),
+        target: get_i64(run, "id").map(|id| NotificationTarget::Run { id: id.to_string() }),
+        url: get_str(run, "html_url"),
     }
 }
 
@@ -1311,7 +1362,7 @@ impl NotificationSource for GitHubNotif {
         }
         let v = self.0.get_json(url).await?;
         if n.item_type == NotificationItemType::Pipeline {
-            return Ok(map_suite_run_detail(&v));
+            return Ok(if url.contains("check_suite_id=") { map_suite_run_detail(&v) } else { find_notified_run(&v, n) });
         }
         let mut detail = map_comment_detail(&v);
         if n.kind == NotificationKind::Mention {
@@ -2253,6 +2304,38 @@ mod tests {
         let mut filled = n.clone();
         d.fill(&mut filled);
         assert_eq!(filled.url.as_deref(), Some("https://github.com/acme/pay/actions/runs/9001"), "o now opens the run, not the repo");
+    }
+
+    /// GitHub's CI notification usually has no subject URL: the run is found by the workflow and
+    /// branch its title names, the outcome it says, nearest the notification's time.
+    #[tokio::test]
+    async fn a_ci_notification_without_a_suite_url_finds_its_run_by_title() {
+        let (forge, pr) = forge_client(&[]);
+        let base = forge.base();
+        let v = serde_json::json!({ "id": "5", "unread": true, "reason": "ci_activity", "updated_at": "2026-10-15T02:00:00Z",
+            "subject": { "title": "forgetop-it workflow run failed for feat/x branch", "type": "CheckSuite", "url": null, "latest_comment_url": null },
+            "repository": { "full_name": "acme/pay", "html_url": "https://github.com/acme/pay", "url": format!("{base}/repos/acme/pay") } });
+        let n = map_notification(&v);
+        assert_eq!(n.kind, NotificationKind::CiFailed);
+        assert_eq!(n.detail_ref.as_deref(), Some(format!("{base}/repos/acme/pay/actions/runs?branch=feat%2Fx&per_page=30").as_str()));
+
+        let run = |id: i64, name: &str, conclusion: &str, at: &str| serde_json::json!({
+            "id": id, "name": name, "conclusion": conclusion, "updated_at": at, "run_number": id - 9000, "event": "push",
+            "head_commit": { "message": "Fix the cache\n\nlonger body" }, "triggering_actor": { "login": "dan" },
+            "html_url": format!("https://github.com/acme/pay/actions/runs/{id}") });
+        forge.route("/repos/acme/pay/actions/runs", serde_json::json!({ "workflow_runs": [
+            run(9001, "forgetop-it", "failure", "2026-10-14T02:00:00Z"),
+            run(9002, "forgetop-it", "success", "2026-10-15T02:00:00Z"),
+            run(9003, "CI", "failure", "2026-10-15T02:00:00Z"),
+            run(9004, "forgetop-it", "failure", "2026-10-15T01:59:00Z"),
+        ] }));
+        let d = GitHubNotif(pr.0.clone()).detail(&n).await.unwrap();
+        assert_eq!(d.target, Some(NotificationTarget::Run { id: "9004".into() }), "same workflow, failed, nearest in time");
+        assert_eq!(d.excerpt.as_deref(), Some("Run #4 · push · Fix the cache"));
+        assert_eq!(d.actor.as_deref(), Some("dan"));
+        assert_eq!(d.url.as_deref(), Some("https://github.com/acme/pay/actions/runs/9004"));
+        assert_eq!(ci_title("Release workflow run succeeded for main branch"), Some(("Release".into(), "main".into())));
+        assert_eq!(ci_title("Run failed: CI - main (abc123)"), None);
     }
 
     /// GitHub sends `ci_activity` for every run you triggered: a success is not a failure.

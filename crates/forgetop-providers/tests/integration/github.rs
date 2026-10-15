@@ -435,6 +435,12 @@ async fn github_lists_notifications() {
         // The one excerpt a list carries is a finished run's outcome, read off its title.
         assert!(n.excerpt.is_none() || n.reason == "ci_activity", "what is fetched lazily ({})", n.id);
     }
+    // A CI notification names its run only through the detail (GitHub sends no suite URL): say
+    // what the lookup found for one, so a CI log shows whether the run resolution works live.
+    if let Some(ci) = list.iter().find(|n| n.item_type == IT::Pipeline && n.detail_ref.is_some()) {
+        let d = notifs.detail(ci).await.expect("a CI notification's run lookup answers");
+        eprintln!("github: CI notification {:?} → run {:?}, {:?}", ci.title, d.target, d.excerpt);
+    }
     let mut reasons: Vec<&str> = list.iter().map(|n| n.reason.as_str()).collect();
     reasons.sort_unstable();
     reasons.dedup();
