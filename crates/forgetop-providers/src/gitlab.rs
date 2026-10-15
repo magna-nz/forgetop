@@ -524,6 +524,13 @@ fn gitlab_action_kind(action: &str) -> NotificationKind {
     }
 }
 
+/// The note id a todo's `target_url` ends in (`…/merge_requests/42#note_1234` → `1234`). It is the
+/// same `id` [`map_note`] gives that note inside the MR's discussions or the issue's notes.
+fn note_anchor(url: &str) -> Option<String> {
+    let id = url.rsplit_once("#note_")?.1;
+    (!id.is_empty() && id.chars().all(|c| c.is_ascii_digit())).then(|| id.to_string())
+}
+
 /// Map a GitLab todo (`GET /todos`) to a [`Notification`]. `iid` is safe to drill into
 /// because the source scopes todos to this project.
 pub fn map_todo(v: &Value) -> Notification {
@@ -539,18 +546,42 @@ pub fn map_todo(v: &Value) -> Notification {
         }
         _ => None,
     };
+    let reason = get_str(v, "action_name").unwrap_or_default();
+    let kind = gitlab_action_kind(&reason);
+    let title = target.and_then(|t| get_str(t, "title")).unwrap_or_default();
+    let url = get_str(v, "target_url").or_else(|| target.and_then(|t| get_str(t, "web_url")));
+    let is_mr = item_type == NotificationItemType::PullRequest;
+    let note = if kind == NotificationKind::Mention { url.as_deref().and_then(note_anchor) } else { None };
+    let target_to = match (kind, note) {
+        (NotificationKind::Mention | NotificationKind::Comment, Some(id)) => NotificationTarget::Comment { id },
+        (NotificationKind::ReviewRequested, _) if is_mr => NotificationTarget::Diff,
+        (NotificationKind::CiFailed, _) if is_mr => NotificationTarget::Checks,
+        _ => NotificationTarget::Overview,
+    };
+    // For a mention the todo's `body` is the note that mentioned you. Where it only repeats the
+    // item's title (a mention in the description) it says nothing the row doesn't already.
+    let excerpt = if kind == NotificationKind::Mention {
+        get_str(v, "body").filter(|b| b.trim() != title.trim()).as_deref().and_then(content::comment_excerpt)
+    } else {
+        None
+    };
     Notification {
         id: get_i64(v, "id").map(|i| i.to_string()).unwrap_or_default(),
-        kind: gitlab_action_kind(&get_str(v, "action_name").unwrap_or_default()),
+        kind,
         item_type,
         item_id,
-        title: target.and_then(|t| get_str(t, "title")).unwrap_or_default(),
+        title,
         context: get_obj(v, "project").and_then(|p| get_str(p, "path_with_namespace")).unwrap_or_default(),
         // `path_with_namespace` is already the connection-relative `group/project` spelling.
         repository: get_obj(v, "project").and_then(|p| get_str(p, "path_with_namespace")),
-        url: get_str(v, "target_url").or_else(|| target.and_then(|t| get_str(t, "web_url"))),
+        url,
         unread: get_str(v, "state").as_deref() == Some("pending"),
         updated_at: get_date(v, "updated_at").or_else(|| get_date(v, "created_at")),
+        reason,
+        actor: get_obj(v, "author").and_then(|a| get_str(a, "name").or_else(|| get_str(a, "username"))),
+        excerpt,
+        target: target_to,
+        detail_ref: None,
     }
 }
 
@@ -697,11 +728,16 @@ impl NotificationSource for GitLabNotif {
         let v = self.0.get_json(&url).await?;
         Ok(v.as_array().unwrap_or(&vec![]).iter().map(map_todo).collect())
     }
-    async fn mark_read(&self, id: &str) -> Result<()> {
-        self.0.post_json(&format!("{}/todos/{id}/mark_as_done", self.0.base), json!({})).await
+    /// A to-do has no read state: it is pending or done. Opening one leaves it pending, so it stays
+    /// in the inbox until you're done with it.
+    async fn mark_read(&self, _id: &str) -> Result<()> {
+        Ok(())
     }
     async fn mark_all_read(&self) -> Result<()> {
-        self.0.post_json(&format!("{}/todos/mark_as_done", self.0.base), json!({})).await
+        Ok(())
+    }
+    async fn mark_done(&self, id: &str) -> Result<()> {
+        self.0.post_json(&format!("{}/todos/{id}/mark_as_done", self.0.base), json!({})).await
     }
 }
 
@@ -1397,6 +1433,82 @@ mod tests {
         )
         .unwrap();
         assert_eq!(map_todo(&build).kind, NotificationKind::CiFailed);
+    }
+
+    #[test]
+    fn a_mention_carries_who_what_and_the_note_it_lands_on() {
+        let v: Value = serde_json::from_str(
+            r#"{ "id": 131, "action_name": "mentioned", "state": "pending", "created_at": "2026-07-10T08:00:00Z",
+                 "author": { "name": "Priya Nair", "username": "priya" },
+                 "body": "@dan  does the key\ncheck run first?",
+                 "target_type": "MergeRequest", "target": { "iid": 42, "title": "Rotate keys" },
+                 "project": { "path_with_namespace": "platform/infra" },
+                 "target_url": "https://gitlab.com/platform/infra/-/merge_requests/42#note_5551" }"#,
+        )
+        .unwrap();
+        let n = map_todo(&v);
+        assert_eq!((n.kind, n.reason.as_str()), (NotificationKind::Mention, "mentioned"));
+        assert_eq!(n.actor.as_deref(), Some("Priya Nair"));
+        assert_eq!(n.excerpt.as_deref(), Some("@dan does the key check run first?"));
+        // `map_note` gives the same note this id inside the MR's discussions.
+        assert_eq!(n.target, NotificationTarget::Comment { id: map_note(&serde_json::json!({ "id": 5551 })).id });
+        assert_eq!(n.url.as_deref(), Some("https://gitlab.com/platform/infra/-/merge_requests/42#note_5551"));
+
+        // The same on an issue, with `directly_addressed`.
+        let issue: Value = serde_json::from_str(
+            r#"{ "id": 9, "action_name": "directly_addressed", "state": "done", "body": "@dan ping",
+                 "target_type": "Issue", "target": { "iid": 7, "title": "Flaky test" },
+                 "project": { "path_with_namespace": "p/x" }, "target_url": "https://gitlab.com/p/x/-/issues/7#note_12" }"#,
+        )
+        .unwrap();
+        let m = map_todo(&issue);
+        assert_eq!((m.kind, m.target, m.unread), (NotificationKind::Mention, NotificationTarget::Comment { id: "12".into() }, false));
+        assert_eq!(m.actor, None, "no author in the payload");
+    }
+
+    #[test]
+    fn a_mention_with_no_note_or_only_the_title_has_no_comment_or_excerpt() {
+        let v: Value = serde_json::from_str(
+            r#"{ "id": 1, "action_name": "mentioned", "body": "Rotate keys",
+                 "target_type": "MergeRequest", "target": { "iid": 42, "title": "Rotate keys" },
+                 "project": { "path_with_namespace": "platform/infra" },
+                 "target_url": "https://gitlab.com/platform/infra/-/merge_requests/42" }"#,
+        )
+        .unwrap();
+        let n = map_todo(&v);
+        assert_eq!((n.target, n.excerpt), (NotificationTarget::Overview, None));
+    }
+
+    #[test]
+    fn review_and_build_todos_land_on_the_diff_and_the_checks() {
+        let todo = |action: &str, ty: &str| -> Notification {
+            map_todo(&serde_json::json!({ "id": 1, "action_name": action, "target_type": ty,
+                "target": { "iid": 42, "title": "t" }, "project": { "path_with_namespace": "p/x" },
+                "target_url": "https://gitlab.com/p/x/-/merge_requests/42" }))
+        };
+        for action in ["review_requested", "approval_required"] {
+            let n = todo(action, "MergeRequest");
+            assert_eq!((n.kind, n.target, n.reason.as_str()), (NotificationKind::ReviewRequested, NotificationTarget::Diff, action));
+            assert_eq!(n.url.as_deref(), Some("https://gitlab.com/p/x/-/merge_requests/42"));
+        }
+        let b = todo("build_failed", "MergeRequest");
+        assert_eq!((b.kind, b.target), (NotificationKind::CiFailed, NotificationTarget::Checks));
+        // Neither means anything on an issue.
+        assert_eq!(todo("build_failed", "Issue").target, NotificationTarget::Overview);
+        // Anything else is Other, labelled by the raw action name.
+        let o = todo("unmergeable", "MergeRequest");
+        assert_eq!((o.kind, o.reason.as_str(), o.target), (NotificationKind::Other, "unmergeable", NotificationTarget::Overview));
+        let a = todo("assigned", "MergeRequest");
+        assert_eq!((a.kind, a.target), (NotificationKind::Assigned, NotificationTarget::Overview));
+    }
+
+    #[test]
+    fn an_excerpt_is_cut_on_a_char_boundary() {
+        let cut = content::comment_excerpt(&"é ".repeat(300)).unwrap();
+        assert!(cut.chars().count() <= 241 && cut.ends_with('…'));
+        assert_eq!(content::comment_excerpt("   "), None);
+        assert_eq!(note_anchor("https://x/-/issues/1#note_"), None);
+        assert_eq!(note_anchor("https://x/-/issues/1#note_7a"), None);
     }
 
     #[test]

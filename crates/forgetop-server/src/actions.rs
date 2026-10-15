@@ -5,9 +5,9 @@
 
 use std::sync::Arc;
 
-use forgetop_core::domain::{ApprovalDecision, LineComment, ReviewVote};
+use forgetop_core::domain::{ApprovalDecision, LineComment, Notification, NotificationDetail, ReviewVote};
 use forgetop_core::provider::{ItemRef, MergeOptions, MergeStrategy, NotificationSource};
-use forgetop_core::service::SectionService;
+use forgetop_core::service::{ConfigService, SectionService};
 use serde::Deserialize;
 
 use crate::dto;
@@ -255,6 +255,13 @@ pub struct NotifReadReq {
     pub id: String,
 }
 
+/// Several notifications on one connection — a thread's members, for "mark read" and "done".
+#[derive(Deserialize)]
+pub struct NotifIdsReq {
+    pub conn: String,
+    pub ids: Vec<String>,
+}
+
 // ---- actions ----
 
 pub async fn pr_vote(sections: &SectionService, req: PrVoteReq) -> Result<(), ActionError> {
@@ -370,4 +377,63 @@ pub async fn pipeline_rerun(sections: &SectionService, req: PipelineRerunReq) ->
 pub async fn notif_read(sections: &SectionService, req: NotifReadReq) -> Result<(), ActionError> {
     let source = notif_source(sections, &req.conn).await.ok_or(ActionError::NotFound)?;
     source.mark_read(&req.id).await.map_err(failed)
+}
+
+/// Marks each of `ids` read at the forge, best-effort: one failing doesn't stop the rest. Ids the
+/// current rows already show as read are skipped (on GitHub every call counts against the hourly
+/// budget). Fails only when every call it made failed.
+pub async fn notif_read_many(sections: &SectionService, rows: &[dto::NotifRow], req: &NotifIdsReq) -> Result<(), ActionError> {
+    let source = notif_source(sections, &req.conn).await.ok_or(ActionError::NotFound)?;
+    let (mut tried, mut failed) = (0, 0);
+    let mut first_error = None;
+    for id in &req.ids {
+        let known = rows.iter().find(|r| r.connection_id == req.conn && r.notification.id == *id);
+        if known.is_some_and(|r| !r.notification.unread) {
+            continue;
+        }
+        tried += 1;
+        if let Err(e) = source.mark_read(id).await {
+            failed += 1;
+            first_error.get_or_insert(e.to_string());
+        }
+    }
+    match first_error {
+        Some(e) if failed == tried => Err(ActionError::Failed(e)),
+        _ => Ok(()),
+    }
+}
+
+/// "Done" on a thread: its members are marked done at the forge, then dismissed locally under the
+/// key the TUI uses, merged into the saved list so neither frontend drops the other's. Ids the
+/// current rows don't know are marked done but not dismissed — there is no `updated_at` to key
+/// them by.
+pub async fn notif_done(sections: &SectionService, config: &ConfigService, rows: &[dto::NotifRow], req: &NotifIdsReq) -> Result<(), ActionError> {
+    // Every id, read or not: done is the forge's own "done" (GitHub mark-as-done, GitLab's
+    // to-do done) — a read notification stays listed until this. Best-effort per id, failing
+    // only when every call failed.
+    let source = notif_source(sections, &req.conn).await.ok_or(ActionError::NotFound)?;
+    let mut first_error = None;
+    let mut misses = 0;
+    for id in &req.ids {
+        if let Err(e) = source.mark_done(id).await {
+            misses += 1;
+            first_error.get_or_insert(e.to_string());
+        }
+    }
+    if let Some(e) = first_error.filter(|_| misses == req.ids.len()) {
+        return Err(ActionError::Failed(e));
+    }
+    let keys: Vec<String> = req
+        .ids
+        .iter()
+        .filter_map(|id| rows.iter().find(|r| r.connection_id == req.conn && r.notification.id == *id))
+        .map(|r| r.dismiss_key.clone())
+        .collect();
+    config.dismiss_notifications(keys).await.map_err(failed)
+}
+
+/// The actor and excerpt of one notification its feed entry left out (GitHub's latest comment).
+pub async fn notif_detail(sections: &SectionService, conn: &str, n: &Notification) -> Result<NotificationDetail, ActionError> {
+    let source = notif_source(sections, conn).await.ok_or(ActionError::NotFound)?;
+    source.detail(n).await.map_err(failed)
 }

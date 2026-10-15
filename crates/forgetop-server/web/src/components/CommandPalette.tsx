@@ -125,12 +125,13 @@ export function CommandPalette({
         run: openUrl(r.run.url, "pipelines"),
       };
     });
-    const notifItems: Command[] = (notifs.data ?? []).map((r) => {
+    // A reaction is never a row of its own (it folds into its thread in the inbox).
+    const notifItems: Command[] = (notifs.data ?? []).filter((r) => r.tier !== "Hidden").map((r) => {
       const meta = notificationMeta(r.notification.kind);
       return {
         id: `notif:${r.connection_id}:${r.notification.id}`,
         label: r.notification.title,
-        sublabel: `${r.notification.context} · ${r.connection}`,
+        sublabel: `${r.phrase || r.notification.context} · ${r.connection}`,
         ident: r.notification.context,
         glyph: meta.glyph,
         color: meta.color,

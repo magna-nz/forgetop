@@ -1,6 +1,6 @@
 //! Linear live tests: work items only (Linear has no PRs/pipelines).
 
-use forgetop_core::domain::{WorkItemParent, WorkItemStateCategory};
+use forgetop_core::domain::{NotificationKind, NotificationTarget, WorkItemParent, WorkItemStateCategory};
 use forgetop_core::provider::*;
 
 use crate::harness;
@@ -214,4 +214,31 @@ async fn linear_lists_notifications() {
     if let Some(n) = list.first() {
         assert!(!n.id.is_empty(), "a notification carries an id for mark-read");
     }
+    // The query's `actor`, `comment` and `issue.state` fields decoded (a wrong field name would
+    // have failed the whole list above). Print what came back — types only, no content.
+    let mut seen: std::collections::BTreeMap<(String, String), usize> = Default::default();
+    for n in &list {
+        assert!(!n.reason.is_empty(), "every notification keeps Linear's raw type ({})", n.id);
+        *seen.entry((n.reason.clone(), format!("{:?}", n.kind))).or_default() += 1;
+        if n.kind == NotificationKind::Reaction {
+            assert_eq!(n.target, NotificationTarget::Overview, "a reaction opens the issue");
+        }
+        if n.kind == NotificationKind::StateChange {
+            assert_eq!(n.target, NotificationTarget::Activity);
+            if let Some(state) = &n.excerpt {
+                assert!(!state.contains('\n'), "a state excerpt is the state's name alone");
+            }
+        }
+        if let NotificationTarget::Comment { id } = &n.target {
+            assert!(!id.is_empty());
+            assert!(matches!(n.kind, NotificationKind::Mention | NotificationKind::Comment));
+        }
+    }
+    for ((reason, kind), count) in &seen {
+        eprintln!("linear: {count} x {reason} -> {kind}");
+    }
+    let with_actor = list.iter().filter(|n| n.actor.is_some()).count();
+    let with_comment = list.iter().filter(|n| matches!(n.target, NotificationTarget::Comment { .. })).count();
+    let with_excerpt = list.iter().filter(|n| n.excerpt.is_some()).count();
+    eprintln!("linear: {with_actor} with an actor, {with_comment} targeting a comment, {with_excerpt} with an excerpt");
 }

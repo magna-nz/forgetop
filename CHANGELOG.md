@@ -9,6 +9,41 @@ Adding a release: one `## <version> — <date>` section, a line per user-visible
 and the pull request each one came from. `git log v<previous>..HEAD --merges` lists the
 candidates.
 
+## 1.12.0 — 2026-10-15
+
+Added
+
+- **An inbox that says why.** Notifications on the same pull request or issue fold into one
+  row, led by the reason that asks most of you, with a `+N` for the rest: Linear's three or four
+  notifications per issue are one line now. Each row says what happened in words ("Priya
+  mentioned you", "→ In Review", "new in Platform", "marked urgent") instead of a generic
+  "activity", and the preview says why it reached you. The inbox is **For you** only: review
+  requests, mentions, assignments, failures and due dates; what you merely follow (comments,
+  status moves, new issues where you watch, a run that succeeded) stays in the forge's own
+  inbox. A GitHub CI notification says how the run ended: only a failed run is listed.
+  ([#248](https://github.com/magna-nz/forgetop/pull/248))
+- **Notifications open where they mean.** In the terminal, Enter opens the item in a pane beside
+  the inbox and Enter again makes it full-screen; the preview is always up, beside the list or
+  under it. A mention or a comment opens on that comment, a CI failure on the failing check, a
+  review request on the diff. From an item opened from the
+  inbox, a triage strip moves to the next or previous notification and marks this one done
+  (`]` `[` `e` in the terminal, `j` `k` `e` in the dashboard pane). A CI notification opens its
+  run, not the repository. On GitHub the comment, who wrote it, and a CI notification's run are
+  read for the row you are on only, never during a refresh.
+  ([#248](https://github.com/magna-nz/forgetop/pull/248))
+- **Dismiss, shared.** Opening a notification only marks it read: it stays in the inbox, so you
+  can come back to it. Dismissing is what clears it — `e` (or Dismiss in the dashboard); in the
+  terminal, Space selects notifications and `b` bulk-dismisses them, as on the section lists. A
+  dismissal is marked done at the forge (GitHub's "mark as done", GitLab's to-do done) and is
+  gone from both the dashboard and the terminal UI. The inbox preview toggle is `p`.
+  ([#248](https://github.com/magna-nz/forgetop/pull/248))
+
+Changed
+
+- In a work item opened from the inbox, `e` is done & next, so edit is `E` there (`E` edits
+  everywhere else too). `A`, `d` and `D` in the inbox still work, as mark all read, done and
+  done all. ([#248](https://github.com/magna-nz/forgetop/pull/248))
+
 ## 1.11.0 — 2026-10-14
 
 Added

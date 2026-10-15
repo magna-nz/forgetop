@@ -8,6 +8,7 @@ pub mod domain;
 pub mod error;
 pub mod filter;
 pub mod highlight;
+pub mod inbox;
 pub mod launchpad;
 pub mod provider;
 pub mod repo;

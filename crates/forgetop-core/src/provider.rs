@@ -569,8 +569,19 @@ pub trait PipelineSource: Send + Sync {
 pub trait NotificationSource: Send + Sync {
     /// The current user's notifications, newest first.
     async fn list(&self) -> Result<Vec<Notification>>;
-    /// Mark a single notification read by its id.
+    /// Mark a single notification read by its id. Opening one does this; it stays listed.
     async fn mark_read(&self, id: &str) -> Result<()>;
+    /// Done with a notification: what clears it from the forge's own inbox where the forge has
+    /// such a state (GitHub "mark as done", GitLab's to-do done). Default: mark it read. Either
+    /// way the frontends save a dismissal for it, which is what keeps it out of forgetop's inbox.
+    async fn mark_done(&self, id: &str) -> Result<()> {
+        self.mark_read(id).await
+    }
+    /// The actor and excerpt of one notification whose list entry didn't carry them — fetched
+    /// for the selected row only, never during a reload. Default: nothing more to say.
+    async fn detail(&self, _notification: &Notification) -> Result<NotificationDetail> {
+        Ok(NotificationDetail::default())
+    }
     /// Mark every notification read. Default: mark each one; providers with a bulk endpoint
     /// (GitHub `PUT /notifications`, GitLab `/todos/mark_as_done`) should override.
     async fn mark_all_read(&self) -> Result<()> {

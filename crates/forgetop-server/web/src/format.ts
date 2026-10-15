@@ -333,6 +333,12 @@ export function notificationMeta(kind: NotificationKind): { icon: string; glyph:
       return { icon: "❝", glyph: "comment", label: "Comment", color: V("yellow") };
     case "StateChange":
       return { icon: "↻", glyph: "refresh", label: "State change", color: V("green") };
+    case "NewItem":
+      return { icon: "+", glyph: "plus", label: "New", color: V("cyan") };
+    case "Due":
+      return { icon: "◷", glyph: "clock", label: "Due", color: V("yellow") };
+    case "Reaction":
+      return { icon: "☺", glyph: "smile", label: "Reaction", color: V("dim") };
     case "Other":
       return { icon: "•", glyph: "dot", label: "Update", color: V("dim") };
   }

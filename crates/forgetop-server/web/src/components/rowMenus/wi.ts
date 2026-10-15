@@ -77,7 +77,7 @@ export function useWiRowMenu(): (row: WiRowLike, opts?: RowMenuOpts) => MenuEntr
       };
 
       const entries: MenuEntry[] = [
-        { label: "Open", icon: "open-pane", hint: "↵", onSelect: () => open(ref) },
+        { label: "Open", icon: "open-pane", hint: "↵", onSelect: () => void open(ref) },
         {
           label: `Open in ${providerMeta(row.provider).label}`,
           icon: "external",
@@ -150,8 +150,8 @@ export function useWiRowMenu(): (row: WiRowLike, opts?: RowMenuOpts) => MenuEntr
             ];
           },
         },
-        { label: "Edit title & description…", icon: "pencil", hint: "e", onSelect: () => open(ref, "edit") },
-        { label: "Comment…", icon: "comment", hint: "c", onSelect: () => open(ref, "comment") },
+        { label: "Edit title & description…", icon: "pencil", hint: "e", onSelect: () => void open(ref, "edit") },
+        { label: "Comment…", icon: "comment", hint: "c", onSelect: () => void open(ref, "comment") },
         { type: "separator" },
         {
           id: "hide-state",

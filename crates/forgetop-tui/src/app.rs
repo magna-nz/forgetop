@@ -10,6 +10,7 @@ use forgetop_core::cache::{CachePut, CacheStore};
 use forgetop_core::config::{NotificationPrefs, SavedView, SortPref};
 use forgetop_core::domain::*;
 use forgetop_core::filter::{pull_request_matches, run_triggered_by};
+use forgetop_core::inbox::{self, InboxThread};
 use forgetop_core::provider::*;
 use forgetop_core::runlog::{self, FailureSummary, LogSection};
 use forgetop_core::service::{ConfigService, ConnectionHealth, ConnectionHealthService, SectionService};
@@ -66,6 +67,7 @@ const DIAG_INBOX_PR_DETAIL: &str = "tui.inbox.pr_detail";
 const DIAG_INBOX_WI_DETAIL: &str = "tui.inbox.work_item_detail";
 const DIAG_INBOX_MARK_READ: &str = "tui.inbox.mark_read";
 const DIAG_INBOX_MARK_ALL_READ: &str = "tui.inbox.mark_all_read";
+const DIAG_INBOX_DETAIL: &str = "tui.inbox.notification_detail";
 
 // ---- cache keys ----
 //
@@ -154,13 +156,6 @@ fn mark_cached_inbox_read(cache: &CacheStore, matches: impl Fn(&NotifRow) -> boo
             })
             .collect()
     });
-}
-
-/// Identity of a notification for dismissal. It carries `updated_at` so a thread with new
-/// activity since it was dismissed is a different key — and shows up again.
-fn inbox_dismiss_key(row: &NotifRow) -> String {
-    let at = row.notification.updated_at.map(|t| t.timestamp()).unwrap_or_default();
-    format!("{}:{}:{at}", row.connection_id, row.notification.id)
 }
 
 /// Every cached list a connection contributes rows to. The PR list is keyed by filter and
@@ -348,6 +343,12 @@ pub enum AppEvent {
     /// `None` text means the forge couldn't say. Applied only if the view still shows that PR
     /// at that commit.
     FileTextLoaded { key: String, path: String, sha: Option<String>, text: Option<String> },
+    /// The who and what of one inbox notification, fetched for the selected thread's lead (see
+    /// [`App::tick_inbox_detail`]). `None` when the call failed; it is not asked again.
+    InboxDetailLoaded { conn_id: String, id: String, detail: Option<NotificationDetail> },
+    /// Marking inbox notifications read at their forge failed after the inbox already showed
+    /// them read (the next refresh shows the forge's truth).
+    InboxReadFailed { error: String },
 }
 
 /// A snapshot of everything the background fetch needs from `self` at spawn time, so it
@@ -763,12 +764,19 @@ pub struct WiRow {
 }
 
 /// One notification tagged with the connection it came from (for the inbox).
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct NotifRow {
     pub connection_id: String,
     pub connection: String,
     pub provider: ProviderType,
     pub notification: Notification,
+}
+
+impl NotifRow {
+    /// This notification's key in the shared dismissal list (core's [`inbox::dismiss_key`]).
+    pub fn dismiss_key(&self) -> String {
+        inbox::dismiss_key(&self.connection_id, &self.notification)
+    }
 }
 
 /// The four fetched sections behind a full-screen PR view (Conversation/Commits/Checks/Diff),
@@ -917,7 +925,24 @@ pub struct App {
     pub pipes: Vec<PipeRow>,
     /// The cross-provider notification inbox (distinct from `notifications`, the desktop-ping prefs).
     pub inbox: Vec<NotifRow>,
+    /// The selected thread: an index into [`App::inbox_threads`].
     pub inbox_sel: usize,
+    /// The user's `p` choice for the inbox preview; `None` shows it.
+    pub inbox_preview: Option<bool>,
+    /// Inbox threads marked with Space for a bulk dismiss (`b`), by thread key: rows are rebuilt
+    /// on every refresh, so a mark names the thread rather than where it sits.
+    pub inbox_marks: HashSet<String>,
+    /// Notification details fetched this session, by (connection, notification id), so a row a
+    /// refresh brings back without them gets them again without asking the forge twice.
+    inbox_details: HashMap<(String, String), NotificationDetail>,
+    /// Details already asked for (answered or not): each is asked for once a session.
+    inbox_detail_asked: HashSet<(String, String)>,
+    /// The detail the selected thread wants, and the anim ticks the cursor has rested on it.
+    inbox_detail_wait: Option<((String, String), u8)>,
+    /// The thread ([`InboxThread::key`]) the open item view was opened from, for the triage strip.
+    pub(crate) inbox_origin: Option<String>,
+    /// Where that item view should land (its comment, its checks).
+    pub inbox_landing: Option<InboxLanding>,
     /// URL of the embedded web dashboard, if its server started. `B` opens it.
     pub dashboard_url: Option<String>,
     /// Browser boundary for the global feedback shortcut. A function pointer keeps the
@@ -1067,7 +1092,7 @@ pub struct App {
     /// dashboard is told apart from one made here (a saved view sets `wi_hidden_states`
     /// without saving it, and must not be undone by the next sync).
     shared_hidden_states_seen: Vec<String>,
-    /// Notifications dismissed from the inbox (`d` / `D`), keyed by [`inbox_dismiss_key`].
+    /// Notifications done in the inbox (`e` / `E`, here or in the dashboard), keyed by [`inbox::dismiss_key`].
     /// Persisted to config so they stay hidden across restarts.
     inbox_dismissed: HashSet<String>,
     /// True when the currently-open item view was opened from the Launchpad, so Esc
@@ -1075,7 +1100,7 @@ pub struct App {
     lp_origin: bool,
     /// True when the open item view was opened from the notification inbox, so Esc returns
     /// there. Takes precedence over `lp_origin`.
-    from_inbox: bool,
+    pub(crate) from_inbox: bool,
     /// True while a background refresh is in flight (drives the header spinner + loading text).
     pub reloading: bool,
     /// Sender for completed background jobs; set once the event loop is running.
@@ -1103,6 +1128,9 @@ pub struct App {
     /// True while the open item view is a pane over the Command Center it was opened from,
     /// rather than full-screen: the Command Center stays drawn beside it and Esc closes it.
     pub lp_pane: bool,
+    /// True while the item opened from the inbox is a pane beside the inbox list rather than
+    /// full-screen: Enter on a thread opens it here, Enter again makes it full-screen.
+    pub inbox_pane: bool,
     /// Width of the content area in the last frame, which decides whether the split fits.
     pub content_w: u16,
     /// The log fetch in flight — `(conn, run, job)` key and anim ticks waited — so at most
@@ -1246,6 +1274,76 @@ pub enum Screen {
     WiView(Box<WiView>),
     /// The cross-provider notification inbox.
     Inbox,
+}
+
+/// The narrowest content area that shows the inbox's preview beside its list unasked. Below it
+/// the list keeps the width; `space` shows the preview anyway (under the list).
+pub const INBOX_PREVIEW_MIN_WIDTH: u16 = 120;
+
+/// Where an item view opened from the inbox should land — the comment, the failing check — and
+/// what is still to do about it. Set by [`App::open_inbox_selected`]; the item's detail may not
+/// be fetched yet, so the search for the target runs again when it lands.
+pub struct InboxLanding {
+    /// The opened item's detail cache key: the landing applies only while that item is the screen.
+    pub key: String,
+    pub target: NotificationTarget,
+    /// Still looking for the target in the view's (possibly not yet fetched) detail.
+    seek: bool,
+    /// Scroll the target into view once the next frame has said where it is.
+    reveal: bool,
+    /// The wrapped row the renderer drew the target on in the last frame.
+    pub row: Cell<Option<u16>>,
+}
+
+impl InboxLanding {
+    /// A landing on `target` in the item whose detail key is `key`, not yet looked for.
+    pub fn new(key: String, target: NotificationTarget) -> Self {
+        InboxLanding { key, target, seek: true, reveal: false, row: Cell::new(None) }
+    }
+
+    /// A landing on `target` in the item `screen` shows — `None` when it shows no PR or work item.
+    pub fn for_screen(screen: &Screen, target: NotificationTarget) -> Option<Self> {
+        let key = match screen {
+            Screen::PrView(v) => pr_detail_cache_key(&v.connection_id, &v.pr.item_ref()),
+            Screen::WiView(v) => wi_detail_cache_key(&v.connection_id, &v.wi.item_ref()),
+            Screen::Pipeline(v) => pipeline_detail_cache_key(&v.connection_id, &v.run.item_ref()),
+            _ => return None,
+        };
+        Some(InboxLanding::new(key, target))
+    }
+
+    /// Whether `screen` is the item this landing was made for.
+    pub fn applies_to(&self, screen: &Screen) -> bool {
+        match screen {
+            Screen::PrView(v) => pr_detail_cache_key(&v.connection_id, &v.pr.item_ref()) == self.key,
+            Screen::WiView(v) => wi_detail_cache_key(&v.connection_id, &v.wi.item_ref()) == self.key,
+            Screen::Pipeline(v) => pipeline_detail_cache_key(&v.connection_id, &v.run.item_ref()) == self.key,
+            _ => false,
+        }
+    }
+
+    /// The comment the item was opened at, if any.
+    pub fn comment(&self) -> Option<&str> {
+        match &self.target {
+            NotificationTarget::Comment { id } => Some(id),
+            _ => None,
+        }
+    }
+}
+
+/// Which PR tab a notification's target opens on.
+fn inbox_target_tab(target: &NotificationTarget) -> usize {
+    match target {
+        NotificationTarget::Checks => 2,
+        NotificationTarget::Diff => 3,
+        NotificationTarget::Overview | NotificationTarget::Comment { .. } | NotificationTarget::Activity | NotificationTarget::Run { .. } => 0,
+    }
+}
+
+/// Whether `thread` holds the comment `id` (or is that thread — some forges address a review
+/// thread rather than its first comment).
+fn thread_holds_comment(thread: &CommentThread, id: &str) -> bool {
+    thread.id == id || thread.comments.iter().any(|c| c.id == id)
 }
 
 /// State for the full-screen PR view.
@@ -3467,6 +3565,13 @@ impl App {
             pipes: Vec::new(),
             inbox: Vec::new(),
             inbox_sel: 0,
+            inbox_preview: None,
+            inbox_marks: HashSet::new(),
+            inbox_details: HashMap::new(),
+            inbox_detail_asked: HashSet::new(),
+            inbox_detail_wait: None,
+            inbox_origin: None,
+            inbox_landing: None,
             dashboard_url: None,
             feedback_opener: system_feedback_opener,
             pr_state: TableState::default(),
@@ -3544,6 +3649,7 @@ impl App {
             pr_viewed: HashMap::new(),
             preview_focus: false,
             lp_pane: false,
+            inbox_pane: false,
             content_w: 0,
             log_inflight: None,
             run_details: HashMap::new(),
@@ -4225,7 +4331,7 @@ impl App {
     }
 
     /// Takes in what the other frontend saved since this one last looked: Command Center
-    /// dismissals and hidden work-item states live in the config both share, and the dashboard
+    /// dismissals, inbox dismissals and hidden work-item states live in the config both share, and the dashboard
     /// adds to them while the TUI runs. Called on every reload, so a dismissal made in the
     /// browser leaves the terminal's Command Center within one refresh. Cheap when nothing
     /// changed; a changed list replaces the local copy (what was dismissed here is in the saved
@@ -4239,6 +4345,9 @@ impl App {
         if ui.hidden_work_item_states != self.shared_hidden_states_seen {
             self.apply_hidden_work_item_states(&ui.hidden_work_item_states);
         }
+        // Inbox "done" from the dashboard. Taken in as a union: a key is only ever forgotten
+        // here by the same rule the saved list prunes by (the feed stopped returning it).
+        self.inbox_dismissed.extend(ui.dismissed_notifications.iter().cloned());
     }
 
     /// Applies persisted Command Center dismissals at startup (seeds the in-memory set;
@@ -4526,11 +4635,21 @@ impl App {
                 self.refresh_repo_scope(deps);
             }
             AppEvent::PrDetailLoaded { key, detail, fetched_at } => {
+                let landing = self.inbox_landing.as_ref().is_some_and(|l| l.key == key);
                 self.with_preview_screen(&key.clone(), |app| app.apply_pr_detail(deps, key, *detail, fetched_at));
+                if landing {
+                    self.seek_inbox_landing(true);
+                }
             }
             AppEvent::WiDetailLoaded { key, detail, fetched_at } => {
+                let landing = self.inbox_landing.as_ref().is_some_and(|l| l.key == key);
                 self.with_preview_screen(&key.clone(), |app| app.apply_wi_detail(deps, key, *detail, fetched_at));
+                if landing {
+                    self.seek_inbox_landing(true);
+                }
             }
+            AppEvent::InboxDetailLoaded { conn_id, id, detail } => self.apply_inbox_detail(conn_id, id, detail),
+            AppEvent::InboxReadFailed { error } => self.toast = Some(error),
             AppEvent::PipelineDetailLoaded { key, detail, fetched_at } => {
                 // Every run detail seen this session feeds the job estimates of in-flight runs.
                 if let Some(run) = &detail.run {
@@ -4775,9 +4894,12 @@ impl App {
         if self.preview_focus && !matches!(self.screen, Screen::PrView(_) | Screen::WiView(_) | Screen::Pipeline(_)) {
             self.preview_focus = false;
         }
-        // The same for the pane over the Command Center.
+        // The same for the pane over the Command Center, and the one beside the inbox.
         if self.lp_pane && !self.item_view_open() {
             self.lp_pane = false;
+        }
+        if self.inbox_pane && !self.item_view_open() {
+            self.inbox_pane = false;
         }
         if !matches!(self.screen, Screen::List) || !self.preview_shown() {
             self.preview = None;
@@ -5105,7 +5227,7 @@ impl App {
             self.open_pending_exit_prompt();
             return;
         }
-        self.screen = self.view_origin();
+        self.return_to_origin();
     }
 
     // ---- command palette ----
@@ -5281,12 +5403,13 @@ impl App {
                     out.push(("Open in browser", c('o')));
                 }
             }
-            // The WI arm of `on_key_inner` and `on_wi_view_key`.
+            // The WI arm of `on_key_inner` and `on_wi_view_key`. Opened from the inbox, `e` is the
+            // triage strip's "done", and editing is on `E`.
             Screen::WiView(v) => {
                 out.extend([
                     ("Update state", c('u')),
                     ("Assign…", c('@')),
-                    ("Edit title / description", c('e')),
+                    ("Edit title / description", c(if self.inbox_triage() { 'E' } else { 'e' })),
                     ("Comment", c('c')),
                 ]);
                 if v.wi.url.is_some() {
@@ -5356,18 +5479,24 @@ impl App {
             }
             // `on_inbox_key`.
             Screen::Inbox => {
-                if let Some(row) = self.inbox.get(self.inbox_sel) {
-                    if row.notification.url.is_some() {
+                if let Some(t) = self.inbox_selected() {
+                    out.push(("Open at the notification", Key::Enter));
+                    if self.inbox[t.lead].notification.url.is_some() {
                         out.push(("Open in browser", c('o')));
                     }
                     out.extend([
+                        ("Dismiss (cleared from the inbox)", c('e')),
+                        ("Dismiss every thread", c('E')),
                         ("Mark read", c('x')),
-                        ("Mark all read", c('A')),
-                        ("Dismiss", c('d')),
-                        ("Dismiss all", c('D')),
+                        ("Mark every thread in this view read", c('A')),
                     ]);
                 }
-                out.push(("Refresh", c('r')));
+                out.extend([
+                    ("Select / unselect", c(' ')),
+                    ("Bulk dismiss the selected", c('b')),
+                    ("Preview on / off", c('p')),
+                    ("Refresh", c('r')),
+                ]);
             }
             // `on_config_key`.
             Screen::Config(v) => {
@@ -5533,6 +5662,9 @@ impl App {
             _ => {
                 self.lp_origin = matches!(self.screen, Screen::Launchpad);
                 self.from_inbox = matches!(self.screen, Screen::Inbox);
+                // Not a thread opened at its target: no triage strip over it.
+                self.inbox_origin = None;
+                self.inbox_landing = None;
             }
         }
         // A full view, not the list's preview: the opened item has no list row beside it.
@@ -5571,7 +5703,7 @@ impl App {
 
     /// Show the notification inbox, keeping its selection in range.
     fn open_inbox(&mut self) {
-        self.inbox_sel = self.inbox_sel.min(self.inbox.len().saturating_sub(1));
+        self.clamp_inbox_sel();
         self.screen = Screen::Inbox;
     }
 
@@ -5634,27 +5766,79 @@ impl App {
         });
     }
 
-    /// Number of unread notifications — drives the header indicator.
+    /// The inbox rows as core's thread grouping takes them: (connection, notification).
+    pub fn inbox_rows(&self) -> Vec<(&str, &Notification)> {
+        self.inbox.iter().map(|r| (r.connection_id.as_str(), &r.notification)).collect()
+    }
+
+    /// Every visible thread, newest first: core's grouping, a view over the rows on hand.
+    pub fn inbox_all_threads(&self) -> Vec<InboxThread> {
+        inbox::threads(&self.inbox_rows())
+    }
+
+    /// What the inbox lists: the threads waiting on you, newest first (core's [`inbox::inbox`],
+    /// as the dashboard lists them). [`App::inbox_sel`] indexes this.
+    pub fn inbox_threads(&self) -> Vec<InboxThread> {
+        inbox::inbox(&self.inbox_rows())
+    }
+
+    /// The selected thread of the current view.
+    pub fn inbox_selected(&self) -> Option<InboxThread> {
+        self.inbox_threads().into_iter().nth(self.inbox_sel)
+    }
+
+    /// The thread the open item view was opened from, while the triage strip applies.
+    pub fn inbox_origin(&self) -> Option<&str> {
+        self.inbox_origin.as_deref()
+    }
+
+    /// Whether the inbox draws its preview: the user's `space` choice, else yes.
+    pub fn inbox_preview_shown(&self) -> bool {
+        // Always, unless `space` hid it: beside the list when wide, under it when narrow.
+        self.inbox_preview.unwrap_or(true)
+    }
+
+    fn clamp_inbox_sel(&mut self) {
+        let n = self.inbox_threads().len();
+        self.inbox_sel = self.inbox_sel.min(n.saturating_sub(1));
+    }
+
+    /// Puts the selection on thread `key` when the current view lists it; otherwise keeps the
+    /// index, in range. Reading a thread can hand its lead to another reason, and so move it.
+    fn select_inbox_thread(&mut self, key: Option<&str>) {
+        match key.and_then(|k| self.inbox_threads().iter().position(|t| t.key == k)) {
+            Some(i) => self.inbox_sel = i,
+            None => self.clamp_inbox_sel(),
+        }
+    }
+
+    /// Unread threads waiting on you — the tab row's "Notifications (N)". Threads, not events:
+    /// five comments and a mention on one issue are one thing to look at, and what you merely
+    /// follow doesn't count.
     pub fn unread_count(&self) -> usize {
-        self.inbox.iter().filter(|r| r.notification.unread).count()
+        self.inbox_threads().iter().filter(|t| t.unread).count()
     }
 
     fn inbox_move(&mut self, delta: isize) {
-        let n = self.inbox.len();
+        let n = self.inbox_threads().len();
         if n == 0 {
             return;
         }
         self.inbox_sel = (self.inbox_sel as isize + delta).rem_euclid(n as isize) as usize;
     }
 
+
     async fn on_inbox_key(&mut self, key: Key, deps: &AppDeps) {
         match key {
+            // Marks are let go first: Esc backs out one thing at a time, as on the lists.
+            Key::Escape if !self.inbox_marks.is_empty() => self.inbox_marks.clear(),
             Key::Escape => self.screen = Screen::Launchpad,
             Key::Up | Key::Char('k') => self.inbox_move(-1),
             Key::Down | Key::Char('j') => self.inbox_move(1),
             Key::Enter => self.open_inbox_selected(deps).await,
             Key::Char('o') => {
-                if let Some(url) = self.inbox.get(self.inbox_sel).and_then(|r| r.notification.url.clone()) {
+                let url = self.inbox_selected().and_then(|t| self.inbox[t.lead].notification.url.clone());
+                if let Some(url) = url {
                     self.toast = Some(match open::that(&url) {
                         Ok(_) => "Opened in browser".into(),
                         Err(e) => format!("Couldn't open: {e}"),
@@ -5662,39 +5846,152 @@ impl App {
                 }
             }
             Key::Char('x') => self.mark_selected_inbox_read(deps).await,
-            Key::Char('A') => self.mark_all_inbox_read(deps).await,
-            Key::Char('d') => self.dismiss_selected_inbox(deps).await,
-            Key::Char('D') => self.confirm_dismiss_all_inbox(),
+            // `A`, `d` and `D` are the keys these had before threads: kept for a release.
+            Key::Char('A') => self.mark_inbox_view_read(deps).await,
+            Key::Char('e' | 'd') => self.done_selected_inbox(deps).await,
+            Key::Char('E' | 'D') => self.confirm_done_inbox_view(),
+            // Space marks a thread, as on the section lists; `b` dismisses the marked ones.
+            Key::Char(' ') => self.toggle_inbox_mark(),
+            Key::Char('b') => self.bulk_dismiss_inbox(deps).await,
+            Key::Char('p') => self.inbox_preview = Some(!self.inbox_preview_shown()),
             Key::Char('r') => self.request_reload(deps),
             _ => {}
         }
     }
 
-    /// Drill into the item a notification points at (fetching it), or open the browser when
-    /// there's no in-app target. Opening also marks the notification read.
+    /// The marked threads still in the inbox, in the order shown. Marks on threads that left
+    /// (dismissed elsewhere, or gone from the feed) count for nothing.
+    pub fn marked_inbox_threads(&self) -> Vec<InboxThread> {
+        self.inbox_threads().into_iter().filter(|t| self.inbox_marks.contains(&t.key)).collect()
+    }
+
+    /// Space: marks the thread under the cursor for a bulk dismiss, or lets go of it.
+    fn toggle_inbox_mark(&mut self) {
+        let Some(t) = self.inbox_selected() else { return };
+        let listed: HashSet<String> = self.inbox_threads().into_iter().map(|t| t.key).collect();
+        self.inbox_marks.retain(|k| listed.contains(k));
+        if !self.inbox_marks.remove(&t.key) {
+            self.inbox_marks.insert(t.key);
+        }
+    }
+
+    /// `b`: dismisses every marked thread — the forge's done, and gone from both frontends.
+    async fn bulk_dismiss_inbox(&mut self, deps: &AppDeps) {
+        let threads = self.marked_inbox_threads();
+        self.inbox_marks.clear();
+        if threads.is_empty() {
+            self.toast = Some("Nothing selected — Space marks a notification".into());
+            return;
+        }
+        let n = threads.len();
+        self.toast = Some(format!("Dismissed {n} {}", if n == 1 { "notification" } else { "notifications" }));
+        self.done_inbox_threads(deps, threads).await;
+    }
+
+    /// The connection and member ids of `t` — what marking it read sends.
+    fn inbox_thread_reads(&self, t: &InboxThread) -> (String, Vec<String>) {
+        let conn = self.inbox[t.lead].connection_id.clone();
+        // Only what is still unread: each mark-read is a forge call (on GitHub, from the budget).
+        let unread = t.members.iter().map(|&i| &self.inbox[i].notification).filter(|n| n.unread);
+        (conn, unread.map(|n| n.id.clone()).collect())
+    }
+
+    /// The reads for several threads, one entry per connection.
+    fn inbox_reads(&self, threads: &[InboxThread]) -> Vec<(String, Vec<String>)> {
+        let mut out: Vec<(String, Vec<String>)> = Vec::new();
+        for t in threads {
+            let (conn, ids) = self.inbox_thread_reads(t);
+            match out.iter_mut().find(|(c, _)| *c == conn) {
+                Some((_, all)) => all.extend(ids),
+                None => out.push((conn, ids)),
+            }
+        }
+        out
+    }
+
+    /// Shows `t` read here and in the cache the next launch paints.
+    fn read_inbox_thread_locally(&mut self, t: &InboxThread, deps: &AppDeps) {
+        let (conn, ids) = self.inbox_thread_reads(t);
+        for &i in &t.members {
+            self.inbox[i].notification.unread = false;
+        }
+        mark_cached_inbox_read(&deps.cache, |row| row.connection_id == conn && ids.contains(&row.notification.id));
+    }
+
+    /// Marks notifications read at their forges: `reads` per connection, or every one when `all`.
+    /// The inbox already shows them read; this runs off the key path when the app has a job
+    /// channel, and a failure comes back as a toast (the next refresh shows the forge's truth).
+    async fn send_inbox_reads(&mut self, deps: &AppDeps, reads: Vec<(String, Vec<String>)>, all: bool) {
+        let job = mark_read_at_forges(deps.clone(), reads, all);
+        match self.job_tx.clone() {
+            Some(tx) => {
+                tokio::spawn(async move {
+                    if let Err(error) = job.await {
+                        let _ = tx.send(AppEvent::InboxReadFailed { error });
+                    }
+                });
+            }
+            None => {
+                if let Err(error) = job.await {
+                    self.toast = Some(error);
+                }
+            }
+        }
+    }
+
+    /// Opens the selected thread's item where its lead points — a PR at the comment, on its
+    /// Checks or its Diff; a work item at the comment — or the browser when there is no view for
+    /// it here. Opening marks every member of the thread read.
     async fn open_inbox_selected(&mut self, deps: &AppDeps) {
-        let Some(row) = self.inbox.get(self.inbox_sel) else { return };
-        let conn = row.connection_id.clone();
-        let n = &row.notification;
-        let (item_type, item_id, url, notif_id) = (n.item_type, n.item_id.clone(), n.url.clone(), n.id.clone());
+        let Some(t) = self.inbox_selected() else { return };
+        // From the list, the item opens in a pane beside it when both fit; walking the inbox from
+        // an open item keeps it however it is now — in the pane, or full-screen.
+        let pane = if matches!(self.screen, Screen::Inbox) { self.content_w >= PREVIEW_MIN_WIDTH } else { self.inbox_pane };
+        let lead = self.inbox[t.lead].clone();
+        let reads = self.inbox_thread_reads(&t);
+        self.read_inbox_thread_locally(&t, deps);
+        self.select_inbox_thread(Some(&t.key));
+        self.send_inbox_reads(deps, vec![reads], false).await;
+
+        let conn = lead.connection_id.clone();
+        let mut n = lead.notification;
         // A notification names the repository its item lives in, which is what lets the inbox
         // open an item on a connection that spans several of them.
         let item_repo = n.repository.clone();
-
-        if let Err(error) = self.mark_inbox_read(&conn, &notif_id, deps).await {
-            self.toast = Some(error);
-            return;
-        }
-
-        match (item_type, item_id) {
+        match (n.item_type, n.item_id.clone()) {
+            (NotificationItemType::Pipeline, _) => {
+                // GitHub names only the check suite; the run is the detail's to say. Opened before
+                // the preview asked for it, ask now — one call, for this row only.
+                if !matches!(n.target, NotificationTarget::Run { .. }) && n.detail_ref.is_some() {
+                    if let Some(d) = self.inbox_detail_now(&conn, &n, deps).await {
+                        d.fill(&mut n);
+                    }
+                }
+                if let NotificationTarget::Run { id } = &n.target {
+                    let feeds = detail_or_default(deps.sections.pipeline_feeds().await, DIAG_PIPELINE_FEEDS);
+                    if let Some(feed) = feeds.iter().find(|f| f.connection.connection_id() == conn) {
+                        if let Some(run) = detail_or_none(feed.source.get_run(&ItemRef::maybe(item_repo.clone(), id.clone())).await, DIAG_PIPELINE_RUN) {
+                            let provider = feed.connection.provider_type();
+                            let (run_id, definition_id, branch) = (run.id.clone(), run.definition_id.clone(), run.branch.clone());
+                            let key = pipeline_detail_cache_key(&conn, &run.item_ref());
+                            self.open_pipeline_for(deps, conn, provider, run_id, definition_id, branch, n.title.clone(), run);
+                            // Esc comes back to this thread in the inbox, and the strip walks it.
+                            self.enter_from_inbox(&t.key, key, NotificationTarget::Overview);
+                            self.inbox_pane = pane;
+                            return;
+                        }
+                    }
+                }
+            }
             (NotificationItemType::PullRequest, Some(id)) => {
                 if let Some(src) = self.pr_source_for(&conn, deps).await {
                     match src.get(&ItemRef::maybe(item_repo.clone(), id.clone())).await {
                         Ok(pr) => {
-                            self.from_inbox = true;
-                            self.lp_origin = false;
+                            self.enter_from_inbox(&t.key, pr_detail_cache_key(&conn, &pr.item_ref()), n.target.clone());
                             let (label, purl) = (pr_label(&pr), pr.url.clone());
-                            self.open_pr_view_for(deps, 0, label, purl, conn, pr);
+                            self.open_pr_view_for(deps, inbox_target_tab(&n.target), label, purl, conn, pr);
+                            self.inbox_pane = pane;
+                            self.seek_inbox_landing(false);
                             return;
                         }
                         Err(_) => log_operation_failure(DIAG_INBOX_PR_DETAIL),
@@ -5705,9 +6002,10 @@ impl App {
                 if let Some(src) = self.wi_source_for(&conn, deps).await {
                     match src.get(&ItemRef::maybe(item_repo.clone(), id.clone())).await {
                         Ok(wi) => {
-                            self.from_inbox = true;
-                            self.lp_origin = false;
+                            self.enter_from_inbox(&t.key, wi_detail_cache_key(&conn, &wi.item_ref()), n.target.clone());
                             self.open_wi_view_for(deps, conn, wi);
+                            self.inbox_pane = pane;
+                            self.seek_inbox_landing(false);
                             return;
                         }
                         Err(_) => log_operation_failure(DIAG_INBOX_WI_DETAIL),
@@ -5716,8 +6014,13 @@ impl App {
             }
             _ => {}
         }
-        // No in-app target (or the fetch failed) — fall back to the browser.
-        match url {
+        // No view for it here (or the fetch failed): back on the inbox at this thread — a `]`
+        // from the triage strip lands here too — and the browser.
+        if !matches!(self.screen, Screen::Inbox) {
+            self.inbox_origin = Some(t.key.clone());
+            self.leave_to_inbox();
+        }
+        match n.url {
             Some(u) => {
                 self.toast = Some(match open::that(&u) {
                     Ok(_) => "Opened in browser".into(),
@@ -5728,130 +6031,398 @@ impl App {
         }
     }
 
-    async fn mark_selected_inbox_read(&mut self, deps: &AppDeps) {
-        if let Some((conn, id)) = self.inbox.get(self.inbox_sel).map(|r| (r.connection_id.clone(), r.notification.id.clone())) {
-            self.toast = Some(match self.mark_inbox_read(&conn, &id, deps).await {
-                Ok(()) => "Marked read".into(),
-                Err(error) => error,
-            });
-        }
+    /// Notes that the item view about to open comes from inbox thread `thread`, and where in it
+    /// to land. The view is full screen: the triage strip goes above it, not beside a list.
+    fn enter_from_inbox(&mut self, thread: &str, key: String, target: NotificationTarget) {
+        self.from_inbox = true;
+        self.lp_origin = false;
+        self.preview_focus = false;
+        self.lp_pane = false;
+        self.inbox_origin = Some(thread.to_owned());
+        self.inbox_landing = Some(InboxLanding::new(key, target));
     }
 
-    async fn mark_inbox_read(&mut self, conn: &str, notif_id: &str, deps: &AppDeps) -> std::result::Result<(), String> {
-        let feeds = deps.sections.notification_feeds().await.map_err(|error| {
-            inbox_action_error(
-                "Couldn't load notification connections",
-                error,
-                DIAG_INBOX_FEEDS,
-            )
-        })?;
-        let feed = feeds
-            .iter()
-            .find(|feed| feed.connection.connection_id() == conn)
-            .ok_or_else(|| {
-                inbox_action_error(
-                    "Couldn't mark notification read",
-                    "notification connection unavailable",
-                    DIAG_INBOX_MARK_READ,
-                )
-            })?;
-        feed.source.mark_read(notif_id).await.map_err(|error| {
-            inbox_action_error(
-                "Couldn't mark notification read",
-                error,
-                DIAG_INBOX_MARK_READ,
-            )
-        })?;
-        for row in &mut self.inbox {
-            if row.connection_id == conn && row.notification.id == notif_id {
-                row.notification.unread = false;
+    /// Looks for the landing's target in the open view: the general thread holding the comment
+    /// (the Conversation cursor goes on it), the first failing check, the work item's comment.
+    /// `last` is the fetched detail answering: a target still not found then never will be, and
+    /// the view stays on its tab without a selection.
+    fn seek_inbox_landing(&mut self, last: bool) {
+        let Some(landing) = self.inbox_landing.as_mut() else { return };
+        if !landing.seek || !landing.applies_to(&self.screen) {
+            return;
+        }
+        let found = match (&mut self.screen, &landing.target) {
+            (Screen::PrView(v), NotificationTarget::Comment { id }) => {
+                let general = v.general_threads().position(|t| thread_holds_comment(t, id));
+                if let Some(i) = general {
+                    v.conv_sel = Some(i);
+                }
+                // A line comment is listed on the Conversation too, without a cursor of its own:
+                // it is still scrolled to and tagged.
+                general.is_some() || v.diff.threads.iter().any(|t| thread_holds_comment(t, id))
             }
-        }
-        mark_cached_inbox_read(&deps.cache, |row| row.connection_id == conn && row.notification.id == notif_id);
-        Ok(())
-    }
-
-    async fn mark_all_inbox_read(&mut self, deps: &AppDeps) {
-        let feeds = match deps.sections.notification_feeds().await {
-            Ok(feeds) => feeds,
-            Err(error) => {
-                self.toast = Some(inbox_action_error(
-                    "Couldn't load notification connections",
-                    error,
-                    DIAG_INBOX_FEEDS,
-                ));
+            (Screen::PrView(v), NotificationTarget::Checks) => v.checks.iter().any(|c| c.status == CheckStatus::Failed),
+            (Screen::WiView(v), NotificationTarget::Comment { id }) => v.threads.iter().any(|t| thread_holds_comment(t, id)),
+            // The tab was the whole of it.
+            _ => {
+                landing.seek = false;
                 return;
             }
         };
-        if feeds.is_empty() && !self.inbox.is_empty() {
-            self.toast = Some(inbox_action_error(
-                "Couldn't mark all notifications read",
-                "notification connections unavailable",
-                DIAG_INBOX_MARK_ALL_READ,
-            ));
+        if found {
+            landing.seek = false;
+            landing.reveal = true;
+            landing.row.set(None);
+        } else if last {
+            landing.seek = false;
+        }
+    }
+
+    /// After a frame: scrolls the landing's target into view, now that the renderer has said
+    /// which row it is on. Once — after that the scroll is the user's.
+    pub fn reveal_inbox_landing(&mut self) {
+        let Some(landing) = self.inbox_landing.as_mut() else { return };
+        if !landing.reveal || !landing.applies_to(&self.screen) {
             return;
         }
-        for feed in feeds {
-            if let Err(error) = feed.source.mark_all_read().await {
-                self.toast = Some(inbox_action_error(
-                    "Couldn't mark all notifications read",
-                    error,
-                    DIAG_INBOX_MARK_ALL_READ,
-                ));
-                return;
+        let Some(row) = landing.row.get() else { return };
+        landing.reveal = false;
+        // One row of what comes before it, so the target doesn't sit flush on the border.
+        let scroll = row.saturating_sub(1).min(self.detail_scroll_max);
+        match &mut self.screen {
+            Screen::PrView(v) => v.scroll = scroll,
+            Screen::WiView(v) => v.scroll = scroll,
+            _ => {}
+        }
+    }
+
+    /// Whether the open item view came from an inbox thread: the triage strip shows above it,
+    /// and `]` `[` `e` walk the inbox.
+    pub fn inbox_triage(&self) -> bool {
+        self.from_inbox
+            && !self.preview_focus
+            && !self.lp_pane
+            && self.inbox_origin.is_some()
+            && self.inbox_landing.as_ref().is_some_and(|l| l.applies_to(&self.screen))
+    }
+
+    /// Whether `]` / `[` belong to the open view rather than the triage strip: the PR Diff tab
+    /// jumps between comment threads with them. `}` / `{` walk the inbox from there.
+    pub fn triage_brackets_taken(&self) -> bool {
+        matches!(&self.screen, Screen::PrView(v) if v.tab == 3)
+    }
+
+    /// The triage strip's keys, answered before the view's own. True when `key` was one.
+    async fn on_inbox_triage_key(&mut self, key: Key, deps: &AppDeps) -> bool {
+        if !self.inbox_triage() {
+            return false;
+        }
+        let brackets = !self.triage_brackets_taken();
+        match key {
+            // Enter on the pane beside the inbox opens the item full-screen.
+            Key::Enter if self.inbox_pane => self.inbox_pane = false,
+            Key::Char('}') => self.step_inbox_triage(1, deps).await,
+            Key::Char('{') => self.step_inbox_triage(-1, deps).await,
+            Key::Char(']') if brackets => self.step_inbox_triage(1, deps).await,
+            Key::Char('[') if brackets => self.step_inbox_triage(-1, deps).await,
+            Key::Char('e') => self.done_inbox_triage(deps).await,
+            _ => return false,
+        }
+        true
+    }
+
+    /// `]` / `[` on the triage strip: opens the next / previous thread of the current view at
+    /// its target.
+    async fn step_inbox_triage(&mut self, delta: isize, deps: &AppDeps) {
+        if self.leave_blocked() {
+            return;
+        }
+        let threads = self.inbox_threads();
+        let here = self.inbox_origin.as_deref().and_then(|k| threads.iter().position(|t| t.key == k));
+        // A thread that left the view (read into another tier) left its place to the next one.
+        let next = match here {
+            Some(i) => i as isize + delta,
+            None if delta > 0 => self.inbox_sel as isize,
+            None => self.inbox_sel as isize - 1,
+        };
+        if next < 0 {
+            self.toast = Some("That's the first thread in the inbox".into());
+            return;
+        }
+        if next as usize >= threads.len() {
+            self.toast = Some("That's the last thread in the inbox".into());
+            return;
+        }
+        self.inbox_sel = next as usize;
+        self.open_inbox_selected(deps).await;
+    }
+
+    /// `e` on the triage strip: done with this thread, on to the next — or back to the inbox
+    /// when it was the last.
+    async fn done_inbox_triage(&mut self, deps: &AppDeps) {
+        if self.leave_blocked() {
+            return;
+        }
+        let Some(key) = self.inbox_origin.clone() else { return };
+        let at = self.inbox_threads().iter().position(|t| t.key == key).unwrap_or(self.inbox_sel);
+        let Some(t) = self.inbox_all_threads().into_iter().find(|t| t.key == key) else {
+            self.leave_to_inbox();
+            return;
+        };
+        self.toast = Some("Dismissed".into());
+        self.done_inbox_threads(deps, vec![t]).await;
+        if at < self.inbox_threads().len() {
+            self.inbox_sel = at;
+            self.open_inbox_selected(deps).await;
+        } else {
+            self.leave_to_inbox();
+            if self.toast.as_deref() == Some("Dismissed") {
+                self.toast = Some("Dismissed — nothing left in the inbox".into());
             }
         }
-        for row in &mut self.inbox {
-            row.notification.unread = false;
+    }
+
+    /// Back to the inbox, the selection on the thread the item view was opened from.
+    fn leave_to_inbox(&mut self) {
+        self.screen = Screen::Inbox;
+        self.inbox_pane = false;
+        let origin = self.inbox_origin.take();
+        self.select_inbox_thread(origin.as_deref());
+        self.inbox_landing = None;
+        self.from_inbox = false;
+    }
+
+    /// Esc out of an item view: back to where it was opened from.
+    fn return_to_origin(&mut self) {
+        if self.from_inbox && self.inbox_origin.is_some() {
+            self.leave_to_inbox();
+        } else {
+            self.screen = self.view_origin();
         }
-        mark_cached_inbox_read(&deps.cache, |_| true);
-        self.toast = Some("All marked read".into());
     }
 
-    /// Hides the selected notification from the inbox (the `d` key). Dismissal is local — the
-    /// provider's own read state is untouched — and persisted, so it survives a restart.
-    async fn dismiss_selected_inbox(&mut self, deps: &AppDeps) {
-        let Some(row) = self.inbox.get(self.inbox_sel) else { return };
-        self.inbox_dismissed.insert(inbox_dismiss_key(row));
-        self.inbox.remove(self.inbox_sel);
-        self.inbox_sel = self.inbox_sel.min(self.inbox.len().saturating_sub(1));
-        self.toast = Some(match self.persist_inbox_dismissed(deps).await {
-            Ok(()) => "Dismissed".into(),
-            Err(error) => error,
-        });
+    /// `x`: marks the selected thread read, every member of it. It stays listed. Shown read at
+    /// once, like every other inbox write; a forge that refuses answers with a toast, and the next
+    /// refresh shows its truth.
+    async fn mark_selected_inbox_read(&mut self, deps: &AppDeps) {
+        let Some(t) = self.inbox_selected() else { return };
+        let reads = self.inbox_thread_reads(&t);
+        self.read_inbox_thread_locally(&t, deps);
+        self.select_inbox_thread(Some(&t.key));
+        // Before the send: a failure answered inline replaces it.
+        self.toast = Some("Marked read".into());
+        self.send_inbox_reads(deps, vec![reads], false).await;
     }
 
-    /// `D` clears the whole list, so it asks first.
-    fn confirm_dismiss_all_inbox(&mut self) {
-        if self.inbox.is_empty() {
+    /// `A`: marks every thread in the inbox read.
+    async fn mark_inbox_view_read(&mut self, deps: &AppDeps) {
+        let threads = self.inbox_threads();
+        if threads.is_empty() {
             return;
         }
+        let keep = self.inbox_selected().map(|t| t.key);
+        let reads = self.inbox_reads(&threads);
+        for t in &threads {
+            self.read_inbox_thread_locally(t, deps);
+        }
+        self.select_inbox_thread(keep.as_deref());
+        // Before the send: a failure answered inline replaces it.
+        self.toast = Some("All marked read".into());
+        self.send_inbox_reads(deps, reads, false).await;
+    }
+
+    /// `e`: done with the selected thread — read at the forge, and gone from the inbox.
+    async fn done_selected_inbox(&mut self, deps: &AppDeps) {
+        let Some(t) = self.inbox_selected() else { return };
+        self.toast = Some("Dismissed".into());
+        self.done_inbox_threads(deps, vec![t]).await;
+    }
+
+    /// "Done" with `threads`: every member is marked read at its forge and its dismissal key is
+    /// added to the list both frontends share (merged, never overwritten — the dashboard adds
+    /// to it too), and the threads leave the inbox now. `all` marks everything read at once.
+    async fn done_inbox_threads(&mut self, deps: &AppDeps, threads: Vec<InboxThread>) {
+        if threads.is_empty() {
+            return;
+        }
+        let members: HashSet<usize> = threads.iter().flat_map(|t| t.members.iter().copied()).collect();
+        // Every member, read or not: done is the forge's own "done" (GitHub mark-as-done, GitLab's
+        // to-do done), not a read — a read notification stays in the inbox until this.
+        let mut dones: Vec<(String, Vec<String>)> = Vec::new();
+        for &i in &members {
+            let (conn, id) = (self.inbox[i].connection_id.clone(), self.inbox[i].notification.id.clone());
+            match dones.iter_mut().find(|(c, _)| *c == conn) {
+                Some((_, ids)) => ids.push(id),
+                None => dones.push((conn, vec![id])),
+            }
+        }
+        let mut keys: Vec<String> = members.iter().map(|&i| self.inbox[i].dismiss_key()).collect();
+        keys.sort();
+        self.inbox_dismissed.extend(keys.iter().cloned());
+        let gone: HashSet<(String, String)> =
+            members.iter().map(|&i| (self.inbox[i].connection_id.clone(), self.inbox[i].notification.id.clone())).collect();
+        mark_cached_inbox_read(&deps.cache, |row| gone.contains(&(row.connection_id.clone(), row.notification.id.clone())));
+        let mut i = 0;
+        self.inbox.retain(|_| {
+            let keep = !members.contains(&i);
+            i += 1;
+            keep
+        });
+        self.clamp_inbox_sel();
+        if let Err(e) = deps.config.dismiss_notifications(keys).await {
+            self.toast = Some(format!("Couldn't save: {e}"));
+        }
+        let job = done_at_forges(deps.clone(), dones);
+        match self.job_tx.clone() {
+            Some(tx) => {
+                tokio::spawn(async move {
+                    if let Err(error) = job.await {
+                        let _ = tx.send(AppEvent::InboxReadFailed { error });
+                    }
+                });
+            }
+            None => {
+                if let Err(error) = job.await {
+                    self.toast = Some(error);
+                }
+            }
+        }
+    }
+
+    /// `E` clears a whole view, so it asks first.
+    fn confirm_done_inbox_view(&mut self) {
+        let n = self.inbox_threads().len();
+        if n == 0 {
+            return;
+        }
+        let noun = if n == 1 { "thread" } else { "threads" };
         self.overlay = Some(Overlay::Confirm {
             title: "Dismiss all".into(),
-            message: format!("Dismiss all {} notifications from the inbox?", self.inbox.len()),
-            action: Action::DismissAllInbox,
+            message: format!("Dismiss all {n} {noun} from the inbox?"),
+            action: Action::InboxDoneAll,
         });
     }
 
-    async fn dismiss_all_inbox(&mut self, deps: &AppDeps) {
-        self.inbox_dismissed.extend(self.inbox.iter().map(inbox_dismiss_key));
-        self.inbox.clear();
-        self.inbox_sel = 0;
-        self.toast = Some(match self.persist_inbox_dismissed(deps).await {
-            Ok(()) => "All dismissed".into(),
-            Err(error) => error,
+    async fn done_inbox_view(&mut self, deps: &AppDeps) {
+        let threads = self.inbox_threads();
+        self.toast = Some("All dismissed".into());
+        self.done_inbox_threads(deps, threads).await;
+    }
+
+    /// Driven by the anim timer: once the cursor has rested on a thread for
+    /// [`PREVIEW_SETTLE_TICKS`], fetches its lead's who-and-what when the feed entry lacked them
+    /// (GitHub). One call for the selected thread, once a session — never during a refresh.
+    pub fn tick_inbox_detail(&mut self, deps: &AppDeps) {
+        // The selected thread on the Inbox; or, once its item is open from the inbox, the thread
+        // it came from — opened before its detail arrived, it still has to learn where to land.
+        let thread = match &self.screen {
+            Screen::Inbox => self.inbox_selected(),
+            _ if self.inbox_triage() => self.inbox_origin_thread(),
+            _ => None,
+        };
+        let want = thread.and_then(|t| {
+            let row = &self.inbox[t.lead];
+            let n = &row.notification;
+            let key = (row.connection_id.clone(), n.id.clone());
+            (n.wants_detail() && !self.inbox_detail_asked.contains(&key)).then_some(key)
+        });
+        let Some(key) = want else {
+            self.inbox_detail_wait = None;
+            return;
+        };
+        let ticks = match &mut self.inbox_detail_wait {
+            Some((k, t)) if *k == key => {
+                *t = t.saturating_add(1);
+                *t
+            }
+            wait => {
+                *wait = Some((key.clone(), 1));
+                1
+            }
+        };
+        if ticks < PREVIEW_SETTLE_TICKS {
+            return;
+        }
+        let Some(tx) = self.job_tx.clone() else { return };
+        let Some(row) = self.inbox.iter().find(|r| r.connection_id == key.0 && r.notification.id == key.1) else { return };
+        let notification = row.notification.clone();
+        self.inbox_detail_asked.insert(key.clone());
+        self.inbox_detail_wait = None;
+        let deps = deps.clone();
+        tokio::spawn(async move {
+            let (conn_id, id) = key;
+            let detail = match deps.sections.notification_feeds().await {
+                Ok(feeds) => match feeds.iter().find(|f| f.connection.connection_id() == conn_id) {
+                    Some(feed) => feed.source.detail(&notification).await.ok(),
+                    None => None,
+                },
+                Err(_) => None,
+            };
+            if detail.is_none() {
+                log_operation_failure(DIAG_INBOX_DETAIL);
+            }
+            let _ = tx.send(AppEvent::InboxDetailLoaded { conn_id, id, detail });
         });
     }
 
-    async fn persist_inbox_dismissed(&self, deps: &AppDeps) -> std::result::Result<(), String> {
-        let mut keys: Vec<String> = self.inbox_dismissed.iter().cloned().collect();
-        keys.sort();
-        deps.config.set_dismissed_notifications(keys).await.map_err(|e| format!("Couldn't save: {e}"))
+    /// Files a fetched detail and fills it into the row (and any copy a refresh brings back).
+    fn apply_inbox_detail(&mut self, conn_id: String, id: String, detail: Option<NotificationDetail>) {
+        let Some(detail) = detail else { return };
+        // The item this thread is about may already be open from the inbox, landed on the
+        // overview because the detail hadn't said which comment yet: land it there now.
+        let opened_here = self.inbox_triage()
+            && self.inbox_origin_thread().is_some_and(|t| {
+                let lead = &self.inbox[t.lead];
+                lead.connection_id == conn_id && lead.notification.id == id
+            });
+        if let (true, Some(target), Some(landing)) = (opened_here, &detail.target, self.inbox_landing.as_mut()) {
+            if landing.target == NotificationTarget::Overview {
+                landing.target = target.clone();
+                landing.seek = true;
+            }
+        }
+        self.inbox_details.insert((conn_id, id), detail);
+        self.fill_inbox_details();
+        self.seek_inbox_landing(false);
+    }
+
+    /// Fetches `n`'s detail right away — for opening a row whose preview never asked — and files
+    /// it like a background fetch would. `None` when the feed is gone or the forge refused.
+    async fn inbox_detail_now(&mut self, conn: &str, n: &Notification, deps: &AppDeps) -> Option<NotificationDetail> {
+        let key = (conn.to_string(), n.id.clone());
+        if let Some(d) = self.inbox_details.get(&key) {
+            return Some(d.clone());
+        }
+        self.inbox_detail_asked.insert(key.clone());
+        let feeds = deps.sections.notification_feeds().await.ok()?;
+        let feed = feeds.iter().find(|f| f.connection.connection_id() == conn)?;
+        let detail = feed.source.detail(n).await.inspect_err(|_| log_operation_failure(DIAG_INBOX_DETAIL)).ok()?;
+        self.inbox_details.insert(key, detail.clone());
+        self.fill_inbox_details();
+        Some(detail)
+    }
+
+    /// The thread the open item view came from, as the inbox holds it now.
+    fn inbox_origin_thread(&self) -> Option<InboxThread> {
+        let key = self.inbox_origin.as_deref()?;
+        self.inbox_all_threads().into_iter().find(|t| t.key == key)
+    }
+
+    /// Gives every row the detail fetched for it this session where it lacks it: actor, excerpt,
+    /// and the target a GitHub mention only learns from its comment.
+    fn fill_inbox_details(&mut self) {
+        if self.inbox_details.is_empty() {
+            return;
+        }
+        for row in &mut self.inbox {
+            let Some(d) = self.inbox_details.get(&(row.connection_id.clone(), row.notification.id.clone())) else { continue };
+            d.fill(&mut row.notification);
+        }
     }
 
     /// Drops dismissed notifications from `rows`.
     fn without_dismissed(&self, mut rows: Vec<NotifRow>) -> Vec<NotifRow> {
-        rows.retain(|row| !self.inbox_dismissed.contains(&inbox_dismiss_key(row)));
+        rows.retain(|row| !self.inbox_dismissed.contains(&row.dismiss_key()));
         rows
     }
 
@@ -5975,14 +6546,21 @@ impl App {
             // A dismissal the feed no longer returns can never match again (new activity is a
             // new key), so forget it rather than letting the saved list grow forever. Only on a
             // complete fetch: a connection that failed returned nothing, not "none of these".
-            let live: HashSet<String> = r.inbox.iter().map(inbox_dismiss_key).collect();
+            let live: HashSet<String> = r.inbox.iter().map(NotifRow::dismiss_key).collect();
             self.inbox_dismissed.retain(|key| live.contains(key));
+            // The saved list too, pruned in place (the dashboard adds to it: never overwritten).
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let config = deps.config.clone();
+                handle.spawn(async move {
+                    let _ = config.prune_dismissed_notifications(&live).await;
+                });
+            }
         }
+        let keep = self.inbox_selected().map(|t| t.key);
         let inbox = self.without_dismissed(r.inbox);
         take_section(&mut self.inbox, inbox, sections_ok.inbox);
-        if self.inbox_sel >= self.inbox.len() {
-            self.inbox_sel = self.inbox.len().saturating_sub(1);
-        }
+        self.fill_inbox_details();
+        self.select_inbox_thread(keep.as_deref());
         self.health = r.health;
         // Keyed by the filter `self.prs` was just derived under, not the one this fetch was
         // spawned with. They differ whenever the user switches view mid-flight, and the rows
@@ -6275,13 +6853,11 @@ impl App {
         seed_section(cache, CACHE_KEY_PIPELINES, &mut self.pipes, &mut oldest);
         seed_section(cache, CACHE_KEY_INBOX, &mut self.inbox, &mut oldest);
         let dismissed = &self.inbox_dismissed;
-        self.inbox.retain(|row| !dismissed.contains(&inbox_dismiss_key(row)));
+        self.inbox.retain(|row| !dismissed.contains(&row.dismiss_key()));
         seed_section(cache, CACHE_KEY_LAUNCHPAD_MINE, &mut self.lp_prs_mine, &mut oldest);
         seed_section(cache, CACHE_KEY_LAUNCHPAD_REVIEW, &mut self.lp_prs_review, &mut oldest);
         self.data_age = oldest;
-        if self.inbox_sel >= self.inbox.len() {
-            self.inbox_sel = self.inbox.len().saturating_sub(1);
-        }
+        self.clamp_inbox_sel();
         // Seeded rows are only visible once the views derived from them are rebuilt — the
         // Launchpad is the landing screen, so skipping this would seed into nothing.
         self.rebuild_launchpad();
@@ -6968,7 +7544,7 @@ impl App {
                 None
             }
             Screen::Inbox => {
-                self.inbox_sel = step(self.inbox_sel, self.inbox.len());
+                self.inbox_sel = step(self.inbox_sel, self.inbox_threads().len());
                 None
             }
             Screen::Pipeline(v) => {
@@ -7102,7 +7678,7 @@ impl App {
         // to the strip. The
         // input-capturing modes (wizard, overlay, quick filter) return above, so Tab still
         // reaches them.
-        if matches!(key, Key::Tab | Key::BackTab) && (self.preview_focus || self.lp_pane) {
+        if matches!(key, Key::Tab | Key::BackTab) && (self.preview_focus || self.lp_pane || self.inbox_pane) {
             if let Screen::PrView(v) = &mut self.screen {
                 v.step_tab(if key == Key::Tab { 1 } else { -1 });
                 return;
@@ -7119,6 +7695,10 @@ impl App {
         }
 
         if self.on_preview_key(key, deps).await {
+            return;
+        }
+        // An item opened from the inbox: the triage strip's keys come before the view's own.
+        if self.on_inbox_triage_key(key, deps).await {
             return;
         }
 
@@ -7767,7 +8347,7 @@ impl App {
                     self.open_pending_exit_prompt();
                     return;
                 }
-                self.screen = self.view_origin();
+                self.return_to_origin();
                 return;
             }
             Key::Char('o') => {
@@ -7901,7 +8481,7 @@ impl App {
     fn on_wi_view_key(&mut self, key: Key) {
         match key {
             Key::Escape | Key::Char('q') => {
-                self.screen = self.view_origin();
+                self.return_to_origin();
                 return;
             }
             Key::Char('o') => {
@@ -7912,7 +8492,8 @@ impl App {
                 self.open_wi_comment();
                 return;
             }
-            Key::Char('e') => {
+            // `E` too: opened from the inbox, `e` is the triage strip's "done".
+            Key::Char('e' | 'E') => {
                 self.open_wi_edit();
                 return;
             }
@@ -9022,7 +9603,7 @@ impl App {
 
     fn on_pipeline_key(&mut self, key: Key) {
         match key {
-            Key::Escape | Key::Char('q') => self.screen = self.view_origin(),
+            Key::Escape | Key::Char('q') => self.return_to_origin(),
             Key::Char('T') => self.open_pipeline_trigger(),
             Key::Char('A') => self.open_approval_picker(),
             Key::Char('X') => self.open_pipeline_cancel(),
@@ -9356,7 +9937,7 @@ impl App {
                 return nodes.get(v.selected).and_then(|n| n.url.clone()).or_else(|| v.run.url.clone());
             }
             // The Inbox opens the selected notification's URL directly.
-            Screen::Inbox => return self.inbox.get(self.inbox_sel).and_then(|r| r.notification.url.clone()),
+            Screen::Inbox => return self.inbox_selected().and_then(|t| self.inbox[t.lead].notification.url.clone()),
             // Launchpad has no single "selected URL" here — Enter opens the item's view,
             // where `o` then works.
             Screen::Launchpad | Screen::List | Screen::Config(_) => {}
@@ -10000,7 +10581,7 @@ impl App {
         // The views derived from those lists have to be rebuilt, or the rows stay on screen.
         self.rebuild_launchpad();
         self.refresh_repo_scope(deps);
-        self.inbox_sel = self.inbox_sel.min(self.inbox.len().saturating_sub(1));
+        self.clamp_inbox_sel();
         self.fix_selection();
     }
 
@@ -10226,7 +10807,7 @@ impl App {
                 self.execute_pipeline_run_action(action, deps).await
             }
             Action::RemoveConnection { .. } => self.execute_config_action(action, deps).await,
-            Action::DismissAllInbox => self.dismiss_all_inbox(deps).await,
+            Action::InboxDoneAll => self.done_inbox_view(deps).await,
             Action::ApplyToggle { kind, ids } => self.apply_toggle(kind, ids, deps).await,
             Action::AddLineComment(body) => self.add_line_comment(body),
             Action::SubmitReview(event) => self.submit_review(event, deps).await,
@@ -10256,7 +10837,7 @@ impl App {
             }
             Action::Palette(target) => self.run_palette_target(target, deps).await,
             Action::OpenReviewMenu => self.open_review_submit(),
-            Action::LeavePrView => self.screen = self.view_origin(),
+            Action::LeavePrView => self.return_to_origin(),
             Action::SetupInTerminal => self.start_add_connection(),
             Action::SetupInBrowser => self.start_setup(),
         }
@@ -12607,6 +13188,66 @@ async fn fetch_work_items(deps: &AppDeps, errors: &mut Vec<String>) -> (Vec<WiRo
     (out, ok)
 }
 
+/// Marks inbox notifications read at their forges: `reads` (connection, ids) one by one, or —
+/// when `all` — everything on every feed (GitHub and GitLab have a bulk endpoint for it).
+/// Owned arguments, so it can run off the key path.
+async fn mark_read_at_forges(deps: AppDeps, reads: Vec<(String, Vec<String>)>, all: bool) -> std::result::Result<(), String> {
+    let feeds = deps
+        .sections
+        .notification_feeds()
+        .await
+        .map_err(|error| inbox_action_error("Couldn't load notification connections", error, DIAG_INBOX_FEEDS))?;
+    if all {
+        if feeds.is_empty() && !reads.is_empty() {
+            return Err(inbox_action_error(
+                "Couldn't mark all notifications read",
+                "notification connections unavailable",
+                DIAG_INBOX_MARK_ALL_READ,
+            ));
+        }
+        for feed in feeds {
+            feed.source
+                .mark_all_read()
+                .await
+                .map_err(|error| inbox_action_error("Couldn't mark all notifications read", error, DIAG_INBOX_MARK_ALL_READ))?;
+        }
+        return Ok(());
+    }
+    for (conn, ids) in reads {
+        let feed = feeds.iter().find(|feed| feed.connection.connection_id() == conn).ok_or_else(|| {
+            inbox_action_error("Couldn't mark notification read", "notification connection unavailable", DIAG_INBOX_MARK_READ)
+        })?;
+        for id in ids {
+            feed.source
+                .mark_read(&id)
+                .await
+                .map_err(|error| inbox_action_error("Couldn't mark notification read", error, DIAG_INBOX_MARK_READ))?;
+        }
+    }
+    Ok(())
+}
+
+/// Marks notifications done at their forges ([`NotificationSource::mark_done`]), per connection.
+async fn done_at_forges(deps: AppDeps, dones: Vec<(String, Vec<String>)>) -> std::result::Result<(), String> {
+    let feeds = deps
+        .sections
+        .notification_feeds()
+        .await
+        .map_err(|error| inbox_action_error("Couldn't load notification connections", error, DIAG_INBOX_FEEDS))?;
+    for (conn, ids) in dones {
+        let feed = feeds.iter().find(|feed| feed.connection.connection_id() == conn).ok_or_else(|| {
+            inbox_action_error("Couldn't dismiss the notification", "notification connection unavailable", DIAG_INBOX_MARK_READ)
+        })?;
+        for id in ids {
+            feed.source
+                .mark_done(&id)
+                .await
+                .map_err(|error| inbox_action_error("Couldn't dismiss the notification", error, DIAG_INBOX_MARK_READ))?;
+        }
+    }
+    Ok(())
+}
+
 async fn fetch_notifications(deps: &AppDeps, errors: &mut Vec<String>) -> (Vec<NotifRow>, bool) {
     let mut out = Vec::new();
     let mut ok = true;
@@ -13467,7 +14108,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_inbox_mark_keeps_the_row_unread_and_does_not_report_success() {
+    /// `x` shows the thread read at once (the standing optimistic rule); a forge that refuses
+    /// still says so instead of leaving "Marked read" up.
+    async fn a_failed_inbox_mark_reports_the_error_instead_of_success() {
         let deps = test_deps();
         let mut app = App::new("slate");
         app.inbox = vec![NotifRow {
@@ -13485,12 +14128,17 @@ mod tests {
                 url: None,
                 unread: true,
                 updated_at: None,
+                reason: String::new(),
+                actor: None,
+                excerpt: None,
+                target: Default::default(),
+                detail_ref: None,
             },
         }];
 
         app.mark_selected_inbox_read(&deps).await;
 
-        assert!(app.inbox[0].notification.unread, "failed persistence keeps local state unread");
+        assert!(!app.inbox[0].notification.unread, "shown read before the forge answers");
         assert!(
             app.toast
                 .as_deref()
@@ -13529,6 +14177,11 @@ mod tests {
                 url: None,
                 unread: true,
                 updated_at: None,
+                reason: String::new(),
+                actor: None,
+                excerpt: None,
+                target: Default::default(),
+                detail_ref: None,
             },
         };
 
@@ -13954,6 +14607,11 @@ mod tests {
                 url: None,
                 unread: true,
                 updated_at: None,
+                reason: String::new(),
+                actor: None,
+                excerpt: None,
+                target: Default::default(),
+                detail_ref: None,
             },
         }
     }
@@ -14537,6 +15195,11 @@ mod tests {
                 url: None,
                 unread,
                 updated_at: None,
+                reason: String::new(),
+                actor: None,
+                excerpt: None,
+                target: Default::default(),
+                detail_ref: None,
             },
         };
         app.inbox = vec![n("a", true), n("b", false), n("c", true)];
@@ -15317,9 +15980,12 @@ mod tests {
         assert!(fresh.lp.is_empty(), "a restarted app keeps the dismissal");
     }
 
+    /// `d` is the old key for `e` (done), kept for a release: it now marks the thread read at
+    /// the forge as well as clearing it, so the toast says "Done".
     #[tokio::test]
     async fn d_dismisses_the_selected_notification_and_it_stays_hidden_across_reloads_and_restarts() {
-        let deps = test_deps();
+        let calls = ItemCalls::new();
+        let deps = deps_with_items(calls.clone()).await;
         let mut app = App::new("slate");
         app.screen = Screen::Inbox;
         app.inbox = vec![notif_row("a"), notif_row("b"), notif_row("c")];
@@ -15331,6 +15997,7 @@ mod tests {
         assert_eq!(ids, ["a", "b"], "the selected row is gone");
         assert_eq!(app.inbox_sel, 1, "the selection stays in range");
         assert_eq!(app.toast.as_deref(), Some("Dismissed"));
+        assert_eq!(calls.calls(), ["done c"], "done is the forge's done too");
 
         // The next poll returns it again; it must not come back.
         let mut r = reloaded(Vec::new());
@@ -15349,15 +16016,16 @@ mod tests {
         assert_eq!(ids, ["a"], "a restarted app keeps the dismissal");
     }
 
+    /// `D` is the old key for `E` (done with the whole view), kept for a release.
     #[tokio::test]
     async fn shift_d_asks_then_dismisses_the_whole_inbox() {
-        let deps = test_deps();
+        let deps = deps_with_items(ItemCalls::new()).await;
         let mut app = App::new("slate");
         app.screen = Screen::Inbox;
         app.inbox = vec![notif_row("a"), notif_row("b")];
 
         app.on_key(Key::Char('D'), &deps).await;
-        assert!(matches!(&app.overlay, Some(Overlay::Confirm { action: Action::DismissAllInbox, .. })));
+        assert!(matches!(&app.overlay, Some(Overlay::Confirm { action: Action::InboxDoneAll, .. })));
         assert_eq!(app.inbox.len(), 2, "nothing is dismissed before confirming");
 
         app.on_key(Key::Char('y'), &deps).await;
@@ -15372,7 +16040,7 @@ mod tests {
         let mut app = App::new("slate");
         let mut old = notif_row("a");
         old.notification.updated_at = Some(Utc::now() - chrono::TimeDelta::hours(1));
-        app.apply_dismissed_notifications(&[inbox_dismiss_key(&old), inbox_dismiss_key(&notif_row("gone"))]);
+        app.apply_dismissed_notifications(&[old.dismiss_key(), notif_row("gone").dismiss_key()]);
 
         let mut fresh = notif_row("a");
         fresh.notification.updated_at = Some(Utc::now());
@@ -15388,7 +16056,7 @@ mod tests {
     fn a_failed_inbox_fetch_keeps_dismissals() {
         let deps = test_deps();
         let mut app = App::new("slate");
-        let key = inbox_dismiss_key(&notif_row("a"));
+        let key = notif_row("a").dismiss_key();
         app.apply_dismissed_notifications(std::slice::from_ref(&key));
 
         let mut r = reloaded(Vec::new());
@@ -15396,6 +16064,452 @@ mod tests {
         app.apply_reloaded(r, &deps);
 
         assert!(app.inbox_dismissed.contains(&key), "an outage is not evidence the notification is gone");
+    }
+
+    // ---- the inbox as threads ----
+
+    /// A notification on connection `c` about pull request `item`, `mins` minutes old.
+    fn inbox_note(id: &str, kind: NotificationKind, item: &str, mins: i64, unread: bool) -> NotifRow {
+        let mut row = notif_row(id);
+        row.notification.kind = kind;
+        row.notification.item_type = NotificationItemType::PullRequest;
+        row.notification.item_id = Some(item.into());
+        row.notification.updated_at = Some(Utc::now() - chrono::TimeDelta::minutes(mins));
+        row.notification.unread = unread;
+        row
+    }
+
+    fn inbox_ids(app: &App) -> Vec<&str> {
+        app.inbox.iter().map(|r| r.notification.id.as_str()).collect()
+    }
+
+    #[test]
+    fn events_on_one_item_are_one_thread_and_the_badge_counts_unread_threads_for_you() {
+        let mut app = App::new("slate");
+        app.inbox = vec![
+            inbox_note("m", NotificationKind::Mention, "7", 5, true),
+            inbox_note("c", NotificationKind::Comment, "7", 1, true),
+            inbox_note("f", NotificationKind::Comment, "8", 2, true),
+            inbox_note("r", NotificationKind::ReviewRequested, "9", 3, false),
+        ];
+        assert_eq!(app.inbox_all_threads().len(), 3, "the mention and the comment on #7 are one thread");
+        assert_eq!(app.unread_count(), 1, "#7 waits on you; #8 is only followed and #9 is read");
+        assert_eq!(app.inbox_threads().len(), 2, "#8 is only followed: not listed");
+        let t = app.inbox_selected().expect("For you opens on #7, the newest");
+        assert_eq!(app.inbox[t.lead].notification.id, "m", "the mention leads, though the comment is newer");
+        assert_eq!(t.members.len(), 2);
+    }
+
+    /// The inbox is what waits on you: a thread you only follow isn't listed, and `[` `]` `1`
+    /// `2` `3` no longer switch anything.
+    #[tokio::test]
+    async fn the_inbox_lists_only_what_waits_on_you() {
+        let deps = test_deps();
+        let mut app = App::new("slate");
+        app.screen = Screen::Inbox;
+        app.inbox = vec![
+            inbox_note("a", NotificationKind::Mention, "1", 1, true),
+            inbox_note("b", NotificationKind::Comment, "2", 2, true),
+            inbox_note("c", NotificationKind::Assigned, "3", 3, false),
+        ];
+        let ids = |app: &App| app.inbox_threads().iter().map(|t| app.inbox[t.lead].notification.id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(&app), ["a", "c"], "read or not, only For you");
+        for k in ['[', ']', '2', '3'] {
+            app.on_key(Key::Char(k), &deps).await;
+        }
+        assert_eq!(ids(&app), ["a", "c"]);
+        assert!(matches!(app.screen, Screen::Inbox));
+    }
+
+    /// Space marks threads as on the section lists, `b` dismisses exactly those, and Esc lets go
+    /// of the marks before it leaves the inbox.
+    #[tokio::test]
+    async fn space_marks_threads_and_b_dismisses_only_the_marked() {
+        let calls = ItemCalls::new();
+        let deps = deps_with_items(calls.clone()).await;
+        let mut app = App::new("slate");
+        app.screen = Screen::Inbox;
+        app.inbox = vec![
+            inbox_note("a", NotificationKind::Mention, "1", 1, true),
+            inbox_note("b", NotificationKind::Assigned, "2", 2, true),
+            inbox_note("c", NotificationKind::ReviewRequested, "3", 3, true),
+        ];
+        app.on_key(Key::Char(' '), &deps).await;
+        app.on_key(Key::Down, &deps).await;
+        app.on_key(Key::Down, &deps).await;
+        app.on_key(Key::Char(' '), &deps).await;
+        assert_eq!(app.marked_inbox_threads().len(), 2, "a and c");
+
+        // Esc lets go of the marks first, and stays on the inbox.
+        app.on_key(Key::Escape, &deps).await;
+        assert!(app.inbox_marks.is_empty() && matches!(app.screen, Screen::Inbox));
+
+        app.inbox_sel = 0;
+        app.on_key(Key::Char(' '), &deps).await;
+        app.on_key(Key::Down, &deps).await;
+        app.on_key(Key::Down, &deps).await;
+        app.on_key(Key::Char(' '), &deps).await;
+        app.on_key(Key::Char('b'), &deps).await;
+        assert_eq!(inbox_ids(&app), ["b"], "only the marked are dismissed");
+        let mut done = calls.calls();
+        done.sort();
+        assert_eq!(done, ["done a", "done c"]);
+        assert_eq!(app.toast.as_deref(), Some("Dismissed 2 notifications"));
+        assert!(app.inbox_marks.is_empty());
+
+        // With nothing marked, `b` says how to mark.
+        app.on_key(Key::Char('b'), &deps).await;
+        assert_eq!(inbox_ids(&app), ["b"]);
+        assert!(app.toast.as_deref().is_some_and(|t| t.contains("Space")));
+    }
+
+    /// Opening a thread reads it and nothing more: it stays in the inbox, read, until it's done.
+    #[tokio::test]
+    async fn an_opened_thread_stays_in_the_inbox_read_until_done() {
+        let calls = ItemCalls::new();
+        let (mut app, deps) = open_notes(calls.clone(), vec![note_at(NotificationTarget::Overview)]).await;
+        assert_eq!(calls.calls(), ["read n1"], "read, not done");
+        app.on_key(Key::Escape, &deps).await;
+        assert!(matches!(app.screen, Screen::Inbox));
+        assert_eq!(inbox_ids(&app), ["n1"], "still listed");
+        assert!(!app.inbox[0].notification.unread);
+        assert_eq!(app.inbox_threads().len(), 1);
+        app.on_key(Key::Char('e'), &deps).await;
+        assert!(app.inbox.is_empty(), "done is what clears it");
+        assert_eq!(calls.calls(), ["read n1", "done n1"]);
+    }
+
+    #[tokio::test]
+    async fn e_marks_every_member_read_and_merges_their_dismissal_keys_into_the_shared_list() {
+        let calls = ItemCalls::new();
+        let deps = deps_with_items(calls.clone()).await;
+        // Saved by the dashboard while the terminal was running: it must survive this write.
+        deps.config.dismiss_notifications(vec!["gl:9:1".into()]).await.unwrap();
+        let mut app = App::new("slate");
+        app.screen = Screen::Inbox;
+        app.inbox = vec![
+            inbox_note("m", NotificationKind::Mention, "7", 5, true),
+            inbox_note("c", NotificationKind::Comment, "7", 1, true),
+            inbox_note("x", NotificationKind::Reaction, "7", 0, true),
+            inbox_note("o", NotificationKind::Mention, "8", 9, true),
+        ];
+        let keys: Vec<String> = app.inbox[..3].iter().map(NotifRow::dismiss_key).collect();
+
+        app.on_key(Key::Char('e'), &deps).await;
+
+        let mut done = calls.calls();
+        done.sort();
+        assert_eq!(done, ["done c", "done m", "done x"], "every member is done at the forge, the reaction too");
+        assert_eq!(inbox_ids(&app), ["o"], "the thread is gone");
+        assert_eq!(app.toast.as_deref(), Some("Dismissed"));
+        let saved = deps.config.snapshot().ui.dismissed_notifications;
+        assert!(saved.contains(&"gl:9:1".to_string()), "the dashboard's dismissal is kept: {saved:?}");
+        for key in &keys {
+            assert!(saved.contains(key), "{key} saved: {saved:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_dismissal_made_in_the_dashboard_hides_the_thread_on_the_next_reload() {
+        let deps = test_deps();
+        let mut app = App::new("slate");
+        let gone = inbox_note("a", NotificationKind::Mention, "7", 1, true);
+        deps.config.dismiss_notifications(vec![gone.dismiss_key()]).await.unwrap();
+
+        let mut r = reloaded(Vec::new());
+        r.inbox = vec![gone.clone(), inbox_note("b", NotificationKind::Mention, "8", 2, true)];
+        app.apply_reloaded(r, &deps);
+
+        assert_eq!(inbox_ids(&app), ["b"]);
+    }
+
+    #[tokio::test]
+    async fn a_complete_reload_prunes_the_saved_dismissals_in_place() {
+        let deps = test_deps();
+        let live = inbox_note("a", NotificationKind::Mention, "7", 1, true);
+        deps.config.dismiss_notifications(vec!["c:gone:0".into(), live.dismiss_key()]).await.unwrap();
+        let mut app = App::new("slate");
+        app.apply_dismissed_notifications(&deps.config.snapshot().ui.dismissed_notifications);
+
+        let mut r = reloaded(Vec::new());
+        r.inbox = vec![live.clone()];
+        app.apply_reloaded(r, &deps);
+
+        for _ in 0..100 {
+            if deps.config.snapshot().ui.dismissed_notifications.len() == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(deps.config.snapshot().ui.dismissed_notifications, [live.dismiss_key()], "only what no longer arrives goes");
+        assert!(app.inbox.is_empty(), "the live dismissal still hides its row");
+    }
+
+    /// The recording provider behind an inbox holding `notes`, the first selected and opened.
+    async fn open_notes(calls: ItemCalls, notes: Vec<NotifRow>) -> (App, AppDeps) {
+        let deps = deps_with_items(calls).await;
+        let mut app = App::new("slate");
+        app.screen = Screen::Inbox;
+        app.inbox = notes;
+        app.on_key(Key::Enter, &deps).await;
+        (app, deps)
+    }
+
+    /// A mention on PR `1` (the one the recording provider answers with) that points at `target`.
+    fn note_at(target: NotificationTarget) -> NotifRow {
+        let mut n = inbox_note("n1", NotificationKind::Mention, "1", 1, true);
+        n.notification.target = target;
+        n
+    }
+
+    /// Enter on a thread opens its item in a pane beside the inbox, focused; Enter again makes it
+    /// full-screen; Esc from either comes back to the inbox on that thread.
+    #[tokio::test]
+    async fn enter_opens_the_item_in_a_pane_beside_the_inbox_and_enter_again_goes_full_screen() {
+        let deps = deps_with_items(ItemCalls::new()).await;
+        let mut app = App::new("slate");
+        app.screen = Screen::Inbox;
+        app.content_w = PREVIEW_MIN_WIDTH + 20;
+        app.inbox = vec![note_at(NotificationTarget::Comment { id: "t2-c".into() })];
+
+        app.on_key(Key::Enter, &deps).await;
+        assert!(matches!(app.screen, Screen::PrView(_)), "the item is what takes the keys");
+        assert!(app.inbox_pane, "in the pane beside the inbox");
+        assert!(app.inbox_triage(), "with the triage strip");
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(200, 40)).unwrap();
+        terminal.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        let out: String = terminal.backend().buffer().content().iter().map(|c| c.symbol()).collect();
+        assert!(out.contains(" Inbox ") && out.contains("↵ full screen"), "the strip says what Enter does now");
+        assert!(out.contains("waiting on you"), "and the inbox list stays beside the pane");
+
+        app.on_key(Key::Enter, &deps).await;
+        assert!(matches!(app.screen, Screen::PrView(_)) && !app.inbox_pane, "full-screen now");
+        assert!(app.inbox_triage(), "still walking the inbox");
+
+        app.on_key(Key::Escape, &deps).await;
+        assert!(matches!(app.screen, Screen::Inbox) && !app.inbox_pane);
+        assert_eq!(app.inbox_sel, 0);
+    }
+
+    /// Too narrow for the pane, Enter opens the item full-screen as before.
+    #[tokio::test]
+    async fn a_narrow_inbox_opens_the_item_full_screen() {
+        let deps = deps_with_items(ItemCalls::new()).await;
+        let mut app = App::new("slate");
+        app.screen = Screen::Inbox;
+        app.content_w = PREVIEW_MIN_WIDTH - 1;
+        app.inbox = vec![note_at(NotificationTarget::Overview)];
+        app.on_key(Key::Enter, &deps).await;
+        assert!(matches!(app.screen, Screen::PrView(_)) && !app.inbox_pane);
+    }
+
+    #[tokio::test]
+    async fn enter_opens_a_pr_at_the_comment_with_the_conversation_cursor_on_its_thread() {
+        let calls = ItemCalls::new();
+        let (mut app, deps) = open_notes(calls.clone(), vec![note_at(NotificationTarget::Comment { id: "t2-c".into() })]).await;
+        assert_eq!(pr_pane(&app).tab, 0, "the Conversation");
+        assert!(app.inbox_triage(), "opened from the inbox: the triage strip applies");
+        assert!(!app.inbox[0].notification.unread, "opening reads the thread");
+        assert_eq!(calls.calls(), ["read n1"]);
+
+        // The threads arrive with the detail fetch; the cursor lands on the one holding the comment.
+        app.on_event(pr_detail_with(vec![comment_by("t1", "sam", "first"), comment_by("t2", "priya", "@me have a look")]), &deps);
+        assert_eq!(pr_pane(&app).conv_sel, Some(1));
+        assert!(app.inbox_landing.as_ref().is_some_and(|l| !l.seek && l.reveal), "found, and to be scrolled to");
+    }
+
+    /// A GitHub mention only learns its comment from the lazy detail. Opened before that arrives,
+    /// the PR shows its Conversation; when the detail lands, the cursor moves to the mention.
+    #[tokio::test]
+    async fn a_mention_opened_before_its_detail_lands_on_the_comment_once_it_arrives() {
+        let mut note = note_at(NotificationTarget::Overview);
+        note.notification.detail_ref = Some("https://api.github.test/repos/a/b/issues/comments/9".into());
+        let (mut app, deps) = open_notes(ItemCalls::new(), vec![note]).await;
+        app.on_event(pr_detail_with(vec![comment_by("t1", "sam", "first"), comment_by("t2", "priya", "@me have a look")]), &deps);
+        assert_eq!(pr_pane(&app).conv_sel, None, "nothing to land on yet");
+
+        app.apply_inbox_detail(
+            "c".into(),
+            "n1".into(),
+            Some(NotificationDetail {
+                actor: Some("priya".into()),
+                excerpt: Some("@me have a look".into()),
+                target: Some(NotificationTarget::Comment { id: "t2-c".into() }),
+                ..Default::default()
+            }),
+        );
+        assert_eq!(pr_pane(&app).conv_sel, Some(1), "the cursor moves to the mention");
+        assert!(app.inbox_landing.as_ref().is_some_and(|l| l.reveal), "and it is scrolled to");
+        assert_eq!(app.inbox[0].notification.target, NotificationTarget::Comment { id: "t2-c".into() });
+    }
+
+    #[tokio::test]
+    async fn a_comment_missing_from_the_threads_leaves_the_conversation_without_a_selection() {
+        let (mut app, deps) = open_notes(ItemCalls::new(), vec![note_at(NotificationTarget::Comment { id: "deleted".into() })]).await;
+        app.on_event(pr_detail_with(vec![comment_by("t1", "sam", "first")]), &deps);
+        let v = pr_pane(&app);
+        assert_eq!((v.tab, v.conv_sel), (0, None));
+        assert!(app.inbox_landing.as_ref().is_some_and(|l| !l.seek && !l.reveal), "the search ended without an error");
+    }
+
+    #[tokio::test]
+    async fn checks_and_diff_targets_open_on_their_tabs() {
+        let (mut app, deps) = open_notes(ItemCalls::new(), vec![note_at(NotificationTarget::Checks)]).await;
+        assert_eq!(pr_pane(&app).tab, 2, "Checks");
+        let check = |name: &str, status| CheckRun { name: name.into(), status, url: None };
+        app.on_event(
+            AppEvent::PrDetailLoaded {
+                key: pr_detail_cache_key("c", &pr(None).item_ref()),
+                detail: Box::new(PrDetailFetch {
+                    checks: Some(vec![check("lint", CheckStatus::Passed), check("test", CheckStatus::Failed)]),
+                    ..Default::default()
+                }),
+                fetched_at: Utc::now(),
+            },
+            &deps,
+        );
+        assert!(app.inbox_landing.as_ref().is_some_and(|l| !l.seek && l.reveal), "the failing check is found");
+
+        let (app, _) = open_notes(ItemCalls::new(), vec![note_at(NotificationTarget::Diff)]).await;
+        assert_eq!(pr_pane(&app).tab, 3, "Diff");
+    }
+
+    #[tokio::test]
+    async fn a_work_item_comment_target_is_scrolled_to_once_its_comments_arrive() {
+        let mut calls = ItemCalls::new();
+        // Long enough that the comment starts below the first screenful.
+        calls.wi.description = Some((0..80).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n\n"));
+        let mut note = note_at(NotificationTarget::Comment { id: "w2-c".into() });
+        note.notification.item_type = NotificationItemType::WorkItem;
+        let (mut app, deps) = open_notes(calls, vec![note]).await;
+        let key = match &app.screen {
+            Screen::WiView(v) => wi_detail_cache_key(&v.connection_id, &v.wi.item_ref()),
+            _ => panic!("expected the work item"),
+        };
+        app.on_event(
+            AppEvent::WiDetailLoaded {
+                key,
+                detail: Box::new(WiDetailFetch {
+                    threads: Some(vec![comment_by("w1", "sam", "first"), comment_by("w2", "priya", "@me see here")]),
+                    ..Default::default()
+                }),
+                fetched_at: Utc::now(),
+            },
+            &deps,
+        );
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        let Screen::WiView(v) = &app.screen else { panic!("expected the work item") };
+        assert!(v.scroll > 0, "scrolled down to the comment");
+        assert!(app.inbox_landing.as_ref().is_some_and(|l| !l.reveal), "once: the scroll is the user's after that");
+    }
+
+    #[tokio::test]
+    async fn a_work_item_opened_from_the_inbox_edits_on_shift_e_since_e_is_done() {
+        let mut note = note_at(NotificationTarget::Overview);
+        note.notification.item_type = NotificationItemType::WorkItem;
+        let (mut app, deps) = open_notes(ItemCalls::new(), vec![note]).await;
+        app.on_key(Key::Char('E'), &deps).await;
+        assert!(matches!(&app.overlay, Some(Overlay::Picker { kind: PickerKind::WorkItemEdit, .. })));
+        assert_eq!(app.inbox.len(), 1, "nothing was marked done");
+    }
+
+    fn three_threads() -> Vec<NotifRow> {
+        vec![
+            inbox_note("a", NotificationKind::Mention, "7", 1, true),
+            inbox_note("b", NotificationKind::ReviewRequested, "8", 2, true),
+            inbox_note("c", NotificationKind::Assigned, "9", 3, true),
+        ]
+    }
+
+    #[tokio::test]
+    async fn brackets_walk_the_inbox_from_an_opened_item_and_esc_returns_to_the_row_it_came_from() {
+        let (mut app, deps) = open_notes(ItemCalls::new(), three_threads()).await;
+        let first = app.inbox_origin.clone();
+
+        app.on_key(Key::Char(']'), &deps).await;
+        assert!(matches!(app.screen, Screen::PrView(_)));
+        assert_ne!(app.inbox_origin, first, "the next thread is the one open");
+        assert_eq!(app.inbox_sel, 1);
+        assert!(!app.inbox[1].notification.unread, "and opening it read it");
+
+        app.on_key(Key::Char('['), &deps).await;
+        assert_eq!(app.inbox_sel, 0);
+        app.on_key(Key::Char('['), &deps).await;
+        assert_eq!(app.toast.as_deref(), Some("That's the first thread in the inbox"));
+
+        app.on_key(Key::Char(']'), &deps).await;
+        app.on_key(Key::Escape, &deps).await;
+        assert!(matches!(app.screen, Screen::Inbox));
+        assert_eq!(app.inbox_sel, 1, "back on the row it came from");
+        assert!(!app.inbox_triage());
+    }
+
+    #[tokio::test]
+    async fn on_the_diff_tab_brackets_jump_threads_and_braces_walk_the_inbox() {
+        let mut notes = three_threads();
+        notes[0].notification.target = NotificationTarget::Diff;
+        let (mut app, deps) = open_notes(ItemCalls::new(), notes).await;
+        assert_eq!(pr_pane(&app).tab, 3);
+        let first = app.inbox_origin.clone();
+
+        app.on_key(Key::Char(']'), &deps).await;
+        assert_eq!(app.inbox_origin, first, "] is the diff's next comment thread here");
+        app.on_key(Key::Char('}'), &deps).await;
+        assert_eq!(app.inbox_sel, 1, "`}}` walks the inbox from any tab");
+    }
+
+    #[tokio::test]
+    async fn e_on_an_opened_item_is_done_and_next_and_returns_to_the_inbox_after_the_last() {
+        let calls = ItemCalls::new();
+        let mut notes = three_threads();
+        notes.truncate(2);
+        let (mut app, deps) = open_notes(calls.clone(), notes).await;
+
+        app.on_key(Key::Char('e'), &deps).await;
+        assert_eq!(inbox_ids(&app), ["b"], "done with the first");
+        assert!(matches!(app.screen, Screen::PrView(_)) && app.inbox_triage(), "and the next is open");
+        assert_eq!(app.inbox_origin, app.inbox_all_threads().first().map(|t| t.key.clone()));
+
+        app.on_key(Key::Char('e'), &deps).await;
+        assert!(app.inbox.is_empty());
+        assert!(matches!(app.screen, Screen::Inbox), "nothing left: back to the inbox");
+        assert_eq!(app.toast.as_deref(), Some("Dismissed — nothing left in the inbox"));
+        assert_eq!(deps.config.snapshot().ui.dismissed_notifications.len(), 2);
+        assert!(calls.calls().contains(&"read b".to_string()));
+    }
+
+    #[tokio::test]
+    async fn the_selected_leads_detail_is_fetched_once_after_the_cursor_rests_and_never_again() {
+        let calls = ItemCalls::new();
+        let deps = deps_with_items(calls.clone()).await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut app = App::new("slate");
+        app.job_tx = Some(tx);
+        app.screen = Screen::Inbox;
+        let mut note = inbox_note("n1", NotificationKind::Mention, "7", 1, true);
+        note.notification.detail_ref = Some("https://api.github.com/repos/acme/pay/issues/comments/9".into());
+        app.inbox = vec![note.clone()];
+
+        app.tick_inbox_detail(&deps);
+        tokio::task::yield_now().await;
+        assert!(rx.try_recv().is_err(), "not on the first tick: the cursor may only be passing");
+        app.tick_inbox_detail(&deps);
+        let event = rx.recv().await.expect("the detail");
+        app.on_event(event, &deps);
+        assert_eq!(app.inbox[0].notification.actor.as_deref(), Some("Priya Nair"));
+        assert_eq!(app.inbox[0].notification.excerpt.as_deref(), Some("Can you look at the retry?"));
+
+        // A refresh brings the row back bare: it is filled from memory, not asked for again.
+        let mut r = reloaded(Vec::new());
+        r.inbox = vec![note];
+        app.apply_reloaded(r, &deps);
+        assert_eq!(app.inbox[0].notification.actor.as_deref(), Some("Priya Nair"));
+        for _ in 0..5 {
+            app.tick_inbox_detail(&deps);
+        }
+        tokio::task::yield_now().await;
+        assert_eq!(calls.calls().iter().filter(|c| c.starts_with("detail")).count(), 1, "{:?}", calls.calls());
     }
 
     #[test]
@@ -20724,8 +21838,33 @@ mod tests {
         fn pipelines(&self) -> Option<Arc<dyn PipelineSource>> {
             None
         }
+        fn notifications(&self) -> Option<Arc<dyn NotificationSource>> {
+            Some(Arc::new(MockItemSource(self.0.clone())))
+        }
         async fn check(&self) -> bool {
             true
+        }
+    }
+
+    /// The inbox side of the recording provider: reads are logged as `read <id>`, details as
+    /// `detail <id>`.
+    #[async_trait::async_trait]
+    impl NotificationSource for MockItemSource {
+        async fn list(&self) -> forgetop_core::Result<Vec<Notification>> {
+            Ok(Vec::new())
+        }
+        async fn mark_read(&self, id: &str) -> forgetop_core::Result<()> {
+            self.0.record(format!("read {id}")).await
+        }
+        async fn mark_done(&self, id: &str) -> forgetop_core::Result<()> {
+            self.0.record(format!("done {id}")).await
+        }
+        async fn mark_all_read(&self) -> forgetop_core::Result<()> {
+            self.0.record("read all".into()).await
+        }
+        async fn detail(&self, n: &Notification) -> forgetop_core::Result<NotificationDetail> {
+            self.0.log.lock().unwrap().push(format!("detail {}", n.id));
+            Ok(NotificationDetail { actor: Some("Priya Nair".into()), excerpt: Some("Can you look at the retry?".into()), ..Default::default() })
         }
     }
 

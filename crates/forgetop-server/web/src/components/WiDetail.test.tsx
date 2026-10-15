@@ -209,4 +209,97 @@ describe("WiDetail", () => {
     await userEvent.click(screen.getByRole("button", { name: "Reopen with edit" }));
     expect(await screen.findByRole("textbox", { name: "Title" })).toBeInTheDocument();
   });
+
+  it("opened at a comment, scrolls to it and marks it; the triage strip's Done closes the last thread", async () => {
+    const d = detail();
+    const priya = { id: "u1", display_name: "Priya Nair", handle: "priya", avatar_url: null };
+    d.threads = [
+      { id: "th1", comments: [{ id: "k1", author: priya, body: "Earlier note", created_at: null }], file_path: null, line: null, is_resolved: false },
+      { id: "th2", comments: [{ id: "k2", author: priya, body: "What tolerance do we accept?", created_at: null }], file_path: null, line: null, is_resolved: false },
+    ];
+    mockFetch({ get: { "/api/wi/detail": d } });
+    let done = 0;
+    function TargetOpener() {
+      const open = useWiOpener();
+      useEffect(() => {
+        open({ conn: "c", id: "w1" }, undefined, {
+          commentId: "k2",
+          fromInbox: {
+            key: "t",
+            index: 1,
+            total: 1,
+            phrase: "Sam commented",
+            why: "you follow this issue",
+            conn: "c",
+            notificationId: "n1",
+            needsDetail: false,
+            providerLabel: "Linear",
+            onDone: () => {
+              done++;
+              return "none";
+            },
+          },
+        });
+      }, [open]);
+      return null;
+    }
+    renderWithClient(
+      <WiDetailProvider>
+        <TargetOpener />
+      </WiDetailProvider>,
+    );
+
+    const pane = await screen.findByRole("region", { name: "Work item" });
+    await within(pane).findByText("What tolerance do we accept?");
+    const marked = pane.querySelector("[data-target]") as HTMLElement;
+    expect(marked).toHaveTextContent("What tolerance do we accept?");
+    expect(marked).not.toHaveTextContent("Earlier note");
+    expect(within(marked).getByText("From your inbox")).toBeInTheDocument();
+    expect(within(pane).getByTestId("triage-strip")).toHaveTextContent("Inbox · 1 of 1");
+
+    await userEvent.click(within(pane).getByRole("button", { name: /Dismiss/ }));
+    expect(done).toBe(1);
+    await waitFor(() => expect(screen.queryByRole("region", { name: "Work item" })).not.toBeInTheDocument());
+  });
+
+  it("a comment in a thread of several rings that comment only, not its thread", async () => {
+    const d = detail();
+    const priya = { id: "u1", display_name: "Priya Nair", handle: "priya", avatar_url: null };
+    d.threads = [
+      {
+        id: "th1",
+        comments: [
+          { id: "k1", author: priya, body: "First note", created_at: null },
+          { id: "k2", author: priya, body: "What tolerance do we accept?", created_at: null },
+          { id: "k3", author: priya, body: "Third note", created_at: null },
+        ],
+        file_path: null,
+        line: null,
+        is_resolved: false,
+      },
+    ];
+    mockFetch({ get: { "/api/wi/detail": d } });
+    function TargetOpener() {
+      const open = useWiOpener();
+      useEffect(() => {
+        open({ conn: "c", id: "w1" }, undefined, { commentId: "k2" });
+      }, [open]);
+      return null;
+    }
+    renderWithClient(
+      <WiDetailProvider>
+        <TargetOpener />
+      </WiDetailProvider>,
+    );
+
+    const pane = await screen.findByRole("region", { name: "Work item" });
+    await within(pane).findByText("What tolerance do we accept?");
+    const marked = pane.querySelectorAll("[data-target]");
+    expect(marked).toHaveLength(1);
+    expect(marked[0]).toHaveAttribute("data-comment-id", "k2");
+    expect(marked[0]).not.toHaveTextContent("First note");
+    expect(marked[0]).not.toHaveTextContent("Third note");
+    expect(within(marked[0] as HTMLElement).getByText("From your inbox")).toBeInTheDocument();
+    expect(within(pane).getAllByText("From your inbox")).toHaveLength(1);
+  });
 });

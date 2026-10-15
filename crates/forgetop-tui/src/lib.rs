@@ -151,6 +151,8 @@ async fn event_loop(terminal: &mut Term, app: &mut App, deps: &AppDeps) -> Resul
             _ = anim.tick() => {
                 app.tick_anim();
                 app.tick_preview(deps);
+                // The selected inbox thread's who-and-what, once the cursor rests on it.
+                app.tick_inbox_detail(deps);
                 // Polls an open log pane while its job is live; idle otherwise.
                 app.tick_logs(deps);
             }

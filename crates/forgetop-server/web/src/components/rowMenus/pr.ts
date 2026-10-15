@@ -41,7 +41,7 @@ export function usePrRowMenu(): (row: PrRowLike, opts?: RowMenuOpts) => MenuEntr
     (row: PrRowLike, opts?: RowMenuOpts): MenuEntry[] => {
       const pr = row.pull_request;
       const ref: PrRef = { conn: row.connection_id, repo: pr.repository, id: pr.id };
-      const invalidate = [["prs"], ["launchpad"], ["notifications"], prDetailKey(ref)];
+      const invalidate = [["prs"], ["launchpad"], ["notifications"], ["inbox"], prDetailKey(ref)];
       const url = pr.url ?? null;
       const state = prState(pr).kind;
       const isOpen = state !== "merged" && state !== "closed" && state !== "draft";
@@ -108,7 +108,7 @@ export function usePrRowMenu(): (row: PrRowLike, opts?: RowMenuOpts) => MenuEntr
       };
 
       const entries: MenuEntry[] = [
-        { label: "Open", icon: "open-pane", hint: "↵", onSelect: () => open(ref) },
+        { label: "Open", icon: "open-pane", hint: "↵", onSelect: () => void open(ref) },
         {
           label: `Open in ${providerMeta(row.provider).label}`,
           icon: "external",

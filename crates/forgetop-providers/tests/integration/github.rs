@@ -419,4 +419,30 @@ async fn github_lists_notifications() {
     if let Some(n) = list.first() {
         assert!(!n.id.is_empty(), "a notification carries an id for mark-read");
     }
+    // Every thread keeps GitHub's raw reason. Who and what — and for a mention which comment it
+    // is, for a CI run which run — are `detail()`'s to fetch, by the handle the row carries: nothing
+    // was fetched per row to get here.
+    use forgetop_core::domain::{NotificationItemType as IT, NotificationKind as K, NotificationTarget as T};
+    for n in &list {
+        assert!(!n.reason.is_empty(), "the raw reason is kept ({})", n.id);
+        if matches!(n.target, T::Comment { .. }) {
+            assert!(n.detail_ref.is_some(), "a comment target comes with its detail handle ({})", n.id);
+        }
+        if n.detail_ref.is_some() {
+            assert!(matches!(n.kind, K::Mention | K::Comment) || n.item_type == IT::Pipeline, "only a comment or a CI run is fetched later ({})", n.id);
+        }
+        assert!(n.actor.is_none(), "who is fetched lazily, not listed ({})", n.id);
+        // The one excerpt a list carries is a finished run's outcome, read off its title.
+        assert!(n.excerpt.is_none() || n.reason == "ci_activity", "what is fetched lazily ({})", n.id);
+    }
+    // A CI notification names its run only through the detail (GitHub sends no suite URL): say
+    // what the lookup found for one, so a CI log shows whether the run resolution works live.
+    if let Some(ci) = list.iter().find(|n| n.item_type == IT::Pipeline && n.detail_ref.is_some()) {
+        let d = notifs.detail(ci).await.expect("a CI notification's run lookup answers");
+        eprintln!("github: CI notification {:?} → run {:?}, {:?}", ci.title, d.target, d.excerpt);
+    }
+    let mut reasons: Vec<&str> = list.iter().map(|n| n.reason.as_str()).collect();
+    reasons.sort_unstable();
+    reasons.dedup();
+    eprintln!("github: reasons seen: {reasons:?}");
 }

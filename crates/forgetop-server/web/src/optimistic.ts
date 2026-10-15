@@ -11,13 +11,15 @@
  * real answer rather than show a guess that can be wrong.
  */
 import type { QueryClient } from "@tanstack/react-query";
-import { prDetailKey, wiDetailKey } from "./api";
+import { inboxKey, prDetailKey, wiDetailKey } from "./api";
 import type {
   Comment,
   CommentThread,
   ConnectionRow,
   HealthRow,
+  InboxThread,
   LaunchpadResponse,
+  NotificationDetailResponse,
   NotifRow,
   PipelineSelection,
   PipeRow,
@@ -36,6 +38,7 @@ import type {
 /** Lists whose rows each carry the connection they came from. Keys match by prefix, so "prs"
  *  covers every ["prs", view] the user has visited, not only the one on screen. */
 const CONNECTION_TAGGED_LISTS = ["prs", "work-items", "pipelines", "notifications"];
+const INBOX = ["inbox"];
 
 /**
  * Drops everything a just-removed connection contributed.
@@ -51,6 +54,7 @@ export function dropConnectionFromCache(qc: QueryClient, id: string): void {
       rows?.filter((r) => r.connection_id !== id),
     );
   }
+  qc.setQueriesData<InboxThread[]>({ queryKey: INBOX }, (threads) => threads?.filter((t) => t.lead.connection_id !== id));
   qc.setQueriesData<LaunchpadResponse>({ queryKey: ["launchpad"] }, (lp) =>
     lp && { ...lp, rows: lp.rows.filter((r) => r.connection_id !== id) },
   );
@@ -69,6 +73,72 @@ export function markNotificationReadInCache(qc: QueryClient, conn: string, id: s
         ? { ...r, notification: { ...r.notification, unread: false } }
         : r,
     ),
+  );
+}
+
+/** The `(connection, id)` pairs a thread stands for, as a lookup. */
+const memberSet = (thread: Pick<InboxThread, "members">) => new Set(thread.members.map((m) => `${m.conn}\u0001${m.id}`));
+const rowIn = (set: Set<string>, r: NotifRow) => set.has(`${r.connection_id}\u0001${r.notification.id}`);
+const readRow = (r: NotifRow): NotifRow => (r.notification.unread ? { ...r, notification: { ...r.notification, unread: false } } : r);
+
+/**
+ * Marks every notification of an inbox thread read: the thread row stops reading as unread (and
+ * leaves the bell's count) and so do its rows in the flat list. Rows of other threads keep their
+ * identity, so nothing else re-renders.
+ */
+export function markThreadReadInCache(qc: QueryClient, thread: Pick<InboxThread, "key" | "members">): void {
+  const set = memberSet(thread);
+  qc.setQueriesData<InboxThread[]>({ queryKey: INBOX }, (threads) =>
+    threads?.map((t) =>
+      t.key === thread.key
+        ? { ...t, unread: false, lead: readRow(t.lead), more: t.more.map(readRow), members: t.members.map((m) => ({ ...m, unread: false })) }
+        : t,
+    ),
+  );
+  qc.setQueriesData<NotifRow[]>({ queryKey: ["notifications"] }, (rows) => rows?.map((r) => (rowIn(set, r) ? readRow(r) : r)));
+}
+
+/**
+ * Takes a thread out of the inbox ("done"): the row leaves every inbox view and its members leave
+ * the flat list, as the server's dismissal will make them on the next fetch.
+ */
+export function removeThreadFromCache(qc: QueryClient, thread: Pick<InboxThread, "key" | "members">): void {
+  const set = memberSet(thread);
+  qc.setQueriesData<InboxThread[]>({ queryKey: INBOX }, (threads) => threads?.filter((t) => t.key !== thread.key));
+  qc.setQueriesData<NotifRow[]>({ queryKey: ["notifications"] }, (rows) => rows?.filter((r) => !rowIn(set, r)));
+}
+
+/**
+ * Writes a fetched notification detail into the inbox thread it leads: who and what (only where
+ * the feed left them out), where opening now lands (only over a row that pointed at the item as a
+ * whole — a GitHub mention's comment, once the server has checked it mentions you), and the
+ * phrase and why the server recomputed with it. This is the server's own answer, not a guess, so
+ * it replaces the refetch of the whole inbox a detail used to cost. Threads led by anything else
+ * keep their identity.
+ */
+export function patchInboxDetailInCache(qc: QueryClient, conn: string, id: string, detail: NotificationDetailResponse): void {
+  qc.setQueryData<InboxThread[]>(inboxKey, (threads) =>
+    threads?.map((t) => {
+      const lead = t.lead;
+      const n = lead.notification;
+      if (lead.connection_id !== conn || n.id !== id) return t;
+      const retarget = !!detail.target && (!n.target || n.target.kind === "Overview");
+      return {
+        ...t,
+        lead: {
+          ...lead,
+          phrase: detail.phrase || lead.phrase,
+          why: detail.why || lead.why,
+          notification: {
+            ...n,
+            actor: n.actor ?? detail.actor ?? n.actor,
+            excerpt: n.excerpt ?? detail.excerpt ?? n.excerpt,
+            target: retarget ? detail.target! : n.target,
+            url: detail.url ?? n.url,
+          },
+        },
+      };
+    }),
   );
 }
 

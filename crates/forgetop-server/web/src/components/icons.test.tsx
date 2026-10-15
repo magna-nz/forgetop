@@ -18,7 +18,7 @@ const NAMES: IconName[] = [
   "chevron-down", "chevron-right", "external", "x", "plus", "check", "comment", "at", "arrow-right", "user",
   "user-plus", "copy", "link", "dots", "pencil", "shield", "logs", "rerun", "square", "minus-circle", "git-branch", "open-pane",
   "pr-open", "pr-draft", "pr-merged", "pr-closed", "check-circle", "x-circle", "running", "queued", "clock",
-  "warning", "half", "circle", "blocked", "skipped", "dot", "review",
+  "warning", "half", "circle", "blocked", "skipped", "dot", "review", "smile",
 ];
 
 describe("Icon", () => {
@@ -62,7 +62,7 @@ describe("every status meta names a glyph the icon set draws", () => {
   });
 
   it("notifications and timeline events", () => {
-    for (const k of ["ReviewRequested", "Mention", "Assigned", "CiFailed", "Comment", "StateChange", "Other"] as NotificationKind[])
+    for (const k of ["ReviewRequested", "Mention", "Assigned", "CiFailed", "Comment", "StateChange", "NewItem", "Due", "Reaction", "Other"] as NotificationKind[])
       expect(known.has(notificationMeta(k).glyph), k).toBe(true);
     for (const k of ["Approved", "ChangesRequested", "Reviewed", "Commented", "Merged", "Closed", "Reopened", "StateChanged", "Assigned", "Labeled", "Committed"] as TimelineEventKind[])
       expect(known.has(timelineMeta(k).glyph), k).toBe(true);

@@ -11,10 +11,31 @@ import { Markdown } from "./Markdown";
 import { Avatar, Button, Chip, claimPane, GroupHeading, IconButton, PaneHeader, setPaneGuard, SlideOver, StatusBadge, StatusGlyph, Tabs, Timeline, usePaneRegistration } from "./ui";
 import { Icon } from "./icons";
 import { renderSpans } from "./syntax";
+import { InboxTag, ringedComment, ringsThread, TARGET_BOX, threadHolds, TriageStrip, useInboxTargetComment, type InboxOrigin } from "./TriageStrip";
 
 // ---- opener context ----
 
-const PrOpenerCtx = createContext<(ref: PrRef) => void>(() => {});
+/** The pane's sections. */
+export type PrTab = "conversation" | "commits" | "checks" | "files";
+
+/** Where to land in the pane, for an opener that knows (a notification): a tab, a comment to
+ *  scroll to and mark, and — from the inbox — the triage strip's place and moves. */
+export interface PrOpenTarget {
+  tab?: PrTab;
+  /** A comment id (that comment) or a thread id (the whole thread): scrolled into view on
+   *  Conversation and marked. */
+  commentId?: string;
+  fromInbox?: InboxOrigin;
+}
+
+/** A target beside a sequence number, so opening again with a target applies it again. */
+type PendingTarget = PrOpenTarget & { seq: number };
+
+/** Opens a pull request in the pane. True when it opened; false when the open pane's leave guard
+ *  (unsubmitted comments) refused and nothing changed — a caller with a side effect that only
+ *  makes sense once the pane is showing it (marking a notification read) waits on this. */
+export type PrOpener = (ref: PrRef, target?: PrOpenTarget) => boolean;
+const PrOpenerCtx = createContext<PrOpener>(() => false);
 export const usePrOpener = () => useContext(PrOpenerCtx);
 /** The pull request open in the pane, so a list can mark its row as selected. */
 const PrCurrentCtx = createContext<PrRef | null>(null);
@@ -22,18 +43,26 @@ export const useCurrentPr = () => useContext(PrCurrentCtx);
 
 export function PrDetailProvider({ children }: { children: ReactNode }) {
   const [ref, setRef] = useState<PrRef | null>(null);
-  const close = useCallback(() => setRef(null), []);
+  const [target, setTarget] = useState<PendingTarget | null>(null);
+  const seq = useRef(0);
+  const close = useCallback(() => {
+    setRef(null);
+    setTarget(null);
+  }, []);
   usePaneRegistration("pr", close);
   // Opening a PR closes any other pane first, and asks the open PR pane's guard (unsubmitted
   // comments) before switching away from it — the same check Esc and ✕ make.
-  const open = useCallback((r: PrRef) => {
-    if (claimPane("pr")) setRef(r);
+  const open = useCallback<PrOpener>((r, t) => {
+    if (!claimPane("pr")) return false;
+    setRef(r);
+    setTarget(t ? { ...t, seq: ++seq.current } : null);
+    return true;
   }, []);
   return (
     <PrOpenerCtx.Provider value={open}>
       <PrCurrentCtx.Provider value={ref}>
         {children}
-        {ref && <PrDetailPanel prRef={ref} onClose={close} />}
+        {ref && <PrDetailPanel prRef={ref} target={target} onClose={close} />}
       </PrCurrentCtx.Provider>
     </PrOpenerCtx.Provider>
   );
@@ -41,7 +70,7 @@ export function PrDetailProvider({ children }: { children: ReactNode }) {
 
 // ---- panel ----
 
-type Tab = "conversation" | "commits" | "checks" | "files";
+type Tab = PrTab;
 
 /** What a detail without a `writes` field (an older server) supports: nothing optional. */
 const NO_WRITES: PrWriteSupport = { resolve_threads: false, draft: false, close: false, reopen: false, request_reviewer: false };
@@ -52,7 +81,7 @@ type OnResolve = (threadId: string, resolved: boolean) => void;
 /** A muted middle-dot separator for the header's meta lines. */
 const Sep = () => <span style={{ color: "var(--fg3)" }}>·</span>;
 
-function PrDetailPanel({ prRef, onClose }: { prRef: PrRef; onClose: () => void }) {
+function PrDetailPanel({ prRef, target, onClose }: { prRef: PrRef; target: PendingTarget | null; onClose: () => void }) {
   const { data, isLoading, error } = usePrDetail(prRef);
   const connections = useConnections();
   const provider: ProviderType | undefined = connections.data?.find((c) => c.id === prRef.conn)?.provider;
@@ -104,12 +133,20 @@ function PrDetailPanel({ prRef, onClose }: { prRef: PrRef; onClose: () => void }
     setMoreOpen(false);
   }, [prRef.conn, prRef.id]);
 
+  // Declared after the reset above, so on a fresh open the reset runs first and the target wins.
+  useEffect(() => {
+    if (target?.tab) setTab(target.tab);
+  }, [target?.seq]); // eslint-disable-line react-hooks/exhaustive-deps
+  const fromInbox = target?.fromInbox ?? null;
+  const targetComment = useInboxTargetComment(target?.commentId, fromInbox);
+
   const refresh = () => {
     qc.invalidateQueries({ queryKey: prDetailKey(prRef) });
     qc.invalidateQueries({ queryKey: ["prs"] });
     qc.invalidateQueries({ queryKey: ["launchpad"] });
     // Acting on a PR (merge, approve, …) can clear its review-request / mention notification.
     qc.invalidateQueries({ queryKey: ["notifications"] });
+    qc.invalidateQueries({ queryKey: ["inbox"] });
   };
 
   // Who you are on this connection, for showing your vote and comments before the provider does.
@@ -271,6 +308,7 @@ function PrDetailPanel({ prRef, onClose }: { prRef: PrRef; onClose: () => void }
 
   const header = (
     <>
+      {fromInbox && <TriageStrip origin={fromInbox} onClose={requestClose} />}
       <PaneHeader
         glyph={status?.glyph}
         color={status?.color}
@@ -480,6 +518,7 @@ function PrDetailPanel({ prRef, onClose }: { prRef: PrRef; onClose: () => void }
               onReply={reply}
               onResolve={onResolve}
               onComment={comment}
+              targetCommentId={targetComment}
             />
           )}
           {tab === "commits" && (
@@ -491,7 +530,7 @@ function PrDetailPanel({ prRef, onClose }: { prRef: PrRef; onClose: () => void }
               }}
             />
           )}
-          {tab === "checks" && <ChecksTab checks={data.checks} provider={provider} />}
+          {tab === "checks" && <ChecksTab checks={data.checks} provider={provider} focusFailed={target?.tab === "checks"} />}
         </>
       )}
     </SlideOver>
@@ -763,13 +802,20 @@ function checkWord(status: CheckStatus): string {
 
 /** The Checks tab: one row per check run, linking out to the run where the provider gives a URL.
  *  Greyed with the standard message when the provider can't report checks. */
-function ChecksTab({ checks, provider }: { checks: CheckRun[]; provider: ProviderType | undefined }) {
+function ChecksTab({ checks, provider, focusFailed = false }: { checks: CheckRun[]; provider: ProviderType | undefined; focusFailed?: boolean }) {
   const supported = provider ? providerSupports(provider, "checks") : true;
+  // Opened at a CI failure (a notification): the first failing run is the one to look at.
+  const focused = focusFailed ? checks.findIndex((c) => c.status === "Failed") : -1;
+  const focusRef = useRef<HTMLElement | null>(null);
+  useEffect(() => {
+    focusRef.current?.scrollIntoView?.({ block: "nearest" });
+  }, [focused]);
   if (!supported && provider) return <Empty text={unsupportedMessage(provider)} />;
   if (checks.length === 0) return <Empty text="No checks reported for this pull request." />;
   return (
     <div className="flex flex-col px-2 py-2">
       {checks.map((c, i) => {
+        const sel = i === focused ? { "data-selected": true, ref: (el: HTMLElement | null) => void (focusRef.current = el) } : {};
         const m = checkMeta(c.status);
         const inner = (
           <>
@@ -782,11 +828,11 @@ function ChecksTab({ checks, provider }: { checks: CheckRun[]; provider: Provide
           </>
         );
         return c.url ? (
-          <a key={i} href={c.url} target="_blank" rel="noreferrer" className="ft-row" style={{ minHeight: 32 }}>
+          <a key={i} href={c.url} target="_blank" rel="noreferrer" className="ft-row" style={{ minHeight: 32 }} {...sel}>
             {inner}
           </a>
         ) : (
-          <div key={i} className="ft-row" style={{ minHeight: 32, cursor: "default" }}>
+          <div key={i} className="ft-row" style={{ minHeight: 32, cursor: "default" }} {...sel}>
             {inner}
           </div>
         );
@@ -1502,13 +1548,25 @@ function ThreadBox({
   busy,
   onReply,
   onResolve,
+  targetId = null,
 }: {
   thread: CommentThread;
   busy: boolean;
   onReply: (threadId: string, body: string) => void;
   /** Absent when the provider can't resolve threads — the state still shows, the button doesn't. */
   onResolve?: OnResolve;
+  /** The id a notification pointed at. This thread's own id: the thread is ringed; one of its
+   *  comments' ids: only that comment is. Either way it is scrolled into view, tagged with why. */
+  targetId?: string | null;
 }) {
+  const target = ringsThread(thread, targetId);
+  const targetComment = ringedComment(thread, targetId);
+  const box = useRef<HTMLDivElement>(null);
+  const commentBox = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (target) box.current?.scrollIntoView?.({ block: "center" });
+    else if (targetComment) commentBox.current?.scrollIntoView?.({ block: "center" });
+  }, [target, targetComment]);
   const [replying, setReplying] = useState(false);
   const [draft, setDraft] = useState("");
   const submit = () => {
@@ -1533,12 +1591,27 @@ function ThreadBox({
     </span>
   );
   return (
-    <div className="rounded-md px-2.5 py-2 text-[12.5px]" style={{ background: "var(--hover)", border: "1px solid var(--border)" }}>
+    <div
+      ref={box}
+      className="rounded-md px-2.5 py-2 text-[12.5px]"
+      style={target ? TARGET_BOX : { background: "var(--hover)", border: "1px solid var(--border)" }}
+      data-target={target || undefined}
+    >
+      {target && <InboxTag />}
       {thread.comments.length === 0 && <div className="flex items-center gap-2">{controls}</div>}
       {thread.comments.map((c, i) => {
         const age = relativeTime(c.created_at);
+        const ringed = c.id === targetComment;
         return (
-          <div key={c.id} className={i > 0 ? "mt-2.5" : undefined}>
+          <div
+            key={c.id}
+            ref={ringed ? commentBox : undefined}
+            data-comment-id={c.id}
+            data-target={ringed || undefined}
+            className={[i > 0 ? "mt-2.5" : "", ringed ? "rounded-md px-2 py-1.5 -mx-2" : ""].join(" ").trim() || undefined}
+            style={ringed ? TARGET_BOX : undefined}
+          >
+            {ringed && <InboxTag />}
             <div className="flex items-center gap-2" style={{ minHeight: 22 }}>
               <Avatar name={c.author.display_name} size={16} />
               <span className="font-medium" style={{ color: "var(--fg)" }}>
@@ -1617,6 +1690,7 @@ function ConversationTab({
   onReply,
   onResolve,
   onComment,
+  targetCommentId = null,
 }: {
   threads: CommentThread[];
   description?: string | null;
@@ -1625,6 +1699,9 @@ function ConversationTab({
   onReply: (threadId: string, body: string) => void;
   onResolve?: OnResolve;
   onComment: (body: string) => void;
+  /** A comment (or thread) a notification pointed at; that comment (or the whole thread) is
+   *  marked. Not found: nothing is. */
+  targetCommentId?: string | null;
 }) {
   const [draft, setDraft] = useState("");
   const general = threads.filter((t) => !t.file_path);
@@ -1637,13 +1714,26 @@ function ConversationTab({
       {timeline.length > 0 && <Timeline events={timeline} />}
       <div className="flex flex-col gap-2">
         <GroupHeading>{openCount > 0 ? `Comments · ${openCount} open` : "Comments"}</GroupHeading>
-        {general.length === 0 && (
+        {general.length === 0 && !threads.some((t) => threadHolds(t, targetCommentId)) && (
           <div className="text-[12.5px]" style={{ color: "var(--fg3)" }}>
             No comments yet.
           </div>
         )}
+        {/* A notification about a line comment names a thread the diff holds; it is shown here
+            too, above the rest, so opening at it never lands on a page without it. */}
+        {threads
+          .filter((t) => t.file_path && threadHolds(t, targetCommentId))
+          .map((t) => (
+            <div key={t.id} className="flex flex-col gap-1">
+              <span className="mono text-[12px] truncate" style={{ color: "var(--fg3)" }}>
+                {t.file_path}
+                {t.line != null ? `:${t.line}` : ""}
+              </span>
+              <ThreadBox thread={t} busy={busy} onReply={onReply} onResolve={onResolve} targetId={targetCommentId} />
+            </div>
+          ))}
         {general.map((t) => (
-          <ThreadBox key={t.id} thread={t} busy={busy} onReply={onReply} onResolve={onResolve} />
+          <ThreadBox key={t.id} thread={t} busy={busy} onReply={onReply} onResolve={onResolve} targetId={targetCommentId} />
         ))}
       </div>
       <div className="flex flex-col gap-2">

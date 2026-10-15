@@ -23,7 +23,7 @@ export function Settings() {
   const [editing, setEditing] = useState<ConnectionRow | null | undefined>(undefined); // undefined = closed
 
   const refreshAll = () => {
-    ["connections", "health", "launchpad", "prs", "work-items", "pipelines", "notifications"].forEach((k) =>
+    ["connections", "health", "launchpad", "prs", "work-items", "pipelines", "notifications", "inbox"].forEach((k) =>
       qc.invalidateQueries({ queryKey: [k] }),
     );
   };

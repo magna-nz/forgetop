@@ -26,6 +26,15 @@ fn base() -> DateTime<Utc> {
     Utc::now()
 }
 
+/// The demo's notification clock: "now" as of the first time a feed is read, held for the run.
+/// A notification's `updated_at` is part of its identity (a dismissal is keyed by it, so new
+/// activity brings a thread back), so it must not move between two reads of the same feed the
+/// way [`base`] does.
+fn notif_base() -> DateTime<Utc> {
+    static AT: OnceLock<DateTime<Utc>> = OnceLock::new();
+    *AT.get_or_init(Utc::now)
+}
+
 fn user(id: &str, name: &str, handle: &str) -> User {
     User { id: id.into(), display_name: name.into(), handle: Some(handle.into()), avatar_url: None }
 }
@@ -52,6 +61,10 @@ fn carol() -> User {
 }
 fn dev() -> User {
     user("u4", "Tom Becker", "tom")
+}
+/// A Linear teammate who comments on your tickets (not a PR reviewer).
+fn sam_ortiz() -> User {
+    user("u5", "Sam Ortiz", "sam.ortiz")
 }
 
 fn rev(u: User, vote: ReviewVote) -> Reviewer {
@@ -1069,6 +1082,43 @@ fn submitted_threads() -> &'static Mutex<HashMap<String, Vec<CommentThread>>> {
     STORE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// The comment on PR 1487 that the demo's GitHub mention notification (`gh-4`) opens on. Its
+/// text is shared with that notification's lazy `detail()`, so the two cannot drift apart.
+const KEY_QUESTION: &str = "@sam does the key check need to run before the ledger write, or is the unique index enough on its own?";
+/// The comment on PR 1476 behind the GitHub comment notification (`gh-5`).
+const PROMO_NOTE: &str = "Looks like the cart summary drops the promo line on mobile - I left a screenshot in the Figma comment.";
+/// The comment on MR 312 behind the GitLab mention (`gl-3`).
+const REPLICA_QUESTION: &str = "@sam can you confirm the replica's instance class before we apply? The plan shows a db.r6g.xlarge.";
+/// The comment on ENG-231 behind the Linear comment notification (`ln-5`).
+const TOLERANCE_QUESTION: &str = "Should the tolerance be per-processor or global? Stripe settles in USD but Adyen reports in EUR.";
+/// The comment on ENG-245 behind the Linear mention (`ln-10`).
+const SNAPSHOT_QUESTION: &str = "@sam does the spike need to cover snapshotting, or only replay cost?";
+
+/// A one-comment thread, for the comments the demo's notifications point at.
+fn seeded_thread(thread_id: &str, comment_id: &str, author: User, body: &str, hours_ago: i64) -> CommentThread {
+    CommentThread {
+        id: thread_id.into(),
+        comments: vec![Comment { id: comment_id.into(), author, body: body.into(), created_at: Some(base() - chrono::Duration::hours(hours_ago)) }],
+        file_path: None,
+        line: None,
+        is_resolved: false,
+        is_resolvable: false,
+    }
+}
+
+/// Conversation threads a demo notification opens on, by item id: a notification's
+/// `Comment { id }` target has to name a comment the item's threads actually carry.
+fn seeded_threads(item_id: &str) -> Vec<CommentThread> {
+    match item_id {
+        "1487" => vec![seeded_thread("t-key", "c-key", alice(), KEY_QUESTION, 7)],
+        "1476" => vec![seeded_thread("t-promo", "c-promo", carol(), PROMO_NOTE, 27)],
+        "312" => vec![seeded_thread("t-replica", "c-replica", carol(), REPLICA_QUESTION, 9)],
+        "ENG-231" => vec![seeded_thread("issue-ENG-231", "ln-c1", sam_ortiz(), TOLERANCE_QUESTION, 3)],
+        "ENG-245" => vec![seeded_thread("issue-ENG-245", "ln-c2", bob(), SNAPSHOT_QUESTION, 5)],
+        _ => vec![],
+    }
+}
+
 /// Work-item edits made this run (reassign / title / description), keyed by item id, so they
 /// persist and read back like a real provider. `assignee: None` = unchanged, `Some(None)` =
 /// unassigned, `Some(Some(u))` = assigned.
@@ -1648,6 +1698,8 @@ impl PullRequestSource for DemoPr {
                 is_resolvable: true,
             },
         ];
+        // The comments the demo's notifications open on.
+        threads.extend(seeded_threads(id));
         // Include anything submitted this session so it persists like a real provider.
         if let Some(extra) = submitted_threads().lock().unwrap().get(id) {
             threads.extend(extra.iter().cloned());
@@ -2132,8 +2184,11 @@ impl WorkItemSource for DemoWi {
     }
     async fn threads(&self, item: &ItemRef) -> Result<Vec<CommentThread>> {
         let id: &str = &item.id;
-        // Comments submitted this session persist and come back, like a real provider.
-        Ok(submitted_threads().lock().unwrap().get(id).cloned().unwrap_or_default())
+        // The comments the demo's notifications open on, then the ones submitted this session —
+        // those persist and come back, like a real provider.
+        let mut threads = seeded_threads(id);
+        threads.extend(submitted_threads().lock().unwrap().get(id).cloned().unwrap_or_default());
+        Ok(threads)
     }
     async fn timeline(&self, item: &ItemRef) -> Result<Vec<TimelineEvent>> {
         let id: &str = &item.id;
@@ -2727,29 +2782,98 @@ fn notif(
         context: context.into(),
         url: Some(url.into()),
         unread: true,
-        updated_at: Some(base() - chrono::Duration::hours(updated_h)),
+        updated_at: Some(notif_base() - chrono::Duration::hours(updated_h)),
+        reason: String::new(),
+        actor: None,
+        excerpt: None,
+        target: Default::default(),
+        detail_ref: None,
     }
 }
 
+/// A notification's why: the provider's raw `reason`, who caused it, what it said, and where
+/// opening it lands.
+fn why(mut n: Notification, reason: &str, actor: Option<&str>, excerpt: Option<&str>, target: NotificationTarget) -> Notification {
+    n.reason = reason.into();
+    n.actor = actor.map(Into::into);
+    n.excerpt = excerpt.map(Into::into);
+    n.target = target;
+    n
+}
+
+/// Already read when the session starts.
+fn read(mut n: Notification) -> Notification {
+    n.unread = false;
+    n
+}
+
+/// A notification whose actor and text are fetched on demand by `detail()`, as GitHub's are.
+/// Addressed in the GitHub demo connection's repository, as a CI notification is.
+fn in_repo(mut n: Notification) -> Notification {
+    n.repository = Some("northwind/payments".into());
+    n
+}
+
+fn lazy(mut n: Notification, detail_ref: &str) -> Notification {
+    n.detail_ref = Some(detail_ref.into());
+    n
+}
+
 /// Canned notifications per demo connection, each pointing at one of that connection's real
-/// demo items (by id) so pressing it drills into the actual PR / work item.
+/// demo items (by id) so pressing it drills into the actual PR / work item. A `Comment` target
+/// names a comment that item's threads carry (see [`seeded_threads`]).
 fn demo_notifications_for(conn: &str) -> Vec<Notification> {
     use NotificationItemType as IT;
     use NotificationKind as K;
+    use NotificationTarget as T;
+    let comment = |id: &str| T::Comment { id: id.into() };
     match conn {
+        // GitHub's feed names no actor and no text: the two mentions below are filled in by
+        // `detail()` for the selected row, as the real provider does.
         "github" => vec![
-            notif("gh-1", K::ReviewRequested, IT::PullRequest, Some("1501"), "Refactor the webhook retry queue", "northwind/payments", "https://example.test/pr/1501", 1),
-            notif("gh-2", K::CiFailed, IT::PullRequest, Some("1492"), "Bump Next.js to 14.2.5", "northwind/web", "https://example.test/pr/1492", 3),
-            notif("gh-3", K::Mention, IT::WorkItem, Some("#842"), "Investigate elevated p99 on POST /charge", "northwind/payments", "https://example.test/issue/842", 5),
-            notif("gh-4", K::Comment, IT::PullRequest, Some("1487"), "Add idempotency keys to the payments API", "northwind/payments", "https://example.test/pr/1487", 26),
+            why(notif("gh-1", K::ReviewRequested, IT::PullRequest, Some("1501"), "Refactor the webhook retry queue", "northwind/payments", "https://example.test/pr/1501", 1), "review_requested", None, None, T::Diff),
+            why(notif("gh-2", K::CiFailed, IT::PullRequest, Some("1492"), "Bump Next.js to 14.2.5", "northwind/web", "https://example.test/pr/1492", 3), "ci_activity", None, None, T::Checks),
+            why(notif("gh-3", K::Mention, IT::WorkItem, Some("#842"), "Investigate elevated p99 on POST /charge", "northwind/payments", "https://example.test/issue/842", 5), "team_mention", None, None, T::Overview),
+            lazy(
+                why(notif("gh-4", K::Mention, IT::PullRequest, Some("1487"), "Add idempotency keys to the payments API", "northwind/payments", "https://example.test/pr/1487", 7), "mention", None, None, T::Overview),
+                "demo:gh-4",
+            ),
+            lazy(
+                read(why(notif("gh-5", K::Comment, IT::PullRequest, Some("1476"), "Checkout redesign", "northwind/web", "https://example.test/pr/1476#issuecomment-4761", 27), "comment", None, None, comment("c-promo"))),
+                "demo:gh-5",
+            ),
+            read(why(notif("gh-6", K::StateChange, IT::PullRequest, Some("1450"), "Cache the customer risk score", "northwind/payments", "https://example.test/pr/1450", 30), "state_change", None, None, T::Activity)),
+            read(why(notif("gh-7", K::Other, IT::WorkItem, Some("#851"), "Add retry-budget metrics to the sync worker", "northwind/payments", "https://example.test/issue/851", 40), "subscribed", None, None, T::Overview)),
+            // CI: GitHub names only the check suite, and the link is the repository's; the run
+            // (and its page) comes from the detail, like the real `actions/runs?check_suite_id=`.
+            in_repo(lazy(
+                why(notif("gh-8", K::CiFailed, IT::Pipeline, None, "CI workflow run failed for claude/cache-rewrite-7ab2 branch", "northwind/payments", "https://example.test/northwind/payments", 1), "ci_activity", None, None, T::Overview),
+                "demo:ci-r500",
+            )),
+            in_repo(lazy(
+                why(notif("gh-9", K::Other, IT::Pipeline, None, "CI workflow run succeeded for claude/m4-action-palette-shortcut-f096cc branch", "northwind/payments", "https://example.test/northwind/payments", 1), "ci_activity", None, Some("succeeded"), T::Overview),
+                "demo:ci-r499",
+            )),
         ],
         "gitlab" => vec![
-            notif("gl-1", K::ReviewRequested, IT::PullRequest, Some("318"), "Rotate the KMS signing keys", "platform/infra", "https://example.test/mr/318", 2),
-            notif("gl-2", K::Assigned, IT::WorkItem, Some("#77"), "Right-size the staging cluster", "platform/infra", "https://example.test/issue/77", 6),
+            why(notif("gl-1", K::ReviewRequested, IT::PullRequest, Some("318"), "Rotate the KMS signing keys", "platform/infra", "https://example.test/mr/318", 2), "review_requested", Some("Priya Nair"), None, T::Diff),
+            why(notif("gl-2", K::Assigned, IT::WorkItem, Some("#77"), "Right-size the staging cluster", "platform/infra", "https://example.test/issue/77", 6), "assigned", Some("Marcus Lee"), None, T::Overview),
+            why(notif("gl-3", K::Mention, IT::PullRequest, Some("312"), "Terraform: add a Postgres read replica", "platform/infra", "https://example.test/mr/312#note_6120", 9), "mentioned", Some("Elena Sokolova"), Some(REPLICA_QUESTION), comment("c-replica")),
+            read(why(notif("gl-4", K::Other, IT::PullRequest, Some("305"), "Bump the base image to alpine 3.20", "platform/infra", "https://example.test/mr/305", 33), "unmergeable", None, None, T::Overview)),
         ],
+        // Linear sends one notification per event, so ENG-231 arrives as a thread: created,
+        // moved to Todo, assigned, a comment and a reaction.
         "linear" => vec![
-            notif("ln-1", K::Assigned, IT::WorkItem, Some("ENG-231"), "Design the ledger reconciliation job", "Engineering", "https://example.test/issue/ENG-231", 4),
-            notif("ln-2", K::StateChange, IT::WorkItem, Some("ENG-198"), "Migrate feature flags to OpenFeature", "Engineering", "https://example.test/issue/ENG-198", 18),
+            why(notif("ln-1", K::Assigned, IT::WorkItem, Some("ENG-231"), "Design the ledger reconciliation job", "Engineering", "https://example.test/issue/ENG-231", 4), "issueAssignedToYou", Some("Marcus Lee"), None, T::Overview),
+            read(why(notif("ln-3", K::NewItem, IT::WorkItem, Some("ENG-231"), "Design the ledger reconciliation job", "Engineering", "https://example.test/issue/ENG-231", 31), "issueCreated", Some("Marcus Lee"), None, T::Overview)),
+            read(why(notif("ln-4", K::StateChange, IT::WorkItem, Some("ENG-231"), "Design the ledger reconciliation job", "Engineering", "https://example.test/issue/ENG-231", 29), "issueStatusChanged", Some("Marcus Lee"), Some("Todo"), T::Activity)),
+            why(notif("ln-5", K::Comment, IT::WorkItem, Some("ENG-231"), "Design the ledger reconciliation job", "Engineering", "https://example.test/issue/ENG-231#comment-ln-c1", 3), "issueNewComment", Some("Sam Ortiz"), Some(TOLERANCE_QUESTION), comment("ln-c1")),
+            why(notif("ln-6", K::Reaction, IT::WorkItem, Some("ENG-231"), "Design the ledger reconciliation job", "Engineering", "https://example.test/issue/ENG-231", 2), "issueCommentReaction", Some("Priya Nair"), None, T::Overview),
+            read(why(notif("ln-2", K::StateChange, IT::WorkItem, Some("ENG-198"), "Migrate feature flags to OpenFeature", "Engineering", "https://example.test/issue/ENG-198", 18), "issueStatusChanged", Some("Elena Sokolova"), Some("Blocked"), T::Activity)),
+            why(notif("ln-9", K::Due, IT::WorkItem, Some("ENG-198"), "Migrate feature flags to OpenFeature", "Engineering", "https://example.test/issue/ENG-198", 5), "issueDue", None, None, T::Overview),
+            why(notif("ln-7", K::Other, IT::WorkItem, Some("ENG-250"), "Add SLO dashboards for the charge API", "Engineering", "https://example.test/issue/ENG-250", 8), "issuePriorityUrgent", Some("Marcus Lee"), None, T::Overview),
+            why(notif("ln-8", K::StateChange, IT::WorkItem, Some("ENG-245"), "Spike: event sourcing for the payments ledger", "Engineering", "https://example.test/issue/ENG-245", 6), "issueStatusChanged", Some("Elena Sokolova"), Some("In Review"), T::Activity),
+            why(notif("ln-10", K::Mention, IT::WorkItem, Some("ENG-245"), "Spike: event sourcing for the payments ledger", "Engineering", "https://example.test/issue/ENG-245#comment-ln-c2", 5), "issueCommentMention", Some("Marcus Lee"), Some(SNAPSHOT_QUESTION), comment("ln-c2")),
         ],
         _ => vec![],
     }
@@ -2775,6 +2899,31 @@ impl NotificationSource for DemoNotifications {
     async fn mark_read(&self, id: &str) -> Result<()> {
         read_notifications().lock().unwrap().insert(id.to_string());
         Ok(())
+    }
+    /// What GitHub's `latest_comment_url` fetch returns, for the notifications that carry a ref.
+    async fn detail(&self, n: &Notification) -> Result<NotificationDetail> {
+        demo_latency().await;
+        // A check suite's run, as GitHub's `actions/runs?check_suite_id=` answers it.
+        if let Some(run) = n.detail_ref.as_deref().and_then(|r| r.strip_prefix("demo:ci-")) {
+            // What the run says about itself, as GitHub's runs list does: number, trigger, commit.
+            let excerpt = pipeline_runs_for(&self.conn).into_iter().find(|r| r.id == run).map(|r| {
+                let said: Vec<String> = [r.number.map(|n| format!("Run #{n}")), r.event.clone(), r.title.clone()].into_iter().flatten().collect();
+                said.join(" · ")
+            });
+            return Ok(NotificationDetail {
+                actor: Some("sam".into()),
+                excerpt,
+                target: Some(NotificationTarget::Run { id: run.into() }),
+                url: Some(format!("https://example.test/northwind/payments/actions/runs/{run}")),
+            });
+        }
+        // Like GitHub, a mention's comment is only named as its target once read.
+        let (actor, text, target) = match n.detail_ref.as_deref() {
+            Some("demo:gh-4") => ("Priya Nair", KEY_QUESTION, Some(NotificationTarget::Comment { id: "c-key".into() })),
+            Some("demo:gh-5") => ("Elena Sokolova", PROMO_NOTE, None),
+            _ => return Ok(NotificationDetail::default()),
+        };
+        Ok(NotificationDetail { actor: Some(actor.into()), excerpt: Some(text.into()), target, ..Default::default() })
     }
 }
 
@@ -3031,6 +3180,105 @@ mod tests {
         src.mark_read(&review.id).await.unwrap();
         let after = src.list().await.unwrap();
         assert!(!after.iter().find(|n| n.id == review.id).unwrap().unread);
+    }
+
+    /// A notification that opens on a comment must name one the item's threads carry, whichever
+    /// source serves that item; and every item it points at must be one the demo can open.
+    #[tokio::test]
+    async fn demo_notification_targets_resolve_in_the_items_threads() {
+        for conn in ["github", "gitlab", "linear"] {
+            let ns = DemoNotifications { conn: conn.into() }.list().await.unwrap();
+            assert!(!ns.is_empty(), "{conn}");
+            for n in &ns {
+                assert!(!n.reason.is_empty(), "{} has a raw reason", n.id);
+                // A CI notification names a check suite, not an item: its run comes from the
+                // detail, and must be a run the demo can open.
+                if n.item_type == NotificationItemType::Pipeline {
+                    let d = DemoNotifications { conn: conn.into() }.detail(n).await.unwrap();
+                    let Some(NotificationTarget::Run { id: run }) = d.target else { panic!("{}: resolves to a run", n.id) };
+                    DemoPipe { conn: conn.into() }.get_run(&ItemRef::new(&run)).await.unwrap_or_else(|_| panic!("{}: run {run} exists", n.id));
+                    continue;
+                }
+                let id = n.item_id.clone().expect("every demo notification has an item");
+                let item = ItemRef::new(&id);
+                let threads = match n.item_type {
+                    NotificationItemType::PullRequest => {
+                        let src = DemoPr { conn: conn.into() };
+                        src.get(&item).await.unwrap_or_else(|_| panic!("{}: PR {id} exists", n.id));
+                        src.threads(&item).await.unwrap()
+                    }
+                    _ => {
+                        let src = DemoWi { conn: conn.into() };
+                        src.get(&item).await.unwrap_or_else(|_| panic!("{}: item {id} exists", n.id));
+                        src.threads(&item).await.unwrap()
+                    }
+                };
+                if let NotificationTarget::Comment { id: comment } = &n.target {
+                    assert!(
+                        threads.iter().any(|t| t.comments.iter().any(|c| &c.id == comment)),
+                        "{}: comment {comment} is in {id}'s threads",
+                        n.id
+                    );
+                }
+                match n.target {
+                    NotificationTarget::Diff => assert_eq!(n.kind, NotificationKind::ReviewRequested, "{}", n.id),
+                    NotificationTarget::Checks => assert_eq!(n.kind, NotificationKind::CiFailed, "{}", n.id),
+                    NotificationTarget::Activity => assert_eq!(n.kind, NotificationKind::StateChange, "{}", n.id),
+                    _ => {}
+                }
+            }
+        }
+        // Checks target: the CI-failed PR really has a failing check to select.
+        let checks = DemoPr { conn: "github".into() }.checks(&ItemRef::new("1492")).await.unwrap();
+        assert!(checks.iter().any(|c| c.status == CheckStatus::Failed));
+    }
+
+    #[tokio::test]
+    async fn the_github_mention_is_filled_in_lazily_and_matches_its_comment() {
+        let src = DemoNotifications { conn: "github".into() };
+        let ns = src.list().await.unwrap();
+        let m = ns.iter().find(|n| n.kind == NotificationKind::Mention && n.item_id.as_deref() == Some("1487")).unwrap();
+        assert_eq!((m.actor.as_deref(), m.excerpt.as_deref()), (None, None), "the feed names neither");
+        assert!(m.detail_ref.is_some());
+        let d = src.detail(m).await.unwrap();
+        assert_eq!(d.actor.as_deref(), Some("Priya Nair"));
+        assert_eq!(m.target, NotificationTarget::Overview, "the feed alone can't say which comment is the mention");
+        let Some(NotificationTarget::Comment { id }) = &d.target else { panic!("the detail lands the mention on its comment") };
+        let threads = DemoPr { conn: "github".into() }.threads(&ItemRef::new("1487")).await.unwrap();
+        let comment = threads.iter().flat_map(|t| &t.comments).find(|c| &c.id == id).unwrap();
+        assert_eq!(comment.author.display_name, "Priya Nair");
+        assert_eq!(Some(comment.body.as_str()), d.excerpt.as_deref(), "the excerpt is the comment's own text");
+        // A notification with no ref has nothing to fetch.
+        let bare = ns.iter().find(|n| n.detail_ref.is_none()).unwrap();
+        assert_eq!(src.detail(bare).await.unwrap(), NotificationDetail::default());
+    }
+
+    #[test]
+    fn the_linear_demo_has_a_multi_event_thread_and_a_mix_of_read_and_unread() {
+        // The canned data, not `list()`: the read set is process-wide and other tests mark ids read.
+        let ns = demo_notifications_for("linear");
+        let on_231: Vec<_> = ns.iter().filter(|n| n.item_id.as_deref() == Some("ENG-231")).collect();
+        assert!(on_231.len() >= 4, "several events on one item");
+        for kind in [NotificationKind::NewItem, NotificationKind::Comment, NotificationKind::StateChange, NotificationKind::Reaction] {
+            assert!(on_231.iter().any(|n| n.kind == kind), "{kind:?}");
+        }
+        assert!(on_231.iter().any(|n| n.kind == NotificationKind::StateChange && n.excerpt.as_deref() == Some("Todo")));
+        assert!(ns.iter().any(|n| n.kind == NotificationKind::StateChange && n.excerpt.as_deref() == Some("In Review")));
+        assert!(ns.iter().any(|n| n.kind == NotificationKind::Other && n.reason == "issuePriorityUrgent"));
+        assert!(ns.iter().any(|n| n.unread) && ns.iter().any(|n| !n.unread));
+    }
+
+    #[tokio::test]
+    async fn every_demo_notification_can_be_marked_read() {
+        // Not GitHub: the read set is process-wide, and the list test above relies on some of
+        // GitHub's staying unread. Marking read is a plain insert, the same for every id.
+        for conn in ["gitlab", "linear"] {
+            let src = DemoNotifications { conn: conn.into() };
+            for n in src.list().await.unwrap() {
+                src.mark_read(&n.id).await.unwrap();
+            }
+            assert!(src.list().await.unwrap().iter().all(|n| !n.unread), "{conn}");
+        }
     }
 
     /// Listings mirror GitHub's `requested_reviewers`: once you have reviewed a PR its list row

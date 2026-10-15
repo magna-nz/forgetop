@@ -9,6 +9,7 @@ use forgetop_core::{Error, Result};
 use reqwest::header::AUTHORIZATION;
 use serde_json::{json, Value};
 
+use crate::content;
 use crate::json::*;
 
 fn prov<E: std::fmt::Display>(e: E) -> Error {
@@ -113,13 +114,17 @@ pub fn map_comment(v: &Value) -> Comment {
     }
 }
 
-/// Linear notification `type` → our unified kind.
+/// Linear notification `type` → our unified kind. Anything unlisted is `Other`, and the row is
+/// then labelled from the raw type (see [`Notification::reason`]).
 fn linear_type_kind(t: &str) -> NotificationKind {
     match t {
         "issueAssignedToYou" => NotificationKind::Assigned,
         "issueMention" | "issueCommentMention" => NotificationKind::Mention,
         "issueStatusChanged" => NotificationKind::StateChange,
         "issueNewComment" => NotificationKind::Comment,
+        "issueCreated" | "issueAddedToTriage" => NotificationKind::NewItem,
+        "issueDue" | "issueReminder" => NotificationKind::Due,
+        t if t.contains("Reaction") => NotificationKind::Reaction,
         _ => NotificationKind::Other,
     }
 }
@@ -128,10 +133,34 @@ fn linear_type_kind(t: &str) -> NotificationKind {
 /// so the item id is the issue id (which the work-item source can open).
 pub fn map_linear_notification(v: &Value) -> Notification {
     let issue = get_obj(v, "issue");
+    let reason = get_str(v, "type").unwrap_or_default();
+    let kind = linear_type_kind(&reason);
+    let comment = get_obj(v, "comment");
+    let mut url = issue.and_then(|i| get_str(i, "url"));
+    let mut target = NotificationTarget::Overview;
+    let mut excerpt = None;
+    match kind {
+        NotificationKind::Mention | NotificationKind::Comment => {
+            if let Some(c) = comment {
+                excerpt = get_str(c, "body").as_deref().and_then(content::comment_excerpt);
+                // `map_comment` gives a work item's comments this same `id`.
+                if let Some(id) = get_str(c, "id") {
+                    target = NotificationTarget::Comment { id };
+                    url = get_str(c, "url").or(url);
+                }
+            }
+        }
+        // The state the issue is in now: the one the change moved it to.
+        NotificationKind::StateChange => {
+            excerpt = issue.and_then(|i| get_obj(i, "state")).and_then(|s| get_str(s, "name")).filter(|n| !n.is_empty());
+            target = NotificationTarget::Activity;
+        }
+        _ => {}
+    }
     Notification {
         repository: None,
         id: get_str(v, "id").unwrap_or_default(),
-        kind: linear_type_kind(&get_str(v, "type").unwrap_or_default()),
+        kind,
         item_type: if issue.is_some() { NotificationItemType::WorkItem } else { NotificationItemType::Other },
         item_id: issue.and_then(|i| get_str(i, "id")),
         title: issue.and_then(|i| get_str(i, "title")).unwrap_or_default(),
@@ -140,13 +169,20 @@ pub fn map_linear_notification(v: &Value) -> Notification {
             .and_then(|t| get_str(t, "name"))
             .or_else(|| issue.and_then(|i| get_str(i, "identifier")))
             .unwrap_or_else(|| "Linear".into()),
-        url: issue.and_then(|i| get_str(i, "url")),
+        url,
         unread: get_str(v, "readAt").is_none(),
         updated_at: get_date(v, "createdAt"),
+        reason,
+        actor: get_obj(v, "actor").and_then(|a| get_str(a, "name")),
+        excerpt,
+        target,
+        detail_ref: None,
     }
 }
 
-const NOTIFICATIONS_QUERY: &str = r#"query { notifications(first: 50) { nodes { id type readAt createdAt ... on IssueNotification { issue { id title url identifier team { name } } } } } }"#;
+/// `comment` and `issue.state` exist only on `IssueNotification`, hence the fragment; `actor`
+/// is on every notification.
+const NOTIFICATIONS_QUERY: &str = r#"query { notifications(first: 50) { nodes { id type readAt createdAt actor { name } ... on IssueNotification { comment { id body url } issue { id title url identifier team { name } state { name } } } } } }"#;
 
 pub struct LinearClient {
     http: reqwest::Client,
@@ -456,6 +492,74 @@ mod tests {
         let m = map_linear_notification(&read);
         assert_eq!(m.kind, NotificationKind::Mention);
         assert!(!m.unread, "readAt set → read");
+    }
+
+    fn issue_note(ty: &str, extra: &str) -> Notification {
+        let v: Value = serde_json::from_str(&format!(
+            r#"{{ "id": "n", "type": "{ty}", "readAt": null, "createdAt": "2026-07-10T08:00:00Z",
+                 "actor": {{ "name": "Sam Ortiz" }}{extra},
+                 "issue": {{ "id": "iss-1", "title": "Ledger job", "url": "https://linear.app/x/issue/ENG-1",
+                            "identifier": "ENG-1", "team": {{ "name": "Platform" }}, "state": {{ "name": "In Review" }} }} }}"#
+        ))
+        .unwrap();
+        map_linear_notification(&v)
+    }
+
+    #[test]
+    fn newer_types_get_their_own_kinds_and_keep_the_raw_type() {
+        for (ty, kind) in [
+            ("issueCreated", NotificationKind::NewItem),
+            ("issueAddedToTriage", NotificationKind::NewItem),
+            ("issueDue", NotificationKind::Due),
+            ("issueReminder", NotificationKind::Due),
+            ("issueCommentReaction", NotificationKind::Reaction),
+            ("issueEmojiReaction", NotificationKind::Reaction),
+            ("issueAssignedToYou", NotificationKind::Assigned),
+            ("issueMention", NotificationKind::Mention),
+            ("issueCommentMention", NotificationKind::Mention),
+            ("issueStatusChanged", NotificationKind::StateChange),
+            ("issueNewComment", NotificationKind::Comment),
+            ("issuePriorityUrgent", NotificationKind::Other),
+            ("issueTitleChanged", NotificationKind::Other),
+        ] {
+            let n = issue_note(ty, "");
+            assert_eq!((n.kind, n.reason.as_str()), (kind, ty), "{ty}");
+            assert_eq!(n.actor.as_deref(), Some("Sam Ortiz"));
+        }
+    }
+
+    #[test]
+    fn a_comment_notification_targets_the_comment_and_links_to_it() {
+        let comment = r#", "comment": { "id": "c-77", "body": "  can we\n\nship  this?  ", "url": "https://linear.app/x/issue/ENG-1#comment-c-77" }"#;
+        for ty in ["issueNewComment", "issueCommentMention"] {
+            let n = issue_note(ty, comment);
+            // The id is the one `map_comment` gives the same comment in the work item's threads.
+            let c = map_comment(&serde_json::json!({ "id": "c-77", "body": "x" }));
+            assert_eq!(n.target, NotificationTarget::Comment { id: c.id }, "{ty}");
+            assert_eq!(n.excerpt.as_deref(), Some("can we ship this?"));
+            assert_eq!(n.url.as_deref(), Some("https://linear.app/x/issue/ENG-1#comment-c-77"));
+        }
+        // A mention in the description has no comment: the issue, from the top.
+        let m = issue_note("issueMention", "");
+        assert_eq!((m.target, m.excerpt, m.url.as_deref()), (NotificationTarget::Overview, None, Some("https://linear.app/x/issue/ENG-1")));
+        // A null comment (Linear sends one for non-comment notifications) is the same.
+        let nul = issue_note("issueNewComment", r#", "comment": null"#);
+        assert_eq!((nul.target, nul.excerpt), (NotificationTarget::Overview, None));
+        // A comment on a non-comment kind is not surfaced.
+        let r = issue_note("issueCommentReaction", comment);
+        assert_eq!((r.target, r.excerpt), (NotificationTarget::Overview, None));
+    }
+
+    #[test]
+    fn a_status_change_carries_the_state_it_moved_to() {
+        let n = issue_note("issueStatusChanged", "");
+        assert_eq!(n.kind, NotificationKind::StateChange);
+        assert_eq!(n.excerpt.as_deref(), Some("In Review"), "the state name and nothing else");
+        assert_eq!(n.target, NotificationTarget::Activity);
+        // No state in the payload: no excerpt, but still the activity.
+        let bare: Value = serde_json::from_str(r#"{ "id": "n", "type": "issueStatusChanged", "issue": { "id": "i", "title": "t" } }"#).unwrap();
+        let b = map_linear_notification(&bare);
+        assert_eq!((b.excerpt, b.target, b.actor), (None, NotificationTarget::Activity, None));
     }
 
     #[test]
