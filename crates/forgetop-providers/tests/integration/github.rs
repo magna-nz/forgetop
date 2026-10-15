@@ -419,13 +419,21 @@ async fn github_lists_notifications() {
     if let Some(n) = list.first() {
         assert!(!n.id.is_empty(), "a notification carries an id for mark-read");
     }
-    // Every thread keeps GitHub's raw reason, and a comment target comes with the handle that
-    // `detail()` fetches it by (and only then) — nothing was fetched per row to get here.
+    // Every thread keeps GitHub's raw reason. Who and what — and for a mention which comment it
+    // is, for a CI run which run — are `detail()`'s to fetch, by the handle the row carries: nothing
+    // was fetched per row to get here.
+    use forgetop_core::domain::{NotificationItemType as IT, NotificationKind as K, NotificationTarget as T};
     for n in &list {
         assert!(!n.reason.is_empty(), "the raw reason is kept ({})", n.id);
-        let is_comment = matches!(n.target, forgetop_core::domain::NotificationTarget::Comment { .. });
-        assert_eq!(is_comment, n.detail_ref.is_some(), "a comment target and its detail handle go together ({})", n.id);
-        assert!(n.actor.is_none() && n.excerpt.is_none(), "who and what are fetched lazily, not listed");
+        if matches!(n.target, T::Comment { .. }) {
+            assert!(n.detail_ref.is_some(), "a comment target comes with its detail handle ({})", n.id);
+        }
+        if n.detail_ref.is_some() {
+            assert!(matches!(n.kind, K::Mention | K::Comment) || n.item_type == IT::Pipeline, "only a comment or a CI run is fetched later ({})", n.id);
+        }
+        assert!(n.actor.is_none(), "who is fetched lazily, not listed ({})", n.id);
+        // The one excerpt a list carries is a finished run's outcome, read off its title.
+        assert!(n.excerpt.is_none() || n.reason == "ci_activity", "what is fetched lazily ({})", n.id);
     }
     let mut reasons: Vec<&str> = list.iter().map(|n| n.reason.as_str()).collect();
     reasons.sort_unstable();
