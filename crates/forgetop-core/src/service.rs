@@ -361,6 +361,29 @@ impl ConfigService {
         .await
     }
 
+    /// Records inbox dismissals ("done", keyed by [`crate::inbox::dismiss_key`]), keeping every
+    /// other — the dashboard and the TUI both add to this list.
+    pub async fn dismiss_notifications(&self, keys: Vec<String>) -> Result<()> {
+        self.update_ui(|ui| {
+            for key in keys {
+                if !ui.dismissed_notifications.contains(&key) {
+                    ui.dismissed_notifications.push(key);
+                }
+            }
+        })
+        .await
+    }
+
+    /// Forgets saved inbox dismissals whose notification no longer arrives, so the list doesn't
+    /// grow forever. `live` is every dismissal key the feeds returned on a full reload — pass it
+    /// only when every feed answered, or a feed that failed would lose its dismissals.
+    pub async fn prune_dismissed_notifications(&self, live: &std::collections::HashSet<String>) -> Result<()> {
+        if self.snapshot().ui.dismissed_notifications.iter().all(|k| live.contains(k)) {
+            return Ok(());
+        }
+        self.update_ui(|ui| ui.dismissed_notifications.retain(|k| live.contains(k))).await
+    }
+
     pub async fn set_dismissed_notifications(&self, dismissed: Vec<String>) -> Result<()> {
         let mut cfg = self.snapshot();
         cfg.ui.dismissed_notifications = dismissed;
@@ -1136,6 +1159,19 @@ mod tests {
         svc.set_pipeline_auto_discover("gh-1", true).await.unwrap();
         svc.load().await.unwrap();
         assert!(svc.snapshot().pipelines.unwrap().subscriptions[0].auto_discover_all, "kept after restart");
+    }
+
+    /// Both frontends add inbox dismissals; neither may drop what the other saved.
+    #[tokio::test]
+    async fn inbox_dismissals_merge_and_prune_only_what_no_longer_arrives() {
+        let svc = ConfigService::new(Arc::new(InMemoryConfigStore::default()), Arc::new(InMemorySecretStore::default()), registry());
+        svc.dismiss_notifications(vec!["gh:1:10".into()]).await.unwrap();
+        svc.dismiss_notifications(vec!["ln:2:20".into(), "gh:1:10".into()]).await.unwrap();
+        assert_eq!(svc.snapshot().ui.dismissed_notifications, ["gh:1:10", "ln:2:20"]);
+
+        let live: std::collections::HashSet<String> = ["ln:2:20".to_string(), "gl:3:30".to_string()].into();
+        svc.prune_dismissed_notifications(&live).await.unwrap();
+        assert_eq!(svc.snapshot().ui.dismissed_notifications, ["ln:2:20"]);
     }
 
     /// A config with no pipelines is only marked, never rewritten on disk for it.

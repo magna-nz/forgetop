@@ -14,6 +14,7 @@ use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
 use axum::Router;
 use forgetop_core::cache::CacheStore;
+use forgetop_core::domain::{Notification, NotificationDetail};
 use forgetop_core::launchpad::{Entry, EntryKind};
 use forgetop_core::provider::{ItemRef, PrDecoration};
 use forgetop_core::secret::SecretStore;
@@ -90,11 +91,41 @@ impl DecorationCache {
     }
 }
 
+/// Notification details (actor, excerpt) fetched on demand, per `(connection, id, detail_ref)` —
+/// so reopening a notification costs no call (the GitHub budget), while new activity on the same
+/// thread (a new latest comment, so a new `detail_ref`) is fetched afresh.
+#[derive(Default)]
+struct NotifDetailCache {
+    entries: std::sync::Mutex<std::collections::HashMap<String, NotificationDetail>>,
+}
+
+impl NotifDetailCache {
+    /// Bounded like [`DecorationCache`], and dropped whole on overflow for the same reason.
+    const MAX: usize = 500;
+
+    fn key(conn: &str, n: &Notification) -> String {
+        format!("{conn}\u{1}{}\u{1}{}", n.id, n.detail_ref.as_deref().unwrap_or(""))
+    }
+
+    fn get(&self, key: &str) -> Option<NotificationDetail> {
+        self.entries.lock().unwrap_or_else(|p| p.into_inner()).get(key).cloned()
+    }
+
+    fn put(&self, key: String, value: NotificationDetail) {
+        let mut entries = self.entries.lock().unwrap_or_else(|p| p.into_inner());
+        if entries.len() >= Self::MAX {
+            entries.clear();
+        }
+        entries.insert(key, value);
+    }
+}
+
 #[derive(Clone)]
 struct AppState {
     deps: Deps,
     token: Arc<str>,
     decorations: Arc<DecorationCache>,
+    notif_details: Arc<NotifDetailCache>,
     /// Lists with a live fetch out right now, by key: a poll that lands meanwhile answers from
     /// the cache rather than starting another.
     inflight: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
@@ -111,6 +142,7 @@ async fn bind(deps: Deps, port: u16) -> std::io::Result<(tokio::net::TcpListener
         deps,
         token: Arc::from(token.as_str()),
         decorations: Arc::new(DecorationCache::default()),
+        notif_details: Arc::new(NotifDetailCache::default()),
         inflight: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         flusher,
     };
@@ -181,6 +213,10 @@ fn router(state: AppState) -> Router {
         .route("/api/pipeline/cancel", post(pipeline_cancel))
         .route("/api/pipeline/rerun", post(pipeline_rerun))
         .route("/api/notification/read", post(notification_read))
+        .route("/api/notification/read-many", post(notification_read_many))
+        .route("/api/notification/done", post(notification_done))
+        .route("/api/notification/detail", post(notification_detail))
+        .route("/api/inbox", get(inbox))
         .route("/api/providers", get(providers))
         .route("/api/connections", get(list_connections).post(save_connection))
         .route("/api/connections/delete", post(delete_connection))
@@ -315,9 +351,57 @@ async fn pipelines(State(s): State<AppState>) -> Response {
     let hit = cached::pipelines(&s.deps.cache);
     serve_cached(&s, "pipelines", hit, |s: AppState| async move { dto::pipelines(&s.deps.sections).await }).await
 }
+/// The notifications either frontend marked done (`ui.dismissed_notifications`), read once per
+/// request so the cached answer and the live fetch hide the same rows.
+fn dismissed_notifications(s: &AppState) -> Arc<std::collections::HashSet<String>> {
+    Arc::new(s.deps.config.snapshot().ui.dismissed_notifications.into_iter().collect())
+}
+
+/// What the inbox shows of `rows`: dismissed ones dropped, and any detail already fetched for a
+/// row (`/api/notification/detail`) filled in, so its phrase names the actor from then on.
+fn visible_notifications(s: &AppState, rows: Vec<dto::NotifRow>, dismissed: &std::collections::HashSet<String>) -> Vec<dto::NotifRow> {
+    rows.into_iter()
+        .filter(|r| !dismissed.contains(&r.dismiss_key))
+        .map(|r| {
+            let n = &r.notification;
+            if n.detail_ref.is_none() || (n.actor.is_some() && n.excerpt.is_some()) {
+                return r;
+            }
+            match s.notif_details.get(&NotifDetailCache::key(&r.connection_id, n)) {
+                Some(d) => r.with_detail(&d),
+                None => r,
+            }
+        })
+        .collect()
+}
+
+/// Both inbox endpoints share one live fetch: while one is out, the other answers from the cache.
+const NOTIFICATIONS_FETCH: &str = "notifications";
+
 async fn notifications(State(s): State<AppState>) -> Response {
-    let hit = cached::notifications(&s.deps.cache);
-    serve_cached(&s, "notifications", hit, |s: AppState| async move { dto::notifications(&s.deps.sections, &s.deps.cache).await }).await
+    let dismissed = dismissed_notifications(&s);
+    let hit = cached::notifications(&s.deps.cache)
+        .map(|c| cached::Cached { value: visible_notifications(&s, c.value, &dismissed), fetched_at: c.fetched_at });
+    serve_cached(&s, NOTIFICATIONS_FETCH, hit, move |s: AppState| async move {
+        let rows = dto::notifications(&s.deps.sections, &s.deps.cache).await;
+        visible_notifications(&s, rows, &dismissed)
+    })
+    .await
+}
+
+/// The notifications folded into one row per item (`forgetop_core::inbox::threads`), over the
+/// same rows `/api/notifications` serves.
+async fn inbox(State(s): State<AppState>) -> Response {
+    let dismissed = dismissed_notifications(&s);
+    let hit = cached::notifications(&s.deps.cache).map(|c| cached::Cached {
+        value: dto::inbox_threads(&visible_notifications(&s, c.value, &dismissed)),
+        fetched_at: c.fetched_at,
+    });
+    serve_cached(&s, NOTIFICATIONS_FETCH, hit, move |s: AppState| async move {
+        let rows = dto::notifications(&s.deps.sections, &s.deps.cache).await;
+        dto::inbox_threads(&visible_notifications(&s, rows, &dismissed))
+    })
+    .await
 }
 async fn launchpad(State(s): State<AppState>) -> Response {
     // Read once, so the cached answer and the live fetch hide the same entries.
@@ -593,6 +677,80 @@ async fn pipeline_rerun(State(s): State<AppState>, Json(req): Json<actions::Pipe
 
 async fn notification_read(State(s): State<AppState>, Json(req): Json<actions::NotifReadReq>) -> Response {
     action_response("dashboard.notification_read", actions::notif_read(&s.deps.sections, req).await)
+}
+
+/// The notifications an action resolves `ids` against — every row, dismissed ones included. The
+/// shared cache answers when it knows every id (the inbox was just polled); otherwise one live
+/// fetch, which writes the cache back like any other.
+async fn current_notifications(s: &AppState, conn: &str, ids: &[String]) -> Vec<dto::NotifRow> {
+    if let Some(hit) = cached::notifications(&s.deps.cache) {
+        let knows = |id: &String| hit.value.iter().any(|r| r.connection_id == conn && r.notification.id == *id);
+        if ids.iter().all(knows) {
+            return hit.value;
+        }
+    }
+    let rows = dto::notifications(&s.deps.sections, &s.deps.cache).await;
+    s.flusher.schedule();
+    rows
+}
+
+async fn notification_read_many(State(s): State<AppState>, Json(req): Json<actions::NotifIdsReq>) -> Response {
+    let rows = current_notifications(&s, &req.conn, &req.ids).await;
+    action_response("dashboard.notification_read_many", actions::notif_read_many(&s.deps.sections, &rows, &req).await)
+}
+
+/// "Done" on an inbox thread: read at the forge, then dismissed under the TUI's key.
+async fn notification_done(State(s): State<AppState>, Json(req): Json<actions::NotifIdsReq>) -> Response {
+    let rows = current_notifications(&s, &req.conn, &req.ids).await;
+    action_response("dashboard.notification_done", actions::notif_done(&s.deps.sections, &s.deps.config, &rows, &req).await)
+}
+
+#[derive(Deserialize)]
+struct NotifDetailReq {
+    conn: String,
+    id: String,
+}
+
+/// The actor and excerpt of one notification, fetched once per `(connection, id, detail_ref)` and
+/// kept for the session. A notification whose feed entry already carries them answers with those,
+/// without a call.
+async fn notification_detail(State(s): State<AppState>, Json(req): Json<NotifDetailReq>) -> Response {
+    let rows = current_notifications(&s, &req.conn, std::slice::from_ref(&req.id)).await;
+    let Some(row) = rows.into_iter().find(|r| r.connection_id == req.conn && r.notification.id == req.id) else {
+        return (StatusCode::NOT_FOUND, "notification not found").into_response();
+    };
+    let detail = if row.notification.detail_ref.is_none() {
+        // Nothing to fetch: the feed already said all it can.
+        NotificationDetail::default()
+    } else {
+        let key = NotifDetailCache::key(&req.conn, &row.notification);
+        match s.notif_details.get(&key) {
+            Some(hit) => hit,
+            None => match actions::notif_detail(&s.deps.sections, &req.conn, &row.notification).await {
+                Ok(d) => {
+                    s.notif_details.put(key, d.clone());
+                    d
+                }
+                Err(e) => {
+                    // Remembered as "nothing more", so a deleted comment isn't asked for again on
+                    // every open: each ask is a call against the hourly budget.
+                    s.notif_details.put(key, NotificationDetail::default());
+                    return action_response_with("dashboard.notification_detail", Err(e));
+                }
+            },
+        }
+    };
+    let target = detail.target.clone();
+    // What the feed carried wins over a fetched guess; the phrase and why follow the filled row.
+    let filled = row.with_detail(&detail);
+    Json(serde_json::json!({
+        "actor": filled.notification.actor,
+        "excerpt": filled.notification.excerpt,
+        "target": target,
+        "phrase": filled.phrase,
+        "why": filled.why,
+    }))
+    .into_response()
 }
 
 // ---- connection management ----
@@ -1031,7 +1189,7 @@ mod tests {
         assert!(cache.get::<Vec<cached::TuiPrRow>>(cached::KEY_LAUNCHPAD_REVIEW).is_some());
         assert!(cache.get::<Vec<cached::TuiWiRow>>(cached::KEY_WORK_ITEMS).is_some());
         assert!(cache.get::<Vec<cached::TuiPipeRow>>(cached::KEY_PIPELINES).is_some());
-        assert!(cache.get::<Vec<dto::NotifRow>>(cached::KEY_INBOX).is_some());
+        assert!(cache.get::<Vec<cached::TuiNotifRow>>(cached::KEY_INBOX).is_some());
         // The Command Center rebuilt from those entries is the one the live build produced.
         let live: serde_json::Value = api.get_raw("/api/launchpad").await.json().await.unwrap();
         let from_cache = cached::launchpad(&cache, &[]).expect("launchpad from cache");

@@ -1,8 +1,9 @@
 //! All rendering. Immediate-mode: we redraw the whole frame from `App` each tick.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Local, Utc};
 use forgetop_core::domain::*;
 use forgetop_core::highlight::{lang_for, HlKind, LineHighlighter};
+use forgetop_core::inbox::{self, InboxThread};
 use forgetop_core::launchpad::{pr_approved_by, pr_changes_requested_by, pr_state, PrBlocker, PrState};
 use forgetop_core::provider::PrWriteSupport;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -21,7 +22,7 @@ use forgetop_core::runlog;
 use crate::app::{
     dashboard_target, first_failed_node, gate_stage, is_error_line, last_activity, match_ranges, pipe_definition_name,
     pr_life, provider_label, run_secs, waiting_secs, App, ArtifactsPanel, ConfigView, DiffFocus, DiffView, FlatNode, Hit,
-    LogRow, LogView, LpSlot, PipeGroup, PipeHead, PipeLine, PipeRow, PipelineView, PrLife, PrView, RunHistory, Screen,
+    InboxLanding, InboxView, LogRow, LogView, LpSlot, PipeGroup, PipeHead, PipeLine, PipeRow, PipelineView, PrLife, PrView, RunHistory, Screen,
     WiHead, WiLine, WiView, LOG_SPLIT_MIN_WIDTH, LOG_TREE_WIDTH, PR_TABS, TABS,
 };
 use crate::diff::{cursor_line_label, pending_marks};
@@ -74,6 +75,8 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     HITS.with(|h| h.borrow_mut().clear());
     render_frame(frame, app);
     app.hits = HITS.with(|h| std::mem::take(&mut *h.borrow_mut()));
+    // An item just opened from the inbox scrolls to its target, now the frame says where it is.
+    app.reveal_inbox_landing();
     // The frame decided whether a diff's file list is a tree or flat; a cursor left on a folder
     // the other layout has no row for moves to the nearest one that is listed. (Moving the
     // cursor changes no row, so the hits just recorded still stand.)
@@ -382,14 +385,22 @@ fn render_content(frame: &mut Frame, area: Rect, app: &mut App) {
         }
         Screen::PrView(_) | Screen::WiView(_) | Screen::List => {}
     }
+    // An item opened from the inbox has the triage strip over it.
+    let mut area = area;
+    if app.inbox_triage() && area.height > 4 {
+        let split = Layout::default().direction(Direction::Vertical).constraints([Constraint::Length(1), Constraint::Min(3)]).split(area);
+        render_triage_strip(frame, split[0], app);
+        area = split[1];
+    }
+    let landing = app.inbox_landing.as_ref().filter(|l| l.applies_to(&app.screen));
     // The full-screen views report how far they can scroll, so the key handler can clamp.
-    if matches!(app.screen, Screen::PrView(_)) {
-        let max = if let Screen::PrView(view) = &app.screen { render_pr_view(frame, area, &app.theme, view) } else { 0 };
+    if let Screen::PrView(view) = &app.screen {
+        let max = render_pr_view(frame, area, &app.theme, view, landing);
         app.detail_scroll_max = max;
         return;
     }
-    if matches!(app.screen, Screen::WiView(_)) {
-        let max = if let Screen::WiView(view) = &app.screen { render_wi_view(frame, area, &app.theme, view) } else { 0 };
+    if let Screen::WiView(view) = &app.screen {
+        let max = render_wi_view(frame, area, &app.theme, view, landing);
         app.detail_scroll_max = max;
         return;
     }
@@ -484,8 +495,8 @@ fn mark_cut_rows(frame: &mut Frame, area: Rect, cut: u16, theme: &Theme) {
 /// key handler clamps against it). Anything else draws nothing.
 fn render_item_view(frame: &mut Frame, area: Rect, theme: &Theme, view: &Screen, anim: usize) -> u16 {
     match view {
-        Screen::PrView(v) => render_pr_view(frame, area, theme, v),
-        Screen::WiView(v) => render_wi_view(frame, area, theme, v),
+        Screen::PrView(v) => render_pr_view(frame, area, theme, v, None),
+        Screen::WiView(v) => render_wi_view(frame, area, theme, v, None),
         Screen::Pipeline(v) => {
             render_pipeline(frame, area, theme, v, anim);
             0
@@ -2257,20 +2268,35 @@ fn body_lines(body: &str, theme: &Theme, base: Color, lead: impl Fn(bool) -> Vec
         .collect()
 }
 
+#[cfg(test)]
 fn comment_lines(theme: &Theme, threads: &[CommentThread]) -> Vec<Line<'static>> {
+    comment_lines_marked(theme, threads, None).0
+}
+
+/// [`comment_lines`], with the comment `mark` (an item opened from the inbox at it) tagged.
+/// Also returns the line the tagged comment starts on.
+fn comment_lines_marked(theme: &Theme, threads: &[CommentThread], mark: Option<&str>) -> (Vec<Line<'static>>, Option<usize>) {
     let total: usize = threads.iter().map(|t| t.comments.len()).sum();
     let mut heading = vec![Span::styled(format!("Comments ({total})"), Style::default().fg(theme.accent).add_modifier(Modifier::BOLD))];
     if total == 0 {
         heading.push(Span::styled("   No comments.", Style::default().fg(theme.dim)));
     }
     let mut lines = vec![Line::from(""), Line::from(heading)];
+    let mut marked = None;
     for thread in threads {
-        for c in &thread.comments {
-            lines.push(Line::from(Span::styled(format!("{}:", c.author.display_name), Style::default().fg(theme.blue))));
+        // The thread holding the mark is tagged at its comment (or its first, for a thread id).
+        let thread_marked = mark.is_some_and(|m| thread.id == m) && !thread.comments.iter().any(|c| Some(c.id.as_str()) == mark);
+        for (i, c) in thread.comments.iter().enumerate() {
+            let mut author = vec![Span::styled(format!("{}:", c.author.display_name), Style::default().fg(theme.blue))];
+            if marked.is_none() && (Some(c.id.as_str()) == mark || (thread_marked && i == 0)) {
+                marked = Some(lines.len());
+                author.push(inbox_tag(theme));
+            }
+            lines.push(Line::from(author));
             lines.extend(body_lines(&c.body, theme, theme.fg, |blank| if blank { vec![] } else { vec![Span::raw("  ")] }));
         }
     }
-    lines
+    (lines, marked)
 }
 
 /// The widest the actor column may grow before a name is truncated, so one long name can't
@@ -2394,6 +2420,7 @@ fn review_glyph(theme: &Theme, vote: ReviewVote) -> (&'static str, ratatui::styl
 /// the thread cursor (an index into the general threads) and `hint` the keys to show on the
 /// selected thread's first line, right-aligned within `width`. Also returns the line each general
 /// thread starts on, in cursor order, so the caller can work out where it lands once wrapped.
+#[cfg(test)]
 fn pr_conversation_lines(
     theme: &Theme,
     pr: &PullRequest,
@@ -2403,6 +2430,23 @@ fn pr_conversation_lines(
     hint: &str,
     width: usize,
 ) -> (Vec<Line<'static>>, Vec<usize>) {
+    let (lines, starts, _) = pr_conversation_lines_marked(theme, pr, threads, timeline, sel, hint, width, None);
+    (lines, starts)
+}
+
+/// [`pr_conversation_lines`], with the thread holding comment `mark` tagged as where the inbox
+/// opened the PR. Also returns that thread's first line.
+#[allow(clippy::too_many_arguments)]
+fn pr_conversation_lines_marked(
+    theme: &Theme,
+    pr: &PullRequest,
+    threads: &[CommentThread],
+    timeline: &[TimelineEvent],
+    sel: Option<usize>,
+    hint: &str,
+    width: usize,
+    mark: Option<&str>,
+) -> (Vec<Line<'static>>, Vec<usize>, Option<usize>) {
     let mut lines = vec![
         field(theme, "Author", pr.author.display_name.clone()),
         field(theme, "Branch", format!("{} → {}", pr.source_ref.clone().unwrap_or_default(), pr.target_ref.clone().unwrap_or_default())),
@@ -2445,10 +2489,10 @@ fn pr_conversation_lines(
         lines.extend(crate::markdown::render(desc, theme, theme.fg));
     }
     let base = lines.len();
-    let (comments, starts) = pr_comment_lines(theme, threads, sel, hint, width);
+    let (comments, starts, marked) = pr_comment_lines_marked(theme, threads, sel, hint, width, mark);
     lines.extend(comments);
     lines.extend(activity_lines(theme, timeline));
-    (lines, starts.into_iter().map(|i| base + i).collect())
+    (lines, starts.into_iter().map(|i| base + i).collect(), marked.map(|i| base + i))
 }
 
 /// The Conversation tab's Comments section. Each thread opens on its state and who started it
@@ -2456,7 +2500,22 @@ fn pr_conversation_lines(
 /// resolved. The general thread at `sel` gets a `▌` bar down its left and `hint` right-aligned
 /// on its first line, when that fits in `width`. Returns the lines and the index of each general
 /// thread's first line, in cursor order.
+#[cfg(test)]
 fn pr_comment_lines(theme: &Theme, threads: &[CommentThread], sel: Option<usize>, hint: &str, width: usize) -> (Vec<Line<'static>>, Vec<usize>) {
+    let (lines, starts, _) = pr_comment_lines_marked(theme, threads, sel, hint, width, None);
+    (lines, starts)
+}
+
+/// [`pr_comment_lines`], with the thread holding comment `mark` tagged `◂ from your inbox` on its
+/// first line. Also returns that line's index.
+fn pr_comment_lines_marked(
+    theme: &Theme,
+    threads: &[CommentThread],
+    sel: Option<usize>,
+    hint: &str,
+    width: usize,
+    mark: Option<&str>,
+) -> (Vec<Line<'static>>, Vec<usize>, Option<usize>) {
     let total: usize = threads.iter().map(|t| t.comments.len()).sum();
     let open = threads.iter().filter(|t| !t.is_resolved).count();
     let mut heading = vec![Span::styled(format!("Comments ({total})"), Style::default().fg(theme.accent).add_modifier(Modifier::BOLD))];
@@ -2468,6 +2527,7 @@ fn pr_comment_lines(theme: &Theme, threads: &[CommentThread], sel: Option<usize>
     }
     let mut lines = vec![Line::from(""), Line::from(heading)];
     let mut starts = Vec::new();
+    let mut marked = None;
     for thread in threads {
         let general = thread.file_path.is_none();
         let selected = general && sel == Some(starts.len());
@@ -2495,6 +2555,19 @@ fn pr_comment_lines(theme: &Theme, threads: &[CommentThread], sel: Option<usize>
             let at = thread.line.map(|l| format!(":{l}")).unwrap_or_default();
             head.push(Span::styled(format!(" · {path}{at}"), Style::default().fg(theme.dim)));
         }
+        // Which comment the inbox landed on: the thread itself (or its first comment) tags the
+        // thread's first line; a later comment — GitHub keeps a whole conversation in one thread —
+        // tags that comment's own author line instead.
+        let mark_at = match mark {
+            Some(m) if marked.is_none() => {
+                if thread.id == m { Some(0) } else { thread.comments.iter().position(|c| c.id == m) }
+            }
+            _ => None,
+        };
+        if mark_at == Some(0) {
+            marked = Some(lines.len());
+            head.push(inbox_tag(theme));
+        }
         if selected && !hint.is_empty() {
             let used: usize = head.iter().map(|s| s.content.chars().count()).sum();
             let hint_w = hint.chars().count();
@@ -2508,7 +2581,12 @@ fn pr_comment_lines(theme: &Theme, threads: &[CommentThread], sel: Option<usize>
         for (i, c) in thread.comments.iter().enumerate() {
             // The first comment's author is on the thread's first line already.
             if i > 0 {
-                lines.push(Line::from(vec![bar(), Span::styled(format!("{}:", c.author.display_name), Style::default().fg(theme.blue))]));
+                let mut who = vec![bar(), Span::styled(format!("{}:", c.author.display_name), Style::default().fg(theme.blue))];
+                if mark_at == Some(i) {
+                    marked = Some(lines.len());
+                    who.push(inbox_tag(theme));
+                }
+                lines.push(Line::from(who));
             }
             lines.extend(body_lines(&c.body, theme, body_fg, |blank| {
                 // The selected thread's bar runs down its blank lines too, but without the
@@ -2521,7 +2599,7 @@ fn pr_comment_lines(theme: &Theme, threads: &[CommentThread], sel: Option<usize>
             }));
         }
     }
-    (lines, starts)
+    (lines, starts, marked)
 }
 
 /// The keys that act on the thread under a cursor, as its first line shows them: resolve or
@@ -2563,26 +2641,36 @@ fn pr_commit_lines(theme: &Theme, commits: &[Commit], sel: usize) -> Vec<Line<'s
         .collect()
 }
 
-/// The Checks tab: one line per named check with its status, like the pipeline steps.
-fn pr_checks_lines(theme: &Theme, checks: &[CheckRun]) -> Vec<Line<'static>> {
+/// The Checks tab: one line per named check with its status, like the pipeline steps. When the
+/// inbox opened the PR at its checks (`mark`), the first failing one is selected and tagged; its
+/// line is returned too.
+fn pr_checks_lines_marked(theme: &Theme, checks: &[CheckRun], mark: bool) -> (Vec<Line<'static>>, Option<usize>) {
     if checks.is_empty() {
-        return vec![Line::from(Span::styled("No checks reported for this pull request.", Style::default().fg(theme.dim)))];
+        return (vec![Line::from(Span::styled("No checks reported for this pull request.", Style::default().fg(theme.dim)))], None);
     }
-    checks
+    let marked = if mark { checks.iter().position(|c| c.status == CheckStatus::Failed) } else { None };
+    let lines = checks
         .iter()
-        .map(|c| {
+        .enumerate()
+        .map(|(i, c)| {
             let color = theme.check_color(c.status);
-            Line::from(vec![
+            let mut line = Line::from(vec![
                 Span::styled(format!(" {} ", check_icon(c.status)), Style::default().fg(color)),
                 Span::styled(cell(&c.name, 40), Style::default().fg(theme.fg)),
                 Span::styled(format!("{:?}", c.status), Style::default().fg(color)),
-            ])
+            ]);
+            if marked == Some(i) {
+                mark_selected(&mut line, theme);
+                line.spans.push(inbox_tag(theme));
+            }
+            line
         })
-        .collect()
+        .collect();
+    (lines, marked)
 }
 
 /// Renders the PR view and returns the maximum scroll offset for the current tab.
-fn render_pr_view(frame: &mut Frame, area: Rect, theme: &Theme, view: &PrView) -> u16 {
+fn render_pr_view(frame: &mut Frame, area: Rect, theme: &Theme, view: &PrView, landing: Option<&InboxLanding>) -> u16 {
     // Header, the one-line verdict, the sub-tab bar, then the content. The verdict gets two rows
     // and paints the first, so the blank one separates it from the tab bar below.
     let rows = Layout::default()
@@ -2632,17 +2720,33 @@ fn render_pr_view(frame: &mut Frame, area: Rect, theme: &Theme, view: &PrView) -
         hit_rows(body, scroll as usize, (0..total).map(|i| Some(Hit::CommitRow(i))));
         return 0;
     }
-    let (title, lines) = match view.tab {
+    let inner_w = rows[3].width.saturating_sub(2);
+    let (title, lines, marked) = match view.tab {
         0 => {
-            let inner_w = rows[3].width.saturating_sub(2);
             let hint = view.conv_thread().map_or("", |t| thread_hint(view.can_resolve_thread(t), t.is_resolved));
-            let (lines, starts) =
-                pr_conversation_lines(theme, &view.pr, &view.diff.threads, &view.timeline, view.conv_sel, hint, inner_w as usize);
+            let mark = landing.and_then(InboxLanding::comment);
+            let (lines, starts, marked) = pr_conversation_lines_marked(
+                theme,
+                &view.pr,
+                &view.diff.threads,
+                &view.timeline,
+                view.conv_sel,
+                hint,
+                inner_w as usize,
+                mark,
+            );
             record_conv_layout(view, &lines, &starts, inner_w, rows[3].height.saturating_sub(2));
-            ("Conversation", lines)
+            ("Conversation", lines, marked)
         }
-        _ => ("Checks", pr_checks_lines(theme, &view.checks)),
+        _ => {
+            let mark = landing.is_some_and(|l| l.target == NotificationTarget::Checks);
+            let (lines, marked) = pr_checks_lines_marked(theme, &view.checks, mark);
+            ("Checks", lines, marked)
+        }
     };
+    if let (Some(l), Some(i)) = (landing, marked) {
+        l.row.set(Some(wrapped_rows_before(&lines, i, inner_w)));
+    }
     let para = Paragraph::new(lines).block(section_block(theme, title)).wrap(Wrap { trim: false });
     let max = wrapped_scroll_max(&para, rows[3]);
     frame.render_widget(para.scroll((view.scroll.min(max), 0)), rows[3]);
@@ -2682,7 +2786,7 @@ fn wrapped_scroll_max(para: &Paragraph, area: Rect) -> u16 {
     rows.saturating_sub(area.height)
 }
 
-fn render_wi_view(frame: &mut Frame, area: Rect, theme: &Theme, view: &WiView) -> u16 {
+fn render_wi_view(frame: &mut Frame, area: Rect, theme: &Theme, view: &WiView, landing: Option<&InboxLanding>) -> u16 {
     let wi = &view.wi;
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -2714,8 +2818,13 @@ fn render_wi_view(frame: &mut Frame, area: Rect, theme: &Theme, view: &WiView) -
         lines.push(Line::from(""));
         lines.extend(crate::markdown::render(desc, theme, theme.dim));
     }
-    lines.extend(comment_lines(theme, &view.threads));
+    let base = lines.len();
+    let (comments, marked) = comment_lines_marked(theme, &view.threads, landing.and_then(InboxLanding::comment));
+    lines.extend(comments);
     lines.extend(activity_lines(theme, &view.timeline));
+    if let (Some(l), Some(i)) = (landing, marked) {
+        l.row.set(Some(wrapped_rows_before(&lines, base + i, rows[1].width.saturating_sub(2))));
+    }
     let para = Paragraph::new(lines).block(section_block(theme, "Work Item")).wrap(Wrap { trim: false });
     let max = wrapped_scroll_max(&para, rows[1]);
     frame.render_widget(para.scroll((view.scroll.min(max), 0)), rows[1]);
@@ -2865,11 +2974,12 @@ fn base_footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
         };
     }
     if matches!(app.screen, Screen::WiView(_)) {
-        // Scrolling is left to `?` help: the view's own actions need the room.
+        // Scrolling is left to `?` help: the view's own actions need the room. Opened from the
+        // inbox, `e` is the triage strip's "done" and editing moves to `E`.
         return vec![
             ("u", "update state"),
             ("@", "assign"),
-            ("e", "edit"),
+            (if app.inbox_triage() { "E" } else { "e" }, "edit"),
             ("c", "comment"),
             ("o", "open"),
             ("Esc/q", "back"),
@@ -2877,12 +2987,14 @@ fn base_footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
     }
     if matches!(app.screen, Screen::Inbox) {
         return vec![
-            ("↵", "open item"),
+            ("↵", "open"),
+            ("e", "done"),
+            ("E", "done all"),
+            ("x", "read"),
             ("o", "browser"),
-            ("x", "mark read"),
-            ("A", "all read"),
-            ("d", "dismiss"),
-            ("D", "dismiss all"),
+            ("1/2/3", "views"),
+            ("space", "preview"),
+            ("r", "refresh"),
             ("Esc", "back"),
         ];
     }
@@ -3007,62 +3119,169 @@ fn base_footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
     keys
 }
 
-/// A short glyph + label + colour for each notification kind.
-fn notif_kind(theme: &Theme, kind: NotificationKind) -> (&'static str, &'static str, ratatui::style::Color) {
+/// A notification kind's glyph and colour. The words beside it are core's
+/// [`inbox::phrase`] — "Priya mentioned you", "→ In Review" — never a bare category.
+fn notif_kind(theme: &Theme, kind: NotificationKind) -> (&'static str, Color) {
     match kind {
-        NotificationKind::ReviewRequested => ("◆", "review", theme.accent),
-        NotificationKind::Assigned => ("◎", "assigned", theme.accent),
-        NotificationKind::Mention => ("@", "mention", theme.magenta),
-        NotificationKind::CiFailed => ("✗", "ci failed", theme.red),
-        NotificationKind::Comment => ("▪", "comment", theme.dim),
-        NotificationKind::StateChange => ("↻", "update", theme.dim),
-        NotificationKind::Other => ("•", "activity", theme.dim),
+        NotificationKind::ReviewRequested => ("◆", theme.accent),
+        NotificationKind::Assigned => ("◎", theme.accent),
+        NotificationKind::Mention => ("@", theme.magenta),
+        NotificationKind::CiFailed => ("✗", theme.red),
+        NotificationKind::Due => ("◷", theme.yellow),
+        NotificationKind::Comment => ("▪", theme.dim),
+        NotificationKind::StateChange => ("↻", theme.green),
+        NotificationKind::NewItem => ("+", theme.cyan),
+        NotificationKind::Reaction => ("♡", theme.dim),
+        NotificationKind::Other => ("•", theme.dim),
     }
+}
+
+/// The inbox row's reason column: glyph and phrase, cut to fit so the titles line up.
+const INBOX_PHRASE_W: usize = 22;
+
+/// The day heading a thread sits under, by its newest event in local time.
+fn inbox_day(latest: Option<DateTime<Utc>>) -> &'static str {
+    let Some(at) = latest else { return "Earlier" };
+    let today = Local::now().date_naive();
+    let day = at.with_timezone(&Local).date_naive();
+    if day >= today {
+        "Today"
+    } else if Some(day) == today.pred_opt() {
+        "Yesterday"
+    } else {
+        "Earlier"
+    }
+}
+
+/// The item a notification is about, as the forge names it: `#1487` for a number, `PLT-77`
+/// for a key. Empty when it names no item.
+fn inbox_ident(n: &Notification) -> String {
+    match n.item_id.as_deref() {
+        Some(id) if !id.is_empty() && id.chars().all(|c| c.is_ascii_digit()) => format!("#{id}"),
+        Some(id) => id.to_string(),
+        None => String::new(),
+    }
+}
+
+/// What `↵` will open for a thread led by `n`, in words, for the preview's last line.
+fn inbox_open_hint(n: &Notification) -> String {
+    let at_comment = || match n.actor.as_deref().and_then(|a| a.split_whitespace().next()) {
+        Some(who) => format!(" at {who}'s comment"),
+        None => " at the comment".into(),
+    };
+    match (n.item_type, n.item_id.is_some()) {
+        (NotificationItemType::PullRequest, true) => match &n.target {
+            NotificationTarget::Comment { .. } => format!("opens the PR{}", at_comment()),
+            NotificationTarget::Checks => "opens the PR on its Checks".into(),
+            NotificationTarget::Diff => "opens the PR on its Diff".into(),
+            NotificationTarget::Overview | NotificationTarget::Activity => "opens the PR".into(),
+        },
+        (NotificationItemType::WorkItem, true) => match &n.target {
+            NotificationTarget::Comment { .. } => format!("opens the work item{}", at_comment()),
+            _ => "opens the work item".into(),
+        },
+        _ if n.url.is_some() => "opens it in your browser".into(),
+        _ => "has nothing to open".into(),
+    }
+}
+
+/// The inbox panel's title: the three views with their thread counts, the showing one lit.
+fn inbox_title(app: &App) -> Line<'static> {
+    let theme = &app.theme;
+    let mut spans = vec![Span::styled(" Inbox ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD))];
+    for (view, count) in InboxView::ALL.into_iter().zip(app.inbox_view_counts()) {
+        let style = if view == app.inbox_view {
+            Style::default().fg(theme.bg).bg(theme.accent).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.dim)
+        };
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(format!(" {} {count} ", view.label()), style));
+    }
+    spans.push(Span::styled("  1 2 3 ", Style::default().fg(theme.dim)));
+    Line::from(spans)
 }
 
 fn render_inbox(frame: &mut Frame, area: Rect, app: &App) {
     let theme = &app.theme;
-    let title = format!("Inbox — {} unread of {}", app.unread_count(), app.inbox.len());
-    let block = section_block(theme, &title);
-    if app.inbox.is_empty() {
-        empty(frame, area, theme, "No notifications. The inbox aggregates GitHub, GitLab, and Linear.", block);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.accent))
+        .style(Style::default().bg(theme.bg))
+        .title(inbox_title(app));
+    let threads = app.inbox_threads();
+    if threads.is_empty() {
+        let msg = if app.inbox.is_empty() {
+            "No notifications. The inbox aggregates GitHub, GitLab, and Linear."
+        } else {
+            match app.inbox_view {
+                InboxView::ForYou => "Nothing is waiting on you. 2 shows what you follow, 3 everything.",
+                InboxView::Following => "Nothing new where you follow. 1 shows what is waiting on you.",
+                InboxView::All => "Nothing left in the inbox.",
+            }
+        };
+        empty(frame, area, theme, msg, block);
         return;
     }
+    let sel = app.inbox_sel.min(threads.len() - 1);
 
-    let rows: Vec<Row> = app
-        .inbox
-        .iter()
-        .map(|r| {
-            let n = &r.notification;
-            let (glyph, label, color) = notif_kind(theme, n.kind);
-            let dot = if n.unread {
-                Span::styled("●", Style::default().fg(theme.yellow))
-            } else {
-                Span::raw(" ")
-            };
-            let title_style = if n.unread {
-                Style::default().fg(theme.fg).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(theme.dim)
-            };
-            Row::new(vec![
-                Cell::from(dot),
-                Cell::from(Span::styled(format!("{glyph} {label}"), Style::default().fg(color))),
-                Cell::from(Span::styled(n.title.clone(), title_style)),
-                Cell::from(Span::styled(n.context.clone(), Style::default().fg(theme.dim))),
-                Cell::from(Span::styled(r.connection.clone(), Style::default().fg(theme.dim))),
-                Cell::from(Span::styled(rel_age(n.updated_at), Style::default().fg(theme.dim))),
-            ])
-        })
-        .collect();
+    // Wide, the preview sits beside the list; narrow (when `space` asked for it), under it.
+    let (list_area, preview_area) = if !app.inbox_preview_shown() {
+        (area, None)
+    } else if area.width >= crate::app::INBOX_PREVIEW_MIN_WIDTH {
+        let w = (area.width * 40 / 100).max(44);
+        (Rect { width: area.width - w, ..area }, Some(Rect { x: area.right() - w, width: w, ..area }))
+    } else {
+        let h = (area.height / 2).max(8).min(area.height.saturating_sub(6));
+        (Rect { height: area.height - h, ..area }, Some(Rect { y: area.bottom() - h, height: h, ..area }))
+    };
+
+    let rows_ref = app.inbox_rows();
+    let mut rows: Vec<Row> = Vec::new();
+    let mut targets: Vec<Option<Hit>> = Vec::new();
+    let mut sel_line = 0;
+    let mut day = "";
+    for (i, t) in threads.iter().enumerate() {
+        let heading = inbox_day(t.latest);
+        if heading != day {
+            day = heading;
+            rows.push(Row::new(vec![
+                Cell::from(""),
+                Cell::from(Span::styled(heading, Style::default().fg(theme.dim).add_modifier(Modifier::BOLD))),
+            ]));
+            targets.push(None);
+        }
+        if i == sel {
+            sel_line = rows.len();
+        }
+        let n = &app.inbox[t.lead].notification;
+        let (glyph, color) = notif_kind(theme, n.kind);
+        let dot = if t.unread { Span::styled("●", Style::default().fg(theme.yellow)) } else { Span::raw(" ") };
+        let title_style = if t.unread {
+            Style::default().fg(theme.fg).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.dim)
+        };
+        let more = t.more(&rows_ref);
+        rows.push(Row::new(vec![
+            Cell::from(dot),
+            Cell::from(Span::styled(truncate(&format!("{glyph} {}", inbox::phrase(n)), INBOX_PHRASE_W), Style::default().fg(color))),
+            Cell::from(Span::styled(n.title.clone(), title_style)),
+            Cell::from(Span::styled(if more > 0 { format!("+{more}") } else { String::new() }, Style::default().fg(theme.dim))),
+            Cell::from(Span::styled(inbox_ident(n), Style::default().fg(theme.yellow))),
+            Cell::from(Span::styled(rel_age(t.latest), Style::default().fg(theme.dim))),
+        ]));
+        targets.push(Some(Hit::InboxRow(i)));
+    }
 
     let widths = [
         Constraint::Length(1),
-        Constraint::Length(12),
-        Constraint::Min(20),
-        Constraint::Length(22),
-        Constraint::Length(12),
-        Constraint::Length(5),
+        Constraint::Length(INBOX_PHRASE_W as u16),
+        Constraint::Min(16),
+        Constraint::Length(3),
+        Constraint::Length(10),
+        Constraint::Length(4),
     ];
     let table = Table::new(rows, widths)
         .block(block)
@@ -3070,10 +3289,180 @@ fn render_inbox(frame: &mut Frame, area: Rect, app: &App) {
         .row_highlight_style(highlight(theme))
         .highlight_symbol("▐ ");
     let mut state = TableState::default();
-    state.select(Some(app.inbox_sel.min(app.inbox.len().saturating_sub(1))));
-    frame.render_stateful_widget(table, area, &mut state);
-    let body = area.inner(ratatui::layout::Margin::new(1, 1));
-    hit_rows(body, state.offset(), (0..app.inbox.len()).map(|i| Some(Hit::InboxRow(i))));
+    state.select(Some(sel_line));
+    frame.render_stateful_widget(table, list_area, &mut state);
+    let body = list_area.inner(ratatui::layout::Margin::new(1, 1));
+    hit_rows(body, state.offset(), targets);
+
+    if let Some(pane) = preview_area {
+        let lines = inbox_preview_lines(app, &threads[sel], pane.width.saturating_sub(2) as usize);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(theme.dim))
+            .style(Style::default().bg(theme.bg))
+            .title(Span::styled(" Preview ", Style::default().fg(theme.dim)))
+            .title_bottom(Line::from(Span::styled(" space hides ", Style::default().fg(theme.dim))).right_aligned());
+        frame.render_widget(Clear, pane);
+        frame.render_widget(Paragraph::new(lines).block(block).wrap(Wrap { trim: false }), pane);
+    }
+}
+
+/// The most of an excerpt the preview quotes before cutting it short.
+const INBOX_EXCERPT_LINES: usize = 8;
+
+/// The preview of thread `t`: where it is, what it is, who did what and why it reached you, the
+/// excerpt, the thread's other events, and what `↵` opens.
+fn inbox_preview_lines(app: &App, t: &InboxThread, width: usize) -> Vec<Line<'static>> {
+    let theme = &app.theme;
+    let row = &app.inbox[t.lead];
+    let n = &row.notification;
+    let dim = Style::default().fg(theme.dim);
+
+    let mut head: Vec<Span<'static>> = Vec::new();
+    let ident = inbox_ident(n);
+    if !ident.is_empty() {
+        head.push(Span::styled(ident, Style::default().fg(theme.yellow)));
+    }
+    for part in [n.context.clone(), provider_label(row.provider).to_string()] {
+        if part.is_empty() {
+            continue;
+        }
+        if !head.is_empty() {
+            head.push(Span::styled(" · ", dim));
+        }
+        head.push(Span::styled(part, dim));
+    }
+    let mut lines = vec![
+        Line::from(head),
+        Line::from(Span::styled(n.title.clone(), Style::default().fg(theme.fg).add_modifier(Modifier::BOLD))),
+        Line::from(""),
+    ];
+
+    let (glyph, color) = notif_kind(theme, n.kind);
+    let phrase = inbox::phrase(n);
+    let mut what = vec![
+        Span::styled(format!("{glyph} "), Style::default().fg(color)),
+        Span::styled(phrase.clone(), Style::default().fg(theme.fg).add_modifier(Modifier::BOLD)),
+    ];
+    // The phrase names the actor by first name where it can; otherwise say who in full.
+    if let Some(actor) = n.actor.as_deref().filter(|a| !a.is_empty()) {
+        let first = actor.split_whitespace().next().unwrap_or(actor);
+        if !phrase.contains(first) {
+            what.push(Span::styled(" · ", dim));
+            what.push(Span::styled(actor.to_string(), Style::default().fg(theme.blue)));
+        }
+    }
+    let age = rel_age(n.updated_at);
+    if age != "—" {
+        what.push(Span::styled(format!(" · {age}"), dim));
+    }
+    lines.push(Line::from(what));
+    lines.push(Line::from(Span::styled(format!("why: {}", inbox::why(n)), dim)));
+
+    // A state change's excerpt is the state, which the phrase already says.
+    if let Some(excerpt) = n.excerpt.as_deref().filter(|e| !e.trim().is_empty() && n.kind != NotificationKind::StateChange) {
+        lines.push(Line::from(""));
+        let mut quoted: Vec<String> = excerpt.lines().flat_map(|l| wrap_words(l, width.saturating_sub(2).max(8))).collect();
+        if quoted.len() > INBOX_EXCERPT_LINES {
+            quoted.truncate(INBOX_EXCERPT_LINES);
+            if let Some(last) = quoted.last_mut() {
+                last.push('…');
+            }
+        }
+        for q in quoted {
+            lines.push(Line::from(vec![Span::styled("┃ ", Style::default().fg(color)), Span::styled(q, Style::default().fg(theme.fg))]));
+        }
+    }
+
+    let rows = app.inbox_rows();
+    let others: Vec<&Notification> = t
+        .members
+        .iter()
+        .filter(|&&i| i != t.lead && rows[i].1.kind.tier() != NotificationTier::Hidden)
+        .map(|&i| rows[i].1)
+        .collect();
+    if !others.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("{} more on this item", others.len()),
+            Style::default().fg(theme.accent).add_modifier(Modifier::BOLD),
+        )));
+        for o in others {
+            let (glyph, color) = notif_kind(theme, o.kind);
+            let mut spans = vec![
+                Span::raw("  "),
+                Span::styled(format!("{glyph} "), Style::default().fg(color)),
+                Span::styled(inbox::phrase(o), Style::default().fg(if o.unread { theme.fg } else { theme.dim })),
+            ];
+            let age = rel_age(o.updated_at);
+            if age != "—" {
+                spans.push(Span::styled(format!(" · {age}"), dim));
+            }
+            lines.push(Line::from(spans));
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled(" ↵ ", Style::default().fg(theme.bg).bg(theme.accent).add_modifier(Modifier::BOLD)),
+        Span::styled(format!(" {}", inbox_open_hint(n)), dim),
+    ]));
+    lines
+}
+
+/// The one-line strip over an item opened from the inbox: where in the inbox it is, why it is
+/// there, and the keys that walk on — `]` next, `[` previous, `e` done & next, `Esc` back.
+fn render_triage_strip(frame: &mut Frame, area: Rect, app: &App) {
+    let theme = &app.theme;
+    let bar = Style::default().bg(theme.panel);
+    let threads = app.inbox_threads();
+    let origin = app.inbox_origin();
+    let pos = origin.and_then(|k| threads.iter().position(|t| t.key == k));
+    let lead = origin.and_then(|k| app.inbox_all_threads().into_iter().find(|t| t.key == k)).map(|t| t.lead);
+
+    let mut left = vec![
+        Span::styled(" Inbox ", bar.fg(theme.bg).bg(theme.magenta).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!("  {} of {}  ", pos.map_or("–".to_string(), |p| (p + 1).to_string()), threads.len()),
+            bar.fg(theme.fg).add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if let Some(i) = lead {
+        let n = &app.inbox[i].notification;
+        let (glyph, color) = notif_kind(theme, n.kind);
+        left.push(Span::styled(format!("{glyph} "), bar.fg(color)));
+        left.push(Span::styled(inbox::phrase(n), bar.fg(theme.fg)));
+    }
+
+    let (next, prev) = if app.triage_brackets_taken() { ("}", "{") } else { ("]", "[") };
+    let keys = [(next, "next"), (prev, "prev"), ("e", "done & next"), ("Esc", "back to inbox")];
+    let mut right: Vec<Span<'static>> = Vec::new();
+    for (k, label) in keys {
+        right.push(Span::styled(format!(" {k} "), bar.fg(theme.accent).add_modifier(Modifier::BOLD)));
+        right.push(Span::styled(format!("{label} "), bar.fg(theme.dim)));
+    }
+    let used = Line::from(left.clone()).width() + Line::from(right.clone()).width();
+    let mut spans = left;
+    if used < area.width as usize {
+        spans.push(Span::styled(" ".repeat(area.width as usize - used), bar));
+        spans.extend(right);
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)).style(bar), area);
+}
+
+/// The rows `lines[..idx]` take once wrapped to `width` — where line `idx` starts on screen.
+fn wrapped_rows_before(lines: &[Line<'static>], idx: usize, width: u16) -> u16 {
+    lines
+        .iter()
+        .take(idx)
+        .map(|l| u16::try_from(Paragraph::new(l.clone()).wrap(Wrap { trim: false }).line_count(width)).unwrap_or(u16::MAX))
+        .fold(0, u16::saturating_add)
+}
+
+/// The tag on whatever an item opened from the inbox was opened at.
+fn inbox_tag(theme: &Theme) -> Span<'static> {
+    Span::styled("  ◂ from your inbox", Style::default().fg(theme.magenta).add_modifier(Modifier::BOLD))
 }
 
 fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
@@ -5811,6 +6200,29 @@ pub(crate) fn help_sections() -> Vec<(&'static str, Vec<(&'static str, &'static 
                 ("[  ]", "Previous / next saved view"),
                 ("V", "Save the current filter + sort + states as a view"),
                 ("X", "Delete the current view"),
+            ],
+        ),
+        (
+            "Notification inbox (i)",
+            vec![
+                ("1  2  3", "For you (waiting on you) · Following (what you watch) · All"),
+                ("Enter", "Open the item where the notification points (its comment, Checks, Diff); marks the thread read"),
+                ("e", "Done: mark the thread read and clear it (the dashboard sees it too)"),
+                ("E", "Done with every thread in the view (asks first)"),
+                ("x", "Mark the thread read; it stays listed"),
+                ("A", "Mark every thread in the view read"),
+                ("o", "Open the notification in the browser"),
+                ("Space", "Preview on / off (shown unasked at 120+ columns)"),
+                ("d  D", "Old keys for e / E, kept for now"),
+            ],
+        ),
+        (
+            "Item opened from the inbox",
+            vec![
+                ("]  [", "Open the next / previous thread at its target (on a PR's Diff: }  {)"),
+                ("e", "Done with this thread, on to the next"),
+                ("E (work item)", "Edit — e is done here"),
+                ("Esc", "Back to the inbox, on the thread you came from"),
             ],
         ),
         (
@@ -8783,6 +9195,11 @@ mod tests {
                 url: Some("http://x".into()),
                 unread,
                 updated_at: None,
+                reason: String::new(),
+                actor: None,
+                excerpt: None,
+                target: Default::default(),
+                detail_ref: None,
             },
         }
     }
@@ -8801,6 +9218,157 @@ mod tests {
         assert!(out.contains("review"), "kind label renders");
         assert!(out.contains("Inbox"), "inbox panel title");
         assert!(out.contains("Notifications (1)"), "far-right nav item shows the unread count");
+    }
+
+    /// `notif_row` on item `item`, `mins` minutes old.
+    fn note(id: &str, kind: NotificationKind, item: &str, mins: i64) -> crate::app::NotifRow {
+        let mut row = notif_row(id, kind, "Cap the retry backoff", true);
+        row.notification.item_id = Some(item.into());
+        row.notification.updated_at = Some(Utc::now() - chrono::TimeDelta::minutes(mins));
+        row
+    }
+
+    #[test]
+    fn the_inbox_draws_a_thread_as_one_row_with_a_count_of_the_rest() {
+        use crate::app::Screen;
+        let mut app = App::new("slate");
+        app.inbox = vec![
+            note("c", NotificationKind::Comment, "1487", 1),
+            note("m", NotificationKind::Mention, "1487", 5),
+            note("s", NotificationKind::StateChange, "1487", 9),
+            note("f", NotificationKind::Comment, "1500", 3),
+        ];
+        app.screen = Screen::Inbox;
+        let out = render_to_string(&mut app, 110, 24);
+        assert_eq!(out.matches("Cap the retry backoff").count(), 1, "For you lists #1487 once (#1500 is only followed)");
+        assert!(out.contains("+2"), "the comment and the state change ride along");
+        assert!(out.contains("@ mentioned you"), "led by the mention, in words");
+        assert!(out.contains("#1487"), "the item's identifier");
+        assert!(out.contains("Today"), "under its day");
+        assert!(out.contains("For you 1") && out.contains("Following 1") && out.contains("All 2"), "the views and their counts");
+        assert!(out.contains("Notifications (1)"), "the badge counts threads waiting on you, not events");
+    }
+
+    #[test]
+    fn the_inbox_preview_says_who_did_what_why_and_quotes_the_excerpt() {
+        use crate::app::Screen;
+        let mut app = App::new("slate");
+        let mut lead = note("m", NotificationKind::Mention, "1487", 5);
+        lead.notification.actor = Some("Priya Nair".into());
+        lead.notification.excerpt = Some("Could you check the backoff cap before Friday?".into());
+        lead.notification.target = NotificationTarget::Comment { id: "9".into() };
+        let mut comment = note("c", NotificationKind::Comment, "1487", 1);
+        comment.notification.actor = Some("Sam Rivera".into());
+        app.inbox = vec![lead, comment];
+        app.screen = Screen::Inbox;
+        let out = render_to_string(&mut app, 170, 30);
+        assert!(out.contains("Priya mentioned you"), "the phrase, with who");
+        assert!(out.contains("why: you were @-mentioned"));
+        assert!(out.contains("┃ Could you check the backoff cap before Friday?"), "the excerpt, quoted");
+        assert!(out.contains("1 more on this item") && out.contains("Sam commented"));
+        assert!(out.contains("opens the PR at Priya's comment"), "what Enter will do");
+    }
+
+    #[test]
+    fn a_narrow_terminal_hides_the_inbox_preview_until_space_asks_for_it() {
+        use crate::app::Screen;
+        let mut app = App::new("slate");
+        app.inbox = vec![note("m", NotificationKind::Mention, "1487", 5)];
+        app.screen = Screen::Inbox;
+        assert!(render_to_string(&mut app, 170, 24).contains("why:"), "wide: the preview is up");
+        assert!(!render_to_string(&mut app, 100, 24).contains("why:"), "narrow: the list keeps the width");
+        app.inbox_preview = Some(true);
+        assert!(render_to_string(&mut app, 100, 30).contains("why:"), "space brings it back, under the list");
+    }
+
+    #[test]
+    fn no_inbox_row_reads_activity() {
+        use crate::app::{InboxView, Screen};
+        use NotificationKind::*;
+        let mut app = App::new("slate");
+        app.inbox = [ReviewRequested, Mention, Assigned, CiFailed, Comment, StateChange, NewItem, Due, Other]
+            .into_iter()
+            .enumerate()
+            .map(|(i, kind)| note(&i.to_string(), kind, &i.to_string(), i as i64))
+            .collect();
+        app.inbox_view = InboxView::All;
+        app.screen = Screen::Inbox;
+        let out = render_to_string(&mut app, 170, 30);
+        assert!(!out.to_lowercase().contains("activity"), "{out}");
+        assert!(out.contains("+ new in") && out.contains("◷ due"));
+    }
+
+    #[test]
+    fn an_item_opened_from_the_inbox_shows_the_triage_strip_and_tags_the_comment() {
+        use crate::app::{InboxLanding, Screen};
+        let mut app = App::new("slate");
+        let mut lead = note("m", NotificationKind::Mention, "1", 5);
+        lead.connection_id = "c".into();
+        lead.notification.actor = Some("Priya Nair".into());
+        app.inbox = vec![lead, note("r", NotificationKind::ReviewRequested, "2", 9)];
+        let mut view = pr_view(0, vec![], vec![]);
+        view.diff.threads = vec![pr_thread("t1", None, false), pr_thread("t2", None, false)];
+        app.screen = Screen::PrView(Box::new(view));
+        app.from_inbox = true;
+        app.inbox_origin = app.inbox_all_threads().first().map(|t| t.key.clone());
+        app.inbox_landing = InboxLanding::for_screen(&app.screen, NotificationTarget::Comment { id: "t2-c".into() });
+        assert!(app.inbox_triage());
+
+        let rows = render_to_rows(&mut app, 140, 40);
+        let strip = rows.iter().find(|r| r.contains(" Inbox ")).expect("the triage strip");
+        assert!(strip.contains("1 of 2") && strip.contains("@ Priya mentioned you"), "{strip}");
+        assert!(strip.contains("] next") && strip.contains("[ prev") && strip.contains("e done & next") && strip.contains("Esc back to inbox"));
+        let tagged: Vec<&String> = rows.iter().filter(|r| r.contains("◂ from your inbox")).collect();
+        assert_eq!(tagged.len(), 1, "one thread is tagged");
+        assert!(app.inbox_landing.as_ref().is_some_and(|l| l.row.get().is_some()), "and the frame said where it is");
+    }
+
+    /// GitHub keeps a PR's whole conversation in one thread: the inbox tags the comment it is
+    /// about, not the thread's first line.
+    #[test]
+    fn a_comment_inside_a_long_thread_is_tagged_on_its_own_line() {
+        use crate::app::{InboxLanding, Screen};
+        let mut app = App::new("slate");
+        app.inbox = vec![note("m", NotificationKind::Mention, "1", 5)];
+        let mut convo = pr_thread("pr-1", None, false);
+        let said = |id: &str, who: &str, body: &str| Comment {
+            id: id.into(),
+            author: User { id: who.into(), display_name: who.into(), handle: None, avatar_url: None },
+            body: body.into(),
+            created_at: None,
+        };
+        convo.comments.push(said("c2", "Priya Nair", "@sam does the key check run first?"));
+        convo.comments.push(said("c3", "Tom Becker", "LGTM"));
+        let mut view = pr_view(0, vec![], vec![]);
+        view.diff.threads = vec![convo];
+        app.screen = Screen::PrView(Box::new(view));
+        app.from_inbox = true;
+        app.inbox_origin = app.inbox_all_threads().first().map(|t| t.key.clone());
+        app.inbox_landing = InboxLanding::for_screen(&app.screen, NotificationTarget::Comment { id: "c2".into() });
+
+        let rows = render_to_rows(&mut app, 140, 40);
+        let tagged: Vec<&String> = rows.iter().filter(|r| r.contains("◂ from your inbox")).collect();
+        assert_eq!(tagged.len(), 1, "{rows:#?}");
+        assert!(tagged[0].contains("Priya Nair"), "the tag sits on Priya's comment: {}", tagged[0]);
+    }
+
+    #[test]
+    fn an_item_opened_from_the_inbox_at_its_checks_selects_the_first_failure() {
+        use crate::app::{InboxLanding, Screen};
+        let mut app = App::new("slate");
+        let check = |name: &str, status| CheckRun { name: name.into(), status, url: None };
+        app.screen = Screen::PrView(Box::new(pr_view(
+            2,
+            vec![check("lint", CheckStatus::Passed), check("unit tests", CheckStatus::Failed), check("e2e", CheckStatus::Failed)],
+            vec![],
+        )));
+        app.from_inbox = true;
+        app.inbox_origin = Some("thread".into());
+        app.inbox_landing = InboxLanding::for_screen(&app.screen, NotificationTarget::Checks);
+        let rows = render_to_rows(&mut app, 140, 30);
+        let tagged: Vec<&String> = rows.iter().filter(|r| r.contains("◂ from your inbox")).collect();
+        assert_eq!(tagged.len(), 1);
+        assert!(tagged[0].contains("unit tests"), "the first failing check: {}", tagged[0]);
     }
 
     #[test]

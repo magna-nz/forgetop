@@ -419,4 +419,16 @@ async fn github_lists_notifications() {
     if let Some(n) = list.first() {
         assert!(!n.id.is_empty(), "a notification carries an id for mark-read");
     }
+    // Every thread keeps GitHub's raw reason, and a comment target comes with the handle that
+    // `detail()` fetches it by (and only then) — nothing was fetched per row to get here.
+    for n in &list {
+        assert!(!n.reason.is_empty(), "the raw reason is kept ({})", n.id);
+        let is_comment = matches!(n.target, forgetop_core::domain::NotificationTarget::Comment { .. });
+        assert_eq!(is_comment, n.detail_ref.is_some(), "a comment target and its detail handle go together ({})", n.id);
+        assert!(n.actor.is_none() && n.excerpt.is_none(), "who and what are fetched lazily, not listed");
+    }
+    let mut reasons: Vec<&str> = list.iter().map(|n| n.reason.as_str()).collect();
+    reasons.sort_unstable();
+    reasons.dedup();
+    eprintln!("github: reasons seen: {reasons:?}");
 }

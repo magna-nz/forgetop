@@ -4,10 +4,11 @@
 use std::sync::Arc;
 
 use forgetop_core::domain::{
-    CheckRun, CommentThread, Commit, FileChange, Notification, PipelineAnnotation, PipelineApproval,
+    CheckRun, CommentThread, Commit, FileChange, Notification, NotificationDetail, NotificationTier, PipelineAnnotation, PipelineApproval,
     PipelineArtifact, PipelineRun, ProviderType, PullRequest, PullRequestStatus, TimelineEvent, TimelineEventKind, WorkItem,
 };
 use forgetop_core::highlight::{lang_for, HlKind, LineHighlighter};
+use forgetop_core::inbox;
 use forgetop_core::filter::run_triggered_by;
 use forgetop_core::launchpad::{self, EntryItem, PipeInput, PrInput, WiInput};
 use forgetop_core::provider::{
@@ -59,12 +60,105 @@ pub struct PipeRow {
     pub approvals: Vec<PipelineApproval>,
 }
 
-#[derive(Serialize, Deserialize)]
+/// One notification as the dashboard lists it, with what the inbox says about it computed once
+/// here (by `forgetop_core::inbox`, the code the TUI labels its rows with) so the frontend never
+/// re-derives a phrase, a tier or a dismissal key. Build it with [`NotifRow::new`] — the live
+/// fetch and the cache translation both do.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct NotifRow {
     pub connection_id: String,
     pub connection: String,
     pub provider: ProviderType,
     pub notification: Notification,
+    /// The row's reason in plain words ("Priya mentioned you", "→ In Review").
+    #[serde(default)]
+    pub phrase: String,
+    /// Why it reached you ("you were @-mentioned") — for the pane's triage strip.
+    #[serde(default)]
+    pub why: String,
+    #[serde(default = "following")]
+    pub tier: NotificationTier,
+    /// The key "done" saves to `ui.dismissed_notifications` (shared with the TUI).
+    #[serde(default)]
+    pub dismiss_key: String,
+}
+
+fn following() -> NotificationTier {
+    NotificationTier::Following
+}
+
+impl NotifRow {
+    pub fn new(connection_id: String, connection: String, provider: ProviderType, notification: Notification) -> Self {
+        Self {
+            phrase: inbox::phrase(&notification),
+            why: inbox::why(&notification),
+            tier: notification.kind.tier(),
+            dismiss_key: inbox::dismiss_key(&connection_id, &notification),
+            connection_id,
+            connection,
+            provider,
+            notification,
+        }
+    }
+
+    /// The row with a lazily fetched detail filled in where the feed left it out (actor, excerpt,
+    /// and a target the feed couldn't settle), and its phrase recomputed with them
+    /// ("mentioned you" → "Priya mentioned you").
+    pub fn with_detail(self, detail: &NotificationDetail) -> Self {
+        let mut n = self.notification;
+        detail.fill(&mut n);
+        Self::new(self.connection_id, self.connection, self.provider, n)
+    }
+}
+
+/// One member of an inbox thread: what "done" and "mark read" send back.
+#[derive(Serialize)]
+pub struct InboxMember {
+    pub conn: String,
+    pub id: String,
+    pub unread: bool,
+}
+
+/// One inbox row: every notification about the same item, led by the one that asks most of you
+/// (see `forgetop_core::inbox::threads`).
+#[derive(Serialize)]
+pub struct InboxThreadRow {
+    pub key: String,
+    pub tier: NotificationTier,
+    pub unread: bool,
+    pub latest: Option<chrono::DateTime<Utc>>,
+    pub lead: NotifRow,
+    /// The other visible members, newest first (the row's `+N`). Hidden ones (reactions) are left
+    /// out here but kept in `members`.
+    pub more: Vec<NotifRow>,
+    /// Every member, hidden ones included, newest first.
+    pub members: Vec<InboxMember>,
+}
+
+/// Folds the rows `/api/notifications` serves into the inbox's threads, newest first.
+pub fn inbox_threads(rows: &[NotifRow]) -> Vec<InboxThreadRow> {
+    let pairs: Vec<(&str, &Notification)> = rows.iter().map(|r| (r.connection_id.as_str(), &r.notification)).collect();
+    inbox::threads(&pairs)
+        .into_iter()
+        .map(|t| InboxThreadRow {
+            more: t
+                .members
+                .iter()
+                .filter(|&&i| i != t.lead && rows[i].tier != NotificationTier::Hidden)
+                .map(|&i| rows[i].clone())
+                .collect(),
+            members: t
+                .members
+                .iter()
+                .map(|&i| InboxMember { conn: rows[i].connection_id.clone(), id: rows[i].notification.id.clone(), unread: rows[i].notification.unread })
+                .collect(),
+            lead: rows[t.lead].clone(),
+            key: t.key,
+            tier: t.tier,
+            unread: t.unread,
+            latest: t.latest,
+        })
+        .collect()
 }
 
 #[derive(Serialize)]
@@ -217,11 +311,13 @@ pub async fn notifications(sections: &SectionService, cache: &CacheStore) -> Vec
     if let Ok(feeds) = sections.notification_feeds().await.inspect_err(|_| log_fetch_failure("dashboard.notifications.feeds")) {
         for feed in feeds {
             if let Ok(list) = feed.source.list().await.inspect_err(|_| log_fetch_failure("dashboard.notifications.list")) {
-                out.extend(list.into_iter().map(|n| NotifRow {
-                    connection_id: feed.connection.connection_id().to_string(),
-                    connection: feed.connection.display_name().to_string(),
-                    provider: feed.connection.provider_type(),
-                    notification: n,
+                out.extend(list.into_iter().map(|n| {
+                    NotifRow::new(
+                        feed.connection.connection_id().to_string(),
+                        feed.connection.display_name().to_string(),
+                        feed.connection.provider_type(),
+                        n,
+                    )
                 }));
             }
         }

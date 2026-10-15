@@ -571,6 +571,11 @@ pub trait NotificationSource: Send + Sync {
     async fn list(&self) -> Result<Vec<Notification>>;
     /// Mark a single notification read by its id.
     async fn mark_read(&self, id: &str) -> Result<()>;
+    /// The actor and excerpt of one notification whose list entry didn't carry them — fetched
+    /// for the selected row only, never during a reload. Default: nothing more to say.
+    async fn detail(&self, _notification: &Notification) -> Result<NotificationDetail> {
+        Ok(NotificationDetail::default())
+    }
     /// Mark every notification read. Default: mark each one; providers with a bulk endpoint
     /// (GitHub `PUT /notifications`, GitLab `/todos/mark_as_done`) should override.
     async fn mark_all_read(&self) -> Result<()> {

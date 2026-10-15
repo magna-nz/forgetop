@@ -52,7 +52,8 @@ export type IconName =
   | "blocked"
   | "skipped"
   | "dot"
-  | "review";
+  | "review"
+  | "smile";
 
 const PATHS: Record<IconName, string> = {
   inbox: '<path d="M2.5 9 4 3.5h8L13.5 9v4H2.5z"/><path d="M2.5 9h3l1.3 2h2.4l1.3-2h3"/>',
@@ -110,6 +111,7 @@ const PATHS: Record<IconName, string> = {
   skipped: '<circle cx="8" cy="8" r="6"/><path d="M6 5.5 10 8l-4 2.5z" fill="currentColor" stroke="none"/>',
   dot: '<circle cx="8" cy="8" r="2.5" fill="currentColor" stroke="none"/>',
   review: '<circle cx="8" cy="8" r="6"/><path d="M5 8.5l2 2 4-4.5"/>',
+  smile: '<circle cx="8" cy="8" r="6"/><path d="M5.6 9.4a3 3 0 0 0 4.8 0M6 6.3v.2M10 6.3v.2"/>',
 };
 
 export function Icon({

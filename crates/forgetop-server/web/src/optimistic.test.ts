@@ -9,14 +9,18 @@ import {
   localComment,
   localThread,
   markNotificationReadInCache,
+  markThreadReadInCache,
   meAsUser,
+  patchInboxDetailInCache,
   patchPullRequest,
   patchWorkItem,
+  removeThreadFromCache,
   setConnectionScopeInCache,
   withVote,
 } from "./optimistic";
 import type {
   ConnectionRow,
+  InboxThread,
   LaunchpadResponse,
   NotifRow,
   PrDetail as PrDetailData,
@@ -358,5 +362,123 @@ describe("placeholder comments", () => {
       ["why?", "bob"],
       ["because", "You"],
     ]);
+  });
+});
+
+describe("inbox threads", () => {
+  const n = (connection_id: string, id: string, unread = true) =>
+    ({ connection_id, notification: { id, unread, title: id } }) as unknown as NotifRow;
+  const t = (key: string, rows: NotifRow[]): InboxThread =>
+    ({
+      key,
+      tier: "ForYou",
+      unread: rows.some((r) => r.notification.unread),
+      lead: rows[0],
+      more: rows.slice(1),
+      members: rows.map((r) => ({ conn: r.connection_id, id: r.notification.id, unread: r.notification.unread })),
+    }) as InboxThread;
+  const seed = () => {
+    const qc = new QueryClient();
+    const a = t("A", [n("c", "1"), n("c", "2")]);
+    const b = t("B", [n("c", "3")]);
+    qc.setQueryData(["inbox"], [a, b]);
+    // The same id on another connection is somebody else's notification.
+    qc.setQueryData(["notifications"], [n("c", "1"), n("c", "2"), n("c", "3"), n("other", "1")]);
+    return { qc, a, b };
+  };
+  const unread = (qc: QueryClient) => (qc.getQueryData(["notifications"]) as NotifRow[]).map((r) => `${r.connection_id}:${r.notification.id}:${r.notification.unread}`);
+
+  it("marking a thread read clears every member, on the thread and in the flat list", () => {
+    const { qc, a, b } = seed();
+    markThreadReadInCache(qc, a);
+    const [ta, tb] = qc.getQueryData(["inbox"]) as InboxThread[];
+    expect(ta.unread).toBe(false);
+    expect([ta.lead, ...ta.more].every((r) => !r.notification.unread)).toBe(true);
+    expect(ta.members.every((m) => !m.unread)).toBe(true);
+    expect(tb).toBe(b);
+    expect(unread(qc)).toEqual(["c:1:false", "c:2:false", "c:3:true", "other:1:true"]);
+  });
+
+  it("done takes the thread and its rows out, and nothing else", () => {
+    const { qc, a } = seed();
+    removeThreadFromCache(qc, a);
+    expect((qc.getQueryData(["inbox"]) as InboxThread[]).map((x) => x.key)).toEqual(["B"]);
+    expect(unread(qc)).toEqual(["c:3:true", "other:1:true"]);
+  });
+
+  it("tolerates the inbox never having been fetched", () => {
+    const qc = new QueryClient();
+    expect(() => removeThreadFromCache(qc, t("A", [n("c", "1")]))).not.toThrow();
+    expect(qc.getQueryData(["inbox"])).toBeUndefined();
+  });
+});
+
+describe("patchInboxDetailInCache", () => {
+  const lead = (connection_id: string, id: string, o: Partial<NotifRow["notification"]> = {}) =>
+    ({
+      connection_id,
+      phrase: "mentioned you",
+      why: "you were @-mentioned",
+      notification: { id, unread: true, title: id, kind: "Mention", target: { kind: "Overview" }, detail_ref: "r", ...o },
+    }) as unknown as NotifRow;
+  const thread = (key: string, l: NotifRow, more: NotifRow[] = []) =>
+    ({ key, tier: "ForYou", unread: true, lead: l, more, members: [] }) as unknown as InboxThread;
+  const answer = {
+    actor: "Priya Nair",
+    excerpt: "@you can we land this?",
+    target: { kind: "Comment" as const, id: "c-9" },
+    phrase: "Priya mentioned you",
+    why: "Priya @-mentioned you in a comment",
+  };
+
+  it("fills the lead it names: who, what, where it lands, and the recomputed phrase", () => {
+    const qc = new QueryClient();
+    const other = thread("B", lead("c", "2"));
+    // The same id on another connection is somebody else's notification.
+    const elsewhere = thread("C", lead("other", "1"));
+    qc.setQueryData(["inbox"], [thread("A", lead("c", "1")), other, elsewhere]);
+
+    patchInboxDetailInCache(qc, "c", "1", answer);
+
+    const [a, b, c] = qc.getQueryData(["inbox"]) as InboxThread[];
+    expect(a.lead.phrase).toBe("Priya mentioned you");
+    expect(a.lead.why).toBe("Priya @-mentioned you in a comment");
+    expect(a.lead.notification.actor).toBe("Priya Nair");
+    expect(a.lead.notification.excerpt).toBe("@you can we land this?");
+    expect(a.lead.notification.target).toEqual({ kind: "Comment", id: "c-9" });
+    expect(b).toBe(other);
+    expect(c).toBe(elsewhere);
+  });
+
+  it("never overwrites what the feed already said, or a target more precise than the item", () => {
+    const qc = new QueryClient();
+    qc.setQueryData(["inbox"], [
+      thread("A", lead("c", "1", { actor: "Sam", excerpt: null, target: { kind: "Checks" } })),
+      thread("B", lead("c", "2", { target: undefined })),
+    ]);
+
+    patchInboxDetailInCache(qc, "c", "1", answer);
+    patchInboxDetailInCache(qc, "c", "2", { ...answer, target: null });
+
+    const [a, b] = qc.getQueryData(["inbox"]) as InboxThread[];
+    expect(a.lead.notification.actor).toBe("Sam");
+    expect(a.lead.notification.excerpt).toBe("@you can we land this?");
+    expect(a.lead.notification.target).toEqual({ kind: "Checks" });
+    // No target in the answer keeps the row's own.
+    expect(b.lead.notification.target).toBeUndefined();
+  });
+
+  it("matches the thread's lead only, not a member further down", () => {
+    const qc = new QueryClient();
+    const t = thread("A", lead("c", "1"), [lead("c", "2")]);
+    qc.setQueryData(["inbox"], [t]);
+    patchInboxDetailInCache(qc, "c", "2", answer);
+    expect((qc.getQueryData(["inbox"]) as InboxThread[])[0]).toBe(t);
+  });
+
+  it("tolerates the inbox never having been fetched", () => {
+    const qc = new QueryClient();
+    expect(() => patchInboxDetailInCache(qc, "c", "1", answer)).not.toThrow();
+    expect(qc.getQueryData(["inbox"])).toBeUndefined();
   });
 });

@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import type { ApprovalDecision, ConnectionRow, FileChange, HealthRow, Highlight, HlSpan, LaunchpadResponse, NotifRow, PipeRef, PipelineAnnotation, PipelineArtifact, PipelineDetail, PipelineSelection, PipeRow, PrDecoration, PrDetail, PrRef, ProviderInfo, PrRow, RepositoryPage, User, WiDetail, WiRef, WiRow } from "./types";
+import type { ApprovalDecision, ConnectionRow, FileChange, HealthRow, Highlight, HlSpan, InboxThread, LaunchpadResponse, NotificationDetailResponse, NotifRow, PipeRef, PipelineAnnotation, PipelineArtifact, PipelineDetail, PipelineSelection, PipeRow, PrDecoration, PrDetail, PrRef, ProviderInfo, PrRow, RepositoryPage, User, WiDetail, WiRef, WiRow } from "./types";
+import { patchInboxDetailInCache } from "./optimistic";
+import { useSettled } from "./useSettled";
 
 // The session token arrives once in the URL (`/?t=…`). We stash it in sessionStorage (so a
 // refresh keeps working) and strip it from the visible URL, then replay it on every API call.
@@ -409,6 +411,52 @@ export const usePullRequests = (view: PrView = "all") => useQuery(listQuery<PrRo
 export const useWorkItems = () => useQuery(listQuery<WiRow[]>(["work-items"], "/api/work-items"));
 export const usePipelines = () => useQuery(listQuery<PipeRow[]>(["pipelines"], "/api/pipelines"));
 export const useNotifications = () => useQuery(listQuery<NotifRow[]>(["notifications"], "/api/notifications"));
+/** The inbox as one row per item (`GET /api/inbox`), over the same rows as `useNotifications`. */
+export const inboxKey = ["inbox"];
+export const useInbox = () => useQuery(listQuery<InboxThread[]>(inboxKey, "/api/inbox"));
+/** Everything a notification write can change: the inbox, the flat list, and the Command
+ *  Center (a review request read or dismissed can move a row there). */
+export const NOTIFICATION_QUERIES = [inboxKey, ["notifications"], ["launchpad"]];
+
+export const notificationDetailKey = (conn: string, id: string) => ["notification-detail", conn, id];
+/** How long a row has to stay selected (or a pane stay open on it) before its detail is fetched:
+ *  a held `j` across twenty rows asks for the one it stops on, not all twenty. */
+export const DETAIL_SETTLE_MS = 300;
+/** What a detail query holds: the server's answer, or nothing at all — a detail that failed is
+ *  settled as empty rather than kept as an error, so no remount or reselection asks again. */
+export type NotificationDetailData = Partial<NotificationDetailResponse>;
+/** The actor and excerpt a feed entry left out — fetched once, only when `want` has held for
+ *  {@link DETAIL_SETTLE_MS} (the row is selected or its pane is open), and kept for the session:
+ *  it is what one comment said. The answer is written into the cached inbox thread it leads
+ *  (who, what, where it points, and the recomputed phrase) rather than refetching the inbox, which
+ *  would go back to every feed. With `want` false it still answers from a fetch made elsewhere
+ *  (the bell reads the page's). */
+export const useNotificationDetail = (conn: string, id: string, want: boolean) => {
+  const qc = useQueryClient();
+  const key = want ? `${conn}\u0001${id}` : null;
+  const settled = useSettled(key, DETAIL_SETTLE_MS);
+  return useQuery<NotificationDetailData>({
+    queryKey: notificationDetailKey(conn, id),
+    queryFn: async () => {
+      let detail: NotificationDetailResponse | undefined;
+      try {
+        detail = await apiPost<NotificationDetailResponse>("/api/notification/detail", { conn, id });
+      } catch {
+        // Shown without it, as before; asking again on every visit would only fail again.
+        return {};
+      }
+      if (!detail) return {};
+      patchInboxDetailInCache(qc, conn, id, detail);
+      return detail;
+    },
+    enabled: key !== null && settled === key,
+    staleTime: Infinity,
+    // Kept past the last observer, so stepping off a row and back doesn't ask again.
+    gcTime: Infinity,
+    retry: false,
+    retryOnMount: false,
+  });
+};
 
 /** The viewer's saved view preferences (`GET /api/prefs`), shared with the TUI's config. */
 export interface Prefs {

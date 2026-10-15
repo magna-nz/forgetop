@@ -591,8 +591,104 @@ pub enum NotificationKind {
     Comment,
     /// The state of something you follow changed (merged, closed, status).
     StateChange,
-    /// Anything else the provider notified about.
+    /// A new item appeared somewhere you follow (Linear: an issue created in, or added to the
+    /// triage of, a team you subscribe to).
+    NewItem,
+    /// Something of yours is due, or a reminder you set fired.
+    Due,
+    /// Someone reacted to a comment. Folded into its thread, never a row of its own.
+    Reaction,
+    /// Anything else the provider notified about. Labelled with the provider's raw
+    /// [`Notification::reason`], never a generic word.
     Other,
+}
+
+/// How much a notification asks of you — what the inbox splits its views by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum NotificationTier {
+    /// Someone is waiting on you: a review request, a mention, an assignment, a failure of
+    /// yours, a due date. The unread badge counts these only.
+    ForYou,
+    /// You are watching: comments, status changes, new items where you follow.
+    Following,
+    /// Never shown as a row (reactions). Still marked read with its thread.
+    Hidden,
+}
+
+impl NotificationKind {
+    pub fn tier(self) -> NotificationTier {
+        use NotificationKind::*;
+        match self {
+            ReviewRequested | Mention | Assigned | CiFailed | Due => NotificationTier::ForYou,
+            Comment | StateChange | NewItem | Other => NotificationTier::Following,
+            Reaction => NotificationTier::Hidden,
+        }
+    }
+
+    /// Which reason leads a thread holding several: lower ranks first. A mention outranks the
+    /// comment it arrived with, and anything asking for you outranks anything that doesn't.
+    pub fn rank(self) -> u8 {
+        use NotificationKind::*;
+        match self {
+            Mention => 0,
+            ReviewRequested => 1,
+            CiFailed => 2,
+            Assigned => 3,
+            Due => 4,
+            Comment => 5,
+            StateChange => 6,
+            NewItem => 7,
+            Other => 8,
+            Reaction => 9,
+        }
+    }
+}
+
+/// Where opening a notification should land inside its item.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+pub enum NotificationTarget {
+    /// The item itself, from the top.
+    #[default]
+    Overview,
+    /// One comment: its thread selected in the PR's Conversation, or scrolled to in a work
+    /// item's comments. `id` is the provider's comment id, as the item's threads carry it.
+    Comment { id: String },
+    /// The PR's checks, with the first failing one selected.
+    Checks,
+    /// The PR's changes — where a review starts.
+    Diff,
+    /// The item's activity — a state change.
+    Activity,
+}
+
+/// The who and what of a notification whose feed entry didn't carry them, fetched on demand
+/// (see [`crate::provider::NotificationSource::detail`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotificationDetail {
+    pub actor: Option<String>,
+    pub excerpt: Option<String>,
+    /// Where opening should land now that the detail is known — a GitHub mention's comment,
+    /// once it is confirmed to be the one that mentions you. `None` keeps the feed's target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<NotificationTarget>,
+}
+
+impl NotificationDetail {
+    /// Fills what `n` lacks from this detail: its actor and excerpt, and its target while the
+    /// feed left it at [`NotificationTarget::Overview`]. Both frontends merge a fetched detail
+    /// into a row through this.
+    pub fn fill(&self, n: &mut Notification) {
+        if n.actor.is_none() {
+            n.actor = self.actor.clone();
+        }
+        if n.excerpt.is_none() {
+            n.excerpt = self.excerpt.clone();
+        }
+        if let (Some(t), NotificationTarget::Overview) = (&self.target, &n.target) {
+            n.target = t.clone();
+        }
+    }
 }
 
 /// What kind of item a notification points at — drives its icon and which source opens it.
@@ -626,6 +722,23 @@ pub struct Notification {
     pub url: Option<String>,
     pub unread: bool,
     pub updated_at: Option<DateTime<Utc>>,
+    /// The provider's own word for why, verbatim (`team_mention`, `issueCreated`,
+    /// `build_failed`) — what an `Other` is labelled with, and what a mapping is checked against.
+    #[serde(default)]
+    pub reason: String,
+    /// Who caused it, when the feed says (GitLab todo author, Linear actor).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
+    /// The comment text or the change ("Triage → Todo"), when the feed carries it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub excerpt: Option<String>,
+    /// Where opening it lands.
+    #[serde(default)]
+    pub target: NotificationTarget,
+    /// Provider-private handle for fetching [`NotificationDetail`] later (GitHub: the thread's
+    /// `latest_comment_url`). `None` when the feed entry already carries all it can.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail_ref: Option<String>,
 }
 
 #[cfg(test)]

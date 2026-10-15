@@ -619,6 +619,28 @@ fn github_reason_kind(reason: &str) -> NotificationKind {
     }
 }
 
+/// Which kind of comment a thread's `latest_comment_url` names, and its numeric id: `Issue` for
+/// `…/issues/comments/<id>` (a conversation comment, on an issue or a PR), `Review` for
+/// `…/pulls/comments/<id>` (a diff comment). Anything else — notably the subject's own URL, which
+/// is what GitHub sends for a review request or a state change — is not a comment.
+enum LatestComment {
+    Issue(String),
+    Review(String),
+}
+
+fn latest_comment(url: &str) -> Option<LatestComment> {
+    let mut segs = url.trim_end_matches('/').rsplit('/');
+    let id = segs.next().filter(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))?;
+    if segs.next()? != "comments" {
+        return None;
+    }
+    match segs.next()? {
+        "issues" => Some(LatestComment::Issue(id.to_string())),
+        "pulls" => Some(LatestComment::Review(id.to_string())),
+        _ => None,
+    }
+}
+
 /// Map a GitHub notification thread (`GET /notifications`) to a [`Notification`].
 pub fn map_notification(v: &Value) -> Notification {
     let subject = get_obj(v, "subject");
@@ -640,15 +662,49 @@ pub fn map_notification(v: &Value) -> Notification {
         _ => None,
     };
     let html = repo.and_then(|r| get_str(r, "html_url"));
-    let url = match (&html, &item_id, item_type) {
+    let mut url = match (&html, &item_id, item_type) {
         (Some(h), Some(n), NotificationItemType::PullRequest) => Some(format!("{h}/pull/{n}")),
         (Some(h), Some(n), NotificationItemType::WorkItem) => Some(format!("{h}/issues/{n}")),
         (Some(h), _, _) => Some(h.clone()),
         _ => None,
     };
+    let reason = get_str(v, "reason").unwrap_or_default();
+    let kind = github_reason_kind(&reason);
+
+    // A comment id is only worth keeping for the kinds that are about a comment. The id is the
+    // REST id, which is exactly what `map_gh_comment` and the GraphQL review threads
+    // (`databaseId`) give a `Comment` — so it names the same comment in the PR's threads.
+    let mut target = match (kind, item_type) {
+        (NotificationKind::ReviewRequested, NotificationItemType::PullRequest) => NotificationTarget::Diff,
+        (NotificationKind::CiFailed, NotificationItemType::PullRequest) => NotificationTarget::Checks,
+        _ => NotificationTarget::Overview,
+    };
+    let mut detail_ref = None;
+    if matches!(kind, NotificationKind::Mention | NotificationKind::Comment) {
+        let latest = subject.and_then(|s| get_str(s, "latest_comment_url"));
+        if let Some((api_url, found)) = latest.and_then(|u| latest_comment(&u).map(|c| (u, c))) {
+            let (id, anchor) = match found {
+                LatestComment::Issue(id) => (id.clone(), format!("#issuecomment-{id}")),
+                LatestComment::Review(id) => (id.clone(), format!("#discussion_r{id}")),
+            };
+            detail_ref = Some(api_url);
+            // GitHub keeps a thread's reason at `mention` while its latest comment moves on to
+            // whoever spoke last, so for a mention that comment is only a candidate: `detail()`
+            // names it as the target once it has read that the comment mentions you.
+            if kind == NotificationKind::Comment {
+                target = NotificationTarget::Comment { id };
+                // The anchor belongs to the item's own page, never the bare repository's.
+                if item_id.is_some() {
+                    if let Some(u) = url.as_mut() {
+                        u.push_str(&anchor);
+                    }
+                }
+            }
+        }
+    }
     Notification {
         id: get_str(v, "id").unwrap_or_default(),
-        kind: github_reason_kind(&get_str(v, "reason").unwrap_or_default()),
+        kind,
         item_type,
         item_id,
         // `full_name` is already the connection-relative spelling GitHub addresses repos by.
@@ -658,6 +714,40 @@ pub fn map_notification(v: &Value) -> Notification {
         url,
         unread: get_bool(v, "unread"),
         updated_at: get_date(v, "updated_at"),
+        reason,
+        // The feed names no actor; `detail()` reads it off the comment for the selected row.
+        actor: None,
+        excerpt: None,
+        target,
+        detail_ref,
+    }
+}
+
+/// Whether `body` @-mentions `login` — as a whole handle, case-insensitively (`@dan` is not
+/// `@danielle`, and an email address is not a mention).
+fn mentions_login(body: &str, login: &str) -> bool {
+    let handle_char = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_';
+    let (body, needle) = (body.to_ascii_lowercase(), format!("@{}", login.to_ascii_lowercase()));
+    body.match_indices(&needle).any(|(at, _)| {
+        let before = body[..at].chars().next_back();
+        let after = body[at + needle.len()..].chars().next();
+        !before.is_some_and(handle_char) && !after.is_some_and(handle_char)
+    })
+}
+
+/// Whether `body` @-mentions a team (`@org/team`) — what a `team_mention` is about.
+fn mentions_a_team(body: &str) -> bool {
+    body.split(|c: char| c.is_whitespace() || c == '(' || c == ',')
+        .any(|w| w.strip_prefix('@').is_some_and(|h| h.contains('/') && !h.starts_with('/')))
+}
+
+/// Who wrote a comment and what it said, from `GET …/issues/comments/<id>` or
+/// `…/pulls/comments/<id>` — both carry `user.login` and `body`.
+pub fn map_comment_detail(v: &Value) -> NotificationDetail {
+    NotificationDetail {
+        actor: get_obj(v, "user").and_then(|u| get_str(u, "login")),
+        excerpt: get_str(v, "body").as_deref().and_then(content::comment_excerpt),
+        target: None,
     }
 }
 
@@ -1154,6 +1244,35 @@ impl NotificationSource for GitHubNotif {
     }
     async fn mark_all_read(&self) -> Result<()> {
         self.0.put_json(&format!("{}/notifications", self.0.base), json!({ "read": true })).await
+    }
+    /// One call, for the row being looked at — never from `list()`, so a quiet reload adds none.
+    async fn detail(&self, n: &Notification) -> Result<NotificationDetail> {
+        let Some(url) = n.detail_ref.as_deref() else { return Ok(NotificationDetail::default()) };
+        // The ref is a URL the feed gave us, held in a cache and passed back through the
+        // frontend: the token only ever goes to this connection's own API.
+        if !url.starts_with(&format!("{}/", self.0.base.trim_end_matches('/'))) {
+            return Err(Error::Provider("notification detail points outside this connection".into()));
+        }
+        let v = self.0.get_json(url).await?;
+        let mut detail = map_comment_detail(&v);
+        if n.kind == NotificationKind::Mention {
+            // The latest comment may be someone's reply after the mention. Say who mentioned you
+            // and land on it only when this comment is the mention; otherwise claim nothing.
+            let body = get_str(&v, "body").unwrap_or_default();
+            let mentions_you = if n.reason == "team_mention" {
+                mentions_a_team(&body)
+            } else {
+                // One cached `/user` call per connection, not per notification.
+                matches!(self.0.self_login().await, Ok(Some(login)) if mentions_login(&body, &login))
+            };
+            if !mentions_you {
+                return Ok(NotificationDetail::default());
+            }
+            detail.target = latest_comment(url).map(|c| match c {
+                LatestComment::Issue(id) | LatestComment::Review(id) => NotificationTarget::Comment { id },
+            });
+        }
+        Ok(detail)
     }
 }
 
@@ -1979,6 +2098,157 @@ mod tests {
         assert_eq!(c.kind, NotificationKind::CiFailed);
         assert_eq!(c.item_type, NotificationItemType::Pipeline);
         assert_eq!(c.item_id, None);
+    }
+
+    fn notif_json(reason: &str, kind: &str, subject_url: &str, latest: &str) -> Value {
+        serde_json::json!({ "id": "7", "unread": true, "reason": reason, "updated_at": "2026-07-10T09:00:00Z",
+            "subject": { "title": "t", "type": kind, "url": subject_url, "latest_comment_url": latest },
+            "repository": { "full_name": "acme/pay", "html_url": "https://github.com/acme/pay" } })
+    }
+
+    #[test]
+    fn a_mention_on_an_issue_comment_targets_it_and_anchors_the_url() {
+        let pr = "https://api.github.com/repos/acme/pay/pulls/1487";
+        let comment = "https://api.github.com/repos/acme/pay/issues/comments/123";
+        let n = map_notification(&notif_json("mention", "PullRequest", pr, comment));
+        assert_eq!(n.kind, NotificationKind::Mention);
+        // The latest comment is only a candidate for a mention: `detail()` settles the target.
+        assert_eq!(n.target, NotificationTarget::Overview);
+        assert_eq!(n.detail_ref.as_deref(), Some(comment));
+        assert_eq!(n.url.as_deref(), Some("https://github.com/acme/pay/pull/1487"));
+        assert_eq!(n.reason, "mention");
+        assert_eq!((n.actor.as_deref(), n.excerpt.as_deref()), (None, None), "the feed names neither");
+
+        // A comment notification targets its comment, by the id the thread mapper gives it.
+        let c = map_notification(&notif_json("comment", "PullRequest", pr, comment));
+        assert_eq!(c.url.as_deref(), Some("https://github.com/acme/pay/pull/1487#issuecomment-123"));
+        let mapped = map_gh_comment(&serde_json::json!({ "id": 123, "body": "hi", "user": { "login": "p" } }));
+        assert_eq!(NotificationTarget::Comment { id: mapped.id }, c.target);
+    }
+
+    #[test]
+    fn a_mention_is_a_whole_handle_and_a_team_mention_names_a_team() {
+        assert!(mentions_login("ping\n@Dan, can you look?", "dan"));
+        assert!(mentions_login("(@dan)", "dan"));
+        assert!(!mentions_login("@danielle can you look?", "dan"), "a longer handle is someone else");
+        assert!(!mentions_login("mail dan@dan.dev", "dan"), "an address is not a mention");
+        assert!(!mentions_login("thanks!", "dan"));
+        assert!(mentions_a_team("cc @acme/payments for review"));
+        assert!(!mentions_a_team("cc @dan"));
+    }
+
+    #[test]
+    fn a_pull_review_comment_anchors_as_a_discussion() {
+        let pr = "https://api.github.com/repos/acme/pay/pulls/1487";
+        let comment = "https://api.github.com/repos/acme/pay/pulls/comments/456";
+        let n = map_notification(&notif_json("comment", "PullRequest", pr, comment));
+        assert_eq!(n.kind, NotificationKind::Comment);
+        assert_eq!(n.target, NotificationTarget::Comment { id: "456".into() });
+        assert_eq!(n.url.as_deref(), Some("https://github.com/acme/pay/pull/1487#discussion_r456"));
+        assert_eq!(n.detail_ref.as_deref(), Some(comment));
+
+        // On an issue the same anchor hangs off /issues/N.
+        let issue = "https://api.github.com/repos/acme/pay/issues/9";
+        let m = map_notification(&notif_json("comment", "Issue", issue, "https://api.github.com/repos/acme/pay/issues/comments/8"));
+        assert_eq!(m.url.as_deref(), Some("https://github.com/acme/pay/issues/9#issuecomment-8"));
+        let m = map_notification(&notif_json("team_mention", "Issue", issue, "https://api.github.com/repos/acme/pay/issues/comments/8"));
+        assert_eq!(m.reason, "team_mention", "the raw reason is kept, not the kind");
+    }
+
+    #[test]
+    fn a_latest_comment_url_that_is_the_subject_is_not_a_comment() {
+        let pr = "https://api.github.com/repos/acme/pay/pulls/1501";
+        // Review requested: the subject URL repeats, no comment, and the target is the diff.
+        let r = map_notification(&notif_json("review_requested", "PullRequest", pr, pr));
+        assert_eq!(r.target, NotificationTarget::Diff);
+        assert_eq!(r.detail_ref, None);
+        assert_eq!(r.url.as_deref(), Some("https://github.com/acme/pay/pull/1501"));
+        // Even a mention whose latest URL is the subject has nothing to land on.
+        let m = map_notification(&notif_json("mention", "PullRequest", pr, pr));
+        assert_eq!((m.target, m.detail_ref), (NotificationTarget::Overview, None));
+        // A review (not a comment) is no comment either.
+        let rv = map_notification(&notif_json("comment", "PullRequest", pr, &format!("{pr}/reviews/5")));
+        assert_eq!((rv.target, rv.detail_ref), (NotificationTarget::Overview, None));
+    }
+
+    #[test]
+    fn ci_activity_lands_on_the_checks_and_other_reasons_stay_overview() {
+        let pr = "https://api.github.com/repos/acme/pay/pulls/1492";
+        let ci = map_notification(&notif_json("ci_activity", "PullRequest", pr, pr));
+        assert_eq!((ci.kind, ci.target, ci.reason.as_str()), (NotificationKind::CiFailed, NotificationTarget::Checks, "ci_activity"));
+        // A check suite is not a PR: nothing to open the checks of.
+        let suite = map_notification(&notif_json("ci_activity", "CheckSuite", "https://api.github.com/repos/acme/pay/check-suites/77", ""));
+        assert_eq!(suite.target, NotificationTarget::Overview);
+        for reason in ["subscribed", "author", "manual"] {
+            let n = map_notification(&notif_json(reason, "PullRequest", pr, pr));
+            assert_eq!((n.kind, n.reason.as_str(), n.target), (NotificationKind::Other, reason, NotificationTarget::Overview));
+        }
+    }
+
+    #[test]
+    fn an_excerpt_collapses_whitespace_and_cuts_on_a_char_boundary() {
+        assert_eq!(content::comment_excerpt("  does the\n\n key   check\trun? "), Some("does the key check run?".into()));
+        assert_eq!(content::comment_excerpt(" \n "), None);
+        let long = "é".repeat(300);
+        let cut = content::comment_excerpt(&long).unwrap();
+        assert_eq!(cut.chars().count(), 241, "240 characters and the ellipsis");
+        assert!(cut.ends_with('…') && cut.starts_with("éé"));
+        assert_eq!(content::comment_excerpt(&"a".repeat(240)).unwrap().chars().count(), 240, "at the limit, untouched");
+    }
+
+    #[test]
+    fn a_comment_maps_to_its_author_and_text() {
+        let d = map_comment_detail(&serde_json::json!({ "id": 1, "user": { "login": "priya" }, "body": "does the key\ncheck run first?" }));
+        assert_eq!(d.actor.as_deref(), Some("priya"));
+        assert_eq!(d.excerpt.as_deref(), Some("does the key check run first?"));
+        assert_eq!(map_comment_detail(&serde_json::json!({})), NotificationDetail::default());
+    }
+
+    #[tokio::test]
+    async fn detail_fetches_the_one_comment_and_list_fetches_none() {
+        let (forge, pr) = forge_client(&[]);
+        forge.route(
+            "/notifications",
+            serde_json::json!([ {
+                "id": "7", "unread": true, "reason": "mention", "updated_at": "2026-07-10T09:00:00Z",
+                "subject": { "title": "t", "type": "PullRequest", "url": format!("{}/repos/acme/pay/pulls/1487", forge.base()),
+                             "latest_comment_url": format!("{}/repos/acme/pay/issues/comments/123", forge.base()) },
+                "repository": { "full_name": "acme/pay", "html_url": "https://github.com/acme/pay" } } ]),
+        );
+        forge.route("/repos/acme/pay/issues/comments/123", serde_json::json!({ "id": 123, "user": { "login": "priya" }, "body": "ping\n@dan" }));
+        forge.route("/user", serde_json::json!({ "login": "dan" }));
+        let notif = GitHubNotif(pr.0.clone());
+
+        let rows = notif.list().await.unwrap();
+        assert_eq!(forge.requests(), vec!["GET /notifications?per_page=50".to_string()], "a list adds no per-row call");
+        assert_eq!(rows[0].target, NotificationTarget::Overview, "a mention's comment is settled by detail()");
+
+        let d = notif.detail(&rows[0]).await.unwrap();
+        assert_eq!((d.actor.as_deref(), d.excerpt.as_deref()), (Some("priya"), Some("ping @dan")));
+        assert_eq!(d.target, Some(NotificationTarget::Comment { id: "123".into() }), "the comment is the mention");
+        assert_eq!(forge.requests_to("/repos/acme/pay/issues/comments/123").len(), 1);
+
+        // No ref, no call; a ref off this connection is refused, with no request made.
+        let mut bare = rows[0].clone();
+        bare.detail_ref = None;
+        assert_eq!(notif.detail(&bare).await.unwrap(), NotificationDetail::default());
+        let mut foreign = rows[0].clone();
+        foreign.detail_ref = Some("https://evil.example/repos/acme/pay/issues/comments/1".into());
+        assert!(notif.detail(&foreign).await.is_err());
+        assert_eq!(forge.requests().len(), 3, "the list, the comment, and who you are");
+    }
+
+    /// GitHub keeps `reason: mention` on a thread whose latest comment is someone's later reply:
+    /// that comment is not the mention, so nobody is named and nothing is landed on.
+    #[tokio::test]
+    async fn a_later_reply_on_a_mention_thread_is_not_called_the_mention() {
+        let (forge, pr) = forge_client(&[]);
+        forge.route("/repos/acme/pay/issues/comments/124", serde_json::json!({ "id": 124, "user": { "login": "bob" }, "body": "LGTM" }));
+        forge.route("/user", serde_json::json!({ "login": "dan" }));
+        let notif = GitHubNotif(pr.0.clone());
+        let mut n = map_notification(&notif_json("mention", "PullRequest", &format!("{}/repos/acme/pay/pulls/1487", forge.base()), &format!("{}/repos/acme/pay/issues/comments/124", forge.base())));
+        n.id = "8".into();
+        assert_eq!(notif.detail(&n).await.unwrap(), NotificationDetail::default());
     }
 
     #[test]

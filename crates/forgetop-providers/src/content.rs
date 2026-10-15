@@ -1,5 +1,6 @@
 //! Shared by the providers' `file_text`: addressing a file by its path in a URL, and reading a
 //! contents payload as text — or as nothing, when what came back isn't text a diff can show.
+//! Also the one shape every notification feed trims a comment to for the inbox excerpt.
 
 use base64::Engine;
 use serde_json::Value;
@@ -39,6 +40,21 @@ pub(crate) fn base64_text(v: &Value) -> Option<String> {
 /// `text`, unless it is binary: a NUL byte is the test `git` itself uses to call a file binary.
 pub(crate) fn text_only(text: String) -> Option<String> {
     (!text.contains('\0')).then_some(text)
+}
+
+/// A comment's text as an inbox excerpt: whitespace collapsed to single spaces, trimmed, and cut
+/// to ~240 characters (on a char boundary) with an ellipsis. `None` when nothing is left.
+pub(crate) fn comment_excerpt(text: &str) -> Option<String> {
+    const MAX: usize = 240;
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return None;
+    }
+    if collapsed.chars().count() <= MAX {
+        return Some(collapsed);
+    }
+    let cut: String = collapsed.chars().take(MAX).collect();
+    Some(format!("{}…", cut.trim_end()))
 }
 
 #[cfg(test)]

@@ -78,6 +78,16 @@ pub struct TuiPipeRow {
     pub gates: Vec<String>,
 }
 
+/// A notification as the TUI caches it. The dashboard's row adds what the inbox computes from
+/// it (phrase, tier, dismissal key); those are derived on the way out, never stored.
+#[derive(Serialize, Deserialize)]
+pub struct TuiNotifRow {
+    pub connection_id: String,
+    pub connection: String,
+    pub provider: ProviderType,
+    pub notification: forgetop_core::domain::Notification,
+}
+
 /// The TUI's unfiltered pull-request pool, from which it derives every PR view. Read only: the
 /// dashboard never has the whole account's worth of rows to write it, so it writes the per-view
 /// keys instead. Unknown fields are ignored, defaults cover a pool written by an older build.
@@ -179,10 +189,16 @@ pub fn pipelines(cache: &CacheStore) -> Option<Cached<Vec<PipeRow>>> {
     Some(Cached { value: entry.value.into_iter().map(pipe_row).collect(), fetched_at: entry.fetched_at })
 }
 
+/// Every cached notification as the dashboard lists it — dismissed ones included; the caller
+/// filters (see `lib.rs`), so "done" can still resolve a dismissed row's key.
 pub fn notifications(cache: &CacheStore) -> Option<Cached<Vec<NotifRow>>> {
-    // Same shape on both sides.
-    let entry = cache.get::<Vec<NotifRow>>(KEY_INBOX)?;
-    Some(Cached { value: entry.value, fetched_at: entry.fetched_at })
+    let entry = cache.get::<Vec<TuiNotifRow>>(KEY_INBOX)?;
+    let value = entry
+        .value
+        .into_iter()
+        .map(|r| NotifRow::new(r.connection_id, r.connection, r.provider, r.notification))
+        .collect();
+    Some(Cached { value, fetched_at: entry.fetched_at })
 }
 
 /// The Command Center from the cached lists. Needs both PR slices (the TUI's launchpad keys, or
@@ -253,7 +269,16 @@ pub fn store_pipelines(cache: &CacheStore, rows: &[TuiPipeRow], at: DateTime<Utc
 }
 
 pub fn store_notifications(cache: &CacheStore, rows: &[NotifRow], at: DateTime<Utc>) {
-    cache.put(KEY_INBOX, &rows, at);
+    let tui: Vec<TuiNotifRow> = rows
+        .iter()
+        .map(|r| TuiNotifRow {
+            connection_id: r.connection_id.clone(),
+            connection: r.connection.clone(),
+            provider: r.provider,
+            notification: r.notification.clone(),
+        })
+        .collect();
+    cache.put(KEY_INBOX, &tui, at);
 }
 
 // ---- flushing ----

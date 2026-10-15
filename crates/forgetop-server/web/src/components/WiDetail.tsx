@@ -7,6 +7,7 @@ import { addWiThread, localThread, meAsUser, patchWorkItem } from "../optimistic
 import { Markdown } from "./Markdown";
 import { Avatar, Button, claimPane, GroupHeading, PaneHeader, SlideOver, Timeline, usePaneRegistration } from "./ui";
 import { Icon } from "./icons";
+import { InboxTag, ringedComment, ringsThread, TARGET_BOX, threadHolds, TriageStrip, useInboxTargetComment, type InboxOrigin } from "./TriageStrip";
 
 // ---- opener context ----
 
@@ -20,7 +21,17 @@ interface PendingIntent {
   seq: number;
 }
 
-const WiOpenerCtx = createContext<(ref: WiRef, intent?: WiOpenIntent) => void>(() => {});
+/** Where to land in the pane, for an opener that knows (a notification): a comment to scroll to
+ *  and mark, and — from the inbox — the triage strip's place and moves. */
+export interface WiOpenTarget {
+  commentId?: string;
+  fromInbox?: InboxOrigin;
+}
+
+/** Opens a work item in the pane. True when it opened; false when the open pane's leave guard
+ *  refused and nothing changed (see `PrOpener`). */
+export type WiOpener = (ref: WiRef, intent?: WiOpenIntent, target?: WiOpenTarget) => boolean;
+const WiOpenerCtx = createContext<WiOpener>(() => false);
 export const useWiOpener = () => useContext(WiOpenerCtx);
 /** The work item open in the pane, so a list can mark its row as selected. */
 const WiCurrentCtx = createContext<WiRef | null>(null);
@@ -29,23 +40,27 @@ export const useCurrentWi = () => useContext(WiCurrentCtx);
 export function WiDetailProvider({ children }: { children: ReactNode }) {
   const [ref, setRef] = useState<WiRef | null>(null);
   const [intent, setIntent] = useState<PendingIntent | null>(null);
+  const [target, setTarget] = useState<WiOpenTarget | null>(null);
   const seq = useRef(0);
   const close = useCallback(() => {
     setRef(null);
     setIntent(null);
+    setTarget(null);
   }, []);
   usePaneRegistration("wi", close);
   // One pane at a time: opening a work item closes a PR or run pane (after its guard, if any).
-  const open = useCallback((r: WiRef, kind?: WiOpenIntent) => {
-    if (!claimPane("wi")) return;
+  const open = useCallback<WiOpener>((r, kind, t) => {
+    if (!claimPane("wi")) return false;
     setRef(r);
     setIntent(kind ? { kind, seq: ++seq.current } : null);
+    setTarget(t ?? null);
+    return true;
   }, []);
   return (
     <WiOpenerCtx.Provider value={open}>
       <WiCurrentCtx.Provider value={ref}>
         {children}
-        {ref && <WiDetailPanel wiRef={ref} intent={intent} onClose={close} />}
+        {ref && <WiDetailPanel wiRef={ref} intent={intent} target={target} onClose={close} />}
       </WiCurrentCtx.Provider>
     </WiOpenerCtx.Provider>
   );
@@ -87,7 +102,17 @@ interface Note {
   ok: boolean;
 }
 
-function WiDetailPanel({ wiRef, intent, onClose }: { wiRef: WiRef; intent: PendingIntent | null; onClose: () => void }) {
+function WiDetailPanel({
+  wiRef,
+  intent,
+  target,
+  onClose,
+}: {
+  wiRef: WiRef;
+  intent: PendingIntent | null;
+  target: WiOpenTarget | null;
+  onClose: () => void;
+}) {
   const { data, isLoading, error } = useWiDetail(wiRef);
   const qc = useQueryClient();
   const [busy, setBusy] = useState(false);
@@ -136,48 +161,52 @@ function WiDetailPanel({ wiRef, intent, onClose }: { wiRef: WiRef; intent: Pendi
     }
   };
 
+  const targetComment = useInboxTargetComment(target?.commentId, target?.fromInbox);
   const wi = data?.work_item;
   const color = wi ? wiStateColor(wi.state, wi.state_category) : "var(--fg3)";
 
   const header = (
-    <PaneHeader
-      glyph={wi ? wiStateGlyph(wi.state, wi.state_category) : undefined}
-      color={color}
-      title={wi?.title ?? (isLoading ? "Loading…" : "Work item")}
-      ident={wi?.identifier ?? undefined}
-      actions={wi?.url ? <ExternalIconLink href={wi.url} label="Open in provider" /> : undefined}
-    >
-      {wi && (
-        <>
-          <span className="font-medium" style={{ color }}>
-            {wi.state}
-          </span>
-          {wi.work_item_type && (
-            <>
-              <Sep />
-              <span>{wi.work_item_type}</span>
-            </>
-          )}
-          <Sep />
-          {wi.assignee ? (
-            <span className="inline-flex items-center gap-1.5">
-              <Avatar name={wi.assignee.display_name} size={18} />
-              {wi.assignee.display_name}
+    <>
+      {target?.fromInbox && <TriageStrip origin={target.fromInbox} onClose={onClose} />}
+      <PaneHeader
+        glyph={wi ? wiStateGlyph(wi.state, wi.state_category) : undefined}
+        color={color}
+        title={wi?.title ?? (isLoading ? "Loading…" : "Work item")}
+        ident={wi?.identifier ?? undefined}
+        actions={wi?.url ? <ExternalIconLink href={wi.url} label="Open in provider" /> : undefined}
+      >
+        {wi && (
+          <>
+            <span className="font-medium" style={{ color }}>
+              {wi.state}
             </span>
-          ) : (
-            <span style={{ color: "var(--fg3)" }}>Unassigned</span>
-          )}
-          {wi.parent && (
-            <>
-              <Sep />
-              <span className="truncate" style={{ color: "var(--fg2)" }}>
-                {wi.parent.kind} · {wi.parent.title}
+            {wi.work_item_type && (
+              <>
+                <Sep />
+                <span>{wi.work_item_type}</span>
+              </>
+            )}
+            <Sep />
+            {wi.assignee ? (
+              <span className="inline-flex items-center gap-1.5">
+                <Avatar name={wi.assignee.display_name} size={18} />
+                {wi.assignee.display_name}
               </span>
-            </>
-          )}
-        </>
-      )}
-    </PaneHeader>
+            ) : (
+              <span style={{ color: "var(--fg3)" }}>Unassigned</span>
+            )}
+            {wi.parent && (
+              <>
+                <Sep />
+                <span className="truncate" style={{ color: "var(--fg2)" }}>
+                  {wi.parent.kind} · {wi.parent.title}
+                </span>
+              </>
+            )}
+          </>
+        )}
+      </PaneHeader>
+    </>
   );
 
   const footer = wi ? (
@@ -292,6 +321,7 @@ function WiDetailPanel({ wiRef, intent, onClose }: { wiRef: WiRef; intent: Pendi
             threads={data.threads}
             busy={busy}
             autoFocus={commentFocus}
+            targetCommentId={targetComment}
             onComment={(body) => {
               // Who you are isn't known here, so the placeholder reads "You" until the refetch
               // brings the provider's copy with your name on it.
@@ -470,12 +500,22 @@ function Comments({
   busy,
   autoFocus = 0,
   onComment,
+  targetCommentId = null,
 }: {
   threads: CommentThread[];
   busy: boolean;
   autoFocus?: number;
   onComment: (body: string) => void;
+  /** A comment a notification pointed at: that comment is scrolled into view and marked (or the
+   *  whole thread, when the id is the thread's). */
+  targetCommentId?: string | null;
 }) {
+  // The one element ringed — a thread or a single comment — for scrolling to.
+  const targetBox = useRef<HTMLDivElement>(null);
+  const hasTarget = threads.some((t) => threadHolds(t, targetCommentId));
+  useEffect(() => {
+    if (hasTarget) targetBox.current?.scrollIntoView?.({ block: "center" });
+  }, [hasTarget, targetCommentId]);
   const [draft, setDraft] = useState("");
   const composer = useRef<HTMLTextAreaElement>(null);
   useEffect(() => {
@@ -490,30 +530,48 @@ function Comments({
           No comments yet.
         </div>
       )}
-      {threads.map((t) => (
-        <div
-          key={t.id}
-          className="flex flex-col gap-2 px-3 py-2"
-          style={{ background: "var(--hover)", border: "1px solid var(--border)", borderRadius: 6 }}
-        >
-          {t.comments.map((c) => (
-            <div key={c.id} className="flex flex-col gap-1">
-              <div className="flex items-center gap-2 text-[12.5px]">
-                <Avatar name={c.author.display_name} size={18} />
-                <span className="font-medium" style={{ color: "var(--fg)" }}>
-                  {c.author.display_name}
-                </span>
-                {c.created_at && (
-                  <span className="num ml-auto text-[12px]" style={{ color: "var(--fg3)" }}>
-                    {relativeTime(c.created_at)}
-                  </span>
-                )}
-              </div>
-              <Markdown source={c.body} />
-            </div>
-          ))}
-        </div>
-      ))}
+      {threads.map((t) => {
+        const isTarget = ringsThread(t, targetCommentId);
+        const targetComment = ringedComment(t, targetCommentId);
+        return (
+          <div
+            key={t.id}
+            ref={isTarget ? targetBox : undefined}
+            className="flex flex-col gap-2 px-3 py-2"
+            style={isTarget ? { ...TARGET_BOX, borderRadius: 6 } : { background: "var(--hover)", border: "1px solid var(--border)", borderRadius: 6 }}
+            data-target={isTarget || undefined}
+          >
+            {isTarget && <InboxTag />}
+            {t.comments.map((c) => {
+              const ringed = c.id === targetComment;
+              return (
+                <div
+                  key={c.id}
+                  ref={ringed ? targetBox : undefined}
+                  data-comment-id={c.id}
+                  data-target={ringed || undefined}
+                  className={ringed ? "flex flex-col gap-1 px-2 py-1.5 -mx-2" : "flex flex-col gap-1"}
+                  style={ringed ? { ...TARGET_BOX, borderRadius: 6 } : undefined}
+                >
+                  {ringed && <InboxTag />}
+                  <div className="flex items-center gap-2 text-[12.5px]">
+                    <Avatar name={c.author.display_name} size={18} />
+                    <span className="font-medium" style={{ color: "var(--fg)" }}>
+                      {c.author.display_name}
+                    </span>
+                    {c.created_at && (
+                      <span className="num ml-auto text-[12px]" style={{ color: "var(--fg3)" }}>
+                        {relativeTime(c.created_at)}
+                      </span>
+                    )}
+                  </div>
+                  <Markdown source={c.body} />
+                </div>
+              );
+            })}
+          </div>
+        );
+      })}
       <textarea
         ref={composer}
         value={draft}

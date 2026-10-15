@@ -2,7 +2,7 @@ import { useEffect } from "react";
 import { describe, it, expect } from "vitest";
 import { screen, waitFor, waitForElementToBeRemoved, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { PrDetailProvider, usePrOpener } from "./PrDetail";
+import { PrDetailProvider, usePrOpener, type PrOpenTarget } from "./PrDetail";
 import { renderWithClient, mockFetch } from "../test/util";
 
 function Opener({ conn, id }: { conn: string; id: string }) {
@@ -893,5 +893,118 @@ describe("PrDetail action bar", () => {
     expect(await screen.findByText("Cache the customer risk score")).toBeInTheDocument();
     await userEvent.keyboard("{Escape}");
     expect(screen.queryByText("Cache the customer risk score")).not.toBeInTheDocument();
+  });
+});
+
+function TargetOpener({ target }: { target: PrOpenTarget }) {
+  const open = usePrOpener();
+  useEffect(() => {
+    open({ conn: "c", id: "1450" }, target);
+  }, [open, target]);
+  return null;
+}
+
+describe("PrDetail opened at a notification's target", () => {
+  it("a review request lands on Files", async () => {
+    mockFetch({ get: { "/api/pr/detail": detail("Open") } });
+    renderWithClient(
+      <PrDetailProvider>
+        <TargetOpener target={{ tab: "files" }} />
+      </PrDetailProvider>,
+    );
+    await waitFor(() => expect(screen.getByRole("tab", { name: /Files/ })).toHaveAttribute("aria-selected", "true"));
+  });
+
+  it("a line comment is brought onto Conversation and marked, with its file and line", async () => {
+    const d = detail("Open");
+    const sam = { id: "u", display_name: "Sam", handle: "sam", avatar_url: null };
+    d.threads = [
+      { id: "t9", comments: [{ id: "c9", author: sam, body: "Off by one here?", created_at: null }], file_path: "src/retry.rs", line: 42, is_resolved: false },
+    ];
+    mockFetch({ get: { "/api/pr/detail": d } });
+    renderWithClient(
+      <PrDetailProvider>
+        <TargetOpener target={{ tab: "conversation", commentId: "c9" }} />
+      </PrDetailProvider>,
+    );
+    await screen.findByText("Off by one here?");
+    const marked = document.querySelector("[data-target]") as HTMLElement;
+    expect(marked).toHaveTextContent("Off by one here?");
+    expect(screen.getByText("src/retry.rs:42")).toBeInTheDocument();
+    expect(screen.queryByText("No comments yet.")).not.toBeInTheDocument();
+  });
+
+  it("a comment in a thread of several rings that comment only, not its thread", async () => {
+    const d = detail("Open");
+    const sam = { id: "u", display_name: "Sam", handle: "sam", avatar_url: null };
+    // GitHub keeps every conversation comment in one thread.
+    d.threads = [
+      {
+        id: "pr-1450",
+        comments: [
+          { id: "c1", author: sam, body: "First remark", created_at: null },
+          { id: "c2", author: sam, body: "@you can we land this?", created_at: null },
+          { id: "c3", author: sam, body: "Third remark", created_at: null },
+        ],
+        file_path: null,
+        line: null,
+        is_resolved: false,
+      },
+    ];
+    mockFetch({ get: { "/api/pr/detail": d } });
+    renderWithClient(
+      <PrDetailProvider>
+        <TargetOpener target={{ tab: "conversation", commentId: "c2" }} />
+      </PrDetailProvider>,
+    );
+    await screen.findByText("@you can we land this?");
+    const marked = document.querySelectorAll("[data-target]");
+    expect(marked).toHaveLength(1);
+    expect(marked[0]).toHaveAttribute("data-comment-id", "c2");
+    expect(marked[0]).toHaveTextContent("@you can we land this?");
+    expect(marked[0]).not.toHaveTextContent("First remark");
+    expect(marked[0]).not.toHaveTextContent("Third remark");
+    expect(within(marked[0] as HTMLElement).getByText("From your inbox")).toBeInTheDocument();
+    expect(screen.getAllByText("From your inbox")).toHaveLength(1);
+  });
+
+  it("a thread's own id rings the whole thread", async () => {
+    const d = detail("Open");
+    const sam = { id: "u", display_name: "Sam", handle: "sam", avatar_url: null };
+    d.threads = [
+      {
+        id: "t5",
+        comments: [
+          { id: "c1", author: sam, body: "First remark", created_at: null },
+          { id: "c2", author: sam, body: "Second remark", created_at: null },
+        ],
+        file_path: null,
+        line: null,
+        is_resolved: false,
+      },
+    ];
+    mockFetch({ get: { "/api/pr/detail": d } });
+    renderWithClient(
+      <PrDetailProvider>
+        <TargetOpener target={{ tab: "conversation", commentId: "t5" }} />
+      </PrDetailProvider>,
+    );
+    await screen.findByText("Second remark");
+    const marked = document.querySelectorAll("[data-target]");
+    expect(marked).toHaveLength(1);
+    expect(marked[0]).not.toHaveAttribute("data-comment-id");
+    expect(marked[0]).toHaveTextContent("First remark");
+    expect(marked[0]).toHaveTextContent("Second remark");
+  });
+
+  it("an id the PR doesn't hold marks nothing", async () => {
+    mockFetch({ get: { "/api/pr/detail": detail("Open") } });
+    renderWithClient(
+      <PrDetailProvider>
+        <TargetOpener target={{ tab: "conversation", commentId: "gone" }} />
+      </PrDetailProvider>,
+    );
+    expect(await screen.findByText("No comments yet.")).toBeInTheDocument();
+    expect(document.querySelector("[data-target]")).toBeNull();
   });
 });

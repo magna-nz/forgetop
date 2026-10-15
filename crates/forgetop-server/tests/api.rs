@@ -927,3 +927,173 @@ async fn prefs_reflect_the_hidden_work_item_states() {
     post("Done", false).await.unwrap();
     assert_eq!(prefs().await["hidden_work_item_states"], serde_json::json!(["Closed"]), "showing one keeps the other hidden");
 }
+
+/// A tiny client for the inbox tests: token on every call, JSON both ways.
+struct Inbox {
+    base: String,
+    tok: String,
+    client: reqwest::Client,
+}
+
+impl Inbox {
+    async fn start(deps: Deps) -> Inbox {
+        let server = spawn(deps, 0).await.expect("server binds");
+        Inbox { base: format!("http://127.0.0.1:{}", server.port), tok: server.token, client: reqwest::Client::new() }
+    }
+    async fn get(&self, path: &str) -> serde_json::Value {
+        let r = self.client.get(format!("{}{path}", self.base)).header("x-forgetop-token", &self.tok).send().await.unwrap();
+        assert_eq!(r.status(), 200, "GET {path}");
+        r.json().await.unwrap()
+    }
+    async fn post(&self, path: &str, body: serde_json::Value) -> reqwest::Response {
+        self.client.post(format!("{}{path}", self.base)).header("x-forgetop-token", &self.tok).json(&body).send().await.unwrap()
+    }
+    /// `(connection, id)` of every row `/api/notifications` serves.
+    async fn notification_ids(&self) -> Vec<(String, String)> {
+        let rows = self.get("/api/notifications").await;
+        rows.as_array().unwrap().iter().map(|r| (r["connection_id"].as_str().unwrap().into(), r["notification"]["id"].as_str().unwrap().into())).collect()
+    }
+}
+
+fn row_id(r: &serde_json::Value) -> (String, String) {
+    (r["connection_id"].as_str().unwrap().into(), r["notification"]["id"].as_str().unwrap().into())
+}
+
+#[tokio::test]
+async fn the_inbox_folds_notifications_into_one_thread_per_item() {
+    let api = Inbox::start(demo_deps(true).await).await;
+    let rows = api.get("/api/notifications").await;
+    let rows = rows.as_array().unwrap();
+    assert!(!rows.is_empty(), "demo has notifications");
+    for r in rows {
+        // The computed fields ride on every row, so the frontend never re-derives them.
+        assert!(r["phrase"].as_str().is_some_and(|p| !p.is_empty() && p != "activity"), "{r}");
+        assert!(r["why"].as_str().is_some_and(|w| !w.is_empty()), "{r}");
+        assert!(["ForYou", "Following", "Hidden"].contains(&r["tier"].as_str().unwrap()), "{r}");
+        let key = r["dismiss_key"].as_str().unwrap();
+        assert!(key.starts_with(&format!("{}:{}:", r["connection_id"].as_str().unwrap(), r["notification"]["id"].as_str().unwrap())), "{key}");
+    }
+
+    let threads = api.get("/api/inbox").await;
+    let threads = threads.as_array().unwrap();
+    assert!(!threads.is_empty());
+    let mut shown = Vec::new();
+    for t in threads {
+        let lead = &t["lead"];
+        assert_ne!(lead["tier"], "Hidden", "a reaction never leads");
+        let item = |r: &serde_json::Value| (r["connection_id"].clone(), r["notification"]["item_type"].clone(), r["notification"]["item_id"].clone());
+        let members: Vec<(String, String)> =
+            t["members"].as_array().unwrap().iter().map(|m| (m["conn"].as_str().unwrap().into(), m["id"].as_str().unwrap().into())).collect();
+        assert!(members.contains(&row_id(lead)), "the lead is a member: {t}");
+        shown.push(row_id(lead));
+        for m in t["more"].as_array().unwrap() {
+            assert_eq!(item(m), item(lead), "every row of a thread is about the same item");
+            assert!(members.contains(&row_id(m)));
+            shown.push(row_id(m));
+        }
+        assert_eq!(t["tier"], lead["tier"]);
+    }
+    // Newest thread first.
+    let latest: Vec<&str> = threads.iter().filter_map(|t| t["latest"].as_str()).collect();
+    assert!(latest.windows(2).all(|w| w[0] >= w[1]), "{latest:?}");
+    // Every visible notification is on exactly one row (as a lead or in `more`).
+    let mut visible: Vec<(String, String)> = rows.iter().filter(|r| r["tier"] != "Hidden").map(row_id).collect();
+    visible.sort();
+    shown.sort();
+    assert_eq!(shown, visible);
+}
+
+#[tokio::test]
+async fn done_dismisses_a_thread_everywhere_and_saves_the_tui_keys() {
+    let deps = demo_deps(true).await;
+    let api = Inbox::start(deps.clone()).await;
+    let rows = api.get("/api/notifications").await;
+    let threads = api.get("/api/inbox").await;
+    let thread = &threads[0];
+    let conn = thread["members"][0]["conn"].as_str().unwrap().to_string();
+    let ids: Vec<String> = thread["members"].as_array().unwrap().iter().map(|m| m["id"].as_str().unwrap().to_string()).collect();
+    let keys: Vec<String> = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["connection_id"] == conn.as_str() && ids.iter().any(|id| r["notification"]["id"] == id.as_str()))
+        .map(|r| r["dismiss_key"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(keys.len(), ids.len(), "every member is a served row");
+
+    let r = api.post("/api/notification/done", serde_json::json!({ "conn": conn, "ids": ids })).await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.json::<serde_json::Value>().await.unwrap(), serde_json::json!({ "ok": true }));
+
+    let after = api.get("/api/inbox").await;
+    assert!(!after.as_array().unwrap().iter().any(|t| t["key"] == thread["key"]), "the thread is gone from /api/inbox");
+    let left = api.notification_ids().await;
+    assert!(!ids.iter().any(|id| left.contains(&(conn.clone(), id.clone()))), "and its rows from /api/notifications");
+    let saved = deps.config.snapshot().ui.dismissed_notifications;
+    for k in &keys {
+        assert!(saved.contains(k), "{k} saved to the list the TUI reads: {saved:?}");
+    }
+
+    // Done again is harmless and saves each key once.
+    assert_eq!(api.post("/api/notification/done", serde_json::json!({ "conn": conn, "ids": ids })).await.status(), 200);
+    assert_eq!(deps.config.snapshot().ui.dismissed_notifications.len(), saved.len());
+
+    // An unknown connection is a 404, and the route sits behind the token.
+    assert_eq!(api.post("/api/notification/done", serde_json::json!({ "conn": "nope", "ids": ["x"] })).await.status(), 404);
+    let bare = api.client.post(format!("{}/api/notification/done", api.base)).json(&serde_json::json!({ "conn": conn, "ids": ids })).send().await.unwrap();
+    assert_eq!(bare.status(), 401);
+}
+
+#[tokio::test]
+async fn a_dismissal_saved_by_the_tui_hides_the_row() {
+    let deps = demo_deps(true).await;
+    let api = Inbox::start(deps.clone()).await;
+    let rows = api.get("/api/notifications").await;
+    let first = &rows[0];
+    let gone = row_id(first);
+    deps.config.set_dismissed_notifications(vec![first["dismiss_key"].as_str().unwrap().to_string()]).await.unwrap();
+
+    assert!(!api.notification_ids().await.contains(&gone), "/api/notifications hides it");
+    let threads = api.get("/api/inbox").await;
+    for t in threads.as_array().unwrap() {
+        assert_ne!(row_id(&t["lead"]), gone);
+        assert!(!t["more"].as_array().unwrap().iter().any(|m| row_id(m) == gone));
+        assert!(!t["members"].as_array().unwrap().iter().any(|m| (m["conn"].as_str().unwrap().to_string(), m["id"].as_str().unwrap().to_string()) == gone));
+    }
+}
+
+#[tokio::test]
+async fn notification_detail_answers_and_fills_the_row() {
+    let api = Inbox::start(demo_deps(true).await).await;
+    let rows = api.get("/api/notifications").await;
+    let rows = rows.as_array().unwrap();
+
+    // Any notification answers with an actor/excerpt object (possibly empty).
+    let (conn, id) = row_id(&rows[0]);
+    let r = api.post("/api/notification/detail", serde_json::json!({ "conn": conn, "id": id })).await;
+    assert_eq!(r.status(), 200);
+    let d: serde_json::Value = r.json().await.unwrap();
+    assert!(d.is_object() && d.get("actor").is_some() && d.get("excerpt").is_some(), "{d}");
+
+    // One whose feed entry left the who and what out gets them from the provider, and from then
+    // on its row carries them — and a phrase that names the actor.
+    if let Some(lazy) = rows.iter().find(|r| r["notification"]["detail_ref"].is_string() && r["notification"]["actor"].is_null()) {
+        let (conn, id) = row_id(lazy);
+        let d: serde_json::Value = api.post("/api/notification/detail", serde_json::json!({ "conn": conn, "id": id })).await.json().await.unwrap();
+        let actor = d["actor"].as_str().expect("the provider names who did it").to_string();
+        let again = api.get("/api/notifications").await;
+        let row = again.as_array().unwrap().iter().find(|r| row_id(r) == (conn.clone(), id.clone())).cloned().unwrap();
+        assert_eq!(row["notification"]["actor"], actor.as_str());
+        if row["notification"]["kind"] == "Mention" {
+            let first = actor.split_whitespace().next().unwrap();
+            assert!(row["phrase"].as_str().unwrap().starts_with(first), "{}", row["phrase"]);
+            // The answer carries the phrase too, so the page can patch its row without a refetch,
+            // and the comment the mention is — which the feed alone couldn't name.
+            assert_eq!(d["phrase"], row["phrase"]);
+            assert_eq!(d["target"]["kind"], "Comment", "{d}");
+            assert_eq!(row["notification"]["target"], d["target"], "the row now opens on that comment");
+        }
+    }
+
+    assert_eq!(api.post("/api/notification/detail", serde_json::json!({ "conn": conn, "id": "no-such" })).await.status(), 404);
+}

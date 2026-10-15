@@ -1,14 +1,17 @@
 import { useIsFetching, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState } from "react";
-import { apiPost, useCacheStatus, useNotifications } from "../api";
-import { notificationMeta, relativeTime, toTime } from "../format";
+import { useCacheStatus, useInbox, useNotificationDetail } from "../api";
+import { notificationMeta, shortAge } from "../format";
 import { useNavigateSection } from "../nav";
-import type { NotifRow, SectionId } from "../types";
-import { markNotificationReadInCache } from "../optimistic";
+import type { InboxThread, SectionId } from "../types";
 import { Icon } from "./icons";
-import { usePrOpener } from "./PrDetail";
+import { useInboxActions } from "./inboxActions";
+import { forYouThreads, unreadIn } from "./Notifications";
+import { quote } from "./TriageStrip";
 import { Button, IconButton, Kbd, StatusGlyph } from "./ui";
-import { useWiOpener } from "./WiDetail";
+
+/** How many threads the bell lists before "Open inbox →". */
+const BELL_MAX = 8;
 
 const TITLES: Record<SectionId, string> = {
   // "Command Center" is the user-facing name for the launchpad section (code keeps `launchpad`).
@@ -44,35 +47,21 @@ export function TopBar({
   const fetching = useIsFetching() > 0;
   const staleAge = useCacheStatus();
   const qc = useQueryClient();
-  const { data: notifications } = useNotifications();
+  const { data: inbox } = useInbox();
   const navigate = useNavigateSection();
-  const openPr = usePrOpener();
-  const openWi = useWiOpener();
+  const actions = useInboxActions();
   const [notificationsOpen, setNotificationsOpen] = useState(false);
   const notificationRef = useRef<HTMLDivElement>(null);
-  const unread = notifications?.filter((r) => r.notification.unread).length ?? 0;
-  // Newest first — the standard notification-bell order.
-  const orderedNotifications = [...(notifications ?? [])].sort((a, b) => toTime(b.notification.updated_at) - toTime(a.notification.updated_at));
+  // The bell is for what asks for you: its badge counts unread For-you threads only, and the
+  // popover lists those threads. What you follow waits on the inbox page.
+  const forYou = forYouThreads(inbox);
+  const unread = unreadIn(inbox ?? [], "ForYou");
+  const followingUnread = unreadIn(inbox ?? [], "Following");
 
-  // Clicking a popup notification opens its item (PR/work-item in-app, else the provider URL),
-  // marks it read, and closes the popup — same behaviour as a row on the Notifications page.
-  const openNotification = (row: NotifRow) => {
-    const n = row.notification;
-    const conn = row.connection_id;
-    if (n.unread) {
-      // Same shared edit the Notifications page uses: the badge drops on the click, and the
-      // invalidation that follows confirms it — or, if the write failed, undoes it.
-      markNotificationReadInCache(qc, conn, n.id);
-      void apiPost("/api/notification/read", { conn, id: n.id }).finally(() => {
-        qc.invalidateQueries({ queryKey: ["notifications"] });
-        qc.invalidateQueries({ queryKey: ["launchpad"] });
-      });
-    }
-    // A notification names the repository its item lives in — that is what lets the inbox open
-    // an item on a connection spanning several repositories.
-    if (n.item_id != null && n.item_type === "PullRequest") openPr({ conn, repo: n.repository, id: n.item_id });
-    else if (n.item_id != null && n.item_type === "WorkItem") openWi({ conn, repo: n.repository, id: n.item_id });
-    else if (n.url) window.open(n.url, "_blank", "noopener,noreferrer");
+  // Clicking a thread opens its item at the target, marks it read, and closes the popover — the
+  // same `open` a row on the Notifications page makes, walking the For-you list.
+  const openThread = (t: InboxThread) => {
+    actions.open(t, forYou);
     setNotificationsOpen(false);
   };
 
@@ -148,62 +137,88 @@ export function TopBar({
               className="absolute right-0 top-full z-30 mt-1.5 w-[360px] overflow-hidden rounded-lg shadow-xl"
               style={{ background: "var(--raised)", border: "1px solid var(--border-strong)" }}
             >
-              <div className="flex items-center h-9 px-3 text-[12px] font-medium" style={{ borderBottom: "1px solid var(--border)", color: "var(--fg2)" }}>
-                Notifications
-                {unread > 0 && (
-                  <span className="num ml-1.5" style={{ color: "var(--fg3)" }}>
-                    {unread} unread
-                  </span>
+              <div className="flex items-center gap-1.5 h-9 px-3 text-[12px] font-medium" style={{ borderBottom: "1px solid var(--border)", color: "var(--fg2)" }}>
+                For you
+                <span className="num font-normal" style={{ color: "var(--fg3)" }}>
+                  {unread}
+                </span>
+                {forYou.length > 0 && (
+                  <Button quiet sm className="ml-auto -mr-1.5" onClick={() => void actions.doneAll(forYou)} title="Mark every For-you thread done">
+                    Mark all done
+                  </Button>
                 )}
               </div>
-              <div className="max-h-80 overflow-auto">
-                {orderedNotifications.length === 0 ? (
+              <div className="max-h-96 overflow-auto">
+                {forYou.length === 0 ? (
                   <div className="px-3 py-4 text-[12.5px]" style={{ color: "var(--fg3)" }}>
-                    No notifications
+                    Nothing needs you
                   </div>
                 ) : (
-                  orderedNotifications.map((row) => {
-                    const n = row.notification;
-                    const kind = notificationMeta(n.kind);
-                    return (
-                      <button
-                        key={`${row.connection_id}:${n.id}`}
-                        type="button"
-                        onClick={() => openNotification(row)}
-                        className="flex w-full items-center gap-2.5 px-3 h-10 text-left transition-colors"
-                        style={{ borderBottom: "1px solid var(--border)", cursor: "pointer" }}
-                        onMouseEnter={(e) => (e.currentTarget.style.background = "var(--hover)")}
-                        onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
-                      >
-                        <StatusGlyph glyph={kind.glyph} color={n.unread ? kind.color : "var(--fg3)"} title={kind.label} />
-                        <span className="min-w-0 flex-1 truncate text-[12.5px]" style={{ color: n.unread ? "var(--fg)" : "var(--fg2)", fontWeight: n.unread ? 500 : 400 }}>
-                          {n.title}
-                        </span>
-                        <span className="num shrink-0 text-[12px] whitespace-nowrap" style={{ color: "var(--fg3)" }}>
-                          {relativeTime(n.updated_at)}
-                        </span>
-                      </button>
-                    );
-                  })
+                  forYou.slice(0, BELL_MAX).map((t) => <BellItem key={t.key} thread={t} onOpen={() => openThread(t)} />)
                 )}
               </div>
-              <button
-                type="button"
-                onClick={() => {
-                  navigate("notifications");
-                  setNotificationsOpen(false);
-                }}
-                className="w-full h-9 px-3 text-left text-[12.5px] font-medium transition-colors"
-                style={{ color: "var(--fg2)" }}
-                onMouseEnter={(e) => (e.currentTarget.style.background = "var(--hover)")}
-                onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
-              >
-                More →
-              </button>
+              <div className="flex items-center h-9 px-3 text-[12px]" style={{ color: "var(--fg3)" }}>
+                <span>
+                  Following · <span className="num">{followingUnread}</span> unread
+                </span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    navigate("notifications");
+                    setNotificationsOpen(false);
+                  }}
+                  className="ml-auto h-7 px-2 -mr-2 rounded text-[12.5px] font-medium transition-colors"
+                  style={{ color: "var(--fg2)" }}
+                  onMouseEnter={(e) => (e.currentTarget.style.background = "var(--hover)")}
+                  onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+                >
+                  Open inbox →
+                </button>
+              </div>
             </div>
           )}
         </div>
       </div>
     </header>
+  );
+}
+
+/** One For-you thread in the bell: glyph, title and age; then why it's here, muted. */
+function BellItem({ thread, onOpen }: { thread: InboxThread; onOpen: () => void }) {
+  const lead = thread.lead;
+  const n = lead.notification;
+  const kind = notificationMeta(n.kind);
+  // Never fetched from here (eight rows would be eight calls); a detail the page or a pane
+  // already fetched is used.
+  const detail = useNotificationDetail(lead.connection_id, n.id, false);
+  const actor = n.actor ?? detail.data?.actor ?? null;
+  const excerpt = n.excerpt ?? detail.data?.excerpt ?? null;
+  const said = excerpt ? ` · ${quote(excerpt, 60)}` : actor && !lead.phrase.includes(actor.split(/\s+/)[0]) ? ` · ${actor}` : "";
+  return (
+    <button
+      type="button"
+      onClick={onOpen}
+      className="flex w-full flex-col gap-0.5 px-3 py-2 text-left transition-colors"
+      style={{ borderBottom: "1px solid var(--border)", cursor: "pointer" }}
+      onMouseEnter={(e) => (e.currentTarget.style.background = "var(--hover)")}
+      onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+    >
+      <span className="flex w-full items-center gap-2.5 min-w-0">
+        <StatusGlyph glyph={kind.glyph} color={thread.unread ? kind.color : "var(--fg3)"} title={kind.label} />
+        <span
+          className="min-w-0 flex-1 truncate text-[13px]"
+          style={{ color: thread.unread ? "var(--fg)" : "var(--fg2)", fontWeight: thread.unread ? 600 : 400 }}
+        >
+          {n.title}
+        </span>
+        <span className="num shrink-0 text-[12px] whitespace-nowrap" style={{ color: "var(--fg3)" }}>
+          {shortAge(thread.latest)}
+        </span>
+      </span>
+      <span className="truncate pl-[24px] text-[12px]" style={{ color: "var(--fg3)" }} title={lead.why}>
+        {lead.phrase}
+        {said}
+      </span>
+    </button>
   );
 }

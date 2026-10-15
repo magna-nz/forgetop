@@ -23,7 +23,23 @@ export type NotificationKind =
   | "CiFailed"
   | "Comment"
   | "StateChange"
+  /** A new item appeared somewhere you follow (Linear: created in a team you subscribe to). */
+  | "NewItem"
+  /** Something of yours is due, or a reminder you set fired. */
+  | "Due"
+  /** A reaction to a comment: folded into its thread, never a row of its own. */
+  | "Reaction"
   | "Other";
+/** How much a notification asks of you — the inbox's tabs. `Hidden` (reactions) never leads a row. */
+export type NotificationTier = "ForYou" | "Following" | "Hidden";
+/** Where opening a notification lands inside its item. Mirrors the Rust `NotificationTarget`
+ *  (serde `tag = "kind"`): a comment carries the provider's comment id. */
+export type NotificationTarget =
+  | { kind: "Overview" }
+  | { kind: "Comment"; id: string }
+  | { kind: "Checks" }
+  | { kind: "Diff" }
+  | { kind: "Activity" };
 export type NotificationItemType = "PullRequest" | "WorkItem" | "Pipeline" | "Other";
 
 export interface User {
@@ -193,6 +209,32 @@ export interface Notification {
   url?: string | null;
   unread: boolean;
   updated_at?: string | null;
+  /** The provider's own word for why, verbatim (`team_mention`, `issueCreated`). */
+  reason?: string;
+  /** Who caused it, when the feed says. Absent on the wire when unknown. */
+  actor?: string | null;
+  /** The comment text or the change, when the feed carries it. */
+  excerpt?: string | null;
+  /** Where opening it lands. Older servers omit it: treat as Overview. */
+  target?: NotificationTarget;
+  /** Set when actor/excerpt can be fetched on demand (`POST /api/notification/detail`). */
+  detail_ref?: string | null;
+}
+
+/** The who and what a feed entry left out, fetched on demand. */
+export interface NotificationDetail {
+  actor?: string | null;
+  excerpt?: string | null;
+  /** Where opening should land now that the detail is known (GitHub: a mention's comment, only
+   *  once verified that comment mentions you). Absent = keep the row's own target. */
+  target?: NotificationTarget | null;
+}
+
+/** `POST /api/notification/detail`: the detail, plus the lead row's phrase and why recomputed
+ *  with it filled in ("Priya mentioned you"). */
+export interface NotificationDetailResponse extends NotificationDetail {
+  phrase: string;
+  why: string;
 }
 
 export interface PrRow {
@@ -234,6 +276,35 @@ export interface NotifRow {
   connection: string;
   provider: ProviderType;
   notification: Notification;
+  /** The row's reason in plain words ("Priya mentioned you", "→ In Review"), computed by the
+   *  server from `forgetop_core::inbox` — never re-derived here. */
+  phrase: string;
+  /** Why it reached you ("you were @-mentioned"). */
+  why: string;
+  tier: NotificationTier;
+  /** The key "done" saves (shared with the TUI). */
+  dismiss_key: string;
+}
+
+/** One member of an inbox thread — what "done" and "mark read" send back. */
+export interface InboxMember {
+  conn: string;
+  id: string;
+  unread: boolean;
+}
+
+/** `GET /api/inbox`: one row per item, led by the notification that asks most of you. */
+export interface InboxThread {
+  key: string;
+  tier: NotificationTier;
+  /** Any visible member still unread. */
+  unread: boolean;
+  latest?: string | null;
+  lead: NotifRow;
+  /** The other visible members, newest first (the row's `+N`). */
+  more: NotifRow[];
+  /** Every member, hidden ones included, newest first. */
+  members: InboxMember[];
 }
 
 export interface HealthRow {
