@@ -135,14 +135,13 @@ const rowTitles = () => [...document.querySelectorAll("[data-thread]")].map((r) 
 const rowOf = (title: string) => screen.getByText(title).closest("[data-thread]") as HTMLElement;
 
 describe("Notifications", () => {
-  it("splits the inbox into For you / Following / All, counting unread threads", async () => {
+  it("shows one list of what /api/inbox returns, with no views to switch between", async () => {
     mockFetch({
       get: {
         "/api/inbox": [
           thread(row("a", { title: "Needs your review", item: "1", h: 1 })),
           thread(row("b", { kind: "Mention", unread: false, title: "Read mention", item: "2", h: 2 })),
-          thread(row("c", { kind: "Comment", title: "A comment you follow", item: "3", h: 3 })),
-          thread(row("d", { kind: "StateChange", title: "A state you follow", item: "4", h: 4 })),
+          thread(row("c", { kind: "Assigned", title: "Assigned to you", item: "3", type: "WorkItem", h: 3 })),
         ],
         "/api/connections": [],
       },
@@ -150,18 +149,12 @@ describe("Notifications", () => {
     renderInbox();
 
     expect(await screen.findByText("Needs your review")).toBeInTheDocument();
-    const tab = (name: RegExp) => screen.getByRole("tab", { name });
-    expect(tab(/For you/)).toHaveAttribute("aria-selected", "true");
-    expect(within(tab(/For you/)).getByText("1")).toBeInTheDocument();
-    expect(within(tab(/Following/)).getByText("2")).toBeInTheDocument();
-    expect(within(tab(/All/)).getByText("3")).toBeInTheDocument();
-    // For you: what asks for you, read or not; nothing you merely follow.
-    expect(rowTitles()).toEqual(["Needs your review", "Read mention"]);
-
-    await userEvent.click(tab(/Following/));
-    expect(rowTitles()).toEqual(["A comment you follow", "A state you follow"]);
-    await userEvent.click(tab(/All/));
-    expect(rowTitles()).toHaveLength(4);
+    // Every thread the server sent, read or not, newest first; no tabs.
+    expect(rowTitles()).toEqual(["Needs your review", "Read mention", "Assigned to you"]);
+    expect(screen.queryAllByRole("tab")).toHaveLength(0);
+    expect(screen.queryByText(/Following/)).not.toBeInTheDocument();
+    // A quiet count of what's unread where the tabs were.
+    expect(screen.getByText("2 unread")).toBeInTheDocument();
     // Grouped by day.
     expect(screen.getByText("Today")).toBeInTheDocument();
   });
@@ -305,8 +298,8 @@ describe("Notifications", () => {
     expect(labels).toEqual(["Open", "Open on GitHub", "Copy link", "Mark read", "Done"]);
   });
 
-  it("says so when a view is empty", async () => {
-    mockFetch({ get: { "/api/inbox": [thread(row("c", { kind: "Comment", title: "Followed" }))], "/api/connections": [] } });
+  it("says so when nothing needs you", async () => {
+    mockFetch({ get: { "/api/inbox": [], "/api/connections": [] } });
     renderInbox();
     expect(await screen.findByText("Nothing needs you")).toBeInTheDocument();
   });

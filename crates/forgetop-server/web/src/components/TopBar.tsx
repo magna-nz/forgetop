@@ -1,12 +1,11 @@
 import { useIsFetching, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState } from "react";
 import { useCacheStatus, useInbox, useNotificationDetail } from "../api";
-import { notificationMeta, shortAge } from "../format";
+import { notificationMeta, shortAge, toTime } from "../format";
 import { useNavigateSection } from "../nav";
 import type { InboxThread, SectionId } from "../types";
 import { Icon } from "./icons";
 import { quotable, useInboxActions } from "./inboxActions";
-import { forYouThreads, unreadIn } from "./Notifications";
 import { quote } from "./TriageStrip";
 import { Button, IconButton, Kbd, StatusGlyph } from "./ui";
 
@@ -52,11 +51,10 @@ export function TopBar({
   const actions = useInboxActions();
   const [notificationsOpen, setNotificationsOpen] = useState(false);
   const notificationRef = useRef<HTMLDivElement>(null);
-  // The bell is for what asks for you: its badge counts unread For-you threads only, and the
-  // popover lists those threads. What you follow waits on the inbox page.
-  const forYou = forYouThreads(inbox);
-  const unread = unreadIn(inbox ?? [], "ForYou");
-  const followingUnread = unreadIn(inbox ?? [], "Following");
+  // The inbox is what asks for you: the badge counts its unread threads, and the popover lists
+  // them, read or not, newest first.
+  const forYou = [...(inbox ?? [])].sort((a, b) => toTime(b.latest) - toTime(a.latest));
+  const unread = forYou.filter((t) => t.unread).length;
 
   // Clicking a thread opens its item at the target, marks it read, and closes the popover — the
   // same `open` a row on the Notifications page makes, walking the For-you list.
@@ -143,7 +141,7 @@ export function TopBar({
                   {unread}
                 </span>
                 {forYou.length > 0 && (
-                  <Button quiet sm className="ml-auto -mr-1.5" onClick={() => void actions.doneAll(forYou)} title="Mark every For-you thread done">
+                  <Button quiet sm className="ml-auto -mr-1.5" onClick={() => void actions.doneAll(forYou)} title="Mark every thread here done">
                     Mark all done
                   </Button>
                 )}
@@ -158,9 +156,6 @@ export function TopBar({
                 )}
               </div>
               <div className="flex items-center h-9 px-3 text-[12px]" style={{ color: "var(--fg3)" }}>
-                <span>
-                  Following · <span className="num">{followingUnread}</span> unread
-                </span>
                 <button
                   type="button"
                   onClick={() => {
@@ -183,7 +178,7 @@ export function TopBar({
   );
 }
 
-/** One For-you thread in the bell: glyph, title and age; then why it's here, muted. */
+/** One inbox thread in the bell: glyph, title and age; then why it's here, muted. */
 function BellItem({ thread, onOpen }: { thread: InboxThread; onOpen: () => void }) {
   const lead = thread.lead;
   const n = lead.notification;

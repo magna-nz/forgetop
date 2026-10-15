@@ -992,15 +992,21 @@ async fn the_inbox_folds_notifications_into_one_thread_per_item() {
             shown.push(row_id(m));
         }
         assert_eq!(t["tier"], lead["tier"]);
+        assert_eq!(t["tier"], "ForYou", "the inbox lists only what waits on you: {t}");
     }
     // Newest thread first.
     let latest: Vec<&str> = threads.iter().filter_map(|t| t["latest"].as_str()).collect();
     assert!(latest.windows(2).all(|w| w[0] >= w[1]), "{latest:?}");
-    // Every visible notification is on exactly one row (as a lead or in `more`).
-    let mut visible: Vec<(String, String)> = rows.iter().filter(|r| r["tier"] != "Hidden").map(row_id).collect();
-    visible.sort();
-    shown.sort();
-    assert_eq!(shown, visible);
+    // No notification is on two rows, and every unread one waiting on you is on one.
+    let mut deduped = shown.clone();
+    deduped.sort();
+    deduped.dedup();
+    assert_eq!(deduped.len(), shown.len(), "{shown:?}");
+    for r in rows.iter().filter(|r| r["tier"] == "ForYou" && r["notification"]["unread"] == true) {
+        assert!(shown.contains(&row_id(r)), "{r}");
+    }
+    // And something the demo only follows isn't listed at all.
+    assert!(rows.iter().any(|r| r["tier"] == "Following" && !shown.contains(&row_id(r))));
 }
 
 #[tokio::test]

@@ -41,16 +41,13 @@ const thread = (id: string, kind: NotificationKind, tier: NotificationTier, o: {
 const bar = () => <TopBar section="launchpad" onOpenPalette={() => {}} sidebarOpen onToggleSidebar={() => {}} />;
 
 describe("TopBar bell", () => {
-  it("counts and lists For-you threads only, and says how many Following are unread", async () => {
+  it("counts unread threads and lists every inbox thread, with no Following footer", async () => {
     mockFetch({
       get: {
         "/api/inbox": [
           thread("a", "ReviewRequested", "ForYou"),
           thread("b", "Mention", "ForYou", { phrase: "Priya mentioned you" }),
           thread("r", "Assigned", "ForYou", { unread: false }),
-          thread("f1", "Comment", "Following"),
-          thread("f2", "Comment", "Following"),
-          thread("f3", "StateChange", "Following", { unread: false }),
         ],
       },
     });
@@ -61,18 +58,17 @@ describe("TopBar bell", () => {
     expect(screen.getByText("Title a")).toBeInTheDocument();
     expect(screen.getByText("Title b")).toBeInTheDocument();
     expect(screen.getByText("Title r")).toBeInTheDocument();
-    expect(screen.queryByText("Title f1")).not.toBeInTheDocument();
     // Two lines: the title, then why it's here.
     expect(screen.getByText("Title b").closest("button")).toHaveTextContent("Priya mentioned you");
-    expect(screen.getByText(/Following ·/)).toHaveTextContent("Following · 2 unread");
+    expect(screen.queryByText(/Following/)).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Open inbox →" })).toBeInTheDocument();
   });
 
-  it("marks every For-you thread done in one request per connection", async () => {
+  it("marks every inbox thread done in one request per connection", async () => {
     let answer!: () => void;
     const held = new Promise<void>((r) => (answer = r));
     const { posts } = mockFetch({
-      get: { "/api/inbox": [thread("a", "ReviewRequested", "ForYou"), thread("b", "Mention", "ForYou"), thread("f", "Comment", "Following")] },
+      get: { "/api/inbox": [thread("a", "ReviewRequested", "ForYou"), thread("b", "Mention", "ForYou")] },
       // Held, so the screen is looked at before the refetch that follows the answer.
       onPost: () => held.then(() => ({ ok: true })),
     });

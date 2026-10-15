@@ -59,8 +59,8 @@ pub fn dismiss_key(conn: &str, n: &Notification) -> String {
 /// Folds `rows` (each a connection id and its notification) into threads, newest first.
 ///
 /// A thread's lead is its unread member that asks most of you (by [`NotificationKind::rank`]),
-/// newest on a tie; once everything is read, its newest member leads. A thread made only of
-/// hidden notifications (reactions) is left out.
+/// newest on a tie; once everything is read, the member that asked most. Its tier is For you
+/// when any member is. A thread made only of hidden notifications (reactions) is left out.
 pub fn threads(rows: &[(&str, &Notification)]) -> Vec<InboxThread> {
     let mut order: Vec<String> = Vec::new();
     let mut groups: std::collections::HashMap<String, Vec<usize>> = std::collections::HashMap::new();
@@ -83,18 +83,23 @@ pub fn threads(rows: &[(&str, &Notification)]) -> Vec<InboxThread> {
             let visible: Vec<usize> =
                 members.iter().copied().filter(|&i| rows[i].1.kind.tier() != NotificationTier::Hidden).collect();
             // While anything is unread, the unread member that asks most of you leads (newest on
-            // a tie: `min_by_key` keeps the first). Once all of it is read, the newest leads —
-            // what last happened — so reading a thread never moves it into For you.
+            // a tie: `min_by_key` keeps the first); once all of it is read, the one that asked most.
             let any_unread = visible.iter().any(|&i| rows[i].1.unread);
-            let lead = if any_unread {
-                *visible.iter().filter(|&&i| rows[i].1.unread).min_by_key(|&&i| rows[i].1.kind.rank())?
+            let lead = *visible
+                .iter()
+                .filter(|&&i| !any_unread || rows[i].1.unread)
+                .min_by_key(|&&i| rows[i].1.kind.rank())?;
+            // A thread is for you if anything in it was, read or not — so opening one never
+            // moves it out of the inbox you opened it from, nor reading one into it.
+            let tier = if visible.iter().any(|&i| rows[i].1.kind.tier() == NotificationTier::ForYou) {
+                NotificationTier::ForYou
             } else {
-                *visible.first()?
+                NotificationTier::Following
             };
             Some(InboxThread {
                 key,
                 lead,
-                tier: rows[lead].1.kind.tier(),
+                tier,
                 unread: any_unread,
                 latest: members.iter().filter_map(|&i| rows[i].1.updated_at).max(),
                 members,
@@ -103,6 +108,13 @@ pub fn threads(rows: &[(&str, &Notification)]) -> Vec<InboxThread> {
         .collect();
     out.sort_by_key(|t| std::cmp::Reverse(t.latest));
     out
+}
+
+/// What the inbox shows: the threads waiting on you ([`NotificationTier::ForYou`]), newest
+/// first. A thread you only follow — comments, status moves, new issues where you watch — isn't
+/// listed; the forge's own inbox still has it. Both frontends list exactly these.
+pub fn inbox(rows: &[(&str, &Notification)]) -> Vec<InboxThread> {
+    threads(rows).into_iter().filter(|t| t.tier == NotificationTier::ForYou).collect()
 }
 
 /// The first word of a display name — "Priya" for "Priya Nair". Handles stay whole.
@@ -290,6 +302,19 @@ mod tests {
     }
 
     #[test]
+    fn the_inbox_lists_only_what_waits_on_you() {
+        let ns = [
+            n("1", NotificationKind::Mention, Some("A"), 8, true),
+            n("2", NotificationKind::Comment, Some("B"), 9, true),
+            n("3", NotificationKind::NewItem, Some("C"), 10, true),
+            n("4", NotificationKind::Assigned, Some("D"), 11, false),
+        ];
+        let rows: Vec<(&str, &Notification)> = ns.iter().map(|x| ("c", x)).collect();
+        let ids: Vec<&str> = inbox(&rows).iter().map(|t| rows[t.lead].1.id.as_str()).collect();
+        assert_eq!(ids, ["4", "1"], "read or not, only For you; newest first");
+    }
+
+    #[test]
     fn notifications_without_an_item_never_merge() {
         let a = n("1", NotificationKind::Other, None, 8, true);
         let b = n("2", NotificationKind::Other, None, 9, true);
@@ -304,23 +329,24 @@ mod tests {
         ];
         let rows: Vec<(&str, &Notification)> = ns.iter().map(|x| ("c", x)).collect();
         let t = &threads(&rows)[0];
-        assert_eq!(rows[t.lead].1.id, "2");
-        assert_eq!(t.tier, NotificationTier::Following, "the mention was handled; what's left is FYI");
+        assert_eq!(rows[t.lead].1.id, "2", "what's new leads the row");
+        assert_eq!(t.tier, NotificationTier::ForYou, "but it is still the thread that mentioned you");
         assert!(t.unread);
     }
 
+    /// Opening a thread reads all of it; it must still be in the inbox when you come back.
     #[test]
-    fn reading_a_followed_thread_never_moves_it_into_for_you() {
-        // {read mention, unread comment} sits in Following; opening it reads the comment too.
-        let ns = [
-            n("1", NotificationKind::Mention, Some("X"), 8, false),
-            n("2", NotificationKind::Comment, Some("X"), 9, false),
-        ];
+    fn reading_a_thread_never_changes_its_tier() {
+        let mut ns = [n("1", NotificationKind::Mention, Some("X"), 8, true), n("2", NotificationKind::Comment, Some("X"), 9, true)];
+        let tier_of = |ns: &[Notification]| {
+            let rows: Vec<(&str, &Notification)> = ns.iter().map(|x| ("c", x)).collect();
+            threads(&rows)[0].tier
+        };
+        assert_eq!(tier_of(&ns), NotificationTier::ForYou);
+        ns.iter_mut().for_each(|x| x.unread = false);
+        assert_eq!(tier_of(&ns), NotificationTier::ForYou);
         let rows: Vec<(&str, &Notification)> = ns.iter().map(|x| ("c", x)).collect();
-        let t = &threads(&rows)[0];
-        assert_eq!(rows[t.lead].1.id, "2", "the newest leads a fully read thread");
-        assert_eq!(t.tier, NotificationTier::Following);
-        assert!(!t.unread);
+        assert_eq!(rows[threads(&rows)[0].lead].1.id, "1", "read, the mention leads again");
     }
 
     #[test]

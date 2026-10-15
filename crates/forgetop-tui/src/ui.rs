@@ -22,7 +22,7 @@ use forgetop_core::runlog;
 use crate::app::{
     dashboard_target, first_failed_node, gate_stage, is_error_line, last_activity, match_ranges, pipe_definition_name,
     pr_life, provider_label, run_secs, waiting_secs, App, ArtifactsPanel, ConfigView, DiffFocus, DiffView, FlatNode, Hit,
-    InboxLanding, InboxView, LogRow, LogView, LpSlot, PipeGroup, PipeHead, PipeLine, PipeRow, PipelineView, PrLife, PrView, RunHistory, Screen,
+    InboxLanding, LogRow, LogView, LpSlot, PipeGroup, PipeHead, PipeLine, PipeRow, PipelineView, PrLife, PrView, RunHistory, Screen,
     WiHead, WiLine, WiView, LOG_SPLIT_MIN_WIDTH, LOG_TREE_WIDTH, PR_TABS, TABS,
 };
 use crate::diff::{cursor_line_label, pending_marks};
@@ -358,6 +358,10 @@ fn render_content(frame: &mut Frame, area: Rect, app: &mut App) {
         && matches!(app.screen, Screen::PrView(_) | Screen::WiView(_) | Screen::Pipeline(_));
     // Unfocused, the split waits for a built preview (the anim tick builds it within a frame):
     // an empty list, or one whose row can't be previewed, keeps the full width.
+    if app.inbox_pane && area.width >= crate::app::PREVIEW_MIN_WIDTH {
+        render_inbox_pane(frame, area, app);
+        return;
+    }
     if app.lp_pane && area.width >= crate::app::PREVIEW_MIN_WIDTH {
         render_launchpad_pane(frame, area, app);
         return;
@@ -372,6 +376,13 @@ fn render_content(frame: &mut Frame, area: Rect, app: &mut App) {
             return;
         }
         Screen::Pipeline(view) => {
+            // A run opened from the inbox has the triage strip over it, like a PR.
+            let mut area = area;
+            if app.inbox_triage() && area.height > 4 {
+                let split = Layout::default().direction(Direction::Vertical).constraints([Constraint::Length(1), Constraint::Min(3)]).split(area);
+                render_triage_strip(frame, split[0], app);
+                area = split[1];
+            }
             render_pipeline(frame, area, &app.theme, view, app.anim);
             return;
         }
@@ -454,6 +465,38 @@ fn render_split(frame: &mut Frame, area: Rect, app: &mut App, focused: bool) {
 /// the width an open PR gets beside a list — a pipeline included, so the pane is the same size
 /// whatever is opened from here. The Command Center stays drawn, dimmed, as what Esc returns to;
 /// it takes no clicks while the pane has the keys.
+/// The inbox with the item opened from it in a pane beside the list: the list keeps the left,
+/// its cursor on that thread; the item — the triage strip over it — takes the rest, and the keys.
+/// Enter there makes the item full-screen; Esc closes the pane.
+fn render_inbox_pane(frame: &mut Frame, area: Rect, app: &mut App) {
+    let pane_w = area.width * 65 / 100;
+    let pane = Rect { x: area.right() - pane_w, width: pane_w, ..area };
+    let rest = Rect { width: area.width - pane_w, ..area };
+
+    HITS_MUTED.with(|m| m.set(true));
+    render_inbox_in(frame, rest, app, false);
+    HITS_MUTED.with(|m| m.set(false));
+
+    frame.render_widget(ratatui::widgets::Clear, pane);
+    let split = Layout::default().direction(Direction::Vertical).constraints([Constraint::Length(1), Constraint::Min(3)]).split(pane);
+    render_triage_strip(frame, split[0], app);
+    let landing = app.inbox_landing.as_ref().filter(|l| l.applies_to(&app.screen));
+    IN_PANE.with(|c| c.set(true));
+    let max = match &app.screen {
+        Screen::PrView(v) => render_pr_view(frame, split[1], &app.theme, v, landing),
+        Screen::WiView(v) => render_wi_view(frame, split[1], &app.theme, v, landing),
+        Screen::Pipeline(v) => {
+            render_pipeline(frame, split[1], &app.theme, v, app.anim);
+            0
+        }
+        _ => 0,
+    };
+    IN_PANE.with(|c| c.set(false));
+    app.detail_scroll_max = max;
+    mark_focus(frame, split[1], &app.theme);
+    mark_idle(frame, rest, &app.theme);
+}
+
 fn render_launchpad_pane(frame: &mut Frame, area: Rect, app: &mut App) {
     let pane_w = area.width * 70 / 100;
     let pane = Rect { x: area.right() - pane_w, width: pane_w, ..area };
@@ -2992,7 +3035,6 @@ fn base_footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
             ("E", "done all"),
             ("x", "read"),
             ("o", "browser"),
-            ("[ ]", "views"),
             ("space", "preview"),
             ("r", "refresh"),
             ("Esc", "back"),
@@ -3187,25 +3229,23 @@ fn inbox_open_hint(n: &Notification) -> String {
     }
 }
 
-/// The inbox panel's title: the three views with their unread counts, the showing one lit, and
-/// the `[ ] views` hint the section lists' view bar carries.
+/// The inbox panel's title: what is waiting on you, and how much of it is unread.
 fn inbox_title(app: &App) -> Line<'static> {
     let theme = &app.theme;
-    let mut spans = vec![Span::styled(" Inbox ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD))];
-    for (view, count) in InboxView::ALL.into_iter().zip(app.inbox_view_counts()) {
-        let style = if view == app.inbox_view {
-            Style::default().fg(theme.bg).bg(theme.accent).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(theme.dim)
-        };
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled(format!(" {} {count} ", view.label()), style));
-    }
-    spans.push(Span::styled("  [ ] views ", Style::default().fg(theme.dim)));
-    Line::from(spans)
+    let unread = app.unread_count();
+    Line::from(vec![
+        Span::styled(" Inbox ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("· {unread} unread waiting on you "), Style::default().fg(theme.dim)),
+    ])
 }
 
 fn render_inbox(frame: &mut Frame, area: Rect, app: &App) {
+    render_inbox_in(frame, area, app, app.inbox_preview_shown());
+}
+
+/// The inbox list in `area`, with its preview when `with_preview` (beside it when wide, under it
+/// when narrow) — without it when an item is open in the pane beside the list.
+fn render_inbox_in(frame: &mut Frame, area: Rect, app: &App, with_preview: bool) {
     let theme = &app.theme;
     let block = Block::default()
         .borders(Borders::ALL)
@@ -3218,11 +3258,7 @@ fn render_inbox(frame: &mut Frame, area: Rect, app: &App) {
         let msg = if app.inbox.is_empty() {
             "No notifications. The inbox aggregates GitHub, GitLab, and Linear."
         } else {
-            match app.inbox_view {
-                InboxView::ForYou => "Nothing is waiting on you. 2 shows what you follow, 3 everything.",
-                InboxView::Following => "Nothing new where you follow. 1 shows what is waiting on you.",
-                InboxView::All => "Nothing left in the inbox.",
-            }
+            "Nothing is waiting on you."
         };
         empty(frame, area, theme, msg, block);
         return;
@@ -3230,7 +3266,7 @@ fn render_inbox(frame: &mut Frame, area: Rect, app: &App) {
     let sel = app.inbox_sel.min(threads.len() - 1);
 
     // Wide, the preview sits beside the list; narrow (when `space` asked for it), under it.
-    let (list_area, preview_area) = if !app.inbox_preview_shown() {
+    let (list_area, preview_area) = if !with_preview {
         (area, None)
     } else if area.width >= crate::app::INBOX_PREVIEW_MIN_WIDTH {
         let w = (area.width * 40 / 100).max(44);
@@ -3441,7 +3477,11 @@ fn render_triage_strip(frame: &mut Frame, area: Rect, app: &App) {
     }
 
     let (next, prev) = if app.triage_brackets_taken() { ("}", "{") } else { ("]", "[") };
-    let keys = [(next, "next"), (prev, "prev"), ("e", "done & next"), ("Esc", "back to inbox")];
+    let mut keys = vec![(next, "next"), (prev, "prev"), ("e", "done & next")];
+    if app.inbox_pane {
+        keys.push(("↵", "full screen"));
+    }
+    keys.push(("Esc", "back to inbox"));
     let mut right: Vec<Span<'static>> = Vec::new();
     for (k, label) in keys {
         right.push(Span::styled(format!(" {k} "), bar.fg(theme.accent).add_modifier(Modifier::BOLD)));
@@ -6210,15 +6250,13 @@ pub(crate) fn help_sections() -> Vec<(&'static str, Vec<(&'static str, &'static 
         (
             "Notification inbox (i)",
             vec![
-                ("[  ]", "Previous / next view: For you (waiting on you) · Following (what you watch) · All"),
-                ("1  2  3", "Jump to For you · Following · All"),
-                ("Enter", "Open the item where the notification points (its comment, Checks, Diff); marks the thread read"),
+                ("Enter", "Open the item in a pane beside the inbox, where the notification points (its comment, Checks, Diff, the run); marks the thread read. Enter again: full screen"),
                 ("e", "Done: mark the thread read and clear it (the dashboard sees it too)"),
                 ("E", "Done with every thread in the view (asks first)"),
                 ("x", "Mark the thread read; it stays listed"),
                 ("A", "Mark every thread in the view read"),
                 ("o", "Open the notification in the browser"),
-                ("Space", "Preview on / off (shown unasked at 120+ columns)"),
+                ("Space", "Preview on / off (beside the list when wide, under it when narrow)"),
                 ("d  D", "Old keys for e / E, kept for now"),
             ],
         ),
@@ -9245,13 +9283,15 @@ mod tests {
             note("f", NotificationKind::Comment, "1500", 3),
         ];
         app.screen = Screen::Inbox;
+        app.inbox_preview = Some(false); // the list alone: the preview repeats the title
         let out = render_to_string(&mut app, 110, 24);
         assert_eq!(out.matches("Cap the retry backoff").count(), 1, "For you lists #1487 once (#1500 is only followed)");
         assert!(out.contains("+2"), "the comment and the state change ride along");
         assert!(out.contains("@ mentioned you"), "led by the mention, in words");
         assert!(out.contains("#1487"), "the item's identifier");
         assert!(out.contains("Today"), "under its day");
-        assert!(out.contains("For you 1") && out.contains("Following 1") && out.contains("All 2"), "the views and their counts");
+        assert!(out.contains("1 unread waiting on you"), "one list, its unread count in the title");
+        assert!(!out.contains("Following"), "no views to switch between");
         assert!(out.contains("Notifications (1)"), "the badge counts threads waiting on you, not events");
     }
 
@@ -9276,20 +9316,20 @@ mod tests {
     }
 
     #[test]
-    fn a_narrow_terminal_hides_the_inbox_preview_until_space_asks_for_it() {
+    fn the_inbox_preview_is_always_up_beside_or_under_the_list_until_space_hides_it() {
         use crate::app::Screen;
         let mut app = App::new("slate");
         app.inbox = vec![note("m", NotificationKind::Mention, "1487", 5)];
         app.screen = Screen::Inbox;
-        assert!(render_to_string(&mut app, 170, 24).contains("why:"), "wide: the preview is up");
-        assert!(!render_to_string(&mut app, 100, 24).contains("why:"), "narrow: the list keeps the width");
-        app.inbox_preview = Some(true);
-        assert!(render_to_string(&mut app, 100, 30).contains("why:"), "space brings it back, under the list");
+        assert!(render_to_string(&mut app, 170, 24).contains("why:"), "wide: beside the list");
+        assert!(render_to_string(&mut app, 100, 30).contains("why:"), "narrow: under the list");
+        app.inbox_preview = Some(false);
+        assert!(!render_to_string(&mut app, 170, 24).contains("why:"), "space hides it");
     }
 
     #[test]
     fn no_inbox_row_reads_activity() {
-        use crate::app::{InboxView, Screen};
+        use crate::app::Screen;
         use NotificationKind::*;
         let mut app = App::new("slate");
         app.inbox = [ReviewRequested, Mention, Assigned, CiFailed, Comment, StateChange, NewItem, Due, Other]
@@ -9297,11 +9337,11 @@ mod tests {
             .enumerate()
             .map(|(i, kind)| note(&i.to_string(), kind, &i.to_string(), i as i64))
             .collect();
-        app.inbox_view = InboxView::All;
         app.screen = Screen::Inbox;
         let out = render_to_string(&mut app, 170, 30);
         assert!(!out.to_lowercase().contains("activity"), "{out}");
-        assert!(out.contains("+ new in") && out.contains("◷ due"));
+        assert!(out.contains("◷ due") && out.contains("review requested"));
+        assert!(!out.contains("+ new in"), "a new issue where you follow isn't listed: {out}");
     }
 
     #[test]

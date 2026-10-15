@@ -6,15 +6,9 @@ import { Icon } from "./icons";
 import { needsDetail, opensInApp, quotable, useInboxActions } from "./inboxActions";
 import { useNotificationRowMenu } from "./rowMenus/notification";
 import { activeInboxKey, isTriageKey, quote, useActiveInboxKey } from "./TriageStrip";
-import { ContextMenu, GroupHeading, IconButton, List, RowMenuButton, Skeleton, StateCard, StatusGlyph, Tabs, useContextMenu } from "./ui";
+import { ContextMenu, GroupHeading, IconButton, List, RowMenuButton, Skeleton, StateCard, StatusGlyph, useContextMenu } from "./ui";
 import { ErrorState } from "./ErrorState";
 import { useListView } from "./ControlBar";
-
-/** The inbox's views: what asks for you, what you follow, or both. */
-export type InboxView = "ForYou" | "Following" | "All";
-
-const inView = (view: InboxView) => (t: InboxThread) => view === "All" || t.tier === view;
-const unreadIn = (threads: InboxThread[], view: InboxView) => threads.filter((t) => t.unread && inView(view)(t)).length;
 
 /** Which day heading a thread sits under, by its newest event. */
 export function dayGroup(iso: string | null | undefined, now = new Date()): "Today" | "Yesterday" | "Earlier" {
@@ -33,23 +27,17 @@ const identOf = (t: InboxThread) => {
   return /^\d+$/.test(id) ? `#${id}` : id;
 };
 
-const EMPTY: Record<InboxView, { title: string; sub: string }> = {
-  ForYou: { title: "Nothing needs you", sub: "Review requests, mentions, assignments, failures and due dates land here." },
-  Following: { title: "Nothing new where you follow", sub: "Comments, status changes and new items on things you watch land here." },
-  All: { title: "Inbox zero", sub: "Review requests, mentions, and CI failures land here." },
-};
-
+/** The inbox is one list: what asks for you. The server sends nothing else. */
 export function Notifications() {
   const { data, isLoading, error } = useInbox();
-  const [view, setView] = useState<InboxView>("ForYou");
-  const all = data ?? [];
+  const unread = (data ?? []).filter((t) => t.unread).length;
   const actions = useInboxActions();
   const activeKey = useActiveInboxKey();
   const [cursor, setCursor] = useState<string | null>(null);
 
   const { rows, bar } = useListView<InboxThread>({
     storageKey: "notifications",
-    rows: data?.filter(inView(view)),
+    rows: data,
     connId: (t) => t.lead.connection_id,
     connLabel: (t) => t.lead.connection,
     sorts: [
@@ -57,17 +45,12 @@ export function Notifications() {
       { label: "Oldest", cmp: (a, b) => toTime(a.latest) - toTime(b.latest) },
     ],
     views: (
-      <Tabs<InboxView>
-        label="Inbox views"
-        className="-mb-1"
-        value={view}
-        onChange={setView}
-        tabs={[
-          { id: "ForYou", label: "For you", count: unreadIn(all, "ForYou") },
-          { id: "Following", label: "Following", count: unreadIn(all, "Following") },
-          { id: "All", label: "All", count: unreadIn(all, "All") },
-        ]}
-      />
+      <span className="flex items-center gap-1.5 h-8 text-[12px] font-medium" style={{ color: "var(--fg2)" }}>
+        For you
+        <span className="num font-normal" style={{ color: "var(--fg3)" }}>
+          {unread} unread
+        </span>
+      </span>
     ),
   });
 
@@ -117,7 +100,11 @@ export function Notifications() {
     <>
       {bar}
       {rows.length === 0 ? (
-        <StateCard icon={<Icon name="check-circle" size={24} />} title={EMPTY[view].title} sub={EMPTY[view].sub} />
+        <StateCard
+          icon={<Icon name="check-circle" size={24} />}
+          title="Nothing needs you"
+          sub="Review requests, mentions, assignments, failures and due dates land here."
+        />
       ) : (
         <List>
           {groups.map((g) => (
@@ -214,10 +201,3 @@ function ThreadRow({ thread, order, selected, onSelect }: { thread: InboxThread;
     </>
   );
 }
-
-/** For the bell: the threads that ask for you, unread or not, newest first. */
-export const forYouThreads = (threads: InboxThread[] | undefined) =>
-  (threads ?? []).filter((t) => t.tier === "ForYou").sort((a, b) => toTime(b.latest) - toTime(a.latest));
-
-// The bell reads the tab counts the same way the page does.
-export { unreadIn };

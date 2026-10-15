@@ -138,7 +138,8 @@ pub struct InboxThreadRow {
 /// Folds the rows `/api/notifications` serves into the inbox's threads, newest first.
 pub fn inbox_threads(rows: &[NotifRow]) -> Vec<InboxThreadRow> {
     let pairs: Vec<(&str, &Notification)> = rows.iter().map(|r| (r.connection_id.as_str(), &r.notification)).collect();
-    inbox::threads(&pairs)
+    // For you only: what the TUI's inbox lists too.
+    inbox::inbox(&pairs)
         .into_iter()
         .map(|t| InboxThreadRow {
             more: t
