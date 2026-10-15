@@ -9,6 +9,34 @@ Adding a release: one `## <version> — <date>` section, a line per user-visible
 and the pull request each one came from. `git log v<previous>..HEAD --merges` lists the
 candidates.
 
+## 1.12.0 — 2026-10-15
+
+Added
+
+- **An inbox that says why.** Notifications on the same pull request or issue fold into one
+  row, led by the reason that asks most of you, with a `+N` for the rest: Linear's three or four
+  notifications per issue are one line now. Each row says what happened in words ("Priya
+  mentioned you", "→ In Review", "new in Platform", "marked urgent") instead of a generic
+  "activity", and the preview says why it reached you ("you follow Platform"). Views for
+  **For you**, **Following** and **All** (`1` `2` `3` in the terminal, tabs in the dashboard);
+  the unread badge and the bell count only what is waiting on you.
+  ([#248](https://github.com/magna-nz/forgetop/pull/248))
+- **Notifications open where they mean.** A mention or a comment opens on that comment, a CI
+  failure on the failing check, a review request on the diff. From an item opened from the
+  inbox, a triage strip moves to the next or previous notification and marks this one done
+  (`]` `[` `e` in the terminal, `j` `k` `e` in the dashboard pane). On GitHub the comment and
+  who wrote it are read for the row you are on only, never during a refresh.
+  ([#248](https://github.com/magna-nz/forgetop/pull/248))
+- **Done, shared.** `e` (or the ✓) marks a thread read at the forge and clears it from the
+  inbox; a thread done in the dashboard is gone from the terminal UI too, and the other way round.
+  ([#248](https://github.com/magna-nz/forgetop/pull/248))
+
+Changed
+
+- In a work item opened from the inbox, `e` is done & next, so edit is `E` there (`E` edits
+  everywhere else too). `A`, `d` and `D` in the inbox still work, as mark all read, done and
+  done all. ([#248](https://github.com/magna-nz/forgetop/pull/248))
+
 ## 1.11.0 — 2026-10-14
 
 Added
