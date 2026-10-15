@@ -927,8 +927,11 @@ pub struct App {
     pub inbox: Vec<NotifRow>,
     /// The selected thread: an index into [`App::inbox_threads`].
     pub inbox_sel: usize,
-    /// The user's `space` choice for the inbox preview; `None` shows it.
+    /// The user's `p` choice for the inbox preview; `None` shows it.
     pub inbox_preview: Option<bool>,
+    /// Inbox threads marked with Space for a bulk dismiss (`b`), by thread key: rows are rebuilt
+    /// on every refresh, so a mark names the thread rather than where it sits.
+    pub inbox_marks: HashSet<String>,
     /// Notification details fetched this session, by (connection, notification id), so a row a
     /// refresh brings back without them gets them again without asking the forge twice.
     inbox_details: HashMap<(String, String), NotificationDetail>,
@@ -3563,6 +3566,7 @@ impl App {
             inbox: Vec::new(),
             inbox_sel: 0,
             inbox_preview: None,
+            inbox_marks: HashSet::new(),
             inbox_details: HashMap::new(),
             inbox_detail_asked: HashSet::new(),
             inbox_detail_wait: None,
@@ -5481,14 +5485,16 @@ impl App {
                         out.push(("Open in browser", c('o')));
                     }
                     out.extend([
-                        ("Done (read, and cleared from the inbox)", c('e')),
-                        ("Done with every thread in this view", c('E')),
+                        ("Dismiss (cleared from the inbox)", c('e')),
+                        ("Dismiss every thread", c('E')),
                         ("Mark read", c('x')),
                         ("Mark every thread in this view read", c('A')),
                     ]);
                 }
                 out.extend([
-                    ("Preview on / off", c(' ')),
+                    ("Select / unselect", c(' ')),
+                    ("Bulk dismiss the selected", c('b')),
+                    ("Preview on / off", c('p')),
                     ("Refresh", c('r')),
                 ]);
             }
@@ -5824,6 +5830,8 @@ impl App {
 
     async fn on_inbox_key(&mut self, key: Key, deps: &AppDeps) {
         match key {
+            // Marks are let go first: Esc backs out one thing at a time, as on the lists.
+            Key::Escape if !self.inbox_marks.is_empty() => self.inbox_marks.clear(),
             Key::Escape => self.screen = Screen::Launchpad,
             Key::Up | Key::Char('k') => self.inbox_move(-1),
             Key::Down | Key::Char('j') => self.inbox_move(1),
@@ -5842,10 +5850,42 @@ impl App {
             Key::Char('A') => self.mark_inbox_view_read(deps).await,
             Key::Char('e' | 'd') => self.done_selected_inbox(deps).await,
             Key::Char('E' | 'D') => self.confirm_done_inbox_view(),
-            Key::Char(' ') => self.inbox_preview = Some(!self.inbox_preview_shown()),
+            // Space marks a thread, as on the section lists; `b` dismisses the marked ones.
+            Key::Char(' ') => self.toggle_inbox_mark(),
+            Key::Char('b') => self.bulk_dismiss_inbox(deps).await,
+            Key::Char('p') => self.inbox_preview = Some(!self.inbox_preview_shown()),
             Key::Char('r') => self.request_reload(deps),
             _ => {}
         }
+    }
+
+    /// The marked threads still in the inbox, in the order shown. Marks on threads that left
+    /// (dismissed elsewhere, or gone from the feed) count for nothing.
+    pub fn marked_inbox_threads(&self) -> Vec<InboxThread> {
+        self.inbox_threads().into_iter().filter(|t| self.inbox_marks.contains(&t.key)).collect()
+    }
+
+    /// Space: marks the thread under the cursor for a bulk dismiss, or lets go of it.
+    fn toggle_inbox_mark(&mut self) {
+        let Some(t) = self.inbox_selected() else { return };
+        let listed: HashSet<String> = self.inbox_threads().into_iter().map(|t| t.key).collect();
+        self.inbox_marks.retain(|k| listed.contains(k));
+        if !self.inbox_marks.remove(&t.key) {
+            self.inbox_marks.insert(t.key);
+        }
+    }
+
+    /// `b`: dismisses every marked thread — the forge's done, and gone from both frontends.
+    async fn bulk_dismiss_inbox(&mut self, deps: &AppDeps) {
+        let threads = self.marked_inbox_threads();
+        self.inbox_marks.clear();
+        if threads.is_empty() {
+            self.toast = Some("Nothing selected — Space marks a notification".into());
+            return;
+        }
+        let n = threads.len();
+        self.toast = Some(format!("Dismissed {n} {}", if n == 1 { "notification" } else { "notifications" }));
+        self.done_inbox_threads(deps, threads).await;
     }
 
     /// The connection and member ids of `t` — what marking it read sends.
@@ -6129,15 +6169,15 @@ impl App {
             self.leave_to_inbox();
             return;
         };
-        self.toast = Some("Done".into());
+        self.toast = Some("Dismissed".into());
         self.done_inbox_threads(deps, vec![t]).await;
         if at < self.inbox_threads().len() {
             self.inbox_sel = at;
             self.open_inbox_selected(deps).await;
         } else {
             self.leave_to_inbox();
-            if self.toast.as_deref() == Some("Done") {
-                self.toast = Some("Done — nothing left in the inbox".into());
+            if self.toast.as_deref() == Some("Dismissed") {
+                self.toast = Some("Dismissed — nothing left in the inbox".into());
             }
         }
     }
@@ -6194,7 +6234,7 @@ impl App {
     /// `e`: done with the selected thread — read at the forge, and gone from the inbox.
     async fn done_selected_inbox(&mut self, deps: &AppDeps) {
         let Some(t) = self.inbox_selected() else { return };
-        self.toast = Some("Done".into());
+        self.toast = Some("Dismissed".into());
         self.done_inbox_threads(deps, vec![t]).await;
     }
 
@@ -6257,15 +6297,15 @@ impl App {
         }
         let noun = if n == 1 { "thread" } else { "threads" };
         self.overlay = Some(Overlay::Confirm {
-            title: "Done with all".into(),
-            message: format!("Mark all {n} {noun} read and clear them from the inbox?"),
+            title: "Dismiss all".into(),
+            message: format!("Dismiss all {n} {noun} from the inbox?"),
             action: Action::InboxDoneAll,
         });
     }
 
     async fn done_inbox_view(&mut self, deps: &AppDeps) {
         let threads = self.inbox_threads();
-        self.toast = Some("All done".into());
+        self.toast = Some("All dismissed".into());
         self.done_inbox_threads(deps, threads).await;
     }
 
@@ -13196,13 +13236,13 @@ async fn done_at_forges(deps: AppDeps, dones: Vec<(String, Vec<String>)>) -> std
         .map_err(|error| inbox_action_error("Couldn't load notification connections", error, DIAG_INBOX_FEEDS))?;
     for (conn, ids) in dones {
         let feed = feeds.iter().find(|feed| feed.connection.connection_id() == conn).ok_or_else(|| {
-            inbox_action_error("Couldn't mark notification done", "notification connection unavailable", DIAG_INBOX_MARK_READ)
+            inbox_action_error("Couldn't dismiss the notification", "notification connection unavailable", DIAG_INBOX_MARK_READ)
         })?;
         for id in ids {
             feed.source
                 .mark_done(&id)
                 .await
-                .map_err(|error| inbox_action_error("Couldn't mark notification done", error, DIAG_INBOX_MARK_READ))?;
+                .map_err(|error| inbox_action_error("Couldn't dismiss the notification", error, DIAG_INBOX_MARK_READ))?;
         }
     }
     Ok(())
@@ -15956,7 +15996,7 @@ mod tests {
         let ids: Vec<&str> = app.inbox.iter().map(|r| r.notification.id.as_str()).collect();
         assert_eq!(ids, ["a", "b"], "the selected row is gone");
         assert_eq!(app.inbox_sel, 1, "the selection stays in range");
-        assert_eq!(app.toast.as_deref(), Some("Done"));
+        assert_eq!(app.toast.as_deref(), Some("Dismissed"));
         assert_eq!(calls.calls(), ["done c"], "done is the forge's done too");
 
         // The next poll returns it again; it must not come back.
@@ -16081,6 +16121,48 @@ mod tests {
         assert!(matches!(app.screen, Screen::Inbox));
     }
 
+    /// Space marks threads as on the section lists, `b` dismisses exactly those, and Esc lets go
+    /// of the marks before it leaves the inbox.
+    #[tokio::test]
+    async fn space_marks_threads_and_b_dismisses_only_the_marked() {
+        let calls = ItemCalls::new();
+        let deps = deps_with_items(calls.clone()).await;
+        let mut app = App::new("slate");
+        app.screen = Screen::Inbox;
+        app.inbox = vec![
+            inbox_note("a", NotificationKind::Mention, "1", 1, true),
+            inbox_note("b", NotificationKind::Assigned, "2", 2, true),
+            inbox_note("c", NotificationKind::ReviewRequested, "3", 3, true),
+        ];
+        app.on_key(Key::Char(' '), &deps).await;
+        app.on_key(Key::Down, &deps).await;
+        app.on_key(Key::Down, &deps).await;
+        app.on_key(Key::Char(' '), &deps).await;
+        assert_eq!(app.marked_inbox_threads().len(), 2, "a and c");
+
+        // Esc lets go of the marks first, and stays on the inbox.
+        app.on_key(Key::Escape, &deps).await;
+        assert!(app.inbox_marks.is_empty() && matches!(app.screen, Screen::Inbox));
+
+        app.inbox_sel = 0;
+        app.on_key(Key::Char(' '), &deps).await;
+        app.on_key(Key::Down, &deps).await;
+        app.on_key(Key::Down, &deps).await;
+        app.on_key(Key::Char(' '), &deps).await;
+        app.on_key(Key::Char('b'), &deps).await;
+        assert_eq!(inbox_ids(&app), ["b"], "only the marked are dismissed");
+        let mut done = calls.calls();
+        done.sort();
+        assert_eq!(done, ["done a", "done c"]);
+        assert_eq!(app.toast.as_deref(), Some("Dismissed 2 notifications"));
+        assert!(app.inbox_marks.is_empty());
+
+        // With nothing marked, `b` says how to mark.
+        app.on_key(Key::Char('b'), &deps).await;
+        assert_eq!(inbox_ids(&app), ["b"]);
+        assert!(app.toast.as_deref().is_some_and(|t| t.contains("Space")));
+    }
+
     /// Opening a thread reads it and nothing more: it stays in the inbox, read, until it's done.
     #[tokio::test]
     async fn an_opened_thread_stays_in_the_inbox_read_until_done() {
@@ -16119,7 +16201,7 @@ mod tests {
         done.sort();
         assert_eq!(done, ["done c", "done m", "done x"], "every member is done at the forge, the reaction too");
         assert_eq!(inbox_ids(&app), ["o"], "the thread is gone");
-        assert_eq!(app.toast.as_deref(), Some("Done"));
+        assert_eq!(app.toast.as_deref(), Some("Dismissed"));
         let saved = deps.config.snapshot().ui.dismissed_notifications;
         assert!(saved.contains(&"gl:9:1".to_string()), "the dashboard's dismissal is kept: {saved:?}");
         for key in &keys {
@@ -16392,7 +16474,7 @@ mod tests {
         app.on_key(Key::Char('e'), &deps).await;
         assert!(app.inbox.is_empty());
         assert!(matches!(app.screen, Screen::Inbox), "nothing left: back to the inbox");
-        assert_eq!(app.toast.as_deref(), Some("Done — nothing left in the inbox"));
+        assert_eq!(app.toast.as_deref(), Some("Dismissed — nothing left in the inbox"));
         assert_eq!(deps.config.snapshot().ui.dismissed_notifications.len(), 2);
         assert!(calls.calls().contains(&"read b".to_string()));
     }

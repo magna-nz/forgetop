@@ -31,9 +31,11 @@ Added
   run, not the repository. On GitHub the comment, who wrote it, and a CI notification's run are
   read for the row you are on only, never during a refresh.
   ([#248](https://github.com/magna-nz/forgetop/pull/248))
-- **Done, shared.** Opening a notification only marks it read: it stays in the inbox, so you
-  can come back to it. `e` (or the ✓) is what clears it — marked done at the forge (GitHub's
-  "mark as done", GitLab's to-do done) and gone from both the dashboard and the terminal UI.
+- **Dismiss, shared.** Opening a notification only marks it read: it stays in the inbox, so you
+  can come back to it. Dismissing is what clears it — `e` (or Dismiss in the dashboard); in the
+  terminal, Space selects notifications and `b` bulk-dismisses them, as on the section lists. A
+  dismissal is marked done at the forge (GitHub's "mark as done", GitLab's to-do done) and is
+  gone from both the dashboard and the terminal UI. The inbox preview toggle is `p`.
   ([#248](https://github.com/magna-nz/forgetop/pull/248))
 
 Changed

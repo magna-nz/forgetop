@@ -75,7 +75,7 @@ describe("TopBar bell", () => {
     renderWithClient(bar());
 
     await userEvent.click(await screen.findByRole("button", { name: /Notifications, 2 unread/ }));
-    await userEvent.click(screen.getByRole("button", { name: "Mark all done" }));
+    await userEvent.click(screen.getByRole("button", { name: "Dismiss all" }));
     expect(screen.queryByText("Title a")).not.toBeInTheDocument();
     await waitFor(() => expect(posts.filter((p) => p.url.includes("/api/notification/done")).map((p) => p.body)).toEqual([{ conn: "c", ids: ["a", "b"] }]));
     expect(within(screen.getByRole("banner")).queryByText("Nothing needs you")).toBeInTheDocument();

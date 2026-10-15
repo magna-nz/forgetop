@@ -150,8 +150,8 @@ export function TriageStrip({ origin, onClose }: { origin: InboxOrigin; onClose:
             Open on {origin.providerLabel}
           </a>
         )}
-        <Button sm icon="check" onClick={done} title="Mark done and open the next (e)">
-          Done <Kbd>e</Kbd>
+        <Button sm icon="check" onClick={done} title="Dismiss and open the next (e)">
+          Dismiss <Kbd>e</Kbd>
         </Button>
       </span>
     </div>

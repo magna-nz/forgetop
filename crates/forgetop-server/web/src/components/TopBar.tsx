@@ -141,8 +141,8 @@ export function TopBar({
                   {unread}
                 </span>
                 {forYou.length > 0 && (
-                  <Button quiet sm className="ml-auto -mr-1.5" onClick={() => void actions.doneAll(forYou)} title="Mark every thread here done">
-                    Mark all done
+                  <Button quiet sm className="ml-auto -mr-1.5" onClick={() => void actions.doneAll(forYou)} title="Dismiss every thread here">
+                    Dismiss all
                   </Button>
                 )}
               </div>

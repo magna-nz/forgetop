@@ -257,7 +257,7 @@ describe("WiDetail", () => {
     expect(within(marked).getByText("From your inbox")).toBeInTheDocument();
     expect(within(pane).getByTestId("triage-strip")).toHaveTextContent("Inbox · 1 of 1");
 
-    await userEvent.click(within(pane).getByRole("button", { name: /Done/ }));
+    await userEvent.click(within(pane).getByRole("button", { name: /Dismiss/ }));
     expect(done).toBe(1);
     await waitFor(() => expect(screen.queryByRole("region", { name: "Work item" })).not.toBeInTheDocument());
   });

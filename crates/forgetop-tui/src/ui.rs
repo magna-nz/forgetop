@@ -2897,6 +2897,8 @@ const SEARCH_KEY: &str = "Ctrl-K";
 /// The footer hint for acting on the rows marked with Space. It gets its own chip colour,
 /// so that a selection being live is hard to miss.
 const BULK_HINT: (&str, &str) = ("b", "bulk action");
+/// The inbox's bulk action, worn like [`BULK_HINT`].
+const BULK_DISMISS_HINT: (&str, &str) = ("b", "bulk dismiss");
 
 /// Context-aware key glossary for the active tab (azdo-style bar along the bottom). Leads with
 /// the Ctrl-K palette ("search anywhere") and the dashboard shortcut (when its server runs),
@@ -3029,16 +3031,21 @@ fn base_footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
         ];
     }
     if matches!(app.screen, Screen::Inbox) {
-        return vec![
+        // With notifications selected, the bulk dismiss leads, in the chip the lists' bulk
+        // action wears.
+        let bulk: &[(&str, &str)] = if app.marked_inbox_threads().is_empty() { &[] } else { &[BULK_DISMISS_HINT] };
+        return bulk.iter().copied().chain([
             ("↵", "open"),
-            ("e", "done"),
-            ("E", "done all"),
+            ("e", "dismiss"),
+            ("E", "dismiss all"),
             ("x", "read"),
             ("o", "browser"),
-            ("space", "preview"),
+            ("space", "select"),
+            ("p", "preview"),
             ("r", "refresh"),
             ("Esc", "back"),
-        ];
+        ])
+        .collect();
     }
     if let Screen::Pipeline(v) = &app.screen {
         if v.artifacts.is_some() {
@@ -3233,10 +3240,15 @@ fn inbox_open_hint(n: &Notification) -> String {
 fn inbox_title(app: &App) -> Line<'static> {
     let theme = &app.theme;
     let unread = app.unread_count();
-    Line::from(vec![
+    let mut spans = vec![
         Span::styled(" Inbox ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD)),
         Span::styled(format!("· {unread} unread waiting on you "), Style::default().fg(theme.dim)),
-    ])
+    ];
+    let marked = app.marked_inbox_threads().len();
+    if marked > 0 {
+        spans.push(Span::styled(format!("· {marked} selected "), Style::default().fg(theme.magenta).add_modifier(Modifier::BOLD)));
+    }
+    Line::from(spans)
 }
 
 fn render_inbox(frame: &mut Frame, area: Rect, app: &App) {
@@ -3303,6 +3315,10 @@ fn render_inbox_in(frame: &mut Frame, area: Rect, app: &App, with_preview: bool)
             Style::default().fg(theme.dim)
         };
         let more = t.more(&rows_ref);
+        // Marked for a bulk dismiss: the list's tint and magenta bar, as on the section lists.
+        let marked = app.inbox_marks.contains(&t.key);
+        let dot = if marked { Span::styled("▌", Style::default().fg(theme.magenta)) } else { dot };
+        let row_style = if marked { Style::default().bg(theme.mark_bg) } else { Style::default() };
         rows.push(Row::new(vec![
             Cell::from(dot),
             Cell::from(Span::styled(truncate(&format!("{glyph} {}", inbox::phrase(n)), INBOX_PHRASE_W), Style::default().fg(color))),
@@ -3310,7 +3326,7 @@ fn render_inbox_in(frame: &mut Frame, area: Rect, app: &App, with_preview: bool)
             Cell::from(Span::styled(if more > 0 { format!("+{more}") } else { String::new() }, Style::default().fg(theme.dim))),
             Cell::from(Span::styled(inbox_ident(n), Style::default().fg(theme.yellow))),
             Cell::from(Span::styled(rel_age(t.latest), Style::default().fg(theme.dim))),
-        ]));
+        ]).style(row_style));
         targets.push(Some(Hit::InboxRow(i)));
     }
 
@@ -3341,7 +3357,7 @@ fn render_inbox_in(frame: &mut Frame, area: Rect, app: &App, with_preview: bool)
             .border_style(Style::default().fg(theme.dim))
             .style(Style::default().bg(theme.bg))
             .title(Span::styled(" Preview ", Style::default().fg(theme.dim)))
-            .title_bottom(Line::from(Span::styled(" space hides ", Style::default().fg(theme.dim))).right_aligned());
+            .title_bottom(Line::from(Span::styled(" p hides ", Style::default().fg(theme.dim))).right_aligned());
         frame.render_widget(Clear, pane);
         frame.render_widget(Paragraph::new(lines).block(block).wrap(Wrap { trim: false }), pane);
     }
@@ -3477,7 +3493,7 @@ fn render_triage_strip(frame: &mut Frame, area: Rect, app: &App) {
     }
 
     let (next, prev) = if app.triage_brackets_taken() { ("}", "{") } else { ("]", "[") };
-    let mut keys = vec![(next, "next"), (prev, "prev"), ("e", "done & next")];
+    let mut keys = vec![(next, "next"), (prev, "prev"), ("e", "dismiss & next")];
     if app.inbox_pane {
         keys.push(("↵", "full screen"));
     }
@@ -3535,7 +3551,7 @@ fn render_footer(frame: &mut Frame, area: Rect, app: &App) {
         && app.wizard.is_none();
     for (key, label) in footer_keys(app) {
         let search = key == SEARCH_KEY;
-        let bulk = (key, label) == BULK_HINT;
+        let bulk = (key, label) == BULK_HINT || (key, label) == BULK_DISMISS_HINT;
         let chip = if bulk {
             theme.magenta
         } else if search || (item_open && is_write_action(key, label)) {
@@ -6251,12 +6267,14 @@ pub(crate) fn help_sections() -> Vec<(&'static str, Vec<(&'static str, &'static 
             "Notification inbox (i)",
             vec![
                 ("Enter", "Open the item in a pane beside the inbox, where the notification points (its comment, Checks, Diff, the run); marks the thread read. Enter again: full screen"),
-                ("e", "Done: mark the thread read and clear it (the dashboard sees it too)"),
-                ("E", "Done with every thread in the view (asks first)"),
+                ("e", "Dismiss: clear the thread from the inbox (the dashboard sees it too)"),
+                ("E", "Dismiss every thread (asks first)"),
                 ("x", "Mark the thread read; it stays listed"),
                 ("A", "Mark every thread in the view read"),
                 ("o", "Open the notification in the browser"),
-                ("Space", "Preview on / off (beside the list when wide, under it when narrow)"),
+                ("Space", "Select the notification (again to let go); Esc lets go of all"),
+                ("b", "Bulk dismiss: every selected notification"),
+                ("p", "Preview on / off (beside the list when wide, under it when narrow)"),
                 ("d  D", "Old keys for e / E, kept for now"),
             ],
         ),
@@ -6264,8 +6282,8 @@ pub(crate) fn help_sections() -> Vec<(&'static str, Vec<(&'static str, &'static 
             "Item opened from the inbox",
             vec![
                 ("]  [", "Open the next / previous thread at its target (on a PR's Diff: }  {)"),
-                ("e", "Done with this thread, on to the next"),
-                ("E (work item)", "Edit — e is done here"),
+                ("e", "Dismiss this thread, on to the next"),
+                ("E (work item)", "Edit — e dismisses here"),
                 ("Esc", "Back to the inbox, on the thread you came from"),
             ],
         ),
@@ -9327,6 +9345,24 @@ mod tests {
         assert!(!render_to_string(&mut app, 170, 24).contains("why:"), "space hides it");
     }
 
+    /// A marked notification wears the lists' mark, the title counts the selection, and the
+    /// footer leads with the bulk dismiss.
+    #[test]
+    fn marked_notifications_show_the_selection_and_the_bulk_dismiss() {
+        use crate::app::Screen;
+        let mut app = App::new("slate");
+        app.inbox = vec![note("m", NotificationKind::Mention, "1", 5), note("r", NotificationKind::ReviewRequested, "2", 9)];
+        app.screen = Screen::Inbox;
+        let out = render_to_string(&mut app, 170, 24);
+        assert!(out.contains("space  select") && out.contains("p  preview") && !out.contains("bulk dismiss"), "{out}");
+        let key = app.inbox_threads()[1].key.clone();
+        app.inbox_marks.insert(key);
+        let out = render_to_string(&mut app, 170, 24);
+        assert!(out.contains("1 selected"), "the title counts it");
+        assert!(out.contains("b  bulk dismiss"), "the footer offers it: {out}");
+        assert!(out.contains("▌"), "the marked row's bar");
+    }
+
     #[test]
     fn no_inbox_row_reads_activity() {
         use crate::app::Screen;
@@ -9363,7 +9399,7 @@ mod tests {
         let rows = render_to_rows(&mut app, 140, 40);
         let strip = rows.iter().find(|r| r.contains(" Inbox ")).expect("the triage strip");
         assert!(strip.contains("1 of 2") && strip.contains("@ Priya mentioned you"), "{strip}");
-        assert!(strip.contains("] next") && strip.contains("[ prev") && strip.contains("e done & next") && strip.contains("Esc back to inbox"));
+        assert!(strip.contains("] next") && strip.contains("[ prev") && strip.contains("e dismiss & next") && strip.contains("Esc back to inbox"));
         let tagged: Vec<&String> = rows.iter().filter(|r| r.contains("◂ from your inbox")).collect();
         assert_eq!(tagged.len(), 1, "one thread is tagged");
         assert!(app.inbox_landing.as_ref().is_some_and(|l| l.row.get().is_some()), "and the frame said where it is");

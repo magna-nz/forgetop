@@ -46,7 +46,7 @@ export function useNotificationRowMenu(): (thread: InboxThread, order: InboxThre
           disabled: thread.unread ? false : "Already read",
           onSelect: () => actions.markRead(thread),
         },
-        { label: "Done", icon: "check-circle", hint: "e", onSelect: () => actions.done(thread) },
+        { label: "Dismiss", icon: "check-circle", hint: "e", onSelect: () => actions.done(thread) },
       ];
     },
     [actions],

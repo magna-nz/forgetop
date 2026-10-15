@@ -252,7 +252,7 @@ describe("Notifications", () => {
     renderInbox();
 
     await screen.findByText("Ping");
-    await userEvent.click(within(rowOf("Ping")).getByRole("button", { name: "Done" }));
+    await userEvent.click(within(rowOf("Ping")).getByRole("button", { name: "Dismiss" }));
     // Gone before the server has answered.
     expect(screen.queryByText("Ping")).not.toBeInTheDocument();
     await waitFor(() => expect(posts.find((p) => p.url.includes("/api/notification/done"))?.body).toEqual({ conn: "c", ids: ["a", "b", "z"] }));
@@ -295,7 +295,7 @@ describe("Notifications", () => {
     fireEvent.contextMenu(rowOf("Ping"));
     const menu = screen.getByRole("menu", { name: "Notification actions" });
     const labels = [...menu.querySelectorAll('[role="menuitem"]')].map((m) => m.querySelector(".ft-menu-label")?.textContent);
-    expect(labels).toEqual(["Open", "Open on GitHub", "Copy link", "Mark read", "Done"]);
+    expect(labels).toEqual(["Open", "Open on GitHub", "Copy link", "Mark read", "Dismiss"]);
   });
 
   it("says so when nothing needs you", async () => {

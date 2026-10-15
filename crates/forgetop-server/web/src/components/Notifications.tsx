@@ -187,8 +187,8 @@ function ThreadRow({ thread, order, selected, onSelect }: { thread: InboxThread;
         </button>
         <IconButton
           icon="check"
-          label="Done"
-          title="Done (e)"
+          label="Dismiss"
+          title="Dismiss (e)"
           onClick={() => void actions.done(thread)}
           className="opacity-0 group-hover:opacity-100 focus-visible:opacity-100 transition-opacity"
         />

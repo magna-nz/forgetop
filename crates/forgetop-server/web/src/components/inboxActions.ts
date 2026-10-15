@@ -96,7 +96,7 @@ export function useInboxActions(): InboxActions {
       try {
         await Promise.all([...byConn].map(([conn, ids]) => apiPost("/api/notification/done", { conn, ids })));
       } catch (e) {
-        notify(`Couldn't mark done: ${errorText(e)}`, { error: true });
+        notify(`Couldn't dismiss: ${errorText(e)}`, { error: true });
       } finally {
         invalidate();
       }
@@ -187,7 +187,7 @@ export function useInboxActions(): InboxActions {
             return "next";
           // Done stands; the move on didn't happen (the pane kept unsaved work, or the next
           // thread has gone), so say so rather than leave a pane that looks like it moved.
-          notify("Marked done — the next thread didn't open");
+          notify("Dismissed — the next thread didn't open");
           return "stayed";
         },
       };
