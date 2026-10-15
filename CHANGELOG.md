@@ -18,14 +18,16 @@ Added
   notifications per issue are one line now. Each row says what happened in words ("Priya
   mentioned you", "→ In Review", "new in Platform", "marked urgent") instead of a generic
   "activity", and the preview says why it reached you ("you follow Platform"). Views for
-  **For you**, **Following** and **All** (`1` `2` `3` in the terminal, tabs in the dashboard);
-  the unread badge and the bell count only what is waiting on you.
+  **For you**, **Following** and **All** (`[` `]` in the terminal, as on the section lists, or
+  `1` `2` `3`; tabs in the dashboard); the unread badge and the bell count only what is waiting
+  on you. A GitHub CI notification says how the run ended: only a failed run asks for you.
   ([#248](https://github.com/magna-nz/forgetop/pull/248))
 - **Notifications open where they mean.** A mention or a comment opens on that comment, a CI
   failure on the failing check, a review request on the diff. From an item opened from the
   inbox, a triage strip moves to the next or previous notification and marks this one done
-  (`]` `[` `e` in the terminal, `j` `k` `e` in the dashboard pane). On GitHub the comment and
-  who wrote it are read for the row you are on only, never during a refresh.
+  (`]` `[` `e` in the terminal, `j` `k` `e` in the dashboard pane). A CI notification opens its
+  run, not the repository. On GitHub the comment, who wrote it, and a CI notification's run are
+  read for the row you are on only, never during a refresh.
   ([#248](https://github.com/magna-nz/forgetop/pull/248))
 - **Done, shared.** `e` (or the ✓) marks a thread read at the forge and clears it from the
   inbox; a thread done in the dashboard is gone from the terminal UI too, and the other way round.

@@ -9,10 +9,11 @@
  */
 import { useQueryClient } from "@tanstack/react-query";
 import { useMemo } from "react";
-import { apiPost, inboxKey, NOTIFICATION_QUERIES } from "../api";
+import { apiPost, inboxKey, NOTIFICATION_QUERIES, notificationDetailKey } from "../api";
 import { providerMeta } from "../format";
-import { markThreadReadInCache, removeThreadFromCache } from "../optimistic";
-import type { InboxThread, Notification, NotifRow } from "../types";
+import { markThreadReadInCache, patchInboxDetailInCache, removeThreadFromCache } from "../optimistic";
+import type { InboxThread, Notification, NotificationDetailResponse, NotifRow } from "../types";
+import { usePipelineOpener } from "./PipelineDetail";
 import { usePrOpener, type PrOpenTarget } from "./PrDetail";
 import type { InboxOrigin } from "./TriageStrip";
 import { notify } from "./ui";
@@ -20,7 +21,11 @@ import { useWiOpener } from "./WiDetail";
 
 /** Whether a notification's item opens in a pane here (a PR or a work item with an id); anything
  *  else opens its provider link. */
-export const opensInApp = (n: Notification) => n.item_id != null && (n.item_type === "PullRequest" || n.item_type === "WorkItem");
+/** A pipeline notification is a run once its detail names one; GitHub's (a check suite) can always
+ *  ask for it. */
+const isRun = (n: Notification) => n.item_type === "Pipeline" && (n.target?.kind === "Run" || !!n.detail_ref);
+export const opensInApp = (n: Notification) =>
+  isRun(n) || (n.item_id != null && (n.item_type === "PullRequest" || n.item_type === "WorkItem"));
 
 /** Where in the PR pane a notification lands. A state change and the item itself open as usual. */
 export function prTarget(n: Notification): Pick<PrOpenTarget, "tab" | "commentId"> {
@@ -37,7 +42,14 @@ export function prTarget(n: Notification): Pick<PrOpenTarget, "tab" | "commentId
 }
 
 /** A lead whose feed entry left the who and what out, and can fetch them. */
-export const needsDetail = (n: Notification) => !!n.detail_ref && !n.actor && !n.excerpt;
+/** Whether a notification's excerpt is something someone wrote, worth quoting beside its phrase.
+ *  A state change's excerpt is the state, and a finished run's its outcome: the phrase says those. */
+export const quotable = (n: Notification) => n.kind !== "StateChange" && !(n.kind === "Other" && n.reason === "ci_activity");
+
+/** Whether the feed left something for `POST /api/notification/detail` to fill: who and what, or
+ *  — for a CI notification — which run it is. */
+export const needsDetail = (n: Notification) =>
+  !!n.detail_ref && ((!n.actor && !n.excerpt) || (n.item_type === "Pipeline" && n.target?.kind !== "Run"));
 
 const errorText = (e: unknown) => (e instanceof Error ? e.message : String(e));
 
@@ -57,6 +69,7 @@ export function useInboxActions(): InboxActions {
   const qc = useQueryClient();
   const openPr = usePrOpener();
   const openWi = useWiOpener();
+  const openPipe = usePipelineOpener();
 
   return useMemo(() => {
     const invalidate = () => NOTIFICATION_QUERIES.forEach((queryKey) => qc.invalidateQueries({ queryKey }));
@@ -104,6 +117,29 @@ export function useInboxActions(): InboxActions {
       );
     }
 
+    /** A CI notification opens its run in the pipeline pane — asking for the run first when the
+     *  feed named only the check suite (GitHub) — or the run's page when no run can be found. */
+    async function openRun(thread: InboxThread) {
+      const conn = thread.lead.connection_id;
+      let n = thread.lead.notification;
+      if (n.target?.kind !== "Run") {
+        try {
+          const detail = await qc.fetchQuery({
+            queryKey: notificationDetailKey(conn, n.id),
+            queryFn: () => apiPost<NotificationDetailResponse>("/api/notification/detail", { conn, id: n.id }),
+            staleTime: Infinity,
+          });
+          patchInboxDetailInCache(qc, conn, n.id, detail);
+          n = { ...n, target: detail.target ?? n.target, url: detail.url ?? n.url };
+        } catch {
+          // No run to name: the link below is what there is.
+        }
+      }
+      void markRead(thread);
+      if (n.target?.kind === "Run") openPipe({ conn, runId: n.target.id, repo: n.repository });
+      else if (n.url) window.open(n.url, "_blank", "noopener,noreferrer");
+    }
+
     function open(given: InboxThread, order: InboxThread[]): boolean {
       // The caller's copy can predate a detail that has since landed in the cache (and moved the
       // target from the item to the comment that mentions you): open the thread as it is now.
@@ -113,6 +149,10 @@ export function useInboxActions(): InboxActions {
       if (!opensInApp(n)) {
         void markRead(thread);
         if (n.url) window.open(n.url, "_blank", "noopener,noreferrer");
+        return true;
+      }
+      if (n.item_type === "Pipeline") {
+        void openRun(thread);
         return true;
       }
       // The pane walks the threads that open in a pane; a link-only one would leave it.
@@ -126,7 +166,7 @@ export function useInboxActions(): InboxActions {
         phrase: lead.phrase,
         why: lead.why,
         actor: n.actor,
-        excerpt: n.excerpt,
+        excerpt: quotable(n) ? n.excerpt : null,
         conn: lead.connection_id,
         notificationId: n.id,
         needsDetail: needsDetail(n),
@@ -163,5 +203,5 @@ export function useInboxActions(): InboxActions {
     }
 
     return { open, markRead, done, doneAll };
-  }, [qc, openPr, openWi]);
+  }, [qc, openPr, openWi, openPipe]);
 }

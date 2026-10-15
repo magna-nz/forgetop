@@ -2992,7 +2992,7 @@ fn base_footer_keys(app: &App) -> Vec<(&'static str, &'static str)> {
             ("E", "done all"),
             ("x", "read"),
             ("o", "browser"),
-            ("1/2/3", "views"),
+            ("[ ]", "views"),
             ("space", "preview"),
             ("r", "refresh"),
             ("Esc", "back"),
@@ -3174,8 +3174,10 @@ fn inbox_open_hint(n: &Notification) -> String {
             NotificationTarget::Comment { .. } => format!("opens the PR{}", at_comment()),
             NotificationTarget::Checks => "opens the PR on its Checks".into(),
             NotificationTarget::Diff => "opens the PR on its Diff".into(),
-            NotificationTarget::Overview | NotificationTarget::Activity => "opens the PR".into(),
+            NotificationTarget::Overview | NotificationTarget::Activity | NotificationTarget::Run { .. } => "opens the PR".into(),
         },
+        // A CI run: named by the target, or one detail call away (GitHub's check suite).
+        (NotificationItemType::Pipeline, _) if matches!(n.target, NotificationTarget::Run { .. }) || n.detail_ref.is_some() => "opens the run".into(),
         (NotificationItemType::WorkItem, true) => match &n.target {
             NotificationTarget::Comment { .. } => format!("opens the work item{}", at_comment()),
             _ => "opens the work item".into(),
@@ -3185,7 +3187,8 @@ fn inbox_open_hint(n: &Notification) -> String {
     }
 }
 
-/// The inbox panel's title: the three views with their thread counts, the showing one lit.
+/// The inbox panel's title: the three views with their unread counts, the showing one lit, and
+/// the `[ ] views` hint the section lists' view bar carries.
 fn inbox_title(app: &App) -> Line<'static> {
     let theme = &app.theme;
     let mut spans = vec![Span::styled(" Inbox ", Style::default().fg(theme.accent).add_modifier(Modifier::BOLD))];
@@ -3198,7 +3201,7 @@ fn inbox_title(app: &App) -> Line<'static> {
         spans.push(Span::raw(" "));
         spans.push(Span::styled(format!(" {} {count} ", view.label()), style));
     }
-    spans.push(Span::styled("  1 2 3 ", Style::default().fg(theme.dim)));
+    spans.push(Span::styled("  [ ] views ", Style::default().fg(theme.dim)));
     Line::from(spans)
 }
 
@@ -3360,8 +3363,10 @@ fn inbox_preview_lines(app: &App, t: &InboxThread, width: usize) -> Vec<Line<'st
     lines.push(Line::from(what));
     lines.push(Line::from(Span::styled(format!("why: {}", inbox::why(n)), dim)));
 
-    // A state change's excerpt is the state, which the phrase already says.
-    if let Some(excerpt) = n.excerpt.as_deref().filter(|e| !e.trim().is_empty() && n.kind != NotificationKind::StateChange) {
+    // Quoted only when it is something someone wrote: a state change's excerpt is the state, and
+    // a finished run's its outcome, which the phrase already says.
+    let said = !matches!(n.kind, NotificationKind::StateChange) && !(n.kind == NotificationKind::Other && n.reason == "ci_activity");
+    if let Some(excerpt) = n.excerpt.as_deref().filter(|e| !e.trim().is_empty() && said) {
         lines.push(Line::from(""));
         let mut quoted: Vec<String> = excerpt.lines().flat_map(|l| wrap_words(l, width.saturating_sub(2).max(8))).collect();
         if quoted.len() > INBOX_EXCERPT_LINES {
@@ -6205,7 +6210,8 @@ pub(crate) fn help_sections() -> Vec<(&'static str, Vec<(&'static str, &'static 
         (
             "Notification inbox (i)",
             vec![
-                ("1  2  3", "For you (waiting on you) · Following (what you watch) · All"),
+                ("[  ]", "Previous / next view: For you (waiting on you) · Following (what you watch) · All"),
+                ("1  2  3", "Jump to For you · Following · All"),
                 ("Enter", "Open the item where the notification points (its comment, Checks, Diff); marks the thread read"),
                 ("e", "Done: mark the thread read and clear it (the dashboard sees it too)"),
                 ("E", "Done with every thread in the view (asks first)"),

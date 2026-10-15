@@ -747,6 +747,7 @@ async fn notification_detail(State(s): State<AppState>, Json(req): Json<NotifDet
         "actor": filled.notification.actor,
         "excerpt": filled.notification.excerpt,
         "target": target,
+        "url": filled.notification.url,
         "phrase": filled.phrase,
         "why": filled.why,
     }))

@@ -198,6 +198,8 @@ pub fn phrase(n: &Notification) -> String {
             Some(a) => format!("{a} reacted"),
             None => "reaction".into(),
         },
+        // A finished workflow run that didn't fail (GitHub `ci_activity`): how it ended.
+        NotificationKind::Other if n.reason == "ci_activity" => format!("CI {}", n.excerpt.as_deref().unwrap_or("finished")),
         NotificationKind::Other => match known_other(&n.reason) {
             Some(p) => p.into(),
             None if n.reason.is_empty() => "update".into(),
@@ -221,6 +223,7 @@ pub fn why(n: &Notification) -> String {
         NotificationKind::NewItem if !n.context.is_empty() => format!("you follow {}", n.context),
         NotificationKind::Other => match n.reason.as_str() {
             "author" => format!("you opened this {noun}"),
+            "ci_activity" => "a run you triggered finished".into(),
             "manual" => format!("you subscribed to this {noun}"),
             "subscribed" if !n.context.is_empty() => format!("you watch {}", n.context),
             _ => format!("you follow this {noun}"),
@@ -327,6 +330,7 @@ mod tests {
             actor: Some("Priya Nair".into()),
             excerpt: Some("ping".into()),
             target: Some(NotificationTarget::Comment { id: "7".into() }),
+            url: None,
         };
         d.fill(&mut m);
         assert_eq!((m.actor.as_deref(), m.excerpt.as_deref()), (Some("Priya Nair"), Some("ping")));
@@ -385,6 +389,10 @@ mod tests {
         assert_eq!(phrase(&o), "member access requested");
         o.reason = String::new();
         assert_eq!(phrase(&o), "update");
+        o.reason = "ci_activity".into();
+        o.excerpt = Some("succeeded".into());
+        assert_eq!(phrase(&o), "CI succeeded");
+        assert_eq!(why(&o), "a run you triggered finished");
     }
 
     #[test]

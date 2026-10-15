@@ -5,6 +5,7 @@ import userEvent from "@testing-library/user-event";
 import { renderWithClient, mockFetch } from "../test/util";
 import { PrDetailProvider } from "./PrDetail";
 import { WiDetailProvider } from "./WiDetail";
+import { PipelineDetailProvider } from "./PipelineDetail";
 import { Notifications, dayGroup } from "./Notifications";
 import { setPaneGuard } from "./ui";
 import { useInboxActions, type InboxActions } from "./inboxActions";
@@ -34,7 +35,7 @@ const row = (
     unread?: boolean;
     title?: string;
     item?: string;
-    type?: "PullRequest" | "WorkItem";
+    type?: "PullRequest" | "WorkItem" | "Pipeline";
     phrase?: string;
     excerpt?: string;
     target?: NotificationTarget;
@@ -121,7 +122,9 @@ function renderInbox() {
   return renderWithClient(
     <PrDetailProvider>
       <WiDetailProvider>
-        <Notifications />
+        <PipelineDetailProvider>
+          <Notifications />
+        </PipelineDetailProvider>
       </WiDetailProvider>
     </PrDetailProvider>,
   );
@@ -454,6 +457,27 @@ describe("Notifications: the detail a feed left out", () => {
     act(() => vi.advanceTimersByTime(300));
     await waitFor(() => expect(pane.querySelectorAll("[data-target]")).toHaveLength(1));
     expect(pane.querySelector("[data-target]")).toHaveAttribute("data-comment-id", "c2");
+  });
+
+  /** GitHub's CI notification names a check suite; the feed's link is the repository. Opening it
+   *  asks for the run and opens that run in the pipeline pane, not the repository page. */
+  it("a CI notification opens its run in the pipeline pane, not the repository", async () => {
+    const opened = vi.spyOn(window, "open").mockImplementation(() => null);
+    const ci = row("ci", { kind: "CiFailed", type: "Pipeline", title: "Release workflow run failed for main branch", detailRef: "r", phrase: "CI failed" });
+    ci.notification.item_id = null;
+    ci.notification.repository = "northwind/payments";
+    const { fetchMock } = mockFetch({
+      get: { "/api/inbox": [thread(ci)], "/api/connections": [] },
+      onPost: (url) =>
+        url.includes("/api/notification/detail")
+          ? { target: { kind: "Run", id: "9001" }, url: "https://example.test/runs/9001", phrase: "CI failed", why: "a check failed on this pipeline" }
+          : { ok: true },
+    });
+    renderInbox();
+    await userEvent.click(await screen.findByText("Release workflow run failed for main branch"));
+    await waitFor(() => expect(fetchMock.mock.calls.some(([u]) => String(u).includes("/api/pipeline/detail") && String(u).includes("9001"))).toBe(true));
+    expect(opened).not.toHaveBeenCalled();
+    opened.mockRestore();
   });
 });
 

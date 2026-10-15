@@ -5,7 +5,7 @@ import { notificationMeta, shortAge } from "../format";
 import { useNavigateSection } from "../nav";
 import type { InboxThread, SectionId } from "../types";
 import { Icon } from "./icons";
-import { useInboxActions } from "./inboxActions";
+import { quotable, useInboxActions } from "./inboxActions";
 import { forYouThreads, unreadIn } from "./Notifications";
 import { quote } from "./TriageStrip";
 import { Button, IconButton, Kbd, StatusGlyph } from "./ui";
@@ -192,7 +192,7 @@ function BellItem({ thread, onOpen }: { thread: InboxThread; onOpen: () => void 
   // already fetched is used.
   const detail = useNotificationDetail(lead.connection_id, n.id, false);
   const actor = n.actor ?? detail.data?.actor ?? null;
-  const excerpt = n.excerpt ?? detail.data?.excerpt ?? null;
+  const excerpt = quotable(n) ? (n.excerpt ?? detail.data?.excerpt ?? null) : null;
   const said = excerpt ? ` · ${quote(excerpt, 60)}` : actor && !lead.phrase.includes(actor.split(/\s+/)[0]) ? ` · ${actor}` : "";
   return (
     <button

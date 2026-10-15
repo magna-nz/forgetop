@@ -3,7 +3,7 @@ import { useInbox, useNotificationDetail } from "../api";
 import { notificationMeta, shortAge, toTime } from "../format";
 import type { InboxThread } from "../types";
 import { Icon } from "./icons";
-import { needsDetail, opensInApp, useInboxActions } from "./inboxActions";
+import { needsDetail, opensInApp, quotable, useInboxActions } from "./inboxActions";
 import { useNotificationRowMenu } from "./rowMenus/notification";
 import { activeInboxKey, isTriageKey, quote, useActiveInboxKey } from "./TriageStrip";
 import { ContextMenu, GroupHeading, IconButton, List, RowMenuButton, Skeleton, StateCard, StatusGlyph, Tabs, useContextMenu } from "./ui";
@@ -148,7 +148,7 @@ function ThreadRow({ thread, order, selected, onSelect }: { thread: InboxThread;
   // The who and what are fetched for the row in hand only — never for every row on a reload.
   const detail = useNotificationDetail(lead.connection_id, n.id, selected && needsDetail(n));
   const actor = n.actor ?? detail.data?.actor ?? null;
-  const excerpt = n.excerpt ?? detail.data?.excerpt ?? null;
+  const excerpt = quotable(n) ? (n.excerpt ?? detail.data?.excerpt ?? null) : null;
   const said = excerpt ? ` · ${quote(excerpt, 60)}` : actor && !lead.phrase.includes(actor.split(/\s+/)[0]) ? ` · ${actor}` : "";
   const ident = identOf(thread);
   const unread = thread.unread;

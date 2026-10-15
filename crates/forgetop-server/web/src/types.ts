@@ -39,7 +39,10 @@ export type NotificationTarget =
   | { kind: "Comment"; id: string }
   | { kind: "Checks" }
   | { kind: "Diff" }
-  | { kind: "Activity" };
+  | { kind: "Activity" }
+  /** A pipeline run by its id: what a GitHub CI notification (a check suite) opens, once its
+   *  detail has named the run. */
+  | { kind: "Run"; id: string };
 export type NotificationItemType = "PullRequest" | "WorkItem" | "Pipeline" | "Other";
 
 export interface User {
@@ -228,6 +231,8 @@ export interface NotificationDetail {
   /** Where opening should land now that the detail is known (GitHub: a mention's comment, only
    *  once verified that comment mentions you). Absent = keep the row's own target. */
   target?: NotificationTarget | null;
+  /** A better web link than the feed's: a CI run's own page where the feed had the repository's. */
+  url?: string | null;
 }
 
 /** `POST /api/notification/detail`: the detail, plus the lead row's phrase and why recomputed

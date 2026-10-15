@@ -2808,6 +2808,12 @@ fn read(mut n: Notification) -> Notification {
 }
 
 /// A notification whose actor and text are fetched on demand by `detail()`, as GitHub's are.
+/// Addressed in the GitHub demo connection's repository, as a CI notification is.
+fn in_repo(mut n: Notification) -> Notification {
+    n.repository = Some("northwind/payments".into());
+    n
+}
+
 fn lazy(mut n: Notification, detail_ref: &str) -> Notification {
     n.detail_ref = Some(detail_ref.into());
     n
@@ -2838,6 +2844,16 @@ fn demo_notifications_for(conn: &str) -> Vec<Notification> {
             ),
             read(why(notif("gh-6", K::StateChange, IT::PullRequest, Some("1450"), "Cache the customer risk score", "northwind/payments", "https://example.test/pr/1450", 30), "state_change", None, None, T::Activity)),
             read(why(notif("gh-7", K::Other, IT::WorkItem, Some("#851"), "Add retry-budget metrics to the sync worker", "northwind/payments", "https://example.test/issue/851", 40), "subscribed", None, None, T::Overview)),
+            // CI: GitHub names only the check suite, and the link is the repository's; the run
+            // (and its page) comes from the detail, like the real `actions/runs?check_suite_id=`.
+            in_repo(lazy(
+                why(notif("gh-8", K::CiFailed, IT::Pipeline, None, "CI workflow run failed for claude/cache-rewrite-7ab2 branch", "northwind/payments", "https://example.test/northwind/payments", 1), "ci_activity", None, None, T::Overview),
+                "demo:ci-r500",
+            )),
+            in_repo(lazy(
+                why(notif("gh-9", K::Other, IT::Pipeline, None, "CI workflow run succeeded for claude/m4-action-palette-shortcut-f096cc branch", "northwind/payments", "https://example.test/northwind/payments", 1), "ci_activity", None, Some("succeeded"), T::Overview),
+                "demo:ci-r499",
+            )),
         ],
         "gitlab" => vec![
             why(notif("gl-1", K::ReviewRequested, IT::PullRequest, Some("318"), "Rotate the KMS signing keys", "platform/infra", "https://example.test/mr/318", 2), "review_requested", Some("Priya Nair"), None, T::Diff),
@@ -2887,13 +2903,22 @@ impl NotificationSource for DemoNotifications {
     /// What GitHub's `latest_comment_url` fetch returns, for the notifications that carry a ref.
     async fn detail(&self, n: &Notification) -> Result<NotificationDetail> {
         demo_latency().await;
+        // A check suite's run, as GitHub's `actions/runs?check_suite_id=` answers it.
+        if let Some(run) = n.detail_ref.as_deref().and_then(|r| r.strip_prefix("demo:ci-")) {
+            return Ok(NotificationDetail {
+                actor: Some("sam".into()),
+                target: Some(NotificationTarget::Run { id: run.into() }),
+                url: Some(format!("https://example.test/northwind/payments/actions/runs/{run}")),
+                ..Default::default()
+            });
+        }
         // Like GitHub, a mention's comment is only named as its target once read.
         let (actor, text, target) = match n.detail_ref.as_deref() {
             Some("demo:gh-4") => ("Priya Nair", KEY_QUESTION, Some(NotificationTarget::Comment { id: "c-key".into() })),
             Some("demo:gh-5") => ("Elena Sokolova", PROMO_NOTE, None),
             _ => return Ok(NotificationDetail::default()),
         };
-        Ok(NotificationDetail { actor: Some(actor.into()), excerpt: Some(text.into()), target })
+        Ok(NotificationDetail { actor: Some(actor.into()), excerpt: Some(text.into()), target, ..Default::default() })
     }
 }
 
@@ -3161,6 +3186,14 @@ mod tests {
             assert!(!ns.is_empty(), "{conn}");
             for n in &ns {
                 assert!(!n.reason.is_empty(), "{} has a raw reason", n.id);
+                // A CI notification names a check suite, not an item: its run comes from the
+                // detail, and must be a run the demo can open.
+                if n.item_type == NotificationItemType::Pipeline {
+                    let d = DemoNotifications { conn: conn.into() }.detail(n).await.unwrap();
+                    let Some(NotificationTarget::Run { id: run }) = d.target else { panic!("{}: resolves to a run", n.id) };
+                    DemoPipe { conn: conn.into() }.get_run(&ItemRef::new(&run)).await.unwrap_or_else(|_| panic!("{}: run {run} exists", n.id));
+                    continue;
+                }
                 let id = n.item_id.clone().expect("every demo notification has an item");
                 let item = ItemRef::new(&id);
                 let threads = match n.item_type {

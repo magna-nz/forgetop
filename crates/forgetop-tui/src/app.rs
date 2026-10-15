@@ -1287,6 +1287,13 @@ pub enum InboxView {
 impl InboxView {
     pub const ALL: [InboxView; 3] = [InboxView::ForYou, InboxView::Following, InboxView::All];
 
+    /// The view `delta` steps along [`InboxView::ALL`], wrapping — what `[` / `]` move to, as
+    /// they move between saved views on the section lists.
+    pub fn step(self, delta: isize) -> InboxView {
+        let at = Self::ALL.iter().position(|v| *v == self).unwrap_or(0) as isize;
+        Self::ALL[(at + delta).rem_euclid(Self::ALL.len() as isize) as usize]
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             InboxView::ForYou => "For you",
@@ -1363,7 +1370,7 @@ fn inbox_target_tab(target: &NotificationTarget) -> usize {
     match target {
         NotificationTarget::Checks => 2,
         NotificationTarget::Diff => 3,
-        NotificationTarget::Overview | NotificationTarget::Comment { .. } | NotificationTarget::Activity => 0,
+        NotificationTarget::Overview | NotificationTarget::Comment { .. } | NotificationTarget::Activity | NotificationTarget::Run { .. } => 0,
     }
 }
 
@@ -5515,6 +5522,8 @@ impl App {
                     ]);
                 }
                 out.extend([
+                    ("Previous view", c('[')),
+                    ("Next view", c(']')),
                     ("For you", c('1')),
                     ("Following", c('2')),
                     ("All notifications", c('3')),
@@ -5888,6 +5897,8 @@ impl App {
             Key::Char('1') => self.set_inbox_view(InboxView::ForYou),
             Key::Char('2') => self.set_inbox_view(InboxView::Following),
             Key::Char('3') => self.set_inbox_view(InboxView::All),
+            Key::Char('[') => self.set_inbox_view(self.inbox_view.step(-1)),
+            Key::Char(']') => self.set_inbox_view(self.inbox_view.step(1)),
             Key::Char(' ') => self.inbox_preview = Some(!self.inbox_preview_shown()),
             Key::Char('r') => self.request_reload(deps),
             _ => {}
@@ -5957,11 +5968,34 @@ impl App {
         self.send_inbox_reads(deps, vec![reads], false).await;
 
         let conn = lead.connection_id.clone();
-        let n = lead.notification;
+        let mut n = lead.notification;
         // A notification names the repository its item lives in, which is what lets the inbox
         // open an item on a connection that spans several of them.
         let item_repo = n.repository.clone();
         match (n.item_type, n.item_id.clone()) {
+            (NotificationItemType::Pipeline, _) => {
+                // GitHub names only the check suite; the run is the detail's to say. Opened before
+                // the preview asked for it, ask now — one call, for this row only.
+                if !matches!(n.target, NotificationTarget::Run { .. }) && n.detail_ref.is_some() {
+                    if let Some(d) = self.inbox_detail_now(&conn, &n, deps).await {
+                        d.fill(&mut n);
+                    }
+                }
+                if let NotificationTarget::Run { id } = &n.target {
+                    let feeds = detail_or_default(deps.sections.pipeline_feeds().await, DIAG_PIPELINE_FEEDS);
+                    if let Some(feed) = feeds.iter().find(|f| f.connection.connection_id() == conn) {
+                        if let Some(run) = detail_or_none(feed.source.get_run(&ItemRef::maybe(item_repo.clone(), id.clone())).await, DIAG_PIPELINE_RUN) {
+                            let provider = feed.connection.provider_type();
+                            let (run_id, definition_id, branch) = (run.id.clone(), run.definition_id.clone(), run.branch.clone());
+                            self.open_pipeline_for(deps, conn, provider, run_id, definition_id, branch, n.title.clone(), run);
+                            // Esc comes back to this thread in the inbox.
+                            self.from_inbox = true;
+                            self.inbox_origin = Some(t.key.clone());
+                            return;
+                        }
+                    }
+                }
+            }
             (NotificationItemType::PullRequest, Some(id)) => {
                 if let Some(src) = self.pr_source_for(&conn, deps).await {
                     match src.get(&ItemRef::maybe(item_repo.clone(), id.clone())).await {
@@ -6286,7 +6320,7 @@ impl App {
             let row = &self.inbox[t.lead];
             let n = &row.notification;
             let key = (row.connection_id.clone(), n.id.clone());
-            (n.detail_ref.is_some() && n.actor.is_none() && n.excerpt.is_none() && !self.inbox_detail_asked.contains(&key)).then_some(key)
+            (n.wants_detail() && !self.inbox_detail_asked.contains(&key)).then_some(key)
         });
         let Some(key) = want else {
             self.inbox_detail_wait = None;
@@ -6346,6 +6380,22 @@ impl App {
         self.inbox_details.insert((conn_id, id), detail);
         self.fill_inbox_details();
         self.seek_inbox_landing(false);
+    }
+
+    /// Fetches `n`'s detail right away — for opening a row whose preview never asked — and files
+    /// it like a background fetch would. `None` when the feed is gone or the forge refused.
+    async fn inbox_detail_now(&mut self, conn: &str, n: &Notification, deps: &AppDeps) -> Option<NotificationDetail> {
+        let key = (conn.to_string(), n.id.clone());
+        if let Some(d) = self.inbox_details.get(&key) {
+            return Some(d.clone());
+        }
+        self.inbox_detail_asked.insert(key.clone());
+        let feeds = deps.sections.notification_feeds().await.ok()?;
+        let feed = feeds.iter().find(|f| f.connection.connection_id() == conn)?;
+        let detail = feed.source.detail(n).await.inspect_err(|_| log_operation_failure(DIAG_INBOX_DETAIL)).ok()?;
+        self.inbox_details.insert(key, detail.clone());
+        self.fill_inbox_details();
+        Some(detail)
     }
 
     /// The thread the open item view came from, as the inbox holds it now.
@@ -16049,6 +16099,25 @@ mod tests {
         assert_eq!((app.inbox_view, app.inbox_threads().len()), (InboxView::ForYou, 2));
     }
 
+    /// `[` / `]` step through the views as they step through saved views on the lists, wrapping.
+    #[tokio::test]
+    async fn brackets_cycle_the_inbox_views_both_ways_and_wrap() {
+        let deps = test_deps();
+        let mut app = App::new("slate");
+        app.screen = Screen::Inbox;
+        app.inbox = vec![inbox_note("a", NotificationKind::Mention, "1", 1, true), inbox_note("b", NotificationKind::Comment, "2", 2, true)];
+        app.inbox_sel = 1;
+        app.on_key(Key::Char(']'), &deps).await;
+        assert_eq!((app.inbox_view, app.inbox_sel), (InboxView::Following, 0), "next, from the top");
+        app.on_key(Key::Char(']'), &deps).await;
+        assert_eq!(app.inbox_view, InboxView::All);
+        app.on_key(Key::Char(']'), &deps).await;
+        assert_eq!(app.inbox_view, InboxView::ForYou, "wraps forward");
+        app.on_key(Key::Char('['), &deps).await;
+        assert_eq!(app.inbox_view, InboxView::All, "wraps back");
+        assert!(matches!(app.screen, Screen::Inbox), "and stays on the inbox");
+    }
+
     #[tokio::test]
     async fn e_marks_every_member_read_and_merges_their_dismissal_keys_into_the_shared_list() {
         let calls = ItemCalls::new();
@@ -16164,6 +16233,7 @@ mod tests {
                 actor: Some("priya".into()),
                 excerpt: Some("@me have a look".into()),
                 target: Some(NotificationTarget::Comment { id: "t2-c".into() }),
+                ..Default::default()
             }),
         );
         assert_eq!(pr_pane(&app).conv_sel, Some(1), "the cursor moves to the mention");
@@ -21689,7 +21759,7 @@ mod tests {
         }
         async fn detail(&self, n: &Notification) -> forgetop_core::Result<NotificationDetail> {
             self.0.log.lock().unwrap().push(format!("detail {}", n.id));
-            Ok(NotificationDetail { actor: Some("Priya Nair".into()), excerpt: Some("Can you look at the retry?".into()), target: None })
+            Ok(NotificationDetail { actor: Some("Priya Nair".into()), excerpt: Some("Can you look at the retry?".into()), ..Default::default() })
         }
     }
 

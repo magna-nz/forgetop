@@ -660,6 +660,19 @@ pub enum NotificationTarget {
     Diff,
     /// The item's activity — a state change.
     Activity,
+    /// A pipeline run, by its run id in the notification's repository: what a CI notification is
+    /// about when the feed names only the check suite (GitHub), learned from the detail.
+    Run { id: String },
+}
+
+impl Notification {
+    /// Whether the feed left something for the lazy detail to fill: who and what, or — for a CI
+    /// notification, which names only a check suite — which run it is.
+    pub fn wants_detail(&self) -> bool {
+        self.detail_ref.is_some()
+            && ((self.actor.is_none() && self.excerpt.is_none())
+                || (self.item_type == NotificationItemType::Pipeline && !matches!(self.target, NotificationTarget::Run { .. })))
+    }
 }
 
 /// The who and what of a notification whose feed entry didn't carry them, fetched on demand
@@ -672,6 +685,10 @@ pub struct NotificationDetail {
     /// once it is confirmed to be the one that mentions you. `None` keeps the feed's target.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<NotificationTarget>,
+    /// A better web link than the feed's — a CI run's own page where the feed only had the
+    /// repository's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
 }
 
 impl NotificationDetail {
@@ -687,6 +704,9 @@ impl NotificationDetail {
         }
         if let (Some(t), NotificationTarget::Overview) = (&self.target, &n.target) {
             n.target = t.clone();
+        }
+        if let Some(u) = &self.url {
+            n.url = Some(u.clone());
         }
     }
 }

@@ -641,6 +641,26 @@ fn latest_comment(url: &str) -> Option<LatestComment> {
     }
 }
 
+/// How a workflow run ended, from a `ci_activity` notification's subject title: "CI workflow run
+/// succeeded for main branch", or the older "Run failed: CI - main (abc123)". Read from the word
+/// after "workflow run", never from anywhere in the title — a branch can be called `fix-failed`.
+/// `None` when the title doesn't say.
+fn ci_outcome(title: &str) -> Option<&'static str> {
+    let t = title.to_ascii_lowercase();
+    let word = match t.split_once("workflow run ") {
+        Some((_, rest)) => rest.split_whitespace().next().unwrap_or_default().to_string(),
+        None => t.split_once(':').map(|(head, _)| head.trim().to_string()).unwrap_or_default(),
+    };
+    Some(match word.trim_start_matches("run ") {
+        "failed" | "failure" => "failed",
+        "timed" => "timed out",
+        "cancelled" | "canceled" => "cancelled",
+        "succeeded" | "success" | "successful" => "succeeded",
+        "skipped" => "skipped",
+        _ => return None,
+    })
+}
+
 /// Map a GitHub notification thread (`GET /notifications`) to a [`Notification`].
 pub fn map_notification(v: &Value) -> Notification {
     let subject = get_obj(v, "subject");
@@ -669,7 +689,21 @@ pub fn map_notification(v: &Value) -> Notification {
         _ => None,
     };
     let reason = get_str(v, "reason").unwrap_or_default();
-    let kind = github_reason_kind(&reason);
+    let title = subject.and_then(|s| get_str(s, "title")).unwrap_or_default();
+    let mut kind = github_reason_kind(&reason);
+    let mut excerpt = None;
+    // `ci_activity` is every workflow run you triggered finishing, not only the failures: only a
+    // failed run asks for you. The rest say how they ended and sit with what you follow. The
+    // run's title says which; on any other subject the title is the item's, so it stays a failure.
+    if reason == "ci_activity" && item_type == NotificationItemType::Pipeline {
+        match ci_outcome(&title) {
+            Some("failed" | "timed out") => {}
+            outcome => {
+                kind = NotificationKind::Other;
+                excerpt = outcome.map(str::to_string);
+            }
+        }
+    }
 
     // A comment id is only worth keeping for the kinds that are about a comment. The id is the
     // REST id, which is exactly what `map_gh_comment` and the GraphQL review threads
@@ -702,6 +736,15 @@ pub fn map_notification(v: &Value) -> Notification {
             }
         }
     }
+    // A CI notification names a check suite, which nothing here opens; the run it belongs to is
+    // one `actions/runs?check_suite_id=` away, asked by `detail()` for the row in hand only.
+    if item_type == NotificationItemType::Pipeline {
+        detail_ref = subject
+            .and_then(|s| get_str(s, "url"))
+            .and_then(|u| u.rsplit_once("/check-suites/").map(|(repo_api, id)| (repo_api.to_string(), id.to_string())))
+            .filter(|(_, id)| !id.is_empty() && id.chars().all(|c| c.is_ascii_digit()))
+            .map(|(repo_api, id)| format!("{repo_api}/actions/runs?check_suite_id={id}"));
+    }
     Notification {
         id: get_str(v, "id").unwrap_or_default(),
         kind,
@@ -709,7 +752,7 @@ pub fn map_notification(v: &Value) -> Notification {
         item_id,
         // `full_name` is already the connection-relative spelling GitHub addresses repos by.
         repository: repo.and_then(|r| get_str(r, "full_name")),
-        title: subject.and_then(|s| get_str(s, "title")).unwrap_or_default(),
+        title,
         context: repo.and_then(|r| get_str(r, "full_name")).unwrap_or_default(),
         url,
         unread: get_bool(v, "unread"),
@@ -717,7 +760,8 @@ pub fn map_notification(v: &Value) -> Notification {
         reason,
         // The feed names no actor; `detail()` reads it off the comment for the selected row.
         actor: None,
-        excerpt: None,
+        // A finished run's outcome; a comment's text comes from `detail()`.
+        excerpt,
         target,
         detail_ref,
     }
@@ -741,13 +785,25 @@ fn mentions_a_team(body: &str) -> bool {
         .any(|w| w.strip_prefix('@').is_some_and(|h| h.contains('/') && !h.starts_with('/')))
 }
 
+/// The run a check suite belongs to, from `GET …/actions/runs?check_suite_id=<id>`: where a CI
+/// notification opens, and its page on GitHub in place of the repository's.
+pub fn map_suite_run_detail(v: &Value) -> NotificationDetail {
+    let Some(run) = get_arr(v, "workflow_runs").first().cloned() else { return NotificationDetail::default() };
+    NotificationDetail {
+        actor: get_obj(&run, "triggering_actor").or_else(|| get_obj(&run, "actor")).and_then(|a| get_str(a, "login")),
+        target: get_i64(&run, "id").map(|id| NotificationTarget::Run { id: id.to_string() }),
+        url: get_str(&run, "html_url"),
+        ..Default::default()
+    }
+}
+
 /// Who wrote a comment and what it said, from `GET …/issues/comments/<id>` or
 /// `…/pulls/comments/<id>` — both carry `user.login` and `body`.
 pub fn map_comment_detail(v: &Value) -> NotificationDetail {
     NotificationDetail {
         actor: get_obj(v, "user").and_then(|u| get_str(u, "login")),
         excerpt: get_str(v, "body").as_deref().and_then(content::comment_excerpt),
-        target: None,
+        ..Default::default()
     }
 }
 
@@ -1254,6 +1310,9 @@ impl NotificationSource for GitHubNotif {
             return Err(Error::Provider("notification detail points outside this connection".into()));
         }
         let v = self.0.get_json(url).await?;
+        if n.item_type == NotificationItemType::Pipeline {
+            return Ok(map_suite_run_detail(&v));
+        }
         let mut detail = map_comment_detail(&v);
         if n.kind == NotificationKind::Mention {
             // The latest comment may be someone's reply after the mention. Say who mentioned you
@@ -2090,7 +2149,7 @@ mod tests {
         // A CI notification on a check-suite maps to a pipeline with no in-app id (browser only).
         let ci: Value = serde_json::from_str(
             r#"{ "id": "9", "unread": true, "reason": "ci_activity",
-                 "subject": { "title": "CI failed", "type": "CheckSuite", "url": "https://api.github.com/repos/acme/pay/check-suites/77" },
+                 "subject": { "title": "CI workflow run failed for main branch", "type": "CheckSuite", "url": "https://api.github.com/repos/acme/pay/check-suites/77" },
                  "repository": { "full_name": "acme/pay", "html_url": "https://github.com/acme/pay" } }"#,
         )
         .unwrap();
@@ -2169,6 +2228,50 @@ mod tests {
         // A review (not a comment) is no comment either.
         let rv = map_notification(&notif_json("comment", "PullRequest", pr, &format!("{pr}/reviews/5")));
         assert_eq!((rv.target, rv.detail_ref), (NotificationTarget::Overview, None));
+    }
+
+    /// A CI notification names a check suite; its run — what opens in-app, and its page — is
+    /// fetched for the row in hand, from the same API host.
+    #[tokio::test]
+    async fn a_check_suite_notification_resolves_to_its_run() {
+        let (forge, pr) = forge_client(&[]);
+        let base = forge.base();
+        let mut v = notif_json("ci_activity", "CheckSuite", &format!("{base}/repos/acme/pay/check-suites/77"), "");
+        v["subject"]["title"] = "Release workflow run succeeded for main branch".into();
+        let n = map_notification(&v);
+        assert_eq!(n.detail_ref.as_deref(), Some(format!("{base}/repos/acme/pay/actions/runs?check_suite_id=77").as_str()));
+        assert_eq!(n.url.as_deref(), Some("https://github.com/acme/pay"), "the feed alone has only the repository");
+
+        forge.route(
+            "/repos/acme/pay/actions/runs",
+            serde_json::json!({ "workflow_runs": [ { "id": 9001, "html_url": "https://github.com/acme/pay/actions/runs/9001",
+                "triggering_actor": { "login": "dan" } } ] }),
+        );
+        let d = GitHubNotif(pr.0.clone()).detail(&n).await.unwrap();
+        assert_eq!(d.target, Some(NotificationTarget::Run { id: "9001".into() }));
+        assert_eq!(d.url.as_deref(), Some("https://github.com/acme/pay/actions/runs/9001"));
+        let mut filled = n.clone();
+        d.fill(&mut filled);
+        assert_eq!(filled.url.as_deref(), Some("https://github.com/acme/pay/actions/runs/9001"), "o now opens the run, not the repo");
+    }
+
+    /// GitHub sends `ci_activity` for every run you triggered: a success is not a failure.
+    #[test]
+    fn ci_activity_is_a_failure_only_when_the_run_failed() {
+        let suite = "https://api.github.com/repos/acme/pay/check-suites/77";
+        let ci = |title: &str| {
+            let mut v = notif_json("ci_activity", "CheckSuite", suite, "");
+            v["subject"]["title"] = title.into();
+            map_notification(&v)
+        };
+        let failed = ci("CI workflow run failed for main branch");
+        assert_eq!((failed.kind, failed.excerpt), (NotificationKind::CiFailed, None));
+        assert_eq!(ci("Run failed: CI - main (abc123)").kind, NotificationKind::CiFailed);
+        let ok = ci("Release workflow run succeeded for fix-failed-retry branch");
+        assert_eq!((ok.kind, ok.excerpt.as_deref()), (NotificationKind::Other, Some("succeeded")), "the branch name is not the outcome");
+        assert_eq!(ci("Integration workflow run cancelled for main branch").excerpt.as_deref(), Some("cancelled"));
+        let unknown = ci("Something else happened");
+        assert_eq!((unknown.kind, unknown.excerpt), (NotificationKind::Other, None), "no claim of failure it can't read");
     }
 
     #[test]

@@ -134,6 +134,7 @@ export function patchInboxDetailInCache(qc: QueryClient, conn: string, id: strin
             actor: n.actor ?? detail.actor ?? n.actor,
             excerpt: n.excerpt ?? detail.excerpt ?? n.excerpt,
             target: retarget ? detail.target! : n.target,
+            url: detail.url ?? n.url,
           },
         },
       };
