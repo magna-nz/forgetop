@@ -1141,6 +1141,14 @@ impl GitHubClient {
         Ok(())
     }
 
+    async fn delete_empty(&self, url: &str) -> Result<()> {
+        let resp = self.http.delete(url).send().await.map_err(prov)?;
+        if !resp.status().is_success() {
+            return Err(Error::Provider(format!("DELETE {url} -> {}", resp.status())));
+        }
+        Ok(())
+    }
+
     async fn put_json(&self, url: &str, body: Value) -> Result<()> {
         let resp = self.http.put(url).json(&body).send().await.map_err(prov)?;
         if !resp.status().is_success() {
@@ -1340,10 +1348,12 @@ source!(GitHubNotif);
 #[async_trait]
 impl NotificationSource for GitHubNotif {
     async fn list(&self) -> Result<Vec<Notification>> {
-        // Account-level, unread only (the inbox surfaces what still needs you). A notification
-        // feed belongs to the account, not to one repository, so this is a single call however
-        // wide the repository scope is — and it stops the inbox going blank when the scope does.
-        let v = self.0.get_json(&format!("{}/notifications?per_page=50", self.0.base)).await?;
+        // Account-level, read ones included (`all=true`): opening a notification marks it read,
+        // and it stays in the inbox until you're done with it. GitHub keeps returning a thread
+        // here after it's marked done too (checked live), so "done" is the frontends' saved
+        // dismissal that hides it. A notification feed belongs to the account, not to one
+        // repository, so this is a single call however wide the repository scope is.
+        let v = self.0.get_json(&format!("{}/notifications?all=true&per_page=50", self.0.base)).await?;
         Ok(v.as_array().unwrap_or(&vec![]).iter().map(map_notification).collect())
     }
     async fn mark_read(&self, id: &str) -> Result<()> {
@@ -1351,6 +1361,11 @@ impl NotificationSource for GitHubNotif {
     }
     async fn mark_all_read(&self) -> Result<()> {
         self.0.put_json(&format!("{}/notifications", self.0.base), json!({ "read": true })).await
+    }
+    /// GitHub's "mark as done", so the thread leaves GitHub's own web inbox as well. The API list
+    /// still returns it; the frontends' saved dismissal is what keeps it out of forgetop's.
+    async fn mark_done(&self, id: &str) -> Result<()> {
+        self.0.delete_empty(&format!("{}/notifications/threads/{id}", self.0.base)).await
     }
     /// One call, for the row being looked at — never from `list()`, so a quiet reload adds none.
     async fn detail(&self, n: &Notification) -> Result<NotificationDetail> {
@@ -2306,6 +2321,23 @@ mod tests {
         assert_eq!(filled.url.as_deref(), Some("https://github.com/acme/pay/actions/runs/9001"), "o now opens the run, not the repo");
     }
 
+    /// Read notifications are listed too (they stay until done), and done is GitHub's own
+    /// mark-as-done — a DELETE of the thread — not another read.
+    #[tokio::test]
+    async fn the_list_keeps_read_threads_and_done_is_mark_as_done() {
+        let (forge, pr) = forge_client(&[]);
+        forge.route("/notifications", serde_json::json!([]));
+        forge.route("/notifications/threads/7", serde_json::json!({}));
+        let notif = GitHubNotif(pr.0.clone());
+        notif.list().await.unwrap();
+        notif.mark_read("7").await.unwrap();
+        notif.mark_done("7").await.unwrap();
+        assert_eq!(
+            forge.requests(),
+            ["GET /notifications?all=true&per_page=50", "PATCH /notifications/threads/7", "DELETE /notifications/threads/7"]
+        );
+    }
+
     /// GitHub's CI notification usually has no subject URL: the run is found by the workflow and
     /// branch its title names, the outcome it says, nearest the notification's time.
     #[tokio::test]
@@ -2406,7 +2438,7 @@ mod tests {
         let notif = GitHubNotif(pr.0.clone());
 
         let rows = notif.list().await.unwrap();
-        assert_eq!(forge.requests(), vec!["GET /notifications?per_page=50".to_string()], "a list adds no per-row call");
+        assert_eq!(forge.requests(), vec!["GET /notifications?all=true&per_page=50".to_string()], "a list adds no per-row call");
         assert_eq!(rows[0].target, NotificationTarget::Overview, "a mention's comment is settled by detail()");
 
         let d = notif.detail(&rows[0]).await.unwrap();

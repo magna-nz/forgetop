@@ -728,11 +728,16 @@ impl NotificationSource for GitLabNotif {
         let v = self.0.get_json(&url).await?;
         Ok(v.as_array().unwrap_or(&vec![]).iter().map(map_todo).collect())
     }
-    async fn mark_read(&self, id: &str) -> Result<()> {
-        self.0.post_json(&format!("{}/todos/{id}/mark_as_done", self.0.base), json!({})).await
+    /// A to-do has no read state: it is pending or done. Opening one leaves it pending, so it stays
+    /// in the inbox until you're done with it.
+    async fn mark_read(&self, _id: &str) -> Result<()> {
+        Ok(())
     }
     async fn mark_all_read(&self) -> Result<()> {
-        self.0.post_json(&format!("{}/todos/mark_as_done", self.0.base), json!({})).await
+        Ok(())
+    }
+    async fn mark_done(&self, id: &str) -> Result<()> {
+        self.0.post_json(&format!("{}/todos/{id}/mark_as_done", self.0.base), json!({})).await
     }
 }
 

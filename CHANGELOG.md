@@ -31,8 +31,9 @@ Added
   run, not the repository. On GitHub the comment, who wrote it, and a CI notification's run are
   read for the row you are on only, never during a refresh.
   ([#248](https://github.com/magna-nz/forgetop/pull/248))
-- **Done, shared.** `e` (or the ✓) marks a thread read at the forge and clears it from the
-  inbox; a thread done in the dashboard is gone from the terminal UI too, and the other way round.
+- **Done, shared.** Opening a notification only marks it read: it stays in the inbox, so you
+  can come back to it. `e` (or the ✓) is what clears it — marked done at the forge (GitHub's
+  "mark as done", GitLab's to-do done) and gone from both the dashboard and the terminal UI.
   ([#248](https://github.com/magna-nz/forgetop/pull/248))
 
 Changed

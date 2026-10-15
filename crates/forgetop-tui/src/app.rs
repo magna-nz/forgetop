@@ -6130,7 +6130,7 @@ impl App {
             return;
         };
         self.toast = Some("Done".into());
-        self.done_inbox_threads(deps, vec![t], false).await;
+        self.done_inbox_threads(deps, vec![t]).await;
         if at < self.inbox_threads().len() {
             self.inbox_sel = at;
             self.open_inbox_selected(deps).await;
@@ -6195,18 +6195,27 @@ impl App {
     async fn done_selected_inbox(&mut self, deps: &AppDeps) {
         let Some(t) = self.inbox_selected() else { return };
         self.toast = Some("Done".into());
-        self.done_inbox_threads(deps, vec![t], false).await;
+        self.done_inbox_threads(deps, vec![t]).await;
     }
 
     /// "Done" with `threads`: every member is marked read at its forge and its dismissal key is
     /// added to the list both frontends share (merged, never overwritten — the dashboard adds
     /// to it too), and the threads leave the inbox now. `all` marks everything read at once.
-    async fn done_inbox_threads(&mut self, deps: &AppDeps, threads: Vec<InboxThread>, all: bool) {
+    async fn done_inbox_threads(&mut self, deps: &AppDeps, threads: Vec<InboxThread>) {
         if threads.is_empty() {
             return;
         }
-        let reads = self.inbox_reads(&threads);
         let members: HashSet<usize> = threads.iter().flat_map(|t| t.members.iter().copied()).collect();
+        // Every member, read or not: done is the forge's own "done" (GitHub mark-as-done, GitLab's
+        // to-do done), not a read — a read notification stays in the inbox until this.
+        let mut dones: Vec<(String, Vec<String>)> = Vec::new();
+        for &i in &members {
+            let (conn, id) = (self.inbox[i].connection_id.clone(), self.inbox[i].notification.id.clone());
+            match dones.iter_mut().find(|(c, _)| *c == conn) {
+                Some((_, ids)) => ids.push(id),
+                None => dones.push((conn, vec![id])),
+            }
+        }
         let mut keys: Vec<String> = members.iter().map(|&i| self.inbox[i].dismiss_key()).collect();
         keys.sort();
         self.inbox_dismissed.extend(keys.iter().cloned());
@@ -6223,7 +6232,21 @@ impl App {
         if let Err(e) = deps.config.dismiss_notifications(keys).await {
             self.toast = Some(format!("Couldn't save: {e}"));
         }
-        self.send_inbox_reads(deps, reads, all).await;
+        let job = done_at_forges(deps.clone(), dones);
+        match self.job_tx.clone() {
+            Some(tx) => {
+                tokio::spawn(async move {
+                    if let Err(error) = job.await {
+                        let _ = tx.send(AppEvent::InboxReadFailed { error });
+                    }
+                });
+            }
+            None => {
+                if let Err(error) = job.await {
+                    self.toast = Some(error);
+                }
+            }
+        }
     }
 
     /// `E` clears a whole view, so it asks first.
@@ -6243,7 +6266,7 @@ impl App {
     async fn done_inbox_view(&mut self, deps: &AppDeps) {
         let threads = self.inbox_threads();
         self.toast = Some("All done".into());
-        self.done_inbox_threads(deps, threads, false).await;
+        self.done_inbox_threads(deps, threads).await;
     }
 
     /// Driven by the anim timer: once the cursor has rested on a thread for
@@ -13164,6 +13187,27 @@ async fn mark_read_at_forges(deps: AppDeps, reads: Vec<(String, Vec<String>)>, a
     Ok(())
 }
 
+/// Marks notifications done at their forges ([`NotificationSource::mark_done`]), per connection.
+async fn done_at_forges(deps: AppDeps, dones: Vec<(String, Vec<String>)>) -> std::result::Result<(), String> {
+    let feeds = deps
+        .sections
+        .notification_feeds()
+        .await
+        .map_err(|error| inbox_action_error("Couldn't load notification connections", error, DIAG_INBOX_FEEDS))?;
+    for (conn, ids) in dones {
+        let feed = feeds.iter().find(|feed| feed.connection.connection_id() == conn).ok_or_else(|| {
+            inbox_action_error("Couldn't mark notification done", "notification connection unavailable", DIAG_INBOX_MARK_READ)
+        })?;
+        for id in ids {
+            feed.source
+                .mark_done(&id)
+                .await
+                .map_err(|error| inbox_action_error("Couldn't mark notification done", error, DIAG_INBOX_MARK_READ))?;
+        }
+    }
+    Ok(())
+}
+
 async fn fetch_notifications(deps: &AppDeps, errors: &mut Vec<String>) -> (Vec<NotifRow>, bool) {
     let mut out = Vec::new();
     let mut ok = true;
@@ -15913,7 +15957,7 @@ mod tests {
         assert_eq!(ids, ["a", "b"], "the selected row is gone");
         assert_eq!(app.inbox_sel, 1, "the selection stays in range");
         assert_eq!(app.toast.as_deref(), Some("Done"));
-        assert_eq!(calls.calls(), ["read c"], "done marks it read at the forge too");
+        assert_eq!(calls.calls(), ["done c"], "done is the forge's done too");
 
         // The next poll returns it again; it must not come back.
         let mut r = reloaded(Vec::new());
@@ -16037,6 +16081,22 @@ mod tests {
         assert!(matches!(app.screen, Screen::Inbox));
     }
 
+    /// Opening a thread reads it and nothing more: it stays in the inbox, read, until it's done.
+    #[tokio::test]
+    async fn an_opened_thread_stays_in_the_inbox_read_until_done() {
+        let calls = ItemCalls::new();
+        let (mut app, deps) = open_notes(calls.clone(), vec![note_at(NotificationTarget::Overview)]).await;
+        assert_eq!(calls.calls(), ["read n1"], "read, not done");
+        app.on_key(Key::Escape, &deps).await;
+        assert!(matches!(app.screen, Screen::Inbox));
+        assert_eq!(inbox_ids(&app), ["n1"], "still listed");
+        assert!(!app.inbox[0].notification.unread);
+        assert_eq!(app.inbox_threads().len(), 1);
+        app.on_key(Key::Char('e'), &deps).await;
+        assert!(app.inbox.is_empty(), "done is what clears it");
+        assert_eq!(calls.calls(), ["read n1", "done n1"]);
+    }
+
     #[tokio::test]
     async fn e_marks_every_member_read_and_merges_their_dismissal_keys_into_the_shared_list() {
         let calls = ItemCalls::new();
@@ -16055,9 +16115,9 @@ mod tests {
 
         app.on_key(Key::Char('e'), &deps).await;
 
-        let mut read = calls.calls();
-        read.sort();
-        assert_eq!(read, ["read c", "read m", "read x"], "every member is read at the forge, the reaction too");
+        let mut done = calls.calls();
+        done.sort();
+        assert_eq!(done, ["done c", "done m", "done x"], "every member is done at the forge, the reaction too");
         assert_eq!(inbox_ids(&app), ["o"], "the thread is gone");
         assert_eq!(app.toast.as_deref(), Some("Done"));
         let saved = deps.config.snapshot().ui.dismissed_notifications;
@@ -21713,6 +21773,9 @@ mod tests {
         }
         async fn mark_read(&self, id: &str) -> forgetop_core::Result<()> {
             self.0.record(format!("read {id}")).await
+        }
+        async fn mark_done(&self, id: &str) -> forgetop_core::Result<()> {
+            self.0.record(format!("done {id}")).await
         }
         async fn mark_all_read(&self) -> forgetop_core::Result<()> {
             self.0.record("read all".into()).await

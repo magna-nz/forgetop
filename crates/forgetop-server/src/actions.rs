@@ -403,12 +403,26 @@ pub async fn notif_read_many(sections: &SectionService, rows: &[dto::NotifRow], 
     }
 }
 
-/// "Done" on a thread: its members are marked read at the forge (as [`notif_read_many`]), then
-/// dismissed locally under the key the TUI uses, merged into the saved list so neither frontend
-/// drops the other's. Ids the current rows don't know are marked read but not dismissed — there
-/// is no `updated_at` to key them by.
+/// "Done" on a thread: its members are marked done at the forge, then dismissed locally under the
+/// key the TUI uses, merged into the saved list so neither frontend drops the other's. Ids the
+/// current rows don't know are marked done but not dismissed — there is no `updated_at` to key
+/// them by.
 pub async fn notif_done(sections: &SectionService, config: &ConfigService, rows: &[dto::NotifRow], req: &NotifIdsReq) -> Result<(), ActionError> {
-    notif_read_many(sections, rows, req).await?;
+    // Every id, read or not: done is the forge's own "done" (GitHub mark-as-done, GitLab's
+    // to-do done) — a read notification stays listed until this. Best-effort per id, failing
+    // only when every call failed.
+    let source = notif_source(sections, &req.conn).await.ok_or(ActionError::NotFound)?;
+    let mut first_error = None;
+    let mut misses = 0;
+    for id in &req.ids {
+        if let Err(e) = source.mark_done(id).await {
+            misses += 1;
+            first_error.get_or_insert(e.to_string());
+        }
+    }
+    if let Some(e) = first_error.filter(|_| misses == req.ids.len()) {
+        return Err(ActionError::Failed(e));
+    }
     let keys: Vec<String> = req
         .ids
         .iter()

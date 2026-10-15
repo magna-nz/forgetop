@@ -442,8 +442,13 @@ async fn gitlab_mr_event_surfaces_as_notification() {
     let n = found.expect("the MR to-do surfaces as a PR notification");
     assert!(n.unread, "a pending to-do reads as unread");
 
-    // Mark it read through the adapter; it drops out of the inbox.
+    // Opening reads it, which a to-do has no state for: it stays. Done is what clears it.
     notifs.mark_read(&n.id).await.expect("mark the notification read");
+    assert!(
+        notifs.list().await.expect("list").iter().any(|x| x.id == n.id),
+        "a to-do that was only read stays in the inbox"
+    );
+    notifs.mark_done(&n.id).await.expect("mark the to-do done");
     let cleared = {
         let notifs = &notifs;
         let id = id.as_str();
@@ -455,7 +460,7 @@ async fn gitlab_mr_event_surfaces_as_notification() {
         })
         .await
     };
-    assert!(cleared.is_some(), "the notification clears after mark-read");
+    assert!(cleared.is_some(), "the notification clears once done");
 
     raw.delete_branch(&branch).await;
 }
