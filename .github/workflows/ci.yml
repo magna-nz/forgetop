@@ -12,6 +12,26 @@ env:
   FORGETOP_SKIP_WEB_BUILD: "1"
 
 jobs:
+  public-demo:
+    name: public demo · test · build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: demo/package-lock.json
+      - name: Install public demo dependencies
+        working-directory: demo
+        run: npm ci
+      - name: Test public demo
+        working-directory: demo
+        run: npm run test
+      - name: Build public demo
+        working-directory: demo
+        run: npm run build
+
   test:
     name: build · test · clippy
     runs-on: ubuntu-latest
